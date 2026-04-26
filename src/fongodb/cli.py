@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+from types import FrameType
+
+from fongodb.server import FongoDBServer
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fongodb",
+        description="Fake MongoDB server speaking the pymongo wire protocol.",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=27117)
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    server = FongoDBServer(host=args.host, port=args.port)
+
+    def handle_signal(signum: int, frame: FrameType | None) -> None:
+        server.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    server.start()
+    server.wait()
+    return 0
