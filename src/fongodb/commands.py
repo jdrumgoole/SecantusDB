@@ -8,9 +8,9 @@ from typing import Any
 
 import bson
 
+from fongodb.aggregate import apply_pipeline
 from fongodb.cursors import CursorNotFound, CursorRegistry
 from fongodb.projection import apply_projection
-from fongodb.query import matches
 from fongodb.storage import Storage
 from fongodb.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 
@@ -405,8 +405,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     else:
         docs = []
         ns = f"{ctx.db_name}.$cmd.aggregate"
-    for stage in pipeline:
-        docs = _apply_stage(stage, docs)
+    docs = apply_pipeline(docs, pipeline)
     first_batch, cursor_id = _split_into_cursor(
         docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
     )
@@ -414,44 +413,6 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "cursor": {"firstBatch": first_batch, "id": cursor_id, "ns": ns},
         "ok": 1.0,
     }
-
-
-def _apply_stage(stage: dict[str, Any], docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if "$match" in stage:
-        return [d for d in docs if matches(d, stage["$match"])]
-    if "$count" in stage:
-        return [{stage["$count"]: len(docs)}]
-    if "$limit" in stage:
-        return docs[: int(stage["$limit"])]
-    if "$skip" in stage:
-        return docs[int(stage["$skip"]) :]
-    if "$group" in stage:
-        return _stage_group(stage["$group"], docs)
-    raise ValueError(f"unsupported aggregation stage: {next(iter(stage))}")
-
-
-def _stage_group(spec: dict[str, Any], docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    id_expr = spec.get("_id")
-    groups: dict[Any, dict[str, Any]] = {}
-    for d in docs:
-        key = _eval_group_key(id_expr, d)
-        bucket = groups.setdefault(key, {"_id": key})
-        for field, accumulator in spec.items():
-            if field == "_id":
-                continue
-            if not isinstance(accumulator, dict):
-                continue
-            if "$sum" in accumulator:
-                addend = accumulator["$sum"]
-                value = addend if not isinstance(addend, str) else d.get(addend.lstrip("$"), 0)
-                bucket[field] = bucket.get(field, 0) + (value or 0)
-    return list(groups.values())
-
-
-def _eval_group_key(expr: Any, doc: dict[str, Any]) -> Any:
-    if isinstance(expr, str) and expr.startswith("$"):
-        return doc.get(expr[1:])
-    return expr
 
 
 _HANDLERS: dict[str, CommandHandler] = {

@@ -63,7 +63,7 @@ class _SortKey:
         return isinstance(other, _SortKey) and self.val == other.val
 
 
-def _sort_docs(
+def sort_docs(
     docs: list[dict[str, Any]], sort_spec: Mapping[str, Any] | None
 ) -> list[dict[str, Any]]:
     if not sort_spec:
@@ -165,7 +165,7 @@ class Storage:
             if matches(doc, filter):
                 out.append(doc)
         if sort:
-            out = _sort_docs(out, sort)
+            out = sort_docs(out, sort)
         if skip:
             out = out[skip:]
         if limit > 0:

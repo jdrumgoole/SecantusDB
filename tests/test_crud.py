@@ -389,3 +389,68 @@ def test_find_one_and_update_with_projection(coll) -> None:
     coll.insert_one({"_id": 1, "a": 1, "b": 2, "c": 3})
     result = coll.find_one_and_update({"_id": 1}, {"$set": {"a": 99}}, projection={"a": 1})
     assert result == {"_id": 1, "a": 1}
+
+
+def test_aggregate_sort_stage(coll) -> None:
+    coll.insert_many([{"_id": 1, "n": 3}, {"_id": 2, "n": 1}, {"_id": 3, "n": 2}])
+    out = list(coll.aggregate([{"$sort": {"n": 1}}]))
+    assert [d["_id"] for d in out] == [2, 3, 1]
+
+
+def test_aggregate_project_with_computed_field(coll) -> None:
+    coll.insert_many([{"_id": 1, "x": 3, "y": 4}])
+    out = list(coll.aggregate([{"$project": {"_id": 0, "sum": {"$add": ["$x", "$y"]}}}]))
+    assert out == [{"sum": 7}]
+
+
+def test_aggregate_unwind_stage(coll) -> None:
+    coll.insert_one({"_id": 1, "tags": ["a", "b", "c"]})
+    out = list(coll.aggregate([{"$unwind": "$tags"}]))
+    assert [d["tags"] for d in out] == ["a", "b", "c"]
+
+
+def test_aggregate_group_with_avg(coll) -> None:
+    coll.insert_many(
+        [
+            {"team": "a", "score": 2},
+            {"team": "a", "score": 4},
+            {"team": "b", "score": 10},
+        ]
+    )
+    out = sorted(
+        coll.aggregate([{"$group": {"_id": "$team", "avg": {"$avg": "$score"}}}]),
+        key=lambda d: d["_id"],
+    )
+    assert out == [{"_id": "a", "avg": 3.0}, {"_id": "b", "avg": 10.0}]
+
+
+def test_aggregate_replace_root(coll) -> None:
+    coll.insert_one({"_id": 1, "inner": {"a": 1, "b": 2}})
+    out = list(coll.aggregate([{"$replaceRoot": {"newRoot": "$inner"}}]))
+    assert out == [{"a": 1, "b": 2}]
+
+
+def test_aggregate_chain_unwind_group(coll) -> None:
+    coll.insert_many(
+        [
+            {"team": "a", "scores": [10, 20]},
+            {"team": "b", "scores": [5]},
+            {"team": "a", "scores": [30]},
+        ]
+    )
+    out = sorted(
+        coll.aggregate(
+            [
+                {"$unwind": "$scores"},
+                {"$group": {"_id": "$team", "total": {"$sum": "$scores"}}},
+            ]
+        ),
+        key=lambda d: d["_id"],
+    )
+    assert out == [{"_id": "a", "total": 60}, {"_id": "b", "total": 5}]
+
+
+def test_aggregate_addfields(coll) -> None:
+    coll.insert_one({"_id": 1, "x": 5})
+    out = list(coll.aggregate([{"$addFields": {"doubled": {"$multiply": ["$x", 2]}}}]))
+    assert out == [{"_id": 1, "x": 5, "doubled": 10}]
