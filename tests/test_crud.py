@@ -676,3 +676,89 @@ def test_sparse_unique_index_via_pymongo(coll) -> None:
     coll.create_index("email", unique=True, sparse=True)
     coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3, "email": "x@y"}])
     assert coll.count_documents({}) == 3
+
+
+def test_query_elem_match_subdoc(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
+            {"_id": 2, "items": [{"sku": "a", "qty": 10}]},
+        ]
+    )
+    found = list(coll.find({"items": {"$elemMatch": {"sku": "a", "qty": {"$gte": 5}}}}))
+    assert [d["_id"] for d in found] == [2]
+
+
+def test_query_elem_match_scalar(coll) -> None:
+    coll.insert_many([{"_id": 1, "v": [1, 5, 10]}, {"_id": 2, "v": [1, 2, 3]}])
+    found = list(coll.find({"v": {"$elemMatch": {"$gte": 5, "$lt": 11}}}))
+    assert [d["_id"] for d in found] == [1]
+
+
+def test_aggregate_filter_expression(coll) -> None:
+    coll.insert_one({"_id": 1, "nums": [1, 2, 3, 4, 5]})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "big": {
+                            "$filter": {
+                                "input": "$nums",
+                                "as": "n",
+                                "cond": {"$gte": ["$$n", 3]},
+                            }
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"big": [3, 4, 5]}]
+
+
+def test_aggregate_map_expression(coll) -> None:
+    coll.insert_one({"_id": 1, "nums": [1, 2, 3]})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "doubled": {
+                            "$map": {
+                                "input": "$nums",
+                                "as": "n",
+                                "in": {"$multiply": ["$$n", 2]},
+                            }
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"doubled": [2, 4, 6]}]
+
+
+def test_aggregate_reduce_expression(coll) -> None:
+    coll.insert_one({"_id": 1, "nums": [1, 2, 3, 4]})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "total": {
+                            "$reduce": {
+                                "input": "$nums",
+                                "initialValue": 0,
+                                "in": {"$add": ["$$value", "$$this"]},
+                            }
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"total": 10}]

@@ -164,3 +164,64 @@ def test_to_bool_conversions() -> None:
     assert evaluate({"$toBool": 0}, {}) is False
     assert evaluate({"$toBool": "x"}, {}) is True
     assert evaluate({"$toBool": ""}, {}) is False
+
+
+def test_filter_basic() -> None:
+    expr = {"$filter": {"input": "$nums", "as": "n", "cond": {"$gt": ["$$n", 2]}}}
+    assert evaluate(expr, {"nums": [1, 2, 3, 4]}) == [3, 4]
+
+
+def test_filter_with_default_var_name() -> None:
+    expr = {"$filter": {"input": "$nums", "cond": {"$gte": ["$$this", 2]}}}
+    assert evaluate(expr, {"nums": [1, 2, 3]}) == [2, 3]
+
+
+def test_filter_with_limit() -> None:
+    expr = {
+        "$filter": {
+            "input": "$nums",
+            "as": "n",
+            "cond": {"$gt": ["$$n", 0]},
+            "limit": 2,
+        }
+    }
+    assert evaluate(expr, {"nums": [1, 2, 3, 4]}) == [1, 2]
+
+
+def test_map_transforms_each_element() -> None:
+    expr = {"$map": {"input": "$nums", "as": "n", "in": {"$multiply": ["$$n", 10]}}}
+    assert evaluate(expr, {"nums": [1, 2, 3]}) == [10, 20, 30]
+
+
+def test_reduce_sums() -> None:
+    expr = {
+        "$reduce": {
+            "input": "$nums",
+            "initialValue": 0,
+            "in": {"$add": ["$$value", "$$this"]},
+        }
+    }
+    assert evaluate(expr, {"nums": [1, 2, 3, 4]}) == 10
+
+
+def test_reduce_concat_string() -> None:
+    expr = {
+        "$reduce": {
+            "input": "$tags",
+            "initialValue": "",
+            "in": {"$concat": ["$$value", "$$this"]},
+        }
+    }
+    assert evaluate(expr, {"tags": ["a", "b", "c"]}) == "abc"
+
+
+def test_root_system_var_resolves_to_doc() -> None:
+    out = evaluate("$$ROOT", {"x": 1})
+    assert out == {"x": 1}
+
+
+def test_unknown_system_var_raises() -> None:
+    from fongodb.expressions import ExpressionError
+
+    with pytest.raises(ExpressionError):
+        evaluate("$$mystery", {})

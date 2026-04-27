@@ -171,3 +171,22 @@ def test_expr_returns_falsy_for_missing_field() -> None:
 def test_expr_combined_with_other_clauses() -> None:
     doc = {"a": 5, "b": 3, "name": "alice"}
     assert matches(doc, {"name": "alice", "$expr": {"$gt": ["$a", "$b"]}})
+
+
+def test_elem_match_subdoc_form() -> None:
+    doc = {"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]}
+    assert matches(doc, {"items": {"$elemMatch": {"sku": "b", "qty": {"$gte": 5}}}})
+    assert not matches(doc, {"items": {"$elemMatch": {"sku": "b", "qty": {"$gt": 5}}}})
+
+
+def test_elem_match_scalar_form() -> None:
+    doc = {"vals": [1, 5, 10]}
+    assert matches(doc, {"vals": {"$elemMatch": {"$gte": 3, "$lt": 7}}})
+    assert not matches(doc, {"vals": {"$elemMatch": {"$gte": 11}}})
+
+
+def test_elem_match_requires_single_element_match() -> None:
+    doc = {"items": [{"a": 5, "b": 10}, {"a": -1, "b": 2}]}
+    assert not matches(doc, {"items": {"$elemMatch": {"a": {"$gt": 0}, "b": {"$lt": 5}}}})
+    doc2 = {"items": [{"a": 5, "b": 2}]}
+    assert matches(doc2, {"items": {"$elemMatch": {"a": {"$gt": 0}, "b": {"$lt": 5}}}})

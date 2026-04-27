@@ -138,6 +138,8 @@ def _op_matches(values: list[Any], op: str, arg: Any) -> bool:
         return _op_all(values, arg)
     if op == "$mod":
         return _op_mod(values, arg)
+    if op == "$elemMatch":
+        return _op_elem_match(values, arg)
     raise QueryError(f"unsupported query operator: {op}")
 
 
@@ -301,3 +303,19 @@ def _try_mod(v: Any, divisor: Any, remainder: Any) -> bool:
         return bool(v % divisor == remainder)
     except (TypeError, ZeroDivisionError):
         return False
+
+
+def _op_elem_match(values: list[Any], condition: Any) -> bool:
+    if not isinstance(condition, Mapping):
+        return False
+    is_scalar_form = bool(condition) and all(k.startswith("$") for k in condition)
+    for v in values:
+        if not isinstance(v, list):
+            continue
+        for elem in v:
+            if is_scalar_form:
+                if _field_matches([elem], condition):
+                    return True
+            elif isinstance(elem, Mapping) and matches(elem, condition):
+                return True
+    return False
