@@ -225,3 +225,36 @@ def test_unknown_system_var_raises() -> None:
 
     with pytest.raises(ExpressionError):
         evaluate("$$mystery", {})
+
+
+def test_split() -> None:
+    assert evaluate({"$split": ["a,b,c", ","]}, {}) == ["a", "b", "c"]
+    assert evaluate({"$split": ["abc", ","]}, {}) == ["abc"]
+
+
+def test_trim_default_whitespace() -> None:
+    assert evaluate({"$trim": {"input": "  hi  "}}, {}) == "hi"
+
+
+def test_trim_with_chars() -> None:
+    assert evaluate({"$trim": {"input": "**hi**", "chars": "*"}}, {}) == "hi"
+
+
+def test_ltrim_rtrim() -> None:
+    assert evaluate({"$ltrim": {"input": "  hi  "}}, {}) == "hi  "
+    assert evaluate({"$rtrim": {"input": "  hi  "}}, {}) == "  hi"
+
+
+def test_substr_cp() -> None:
+    assert evaluate({"$substrCP": ["hello world", 6, 5]}, {}) == "world"
+    assert evaluate({"$substrCP": ["hello world", 0, 5]}, {}) == "hello"
+
+
+def test_str_len_cp() -> None:
+    assert evaluate({"$strLenCP": "hello"}, {}) == 5
+
+
+def test_index_of_cp() -> None:
+    assert evaluate({"$indexOfCP": ["hello", "ll"]}, {}) == 2
+    assert evaluate({"$indexOfCP": ["hello", "z"]}, {}) == -1
+    assert evaluate({"$indexOfCP": ["hellohello", "ll", 4]}, {}) == 7

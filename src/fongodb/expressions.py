@@ -227,6 +227,92 @@ def _op_to_upper(arg: Any, ctx: _Ctx) -> Any:
     return value.upper() if isinstance(value, str) else value
 
 
+def _op_split(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or len(arg) != 2:
+        raise ExpressionError("$split requires [string, separator]")
+    s = _eval(arg[0], ctx)
+    sep = _eval(arg[1], ctx)
+    if s is None or sep is None:
+        return None
+    if not isinstance(s, str) or not isinstance(sep, str):
+        raise ExpressionError("$split requires string operands")
+    return s.split(sep)
+
+
+def _op_trim(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$trim requires {input, chars?}")
+    s = _eval(arg.get("input"), ctx)
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        raise ExpressionError("$trim input must be a string")
+    chars = _eval(arg.get("chars"), ctx) if "chars" in arg else None
+    return s.strip(chars) if isinstance(chars, str) else s.strip()
+
+
+def _op_ltrim(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$ltrim requires {input, chars?}")
+    s = _eval(arg.get("input"), ctx)
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        raise ExpressionError("$ltrim input must be a string")
+    chars = _eval(arg.get("chars"), ctx) if "chars" in arg else None
+    return s.lstrip(chars) if isinstance(chars, str) else s.lstrip()
+
+
+def _op_rtrim(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$rtrim requires {input, chars?}")
+    s = _eval(arg.get("input"), ctx)
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        raise ExpressionError("$rtrim input must be a string")
+    chars = _eval(arg.get("chars"), ctx) if "chars" in arg else None
+    return s.rstrip(chars) if isinstance(chars, str) else s.rstrip()
+
+
+def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or len(arg) != 3:
+        raise ExpressionError("$substrCP requires [string, start, length]")
+    s = _eval(arg[0], ctx)
+    start = _eval(arg[1], ctx)
+    length = _eval(arg[2], ctx)
+    if s is None:
+        return ""
+    if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
+        raise ExpressionError("$substrCP requires string + ints")
+    if length < 0:
+        return s[start:]
+    return s[start : start + length]
+
+
+def _op_str_len_cp(arg: Any, ctx: _Ctx) -> Any:
+    s = _eval(arg, ctx)
+    if not isinstance(s, str):
+        raise ExpressionError("$strLenCP requires a string")
+    return len(s)
+
+
+def _op_index_of_cp(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or not 2 <= len(arg) <= 4:
+        raise ExpressionError("$indexOfCP requires [string, search, start?, end?]")
+    s = _eval(arg[0], ctx)
+    needle = _eval(arg[1], ctx)
+    if s is None:
+        return None
+    if not isinstance(s, str) or not isinstance(needle, str):
+        raise ExpressionError("$indexOfCP requires string operands")
+    start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
+    end = _eval(arg[3], ctx) if len(arg) >= 4 else len(s)
+    if not isinstance(start, int) or not isinstance(end, int):
+        return -1
+    return s.find(needle, start, end)
+
+
 def _ensure_datetime(value: Any) -> _dt.datetime | None:
     if isinstance(value, _dt.datetime):
         return value
@@ -479,6 +565,14 @@ _OPS = {
     "$toString": _op_to_string,
     "$toLower": _op_to_lower,
     "$toUpper": _op_to_upper,
+    "$split": _op_split,
+    "$trim": _op_trim,
+    "$ltrim": _op_ltrim,
+    "$rtrim": _op_rtrim,
+    "$substr": _op_substr_cp,
+    "$substrCP": _op_substr_cp,
+    "$strLenCP": _op_str_len_cp,
+    "$indexOfCP": _op_index_of_cp,
     "$year": _op_year,
     "$month": _op_month,
     "$dayOfMonth": _op_day_of_month,
