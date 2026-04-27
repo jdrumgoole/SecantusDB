@@ -547,3 +547,33 @@ def test_duplicate_id_int_vs_float_via_pymongo(coll) -> None:
     coll.insert_one({"_id": 1, "x": "int"})
     with pytest.raises(PyDup):
         coll.insert_one({"_id": 1.0, "x": "float"})
+
+
+def test_distinct_simple_field(coll) -> None:
+    coll.insert_many([{"team": "a"}, {"team": "b"}, {"team": "a"}, {"team": "c"}])
+    teams = sorted(coll.distinct("team"))
+    assert teams == ["a", "b", "c"]
+
+
+def test_distinct_with_filter(coll) -> None:
+    coll.insert_many(
+        [
+            {"team": "a", "active": True},
+            {"team": "b", "active": False},
+            {"team": "c", "active": True},
+        ]
+    )
+    teams = sorted(coll.distinct("team", {"active": True}))
+    assert teams == ["a", "c"]
+
+
+def test_distinct_unwinds_array_values(coll) -> None:
+    coll.insert_many([{"tags": ["a", "b"]}, {"tags": ["b", "c"]}])
+    tags = sorted(coll.distinct("tags"))
+    assert tags == ["a", "b", "c"]
+
+
+def test_distinct_dotted_path(coll) -> None:
+    coll.insert_many([{"addr": {"city": "Dublin"}}, {"addr": {"city": "Berlin"}}])
+    cities = sorted(coll.distinct("addr.city"))
+    assert cities == ["Berlin", "Dublin"]

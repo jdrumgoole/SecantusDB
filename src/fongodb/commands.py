@@ -226,6 +226,42 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"n": n, "ok": 1.0}
 
 
+def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from fongodb.paths import get_path
+
+    coll = doc["distinct"]
+    key = doc.get("key", "")
+    filter_ = doc.get("query") or {}
+    if not isinstance(key, str):
+        return {
+            "ok": 0.0,
+            "errmsg": "distinct key must be a string",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    matched = ctx.storage.find_matching(ctx.db_name, coll, filter_)
+    seen: list[Any] = []
+    for d in matched:
+        value = get_path(d, key)
+        if isinstance(value, list):
+            for elem in value:
+                if elem not in seen:
+                    seen.append(elem)
+        elif (value is not None or _key_present(d, key)) and value not in seen:
+            seen.append(value)
+    return {"values": seen, "ok": 1.0}
+
+
+def _key_present(doc: dict[str, Any], path: str) -> bool:
+    cur: Any = doc
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return False
+    return True
+
+
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["findAndModify"]
     query = doc.get("query") or {}
@@ -459,6 +495,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "update": _update,
     "delete": _delete,
     "count": _count,
+    "distinct": _distinct,
     "findAndModify": _find_and_modify,
     "findandmodify": _find_and_modify,
     "drop": _drop,
