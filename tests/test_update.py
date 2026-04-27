@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from fongodb.update import UpdateError, apply_update
+from secantus.update import UpdateError, apply_update
 
 
 def test_set_top_level() -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from bson import Decimal128, ObjectId, Regex
 
-from fongodb.query import QueryError, matches
+from secantus.query import QueryError, matches
 
 
 def test_empty_query_matches_anything() -> None:

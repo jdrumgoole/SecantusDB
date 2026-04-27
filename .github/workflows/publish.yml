@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/fongodb
+      url: https://pypi.org/p/secantus
     permissions:
       id-token: write
     steps:

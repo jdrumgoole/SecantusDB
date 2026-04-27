@@ -8,11 +8,11 @@ from typing import Any
 
 import bson
 
-from fongodb.aggregate import PipelineContext, apply_pipeline
-from fongodb.cursors import CursorNotFound, CursorRegistry
-from fongodb.projection import apply_projection
-from fongodb.storage import Storage
-from fongodb.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
+from secantus.aggregate import PipelineContext, apply_pipeline
+from secantus.cursors import CursorNotFound, CursorRegistry
+from secantus.projection import apply_projection
+from secantus.storage import Storage
+from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 
 WIRE_VERSION = 17
 SERVER_VERSION = "7.0.0"
@@ -124,14 +124,14 @@ def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     return {
         "system": {
             "currentTime": _dt.datetime.now(_dt.UTC),
-            "hostname": "fongodb",
+            "hostname": "secantus",
             "cpuAddrSize": 64,
             "memSizeMB": 0,
             "numCores": os.cpu_count() or 1,
             "cpuArch": "x86_64",
             "numaEnabled": False,
         },
-        "os": {"type": "fongodb", "name": "fongodb", "version": SERVER_VERSION},
+        "os": {"type": "secantus", "name": "secantus", "version": SERVER_VERSION},
         "ok": 1.0,
     }
 
@@ -165,7 +165,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         },
         "command": inner if isinstance(inner, dict) else {},
         "serverInfo": {
-            "host": "fongodb",
+            "host": "secantus",
             "port": 0,
             "version": SERVER_VERSION,
             "gitVersion": "0" * 40,
@@ -221,7 +221,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from fongodb.storage import IndexConflict
+    from secantus.storage import IndexConflict
 
     coll = doc["update"]
     updates = doc.get("updates", [])
@@ -277,7 +277,7 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from fongodb.paths import get_path
+    from secantus.paths import get_path
 
     coll = doc["distinct"]
     key = doc.get("key", "")
@@ -313,7 +313,7 @@ def _key_present(doc: dict[str, Any], path: str) -> bool:
 
 
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from fongodb.storage import IndexConflict
+    from secantus.storage import IndexConflict
 
     coll = doc["findAndModify"]
     query = doc.get("query") or {}
@@ -481,7 +481,7 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from fongodb.storage import IndexConflict
+    from secantus.storage import IndexConflict
 
     coll = doc["createIndexes"]
     indexes = doc.get("indexes", [])

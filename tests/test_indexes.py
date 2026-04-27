@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from fongodb.storage import IndexConflict, Storage
+from secantus.storage import IndexConflict, Storage
 
 
 @pytest.fixture

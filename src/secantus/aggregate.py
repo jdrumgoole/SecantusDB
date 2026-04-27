@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from fongodb.expressions import evaluate
-from fongodb.paths import get_path, set_path, unset_path
-from fongodb.query import matches
+from secantus.expressions import evaluate
+from secantus.paths import get_path, set_path, unset_path
+from secantus.query import matches
 
 if TYPE_CHECKING:
-    from fongodb.storage import Storage
+    from secantus.storage import Storage
 
 
 class AggregateError(Exception):
@@ -89,7 +89,7 @@ def _stage_skip(
 def _stage_sort(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    from fongodb.storage import sort_docs
+    from secantus.storage import sort_docs
 
     return sort_docs(list(docs), spec)
 

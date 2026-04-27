@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from fongodb.cursors import CursorNotFound, CursorRegistry
+from secantus.cursors import CursorNotFound, CursorRegistry
 
 
 def test_register_returns_unique_increasing_ids() -> None:

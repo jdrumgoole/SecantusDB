@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from fongodb.projection import ProjectionError, apply_projection
+from secantus.projection import ProjectionError, apply_projection
 
 
 def test_no_spec_returns_copy() -> None:

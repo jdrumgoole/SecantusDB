@@ -20,20 +20,20 @@ from typing import Any
 import bson
 from bson import Decimal128
 
-from fongodb.paths import get_path, has_path
-from fongodb.projection import apply_projection
-from fongodb.query import matches
-from fongodb.update import apply_update
+from secantus.paths import get_path, has_path
+from secantus.projection import apply_projection
+from secantus.query import matches
+from secantus.update import apply_update
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS _fongodb_collections (
+CREATE TABLE IF NOT EXISTS _secantus_collections (
     db_name   TEXT NOT NULL,
     coll_name TEXT NOT NULL,
     options   BLOB,
     PRIMARY KEY (db_name, coll_name)
 );
 
-CREATE TABLE IF NOT EXISTS _fongodb_documents (
+CREATE TABLE IF NOT EXISTS _secantus_documents (
     db_name   TEXT NOT NULL,
     coll_name TEXT NOT NULL,
     id_key    BLOB NOT NULL,
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS _fongodb_documents (
     PRIMARY KEY (db_name, coll_name, id_key)
 );
 
-CREATE TABLE IF NOT EXISTS _fongodb_indexes (
+CREATE TABLE IF NOT EXISTS _secantus_indexes (
     db_name    TEXT NOT NULL,
     coll_name  TEXT NOT NULL,
     index_name TEXT NOT NULL,
@@ -169,14 +169,14 @@ class Storage:
 
     def _ensure_collection(self, db: str, coll: str) -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO _fongodb_collections(db_name, coll_name) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO _secantus_collections(db_name, coll_name) VALUES (?, ?)",
             (db, coll),
         )
 
     def collection_exists(self, db: str, coll: str) -> bool:
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM _fongodb_collections WHERE db_name = ? AND coll_name = ?",
+                "SELECT 1 FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             ).fetchone()
             return row is not None
@@ -184,7 +184,7 @@ class Storage:
     def create_collection(self, db: str, coll: str) -> bool:
         with self._lock:
             cursor = self._conn.execute(
-                "INSERT OR IGNORE INTO _fongodb_collections(db_name, coll_name) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO _secantus_collections(db_name, coll_name) VALUES (?, ?)",
                 (db, coll),
             )
             return cursor.rowcount > 0
@@ -219,7 +219,7 @@ class Storage:
                 blob = bson.encode(doc)
                 try:
                     self._conn.execute(
-                        "INSERT INTO _fongodb_documents(db_name, coll_name, id_key, doc) "
+                        "INSERT INTO _secantus_documents(db_name, coll_name, id_key, doc) "
                         "VALUES (?, ?, ?, ?)",
                         (db, coll, key, blob),
                     )
@@ -239,7 +239,7 @@ class Storage:
     def _all_docs(self, db: str, coll: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT doc FROM _fongodb_documents WHERE db_name = ? AND coll_name = ?",
+                "SELECT doc FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             ).fetchall()
         return [bson.decode(blob) for (blob,) in rows]
@@ -247,7 +247,7 @@ class Storage:
     def _all_docs_with_id_key(self, db: str, coll: str) -> list[tuple[dict[str, Any], bytes]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT doc, id_key FROM _fongodb_documents WHERE db_name = ? AND coll_name = ?",
+                "SELECT doc, id_key FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             ).fetchall()
         return [(bson.decode(blob), id_key) for (blob, id_key) in rows]
@@ -282,7 +282,7 @@ class Storage:
         if not filter:
             with self._lock:
                 row = self._conn.execute(
-                    "SELECT COUNT(*) FROM _fongodb_documents WHERE db_name = ? AND coll_name = ?",
+                    "SELECT COUNT(*) FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
                     (db, coll),
                 ).fetchone()
                 return row[0]
@@ -318,7 +318,7 @@ class Storage:
                         raise IndexConflict(conflict, new["_id"])
                     modified += 1
                     self._conn.execute(
-                        "UPDATE _fongodb_documents SET doc = ? "
+                        "UPDATE _secantus_documents SET doc = ? "
                         "WHERE db_name = ? AND coll_name = ? AND id_key = ?",
                         (bson.encode(new), db, coll, new_id_key),
                     )
@@ -337,7 +337,7 @@ class Storage:
                 if conflict is not None:
                     raise IndexConflict(conflict, new["_id"])
                 self._conn.execute(
-                    "INSERT INTO _fongodb_documents(db_name, coll_name, id_key, doc) "
+                    "INSERT INTO _secantus_documents(db_name, coll_name, id_key, doc) "
                     "VALUES (?, ?, ?, ?)",
                     (db, coll, _id_key(upserted_id), bson.encode(new)),
                 )
@@ -350,7 +350,7 @@ class Storage:
                 if not matches(doc, filter):
                     continue
                 self._conn.execute(
-                    "DELETE FROM _fongodb_documents "
+                    "DELETE FROM _secantus_documents "
                     "WHERE db_name = ? AND coll_name = ? AND id_key = ?",
                     (db, coll, _id_key(doc["_id"])),
                 )
@@ -363,29 +363,29 @@ class Storage:
         with self._lock:
             existed = self.collection_exists(db, coll)
             self._conn.execute(
-                "DELETE FROM _fongodb_documents WHERE db_name = ? AND coll_name = ?",
+                "DELETE FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             )
             self._conn.execute(
-                "DELETE FROM _fongodb_indexes WHERE db_name = ? AND coll_name = ?",
+                "DELETE FROM _secantus_indexes WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             )
             self._conn.execute(
-                "DELETE FROM _fongodb_collections WHERE db_name = ? AND coll_name = ?",
+                "DELETE FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             )
             return existed
 
     def drop_database(self, db: str) -> None:
         with self._lock:
-            self._conn.execute("DELETE FROM _fongodb_documents WHERE db_name = ?", (db,))
-            self._conn.execute("DELETE FROM _fongodb_indexes WHERE db_name = ?", (db,))
-            self._conn.execute("DELETE FROM _fongodb_collections WHERE db_name = ?", (db,))
+            self._conn.execute("DELETE FROM _secantus_documents WHERE db_name = ?", (db,))
+            self._conn.execute("DELETE FROM _secantus_indexes WHERE db_name = ?", (db,))
+            self._conn.execute("DELETE FROM _secantus_collections WHERE db_name = ?", (db,))
 
     def list_collections(self, db: str) -> list[str]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT coll_name FROM _fongodb_collections WHERE db_name = ? ORDER BY coll_name",
+                "SELECT coll_name FROM _secantus_collections WHERE db_name = ? ORDER BY coll_name",
                 (db,),
             ).fetchall()
         return [r[0] for r in rows]
@@ -393,7 +393,7 @@ class Storage:
     def list_databases(self) -> list[str]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT DISTINCT db_name FROM _fongodb_collections ORDER BY db_name"
+                "SELECT DISTINCT db_name FROM _secantus_collections ORDER BY db_name"
             ).fetchall()
         return [r[0] for r in rows]
 
@@ -411,7 +411,7 @@ class Storage:
         with self._lock:
             self._ensure_collection(db, coll)
             existing = self._conn.execute(
-                "SELECT key_spec, options FROM _fongodb_indexes "
+                "SELECT key_spec, options FROM _secantus_indexes "
                 "WHERE db_name = ? AND coll_name = ? AND index_name = ?",
                 (db, coll, name),
             ).fetchone()
@@ -428,7 +428,7 @@ class Storage:
                         raise IndexConflict(name, d.get("_id"))
                     seen[key] = d.get("_id")
             self._conn.execute(
-                "INSERT INTO _fongodb_indexes(db_name, coll_name, index_name, key_spec, options) "
+                "INSERT INTO _secantus_indexes(db_name, coll_name, index_name, key_spec, options) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (db, coll, name, bson.encode(dict(key_spec)), bson.encode(options)),
             )
@@ -440,7 +440,7 @@ class Storage:
         out: list[dict[str, Any]] = [{"v": 2, "key": {"_id": 1}, "name": _ID_INDEX_NAME}]
         with self._lock:
             rows = self._conn.execute(
-                "SELECT index_name, key_spec, options FROM _fongodb_indexes "
+                "SELECT index_name, key_spec, options FROM _secantus_indexes "
                 "WHERE db_name = ? AND coll_name = ? ORDER BY index_name",
                 (db, coll),
             ).fetchall()
@@ -462,7 +462,7 @@ class Storage:
             return False
         with self._lock:
             cursor = self._conn.execute(
-                "DELETE FROM _fongodb_indexes "
+                "DELETE FROM _secantus_indexes "
                 "WHERE db_name = ? AND coll_name = ? AND index_name = ?",
                 (db, coll, name),
             )
@@ -471,7 +471,7 @@ class Storage:
     def drop_all_indexes(self, db: str, coll: str) -> int:
         with self._lock:
             cursor = self._conn.execute(
-                "DELETE FROM _fongodb_indexes WHERE db_name = ? AND coll_name = ?",
+                "DELETE FROM _secantus_indexes WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             )
             return cursor.rowcount
@@ -479,7 +479,7 @@ class Storage:
     def _unique_indexes(self, db: str, coll: str) -> list[tuple[str, dict[str, Any], bool]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT index_name, key_spec, options FROM _fongodb_indexes "
+                "SELECT index_name, key_spec, options FROM _secantus_indexes "
                 "WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             ).fetchall()

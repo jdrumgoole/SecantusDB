@@ -3,7 +3,7 @@ from __future__ import annotations
 import bson
 import pytest
 
-from fongodb.storage import Storage
+from secantus.storage import Storage
 
 
 @pytest.fixture

@@ -51,7 +51,7 @@ def _match_clause(
     if key == "$nor":
         return not any(matches(doc, c, vars=vars) for c in condition)
     if key == "$expr":
-        from fongodb.expressions import evaluate
+        from secantus.expressions import evaluate
 
         return _truthy(evaluate(condition, doc, vars))
     if key.startswith("$"):

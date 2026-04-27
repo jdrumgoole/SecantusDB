@@ -4,8 +4,8 @@ import copy
 from collections.abc import Mapping
 from typing import Any
 
-from fongodb.paths import get_path, has_path, set_path, unset_path
-from fongodb.query import matches
+from secantus.paths import get_path, has_path, set_path, unset_path
+from secantus.query import matches
 
 _MISSING = object()
 

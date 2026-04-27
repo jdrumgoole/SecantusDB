@@ -38,7 +38,7 @@ def fmt(c: Context) -> None:
 
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27117) -> None:
-    c.run(f"uv run python -m fongodb --host {host} --port {port}", pty=True)
+    c.run(f"uv run python -m secantus --host {host} --port {port}", pty=True)
 
 
 @task

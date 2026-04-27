@@ -1,4 +1,4 @@
-from fongodb.cli import main
+from secantus.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

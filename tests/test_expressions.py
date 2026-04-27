@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from fongodb.expressions import ExpressionError, evaluate
+from secantus.expressions import ExpressionError, evaluate
 
 
 def test_literal_passthrough() -> None:
@@ -221,7 +221,7 @@ def test_root_system_var_resolves_to_doc() -> None:
 
 
 def test_unknown_system_var_raises() -> None:
-    from fongodb.expressions import ExpressionError
+    from secantus.expressions import ExpressionError
 
     with pytest.raises(ExpressionError):
         evaluate("$$mystery", {})

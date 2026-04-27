@@ -8,7 +8,7 @@ from typing import Any
 
 from bson import Decimal128
 
-from fongodb.paths import get_path
+from secantus.paths import get_path
 
 
 class ExpressionError(Exception):

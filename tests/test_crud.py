@@ -7,17 +7,17 @@ from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
-from fongodb import FongoDBServer
+from secantus import SecantusDBServer
 
 
 @pytest.fixture
 def server():
-    with FongoDBServer(port=0) as srv:
+    with SecantusDBServer(port=0) as srv:
         yield srv
 
 
 @pytest.fixture
-def client(server: FongoDBServer):
+def client(server: SecantusDBServer):
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
     try:
         yield mc
@@ -41,7 +41,7 @@ def test_insert_one_then_find(coll) -> None:
     assert found["_id"] == result.inserted_id
 
 
-def test_round_trips_objectid_and_datetime(server: FongoDBServer) -> None:
+def test_round_trips_objectid_and_datetime(server: SecantusDBServer) -> None:
     aware_client = MongoClient(server.uri, tz_aware=True, serverSelectionTimeoutMS=2000)
     try:
         coll = aware_client["testdb"]["things"]
@@ -244,7 +244,7 @@ def test_projection_dotted_inclusion(coll) -> None:
     assert doc == {"addr": {"city": "Dublin"}}
 
 
-def test_small_batch_size_paginates_via_getmore(coll, server: FongoDBServer) -> None:
+def test_small_batch_size_paginates_via_getmore(coll, server: SecantusDBServer) -> None:
     coll.insert_many([{"_id": i, "n": i} for i in range(25)])
     cursor = coll.find().sort("n", 1).batch_size(10)
     docs = list(cursor)
@@ -258,7 +258,7 @@ def test_iterate_large_collection_completes(coll) -> None:
     assert seen == list(range(500))
 
 
-def test_close_cursor_kills_it(coll, server: FongoDBServer) -> None:
+def test_close_cursor_kills_it(coll, server: SecantusDBServer) -> None:
     coll.insert_many([{"_id": i, "n": i} for i in range(50)])
     cursor = coll.find().batch_size(5)
     next(cursor)

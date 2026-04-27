@@ -1,15 +1,15 @@
 # API reference
 
 ```{eval-rst}
-.. automodule:: fongodb
+.. automodule:: secantus
    :members:
    :undoc-members:
 
-.. automodule:: fongodb.server
+.. automodule:: secantus.server
    :members:
    :undoc-members:
 
-.. automodule:: fongodb.cli
+.. automodule:: secantus.cli
    :members:
    :undoc-members:
 ```

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from fongodb.aggregate import AggregateError, apply_pipeline
+from secantus.aggregate import AggregateError, apply_pipeline
 
 
 def test_match_filters_docs() -> None:

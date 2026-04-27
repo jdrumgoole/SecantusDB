@@ -8,10 +8,10 @@ import threading
 from types import TracebackType
 from typing import Any, Self
 
-from fongodb.commands import CommandContext, dispatch
-from fongodb.cursors import CursorRegistry
-from fongodb.storage import Storage
-from fongodb.wire import (
+from secantus.commands import CommandContext, dispatch
+from secantus.cursors import CursorRegistry
+from secantus.storage import Storage
+from secantus.wire import (
     ConnectionClosed,
     OpMsg,
     OpQuery,
@@ -36,7 +36,7 @@ def _db_from_namespace(ns: str) -> str:
     return db or "admin"
 
 
-class FongoDBServer:
+class SecantusDBServer:
     def __init__(
         self,
         host: str = "127.0.0.1",
@@ -75,10 +75,10 @@ class FongoDBServer:
         self.host, self.port = sock.getsockname()[:2]
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._serve_forever, name="fongodb-accept", daemon=True
+            target=self._serve_forever, name="secantus-accept", daemon=True
         )
         self._thread.start()
-        logger.info("fongodb listening on %s:%d", self.host, self.port)
+        logger.info("secantus listening on %s:%d", self.host, self.port)
 
     def stop(self) -> None:
         self._stop_event.set()

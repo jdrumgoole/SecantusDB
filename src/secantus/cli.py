@@ -6,12 +6,12 @@ import signal
 import sys
 from types import FrameType
 
-from fongodb.server import FongoDBServer
+from secantus.server import SecantusDBServer
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="fongodb",
+        prog="secantus",
         description="Fake MongoDB server speaking the pymongo wire protocol.",
     )
     parser.add_argument("--host", default="127.0.0.1")
@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    server = FongoDBServer(host=args.host, port=args.port)
+    server = SecantusDBServer(host=args.host, port=args.port)
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:
         server.stop()

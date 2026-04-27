@@ -4,17 +4,17 @@ import pytest
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-from fongodb import FongoDBServer
+from secantus import SecantusDBServer
 
 
 @pytest.fixture
 def server():
-    with FongoDBServer(port=0) as srv:
+    with SecantusDBServer(port=0) as srv:
         yield srv
 
 
 @pytest.fixture
-def client(server: FongoDBServer):
+def client(server: SecantusDBServer):
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
     try:
         yield mc
