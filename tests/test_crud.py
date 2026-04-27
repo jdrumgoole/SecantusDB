@@ -325,3 +325,67 @@ def test_query_mod(coll) -> None:
     coll.insert_many([{"_id": i, "n": i} for i in range(10)])
     ids = sorted(d["_id"] for d in coll.find({"n": {"$mod": [3, 0]}}))
     assert ids == [0, 3, 6, 9]
+
+
+def test_find_one_and_update_returns_old_by_default(coll) -> None:
+    coll.insert_one({"_id": 1, "n": 5})
+    result = coll.find_one_and_update({"_id": 1}, {"$set": {"n": 99}})
+    assert result == {"_id": 1, "n": 5}
+    assert coll.find_one({"_id": 1})["n"] == 99
+
+
+def test_find_one_and_update_returns_new_when_requested(coll) -> None:
+    from pymongo import ReturnDocument
+
+    coll.insert_one({"_id": 1, "n": 5})
+    result = coll.find_one_and_update(
+        {"_id": 1}, {"$set": {"n": 99}}, return_document=ReturnDocument.AFTER
+    )
+    assert result == {"_id": 1, "n": 99}
+
+
+def test_find_one_and_update_no_match_returns_none(coll) -> None:
+    result = coll.find_one_and_update({"_id": 99}, {"$set": {"x": 1}})
+    assert result is None
+
+
+def test_find_one_and_replace_returns_old(coll) -> None:
+    coll.insert_one({"_id": 1, "old": "value"})
+    result = coll.find_one_and_replace({"_id": 1}, {"new": "stuff"})
+    assert result == {"_id": 1, "old": "value"}
+    assert coll.find_one({"_id": 1}) == {"_id": 1, "new": "stuff"}
+
+
+def test_find_one_and_delete_returns_doc(coll) -> None:
+    coll.insert_one({"_id": 1, "n": 5})
+    result = coll.find_one_and_delete({"_id": 1})
+    assert result == {"_id": 1, "n": 5}
+    assert coll.count_documents({}) == 0
+
+
+def test_find_one_and_update_upsert(coll) -> None:
+    from pymongo import ReturnDocument
+
+    result = coll.find_one_and_update(
+        {"name": "ghost"},
+        {"$set": {"seen": True}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    assert result is not None
+    assert result["name"] == "ghost"
+    assert result["seen"] is True
+
+
+def test_find_one_and_update_uses_sort_to_pick(coll) -> None:
+    coll.insert_many([{"_id": 1, "n": 10}, {"_id": 2, "n": 5}, {"_id": 3, "n": 20}])
+    result = coll.find_one_and_update({}, {"$set": {"picked": True}}, sort=[("n", 1)])
+    assert result["_id"] == 2
+    picked_ids = sorted(d["_id"] for d in coll.find({"picked": True}))
+    assert picked_ids == [2]
+
+
+def test_find_one_and_update_with_projection(coll) -> None:
+    coll.insert_one({"_id": 1, "a": 1, "b": 2, "c": 3})
+    result = coll.find_one_and_update({"_id": 1}, {"$set": {"a": 99}}, projection={"a": 1})
+    assert result == {"_id": 1, "a": 1}

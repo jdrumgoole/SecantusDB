@@ -9,6 +9,7 @@ from typing import Any
 import bson
 
 from fongodb.cursors import CursorNotFound, CursorRegistry
+from fongodb.projection import apply_projection
 from fongodb.query import matches
 from fongodb.storage import Storage
 from fongodb.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
@@ -201,6 +202,93 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"n": n, "ok": 1.0}
 
 
+def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    coll = doc["findAndModify"]
+    query = doc.get("query") or {}
+    sort = doc.get("sort") or None
+    fields = doc.get("fields") or None
+    return_new = bool(doc.get("new", False))
+    upsert = bool(doc.get("upsert", False))
+    is_remove = bool(doc.get("remove", False))
+    update = doc.get("update")
+
+    if is_remove and update is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": "Cannot specify both update and remove=true",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    if not is_remove and update is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "Either an update or remove=true must be specified",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+
+    candidates = ctx.storage.find_matching(ctx.db_name, coll, query, sort=sort, limit=1)
+
+    if not candidates:
+        if upsert and not is_remove:
+            result = ctx.storage.update_matching(
+                ctx.db_name, coll, query, update, multi=False, upsert=True
+            )
+            upserted_id = result["upserted_id"]
+            value: Any = None
+            if return_new and upserted_id is not None:
+                new_docs = ctx.storage.find_matching(ctx.db_name, coll, {"_id": upserted_id})
+                if new_docs:
+                    value = new_docs[0]
+                    if fields:
+                        value = apply_projection(value, fields)
+            return {
+                "lastErrorObject": {
+                    "n": 1,
+                    "updatedExisting": False,
+                    "upserted": upserted_id,
+                },
+                "value": value,
+                "ok": 1.0,
+            }
+        return {
+            "lastErrorObject": {"n": 0, "updatedExisting": False},
+            "value": None,
+            "ok": 1.0,
+        }
+
+    matched_doc = candidates[0]
+    matched_id = matched_doc["_id"]
+
+    if is_remove:
+        ctx.storage.delete_matching(ctx.db_name, coll, {"_id": matched_id}, limit=1)
+        value = matched_doc
+        if fields:
+            value = apply_projection(value, fields)
+        return {
+            "lastErrorObject": {"n": 1, "updatedExisting": True},
+            "value": value,
+            "ok": 1.0,
+        }
+
+    ctx.storage.update_matching(ctx.db_name, coll, {"_id": matched_id}, update, multi=False)
+
+    if return_new:
+        new_docs = ctx.storage.find_matching(ctx.db_name, coll, {"_id": matched_id})
+        value = new_docs[0] if new_docs else None
+    else:
+        value = matched_doc
+
+    if fields and value is not None:
+        value = apply_projection(value, fields)
+
+    return {
+        "lastErrorObject": {"n": 1, "updatedExisting": True},
+        "value": value,
+        "ok": 1.0,
+    }
+
+
 def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["drop"]
     existed = ctx.storage.drop_collection(ctx.db_name, coll)
@@ -382,6 +470,8 @@ _HANDLERS: dict[str, CommandHandler] = {
     "update": _update,
     "delete": _delete,
     "count": _count,
+    "findAndModify": _find_and_modify,
+    "findandmodify": _find_and_modify,
     "drop": _drop,
     "create": _create,
     "dropDatabase": _drop_database,
