@@ -40,9 +40,21 @@ def _match_clause(doc: Mapping[str, Any], key: str, condition: Any) -> bool:
         return any(matches(doc, c) for c in condition)
     if key == "$nor":
         return not any(matches(doc, c) for c in condition)
+    if key == "$expr":
+        from fongodb.expressions import evaluate
+
+        return _truthy(evaluate(condition, doc))
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
     return _field_matches(_resolve_path(doc, key), condition)
+
+
+def _truthy(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (bool, int, float)):
+        return bool(value)
+    return True
 
 
 def _resolve_path(doc: Any, path: str) -> list[Any]:

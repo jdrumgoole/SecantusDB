@@ -149,3 +149,25 @@ def test_size_requires_int() -> None:
 def test_combine_regex_and_other_operators() -> None:
     doc = {"name": "alice", "age": 30}
     assert matches(doc, {"name": {"$regex": "^ali"}, "age": {"$gte": 18}})
+
+
+def test_expr_compares_two_fields() -> None:
+    assert matches({"a": 5, "b": 3}, {"$expr": {"$gt": ["$a", "$b"]}})
+    assert not matches({"a": 1, "b": 3}, {"$expr": {"$gt": ["$a", "$b"]}})
+
+
+def test_expr_with_arithmetic() -> None:
+    doc = {"price": 100, "discount": 30}
+    expr = {"$expr": {"$lt": [{"$subtract": ["$price", "$discount"]}, 80]}}
+    assert matches(doc, expr)
+    assert not matches({"price": 200, "discount": 30}, expr)
+
+
+def test_expr_returns_falsy_for_missing_field() -> None:
+    assert not matches({}, {"$expr": "$missing"})
+    assert not matches({"x": None}, {"$expr": "$x"})
+
+
+def test_expr_combined_with_other_clauses() -> None:
+    doc = {"a": 5, "b": 3, "name": "alice"}
+    assert matches(doc, {"name": "alice", "$expr": {"$gt": ["$a", "$b"]}})

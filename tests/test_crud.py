@@ -508,3 +508,15 @@ def test_aggregate_lookup_no_match_returns_empty_array(client: MongoClient) -> N
         )
     )
     assert out[0]["j"] == []
+
+
+def test_query_expr_compares_fields(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "a": 5, "b": 3},
+            {"_id": 2, "a": 1, "b": 2},
+            {"_id": 3, "a": 7, "b": 7},
+        ]
+    )
+    ids = sorted(d["_id"] for d in coll.find({"$expr": {"$gt": ["$a", "$b"]}}))
+    assert ids == [1]
