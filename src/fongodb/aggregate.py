@@ -432,6 +432,81 @@ def _lookup_match(local: Any, foreign: Any) -> bool:
     return local == foreign
 
 
+def _stage_sample(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    import random
+
+    if not isinstance(spec, Mapping) or "size" not in spec:
+        raise AggregateError("$sample requires {size: N}")
+    size = int(spec["size"])
+    if size >= len(docs):
+        return list(docs)
+    return random.sample(list(docs), size)
+
+
+def _stage_sort_by_count(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    grouped = _stage_group({"_id": spec, "count": {"$sum": 1}}, docs, ctx)
+    grouped.sort(key=lambda d: d.get("count", 0), reverse=True)
+    return grouped
+
+
+def _stage_facet(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$facet requires a document of {name: pipeline}")
+    out: dict[str, Any] = {}
+    for name, sub_pipeline in spec.items():
+        if not isinstance(sub_pipeline, list):
+            raise AggregateError(f"$facet entry {name!r} must be a pipeline array")
+        out[name] = apply_pipeline(list(docs), sub_pipeline, ctx)
+    return [out]
+
+
+def _stage_bucket(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$bucket requires a document spec")
+    group_by = spec.get("groupBy")
+    boundaries = spec.get("boundaries")
+    default = spec.get("default")
+    output_spec = spec.get("output") or {"count": {"$sum": 1}}
+    if not isinstance(boundaries, list) or len(boundaries) < 2:
+        raise AggregateError("$bucket requires boundaries array of >=2 values")
+
+    buckets: dict[Any, list[dict[str, Any]]] = {b: [] for b in boundaries[:-1]}
+    if default is not None:
+        buckets[default] = []
+
+    for d in docs:
+        value = evaluate(group_by, d, ctx.vars)
+        placed = False
+        for i in range(len(boundaries) - 1):
+            lo, hi = boundaries[i], boundaries[i + 1]
+            try:
+                if lo <= value < hi:
+                    buckets[lo].append(d)
+                    placed = True
+                    break
+            except TypeError:
+                continue
+        if not placed and default is not None:
+            buckets[default].append(d)
+
+    result: list[dict[str, Any]] = []
+    for key, bucket_docs in buckets.items():
+        bucket: dict[str, Any] = {"_id": key}
+        for field_name, accumulator in output_spec.items():
+            for d in bucket_docs:
+                _accumulate(bucket, field_name, accumulator, d, ctx.vars)
+        result.append(_finalize(bucket))
+    return result
+
+
 _STAGES = {
     "$match": _stage_match,
     "$count": _stage_count,
@@ -447,4 +522,8 @@ _STAGES = {
     "$replaceWith": _stage_replace_with,
     "$group": _stage_group,
     "$lookup": _stage_lookup,
+    "$sample": _stage_sample,
+    "$sortByCount": _stage_sort_by_count,
+    "$facet": _stage_facet,
+    "$bucket": _stage_bucket,
 }

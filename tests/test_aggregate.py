@@ -169,6 +169,64 @@ def test_project_mixed_inclusion_exclusion_rejected() -> None:
         apply_pipeline([{"a": 1, "b": 2}], [{"$project": {"a": 1, "b": 0}}])
 
 
+def test_sample_returns_subset() -> None:
+    docs = [{"i": i} for i in range(10)]
+    out = apply_pipeline(docs, [{"$sample": {"size": 3}}])
+    assert len(out) == 3
+    assert all(d in docs for d in out)
+
+
+def test_sample_size_larger_than_input_returns_all() -> None:
+    docs = [{"i": i} for i in range(3)]
+    out = apply_pipeline(docs, [{"$sample": {"size": 10}}])
+    assert len(out) == 3
+
+
+def test_sort_by_count() -> None:
+    docs = [{"t": "a"}, {"t": "b"}, {"t": "a"}, {"t": "c"}, {"t": "a"}]
+    out = apply_pipeline(docs, [{"$sortByCount": "$t"}])
+    assert out[0] == {"_id": "a", "count": 3}
+    assert {d["_id"] for d in out} == {"a", "b", "c"}
+
+
+def test_facet_runs_parallel_pipelines() -> None:
+    docs = [{"x": 1}, {"x": 2}, {"x": 3}, {"x": 4}]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$facet": {
+                    "all": [{"$count": "n"}],
+                    "big": [{"$match": {"x": {"$gte": 3}}}, {"$count": "n"}],
+                }
+            }
+        ],
+    )
+    assert out == [{"all": [{"n": 4}], "big": [{"n": 2}]}]
+
+
+def test_bucket_basic_ranges() -> None:
+    docs = [{"v": 1}, {"v": 5}, {"v": 12}, {"v": 25}, {"v": 99}]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$bucket": {
+                    "groupBy": "$v",
+                    "boundaries": [0, 10, 20, 30],
+                    "default": "other",
+                    "output": {"count": {"$sum": 1}},
+                }
+            }
+        ],
+    )
+    by_id = {d["_id"]: d["count"] for d in out}
+    assert by_id[0] == 2
+    assert by_id[10] == 1
+    assert by_id[20] == 1
+    assert by_id["other"] == 1
+
+
 def test_lookup_requires_storage_context() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline(
