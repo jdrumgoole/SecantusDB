@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import bson
 
+from fongodb.paths import get_path
+from fongodb.projection import apply_projection
 from fongodb.query import matches
 from fongodb.update import apply_update
 
@@ -36,6 +38,43 @@ class DuplicateKeyError(Exception):
 
 def _id_key(doc_id: Any) -> bytes:
     return bson.encode({"_": doc_id})
+
+
+class _SortKey:
+    __slots__ = ("val",)
+
+    def __init__(self, val: Any) -> None:
+        self.val = val
+
+    def __lt__(self, other: _SortKey) -> bool:
+        a, b = self.val, other.val
+        if a is None and b is None:
+            return False
+        if a is None:
+            return True
+        if b is None:
+            return False
+        try:
+            return bool(a < b)
+        except TypeError:
+            return type(a).__name__ < type(b).__name__
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _SortKey) and self.val == other.val
+
+
+def _sort_docs(
+    docs: list[dict[str, Any]], sort_spec: Mapping[str, Any] | None
+) -> list[dict[str, Any]]:
+    if not sort_spec:
+        return docs
+    result = list(docs)
+    for field, direction in reversed(list(sort_spec.items())):
+        result.sort(
+            key=lambda d, f=field: _SortKey(get_path(d, f)),
+            reverse=(int(direction) == -1),
+        )
+    return result
 
 
 class Storage:
@@ -117,16 +156,22 @@ class Storage:
         *,
         skip: int = 0,
         limit: int = 0,
+        sort: Mapping[str, Any] | None = None,
+        projection: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         filter = filter or {}
         out: list[dict[str, Any]] = []
         for doc in self._all_docs(db, coll):
             if matches(doc, filter):
                 out.append(doc)
+        if sort:
+            out = _sort_docs(out, sort)
         if skip:
             out = out[skip:]
         if limit > 0:
             out = out[:limit]
+        if projection:
+            out = [apply_projection(d, projection) for d in out]
         return out
 
     def count_matching(self, db: str, coll: str, filter: dict[str, Any] | None = None) -> int:

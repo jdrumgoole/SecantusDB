@@ -168,3 +168,77 @@ def test_query_with_in_operator(coll) -> None:
     found = list(coll.find({"n": {"$in": [1, 3]}}))
     ids = sorted(d["_id"] for d in found)
     assert ids == [1, 3]
+
+
+def test_sort_ascending(coll) -> None:
+    coll.insert_many([{"n": 3}, {"n": 1}, {"n": 2}])
+    result = [d["n"] for d in coll.find().sort("n", 1)]
+    assert result == [1, 2, 3]
+
+
+def test_sort_descending(coll) -> None:
+    coll.insert_many([{"n": 3}, {"n": 1}, {"n": 2}])
+    result = [d["n"] for d in coll.find().sort("n", -1)]
+    assert result == [3, 2, 1]
+
+
+def test_sort_multi_key(coll) -> None:
+    coll.insert_many(
+        [
+            {"team": "a", "score": 10},
+            {"team": "b", "score": 5},
+            {"team": "a", "score": 7},
+            {"team": "b", "score": 9},
+        ]
+    )
+    result = [(d["team"], d["score"]) for d in coll.find().sort([("team", 1), ("score", -1)])]
+    assert result == [("a", 10), ("a", 7), ("b", 9), ("b", 5)]
+
+
+def test_sort_by_dotted_path(coll) -> None:
+    coll.insert_many(
+        [
+            {"name": "x", "addr": {"zip": "30000"}},
+            {"name": "y", "addr": {"zip": "10000"}},
+            {"name": "z", "addr": {"zip": "20000"}},
+        ]
+    )
+    result = [d["name"] for d in coll.find().sort("addr.zip", 1)]
+    assert result == ["y", "z", "x"]
+
+
+def test_sort_with_missing_field_sorts_first(coll) -> None:
+    coll.insert_many([{"_id": 1, "n": 5}, {"_id": 2}, {"_id": 3, "n": 1}])
+    result = [d["_id"] for d in coll.find().sort("n", 1)]
+    assert result[0] == 2  # missing sorts first
+
+
+def test_sort_combined_with_limit(coll) -> None:
+    coll.insert_many([{"n": i} for i in range(10)])
+    top3 = [d["n"] for d in coll.find().sort("n", -1).limit(3)]
+    assert top3 == [9, 8, 7]
+
+
+def test_projection_inclusion(coll) -> None:
+    coll.insert_one({"a": 1, "b": 2, "c": 3})
+    doc = coll.find_one({}, {"a": 1, "c": 1})
+    assert doc is not None
+    assert set(doc.keys()) == {"_id", "a", "c"}
+
+
+def test_projection_exclude_id(coll) -> None:
+    coll.insert_one({"a": 1, "b": 2})
+    doc = coll.find_one({}, {"_id": 0, "a": 1})
+    assert doc == {"a": 1}
+
+
+def test_projection_exclusion(coll) -> None:
+    coll.insert_one({"_id": 1, "a": 1, "b": 2, "c": 3})
+    doc = coll.find_one({}, {"b": 0})
+    assert doc == {"_id": 1, "a": 1, "c": 3}
+
+
+def test_projection_dotted_inclusion(coll) -> None:
+    coll.insert_one({"_id": 1, "addr": {"city": "Dublin", "zip": "D02"}, "name": "Joe"})
+    doc = coll.find_one({}, {"addr.city": 1, "_id": 0})
+    assert doc == {"addr": {"city": "Dublin"}}

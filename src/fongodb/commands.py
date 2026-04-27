@@ -112,7 +112,17 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     filter_ = doc.get("filter") or {}
     skip = int(doc.get("skip", 0) or 0)
     limit = int(doc.get("limit", 0) or 0)
-    docs = ctx.storage.find_matching(ctx.db_name, coll, filter_, skip=skip, limit=limit)
+    sort = doc.get("sort") or None
+    projection = doc.get("projection") or None
+    docs = ctx.storage.find_matching(
+        ctx.db_name,
+        coll,
+        filter_,
+        skip=skip,
+        limit=limit,
+        sort=sort,
+        projection=projection,
+    )
     return {
         "cursor": {
             "firstBatch": docs,
