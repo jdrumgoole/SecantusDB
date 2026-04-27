@@ -3,9 +3,11 @@ from __future__ import annotations
 import sqlite3
 import threading
 from collections.abc import Iterable, Mapping
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
+from bson import Decimal128
 
 from fongodb.paths import get_path
 from fongodb.projection import apply_projection
@@ -36,8 +38,42 @@ class DuplicateKeyError(Exception):
         self.doc_id = doc_id
 
 
+_NUM_PREFIX = b"\x01n:"
+_OTHER_PREFIX = b"\x01o:"
+
+
+def _canon_decimal(d: Decimal) -> bytes | None:
+    if not d.is_finite():
+        return None
+    if d == d.to_integral_value():
+        return str(int(d)).encode()
+    return format(d.normalize(), "f").encode()
+
+
 def _id_key(doc_id: Any) -> bytes:
-    return bson.encode({"_": doc_id})
+    if isinstance(doc_id, bool):
+        return _OTHER_PREFIX + bson.encode({"_": doc_id})
+    if isinstance(doc_id, int):
+        canon = _canon_decimal(Decimal(doc_id))
+        if canon is not None:
+            return _NUM_PREFIX + canon
+    elif isinstance(doc_id, float):
+        try:
+            d = Decimal(repr(doc_id))
+        except (InvalidOperation, ValueError):
+            d = None
+        if d is not None:
+            canon = _canon_decimal(d)
+            if canon is not None:
+                return _NUM_PREFIX + canon
+    elif isinstance(doc_id, Decimal128):
+        try:
+            canon = _canon_decimal(doc_id.to_decimal())
+        except (InvalidOperation, ValueError):
+            canon = None
+        if canon is not None:
+            return _NUM_PREFIX + canon
+    return _OTHER_PREFIX + bson.encode({"_": doc_id})
 
 
 class _SortKey:

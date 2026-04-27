@@ -96,3 +96,29 @@ def test_databases_are_isolated(storage: Storage) -> None:
     d2 = storage.find_matching("db2", "c", {})
     assert d1 == [{"_id": 1, "x": "a"}]
     assert d2 == [{"_id": 1, "x": "b"}]
+
+
+def test_numeric_id_bridge_int_vs_float(storage: Storage) -> None:
+    inserted, _ = storage.insert("db", "c", [{"_id": 1, "x": "int"}], ordered=True)
+    assert inserted == 1
+    inserted2, errors = storage.insert("db", "c", [{"_id": 1.0, "x": "float"}], ordered=True)
+    assert inserted2 == 0
+    assert len(errors) == 1
+
+
+def test_numeric_id_bridge_decimal128(storage: Storage) -> None:
+    from bson import Decimal128
+
+    storage.insert("db", "c", [{"_id": 5}])
+    _, errors = storage.insert("db", "c", [{"_id": Decimal128("5")}])
+    assert len(errors) == 1
+
+
+def test_numeric_id_bridge_distinct_values_still_ok(storage: Storage) -> None:
+    inserted, _ = storage.insert("db", "c", [{"_id": 1}, {"_id": 1.5}, {"_id": 2}])
+    assert inserted == 3
+
+
+def test_bool_id_not_treated_as_numeric(storage: Storage) -> None:
+    inserted, _ = storage.insert("db", "c", [{"_id": True}, {"_id": 1}])
+    assert inserted == 2
