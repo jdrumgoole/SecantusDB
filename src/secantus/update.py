@@ -35,7 +35,14 @@ def apply_update(
     return new
 
 
-_PIPELINE_UPDATE_STAGES = {"$set", "$addFields", "$unset", "$project", "$replaceRoot", "$replaceWith"}
+_PIPELINE_UPDATE_STAGES = {
+    "$set",
+    "$addFields",
+    "$unset",
+    "$project",
+    "$replaceRoot",
+    "$replaceWith",
+}
 
 
 def _apply_pipeline_update(

@@ -430,6 +430,36 @@ def _drop_database(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"dropped": ctx.db_name, "ok": 1.0}
 
 
+def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    src_ns = doc.get("renameCollection")
+    dst_ns = doc.get("to")
+    drop_target = bool(doc.get("dropTarget", False))
+    if not isinstance(src_ns, str) or not isinstance(dst_ns, str):
+        return {
+            "ok": 0.0,
+            "errmsg": "renameCollection requires two string namespaces",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    src_db, _, src_coll = src_ns.partition(".")
+    dst_db, _, dst_coll = dst_ns.partition(".")
+    if not src_coll or not dst_coll:
+        return {
+            "ok": 0.0,
+            "errmsg": "renameCollection namespaces must be of the form db.coll",
+            "code": 73,
+            "codeName": "InvalidNamespace",
+        }
+    ok, err = ctx.storage.rename_collection(
+        src_db, src_coll, dst_db, dst_coll, drop_target=drop_target
+    )
+    if not ok:
+        code = 26 if err and "does not exist" in err else 48
+        code_name = "NamespaceNotFound" if code == 26 else "NamespaceExists"
+        return {"ok": 0.0, "errmsg": err, "code": code, "codeName": code_name}
+    return {"ok": 1.0}
+
+
 def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["create"]
     ctx.storage.create_collection(ctx.db_name, coll)
@@ -649,6 +679,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "drop": _drop,
     "create": _create,
     "dropDatabase": _drop_database,
+    "renameCollection": _rename_collection,
     "listCollections": _list_collections,
     "listDatabases": _list_databases,
     "listIndexes": _list_indexes,

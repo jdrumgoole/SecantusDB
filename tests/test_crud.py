@@ -856,6 +856,16 @@ def test_bulk_write_unordered_continues_past_failure(coll) -> None:
     assert ids == [1, 2, 3]
 
 
+def test_rename_collection_via_pymongo(client: MongoClient) -> None:
+    db = client["rename_db"]
+    db["src"].insert_many([{"_id": 1}, {"_id": 2}])
+    db["src"].rename("dst")
+    assert "src" not in db.list_collection_names()
+    assert "dst" in db.list_collection_names()
+    ids = sorted(d["_id"] for d in db["dst"].find())
+    assert ids == [1, 2]
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(

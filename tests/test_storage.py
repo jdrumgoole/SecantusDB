@@ -122,3 +122,46 @@ def test_numeric_id_bridge_distinct_values_still_ok(storage: Storage) -> None:
 def test_bool_id_not_treated_as_numeric(storage: Storage) -> None:
     inserted, _ = storage.insert("db", "c", [{"_id": True}, {"_id": 1}])
     assert inserted == 2
+
+
+def test_rename_collection_moves_docs_and_indexes(storage: Storage) -> None:
+    storage.insert("db", "src", [{"_id": 1, "x": 1}, {"_id": 2, "x": 2}])
+    storage.create_index("db", "src", "x_1", {"x": 1}, {})
+    ok, err = storage.rename_collection("db", "src", "db", "dst")
+    assert ok and err is None
+    assert storage.find_matching("db", "src", {}) == []
+    docs = sorted(storage.find_matching("db", "dst", {}), key=lambda d: d["_id"])
+    assert [d["_id"] for d in docs] == [1, 2]
+    names = [i["name"] for i in storage.list_indexes("db", "dst")]
+    assert "x_1" in names
+
+
+def test_rename_collection_missing_source(storage: Storage) -> None:
+    ok, err = storage.rename_collection("db", "missing", "db", "dst")
+    assert not ok
+    assert err is not None and "does not exist" in err
+
+
+def test_rename_collection_target_exists_without_drop(storage: Storage) -> None:
+    storage.insert("db", "src", [{"_id": 1}])
+    storage.insert("db", "dst", [{"_id": 99}])
+    ok, err = storage.rename_collection("db", "src", "db", "dst")
+    assert not ok
+    assert err is not None and "exists" in err
+
+
+def test_rename_collection_drop_target(storage: Storage) -> None:
+    storage.insert("db", "src", [{"_id": 1, "from": "src"}])
+    storage.insert("db", "dst", [{"_id": 99, "from": "dst"}])
+    ok, err = storage.rename_collection("db", "src", "db", "dst", drop_target=True)
+    assert ok and err is None
+    docs = storage.find_matching("db", "dst", {})
+    assert docs == [{"_id": 1, "from": "src"}]
+
+
+def test_rename_collection_across_databases(storage: Storage) -> None:
+    storage.insert("dba", "c", [{"_id": 1}])
+    ok, _ = storage.rename_collection("dba", "c", "dbb", "c2")
+    assert ok
+    assert storage.find_matching("dba", "c", {}) == []
+    assert storage.find_matching("dbb", "c2", {}) == [{"_id": 1}]

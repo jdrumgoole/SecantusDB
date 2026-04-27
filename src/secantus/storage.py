@@ -382,6 +382,55 @@ class Storage:
             self._conn.execute("DELETE FROM _secantus_indexes WHERE db_name = ?", (db,))
             self._conn.execute("DELETE FROM _secantus_collections WHERE db_name = ?", (db,))
 
+    def rename_collection(
+        self,
+        src_db: str,
+        src_coll: str,
+        dst_db: str,
+        dst_coll: str,
+        *,
+        drop_target: bool = False,
+    ) -> tuple[bool, str | None]:
+        with self._lock:
+            if not self.collection_exists(src_db, src_coll):
+                return False, f"source namespace does not exist: {src_db}.{src_coll}"
+            if (src_db, src_coll) == (dst_db, dst_coll):
+                return True, None
+            if self.collection_exists(dst_db, dst_coll):
+                if not drop_target:
+                    return False, f"target namespace exists: {dst_db}.{dst_coll}"
+                self._conn.execute(
+                    "DELETE FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
+                    (dst_db, dst_coll),
+                )
+                self._conn.execute(
+                    "DELETE FROM _secantus_indexes WHERE db_name = ? AND coll_name = ?",
+                    (dst_db, dst_coll),
+                )
+                self._conn.execute(
+                    "DELETE FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
+                    (dst_db, dst_coll),
+                )
+            self._conn.execute(
+                "UPDATE _secantus_documents SET db_name = ?, coll_name = ? "
+                "WHERE db_name = ? AND coll_name = ?",
+                (dst_db, dst_coll, src_db, src_coll),
+            )
+            self._conn.execute(
+                "UPDATE _secantus_indexes SET db_name = ?, coll_name = ? "
+                "WHERE db_name = ? AND coll_name = ?",
+                (dst_db, dst_coll, src_db, src_coll),
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO _secantus_collections(db_name, coll_name) VALUES (?, ?)",
+                (dst_db, dst_coll),
+            )
+            self._conn.execute(
+                "DELETE FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
+                (src_db, src_coll),
+            )
+            return True, None
+
     def list_collections(self, db: str) -> list[str]:
         with self._lock:
             rows = self._conn.execute(
