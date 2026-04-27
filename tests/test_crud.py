@@ -762,3 +762,9 @@ def test_aggregate_reduce_expression(coll) -> None:
         )
     )
     assert out == [{"total": 10}]
+
+
+def test_projection_elem_match_first_match(coll) -> None:
+    coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 10}]})
+    doc = coll.find_one({}, {"items": {"$elemMatch": {"qty": {"$gte": 5}}}})
+    assert doc == {"_id": 1, "items": [{"qty": 5}]}

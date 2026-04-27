@@ -58,3 +58,24 @@ def test_does_not_mutate_input() -> None:
     src = {"_id": 1, "a": {"b": 1}}
     apply_projection(src, {"a.b": 0})
     assert src == {"_id": 1, "a": {"b": 1}}
+
+
+def test_elem_match_returns_first_matching_subdoc() -> None:
+    src = {"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 10}]}
+    out = apply_projection(src, {"items": {"$elemMatch": {"qty": {"$gte": 5}}}})
+    assert out == {"_id": 1, "items": [{"qty": 5}]}
+
+
+def test_elem_match_omits_field_when_no_match() -> None:
+    src = {"_id": 1, "items": [{"qty": 1}, {"qty": 2}]}
+    out = apply_projection(src, {"items": {"$elemMatch": {"qty": {"$gte": 100}}}})
+    assert out == {"_id": 1}
+
+
+def test_elem_match_combined_with_other_inclusions() -> None:
+    src = {"_id": 1, "name": "a", "items": [{"qty": 1}, {"qty": 5}]}
+    out = apply_projection(
+        src,
+        {"_id": 0, "name": 1, "items": {"$elemMatch": {"qty": {"$gte": 5}}}},
+    )
+    assert out == {"name": "a", "items": [{"qty": 5}]}
