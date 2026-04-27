@@ -8,7 +8,7 @@ from typing import Any
 
 import bson
 
-from fongodb.aggregate import apply_pipeline
+from fongodb.aggregate import PipelineContext, apply_pipeline
 from fongodb.cursors import CursorNotFound, CursorRegistry
 from fongodb.projection import apply_projection
 from fongodb.storage import Storage
@@ -405,7 +405,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     else:
         docs = []
         ns = f"{ctx.db_name}.$cmd.aggregate"
-    docs = apply_pipeline(docs, pipeline)
+    docs = apply_pipeline(docs, pipeline, PipelineContext(storage=ctx.storage, db_name=ctx.db_name))
     first_batch, cursor_id = _split_into_cursor(
         docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
     )

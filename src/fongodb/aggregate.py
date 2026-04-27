@@ -2,60 +2,92 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from fongodb.expressions import evaluate
 from fongodb.paths import get_path, set_path, unset_path
 from fongodb.query import matches
+
+if TYPE_CHECKING:
+    from fongodb.storage import Storage
 
 
 class AggregateError(Exception):
     pass
 
 
+@dataclass
+class PipelineContext:
+    storage: Storage | None = None
+    db_name: str = ""
+
+
+_NULL_CTX = PipelineContext()
+
+
 def apply_pipeline(
-    docs: list[dict[str, Any]], pipeline: list[dict[str, Any]]
+    docs: list[dict[str, Any]],
+    pipeline: list[dict[str, Any]],
+    ctx: PipelineContext | None = None,
 ) -> list[dict[str, Any]]:
+    ctx = ctx or _NULL_CTX
     for stage in pipeline:
-        docs = _apply_stage(stage, docs)
+        docs = _apply_stage(stage, docs, ctx)
     return docs
 
 
-def _apply_stage(stage: dict[str, Any], docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _apply_stage(
+    stage: dict[str, Any],
+    docs: list[dict[str, Any]],
+    ctx: PipelineContext,
+) -> list[dict[str, Any]]:
     if len(stage) != 1:
         raise AggregateError("each pipeline stage must have exactly one key")
     name, spec = next(iter(stage.items()))
     handler = _STAGES.get(name)
     if handler is None:
         raise AggregateError(f"unsupported aggregation stage: {name}")
-    return handler(spec, docs)
+    return handler(spec, docs, ctx)
 
 
-def _stage_match(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_match(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     return [d for d in docs if matches(d, spec)]
 
 
-def _stage_count(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_count(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     if not isinstance(spec, str):
         raise AggregateError("$count requires a field name string")
     return [{spec: len(docs)}]
 
 
-def _stage_limit(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_limit(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     return docs[: int(spec)]
 
 
-def _stage_skip(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_skip(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     return docs[int(spec) :]
 
 
-def _stage_sort(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_sort(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     from fongodb.storage import sort_docs
 
     return sort_docs(list(docs), spec)
 
 
-def _stage_project(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_project(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$project requires a document spec")
     return [_project_one(d, spec) for d in docs]
@@ -122,7 +154,9 @@ def _path_present(doc: Mapping[str, Any], path: str) -> bool:
     return True
 
 
-def _stage_add_fields(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_add_fields(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$addFields requires a document spec")
     return [_add_fields_one(d, spec) for d in docs]
@@ -135,7 +169,9 @@ def _add_fields_one(doc: dict[str, Any], spec: Mapping[str, Any]) -> dict[str, A
     return result
 
 
-def _stage_unset(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_unset(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     paths = [spec] if isinstance(spec, str) else list(spec)
     out: list[dict[str, Any]] = []
     for d in docs:
@@ -146,7 +182,9 @@ def _stage_unset(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _stage_unwind(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_unwind(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     if isinstance(spec, str):
         path = spec.lstrip("$")
         preserve_null = False
@@ -193,13 +231,17 @@ def _stage_unwind(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]
     return result
 
 
-def _stage_replace_root(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_replace_root(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping) or "newRoot" not in spec:
         raise AggregateError("$replaceRoot requires {newRoot: <expression>}")
     return [_replace_root_one(d, spec["newRoot"]) for d in docs]
 
 
-def _stage_replace_with(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_replace_with(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     return [_replace_root_one(d, spec) for d in docs]
 
 
@@ -210,7 +252,9 @@ def _replace_root_one(doc: dict[str, Any], new_root_expr: Any) -> dict[str, Any]
     return dict(new_root)
 
 
-def _stage_group(spec: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _stage_group(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping) or "_id" not in spec:
         raise AggregateError("$group requires an _id expression")
     id_expr = spec["_id"]
@@ -297,6 +341,47 @@ def _hashable(value: Any) -> Any:
     return value
 
 
+def _stage_lookup(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$lookup requires a document spec")
+    from_coll = spec.get("from")
+    local_field = spec.get("localField")
+    foreign_field = spec.get("foreignField")
+    as_field = spec.get("as")
+    if not (
+        isinstance(from_coll, str)
+        and isinstance(local_field, str)
+        and isinstance(foreign_field, str)
+        and isinstance(as_field, str)
+    ):
+        raise AggregateError("$lookup requires from, localField, foreignField, as (string)")
+    if ctx.storage is None:
+        raise AggregateError("$lookup requires storage context")
+    foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        local_value = get_path(doc, local_field)
+        matches_list = [
+            fd for fd in foreign_docs if _lookup_match(local_value, get_path(fd, foreign_field))
+        ]
+        new = copy.deepcopy(doc)
+        new[as_field] = matches_list
+        out.append(new)
+    return out
+
+
+def _lookup_match(local: Any, foreign: Any) -> bool:
+    if isinstance(local, list) and isinstance(foreign, list):
+        return any(le == fe for le in local for fe in foreign)
+    if isinstance(local, list):
+        return foreign in local
+    if isinstance(foreign, list):
+        return local in foreign
+    return local == foreign
+
+
 _STAGES = {
     "$match": _stage_match,
     "$count": _stage_count,
@@ -311,4 +396,5 @@ _STAGES = {
     "$replaceRoot": _stage_replace_root,
     "$replaceWith": _stage_replace_with,
     "$group": _stage_group,
+    "$lookup": _stage_lookup,
 }

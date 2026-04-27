@@ -167,3 +167,20 @@ def test_unsupported_stage_raises() -> None:
 def test_project_mixed_inclusion_exclusion_rejected() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline([{"a": 1, "b": 2}], [{"$project": {"a": 1, "b": 0}}])
+
+
+def test_lookup_requires_storage_context() -> None:
+    with pytest.raises(AggregateError):
+        apply_pipeline(
+            [{"x": 1}],
+            [
+                {
+                    "$lookup": {
+                        "from": "other",
+                        "localField": "x",
+                        "foreignField": "x",
+                        "as": "joined",
+                    }
+                }
+            ],
+        )

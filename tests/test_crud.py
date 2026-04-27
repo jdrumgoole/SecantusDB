@@ -454,3 +454,57 @@ def test_aggregate_addfields(coll) -> None:
     coll.insert_one({"_id": 1, "x": 5})
     out = list(coll.aggregate([{"$addFields": {"doubled": {"$multiply": ["$x", 2]}}}]))
     assert out == [{"_id": 1, "x": 5, "doubled": 10}]
+
+
+def test_aggregate_lookup_left_outer_join(client: MongoClient) -> None:
+    db = client["lookupdb"]
+    db["orders"].insert_many(
+        [
+            {"_id": 1, "item": "abc", "qty": 1},
+            {"_id": 2, "item": "xyz", "qty": 5},
+            {"_id": 3, "item": "abc", "qty": 10},
+        ]
+    )
+    db["inventory"].insert_many(
+        [
+            {"_id": "abc", "stock": 100},
+            {"_id": "xyz", "stock": 50},
+        ]
+    )
+    pipeline = [
+        {
+            "$lookup": {
+                "from": "inventory",
+                "localField": "item",
+                "foreignField": "_id",
+                "as": "inventory_docs",
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+    out = list(db["orders"].aggregate(pipeline))
+    assert len(out) == 3
+    assert out[0]["inventory_docs"] == [{"_id": "abc", "stock": 100}]
+    assert out[1]["inventory_docs"] == [{"_id": "xyz", "stock": 50}]
+    assert out[2]["inventory_docs"] == [{"_id": "abc", "stock": 100}]
+
+
+def test_aggregate_lookup_no_match_returns_empty_array(client: MongoClient) -> None:
+    db = client["lookupdb2"]
+    db["a"].insert_one({"_id": 1, "key": "missing"})
+    db["b"].insert_one({"_id": "present", "v": 1})
+    out = list(
+        db["a"].aggregate(
+            [
+                {
+                    "$lookup": {
+                        "from": "b",
+                        "localField": "key",
+                        "foreignField": "_id",
+                        "as": "j",
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["j"] == []
