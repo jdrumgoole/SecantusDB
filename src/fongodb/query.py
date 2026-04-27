@@ -27,23 +27,33 @@ class QueryError(Exception):
     pass
 
 
-def matches(doc: Mapping[str, Any], query: Mapping[str, Any]) -> bool:
+def matches(
+    doc: Mapping[str, Any],
+    query: Mapping[str, Any],
+    *,
+    vars: dict[str, Any] | None = None,
+) -> bool:
     if not query:
         return True
-    return all(_match_clause(doc, k, v) for k, v in query.items())
+    return all(_match_clause(doc, k, v, vars) for k, v in query.items())
 
 
-def _match_clause(doc: Mapping[str, Any], key: str, condition: Any) -> bool:
+def _match_clause(
+    doc: Mapping[str, Any],
+    key: str,
+    condition: Any,
+    vars: dict[str, Any] | None,
+) -> bool:
     if key == "$and":
-        return all(matches(doc, c) for c in condition)
+        return all(matches(doc, c, vars=vars) for c in condition)
     if key == "$or":
-        return any(matches(doc, c) for c in condition)
+        return any(matches(doc, c, vars=vars) for c in condition)
     if key == "$nor":
-        return not any(matches(doc, c) for c in condition)
+        return not any(matches(doc, c, vars=vars) for c in condition)
     if key == "$expr":
         from fongodb.expressions import evaluate
 
-        return _truthy(evaluate(condition, doc))
+        return _truthy(evaluate(condition, doc, vars))
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
     return _field_matches(_resolve_path(doc, key), condition)

@@ -777,3 +777,46 @@ def test_explain_find_returns_query_planner(coll) -> None:
     assert explanation["queryPlanner"]["namespace"].endswith(".things")
     assert "winningPlan" in explanation["queryPlanner"]
     assert "serverInfo" in explanation
+
+
+def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
+    db = client["lookup_pipe_db"]
+    db["orders"].insert_many(
+        [
+            {"_id": 1, "item": "abc", "qty": 5, "price": 10.0},
+            {"_id": 2, "item": "xyz", "qty": 1, "price": 100.0},
+        ]
+    )
+    db["inventory"].insert_many(
+        [
+            {"_id": "abc", "stock": 100, "min_qty": 1},
+            {"_id": "xyz", "stock": 50, "min_qty": 5},
+        ]
+    )
+    pipeline = [
+        {
+            "$lookup": {
+                "from": "inventory",
+                "let": {"order_item": "$item", "order_qty": "$qty"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$_id", "$$order_item"]},
+                                    {"$gte": ["$$order_qty", "$min_qty"]},
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "inv_match",
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+    out = list(db["orders"].aggregate(pipeline))
+    assert len(out) == 2
+    assert len(out[0]["inv_match"]) == 1  # abc qty=5 >= min 1
+    assert out[0]["inv_match"][0]["_id"] == "abc"
+    assert out[1]["inv_match"] == []  # xyz qty=1 < min 5

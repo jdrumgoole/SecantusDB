@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
 from fongodb.expressions import evaluate
@@ -21,6 +22,14 @@ class AggregateError(Exception):
 class PipelineContext:
     storage: Storage | None = None
     db_name: str = ""
+    vars: dict[str, Any] = _dc_field(default_factory=dict)
+
+    def with_vars(self, more: dict[str, Any]) -> PipelineContext:
+        return PipelineContext(
+            storage=self.storage,
+            db_name=self.db_name,
+            vars={**self.vars, **more},
+        )
 
 
 _NULL_CTX = PipelineContext()
@@ -52,9 +61,9 @@ def _apply_stage(
 
 
 def _stage_match(
-    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return [d for d in docs if matches(d, spec)]
+    return [d for d in docs if matches(d, spec, vars=ctx.vars)]
 
 
 def _stage_count(
@@ -86,14 +95,16 @@ def _stage_sort(
 
 
 def _stage_project(
-    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$project requires a document spec")
-    return [_project_one(d, spec) for d in docs]
+    return [_project_one(d, spec, ctx.vars) for d in docs]
 
 
-def _project_one(doc: dict[str, Any], spec: Mapping[str, Any]) -> dict[str, Any]:
+def _project_one(
+    doc: dict[str, Any], spec: Mapping[str, Any], vars: dict[str, Any]
+) -> dict[str, Any]:
     inclusions: list[str] = []
     exclusions: list[str] = []
     computed: dict[str, Any] = {}
@@ -132,7 +143,7 @@ def _project_one(doc: dict[str, Any], spec: Mapping[str, Any]) -> dict[str, Any]
             if value is not None or _path_present(doc, path):
                 set_path(result, path, copy.deepcopy(value))
         for key, expr in computed.items():
-            set_path(result, key, evaluate(expr, doc))
+            set_path(result, key, evaluate(expr, doc, vars))
         return result
 
     result = copy.deepcopy(doc)
@@ -155,17 +166,19 @@ def _path_present(doc: Mapping[str, Any], path: str) -> bool:
 
 
 def _stage_add_fields(
-    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$addFields requires a document spec")
-    return [_add_fields_one(d, spec) for d in docs]
+    return [_add_fields_one(d, spec, ctx.vars) for d in docs]
 
 
-def _add_fields_one(doc: dict[str, Any], spec: Mapping[str, Any]) -> dict[str, Any]:
+def _add_fields_one(
+    doc: dict[str, Any], spec: Mapping[str, Any], vars: dict[str, Any]
+) -> dict[str, Any]:
     result = copy.deepcopy(doc)
     for path, expr in spec.items():
-        set_path(result, path, evaluate(expr, doc))
+        set_path(result, path, evaluate(expr, doc, vars))
     return result
 
 
@@ -232,28 +245,30 @@ def _stage_unwind(
 
 
 def _stage_replace_root(
-    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping) or "newRoot" not in spec:
         raise AggregateError("$replaceRoot requires {newRoot: <expression>}")
-    return [_replace_root_one(d, spec["newRoot"]) for d in docs]
+    return [_replace_root_one(d, spec["newRoot"], ctx.vars) for d in docs]
 
 
 def _stage_replace_with(
-    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return [_replace_root_one(d, spec) for d in docs]
+    return [_replace_root_one(d, spec, ctx.vars) for d in docs]
 
 
-def _replace_root_one(doc: dict[str, Any], new_root_expr: Any) -> dict[str, Any]:
-    new_root = evaluate(new_root_expr, doc)
+def _replace_root_one(
+    doc: dict[str, Any], new_root_expr: Any, vars: dict[str, Any]
+) -> dict[str, Any]:
+    new_root = evaluate(new_root_expr, doc, vars)
     if not isinstance(new_root, Mapping):
         raise AggregateError("$replaceRoot newRoot must evaluate to a document")
     return dict(new_root)
 
 
 def _stage_group(
-    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping) or "_id" not in spec:
         raise AggregateError("$group requires an _id expression")
@@ -263,14 +278,14 @@ def _stage_group(
     groups: dict[Any, dict[str, Any]] = {}
     order: list[Any] = []
     for d in docs:
-        key = evaluate(id_expr, d)
+        key = evaluate(id_expr, d, ctx.vars)
         hashable_key = _hashable(key)
         if hashable_key not in groups:
             groups[hashable_key] = {"_id": key}
             order.append(hashable_key)
         bucket = groups[hashable_key]
         for field, accumulator in accumulators.items():
-            _accumulate(bucket, field, accumulator, d)
+            _accumulate(bucket, field, accumulator, d, ctx.vars)
     return [_finalize(groups[k]) for k in order]
 
 
@@ -286,19 +301,20 @@ def _accumulate(
     field: str,
     accumulator: Any,
     doc: Mapping[str, Any],
+    vars: dict[str, Any],
 ) -> None:
     if not isinstance(accumulator, Mapping) or len(accumulator) != 1:
         raise AggregateError(f"$group accumulator for {field!r} must be a single-op doc")
     op, arg = next(iter(accumulator.items()))
     if op == "$sum":
-        increment = 1 if arg == 1 else evaluate(arg, doc)
+        increment = 1 if arg == 1 else evaluate(arg, doc, vars)
         if increment is None:
             increment = 0
         bucket[field] = bucket.get(field, 0) + increment
     elif op == "$count":
         bucket[field] = bucket.get(field, 0) + 1
     elif op == "$avg":
-        v = evaluate(arg, doc)
+        v = evaluate(arg, doc, vars)
         if v is None:
             return
         state = bucket.get(field)
@@ -308,24 +324,24 @@ def _accumulate(
         state["_avg_total"] += v
         state["_avg_n"] += 1
     elif op == "$max":
-        v = evaluate(arg, doc)
+        v = evaluate(arg, doc, vars)
         cur = bucket.get(field)
         if cur is None or (v is not None and v > cur):
             bucket[field] = v
     elif op == "$min":
-        v = evaluate(arg, doc)
+        v = evaluate(arg, doc, vars)
         cur = bucket.get(field)
         if cur is None or (v is not None and v < cur):
             bucket[field] = v
     elif op == "$first":
         if field not in bucket:
-            bucket[field] = evaluate(arg, doc)
+            bucket[field] = evaluate(arg, doc, vars)
     elif op == "$last":
-        bucket[field] = evaluate(arg, doc)
+        bucket[field] = evaluate(arg, doc, vars)
     elif op == "$push":
-        bucket.setdefault(field, []).append(evaluate(arg, doc))
+        bucket.setdefault(field, []).append(evaluate(arg, doc, vars))
     elif op == "$addToSet":
-        v = evaluate(arg, doc)
+        v = evaluate(arg, doc, vars)
         bucket.setdefault(field, [])
         if v not in bucket[field]:
             bucket[field].append(v)
@@ -347,18 +363,21 @@ def _stage_lookup(
     if not isinstance(spec, Mapping):
         raise AggregateError("$lookup requires a document spec")
     from_coll = spec.get("from")
-    local_field = spec.get("localField")
-    foreign_field = spec.get("foreignField")
     as_field = spec.get("as")
-    if not (
-        isinstance(from_coll, str)
-        and isinstance(local_field, str)
-        and isinstance(foreign_field, str)
-        and isinstance(as_field, str)
-    ):
-        raise AggregateError("$lookup requires from, localField, foreignField, as (string)")
+    if not (isinstance(from_coll, str) and isinstance(as_field, str)):
+        raise AggregateError("$lookup requires from and as (strings)")
     if ctx.storage is None:
         raise AggregateError("$lookup requires storage context")
+
+    sub_pipeline = spec.get("pipeline")
+    let_spec = spec.get("let") or {}
+    if sub_pipeline is not None:
+        return _stage_lookup_pipeline(ctx, docs, from_coll, as_field, let_spec, sub_pipeline, spec)
+
+    local_field = spec.get("localField")
+    foreign_field = spec.get("foreignField")
+    if not (isinstance(local_field, str) and isinstance(foreign_field, str)):
+        raise AggregateError("$lookup requires localField+foreignField, or pipeline form")
     foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
     out: list[dict[str, Any]] = []
     for doc in docs:
@@ -368,6 +387,37 @@ def _stage_lookup(
         ]
         new = copy.deepcopy(doc)
         new[as_field] = matches_list
+        out.append(new)
+    return out
+
+
+def _stage_lookup_pipeline(
+    ctx: PipelineContext,
+    docs: list[dict[str, Any]],
+    from_coll: str,
+    as_field: str,
+    let_spec: Mapping[str, Any],
+    sub_pipeline: list[dict[str, Any]],
+    full_spec: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    assert ctx.storage is not None
+    foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
+    local_field = full_spec.get("localField")
+    foreign_field = full_spec.get("foreignField")
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        bound = {name: evaluate(expr, doc, ctx.vars) for name, expr in let_spec.items()}
+        if isinstance(local_field, str) and isinstance(foreign_field, str):
+            local_value = get_path(doc, local_field)
+            candidates = [
+                fd for fd in foreign_docs if _lookup_match(local_value, get_path(fd, foreign_field))
+            ]
+        else:
+            candidates = list(foreign_docs)
+        sub_ctx = ctx.with_vars(bound)
+        joined = apply_pipeline(candidates, sub_pipeline, sub_ctx)
+        new = copy.deepcopy(doc)
+        new[as_field] = joined
         out.append(new)
     return out
 
