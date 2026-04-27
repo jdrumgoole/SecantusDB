@@ -779,6 +779,12 @@ def test_explain_find_returns_query_planner(coll) -> None:
     assert "serverInfo" in explanation
 
 
+def test_pipeline_update_via_pymongo(coll) -> None:
+    coll.insert_one({"_id": 1, "a": 1, "b": 2})
+    coll.update_one({"_id": 1}, [{"$set": {"sum": {"$add": ["$a", "$b"]}}}])
+    assert coll.find_one({"_id": 1}) == {"_id": 1, "a": 1, "b": 2, "sum": 3}
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(

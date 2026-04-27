@@ -73,3 +73,32 @@ def test_apply_does_not_mutate_input() -> None:
     src = {"a": 1, "nested": {"b": [1, 2]}}
     apply_update(src, {"$set": {"nested.b.0": 99}, "$inc": {"a": 1}})
     assert src == {"a": 1, "nested": {"b": [1, 2]}}
+
+
+def test_pipeline_update_with_set_stage() -> None:
+    out = apply_update(
+        {"_id": 1, "a": 1, "b": 2},
+        [{"$set": {"sum": {"$add": ["$a", "$b"]}}}],
+    )
+    assert out == {"_id": 1, "a": 1, "b": 2, "sum": 3}
+
+
+def test_pipeline_update_chains_stages() -> None:
+    out = apply_update(
+        {"_id": 1, "x": 10},
+        [
+            {"$set": {"doubled": {"$multiply": ["$x", 2]}}},
+            {"$unset": "x"},
+        ],
+    )
+    assert out == {"_id": 1, "doubled": 20}
+
+
+def test_pipeline_update_rejects_id_change() -> None:
+    with pytest.raises(UpdateError):
+        apply_update({"_id": 1, "x": 1}, [{"$set": {"_id": 99}}])
+
+
+def test_pipeline_update_rejects_disallowed_stage() -> None:
+    with pytest.raises(UpdateError):
+        apply_update({"_id": 1, "x": 1}, [{"$match": {"x": 1}}])

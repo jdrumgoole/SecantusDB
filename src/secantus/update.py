@@ -11,7 +11,11 @@ class UpdateError(Exception):
     pass
 
 
-def apply_update(doc: dict[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
+def apply_update(
+    doc: dict[str, Any], update: Mapping[str, Any] | list[Mapping[str, Any]]
+) -> dict[str, Any]:
+    if isinstance(update, list):
+        return _apply_pipeline_update(doc, update)
     if not update:
         return copy.deepcopy(doc)
     keys = list(update.keys())
@@ -28,6 +32,29 @@ def apply_update(doc: dict[str, Any], update: Mapping[str, Any]) -> dict[str, An
         if "_id" in new and new["_id"] != doc["_id"]:
             raise UpdateError("cannot change the _id of a document")
         new["_id"] = doc["_id"]
+    return new
+
+
+_PIPELINE_UPDATE_STAGES = {"$set", "$addFields", "$unset", "$project", "$replaceRoot", "$replaceWith"}
+
+
+def _apply_pipeline_update(
+    doc: dict[str, Any], pipeline: list[Mapping[str, Any]]
+) -> dict[str, Any]:
+    for stage in pipeline:
+        if not isinstance(stage, Mapping) or len(stage) != 1:
+            raise UpdateError("each pipeline stage must be a single-key document")
+        (name,) = stage.keys()
+        if name not in _PIPELINE_UPDATE_STAGES:
+            raise UpdateError(f"stage {name} not allowed in pipeline updates")
+    from secantus.aggregate import apply_pipeline
+
+    result = apply_pipeline([doc], list(pipeline))
+    if not result:
+        return copy.deepcopy(doc)
+    new = result[0]
+    if "_id" in doc and new.get("_id") != doc.get("_id"):
+        raise UpdateError("pipeline update cannot change the _id of a document")
     return new
 
 
