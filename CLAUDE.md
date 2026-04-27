@@ -36,7 +36,16 @@ Layers, roughly outermost-in:
 - `src/fongodb/paths.py` — shared dotted-path helpers (`get_path`/`set_path`/`unset_path`/`has_path`/`walk_to_parent`). Used by `update`, `projection`, `aggregate`, and storage's sort.
 - `src/fongodb/storage.py` — SQLite-backed store. Schema:
   - `_fongodb_collections(db_name, coll_name, options)`
-  - `_fongodb_documents(db_name, coll_name, id_key BLOB, doc BLOB)` — full document is `bson.encode(doc)`; `id_key` is `bson.encode({"_": _id})` so byte-equality matches BSON-equality within a type. `RLock`-serialized; `check_same_thread=False` connection. Public `sort_docs` helper used by both find and aggregate's `$sort`.
+  - `_fongodb_documents(db_name, coll_name, id_key BLOB, doc BLOB)` — full document is `bson.encode(doc)`; `id_key` is the canonical-numeric-or-BSON-blob form so int/float/Decimal128 collide. `RLock`-serialized; `check_same_thread=False` connection. Public `sort_docs` helper used by both find and aggregate's `$sort`.
+  - `_fongodb_indexes(db_name, coll_name, index_name, key_spec BLOB, options BLOB)` — see "Indexes are a stopgap" below.
+
+### Indexes are a stopgap
+
+`createIndex` records the definition (so `listIndexes` returns it accurately) and enforces `unique` constraints by full-scanning the collection on every write. **There is no lookup acceleration** — every query still full-scans the document table and filters in Python; `hint` parameters are accepted and ignored. Sparse uniqueness is honored. Compound unique indexes work. `_id_` cannot be dropped.
+
+Out of scope: text / geo / hashed / wildcard indexes, `partialFilterExpression`, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
+
+The eventual fix when this becomes a real bottleneck is **typed sort-key BLOB columns** — 1-byte type tag matching MongoDB's cross-type sort order, then a byte-sortable encoding of the value, with a SQLite B-tree index. Byte-lex comparison on those gives MongoDB-correct ordering and equality through any SQLite index. Don't take a shortcut with raw SQLite-typed columns — SQLite's NULL/INT/REAL/TEXT/BLOB ordering does not match MongoDB's, and Decimal128/ObjectId/Regex have no clean SQLite native type.
 
 ### Type-mapping strategy (the critical decision)
 

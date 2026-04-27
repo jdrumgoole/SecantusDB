@@ -620,3 +620,59 @@ def test_aggregate_with_to_int_conversion(coll) -> None:
         )
     )
     assert out == [{"_id": None, "total": 60}]
+
+
+def test_create_index_listed_via_pymongo(coll) -> None:
+    coll.insert_one({"x": 1})
+    coll.create_index("x")
+    indexes = list(coll.list_indexes())
+    names = sorted(i["name"] for i in indexes)
+    assert names == ["_id_", "x_1"]
+
+
+def test_create_index_with_explicit_name_and_compound(coll) -> None:
+    coll.insert_one({"a": 1, "b": 2})
+    coll.create_index([("a", 1), ("b", -1)], name="ab_idx")
+    found = next(i for i in coll.list_indexes() if i["name"] == "ab_idx")
+    assert dict(found["key"]) == {"a": 1, "b": -1}
+
+
+def test_unique_index_blocks_duplicate_insert_via_pymongo(coll) -> None:
+    from pymongo.errors import DuplicateKeyError as PyDup
+
+    coll.create_index("email", unique=True)
+    coll.insert_one({"email": "alice@example.com"})
+    with pytest.raises(PyDup):
+        coll.insert_one({"email": "alice@example.com"})
+
+
+def test_unique_index_blocks_update_via_pymongo(coll) -> None:
+    from pymongo.errors import DuplicateKeyError as PyDup
+
+    coll.create_index("email", unique=True)
+    coll.insert_many([{"_id": 1, "email": "a@x"}, {"_id": 2, "email": "b@x"}])
+    with pytest.raises(PyDup):
+        coll.update_one({"_id": 2}, {"$set": {"email": "a@x"}})
+
+
+def test_drop_index_via_pymongo(coll) -> None:
+    coll.insert_one({"x": 1})
+    coll.create_index("x")
+    coll.drop_index("x_1")
+    names = [i["name"] for i in coll.list_indexes()]
+    assert names == ["_id_"]
+
+
+def test_drop_indexes_keeps_id_index(coll) -> None:
+    coll.insert_one({"x": 1})
+    coll.create_index("x")
+    coll.create_index("y")
+    coll.drop_indexes()
+    names = [i["name"] for i in coll.list_indexes()]
+    assert names == ["_id_"]
+
+
+def test_sparse_unique_index_via_pymongo(coll) -> None:
+    coll.create_index("email", unique=True, sparse=True)
+    coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3, "email": "x@y"}])
+    assert coll.count_documents({}) == 3

@@ -1,3 +1,14 @@
+"""SQLite-backed document store.
+
+Indexes are a STOPGAP, not real indexing. ``createIndex`` records the
+definition (so ``listIndexes`` returns it accurately) and enforces
+``unique`` constraints by full-scanning the collection on every write.
+There is no lookup acceleration: queries always full-scan the document
+table and filter in Python. Replace this with a typed-sort-key BLOB
+column scheme (per CLAUDE.md "Layer 3") if/when test suites grow large
+enough to feel the difference.
+"""
+
 from __future__ import annotations
 
 import sqlite3
@@ -9,7 +20,7 @@ from typing import Any
 import bson
 from bson import Decimal128
 
-from fongodb.paths import get_path
+from fongodb.paths import get_path, has_path
 from fongodb.projection import apply_projection
 from fongodb.query import matches
 from fongodb.update import apply_update
@@ -28,6 +39,15 @@ CREATE TABLE IF NOT EXISTS _fongodb_documents (
     id_key    BLOB NOT NULL,
     doc       BLOB NOT NULL,
     PRIMARY KEY (db_name, coll_name, id_key)
+);
+
+CREATE TABLE IF NOT EXISTS _fongodb_indexes (
+    db_name    TEXT NOT NULL,
+    coll_name  TEXT NOT NULL,
+    index_name TEXT NOT NULL,
+    key_spec   BLOB NOT NULL,
+    options    BLOB,
+    PRIMARY KEY (db_name, coll_name, index_name)
 );
 """
 
@@ -50,30 +70,44 @@ def _canon_decimal(d: Decimal) -> bytes | None:
     return format(d.normalize(), "f").encode()
 
 
-def _id_key(doc_id: Any) -> bytes:
-    if isinstance(doc_id, bool):
-        return _OTHER_PREFIX + bson.encode({"_": doc_id})
-    if isinstance(doc_id, int):
-        canon = _canon_decimal(Decimal(doc_id))
+def _canon_value(value: Any) -> bytes:
+    if isinstance(value, bool):
+        return _OTHER_PREFIX + bson.encode({"_": value})
+    if isinstance(value, int):
+        canon = _canon_decimal(Decimal(value))
         if canon is not None:
             return _NUM_PREFIX + canon
-    elif isinstance(doc_id, float):
+    elif isinstance(value, float):
         try:
-            d = Decimal(repr(doc_id))
+            d = Decimal(repr(value))
         except (InvalidOperation, ValueError):
             d = None
         if d is not None:
             canon = _canon_decimal(d)
             if canon is not None:
                 return _NUM_PREFIX + canon
-    elif isinstance(doc_id, Decimal128):
+    elif isinstance(value, Decimal128):
         try:
-            canon = _canon_decimal(doc_id.to_decimal())
+            canon = _canon_decimal(value.to_decimal())
         except (InvalidOperation, ValueError):
             canon = None
         if canon is not None:
             return _NUM_PREFIX + canon
-    return _OTHER_PREFIX + bson.encode({"_": doc_id})
+    return _OTHER_PREFIX + bson.encode({"_": value})
+
+
+def _id_key(doc_id: Any) -> bytes:
+    return _canon_value(doc_id)
+
+
+def _index_key(
+    doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
+) -> bytes | None:
+    if sparse:
+        for field in key_spec:
+            if not has_path(dict(doc), field):
+                return None
+    return b"\x00".join(_canon_value(get_path(dict(doc), field)) for field in key_spec)
 
 
 class _SortKey:
@@ -111,6 +145,16 @@ def sort_docs(
             reverse=(int(direction) == -1),
         )
     return result
+
+
+_ID_INDEX_NAME = "_id_"
+
+
+class IndexConflict(Exception):
+    def __init__(self, index_name: str, doc_id: Any) -> None:
+        super().__init__(f"E11000 duplicate key error in index {index_name}: _id={doc_id!r}")
+        self.index_name = index_name
+        self.doc_id = doc_id
 
 
 class Storage:
@@ -152,10 +196,26 @@ class Storage:
         errors: list[dict[str, Any]] = []
         with self._lock:
             self._ensure_collection(db, coll)
+            indexes = self._unique_indexes(db, coll)
             for index, doc in enumerate(docs):
                 if "_id" not in doc:
                     doc["_id"] = bson.ObjectId()
                 key = _id_key(doc["_id"])
+                conflict = self._unique_conflict(db, coll, doc, indexes, exclude_id_key=None)
+                if conflict is not None:
+                    errors.append(
+                        {
+                            "index": index,
+                            "code": 11000,
+                            "errmsg": (
+                                f"E11000 duplicate key error in index {conflict}: "
+                                f"_id={doc['_id']!r}"
+                            ),
+                        }
+                    )
+                    if ordered:
+                        break
+                    continue
                 blob = bson.encode(doc)
                 try:
                     self._conn.execute(
@@ -183,6 +243,14 @@ class Storage:
                 (db, coll),
             ).fetchall()
         return [bson.decode(blob) for (blob,) in rows]
+
+    def _all_docs_with_id_key(self, db: str, coll: str) -> list[tuple[dict[str, Any], bytes]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT doc, id_key FROM _fongodb_documents WHERE db_name = ? AND coll_name = ?",
+                (db, coll),
+            ).fetchall()
+        return [(bson.decode(blob), id_key) for (blob, id_key) in rows]
 
     def find_matching(
         self,
@@ -235,17 +303,24 @@ class Storage:
         upserted_id: Any = None
         with self._lock:
             self._ensure_collection(db, coll)
+            indexes = self._unique_indexes(db, coll)
             for doc in self._all_docs(db, coll):
                 if not matches(doc, filter):
                     continue
                 matched += 1
                 new = apply_update(doc, update)
                 if new != doc:
+                    new_id_key = _id_key(new["_id"])
+                    conflict = self._unique_conflict(
+                        db, coll, new, indexes, exclude_id_key=_id_key(doc["_id"])
+                    )
+                    if conflict is not None:
+                        raise IndexConflict(conflict, new["_id"])
                     modified += 1
                     self._conn.execute(
                         "UPDATE _fongodb_documents SET doc = ? "
                         "WHERE db_name = ? AND coll_name = ? AND id_key = ?",
-                        (bson.encode(new), db, coll, _id_key(new["_id"])),
+                        (bson.encode(new), db, coll, new_id_key),
                     )
                 if not multi:
                     break
@@ -258,6 +333,9 @@ class Storage:
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
                 upserted_id = new["_id"]
+                conflict = self._unique_conflict(db, coll, new, indexes, exclude_id_key=None)
+                if conflict is not None:
+                    raise IndexConflict(conflict, new["_id"])
                 self._conn.execute(
                     "INSERT INTO _fongodb_documents(db_name, coll_name, id_key, doc) "
                     "VALUES (?, ?, ?, ?)",
@@ -289,6 +367,10 @@ class Storage:
                 (db, coll),
             )
             self._conn.execute(
+                "DELETE FROM _fongodb_indexes WHERE db_name = ? AND coll_name = ?",
+                (db, coll),
+            )
+            self._conn.execute(
                 "DELETE FROM _fongodb_collections WHERE db_name = ? AND coll_name = ?",
                 (db, coll),
             )
@@ -297,6 +379,7 @@ class Storage:
     def drop_database(self, db: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM _fongodb_documents WHERE db_name = ?", (db,))
+            self._conn.execute("DELETE FROM _fongodb_indexes WHERE db_name = ?", (db,))
             self._conn.execute("DELETE FROM _fongodb_collections WHERE db_name = ?", (db,))
 
     def list_collections(self, db: str) -> list[str]:
@@ -313,3 +396,118 @@ class Storage:
                 "SELECT DISTINCT db_name FROM _fongodb_collections ORDER BY db_name"
             ).fetchall()
         return [r[0] for r in rows]
+
+    def create_index(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        key_spec: Mapping[str, Any],
+        options: Mapping[str, Any] | None = None,
+    ) -> bool:
+        if name == _ID_INDEX_NAME:
+            return False
+        options = dict(options or {})
+        with self._lock:
+            self._ensure_collection(db, coll)
+            existing = self._conn.execute(
+                "SELECT key_spec, options FROM _fongodb_indexes "
+                "WHERE db_name = ? AND coll_name = ? AND index_name = ?",
+                (db, coll, name),
+            ).fetchone()
+            if existing is not None:
+                return False
+            if options.get("unique"):
+                sparse = bool(options.get("sparse"))
+                seen: dict[bytes, Any] = {}
+                for d in self._all_docs(db, coll):
+                    key = _index_key(d, key_spec, sparse=sparse)
+                    if key is None:
+                        continue
+                    if key in seen:
+                        raise IndexConflict(name, d.get("_id"))
+                    seen[key] = d.get("_id")
+            self._conn.execute(
+                "INSERT INTO _fongodb_indexes(db_name, coll_name, index_name, key_spec, options) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (db, coll, name, bson.encode(dict(key_spec)), bson.encode(options)),
+            )
+            return True
+
+    def list_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
+        if not self.collection_exists(db, coll):
+            return []
+        out: list[dict[str, Any]] = [{"v": 2, "key": {"_id": 1}, "name": _ID_INDEX_NAME}]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT index_name, key_spec, options FROM _fongodb_indexes "
+                "WHERE db_name = ? AND coll_name = ? ORDER BY index_name",
+                (db, coll),
+            ).fetchall()
+        for name, key_blob, opts_blob in rows:
+            entry: dict[str, Any] = {
+                "v": 2,
+                "key": bson.decode(key_blob),
+                "name": name,
+            }
+            if opts_blob:
+                opts = bson.decode(opts_blob)
+                for k, v in opts.items():
+                    entry[k] = v
+            out.append(entry)
+        return out
+
+    def drop_index(self, db: str, coll: str, name: str) -> bool:
+        if name == _ID_INDEX_NAME:
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM _fongodb_indexes "
+                "WHERE db_name = ? AND coll_name = ? AND index_name = ?",
+                (db, coll, name),
+            )
+            return cursor.rowcount > 0
+
+    def drop_all_indexes(self, db: str, coll: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM _fongodb_indexes WHERE db_name = ? AND coll_name = ?",
+                (db, coll),
+            )
+            return cursor.rowcount
+
+    def _unique_indexes(self, db: str, coll: str) -> list[tuple[str, dict[str, Any], bool]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT index_name, key_spec, options FROM _fongodb_indexes "
+                "WHERE db_name = ? AND coll_name = ?",
+                (db, coll),
+            ).fetchall()
+        out: list[tuple[str, dict[str, Any], bool]] = []
+        for name, key_blob, opts_blob in rows:
+            opts = bson.decode(opts_blob) if opts_blob else {}
+            if opts.get("unique"):
+                out.append((name, bson.decode(key_blob), bool(opts.get("sparse"))))
+        return out
+
+    def _unique_conflict(
+        self,
+        db: str,
+        coll: str,
+        candidate_doc: dict[str, Any],
+        indexes: list[tuple[str, dict[str, Any], bool]],
+        *,
+        exclude_id_key: bytes | None,
+    ) -> str | None:
+        if not indexes:
+            return None
+        for name, key_spec, sparse in indexes:
+            new_key = _index_key(candidate_doc, key_spec, sparse=sparse)
+            if new_key is None:
+                continue
+            for other_doc, other_id_key in self._all_docs_with_id_key(db, coll):
+                if exclude_id_key is not None and other_id_key == exclude_id_key:
+                    continue
+                if _index_key(other_doc, key_spec, sparse=sparse) == new_key:
+                    return name
+        return None

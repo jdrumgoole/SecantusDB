@@ -183,20 +183,30 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from fongodb.storage import IndexConflict
+
     coll = doc["update"]
     updates = doc.get("updates", [])
+    ordered = bool(doc.get("ordered", True))
     n = 0
     n_modified = 0
     upserted: list[dict[str, Any]] = []
+    write_errors: list[dict[str, Any]] = []
     for index, spec in enumerate(updates):
-        result = ctx.storage.update_matching(
-            ctx.db_name,
-            coll,
-            spec.get("q", {}),
-            spec.get("u", {}),
-            multi=bool(spec.get("multi", False)),
-            upsert=bool(spec.get("upsert", False)),
-        )
+        try:
+            result = ctx.storage.update_matching(
+                ctx.db_name,
+                coll,
+                spec.get("q", {}),
+                spec.get("u", {}),
+                multi=bool(spec.get("multi", False)),
+                upsert=bool(spec.get("upsert", False)),
+            )
+        except IndexConflict as exc:
+            write_errors.append({"index": index, "code": 11000, "errmsg": str(exc)})
+            if ordered:
+                break
+            continue
         n += result["matched"]
         n_modified += result["modified"]
         if result["upserted_id"] is not None:
@@ -205,6 +215,8 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     reply: dict[str, Any] = {"n": n, "nModified": n_modified, "ok": 1.0}
     if upserted:
         reply["upserted"] = upserted
+    if write_errors:
+        reply["writeErrors"] = write_errors
     return reply
 
 
@@ -263,6 +275,8 @@ def _key_present(doc: dict[str, Any], path: str) -> bool:
 
 
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from fongodb.storage import IndexConflict
+
     coll = doc["findAndModify"]
     query = doc.get("query") or {}
     sort = doc.get("sort") or None
@@ -291,9 +305,17 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
 
     if not candidates:
         if upsert and not is_remove:
-            result = ctx.storage.update_matching(
-                ctx.db_name, coll, query, update, multi=False, upsert=True
-            )
+            try:
+                result = ctx.storage.update_matching(
+                    ctx.db_name, coll, query, update, multi=False, upsert=True
+                )
+            except IndexConflict as exc:
+                return {
+                    "ok": 0.0,
+                    "errmsg": str(exc),
+                    "code": 11000,
+                    "codeName": "DuplicateKey",
+                }
             upserted_id = result["upserted_id"]
             value: Any = None
             if return_new and upserted_id is not None:
@@ -331,7 +353,15 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             "ok": 1.0,
         }
 
-    ctx.storage.update_matching(ctx.db_name, coll, {"_id": matched_id}, update, multi=False)
+    try:
+        ctx.storage.update_matching(ctx.db_name, coll, {"_id": matched_id}, update, multi=False)
+    except IndexConflict as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": 11000,
+            "codeName": "DuplicateKey",
+        }
 
     if return_new:
         new_docs = ctx.storage.find_matching(ctx.db_name, coll, {"_id": matched_id})
@@ -394,9 +424,17 @@ def _list_databases(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
 
 def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["listIndexes"]
+    indexes = ctx.storage.list_indexes(ctx.db_name, coll)
+    if not indexes:
+        return {
+            "ok": 0.0,
+            "errmsg": f"ns does not exist: {ctx.db_name}.{coll}",
+            "code": 26,
+            "codeName": "NamespaceNotFound",
+        }
     return {
         "cursor": {
-            "firstBatch": [{"v": 2, "key": {"_id": 1}, "name": "_id_"}],
+            "firstBatch": indexes,
             "id": 0,
             "ns": f"{ctx.db_name}.$cmd.listIndexes.{coll}",
         },
@@ -404,18 +442,89 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
-def _create_indexes(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from fongodb.storage import IndexConflict
+
+    coll = doc["createIndexes"]
     indexes = doc.get("indexes", [])
+    created_auto = not ctx.storage.collection_exists(ctx.db_name, coll)
+    num_before = len(ctx.storage.list_indexes(ctx.db_name, coll)) if not created_auto else 1
+    ctx.storage.create_collection(ctx.db_name, coll)
+    created = 0
+    for idx_spec in indexes:
+        if not isinstance(idx_spec, dict):
+            return {
+                "ok": 0.0,
+                "errmsg": "index spec must be a document",
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        key_spec = idx_spec.get("key")
+        name = idx_spec.get("name")
+        if not isinstance(key_spec, dict) or not isinstance(name, str):
+            return {
+                "ok": 0.0,
+                "errmsg": "index requires key (document) and name (string)",
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        options = {k: v for k, v in idx_spec.items() if k not in ("key", "name")}
+        try:
+            new = ctx.storage.create_index(ctx.db_name, coll, name, key_spec, options)
+        except IndexConflict as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 11000,
+                "codeName": "DuplicateKey",
+            }
+        if new:
+            created += 1
     return {
-        "createdCollectionAutomatically": False,
-        "numIndexesBefore": 1,
-        "numIndexesAfter": 1 + len(indexes),
+        "createdCollectionAutomatically": created_auto,
+        "numIndexesBefore": num_before,
+        "numIndexesAfter": num_before + created,
         "ok": 1.0,
     }
 
 
-def _drop_indexes(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"nIndexesWas": 1, "ok": 1.0}
+def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    coll = doc["dropIndexes"]
+    target = doc.get("index", "*")
+    num_before = len(ctx.storage.list_indexes(ctx.db_name, coll))
+    if num_before == 0:
+        return {
+            "ok": 0.0,
+            "errmsg": f"ns not found: {ctx.db_name}.{coll}",
+            "code": 26,
+            "codeName": "NamespaceNotFound",
+        }
+    if target == "*":
+        ctx.storage.drop_all_indexes(ctx.db_name, coll)
+        return {"nIndexesWas": num_before, "ok": 1.0}
+    if target == "_id_":
+        return {
+            "ok": 0.0,
+            "errmsg": "cannot drop _id index",
+            "code": 67,
+            "codeName": "InvalidOptions",
+        }
+    if not isinstance(target, str):
+        return {
+            "ok": 0.0,
+            "errmsg": "index must be a string name or '*'",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    ok = ctx.storage.drop_index(ctx.db_name, coll, target)
+    if not ok:
+        return {
+            "ok": 0.0,
+            "errmsg": f"index not found with name [{target}]",
+            "code": 27,
+            "codeName": "IndexNotFound",
+        }
+    return {"nIndexesWas": num_before, "ok": 1.0}
 
 
 def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
