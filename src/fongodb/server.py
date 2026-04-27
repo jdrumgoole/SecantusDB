@@ -9,6 +9,7 @@ from types import TracebackType
 from typing import Any, Self
 
 from fongodb.commands import CommandContext, dispatch
+from fongodb.cursors import CursorRegistry
 from fongodb.storage import Storage
 from fongodb.wire import (
     ConnectionClosed,
@@ -49,6 +50,7 @@ class FongoDBServer:
         self._stop_event = threading.Event()
         self._connection_ids = itertools.count(1)
         self.storage = Storage(storage_path)
+        self.cursors = CursorRegistry()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -127,6 +129,7 @@ class FongoDBServer:
                         ctx = CommandContext(
                             connection_id=connection_id,
                             storage=self.storage,
+                            cursors=self.cursors,
                             db_name=body.get("$db", "admin"),
                         )
                         response_doc = dispatch(body, ctx)
@@ -139,6 +142,7 @@ class FongoDBServer:
                         ctx = CommandContext(
                             connection_id=connection_id,
                             storage=self.storage,
+                            cursors=self.cursors,
                             db_name=_db_from_namespace(op.full_collection_name),
                         )
                         response_doc = dispatch(op.query, ctx)

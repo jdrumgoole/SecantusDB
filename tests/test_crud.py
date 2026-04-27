@@ -242,3 +242,32 @@ def test_projection_dotted_inclusion(coll) -> None:
     coll.insert_one({"_id": 1, "addr": {"city": "Dublin", "zip": "D02"}, "name": "Joe"})
     doc = coll.find_one({}, {"addr.city": 1, "_id": 0})
     assert doc == {"addr": {"city": "Dublin"}}
+
+
+def test_small_batch_size_paginates_via_getmore(coll, server: FongoDBServer) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(25)])
+    cursor = coll.find().sort("n", 1).batch_size(10)
+    docs = list(cursor)
+    assert [d["n"] for d in docs] == list(range(25))
+    assert len(server.cursors) == 0
+
+
+def test_iterate_large_collection_completes(coll) -> None:
+    coll.insert_many([{"_id": i} for i in range(500)])
+    seen = sorted(d["_id"] for d in coll.find())
+    assert seen == list(range(500))
+
+
+def test_close_cursor_kills_it(coll, server: FongoDBServer) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(50)])
+    cursor = coll.find().batch_size(5)
+    next(cursor)
+    assert len(server.cursors) == 1
+    cursor.close()
+    assert len(server.cursors) == 0
+
+
+def test_aggregate_paginates_with_small_batch(coll) -> None:
+    coll.insert_many([{"_id": i, "g": i % 3} for i in range(60)])
+    ids = sorted(d["_id"] for d in coll.aggregate([{"$match": {}}], batchSize=7))
+    assert ids == list(range(60))

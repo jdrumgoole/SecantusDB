@@ -8,6 +8,7 @@ from typing import Any
 
 import bson
 
+from fongodb.cursors import CursorNotFound, CursorRegistry
 from fongodb.query import matches
 from fongodb.storage import Storage
 from fongodb.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
@@ -15,13 +16,31 @@ from fongodb.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 WIRE_VERSION = 17
 SERVER_VERSION = "7.0.0"
 SERVER_VERSION_ARRAY = [7, 0, 0, 0]
+DEFAULT_BATCH_SIZE = 101
 
 
 @dataclass
 class CommandContext:
     connection_id: int
     storage: Storage
+    cursors: CursorRegistry
     db_name: str = "admin"
+
+
+def _split_into_cursor(
+    docs: list[dict[str, Any]],
+    batch_size: int,
+    namespace: str,
+    cursors: CursorRegistry,
+) -> tuple[list[dict[str, Any]], int]:
+    if batch_size <= 0:
+        batch_size = DEFAULT_BATCH_SIZE
+    first = docs[:batch_size]
+    remaining = docs[batch_size:]
+    if not remaining:
+        return first, 0
+    cursor_id = cursors.register(namespace, remaining)
+    return first, cursor_id
 
 
 CommandHandler = Callable[[dict[str, Any], CommandContext], dict[str, Any]]
@@ -114,6 +133,8 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     limit = int(doc.get("limit", 0) or 0)
     sort = doc.get("sort") or None
     projection = doc.get("projection") or None
+    batch_size = int(doc.get("batchSize", 0) or 0)
+    single_batch = bool(doc.get("singleBatch", False))
     docs = ctx.storage.find_matching(
         ctx.db_name,
         coll,
@@ -123,12 +144,15 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         sort=sort,
         projection=projection,
     )
+    ns = _ns(ctx.db_name, coll)
+    if single_batch:
+        first_batch, cursor_id = docs, 0
+    else:
+        first_batch, cursor_id = _split_into_cursor(
+            docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
+        )
     return {
-        "cursor": {
-            "firstBatch": docs,
-            "id": 0,
-            "ns": _ns(ctx.db_name, coll),
-        },
+        "cursor": {"firstBatch": first_batch, "id": cursor_id, "ns": ns},
         "ok": 1.0,
     }
 
@@ -246,11 +270,12 @@ def _drop_indexes(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     return {"nIndexesWas": 1, "ok": 1.0}
 
 
-def _kill_cursors(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    cursor_ids = doc.get("cursors", [])
+def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    cursor_ids = [int(c) for c in doc.get("cursors", [])]
+    killed, not_found = ctx.cursors.kill(cursor_ids)
     return {
-        "cursorsKilled": [],
-        "cursorsNotFound": list(cursor_ids),
+        "cursorsKilled": killed,
+        "cursorsNotFound": not_found,
         "cursorsAlive": [],
         "cursorsUnknown": [],
         "ok": 1.0,
@@ -258,9 +283,25 @@ def _kill_cursors(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
 
 
 def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    cursor_id = int(doc["getMore"])
     coll = doc.get("collection", "")
+    batch_size = int(doc.get("batchSize", 0) or 0)
+    ns = _ns(ctx.db_name, coll)
+    try:
+        batch, exhausted = ctx.cursors.next_batch(cursor_id, batch_size or DEFAULT_BATCH_SIZE)
+    except CursorNotFound:
+        return {
+            "ok": 0.0,
+            "errmsg": f"cursor id {cursor_id} not found",
+            "code": 43,
+            "codeName": "CursorNotFound",
+        }
     return {
-        "cursor": {"nextBatch": [], "id": 0, "ns": _ns(ctx.db_name, coll)},
+        "cursor": {
+            "nextBatch": batch,
+            "id": 0 if exhausted else cursor_id,
+            "ns": ns,
+        },
         "ok": 1.0,
     }
 
@@ -268,6 +309,8 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["aggregate"]
     pipeline = doc.get("pipeline", [])
+    cursor_opts = doc.get("cursor") or {}
+    batch_size = int(cursor_opts.get("batchSize", 0) or 0)
     if isinstance(coll, str):
         docs: list[dict[str, Any]] = ctx.storage.find_matching(ctx.db_name, coll, {})
         ns = _ns(ctx.db_name, coll)
@@ -276,8 +319,11 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         ns = f"{ctx.db_name}.$cmd.aggregate"
     for stage in pipeline:
         docs = _apply_stage(stage, docs)
+    first_batch, cursor_id = _split_into_cursor(
+        docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
+    )
     return {
-        "cursor": {"firstBatch": docs, "id": 0, "ns": ns},
+        "cursor": {"firstBatch": first_batch, "id": cursor_id, "ns": ns},
         "ok": 1.0,
     }
 
