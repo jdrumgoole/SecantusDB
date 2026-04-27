@@ -354,6 +354,25 @@ def _op_second(arg: Any, ctx: _Ctx) -> Any:
     return d.second if d is not None else None
 
 
+def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateFromString requires a document spec")
+    raw = _eval(arg.get("dateString"), ctx)
+    if raw is None:
+        return _eval(arg["onNull"], ctx) if "onNull" in arg else None
+    if not isinstance(raw, str):
+        raise ExpressionError("$dateFromString dateString must be a string")
+    fmt = arg.get("format")
+    try:
+        if isinstance(fmt, str):
+            return _dt.datetime.strptime(raw, fmt)
+        return _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        if "onError" in arg:
+            return _eval(arg["onError"], ctx)
+        raise ExpressionError(f"$dateFromString cannot parse {raw!r}: {exc}") from exc
+
+
 def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateToString requires {date, format}")
@@ -581,6 +600,7 @@ _OPS = {
     "$minute": _op_minute,
     "$second": _op_second,
     "$dateToString": _op_date_to_string,
+    "$dateFromString": _op_date_from_string,
     "$arrayElemAt": _op_array_elem_at,
     "$first": _op_first,
     "$last": _op_last,

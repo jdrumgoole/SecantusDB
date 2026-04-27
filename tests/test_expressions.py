@@ -258,3 +258,31 @@ def test_index_of_cp() -> None:
     assert evaluate({"$indexOfCP": ["hello", "ll"]}, {}) == 2
     assert evaluate({"$indexOfCP": ["hello", "z"]}, {}) == -1
     assert evaluate({"$indexOfCP": ["hellohello", "ll", 4]}, {}) == 7
+
+
+def test_date_from_string_iso() -> None:
+    import datetime as dt
+
+    out = evaluate({"$dateFromString": {"dateString": "2026-04-28T13:14:15"}}, {})
+    assert out == dt.datetime(2026, 4, 28, 13, 14, 15)
+
+
+def test_date_from_string_with_format() -> None:
+    import datetime as dt
+
+    out = evaluate(
+        {"$dateFromString": {"dateString": "2026/04/28", "format": "%Y/%m/%d"}}, {}
+    )
+    assert out == dt.datetime(2026, 4, 28)
+
+
+def test_date_from_string_on_error_fallback() -> None:
+    out = evaluate(
+        {"$dateFromString": {"dateString": "garbage", "onError": "FAILED"}}, {}
+    )
+    assert out == "FAILED"
+
+
+def test_date_from_string_on_null_fallback() -> None:
+    out = evaluate({"$dateFromString": {"dateString": None, "onNull": "missing"}}, {})
+    assert out == "missing"
