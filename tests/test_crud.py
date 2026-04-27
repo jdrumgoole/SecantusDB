@@ -577,3 +577,46 @@ def test_distinct_dotted_path(coll) -> None:
     coll.insert_many([{"addr": {"city": "Dublin"}}, {"addr": {"city": "Berlin"}}])
     cities = sorted(coll.distinct("addr.city"))
     assert cities == ["Berlin", "Dublin"]
+
+
+def test_aggregate_with_date_extractors(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "ts": dt.datetime(2026, 1, 15)},
+            {"_id": 2, "ts": dt.datetime(2026, 4, 27)},
+            {"_id": 3, "ts": dt.datetime(2027, 1, 3)},
+        ]
+    )
+    out = sorted(
+        coll.aggregate(
+            [
+                {"$project": {"_id": 1, "year": {"$year": "$ts"}, "month": {"$month": "$ts"}}},
+                {"$sort": {"_id": 1}},
+            ]
+        ),
+        key=lambda d: d["_id"],
+    )
+    assert out == [
+        {"_id": 1, "year": 2026, "month": 1},
+        {"_id": 2, "year": 2026, "month": 4},
+        {"_id": 3, "year": 2027, "month": 1},
+    ]
+
+
+def test_aggregate_with_array_elem_at(coll) -> None:
+    coll.insert_one({"_id": 1, "tags": ["a", "b", "c"]})
+    out = list(coll.aggregate([{"$project": {"first_tag": {"$arrayElemAt": ["$tags", 0]}}}]))
+    assert out[0]["first_tag"] == "a"
+
+
+def test_aggregate_with_to_int_conversion(coll) -> None:
+    coll.insert_many([{"v": "10"}, {"v": "20"}, {"v": "30"}])
+    out = list(
+        coll.aggregate(
+            [
+                {"$project": {"_id": 0, "n": {"$toInt": "$v"}}},
+                {"$group": {"_id": None, "total": {"$sum": "$n"}}},
+            ]
+        )
+    )
+    assert out == [{"_id": None, "total": 60}]

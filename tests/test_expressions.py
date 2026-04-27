@@ -91,3 +91,76 @@ def test_unsupported_operator_raises() -> None:
 def test_dict_with_no_dollar_key_evaluates_each_field() -> None:
     out = evaluate({"a": "$x", "b": {"$add": ["$x", 1]}}, {"x": 5})
     assert out == {"a": 5, "b": 6}
+
+
+def test_date_extractors() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 4, 27, 13, 14, 15)
+    doc = {"ts": when}
+    assert evaluate({"$year": "$ts"}, doc) == 2026
+    assert evaluate({"$month": "$ts"}, doc) == 4
+    assert evaluate({"$dayOfMonth": "$ts"}, doc) == 27
+    assert evaluate({"$hour": "$ts"}, doc) == 13
+    assert evaluate({"$minute": "$ts"}, doc) == 14
+    assert evaluate({"$second": "$ts"}, doc) == 15
+
+
+def test_date_to_string_default() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 4, 27, 13, 14, 15, 678000)
+    out = evaluate({"$dateToString": {"date": "$ts"}}, {"ts": when})
+    assert out == "2026-04-27T13:14:15.678Z"
+
+
+def test_date_to_string_custom_format() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 4, 27)
+    out = evaluate({"$dateToString": {"date": "$ts", "format": "%Y/%m/%d"}}, {"ts": when})
+    assert out == "2026/04/27"
+
+
+def test_array_elem_at() -> None:
+    doc = {"a": [10, 20, 30]}
+    assert evaluate({"$arrayElemAt": ["$a", 0]}, doc) == 10
+    assert evaluate({"$arrayElemAt": ["$a", -1]}, doc) == 30
+    assert evaluate({"$arrayElemAt": ["$a", 99]}, doc) is None
+
+
+def test_first_last_slice_reverse() -> None:
+    doc = {"a": [1, 2, 3, 4]}
+    assert evaluate({"$first": "$a"}, doc) == 1
+    assert evaluate({"$last": "$a"}, doc) == 4
+    assert evaluate({"$slice": ["$a", 2]}, doc) == [1, 2]
+    assert evaluate({"$slice": ["$a", -2]}, doc) == [3, 4]
+    assert evaluate({"$slice": ["$a", 1, 2]}, doc) == [2, 3]
+    assert evaluate({"$reverseArray": "$a"}, doc) == [4, 3, 2, 1]
+
+
+def test_concat_arrays() -> None:
+    out = evaluate({"$concatArrays": [[1, 2], [3], [4, 5]]}, {})
+    assert out == [1, 2, 3, 4, 5]
+
+
+def test_in_operator_in_expressions() -> None:
+    assert evaluate({"$in": ["b", ["a", "b", "c"]]}, {}) is True
+    assert evaluate({"$in": ["x", ["a", "b", "c"]]}, {}) is False
+
+
+def test_to_int_conversions() -> None:
+    assert evaluate({"$toInt": 3.7}, {}) == 3
+    assert evaluate({"$toInt": "42"}, {}) == 42
+    assert evaluate({"$toInt": True}, {}) == 1
+
+
+def test_to_double_conversions() -> None:
+    assert evaluate({"$toDouble": 3}, {}) == 3.0
+    assert evaluate({"$toDouble": "3.14"}, {}) == 3.14
+
+
+def test_to_bool_conversions() -> None:
+    assert evaluate({"$toBool": 0}, {}) is False
+    assert evaluate({"$toBool": "x"}, {}) is True
+    assert evaluate({"$toBool": ""}, {}) is False

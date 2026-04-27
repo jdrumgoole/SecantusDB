@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import datetime as _dt
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from bson import Decimal128
 
 from fongodb.paths import get_path
 
@@ -201,6 +205,206 @@ def _op_to_upper(arg: Any, doc: Mapping[str, Any]) -> Any:
     return value.upper() if isinstance(value, str) else value
 
 
+def _ensure_datetime(value: Any) -> _dt.datetime | None:
+    if isinstance(value, _dt.datetime):
+        return value
+    return None
+
+
+def _op_year(arg: Any, doc: Mapping[str, Any]) -> Any:
+    d = _ensure_datetime(evaluate(arg, doc))
+    return d.year if d is not None else None
+
+
+def _op_month(arg: Any, doc: Mapping[str, Any]) -> Any:
+    d = _ensure_datetime(evaluate(arg, doc))
+    return d.month if d is not None else None
+
+
+def _op_day_of_month(arg: Any, doc: Mapping[str, Any]) -> Any:
+    d = _ensure_datetime(evaluate(arg, doc))
+    return d.day if d is not None else None
+
+
+def _op_day_of_week(arg: Any, doc: Mapping[str, Any]) -> Any:
+    d = _ensure_datetime(evaluate(arg, doc))
+    return (d.isoweekday() % 7) + 1 if d is not None else None
+
+
+def _op_hour(arg: Any, doc: Mapping[str, Any]) -> Any:
+    d = _ensure_datetime(evaluate(arg, doc))
+    return d.hour if d is not None else None
+
+
+def _op_minute(arg: Any, doc: Mapping[str, Any]) -> Any:
+    d = _ensure_datetime(evaluate(arg, doc))
+    return d.minute if d is not None else None
+
+
+def _op_second(arg: Any, doc: Mapping[str, Any]) -> Any:
+    d = _ensure_datetime(evaluate(arg, doc))
+    return d.second if d is not None else None
+
+
+_DATE_FORMAT_MAP = {
+    "%Y": "%Y",
+    "%m": "%m",
+    "%d": "%d",
+    "%H": "%H",
+    "%M": "%M",
+    "%S": "%S",
+    "%j": "%j",
+    "%w": "%w",
+    "%U": "%U",
+    "%L": None,
+}
+
+
+def _op_date_to_string(arg: Any, doc: Mapping[str, Any]) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateToString requires {date, format}")
+    d = _ensure_datetime(evaluate(arg["date"], doc))
+    if d is None:
+        return None
+    fmt = arg.get("format", "%Y-%m-%dT%H:%M:%S.%LZ")
+    if not isinstance(fmt, str):
+        raise ExpressionError("$dateToString format must be a string")
+    out = fmt
+    if "%L" in out:
+        out = out.replace("%L", f"{d.microsecond // 1000:03d}")
+    return d.strftime(out)
+
+
+def _op_array_elem_at(arg: Any, doc: Mapping[str, Any]) -> Any:
+    arr_expr, idx_expr = arg
+    arr = evaluate(arr_expr, doc)
+    idx = evaluate(idx_expr, doc)
+    if not isinstance(arr, list) or not isinstance(idx, int):
+        return None
+    if -len(arr) <= idx < len(arr):
+        return arr[idx]
+    return None
+
+
+def _op_first(arg: Any, doc: Mapping[str, Any]) -> Any:
+    arr = evaluate(arg, doc)
+    return arr[0] if isinstance(arr, list) and arr else None
+
+
+def _op_last(arg: Any, doc: Mapping[str, Any]) -> Any:
+    arr = evaluate(arg, doc)
+    return arr[-1] if isinstance(arr, list) and arr else None
+
+
+def _op_slice(arg: Any, doc: Mapping[str, Any]) -> Any:
+    if not isinstance(arg, list) or len(arg) not in (2, 3):
+        raise ExpressionError("$slice requires [array, n] or [array, position, n]")
+    arr = evaluate(arg[0], doc)
+    if not isinstance(arr, list):
+        return None
+    if len(arg) == 2:
+        n = evaluate(arg[1], doc)
+        if not isinstance(n, int):
+            return None
+        return arr[:n] if n >= 0 else arr[n:]
+    position = evaluate(arg[1], doc)
+    n = evaluate(arg[2], doc)
+    if not isinstance(position, int) or not isinstance(n, int):
+        return None
+    return arr[position : position + n]
+
+
+def _op_concat_arrays(arg: Any, doc: Mapping[str, Any]) -> Any:
+    parts = [evaluate(a, doc) for a in arg]
+    out: list[Any] = []
+    for p in parts:
+        if not isinstance(p, list):
+            return None
+        out.extend(p)
+    return out
+
+
+def _op_reverse_array(arg: Any, doc: Mapping[str, Any]) -> Any:
+    arr = evaluate(arg, doc)
+    return list(reversed(arr)) if isinstance(arr, list) else None
+
+
+def _op_in(arg: Any, doc: Mapping[str, Any]) -> bool:
+    needle, haystack = evaluate(arg[0], doc), evaluate(arg[1], doc)
+    if not isinstance(haystack, list):
+        return False
+    return needle in haystack
+
+
+def _op_to_int(arg: Any, doc: Mapping[str, Any]) -> Any:
+    value = evaluate(arg, doc)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, Decimal128):
+        return int(value.to_decimal())
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ExpressionError(f"$toInt cannot convert {value!r}") from exc
+    raise ExpressionError(f"$toInt cannot convert {type(value).__name__}")
+
+
+def _op_to_double(arg: Any, doc: Mapping[str, Any]) -> Any:
+    value = evaluate(arg, doc)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, Decimal128):
+        return float(value.to_decimal())
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ExpressionError(f"$toDouble cannot convert {value!r}") from exc
+    raise ExpressionError(f"$toDouble cannot convert {type(value).__name__}")
+
+
+def _op_to_bool(arg: Any, doc: Mapping[str, Any]) -> Any:
+    value = evaluate(arg, doc)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, Decimal128):
+        return value.to_decimal() != Decimal(0)
+    if isinstance(value, str):
+        return len(value) > 0
+    return True
+
+
+def _op_to_decimal(arg: Any, doc: Mapping[str, Any]) -> Any:
+    value = evaluate(arg, doc)
+    if value is None:
+        return None
+    if isinstance(value, Decimal128):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal128(Decimal(repr(value) if isinstance(value, float) else value))
+    if isinstance(value, str):
+        try:
+            return Decimal128(value)
+        except (InvalidOperation, ValueError) as exc:
+            raise ExpressionError(f"$toDecimal cannot convert {value!r}") from exc
+    raise ExpressionError(f"$toDecimal cannot convert {type(value).__name__}")
+
+
 _OPS = {
     "$concat": _op_concat,
     "$add": _op_add,
@@ -223,4 +427,23 @@ _OPS = {
     "$toString": _op_to_string,
     "$toLower": _op_to_lower,
     "$toUpper": _op_to_upper,
+    "$year": _op_year,
+    "$month": _op_month,
+    "$dayOfMonth": _op_day_of_month,
+    "$dayOfWeek": _op_day_of_week,
+    "$hour": _op_hour,
+    "$minute": _op_minute,
+    "$second": _op_second,
+    "$dateToString": _op_date_to_string,
+    "$arrayElemAt": _op_array_elem_at,
+    "$first": _op_first,
+    "$last": _op_last,
+    "$slice": _op_slice,
+    "$concatArrays": _op_concat_arrays,
+    "$reverseArray": _op_reverse_array,
+    "$in": _op_in,
+    "$toInt": _op_to_int,
+    "$toDouble": _op_to_double,
+    "$toBool": _op_to_bool,
+    "$toDecimal": _op_to_decimal,
 }
