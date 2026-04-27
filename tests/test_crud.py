@@ -271,3 +271,57 @@ def test_aggregate_paginates_with_small_batch(coll) -> None:
     coll.insert_many([{"_id": i, "g": i % 3} for i in range(60)])
     ids = sorted(d["_id"] for d in coll.aggregate([{"$match": {}}], batchSize=7))
     assert ids == list(range(60))
+
+
+def test_query_regex_string_form(coll) -> None:
+    coll.insert_many([{"name": "alice"}, {"name": "alex"}, {"name": "bob"}])
+    names = sorted(d["name"] for d in coll.find({"name": {"$regex": "^al"}}))
+    assert names == ["alex", "alice"]
+
+
+def test_query_regex_compiled_pattern(coll) -> None:
+    import re
+
+    coll.insert_many([{"name": "ALICE"}, {"name": "Bob"}])
+    found = list(coll.find({"name": re.compile(r"^alice$", re.IGNORECASE)}))
+    assert len(found) == 1
+    assert found[0]["name"] == "ALICE"
+
+
+def test_query_type_filter(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "v": "hi"},
+            {"_id": 2, "v": 42},
+            {"_id": 3, "v": 3.14},
+        ]
+    )
+    string_ids = [d["_id"] for d in coll.find({"v": {"$type": "string"}})]
+    assert string_ids == [1]
+    number_ids = sorted(d["_id"] for d in coll.find({"v": {"$type": "number"}}))
+    assert number_ids == [2, 3]
+
+
+def test_query_size(coll) -> None:
+    coll.insert_many([{"tags": [1]}, {"tags": [1, 2, 3]}, {"tags": [1, 2]}])
+    found = list(coll.find({"tags": {"$size": 3}}))
+    assert len(found) == 1
+    assert found[0]["tags"] == [1, 2, 3]
+
+
+def test_query_all(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "tags": ["a", "b", "c"]},
+            {"_id": 2, "tags": ["a"]},
+            {"_id": 3, "tags": ["a", "b"]},
+        ]
+    )
+    ids = sorted(d["_id"] for d in coll.find({"tags": {"$all": ["a", "b"]}}))
+    assert ids == [1, 3]
+
+
+def test_query_mod(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(10)])
+    ids = sorted(d["_id"] for d in coll.find({"n": {"$mod": [3, 0]}}))
+    assert ids == [0, 3, 6, 9]

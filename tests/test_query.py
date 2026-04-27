@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from bson import Decimal128, ObjectId, Regex
 
 from fongodb.query import QueryError, matches
 
@@ -79,3 +80,72 @@ def test_not_at_field_level() -> None:
 def test_unknown_operator_raises() -> None:
     with pytest.raises(QueryError):
         matches({"a": 1}, {"a": {"$weirdo": 1}})
+
+
+def test_regex_basic_anchored_match() -> None:
+    assert matches({"name": "alice"}, {"name": {"$regex": "^ali"}})
+    assert not matches({"name": "bob"}, {"name": {"$regex": "^ali"}})
+
+
+def test_regex_case_insensitive_via_options() -> None:
+    assert matches({"name": "ALICE"}, {"name": {"$regex": "alice", "$options": "i"}})
+
+
+def test_regex_as_bson_regex_value() -> None:
+    assert matches({"name": "ALICE"}, {"name": Regex("alice", "i")})
+    assert not matches({"name": "bob"}, {"name": Regex("alice", "i")})
+
+
+def test_regex_matches_array_element() -> None:
+    assert matches({"tags": ["foo", "bar"]}, {"tags": {"$regex": "^ba"}})
+
+
+def test_type_by_alias() -> None:
+    assert matches({"a": "hi"}, {"a": {"$type": "string"}})
+    assert not matches({"a": 1}, {"a": {"$type": "string"}})
+    assert matches({"a": 1.5}, {"a": {"$type": "double"}})
+    assert matches({"a": ObjectId()}, {"a": {"$type": "objectId"}})
+
+
+def test_type_number_alias() -> None:
+    assert matches({"a": 1}, {"a": {"$type": "number"}})
+    assert matches({"a": 1.5}, {"a": {"$type": "number"}})
+    assert matches({"a": Decimal128("1.5")}, {"a": {"$type": "number"}})
+    assert not matches({"a": "x"}, {"a": {"$type": "number"}})
+
+
+def test_type_list_of_aliases() -> None:
+    assert matches({"a": "hi"}, {"a": {"$type": ["string", "int"]}})
+    assert matches({"a": 1}, {"a": {"$type": ["string", "int"]}})
+    assert not matches({"a": 1.5}, {"a": {"$type": ["string", "int"]}})
+
+
+def test_size() -> None:
+    assert matches({"tags": [1, 2, 3]}, {"tags": {"$size": 3}})
+    assert not matches({"tags": [1, 2]}, {"tags": {"$size": 3}})
+    assert not matches({"tags": "abc"}, {"tags": {"$size": 3}})
+
+
+def test_all() -> None:
+    assert matches({"tags": ["a", "b", "c"]}, {"tags": {"$all": ["a", "b"]}})
+    assert not matches({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}})
+
+
+def test_mod() -> None:
+    assert matches({"n": 12}, {"n": {"$mod": [4, 0]}})
+    assert matches({"n": 13}, {"n": {"$mod": [4, 1]}})
+    assert not matches({"n": 13}, {"n": {"$mod": [4, 0]}})
+
+
+def test_mod_on_array_element() -> None:
+    assert matches({"vals": [3, 7, 12]}, {"vals": {"$mod": [4, 0]}})
+
+
+def test_size_requires_int() -> None:
+    with pytest.raises(QueryError):
+        matches({"a": [1, 2]}, {"a": {"$size": "two"}})
+
+
+def test_combine_regex_and_other_operators() -> None:
+    doc = {"name": "alice", "age": 30}
+    assert matches(doc, {"name": {"$regex": "^ali"}, "age": {"$gte": 18}})

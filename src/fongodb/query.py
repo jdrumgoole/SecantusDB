@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import datetime as _dt
+import re
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from bson import Binary, Decimal128, ObjectId, Regex
 
 
 class _Missing:
@@ -64,8 +68,18 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
 
 
 def _field_matches(values: list[Any], condition: Any) -> bool:
+    if isinstance(condition, Regex):
+        return _op_regex(values, condition.pattern, condition.flags)
     if isinstance(condition, Mapping) and condition and all(k.startswith("$") for k in condition):
-        return all(_op_matches(values, op, arg) for op, arg in condition.items())
+        for op, arg in condition.items():
+            if op == "$options":
+                continue
+            if op == "$regex":
+                if not _op_regex(values, arg, condition.get("$options", "")):
+                    return False
+            elif not _op_matches(values, op, arg):
+                return False
+        return True
     return _eq_with_array(values, condition)
 
 
@@ -104,6 +118,14 @@ def _op_matches(values: list[Any], op: str, arg: Any) -> bool:
         return present == bool(arg)
     if op == "$not":
         return not _field_matches(values, arg)
+    if op == "$type":
+        return _op_type(values, arg)
+    if op == "$size":
+        return _op_size(values, arg)
+    if op == "$all":
+        return _op_all(values, arg)
+    if op == "$mod":
+        return _op_mod(values, arg)
     raise QueryError(f"unsupported query operator: {op}")
 
 
@@ -124,4 +146,146 @@ def _try_cmp(a: Any, b: Any, op: Callable[[Any, Any], bool]) -> bool:
     try:
         return bool(op(a, b))
     except TypeError:
+        return False
+
+
+_MONGO_FLAG_MAP = {
+    "i": re.IGNORECASE,
+    "m": re.MULTILINE,
+    "s": re.DOTALL,
+    "x": re.VERBOSE,
+}
+
+
+def _re_flags(flags_input: Any) -> int:
+    if isinstance(flags_input, int):
+        return flags_input
+    if isinstance(flags_input, bytes):
+        flags_input = flags_input.decode()
+    flags = 0
+    for c in flags_input or "":
+        flags |= _MONGO_FLAG_MAP.get(c, 0)
+    return flags
+
+
+def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
+    flags = _re_flags(options)
+    if isinstance(pattern, Regex):
+        regex_pattern = pattern.pattern
+        flags |= _re_flags(pattern.flags)
+    else:
+        regex_pattern = pattern
+    try:
+        compiled = re.compile(regex_pattern, flags)
+    except re.error as exc:
+        raise QueryError(f"invalid regex: {exc}") from exc
+    for v in values:
+        if v is MISSING:
+            continue
+        if isinstance(v, str) and compiled.search(v):
+            return True
+        if isinstance(v, list):
+            for elem in v:
+                if isinstance(elem, str) and compiled.search(elem):
+                    return True
+    return False
+
+
+def _is_bson_int(v: Any, *, ranged: tuple[int, int] | None = None) -> bool:
+    if not isinstance(v, int) or isinstance(v, bool):
+        return False
+    if ranged is not None:
+        lo, hi = ranged
+        return lo <= v <= hi
+    return True
+
+
+_INT32_RANGE = (-(2**31), 2**31 - 1)
+
+
+_TYPE_PREDS: dict[Any, Callable[[Any], bool]] = {
+    1: lambda v: isinstance(v, float),
+    "double": lambda v: isinstance(v, float),
+    2: lambda v: isinstance(v, str),
+    "string": lambda v: isinstance(v, str),
+    3: lambda v: isinstance(v, dict),
+    "object": lambda v: isinstance(v, dict),
+    4: lambda v: isinstance(v, list),
+    "array": lambda v: isinstance(v, list),
+    5: lambda v: isinstance(v, (bytes, Binary)),
+    "binData": lambda v: isinstance(v, (bytes, Binary)),
+    7: lambda v: isinstance(v, ObjectId),
+    "objectId": lambda v: isinstance(v, ObjectId),
+    8: lambda v: isinstance(v, bool),
+    "bool": lambda v: isinstance(v, bool),
+    9: lambda v: isinstance(v, _dt.datetime),
+    "date": lambda v: isinstance(v, _dt.datetime),
+    10: lambda v: v is None,
+    "null": lambda v: v is None,
+    11: lambda v: isinstance(v, Regex),
+    "regex": lambda v: isinstance(v, Regex),
+    16: lambda v: _is_bson_int(v, ranged=_INT32_RANGE),
+    "int": lambda v: _is_bson_int(v, ranged=_INT32_RANGE),
+    18: lambda v: _is_bson_int(v) and not _is_bson_int(v, ranged=_INT32_RANGE),
+    "long": lambda v: _is_bson_int(v) and not _is_bson_int(v, ranged=_INT32_RANGE),
+    19: lambda v: isinstance(v, Decimal128),
+    "decimal": lambda v: isinstance(v, Decimal128),
+    "number": lambda v: isinstance(v, (float, Decimal128)) or _is_bson_int(v),
+}
+
+
+def _matches_type(value: Any, type_spec: Any) -> bool:
+    pred = _TYPE_PREDS.get(type_spec)
+    return bool(pred(value)) if pred else False
+
+
+def _op_type(values: list[Any], type_spec: Any) -> bool:
+    types = type_spec if isinstance(type_spec, list) else [type_spec]
+    for v in values:
+        if v is MISSING:
+            continue
+        if any(_matches_type(v, t) for t in types):
+            return True
+        if isinstance(v, list):
+            for elem in v:
+                if any(_matches_type(elem, t) for t in types):
+                    return True
+    return False
+
+
+def _op_size(values: list[Any], size: Any) -> bool:
+    if not isinstance(size, int):
+        raise QueryError("$size requires an integer")
+    return any(isinstance(v, list) and len(v) == size for v in values)
+
+
+def _op_all(values: list[Any], required: Any) -> bool:
+    if not isinstance(required, list):
+        raise QueryError("$all requires an array")
+    for v in values:
+        if isinstance(v, list) and all(any(elem == r for elem in v) for r in required):
+            return True
+    return False
+
+
+def _op_mod(values: list[Any], mod_spec: Any) -> bool:
+    if not (isinstance(mod_spec, (list, tuple)) and len(mod_spec) == 2):
+        raise QueryError("$mod requires [divisor, remainder]")
+    divisor, remainder = mod_spec
+    for v in values:
+        if v is MISSING:
+            continue
+        if _try_mod(v, divisor, remainder):
+            return True
+        if isinstance(v, list):
+            for elem in v:
+                if _try_mod(elem, divisor, remainder):
+                    return True
+    return False
+
+
+def _try_mod(v: Any, divisor: Any, remainder: Any) -> bool:
+    try:
+        return bool(v % divisor == remainder)
+    except (TypeError, ZeroDivisionError):
         return False
