@@ -785,6 +785,41 @@ def test_pipeline_update_via_pymongo(coll) -> None:
     assert coll.find_one({"_id": 1}) == {"_id": 1, "a": 1, "b": 2, "sum": 3}
 
 
+def test_gridfs_put_and_get_round_trip(client: MongoClient) -> None:
+    import gridfs
+
+    db = client["gfs_db"]
+    fs = gridfs.GridFS(db)
+    payload = b"hello world from secantus"
+    file_id = fs.put(payload, filename="hello.txt", content_type="text/plain")
+    out = fs.get(file_id)
+    assert out.read() == payload
+    assert out.filename == "hello.txt"
+
+
+def test_gridfs_chunked_payload(client: MongoClient) -> None:
+    import gridfs
+
+    db = client["gfs_chunked_db"]
+    fs = gridfs.GridFS(db)
+    payload = b"x" * (300 * 1024)  # 300 KB, spans multiple default 255 KB chunks
+    file_id = fs.put(payload, filename="big.bin")
+    out = fs.get(file_id).read()
+    assert out == payload
+
+
+def test_gridfs_delete(client: MongoClient) -> None:
+    import gridfs
+    from gridfs.errors import NoFile
+
+    db = client["gfs_del_db"]
+    fs = gridfs.GridFS(db)
+    file_id = fs.put(b"data", filename="x.bin")
+    fs.delete(file_id)
+    with pytest.raises(NoFile):
+        fs.get(file_id)
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(
