@@ -768,3 +768,12 @@ def test_projection_elem_match_first_match(coll) -> None:
     coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 10}]})
     doc = coll.find_one({}, {"items": {"$elemMatch": {"qty": {"$gte": 5}}}})
     assert doc == {"_id": 1, "items": [{"qty": 5}]}
+
+
+def test_explain_find_returns_query_planner(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    explanation = coll.find({"n": {"$gte": 2}}).explain()
+    assert "queryPlanner" in explanation
+    assert explanation["queryPlanner"]["namespace"].endswith(".things")
+    assert "winningPlan" in explanation["queryPlanner"]
+    assert "serverInfo" in explanation

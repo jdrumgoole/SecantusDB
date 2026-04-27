@@ -136,6 +136,44 @@ def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    inner = doc.get("explain") or {}
+    if isinstance(inner, dict):
+        cmd_name = next(iter(inner), "")
+        coll_value = inner.get(cmd_name)
+        coll = coll_value if isinstance(coll_value, str) else ""
+        filter_ = inner.get("filter") or inner.get("query") or {}
+    else:
+        coll = ""
+        filter_ = {}
+    namespace = _ns(ctx.db_name, coll) if coll else f"{ctx.db_name}.$cmd"
+    return {
+        "queryPlanner": {
+            "namespace": namespace,
+            "indexFilterSet": False,
+            "parsedQuery": filter_,
+            "winningPlan": {"stage": "COLLSCAN", "filter": filter_},
+            "rejectedPlans": [],
+        },
+        "executionStats": {
+            "executionSuccess": True,
+            "nReturned": 0,
+            "executionTimeMillis": 0,
+            "totalKeysExamined": 0,
+            "totalDocsExamined": 0,
+            "executionStages": {"stage": "COLLSCAN", "nReturned": 0},
+        },
+        "command": inner if isinstance(inner, dict) else {},
+        "serverInfo": {
+            "host": "fongodb",
+            "port": 0,
+            "version": SERVER_VERSION,
+            "gitVersion": "0" * 40,
+        },
+        "ok": 1.0,
+    }
+
+
 def _ns(db: str, coll: str) -> str:
     return f"{db}.{coll}"
 
@@ -599,6 +637,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "getLog": _get_log,
     "whatsmyuri": _whatsmyuri,
     "hostInfo": _hostinfo,
+    "explain": _explain,
     "insert": _insert,
     "find": _find,
     "update": _update,
