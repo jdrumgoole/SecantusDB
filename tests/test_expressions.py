@@ -270,16 +270,12 @@ def test_date_from_string_iso() -> None:
 def test_date_from_string_with_format() -> None:
     import datetime as dt
 
-    out = evaluate(
-        {"$dateFromString": {"dateString": "2026/04/28", "format": "%Y/%m/%d"}}, {}
-    )
+    out = evaluate({"$dateFromString": {"dateString": "2026/04/28", "format": "%Y/%m/%d"}}, {})
     assert out == dt.datetime(2026, 4, 28)
 
 
 def test_date_from_string_on_error_fallback() -> None:
-    out = evaluate(
-        {"$dateFromString": {"dateString": "garbage", "onError": "FAILED"}}, {}
-    )
+    out = evaluate({"$dateFromString": {"dateString": "garbage", "onError": "FAILED"}}, {})
     assert out == "FAILED"
 
 
