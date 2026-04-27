@@ -8,7 +8,7 @@ FongoDB is a fake MongoDB server written in Python. It speaks the MongoDB wire p
 
 The name was chosen to avoid clashing with the existing "Fongo" brand. Older internal references to plain `fongo` are bugs — flag and rename.
 
-**In scope:** the subset of the MongoDB wire protocol that `pymongo` actually emits — connection handshake, CRUD ops, cursors, basic commands.
+**In scope:** the subset of the MongoDB wire protocol that `pymongo` actually emits — connection handshake, CRUD, cursors, aggregation, findAndModify.
 
 **Explicitly out of scope:** replica sets, sharding, change streams that require oplog semantics, and anything else that depends on cluster topology. If a feature only makes sense in a multi-node deployment, FongoDB does not implement it.
 
@@ -22,24 +22,27 @@ The audience is developers who want fast, ephemeral, in-process MongoDB behaviou
 
 ## Architecture
 
-Layers, top to bottom:
+Layers, roughly outermost-in:
 
-- `src/fongodb/server.py` — `FongoDBServer`: TCP accept loop on a daemon thread, one daemon thread per connection. Owns the `Storage`. Per-request, builds a fresh `CommandContext(storage, db_name)` and calls `dispatch`.
+- `src/fongodb/server.py` — `FongoDBServer`: TCP accept loop on a daemon thread, one daemon thread per connection. Owns the `Storage` and the `CursorRegistry`. Per-request, builds a fresh `CommandContext(storage, cursors, db_name)` and calls `dispatch`.
 - `src/fongodb/wire.py` — header (16 bytes, little-endian), `OP_MSG` (2013) parse/build, legacy `OP_QUERY` (2004) parse + `OP_REPLY` (1) build for the initial `pymongo` handshake. `OP_MSG` kind-1 document sequences are merged into the body before dispatch (server-side).
-- `src/fongodb/commands.py` — single dispatch table keyed on the first key of the request doc. Handshake (`hello`/`isMaster`/`ping`/`buildInfo`/etc.) and CRUD (`insert`/`find`/`update`/`delete`/`count`/`drop`/`aggregate`/`listCollections`/...). Unknown commands return `{ok: 0, code: 59, codeName: "CommandNotFound"}` so the connection survives.
-- `src/fongodb/query.py` — pure `matches(doc, filter)`. Operators: `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`/`$exists`/`$and`/`$or`/`$nor`/`$not`. Dotted paths walk into both maps and arrays (numeric index, or fan-out across element subdocs).
+- `src/fongodb/commands.py` — single dispatch table keyed on the first key of the request doc. Handshake (`hello`/`isMaster`/`ping`/`buildInfo`/etc.) and CRUD (`insert`/`find`/`update`/`delete`/`count`/`drop`/`aggregate`/`findAndModify`/`listCollections`/...). Errors raised by handlers are caught and turned into `{ok: 0, errmsg, code, codeName}`. Unknown commands return `code: 59 CommandNotFound` so the connection survives.
+- `src/fongodb/query.py` — pure `matches(doc, filter)`. Field-level operators: `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`/`$exists`/`$not`/`$regex`+`$options`/`$type`/`$size`/`$all`/`$mod`. Document-level operators: `$and`/`$or`/`$nor`/`$expr` (delegates to `expressions.py`). Dotted paths walk into both maps and arrays.
 - `src/fongodb/update.py` — pure `apply_update(doc, update)`. Operators: `$set`/`$unset`/`$inc`/`$mul`/`$min`/`$max`/`$push`/`$pull`/`$addToSet`/`$pop`/`$rename`. Replacement-style updates preserve `_id`. Mixing operators with replacement fields is rejected.
+- `src/fongodb/projection.py` — pure `apply_projection(doc, spec)` for `find()`'s `projection` argument. Inclusion/exclusion modes, `_id` defaults, dotted paths.
+- `src/fongodb/expressions.py` — pure `evaluate(expr, doc)`. The aggregation expression language: field paths (`"$x.y"`), `$literal`, arithmetic (`$add`/`$subtract`/`$multiply`/`$divide`/`$mod`), comparison (`$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`), logical (`$and`/`$or`/`$not`), `$cond`/`$ifNull`, `$size`, `$concat`, `$toString`/`$toLower`/`$toUpper`. Used both by the aggregation pipeline and by `$expr` in queries.
+- `src/fongodb/aggregate.py` — `apply_pipeline(docs, pipeline, ctx)`. Stages: `$match`, `$count`, `$limit`, `$skip`, `$sort`, `$project` (with computed fields), `$addFields`/`$set`, `$unset`, `$unwind`, `$replaceRoot`/`$replaceWith`, `$group`, `$lookup`. `$group` accumulators: `$sum`, `$count`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`. `$lookup` only supports the simple `from`/`localField`/`foreignField`/`as` form so far. `PipelineContext` carries the `Storage` and current `db_name` for stages that need them.
+- `src/fongodb/cursors.py` — `CursorRegistry`. Per-server, thread-safe map of int64 cursor id → remaining docs. Used by `find` and `aggregate` to support pagination via `getMore`/`killCursors`.
+- `src/fongodb/paths.py` — shared dotted-path helpers (`get_path`/`set_path`/`unset_path`/`has_path`/`walk_to_parent`). Used by `update`, `projection`, `aggregate`, and storage's sort.
 - `src/fongodb/storage.py` — SQLite-backed store. Schema:
   - `_fongodb_collections(db_name, coll_name, options)`
-  - `_fongodb_documents(db_name, coll_name, id_key BLOB, doc BLOB)` — full document is `bson.encode(doc)`; `id_key` is `bson.encode({"_": _id})` so byte-equality matches BSON-equality within a type. `RLock`-serialized; `check_same_thread=False` connection.
+  - `_fongodb_documents(db_name, coll_name, id_key BLOB, doc BLOB)` — full document is `bson.encode(doc)`; `id_key` is `bson.encode({"_": _id})` so byte-equality matches BSON-equality within a type. `RLock`-serialized; `check_same_thread=False` connection. Public `sort_docs` helper used by both find and aggregate's `$sort`.
 
 ### Type-mapping strategy (the critical decision)
 
 Documents are stored as **opaque BSON blobs** in SQLite. All filtering, projection, sorting, and updates happen in Python after `bson.decode`. SQLite is a persistence and indexing layer only; it never inspects document content.
 
 This is deliberate. SQLite's storage classes (NULL/INT/REAL/TEXT/BLOB) cannot represent ObjectId, Decimal128, the int32-vs-int64 distinction, Date with timezone, Binary, or Regex — and FongoDB's whole point is that `pymongo` cannot tell us apart from `mongod`. A lossy JSON-text mapping would break that.
-
-**Known limitation:** the numeric type bridge for `_id` uniqueness (where `Int32(1) == Double(1.0)` for `_id` purposes) is not implemented. Two documents with `_id: 1` (int32) and `_id: 1.0` (double) will both insert here; real MongoDB rejects the second.
 
 When secondary indexes land they will use **typed sort-key columns** (1-byte type tag matching BSON's cross-type sort order, then a byte-sortable value encoding) — not JSON1, not numeric coercion.
 
@@ -51,10 +54,10 @@ When secondary indexes land they will use **typed sort-key columns** (1-byte typ
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
 - PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.
-- The on-disk repo path is still `/Users/jdrumgoole/GIT/fongo` (legacy from before the rename); the package and PyPI name are `fongodb`. Renaming the directory is fine if Joe wants to do it, but isn't required.
+- The on-disk repo path is still `/Users/jdrumgoole/GIT/fongo` (legacy from before the rename); the package and PyPI name are `fongodb`. Renaming the directory is fine, not required.
 
 ## Conventions for changes here
 
-- New CRUD operators or aggregation stages should land with both a unit test in `tests/test_query.py` / `tests/test_update.py` and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
-- The wire-protocol layer never ought to know about commands. The command-dispatch layer never ought to know about SQL. Keep these separations clean — they're what let us swap storage backends or add cursor pagination without rewriting everything.
+- New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
+- Layer boundaries to defend: the wire layer never knows about commands; the command layer never knows about SQL; pure operator engines (`query`, `update`, `expressions`, `aggregate`, `projection`) take only docs in and out, no I/O.
 - Errors raised inside command handlers are caught by `dispatch` and turned into `{ok: 0, errmsg, code, codeName}`. Don't leak Python tracebacks to the wire.
