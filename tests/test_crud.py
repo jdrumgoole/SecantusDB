@@ -520,3 +520,30 @@ def test_query_expr_compares_fields(coll) -> None:
     )
     ids = sorted(d["_id"] for d in coll.find({"$expr": {"$gt": ["$a", "$b"]}}))
     assert ids == [1]
+
+
+def test_session_can_be_used_for_writes(client: MongoClient) -> None:
+    db = client["sessdb"]
+    coll = db["things"]
+    with client.start_session() as session:
+        coll.insert_one({"_id": 1, "x": "a"}, session=session)
+        coll.insert_one({"_id": 2, "x": "b"}, session=session)
+        docs = list(coll.find({}, session=session).sort("_id", 1))
+        assert [d["_id"] for d in docs] == [1, 2]
+
+
+def test_transaction_context_does_not_error(client: MongoClient) -> None:
+    db = client["txndb"]
+    coll = db["things"]
+    with client.start_session() as session, session.start_transaction():
+        coll.insert_one({"_id": 1, "x": "a"}, session=session)
+        coll.insert_one({"_id": 2, "x": "b"}, session=session)
+    assert coll.count_documents({}) == 2
+
+
+def test_duplicate_id_int_vs_float_via_pymongo(coll) -> None:
+    from pymongo.errors import DuplicateKeyError as PyDup
+
+    coll.insert_one({"_id": 1, "x": "int"})
+    with pytest.raises(PyDup):
+        coll.insert_one({"_id": 1.0, "x": "float"})

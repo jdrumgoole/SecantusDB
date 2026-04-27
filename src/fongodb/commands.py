@@ -88,6 +88,30 @@ def _end_sessions(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     return {"ok": 1.0}
 
 
+def _start_session(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    import uuid
+
+    from bson import Binary
+
+    return {
+        "id": {"id": Binary(uuid.uuid4().bytes, 4)},
+        "timeoutMinutes": 30,
+        "ok": 1.0,
+    }
+
+
+def _refresh_sessions(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    return {"ok": 1.0}
+
+
+def _abort_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    return {"ok": 1.0}
+
+
+def _commit_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    return {"ok": 1.0}
+
+
 def _get_log(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     return {"totalLinesWritten": 0, "log": [], "ok": 1.0}
 
@@ -423,6 +447,10 @@ _HANDLERS: dict[str, CommandHandler] = {
     "buildInfo": _build_info,
     "buildinfo": _build_info,
     "endSessions": _end_sessions,
+    "startSession": _start_session,
+    "refreshSessions": _refresh_sessions,
+    "abortTransaction": _abort_transaction,
+    "commitTransaction": _commit_transaction,
     "getLog": _get_log,
     "whatsmyuri": _whatsmyuri,
     "hostInfo": _hostinfo,
