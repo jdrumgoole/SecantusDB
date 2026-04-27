@@ -820,6 +820,42 @@ def test_gridfs_delete(client: MongoClient) -> None:
         fs.get(file_id)
 
 
+def test_bulk_write_mixed_ops(coll) -> None:
+    from pymongo import DeleteOne, InsertOne, UpdateOne
+
+    coll.insert_one({"_id": 1, "n": 1})
+    result = coll.bulk_write(
+        [
+            InsertOne({"_id": 2, "n": 2}),
+            UpdateOne({"_id": 1}, {"$inc": {"n": 10}}),
+            DeleteOne({"_id": 2}),
+        ]
+    )
+    assert result.inserted_count == 1
+    assert result.modified_count == 1
+    assert result.deleted_count == 1
+    assert coll.find_one({"_id": 1})["n"] == 11
+    assert coll.count_documents({}) == 1
+
+
+def test_bulk_write_unordered_continues_past_failure(coll) -> None:
+    from pymongo import InsertOne
+    from pymongo.errors import BulkWriteError
+
+    coll.insert_one({"_id": 1})
+    with pytest.raises(BulkWriteError):
+        coll.bulk_write(
+            [
+                InsertOne({"_id": 1}),  # duplicate, should fail
+                InsertOne({"_id": 2}),
+                InsertOne({"_id": 3}),
+            ],
+            ordered=False,
+        )
+    ids = sorted(d["_id"] for d in coll.find())
+    assert ids == [1, 2, 3]
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(
