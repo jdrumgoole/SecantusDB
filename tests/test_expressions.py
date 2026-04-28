@@ -390,3 +390,43 @@ def test_regex_find_no_match_returns_none() -> None:
 def test_regex_find_all() -> None:
     out = evaluate({"$regexFindAll": {"input": "a1 b22 c333", "regex": r"\d+"}}, {})
     assert [m["match"] for m in out] == ["1", "22", "333"]
+
+
+def test_date_add_days() -> None:
+    import datetime as dt
+
+    base = dt.datetime(2026, 4, 28, 12, 0, 0)
+    out = evaluate({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 7}}, {"d": base})
+    assert out == dt.datetime(2026, 5, 5, 12, 0, 0)
+
+
+def test_date_add_months_with_day_clamp() -> None:
+    import datetime as dt
+
+    base = dt.datetime(2026, 1, 31)
+    out = evaluate({"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}}, {"d": base})
+    assert out == dt.datetime(2026, 2, 28)
+
+
+def test_date_subtract() -> None:
+    import datetime as dt
+
+    base = dt.datetime(2026, 4, 28)
+    out = evaluate(
+        {"$dateSubtract": {"startDate": "$d", "unit": "year", "amount": 1}},
+        {"d": base},
+    )
+    assert out == dt.datetime(2025, 4, 28)
+
+
+def test_date_diff_units() -> None:
+    import datetime as dt
+
+    a = dt.datetime(2025, 1, 1)
+    b = dt.datetime(2026, 4, 28)
+    spec = {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "year"}}
+    assert evaluate(spec, {"a": a, "b": b}) == 1
+    spec_month = {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "month"}}
+    assert evaluate(spec_month, {"a": a, "b": b}) == 15
+    spec_day = {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "day"}}
+    assert evaluate(spec_day, {"a": a, "b": b}) == (b - a).days

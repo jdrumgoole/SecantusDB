@@ -412,6 +412,109 @@ def _op_regex_find(arg: Any, ctx: _Ctx) -> Any:
     return {"match": m.group(0), "idx": m.start(), "captures": list(m.groups())}
 
 
+def _add_months(d: _dt.datetime, months: int) -> _dt.datetime:
+    import calendar
+
+    new_month_total = d.month - 1 + months
+    new_year = d.year + new_month_total // 12
+    new_month = (new_month_total % 12) + 1
+    last_day = calendar.monthrange(new_year, new_month)[1]
+    new_day = min(d.day, last_day)
+    return d.replace(year=new_year, month=new_month, day=new_day)
+
+
+def _shift_date(d: _dt.datetime, unit: str, amount: int) -> _dt.datetime:
+    if unit == "year":
+        return _add_months(d, amount * 12)
+    if unit == "quarter":
+        return _add_months(d, amount * 3)
+    if unit == "month":
+        return _add_months(d, amount)
+    if unit == "week":
+        return d + _dt.timedelta(weeks=amount)
+    if unit == "day":
+        return d + _dt.timedelta(days=amount)
+    if unit == "hour":
+        return d + _dt.timedelta(hours=amount)
+    if unit == "minute":
+        return d + _dt.timedelta(minutes=amount)
+    if unit == "second":
+        return d + _dt.timedelta(seconds=amount)
+    if unit == "millisecond":
+        return d + _dt.timedelta(milliseconds=amount)
+    raise ExpressionError(f"unsupported date unit: {unit!r}")
+
+
+def _op_date_add(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateAdd requires a document spec")
+    start = _eval(arg.get("startDate"), ctx)
+    unit = _eval(arg.get("unit"), ctx)
+    amount = _eval(arg.get("amount"), ctx)
+    if start is None or amount is None:
+        return None
+    if not isinstance(start, _dt.datetime):
+        raise ExpressionError("$dateAdd startDate must be a datetime")
+    if not isinstance(unit, str) or not isinstance(amount, int):
+        raise ExpressionError("$dateAdd needs string unit and integer amount")
+    return _shift_date(start, unit, amount)
+
+
+def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateSubtract requires a document spec")
+    start = _eval(arg.get("startDate"), ctx)
+    unit = _eval(arg.get("unit"), ctx)
+    amount = _eval(arg.get("amount"), ctx)
+    if start is None or amount is None:
+        return None
+    if not isinstance(start, _dt.datetime):
+        raise ExpressionError("$dateSubtract startDate must be a datetime")
+    if not isinstance(unit, str) or not isinstance(amount, int):
+        raise ExpressionError("$dateSubtract needs string unit and integer amount")
+    return _shift_date(start, unit, -amount)
+
+
+def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateDiff requires a document spec")
+    start = _eval(arg.get("startDate"), ctx)
+    end = _eval(arg.get("endDate"), ctx)
+    unit = _eval(arg.get("unit"), ctx)
+    if start is None or end is None:
+        return None
+    if not isinstance(start, _dt.datetime) or not isinstance(end, _dt.datetime):
+        raise ExpressionError("$dateDiff endpoints must be datetimes")
+    if not isinstance(unit, str):
+        raise ExpressionError("$dateDiff needs a string unit")
+    if unit == "year":
+        return end.year - start.year - (1 if (end.month, end.day) < (start.month, start.day) else 0)
+    if unit == "quarter":
+        sq = (start.year, (start.month - 1) // 3)
+        eq = (end.year, (end.month - 1) // 3)
+        return (eq[0] - sq[0]) * 4 + (eq[1] - sq[1])
+    if unit == "month":
+        return (
+            (end.year - start.year) * 12
+            + (end.month - start.month)
+            - (1 if end.day < start.day else 0)
+        )
+    delta = end - start
+    if unit == "week":
+        return delta.days // 7
+    if unit == "day":
+        return delta.days
+    if unit == "hour":
+        return int(delta.total_seconds() // 3600)
+    if unit == "minute":
+        return int(delta.total_seconds() // 60)
+    if unit == "second":
+        return int(delta.total_seconds())
+    if unit == "millisecond":
+        return int(delta.total_seconds() * 1000)
+    raise ExpressionError(f"unsupported date unit: {unit!r}")
+
+
 def _op_regex_find_all(arg: Any, ctx: _Ctx) -> Any:
     import re as _re
 
@@ -833,6 +936,9 @@ _OPS = {
     "$regexMatch": _op_regex_match,
     "$regexFind": _op_regex_find,
     "$regexFindAll": _op_regex_find_all,
+    "$dateAdd": _op_date_add,
+    "$dateSubtract": _op_date_subtract,
+    "$dateDiff": _op_date_diff,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,
