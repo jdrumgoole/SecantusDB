@@ -210,3 +210,18 @@ def test_find_positional_matches_no_array_returns_empty() -> None:
     from secantus.update import find_positional_matches
 
     assert find_positional_matches({"x": 1}, {"x": 1}) == {}
+
+
+def test_bit_and_or_xor() -> None:
+    assert apply_update({"f": 0b1100}, {"$bit": {"f": {"and": 0b1010}}}) == {"f": 0b1000}
+    assert apply_update({"f": 0b1100}, {"$bit": {"f": {"or": 0b0011}}}) == {"f": 0b1111}
+    assert apply_update({"f": 0b1100}, {"$bit": {"f": {"xor": 0b1010}}}) == {"f": 0b0110}
+
+
+def test_bit_on_missing_field_treats_as_zero() -> None:
+    assert apply_update({}, {"$bit": {"f": {"or": 0b101}}}) == {"f": 0b101}
+
+
+def test_bit_on_non_int_raises() -> None:
+    with pytest.raises(UpdateError):
+        apply_update({"f": "abc"}, {"$bit": {"f": {"or": 1}}})

@@ -306,5 +306,25 @@ def _apply_op(
                 value = get_path(doc, old)
                 unset_path(doc, old)
                 set_path(doc, new, value)
+    elif op == "$bit":
+        for path, ops in payload.items():
+            if not isinstance(ops, Mapping) or len(ops) != 1:
+                raise UpdateError("$bit requires a single-op document per field")
+            (bit_op,) = ops.keys()
+            mask = ops[bit_op]
+            if not isinstance(mask, int) or isinstance(mask, bool):
+                raise UpdateError("$bit mask must be an integer")
+            for concrete in _expand(doc, path, array_filters, positional_matches):
+                current = get_path(doc, concrete, default=0) or 0
+                if not isinstance(current, int) or isinstance(current, bool):
+                    raise UpdateError(f"$bit on non-integer at {concrete!r}")
+                if bit_op == "and":
+                    set_path(doc, concrete, current & mask)
+                elif bit_op == "or":
+                    set_path(doc, concrete, current | mask)
+                elif bit_op == "xor":
+                    set_path(doc, concrete, current ^ mask)
+                else:
+                    raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
     else:
         raise UpdateError(f"unsupported update operator: {op}")

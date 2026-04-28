@@ -196,3 +196,33 @@ def test_comment_is_ignored() -> None:
     doc = {"a": 1}
     assert matches(doc, {"a": 1, "$comment": "for analytics"})
     assert not matches(doc, {"a": 2, "$comment": "for analytics"})
+
+
+def test_bits_all_set_with_int_mask() -> None:
+    assert matches({"flags": 0b1011}, {"flags": {"$bitsAllSet": 0b1010}})
+    assert not matches({"flags": 0b1001}, {"flags": {"$bitsAllSet": 0b1010}})
+
+
+def test_bits_all_set_with_position_list() -> None:
+    assert matches({"flags": 0b1011}, {"flags": {"$bitsAllSet": [0, 1, 3]}})
+    assert not matches({"flags": 0b1011}, {"flags": {"$bitsAllSet": [2]}})
+
+
+def test_bits_any_set() -> None:
+    assert matches({"flags": 0b0010}, {"flags": {"$bitsAnySet": 0b1010}})
+    assert not matches({"flags": 0b0001}, {"flags": {"$bitsAnySet": 0b1010}})
+
+
+def test_bits_all_clear() -> None:
+    assert matches({"flags": 0b0001}, {"flags": {"$bitsAllClear": 0b1010}})
+    assert not matches({"flags": 0b0011}, {"flags": {"$bitsAllClear": 0b1010}})
+
+
+def test_bits_any_clear() -> None:
+    assert matches({"flags": 0b1010}, {"flags": {"$bitsAnyClear": 0b1011}})
+    assert not matches({"flags": 0b1111}, {"flags": {"$bitsAnyClear": 0b1010}})
+
+
+def test_bits_skip_non_int_values() -> None:
+    assert not matches({"flags": "abc"}, {"flags": {"$bitsAllSet": 0b1}})
+    assert not matches({"flags": True}, {"flags": {"$bitsAllSet": 0b1}})

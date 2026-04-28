@@ -152,7 +152,40 @@ def _op_matches(values: list[Any], op: str, arg: Any) -> bool:
         return _op_mod(values, arg)
     if op == "$elemMatch":
         return _op_elem_match(values, arg)
+    if op == "$bitsAllSet":
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == m)
+    if op == "$bitsAnySet":
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0)
+    if op == "$bitsAllClear":
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0)
+    if op == "$bitsAnyClear":
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != m)
     raise QueryError(f"unsupported query operator: {op}")
+
+
+def _resolve_bitmask(arg: Any) -> int:
+    if isinstance(arg, bool):
+        raise QueryError("bitwise mask cannot be a boolean")
+    if isinstance(arg, int):
+        return arg
+    if isinstance(arg, list):
+        mask = 0
+        for bit in arg:
+            if not isinstance(bit, int) or isinstance(bit, bool):
+                raise QueryError("bitwise mask positions must be integers")
+            mask |= 1 << bit
+        return mask
+    raise QueryError("bitwise operator requires an int or list of bit positions")
+
+
+def _op_bitwise(
+    values: list[Any], arg: Any, predicate: Callable[[int, int], bool]
+) -> bool:
+    mask = _resolve_bitmask(arg)
+    for v in values:
+        if isinstance(v, int) and not isinstance(v, bool) and predicate(v, mask):
+            return True
+    return False
 
 
 def _cmp(values: list[Any], target: Any, op: Callable[[Any, Any], bool]) -> bool:
