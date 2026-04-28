@@ -327,6 +327,47 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
     return math.trunc(n * factor) / factor
 
 
+def _op_merge_objects(arg: Any, ctx: _Ctx) -> Any:
+    items = arg if isinstance(arg, list) else [arg]
+    result: dict[str, Any] = {}
+    for item in items:
+        v = _eval(item, ctx)
+        if v is None:
+            continue
+        if not isinstance(v, Mapping):
+            raise ExpressionError("$mergeObjects requires document-valued arguments")
+        result.update(v)
+    return result
+
+
+def _op_object_to_array(arg: Any, ctx: _Ctx) -> Any:
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, Mapping):
+        raise ExpressionError("$objectToArray requires a document")
+    return [{"k": k, "v": val} for k, val in v.items()]
+
+
+def _op_array_to_object(arg: Any, ctx: _Ctx) -> Any:
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        raise ExpressionError("$arrayToObject requires an array")
+    out: dict[str, Any] = {}
+    for entry in v:
+        if isinstance(entry, Mapping) and "k" in entry and "v" in entry:
+            out[str(entry["k"])] = entry["v"]
+        elif isinstance(entry, list) and len(entry) == 2:
+            out[str(entry[0])] = entry[1]
+        else:
+            raise ExpressionError(
+                "$arrayToObject entries must be {k, v} docs or [k, v] pairs"
+            )
+    return out
+
+
 def _op_split(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or len(arg) != 2:
         raise ExpressionError("$split requires [string, separator]")
@@ -695,6 +736,9 @@ _OPS = {
     "$log": _op_log,
     "$log10": _op_log10,
     "$trunc": _op_trunc,
+    "$mergeObjects": _op_merge_objects,
+    "$objectToArray": _op_object_to_array,
+    "$arrayToObject": _op_array_to_object,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,

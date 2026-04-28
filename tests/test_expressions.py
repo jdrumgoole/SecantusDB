@@ -311,3 +311,33 @@ def test_log_family() -> None:
 def test_trunc() -> None:
     assert evaluate({"$trunc": 3.7}, {}) == 3
     assert evaluate({"$trunc": [3.456, 1]}, {}) == pytest.approx(3.4)
+
+
+def test_merge_objects() -> None:
+    assert evaluate(
+        {"$mergeObjects": [{"a": 1, "b": 2}, {"b": 99, "c": 3}]}, {}
+    ) == {"a": 1, "b": 99, "c": 3}
+    assert evaluate({"$mergeObjects": [{"a": 1}, None, {"b": 2}]}, {}) == {"a": 1, "b": 2}
+
+
+def test_object_to_array() -> None:
+    out = evaluate({"$objectToArray": "$d"}, {"d": {"a": 1, "b": 2}})
+    assert out == [{"k": "a", "v": 1}, {"k": "b", "v": 2}]
+
+
+def test_array_to_object_kv_form() -> None:
+    arr = [{"k": "a", "v": 1}, {"k": "b", "v": 2}]
+    out = evaluate({"$arrayToObject": "$a"}, {"a": arr})
+    assert out == {"a": 1, "b": 2}
+
+
+def test_array_to_object_pair_form() -> None:
+    arr = [["a", 1], ["b", 2]]
+    out = evaluate({"$arrayToObject": "$a"}, {"a": arr})
+    assert out == {"a": 1, "b": 2}
+
+
+def test_object_array_round_trip() -> None:
+    expr = {"$arrayToObject": {"$objectToArray": "$d"}}
+    out = evaluate(expr, {"d": {"a": 1, "b": 2}})
+    assert out == {"a": 1, "b": 2}
