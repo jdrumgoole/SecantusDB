@@ -133,3 +133,48 @@ def test_set_on_insert_skipped_for_existing_doc() -> None:
 def test_set_on_insert_applied_during_upsert() -> None:
     out = apply_update({}, {"$setOnInsert": {"created": True}}, is_upsert=True)
     assert out["created"] is True
+
+
+def test_positional_all_set_on_every_element() -> None:
+    out = apply_update(
+        {"_id": 1, "items": [{"qty": 1}, {"qty": 2}, {"qty": 3}]},
+        {"$set": {"items.$[].qty": 0}},
+    )
+    assert [e["qty"] for e in out["items"]] == [0, 0, 0]
+
+
+def test_positional_filtered_set_only_matching() -> None:
+    out = apply_update(
+        {"_id": 1, "items": [{"qty": 1, "tag": "a"}, {"qty": 5, "tag": "b"}, {"qty": 9}]},
+        {"$set": {"items.$[hi].tag": "BIG"}},
+        array_filters=[{"hi.qty": {"$gte": 5}}],
+    )
+    assert out["items"][0] == {"qty": 1, "tag": "a"}
+    assert out["items"][1] == {"qty": 5, "tag": "BIG"}
+    assert out["items"][2] == {"qty": 9, "tag": "BIG"}
+
+
+def test_positional_inc_on_filtered_elements() -> None:
+    out = apply_update(
+        {"_id": 1, "scores": [10, 20, 30, 40]},
+        {"$inc": {"scores.$[gt20]": 100}},
+        array_filters=[{"gt20": {"$gt": 20}}],
+    )
+    assert out["scores"] == [10, 20, 130, 140]
+
+
+def test_positional_unset_clears_all_elements() -> None:
+    out = apply_update(
+        {"_id": 1, "items": [{"qty": 1, "tag": "a"}, {"qty": 2, "tag": "b"}]},
+        {"$unset": {"items.$[].tag": ""}},
+    )
+    assert out["items"] == [{"qty": 1}, {"qty": 2}]
+
+
+def test_positional_with_unknown_filter_name_raises() -> None:
+    with pytest.raises(UpdateError):
+        apply_update(
+            {"items": [{"x": 1}]},
+            {"$set": {"items.$[unknown].x": 9}},
+            array_filters=[{"other.x": 1}],
+        )

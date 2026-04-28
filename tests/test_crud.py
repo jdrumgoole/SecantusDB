@@ -952,6 +952,25 @@ def test_aggregate_merge_when_not_matched_discard(client: MongoClient) -> None:
     assert list(db["dst"].find()) == []
 
 
+def test_positional_all_via_pymongo(coll) -> None:
+    coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 2}, {"qty": 3}]})
+    coll.update_one({"_id": 1}, {"$set": {"items.$[].qty": 0}})
+    out = coll.find_one({"_id": 1})
+    assert [e["qty"] for e in out["items"]] == [0, 0, 0]
+
+
+def test_positional_filtered_via_pymongo(coll) -> None:
+    coll.insert_one({"_id": 1, "items": [{"qty": 1, "tag": "a"}, {"qty": 5, "tag": "b"}]})
+    coll.update_one(
+        {"_id": 1},
+        {"$set": {"items.$[hi].tag": "BIG"}},
+        array_filters=[{"hi.qty": {"$gte": 5}}],
+    )
+    out = coll.find_one({"_id": 1})
+    assert out["items"][0]["tag"] == "a"
+    assert out["items"][1]["tag"] == "BIG"
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(

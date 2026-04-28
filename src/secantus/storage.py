@@ -297,6 +297,7 @@ class Storage:
         *,
         multi: bool = False,
         upsert: bool = False,
+        array_filters: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         matched = 0
         modified = 0
@@ -308,7 +309,7 @@ class Storage:
                 if not matches(doc, filter):
                     continue
                 matched += 1
-                new = apply_update(doc, update)
+                new = apply_update(doc, update, array_filters=array_filters)
                 if new != doc:
                     new_id_key = _id_key(new["_id"])
                     conflict = self._unique_conflict(
@@ -329,7 +330,7 @@ class Storage:
                 for k, v in filter.items():
                     if not k.startswith("$") and not isinstance(v, dict):
                         seed[k] = v
-                new = apply_update(seed, update, is_upsert=True)
+                new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
                 upserted_id = new["_id"]

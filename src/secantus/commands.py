@@ -163,9 +163,7 @@ def _connection_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, 
 
 def _db_stats(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     colls = ctx.storage.list_collections(ctx.db_name)
-    objects = sum(
-        ctx.storage.count_matching(ctx.db_name, c, None) for c in colls
-    )
+    objects = sum(ctx.storage.count_matching(ctx.db_name, c, None) for c in colls)
     return {
         "db": ctx.db_name,
         "collections": len(colls),
@@ -315,6 +313,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 spec.get("u", {}),
                 multi=bool(spec.get("multi", False)),
                 upsert=bool(spec.get("upsert", False)),
+                array_filters=spec.get("arrayFilters"),
             )
         except IndexConflict as exc:
             write_errors.append({"index": index, "code": 11000, "errmsg": str(exc)})
