@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 from collections.abc import Mapping
 from typing import Any
 
@@ -12,7 +13,10 @@ class UpdateError(Exception):
 
 
 def apply_update(
-    doc: dict[str, Any], update: Mapping[str, Any] | list[Mapping[str, Any]]
+    doc: dict[str, Any],
+    update: Mapping[str, Any] | list[Mapping[str, Any]],
+    *,
+    is_upsert: bool = False,
 ) -> dict[str, Any]:
     if isinstance(update, list):
         return _apply_pipeline_update(doc, update)
@@ -25,6 +29,8 @@ def apply_update(
             raise UpdateError("update document cannot mix operators with replacement fields")
         result = copy.deepcopy(doc)
         for op, payload in update.items():
+            if op == "$setOnInsert" and not is_upsert:
+                continue
             _apply_op(result, op, payload)
         return result
     new = copy.deepcopy(dict(update))
@@ -66,12 +72,29 @@ def _apply_pipeline_update(
 
 
 def _apply_op(doc: dict[str, Any], op: str, payload: Mapping[str, Any]) -> None:
-    if op == "$set":
+    if op == "$set" or op == "$setOnInsert":
         for path, value in payload.items():
             set_path(doc, path, value)
     elif op == "$unset":
         for path in payload:
             unset_path(doc, path)
+    elif op == "$currentDate":
+        for path, opts in payload.items():
+            if opts is True:
+                set_path(doc, path, _dt.datetime.now(_dt.UTC))
+                continue
+            if isinstance(opts, Mapping):
+                kind = opts.get("$type")
+                if kind == "date":
+                    set_path(doc, path, _dt.datetime.now(_dt.UTC))
+                    continue
+                if kind == "timestamp":
+                    import bson as _bson
+                    import time as _time
+
+                    set_path(doc, path, _bson.Timestamp(int(_time.time()), 0))
+                    continue
+            raise UpdateError(f"$currentDate option for {path!r} not understood")
     elif op == "$inc":
         for path, delta in payload.items():
             current = get_path(doc, path, default=0)

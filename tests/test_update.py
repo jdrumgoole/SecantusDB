@@ -102,3 +102,36 @@ def test_pipeline_update_rejects_id_change() -> None:
 def test_pipeline_update_rejects_disallowed_stage() -> None:
     with pytest.raises(UpdateError):
         apply_update({"_id": 1, "x": 1}, [{"$match": {"x": 1}}])
+
+
+def test_current_date_default_sets_datetime() -> None:
+    import datetime as dt
+
+    out = apply_update({"_id": 1}, {"$currentDate": {"updated": True}})
+    assert isinstance(out["updated"], dt.datetime)
+
+
+def test_current_date_with_type_date() -> None:
+    import datetime as dt
+
+    out = apply_update({"_id": 1}, {"$currentDate": {"updated": {"$type": "date"}}})
+    assert isinstance(out["updated"], dt.datetime)
+
+
+def test_current_date_with_type_timestamp() -> None:
+    from bson import Timestamp
+
+    out = apply_update({"_id": 1}, {"$currentDate": {"ts": {"$type": "timestamp"}}})
+    assert isinstance(out["ts"], Timestamp)
+
+
+def test_set_on_insert_skipped_for_existing_doc() -> None:
+    out = apply_update(
+        {"_id": 1, "n": 5}, {"$setOnInsert": {"created": True}}, is_upsert=False
+    )
+    assert "created" not in out
+
+
+def test_set_on_insert_applied_during_upsert() -> None:
+    out = apply_update({}, {"$setOnInsert": {"created": True}}, is_upsert=True)
+    assert out["created"] is True

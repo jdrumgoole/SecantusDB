@@ -329,7 +329,7 @@ class Storage:
                 for k, v in filter.items():
                     if not k.startswith("$") and not isinstance(v, dict):
                         seed[k] = v
-                new = apply_update(seed, update)
+                new = apply_update(seed, update, is_upsert=True)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
                 upserted_id = new["_id"]
