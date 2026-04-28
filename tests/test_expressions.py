@@ -314,9 +314,11 @@ def test_trunc() -> None:
 
 
 def test_merge_objects() -> None:
-    assert evaluate(
-        {"$mergeObjects": [{"a": 1, "b": 2}, {"b": 99, "c": 3}]}, {}
-    ) == {"a": 1, "b": 99, "c": 3}
+    assert evaluate({"$mergeObjects": [{"a": 1, "b": 2}, {"b": 99, "c": 3}]}, {}) == {
+        "a": 1,
+        "b": 99,
+        "c": 3,
+    }
     assert evaluate({"$mergeObjects": [{"a": 1}, None, {"b": 2}]}, {}) == {"a": 1, "b": 2}
 
 
@@ -341,3 +343,50 @@ def test_object_array_round_trip() -> None:
     expr = {"$arrayToObject": {"$objectToArray": "$d"}}
     out = evaluate(expr, {"d": {"a": 1, "b": 2}})
     assert out == {"a": 1, "b": 2}
+
+
+def test_switch_first_matching_branch() -> None:
+    expr = {
+        "$switch": {
+            "branches": [
+                {"case": {"$lt": ["$x", 0]}, "then": "negative"},
+                {"case": {"$eq": ["$x", 0]}, "then": "zero"},
+            ],
+            "default": "positive",
+        }
+    }
+    assert evaluate(expr, {"x": -3}) == "negative"
+    assert evaluate(expr, {"x": 0}) == "zero"
+    assert evaluate(expr, {"x": 5}) == "positive"
+
+
+def test_switch_no_default_raises() -> None:
+    from secantus.expressions import ExpressionError
+
+    expr = {"$switch": {"branches": [{"case": False, "then": "x"}]}}
+    with pytest.raises(ExpressionError):
+        evaluate(expr, {})
+
+
+def test_regex_match() -> None:
+    assert evaluate({"$regexMatch": {"input": "hello", "regex": "^he"}}, {}) is True
+    assert evaluate({"$regexMatch": {"input": "hello", "regex": "^he$"}}, {}) is False
+    assert (
+        evaluate({"$regexMatch": {"input": "HELLO", "regex": "hello", "options": "i"}}, {}) is True
+    )
+
+
+def test_regex_find_returns_match_dict() -> None:
+    out = evaluate({"$regexFind": {"input": "abc123", "regex": r"(\w+)(\d+)"}}, {})
+    assert out["match"] == "abc123"
+    assert out["idx"] == 0
+    assert out["captures"] == ["abc12", "3"]
+
+
+def test_regex_find_no_match_returns_none() -> None:
+    assert evaluate({"$regexFind": {"input": "hello", "regex": "z+"}}, {}) is None
+
+
+def test_regex_find_all() -> None:
+    out = evaluate({"$regexFindAll": {"input": "a1 b22 c333", "regex": r"\d+"}}, {})
+    assert [m["match"] for m in out] == ["1", "22", "333"]

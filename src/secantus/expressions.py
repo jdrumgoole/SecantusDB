@@ -349,6 +349,98 @@ def _op_object_to_array(arg: Any, ctx: _Ctx) -> Any:
     return [{"k": k, "v": val} for k, val in v.items()]
 
 
+def _op_switch(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$switch requires {branches, default?}")
+    branches = arg.get("branches")
+    if not isinstance(branches, list):
+        raise ExpressionError("$switch branches must be an array")
+    for branch in branches:
+        if not isinstance(branch, Mapping) or "case" not in branch or "then" not in branch:
+            raise ExpressionError("each $switch branch needs case and then")
+        if _bool(_eval(branch["case"], ctx)):
+            return _eval(branch["then"], ctx)
+    if "default" in arg:
+        return _eval(arg["default"], ctx)
+    raise ExpressionError("$switch found no matching branch and no default")
+
+
+def _resolve_regex(arg: Any, ctx: _Ctx) -> tuple[str, int]:
+
+    from bson import Regex
+
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("regex expression requires {input, regex, options?}")
+    raw_pattern = _eval(arg.get("regex"), ctx)
+    raw_options = _eval(arg.get("options"), ctx) if "options" in arg else ""
+    pattern = raw_pattern
+    flags = 0
+    if isinstance(pattern, Regex):
+        flags |= _re_flags(pattern.flags)
+        pattern = pattern.pattern
+    if isinstance(raw_options, str):
+        flags |= _re_flags(raw_options)
+    if not isinstance(pattern, str):
+        raise ExpressionError("regex must be a string or BSON Regex")
+    return pattern, flags
+
+
+def _op_regex_match(arg: Any, ctx: _Ctx) -> Any:
+    import re as _re
+
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$regexMatch requires {input, regex, options?}")
+    s = _eval(arg.get("input"), ctx)
+    if not isinstance(s, str):
+        return False
+    pattern, flags = _resolve_regex(arg, ctx)
+    return bool(_re.compile(pattern, flags).search(s))
+
+
+def _op_regex_find(arg: Any, ctx: _Ctx) -> Any:
+    import re as _re
+
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$regexFind requires {input, regex, options?}")
+    s = _eval(arg.get("input"), ctx)
+    if not isinstance(s, str):
+        return None
+    pattern, flags = _resolve_regex(arg, ctx)
+    m = _re.compile(pattern, flags).search(s)
+    if m is None:
+        return None
+    return {"match": m.group(0), "idx": m.start(), "captures": list(m.groups())}
+
+
+def _op_regex_find_all(arg: Any, ctx: _Ctx) -> Any:
+    import re as _re
+
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$regexFindAll requires {input, regex, options?}")
+    s = _eval(arg.get("input"), ctx)
+    if not isinstance(s, str):
+        return []
+    pattern, flags = _resolve_regex(arg, ctx)
+    out: list[dict[str, Any]] = []
+    for m in _re.compile(pattern, flags).finditer(s):
+        out.append({"match": m.group(0), "idx": m.start(), "captures": list(m.groups())})
+    return out
+
+
+def _re_flags(flags_input: Any) -> int:
+    import re as _re
+
+    if isinstance(flags_input, int):
+        return flags_input
+    if isinstance(flags_input, bytes):
+        flags_input = flags_input.decode()
+    flags = 0
+    flag_map = {"i": _re.IGNORECASE, "m": _re.MULTILINE, "s": _re.DOTALL, "x": _re.VERBOSE}
+    for c in flags_input or "":
+        flags |= flag_map.get(c, 0)
+    return flags
+
+
 def _op_array_to_object(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
     if v is None:
@@ -362,9 +454,7 @@ def _op_array_to_object(arg: Any, ctx: _Ctx) -> Any:
         elif isinstance(entry, list) and len(entry) == 2:
             out[str(entry[0])] = entry[1]
         else:
-            raise ExpressionError(
-                "$arrayToObject entries must be {k, v} docs or [k, v] pairs"
-            )
+            raise ExpressionError("$arrayToObject entries must be {k, v} docs or [k, v] pairs")
     return out
 
 
@@ -739,6 +829,10 @@ _OPS = {
     "$mergeObjects": _op_merge_objects,
     "$objectToArray": _op_object_to_array,
     "$arrayToObject": _op_array_to_object,
+    "$switch": _op_switch,
+    "$regexMatch": _op_regex_match,
+    "$regexFind": _op_regex_find,
+    "$regexFindAll": _op_regex_find_all,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,

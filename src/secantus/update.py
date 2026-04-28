@@ -89,8 +89,9 @@ def _apply_op(doc: dict[str, Any], op: str, payload: Mapping[str, Any]) -> None:
                     set_path(doc, path, _dt.datetime.now(_dt.UTC))
                     continue
                 if kind == "timestamp":
-                    import bson as _bson
                     import time as _time
+
+                    import bson as _bson
 
                     set_path(doc, path, _bson.Timestamp(int(_time.time()), 0))
                     continue
