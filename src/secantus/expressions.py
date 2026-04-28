@@ -227,6 +227,106 @@ def _op_to_upper(arg: Any, ctx: _Ctx) -> Any:
     return value.upper() if isinstance(value, str) else value
 
 
+def _op_abs(arg: Any, ctx: _Ctx) -> Any:
+    v = _eval(arg, ctx)
+    return abs(v) if v is not None else None
+
+
+def _op_round(arg: Any, ctx: _Ctx) -> Any:
+    if isinstance(arg, list):
+        if not arg:
+            raise ExpressionError("$round requires [number, place?]")
+        n = _eval(arg[0], ctx)
+        place = _eval(arg[1], ctx) if len(arg) > 1 else 0
+    else:
+        n = _eval(arg, ctx)
+        place = 0
+    if n is None:
+        return None
+    if not isinstance(place, int):
+        place = 0
+    return round(n, place)
+
+
+def _op_floor(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    return math.floor(v) if v is not None else None
+
+
+def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    return math.ceil(v) if v is not None else None
+
+
+def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    return math.sqrt(v) if v is not None and v >= 0 else None
+
+
+def _op_pow(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or len(arg) != 2:
+        raise ExpressionError("$pow requires [base, exponent]")
+    base, exponent = _eval(arg[0], ctx), _eval(arg[1], ctx)
+    if base is None or exponent is None:
+        return None
+    return base**exponent
+
+
+def _op_exp(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    return math.exp(v) if v is not None else None
+
+
+def _op_ln(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    return math.log(v) if v is not None and v > 0 else None
+
+
+def _op_log(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    if not isinstance(arg, list) or len(arg) != 2:
+        raise ExpressionError("$log requires [number, base]")
+    n, base = _eval(arg[0], ctx), _eval(arg[1], ctx)
+    if n is None or base is None or n <= 0 or base <= 0 or base == 1:
+        return None
+    return math.log(n, base)
+
+
+def _op_log10(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    return math.log10(v) if v is not None and v > 0 else None
+
+
+def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    if isinstance(arg, list):
+        n = _eval(arg[0], ctx)
+        place = _eval(arg[1], ctx) if len(arg) > 1 else 0
+    else:
+        n = _eval(arg, ctx)
+        place = 0
+    if n is None:
+        return None
+    if not isinstance(place, int):
+        place = 0
+    factor = 10**place
+    return math.trunc(n * factor) / factor
+
+
 def _op_split(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or len(arg) != 2:
         raise ExpressionError("$split requires [string, separator]")
@@ -584,6 +684,17 @@ _OPS = {
     "$toString": _op_to_string,
     "$toLower": _op_to_lower,
     "$toUpper": _op_to_upper,
+    "$abs": _op_abs,
+    "$round": _op_round,
+    "$floor": _op_floor,
+    "$ceil": _op_ceil,
+    "$sqrt": _op_sqrt,
+    "$pow": _op_pow,
+    "$exp": _op_exp,
+    "$ln": _op_ln,
+    "$log": _op_log,
+    "$log10": _op_log10,
+    "$trunc": _op_trunc,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,

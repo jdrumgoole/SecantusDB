@@ -282,3 +282,32 @@ def test_date_from_string_on_error_fallback() -> None:
 def test_date_from_string_on_null_fallback() -> None:
     out = evaluate({"$dateFromString": {"dateString": None, "onNull": "missing"}}, {})
     assert out == "missing"
+
+
+def test_abs_round_floor_ceil() -> None:
+    assert evaluate({"$abs": -5}, {}) == 5
+    assert evaluate({"$abs": -3.7}, {}) == 3.7
+    assert evaluate({"$round": [3.7, 0]}, {}) == 4
+    assert evaluate({"$round": [3.456, 1]}, {}) == 3.5
+    assert evaluate({"$floor": 3.7}, {}) == 3
+    assert evaluate({"$ceil": 3.2}, {}) == 4
+
+
+def test_sqrt_pow() -> None:
+    assert evaluate({"$sqrt": 9}, {}) == 3
+    assert evaluate({"$sqrt": -1}, {}) is None
+    assert evaluate({"$pow": [2, 8]}, {}) == 256
+
+
+def test_log_family() -> None:
+    import math
+
+    assert evaluate({"$ln": math.e}, {}) == pytest.approx(1)
+    assert evaluate({"$log": [100, 10]}, {}) == pytest.approx(2)
+    assert evaluate({"$log10": 1000}, {}) == pytest.approx(3)
+    assert evaluate({"$ln": -1}, {}) is None
+
+
+def test_trunc() -> None:
+    assert evaluate({"$trunc": 3.7}, {}) == 3
+    assert evaluate({"$trunc": [3.456, 1]}, {}) == pytest.approx(3.4)
