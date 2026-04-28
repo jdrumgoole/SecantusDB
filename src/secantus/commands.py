@@ -136,6 +136,82 @@ def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _server_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    return {
+        "host": "secantus",
+        "version": SERVER_VERSION,
+        "process": "secantus",
+        "pid": os.getpid(),
+        "uptime": 0,
+        "uptimeMillis": 0,
+        "uptimeEstimate": 0,
+        "localTime": _dt.datetime.now(_dt.UTC),
+        "ok": 1.0,
+    }
+
+
+def _connection_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    return {
+        "authInfo": {
+            "authenticatedUsers": [],
+            "authenticatedUserRoles": [],
+            "authenticatedUserPrivileges": [],
+        },
+        "ok": 1.0,
+    }
+
+
+def _db_stats(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    colls = ctx.storage.list_collections(ctx.db_name)
+    objects = sum(
+        ctx.storage.count_matching(ctx.db_name, c, None) for c in colls
+    )
+    return {
+        "db": ctx.db_name,
+        "collections": len(colls),
+        "objects": objects,
+        "avgObjSize": 0,
+        "dataSize": 0,
+        "storageSize": 0,
+        "indexes": sum(len(ctx.storage.list_indexes(ctx.db_name, c)) for c in colls),
+        "indexSize": 0,
+        "totalSize": 0,
+        "scaleFactor": 1,
+        "ok": 1.0,
+    }
+
+
+def _coll_stats(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    coll = doc.get("collStats")
+    if not isinstance(coll, str):
+        return {
+            "ok": 0.0,
+            "errmsg": "collStats requires a collection name",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if not ctx.storage.collection_exists(ctx.db_name, coll):
+        return {
+            "ok": 0.0,
+            "errmsg": f"ns not found: {ctx.db_name}.{coll}",
+            "code": 26,
+            "codeName": "NamespaceNotFound",
+        }
+    return {
+        "ns": f"{ctx.db_name}.{coll}",
+        "count": ctx.storage.count_matching(ctx.db_name, coll, None),
+        "size": 0,
+        "avgObjSize": 0,
+        "storageSize": 0,
+        "totalIndexSize": 0,
+        "indexSizes": {},
+        "nindexes": len(ctx.storage.list_indexes(ctx.db_name, coll)),
+        "scaleFactor": 1,
+        "capped": False,
+        "ok": 1.0,
+    }
+
+
 def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     inner = doc.get("explain") or {}
     if isinstance(inner, dict):
@@ -668,6 +744,10 @@ _HANDLERS: dict[str, CommandHandler] = {
     "whatsmyuri": _whatsmyuri,
     "hostInfo": _hostinfo,
     "explain": _explain,
+    "serverStatus": _server_status,
+    "connectionStatus": _connection_status,
+    "dbStats": _db_stats,
+    "collStats": _coll_stats,
     "insert": _insert,
     "find": _find,
     "update": _update,

@@ -190,3 +190,9 @@ def test_elem_match_requires_single_element_match() -> None:
     assert not matches(doc, {"items": {"$elemMatch": {"a": {"$gt": 0}, "b": {"$lt": 5}}}})
     doc2 = {"items": [{"a": 5, "b": 2}]}
     assert matches(doc2, {"items": {"$elemMatch": {"a": {"$gt": 0}, "b": {"$lt": 5}}}})
+
+
+def test_comment_is_ignored() -> None:
+    doc = {"a": 1}
+    assert matches(doc, {"a": 1, "$comment": "for analytics"})
+    assert not matches(doc, {"a": 2, "$comment": "for analytics"})

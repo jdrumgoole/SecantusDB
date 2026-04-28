@@ -54,6 +54,8 @@ def _match_clause(
         from secantus.expressions import evaluate
 
         return _truthy(evaluate(condition, doc, vars))
+    if key == "$comment":
+        return True
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
     return _field_matches(_resolve_path(doc, key), condition)

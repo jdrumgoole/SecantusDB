@@ -866,6 +866,46 @@ def test_rename_collection_via_pymongo(client: MongoClient) -> None:
     assert ids == [1, 2]
 
 
+def test_server_status_command(client: MongoClient) -> None:
+    out = client.admin.command("serverStatus")
+    assert out["ok"] == 1.0
+    assert "version" in out
+    assert "host" in out
+
+
+def test_db_stats_counts_collections(client: MongoClient) -> None:
+    db = client["stats_db"]
+    db["a"].insert_many([{"x": 1}, {"x": 2}])
+    db["b"].insert_one({"x": 1})
+    out = db.command("dbStats")
+    assert out["ok"] == 1.0
+    assert out["db"] == "stats_db"
+    assert out["collections"] >= 2
+    assert out["objects"] >= 3
+
+
+def test_coll_stats_count(client: MongoClient) -> None:
+    db = client["coll_stats_db"]
+    db["things"].insert_many([{"_id": i} for i in range(5)])
+    out = db.command("collStats", "things")
+    assert out["ok"] == 1.0
+    assert out["count"] == 5
+
+
+def test_coll_stats_missing_namespace(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["coll_stats_missing_db"]
+    with pytest.raises(OperationFailure):
+        db.command("collStats", "missing")
+
+
+def test_query_with_comment_via_pymongo(coll) -> None:
+    coll.insert_many([{"_id": i} for i in range(3)])
+    found = list(coll.find({"$comment": "audit-trail"}))
+    assert len(found) == 3
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(
