@@ -126,9 +126,7 @@ def test_current_date_with_type_timestamp() -> None:
 
 
 def test_set_on_insert_skipped_for_existing_doc() -> None:
-    out = apply_update(
-        {"_id": 1, "n": 5}, {"$setOnInsert": {"created": True}}, is_upsert=False
-    )
+    out = apply_update({"_id": 1, "n": 5}, {"$setOnInsert": {"created": True}}, is_upsert=False)
     assert "created" not in out
 
 
