@@ -23,7 +23,7 @@ from bson import Decimal128
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
-from secantus.update import apply_update
+from secantus.update import apply_update, find_positional_matches
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS _secantus_collections (
@@ -309,7 +309,10 @@ class Storage:
                 if not matches(doc, filter):
                     continue
                 matched += 1
-                new = apply_update(doc, update, array_filters=array_filters)
+                pos = find_positional_matches(doc, filter)
+                new = apply_update(
+                    doc, update, array_filters=array_filters, positional_matches=pos
+                )
                 if new != doc:
                     new_id_key = _id_key(new["_id"])
                     conflict = self._unique_conflict(

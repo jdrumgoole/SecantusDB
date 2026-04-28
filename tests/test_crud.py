@@ -971,6 +971,15 @@ def test_positional_filtered_via_pymongo(coll) -> None:
     assert out["items"][1]["tag"] == "BIG"
 
 
+def test_positional_dollar_via_pymongo(coll) -> None:
+    coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 9}]})
+    coll.update_one({"_id": 1, "items.qty": 5}, {"$set": {"items.$.tag": "MATCH"}})
+    out = coll.find_one({"_id": 1})
+    assert out["items"][0].get("tag") is None
+    assert out["items"][1].get("tag") == "MATCH"
+    assert out["items"][2].get("tag") is None
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(

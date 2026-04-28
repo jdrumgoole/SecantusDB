@@ -178,3 +178,35 @@ def test_positional_with_unknown_filter_name_raises() -> None:
             {"$set": {"items.$[unknown].x": 9}},
             array_filters=[{"other.x": 1}],
         )
+
+
+def test_positional_dollar_sets_first_match() -> None:
+    out = apply_update(
+        {"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 5}]},
+        {"$set": {"items.$.tag": "BIG"}},
+        positional_matches={"items": 1},
+    )
+    assert out["items"][1]["tag"] == "BIG"
+    assert "tag" not in out["items"][0]
+    assert "tag" not in out["items"][2]
+
+
+def test_positional_dollar_without_match_raises() -> None:
+    with pytest.raises(UpdateError):
+        apply_update(
+            {"_id": 1, "items": [{"qty": 1}]},
+            {"$set": {"items.$.tag": "X"}},
+        )
+
+
+def test_find_positional_matches_dotted_path() -> None:
+    from secantus.update import find_positional_matches
+
+    doc = {"_id": 1, "items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]}
+    assert find_positional_matches(doc, {"items.qty": {"$gte": 5}}) == {"items": 1}
+
+
+def test_find_positional_matches_no_array_returns_empty() -> None:
+    from secantus.update import find_positional_matches
+
+    assert find_positional_matches({"x": 1}, {"x": 1}) == {}
