@@ -65,6 +65,10 @@ When secondary indexes land they will use **typed sort-key columns** (1-byte typ
 - PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.
 - The on-disk repo path is still `/Users/jdrumgoole/GIT/fongo` (legacy from the `fongo` → `fongodb` → `secantus` rename history); the package and PyPI name are `secantus`. Renaming the directory is fine, not required.
 
+## Backlog of stubs and stopgaps
+
+`tasks/backlog.md` is the canonical list of commands that are stubbed, features with simplified implementations, and work explicitly deferred from a slice. **Update it whenever you stub something, defer a slice, or discover a limitation. When you fix an item, delete its line.** Future sessions should treat that file as load-bearing — it's the only honest record of where SecantusDB's behaviour diverges from real MongoDB.
+
 ## Conventions for changes here
 
 - New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
