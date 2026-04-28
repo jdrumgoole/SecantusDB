@@ -906,6 +906,52 @@ def test_query_with_comment_via_pymongo(coll) -> None:
     assert len(found) == 3
 
 
+def test_aggregate_out_writes_to_collection(client: MongoClient) -> None:
+    db = client["out_db"]
+    db["src"].insert_many([{"_id": i, "n": i} for i in range(3)])
+    list(db["src"].aggregate([{"$match": {"n": {"$gte": 1}}}, {"$out": "dst"}]))
+    out = sorted(db["dst"].find(), key=lambda d: d["_id"])
+    assert [d["_id"] for d in out] == [1, 2]
+
+
+def test_aggregate_out_replaces_existing_collection(client: MongoClient) -> None:
+    db = client["out_replace_db"]
+    db["src"].insert_many([{"_id": 1, "x": "new"}])
+    db["dst"].insert_many([{"_id": 99, "x": "old"}])
+    list(db["src"].aggregate([{"$out": "dst"}]))
+    out = list(db["dst"].find())
+    assert len(out) == 1
+    assert out[0]["_id"] == 1
+
+
+def test_aggregate_merge_default_merges_matched(client: MongoClient) -> None:
+    db = client["merge_db"]
+    db["src"].insert_many([{"_id": 1, "n": 100}, {"_id": 2, "n": 200}])
+    db["dst"].insert_many([{"_id": 1, "tag": "old"}, {"_id": 3, "tag": "untouched"}])
+    list(db["src"].aggregate([{"$merge": "dst"}]))
+    out = sorted(db["dst"].find(), key=lambda d: d["_id"])
+    by_id = {d["_id"]: d for d in out}
+    assert by_id[1] == {"_id": 1, "n": 100, "tag": "old"}
+    assert by_id[2] == {"_id": 2, "n": 200}
+    assert by_id[3] == {"_id": 3, "tag": "untouched"}
+
+
+def test_aggregate_merge_when_matched_replace(client: MongoClient) -> None:
+    db = client["merge_replace_db"]
+    db["src"].insert_one({"_id": 1, "n": 99})
+    db["dst"].insert_one({"_id": 1, "tag": "old"})
+    list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": "replace"}}]))
+    out = list(db["dst"].find())
+    assert out == [{"_id": 1, "n": 99}]
+
+
+def test_aggregate_merge_when_not_matched_discard(client: MongoClient) -> None:
+    db = client["merge_discard_db"]
+    db["src"].insert_one({"_id": 1, "n": 99})
+    list(db["src"].aggregate([{"$merge": {"into": "dst", "whenNotMatched": "discard"}}]))
+    assert list(db["dst"].find()) == []
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(

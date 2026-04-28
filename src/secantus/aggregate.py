@@ -507,6 +507,81 @@ def _stage_bucket(
     return result
 
 
+def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> list[dict[str, Any]]:
+    if ctx.storage is None:
+        raise AggregateError("$out requires storage context")
+    if isinstance(spec, str):
+        target_db, target_coll = ctx.db_name, spec
+    elif isinstance(spec, Mapping):
+        target_db = spec.get("db", ctx.db_name)
+        target_coll = spec.get("coll")
+        if not isinstance(target_coll, str):
+            raise AggregateError("$out requires a coll string")
+    else:
+        raise AggregateError("$out requires a string or {db, coll}")
+    ctx.storage.drop_collection(target_db, target_coll)
+    if docs:
+        ctx.storage.insert(target_db, target_coll, [copy.deepcopy(d) for d in docs])
+    return []
+
+
+def _stage_merge(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if ctx.storage is None:
+        raise AggregateError("$merge requires storage context")
+    if isinstance(spec, str):
+        target_db, target_coll = ctx.db_name, spec
+        on_fields: list[str] = ["_id"]
+        when_matched = "merge"
+        when_not_matched = "insert"
+    elif isinstance(spec, Mapping):
+        into = spec.get("into")
+        if isinstance(into, str):
+            target_db, target_coll = ctx.db_name, into
+        elif isinstance(into, Mapping):
+            target_db = into.get("db", ctx.db_name)
+            target_coll = into.get("coll")
+            if not isinstance(target_coll, str):
+                raise AggregateError("$merge into.coll must be a string")
+        else:
+            raise AggregateError("$merge requires into")
+        on = spec.get("on", "_id")
+        on_fields = [on] if isinstance(on, str) else list(on)
+        when_matched = spec.get("whenMatched", "merge")
+        when_not_matched = spec.get("whenNotMatched", "insert")
+    else:
+        raise AggregateError("$merge requires a string or document spec")
+
+    for doc in docs:
+        match_filter = {f: get_path(doc, f) for f in on_fields}
+        existing = ctx.storage.find_matching(target_db, target_coll, match_filter, limit=1)
+        if existing:
+            if when_matched == "fail":
+                raise AggregateError("$merge whenMatched=fail and a match exists")
+            if when_matched == "keepExisting":
+                continue
+            if when_matched == "replace":
+                ctx.storage.delete_matching(
+                    target_db, target_coll, {"_id": existing[0]["_id"]}, limit=1
+                )
+                new = copy.deepcopy(doc)
+                new.setdefault("_id", existing[0]["_id"])
+                ctx.storage.insert(target_db, target_coll, [new])
+            else:  # default "merge"
+                merged = {**existing[0], **doc, "_id": existing[0]["_id"]}
+                ctx.storage.update_matching(
+                    target_db, target_coll, {"_id": existing[0]["_id"]}, merged
+                )
+        else:
+            if when_not_matched == "fail":
+                raise AggregateError("$merge whenNotMatched=fail and no match exists")
+            if when_not_matched == "discard":
+                continue
+            ctx.storage.insert(target_db, target_coll, [copy.deepcopy(doc)])
+    return []
+
+
 _STAGES = {
     "$match": _stage_match,
     "$count": _stage_count,
@@ -526,4 +601,6 @@ _STAGES = {
     "$sortByCount": _stage_sort_by_count,
     "$facet": _stage_facet,
     "$bucket": _stage_bucket,
+    "$out": _stage_out,
+    "$merge": _stage_merge,
 }
