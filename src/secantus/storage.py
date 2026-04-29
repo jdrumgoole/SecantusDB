@@ -1,23 +1,31 @@
-"""SQLite-backed document store.
+"""WiredTiger-backed document store.
 
-Indexes are a STOPGAP, not real indexing. ``createIndex`` records the
-definition (so ``listIndexes`` returns it accurately) and enforces
-``unique`` constraints by full-scanning the collection on every write.
-There is no lookup acceleration: queries always full-scan the document
-table and filter in Python. Replace this with a typed-sort-key BLOB
-column scheme (per CLAUDE.md "Layer 3") if/when test suites grow large
-enough to feel the difference.
+WiredTiger is the default storage engine for MongoDB. We use the same
+engine here so that on-disk semantics line up with what test code would
+see against a real ``mongod``.
+
+Indexes use a sidecar entries table (``table:secantus_index_entries``)
+keyed by ``(db, coll, name, value_bytes, id_key)``. ``value_bytes`` comes
+from ``_canon_value`` so byte-equal values collide — that's enough for
+equality lookup and unique enforcement. Single-field equality filters
+are routed through the index in ``find_matching``; everything else still
+falls back to a full collection scan. Range / sort acceleration needs a
+typed sort-key encoder (see backlog).
 """
 
 from __future__ import annotations
 
-import sqlite3
+import contextlib
+import os
+import shutil
+import tempfile
 import threading
 from collections.abc import Iterable, Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
+import wiredtiger as wt
 from bson import Decimal128
 
 from secantus.paths import get_path, has_path
@@ -25,31 +33,10 @@ from secantus.projection import apply_projection
 from secantus.query import matches
 from secantus.update import apply_update, find_positional_matches
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS _secantus_collections (
-    db_name   TEXT NOT NULL,
-    coll_name TEXT NOT NULL,
-    options   BLOB,
-    PRIMARY KEY (db_name, coll_name)
-);
-
-CREATE TABLE IF NOT EXISTS _secantus_documents (
-    db_name   TEXT NOT NULL,
-    coll_name TEXT NOT NULL,
-    id_key    BLOB NOT NULL,
-    doc       BLOB NOT NULL,
-    PRIMARY KEY (db_name, coll_name, id_key)
-);
-
-CREATE TABLE IF NOT EXISTS _secantus_indexes (
-    db_name    TEXT NOT NULL,
-    coll_name  TEXT NOT NULL,
-    index_name TEXT NOT NULL,
-    key_spec   BLOB NOT NULL,
-    options    BLOB,
-    PRIMARY KEY (db_name, coll_name, index_name)
-);
-"""
+_COLL_TABLE = "table:secantus_collections"
+_DOC_TABLE = "table:secantus_documents"
+_IDX_TABLE = "table:secantus_indexes"
+_IDX_ENTRIES_TABLE = "table:secantus_index_entries"
 
 
 class DuplicateKeyError(Exception):
@@ -129,7 +116,7 @@ def _bson_type_rank(value: Any) -> int:
     if value is None:
         return 2
     if isinstance(value, bool):
-        return 9  # bool is a separate rank below numbers
+        return 9
     if isinstance(value, (int, float, Decimal128)):
         return 3
     if isinstance(value, str):
@@ -150,7 +137,7 @@ def _bson_type_rank(value: Any) -> int:
         return 12
     if isinstance(value, MaxKey):
         return 13
-    return 5  # unknown -> object-rank
+    return 5
 
 
 class _SortKey:
@@ -209,35 +196,121 @@ class IndexConflict(Exception):
 
 class Storage:
     def __init__(self, path: str = ":memory:") -> None:
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self._conn.executescript(_SCHEMA)
         self._lock = threading.RLock()
+        self._closed = False
+        self._tempdir: str | None = None
+        if path == ":memory:":
+            self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
+            home = self._tempdir
+            config = "create,in_memory=true"
+        else:
+            os.makedirs(path, exist_ok=True)
+            home = path
+            config = "create"
+        self._conn = wt.wiredtiger_open(home, config)
+        self._tls = threading.local()
+        self._all_sessions: list[Any] = []
+        boot = self._conn.open_session()
+        try:
+            boot.create(_COLL_TABLE, "key_format=SS,value_format=u")
+            boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
+            boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
+            boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSuu,value_format=u")
+        finally:
+            boot.close()
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            if self._closed:
+                return
+            self._closed = True
+            for s in self._all_sessions:
+                with contextlib.suppress(Exception):
+                    s.close()
+            self._all_sessions.clear()
+            with contextlib.suppress(Exception):
+                self._conn.close()
+            if self._tempdir is not None:
+                shutil.rmtree(self._tempdir, ignore_errors=True)
+                self._tempdir = None
+
+    def _session(self) -> Any:
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            s = self._conn.open_session()
+            self._tls.session = s
+            self._tls.cursors = {}
+            with self._lock:
+                self._all_sessions.append(s)
+        return s
+
+    def _cursor(self, table: str, *, overwrite: bool = True) -> Any:
+        self._session()
+        cursors: dict[tuple[str, bool], Any] = self._tls.cursors
+        key = (table, overwrite)
+        c = cursors.get(key)
+        if c is None:
+            cfg = None if overwrite else "overwrite=false"
+            c = self._tls.session.open_cursor(table, None, cfg)
+            cursors[key] = c
+        else:
+            c.reset()
+        return c
+
+    def _coll_options(self, db: str, coll: str) -> dict[str, Any] | None:
+        c = self._cursor(_COLL_TABLE)
+        c.set_key(db, coll)
+        rc = c.search()
+        if rc != 0:
+            return None
+        blob = bytes(c.get_value())
+        return bson.decode(blob) if blob else {}
 
     def _ensure_collection(self, db: str, coll: str) -> None:
-        self._conn.execute(
-            "INSERT OR IGNORE INTO _secantus_collections(db_name, coll_name) VALUES (?, ?)",
-            (db, coll),
-        )
+        c = self._cursor(_COLL_TABLE)
+        c.set_key(db, coll)
+        if c.search() == 0:
+            return
+        c.reset()
+        c[db, coll] = b""
 
     def collection_exists(self, db: str, coll: str) -> bool:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            ).fetchone()
-            return row is not None
+            return self._coll_options(db, coll) is not None
 
     def create_collection(self, db: str, coll: str) -> bool:
         with self._lock:
-            cursor = self._conn.execute(
-                "INSERT OR IGNORE INTO _secantus_collections(db_name, coll_name) VALUES (?, ?)",
-                (db, coll),
-            )
-            return cursor.rowcount > 0
+            c = self._cursor(_COLL_TABLE)
+            c.set_key(db, coll)
+            if c.search() == 0:
+                return False
+            c.reset()
+            c[db, coll] = b""
+            return True
+
+    def _scan_docs(self, db: str, coll: str) -> Iterable[tuple[bytes, bytes]]:
+        c = self._cursor(_DOC_TABLE)
+        c.set_key(db, coll, b"")
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return
+        if rc < 0 and c.next() != 0:
+            return
+        while True:
+            k = c.get_key()
+            if k[0] != db or k[1] != coll:
+                return
+            yield bytes(k[2]), bytes(c.get_value())
+            if c.next() != 0:
+                return
+
+    def _all_docs(self, db: str, coll: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return [bson.decode(blob) for _id_k, blob in self._scan_docs(db, coll)]
+
+    def _all_docs_with_id_key(self, db: str, coll: str) -> list[tuple[dict[str, Any], bytes]]:
+        with self._lock:
+            return [(bson.decode(blob), id_k) for id_k, blob in self._scan_docs(db, coll)]
 
     def insert(
         self, db: str, coll: str, docs: Iterable[dict[str, Any]], *, ordered: bool = True
@@ -246,7 +319,7 @@ class Storage:
         errors: list[dict[str, Any]] = []
         with self._lock:
             self._ensure_collection(db, coll)
-            indexes = self._unique_indexes(db, coll)
+            indexes = self._all_indexes(db, coll)
             for index, doc in enumerate(docs):
                 if "_id" not in doc:
                     doc["_id"] = bson.ObjectId()
@@ -267,14 +340,12 @@ class Storage:
                         break
                     continue
                 blob = bson.encode(doc)
+                doc_cur = self._cursor(_DOC_TABLE, overwrite=False)
+                doc_cur.set_key(db, coll, key)
+                doc_cur.set_value(blob)
                 try:
-                    self._conn.execute(
-                        "INSERT INTO _secantus_documents(db_name, coll_name, id_key, doc) "
-                        "VALUES (?, ?, ?, ?)",
-                        (db, coll, key, blob),
-                    )
-                    inserted += 1
-                except sqlite3.IntegrityError:
+                    doc_cur.insert()
+                except wt.WiredTigerError:
                     errors.append(
                         {
                             "index": index,
@@ -284,23 +355,10 @@ class Storage:
                     )
                     if ordered:
                         break
+                    continue
+                self._write_index_entries(db, coll, doc, indexes)
+                inserted += 1
         return inserted, errors
-
-    def _all_docs(self, db: str, coll: str) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT doc FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            ).fetchall()
-        return [bson.decode(blob) for (blob,) in rows]
-
-    def _all_docs_with_id_key(self, db: str, coll: str) -> list[tuple[dict[str, Any], bytes]]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT doc, id_key FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            ).fetchall()
-        return [(bson.decode(blob), id_key) for (blob, id_key) in rows]
 
     def find_matching(
         self,
@@ -314,10 +372,11 @@ class Storage:
         projection: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         filter = filter or {}
-        out: list[dict[str, Any]] = []
-        for doc in self._all_docs(db, coll):
-            if matches(doc, filter):
-                out.append(doc)
+        with self._lock:
+            candidates = self._try_index_lookup(db, coll, filter)
+            if candidates is None:
+                candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
+        out = [d for d in candidates if matches(d, filter)]
         if sort:
             out = sort_docs(out, sort)
         if skip:
@@ -331,11 +390,7 @@ class Storage:
     def count_matching(self, db: str, coll: str, filter: dict[str, Any] | None = None) -> int:
         if not filter:
             with self._lock:
-                row = self._conn.execute(
-                    "SELECT COUNT(*) FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
-                    (db, coll),
-                ).fetchone()
-                return row[0]
+                return sum(1 for _ in self._scan_docs(db, coll))
         return sum(1 for doc in self._all_docs(db, coll) if matches(doc, filter))
 
     def update_matching(
@@ -354,7 +409,7 @@ class Storage:
         upserted_id: Any = None
         with self._lock:
             self._ensure_collection(db, coll)
-            indexes = self._unique_indexes(db, coll)
+            indexes = self._all_indexes(db, coll)
             for doc in self._all_docs(db, coll):
                 if not matches(doc, filter):
                     continue
@@ -369,11 +424,10 @@ class Storage:
                     if conflict is not None:
                         raise IndexConflict(conflict, new["_id"])
                     modified += 1
-                    self._conn.execute(
-                        "UPDATE _secantus_documents SET doc = ? "
-                        "WHERE db_name = ? AND coll_name = ? AND id_key = ?",
-                        (bson.encode(new), db, coll, new_id_key),
-                    )
+                    self._delete_index_entries(db, coll, doc, indexes)
+                    doc_cur = self._cursor(_DOC_TABLE)
+                    doc_cur[db, coll, new_id_key] = bson.encode(new)
+                    self._write_index_entries(db, coll, new, indexes)
                 if not multi:
                     break
             if matched == 0 and upsert:
@@ -388,51 +442,89 @@ class Storage:
                 conflict = self._unique_conflict(db, coll, new, indexes, exclude_id_key=None)
                 if conflict is not None:
                     raise IndexConflict(conflict, new["_id"])
-                self._conn.execute(
-                    "INSERT INTO _secantus_documents(db_name, coll_name, id_key, doc) "
-                    "VALUES (?, ?, ?, ?)",
-                    (db, coll, _id_key(upserted_id), bson.encode(new)),
-                )
+                doc_cur = self._cursor(_DOC_TABLE)
+                doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
+                self._write_index_entries(db, coll, new, indexes)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
 
     def delete_matching(self, db: str, coll: str, filter: dict[str, Any], *, limit: int = 0) -> int:
         deleted = 0
         with self._lock:
+            indexes = self._all_indexes(db, coll)
             for doc in self._all_docs(db, coll):
                 if not matches(doc, filter):
                     continue
-                self._conn.execute(
-                    "DELETE FROM _secantus_documents "
-                    "WHERE db_name = ? AND coll_name = ? AND id_key = ?",
-                    (db, coll, _id_key(doc["_id"])),
-                )
+                self._delete_index_entries(db, coll, doc, indexes)
+                doc_cur = self._cursor(_DOC_TABLE)
+                doc_cur.set_key(db, coll, _id_key(doc["_id"]))
+                doc_cur.remove()
                 deleted += 1
                 if limit > 0 and deleted >= limit:
                     break
         return deleted
 
+    @staticmethod
+    def _table_kf(table: str) -> str:
+        return {
+            _COLL_TABLE: "SS",
+            _DOC_TABLE: "SSu",
+            _IDX_TABLE: "SSS",
+            _IDX_ENTRIES_TABLE: "SSSuu",
+        }[table]
+
+    @staticmethod
+    def _smallest_for_kf(kf: str) -> tuple[Any, ...]:
+        return tuple(b"" if c == "u" else "" for c in kf)
+
+    def _collect_prefix(
+        self, table: str, prefix: tuple[Any, ...]
+    ) -> list[tuple[tuple[Any, ...], Any]]:
+        c = self._cursor(table)
+        kf = self._table_kf(table)
+        seed = prefix + self._smallest_for_kf(kf)[len(prefix) :]
+        c.set_key(*seed)
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return []
+        if rc < 0 and c.next() != 0:
+            return []
+        out: list[tuple[tuple[Any, ...], Any]] = []
+        while True:
+            k = tuple(c.get_key())
+            if k[: len(prefix)] != prefix:
+                break
+            v = c.get_value()
+            out.append((k, bytes(v) if isinstance(v, (bytes, bytearray)) else v))
+            if c.next() != 0:
+                break
+        return out
+
+    def _delete_keys(self, table: str, keys: list[tuple[Any, ...]]) -> None:
+        if not keys:
+            return
+        c = self._cursor(table)
+        for k in keys:
+            c.set_key(*k)
+            c.remove()
+            c.reset()
+
     def drop_collection(self, db: str, coll: str) -> bool:
         with self._lock:
-            existed = self.collection_exists(db, coll)
-            self._conn.execute(
-                "DELETE FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            )
-            self._conn.execute(
-                "DELETE FROM _secantus_indexes WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            )
-            self._conn.execute(
-                "DELETE FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            )
+            existed = self._coll_options(db, coll) is not None
+            for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+                rows = self._collect_prefix(tbl, (db, coll))
+                self._delete_keys(tbl, [k for k, _ in rows])
+            c = self._cursor(_COLL_TABLE)
+            c.set_key(db, coll)
+            if c.search() == 0:
+                c.remove()
             return existed
 
     def drop_database(self, db: str) -> None:
         with self._lock:
-            self._conn.execute("DELETE FROM _secantus_documents WHERE db_name = ?", (db,))
-            self._conn.execute("DELETE FROM _secantus_indexes WHERE db_name = ?", (db,))
-            self._conn.execute("DELETE FROM _secantus_collections WHERE db_name = ?", (db,))
+            for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE, _COLL_TABLE):
+                rows = self._collect_prefix(tbl, (db,))
+                self._delete_keys(tbl, [k for k, _ in rows])
 
     def rename_collection(
         self,
@@ -444,59 +536,70 @@ class Storage:
         drop_target: bool = False,
     ) -> tuple[bool, str | None]:
         with self._lock:
-            if not self.collection_exists(src_db, src_coll):
+            if self._coll_options(src_db, src_coll) is None:
                 return False, f"source namespace does not exist: {src_db}.{src_coll}"
             if (src_db, src_coll) == (dst_db, dst_coll):
                 return True, None
-            if self.collection_exists(dst_db, dst_coll):
+            if self._coll_options(dst_db, dst_coll) is not None:
                 if not drop_target:
                     return False, f"target namespace exists: {dst_db}.{dst_coll}"
-                self._conn.execute(
-                    "DELETE FROM _secantus_documents WHERE db_name = ? AND coll_name = ?",
-                    (dst_db, dst_coll),
-                )
-                self._conn.execute(
-                    "DELETE FROM _secantus_indexes WHERE db_name = ? AND coll_name = ?",
-                    (dst_db, dst_coll),
-                )
-                self._conn.execute(
-                    "DELETE FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
-                    (dst_db, dst_coll),
-                )
-            self._conn.execute(
-                "UPDATE _secantus_documents SET db_name = ?, coll_name = ? "
-                "WHERE db_name = ? AND coll_name = ?",
-                (dst_db, dst_coll, src_db, src_coll),
-            )
-            self._conn.execute(
-                "UPDATE _secantus_indexes SET db_name = ?, coll_name = ? "
-                "WHERE db_name = ? AND coll_name = ?",
-                (dst_db, dst_coll, src_db, src_coll),
-            )
-            self._conn.execute(
-                "INSERT OR IGNORE INTO _secantus_collections(db_name, coll_name) VALUES (?, ?)",
-                (dst_db, dst_coll),
-            )
-            self._conn.execute(
-                "DELETE FROM _secantus_collections WHERE db_name = ? AND coll_name = ?",
-                (src_db, src_coll),
-            )
+                for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+                    rows = self._collect_prefix(tbl, (dst_db, dst_coll))
+                    self._delete_keys(tbl, [k for k, _ in rows])
+                c = self._cursor(_COLL_TABLE)
+                c.set_key(dst_db, dst_coll)
+                if c.search() == 0:
+                    c.remove()
+            for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+                rows = self._collect_prefix(tbl, (src_db, src_coll))
+                self._delete_keys(tbl, [k for k, _ in rows])
+                c = self._cursor(tbl)
+                for k, v in rows:
+                    new_k = (dst_db, dst_coll) + k[2:]
+                    c.set_key(*new_k)
+                    c.set_value(v)
+                    c.insert()
+                    c.reset()
+            ensure = self._cursor(_COLL_TABLE)
+            ensure.set_key(dst_db, dst_coll)
+            if ensure.search() != 0:
+                ensure.reset()
+                ensure[dst_db, dst_coll] = b""
+            ensure.reset()
+            ensure.set_key(src_db, src_coll)
+            if ensure.search() == 0:
+                ensure.remove()
             return True, None
 
     def list_collections(self, db: str) -> list[str]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT coll_name FROM _secantus_collections WHERE db_name = ? ORDER BY coll_name",
-                (db,),
-            ).fetchall()
-        return [r[0] for r in rows]
+            c = self._cursor(_COLL_TABLE)
+            c.set_key(db, "")
+            rc = c.search_near()
+            if rc == wt.WT_NOTFOUND:
+                return []
+            if rc < 0 and c.next() != 0:
+                return []
+            out: list[str] = []
+            while True:
+                k = c.get_key()
+                if k[0] != db:
+                    break
+                out.append(k[1])
+                if c.next() != 0:
+                    break
+            return sorted(out)
 
     def list_databases(self) -> list[str]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT db_name FROM _secantus_collections ORDER BY db_name"
-            ).fetchall()
-        return [r[0] for r in rows]
+            c = self._cursor(_COLL_TABLE)
+            seen: set[str] = set()
+            rc = c.next()
+            while rc == 0:
+                k = c.get_key()
+                seen.add(k[0])
+                rc = c.next()
+            return sorted(seen)
 
     def create_index(
         self,
@@ -511,15 +614,13 @@ class Storage:
         options = dict(options or {})
         with self._lock:
             self._ensure_collection(db, coll)
-            existing = self._conn.execute(
-                "SELECT key_spec, options FROM _secantus_indexes "
-                "WHERE db_name = ? AND coll_name = ? AND index_name = ?",
-                (db, coll, name),
-            ).fetchone()
-            if existing is not None:
+            c = self._cursor(_IDX_TABLE)
+            c.set_key(db, coll, name)
+            if c.search() == 0:
                 return False
-            if options.get("unique"):
-                sparse = bool(options.get("sparse"))
+            sparse = bool(options.get("sparse"))
+            unique = bool(options.get("unique"))
+            if unique:
                 seen: dict[bytes, Any] = {}
                 for d in self._all_docs(db, coll):
                     key = _index_key(d, key_spec, sparse=sparse)
@@ -528,87 +629,195 @@ class Storage:
                     if key in seen:
                         raise IndexConflict(name, d.get("_id"))
                     seen[key] = d.get("_id")
-            self._conn.execute(
-                "INSERT INTO _secantus_indexes(db_name, coll_name, index_name, key_spec, options) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (db, coll, name, bson.encode(dict(key_spec)), bson.encode(options)),
-            )
+            payload = bson.encode({"key": dict(key_spec), "options": options})
+            c.reset()
+            c[db, coll, name] = payload
+            entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
+            for d in self._all_docs(db, coll):
+                kb = _index_key(d, dict(key_spec), sparse=sparse)
+                if kb is None:
+                    continue
+                entry_cur.reset()
+                entry_cur[db, coll, name, kb, _id_key(d["_id"])] = b""
             return True
 
     def list_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
-        if not self.collection_exists(db, coll):
-            return []
-        out: list[dict[str, Any]] = [{"v": 2, "key": {"_id": 1}, "name": _ID_INDEX_NAME}]
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT index_name, key_spec, options FROM _secantus_indexes "
-                "WHERE db_name = ? AND coll_name = ? ORDER BY index_name",
-                (db, coll),
-            ).fetchall()
-        for name, key_blob, opts_blob in rows:
-            entry: dict[str, Any] = {
-                "v": 2,
-                "key": bson.decode(key_blob),
-                "name": name,
-            }
-            if opts_blob:
-                opts = bson.decode(opts_blob)
+            if self._coll_options(db, coll) is None:
+                return []
+            out: list[dict[str, Any]] = [{"v": 2, "key": {"_id": 1}, "name": _ID_INDEX_NAME}]
+            for name, key_spec, opts in self._iter_indexes(db, coll):
+                entry: dict[str, Any] = {"v": 2, "key": key_spec, "name": name}
                 for k, v in opts.items():
                     entry[k] = v
-            out.append(entry)
-        return out
+                out.append(entry)
+            out.sort(key=lambda e: e["name"])
+            return out
+
+    def _iter_indexes(
+        self, db: str, coll: str
+    ) -> Iterable[tuple[str, dict[str, Any], dict[str, Any]]]:
+        c = self._cursor(_IDX_TABLE)
+        c.set_key(db, coll, "")
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return
+        if rc < 0 and c.next() != 0:
+            return
+        while True:
+            k = c.get_key()
+            if k[0] != db or k[1] != coll:
+                return
+            payload = bson.decode(bytes(c.get_value()))
+            yield k[2], payload.get("key", {}), payload.get("options", {})
+            if c.next() != 0:
+                return
 
     def drop_index(self, db: str, coll: str, name: str) -> bool:
         if name == _ID_INDEX_NAME:
             return False
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM _secantus_indexes "
-                "WHERE db_name = ? AND coll_name = ? AND index_name = ?",
-                (db, coll, name),
-            )
-            return cursor.rowcount > 0
+            c = self._cursor(_IDX_TABLE)
+            c.set_key(db, coll, name)
+            if c.search() != 0:
+                return False
+            c.remove()
+            entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, name))
+            self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            return True
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM _secantus_indexes WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            )
-            return cursor.rowcount
+            rows = self._collect_prefix(_IDX_TABLE, (db, coll))
+            self._delete_keys(_IDX_TABLE, [k for k, _ in rows])
+            entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
+            self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            return len(rows)
 
-    def _unique_indexes(self, db: str, coll: str) -> list[tuple[str, dict[str, Any], bool]]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT index_name, key_spec, options FROM _secantus_indexes "
-                "WHERE db_name = ? AND coll_name = ?",
-                (db, coll),
-            ).fetchall()
-        out: list[tuple[str, dict[str, Any], bool]] = []
-        for name, key_blob, opts_blob in rows:
-            opts = bson.decode(opts_blob) if opts_blob else {}
-            if opts.get("unique"):
-                out.append((name, bson.decode(key_blob), bool(opts.get("sparse"))))
+    def _all_indexes(self, db: str, coll: str) -> list[tuple[str, dict[str, Any], bool, bool]]:
+        """Every non-_id_ index: (name, key_spec, sparse, unique)."""
+        out: list[tuple[str, dict[str, Any], bool, bool]] = []
+        for name, key_spec, opts in list(self._iter_indexes(db, coll)):
+            out.append((name, key_spec, bool(opts.get("sparse")), bool(opts.get("unique"))))
         return out
+
+    def _write_index_entries(
+        self,
+        db: str,
+        coll: str,
+        doc: dict[str, Any],
+        indexes: list[tuple[str, dict[str, Any], bool, bool]],
+    ) -> None:
+        if not indexes:
+            return
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        id_k = _id_key(doc["_id"])
+        for name, key_spec, sparse, _unique in indexes:
+            kb = _index_key(doc, key_spec, sparse=sparse)
+            if kb is None:
+                continue
+            c.reset()
+            c[db, coll, name, kb, id_k] = b""
+
+    def _delete_index_entries(
+        self,
+        db: str,
+        coll: str,
+        doc: dict[str, Any],
+        indexes: list[tuple[str, dict[str, Any], bool, bool]],
+    ) -> None:
+        if not indexes:
+            return
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        id_k = _id_key(doc["_id"])
+        for name, key_spec, sparse, _unique in indexes:
+            kb = _index_key(doc, key_spec, sparse=sparse)
+            if kb is None:
+                continue
+            c.reset()
+            c.set_key(db, coll, name, kb, id_k)
+            if c.search() == 0:
+                c.remove()
 
     def _unique_conflict(
         self,
         db: str,
         coll: str,
         candidate_doc: dict[str, Any],
-        indexes: list[tuple[str, dict[str, Any], bool]],
+        indexes: list[tuple[str, dict[str, Any], bool, bool]],
         *,
         exclude_id_key: bytes | None,
     ) -> str | None:
         if not indexes:
             return None
-        for name, key_spec, sparse in indexes:
-            new_key = _index_key(candidate_doc, key_spec, sparse=sparse)
-            if new_key is None:
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        for name, key_spec, sparse, unique in indexes:
+            if not unique:
                 continue
-            for other_doc, other_id_key in self._all_docs_with_id_key(db, coll):
-                if exclude_id_key is not None and other_id_key == exclude_id_key:
-                    continue
-                if _index_key(other_doc, key_spec, sparse=sparse) == new_key:
+            kb = _index_key(candidate_doc, key_spec, sparse=sparse)
+            if kb is None:
+                continue
+            c.reset()
+            c.set_key(db, coll, name, kb, b"")
+            rc = c.search_near()
+            if rc == wt.WT_NOTFOUND:
+                continue
+            if rc < 0 and c.next() != 0:
+                continue
+            while True:
+                k = c.get_key()
+                if (k[0], k[1], k[2]) != (db, coll, name) or bytes(k[3]) != kb:
+                    break
+                other_id = bytes(k[4])
+                if exclude_id_key is None or other_id != exclude_id_key:
                     return name
+                if c.next() != 0:
+                    break
+        return None
+
+    def _scan_index_for_id_keys(self, db: str, coll: str, name: str, kb: bytes) -> list[bytes]:
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        c.set_key(db, coll, name, kb, b"")
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return []
+        if rc < 0 and c.next() != 0:
+            return []
+        out: list[bytes] = []
+        while True:
+            k = c.get_key()
+            if (k[0], k[1], k[2]) != (db, coll, name) or bytes(k[3]) != kb:
+                break
+            out.append(bytes(k[4]))
+            if c.next() != 0:
+                break
+        return out
+
+    def _docs_by_id_keys(self, db: str, coll: str, id_keys: list[bytes]) -> list[dict[str, Any]]:
+        if not id_keys:
+            return []
+        c = self._cursor(_DOC_TABLE)
+        out: list[dict[str, Any]] = []
+        for id_k in id_keys:
+            c.reset()
+            c.set_key(db, coll, id_k)
+            if c.search() == 0:
+                out.append(bson.decode(bytes(c.get_value())))
+        return out
+
+    def _try_index_lookup(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        if not filter or len(filter) != 1:
+            return None
+        field, value = next(iter(filter.items()))
+        if field.startswith("$"):
+            return None
+        if isinstance(value, dict):
+            return None
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if list(key_spec.keys()) == [field]:
+                kb = _canon_value(value)
+                id_keys = self._scan_index_for_id_keys(db, coll, name, kb)
+                return self._docs_by_id_keys(db, coll, id_keys)
         return None
