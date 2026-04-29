@@ -8,6 +8,8 @@ from typing import Any
 
 import bson
 
+from collections.abc import Mapping
+
 from secantus.aggregate import PipelineContext, apply_pipeline
 from secantus.cursors import CursorNotFound, CursorRegistry
 from secantus.projection import apply_projection
@@ -711,13 +713,24 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     pipeline = doc.get("pipeline", [])
     cursor_opts = doc.get("cursor") or {}
     batch_size = int(cursor_opts.get("batchSize", 0) or 0)
+    coll_name = ""
     if isinstance(coll, str):
-        docs: list[dict[str, Any]] = ctx.storage.find_matching(ctx.db_name, coll, {})
+        coll_name = coll
+        first_stage = pipeline[0] if pipeline else {}
+        if isinstance(first_stage, Mapping) and (
+            "$collStats" in first_stage
+            or "$indexStats" in first_stage
+            or "$documents" in first_stage
+        ):
+            docs: list[dict[str, Any]] = []
+        else:
+            docs = ctx.storage.find_matching(ctx.db_name, coll, {})
         ns = _ns(ctx.db_name, coll)
     else:
         docs = []
         ns = f"{ctx.db_name}.$cmd.aggregate"
-    docs = apply_pipeline(docs, pipeline, PipelineContext(storage=ctx.storage, db_name=ctx.db_name))
+    pipeline_ctx = PipelineContext(storage=ctx.storage, db_name=ctx.db_name, coll_name=coll_name)
+    docs = apply_pipeline(docs, pipeline, pipeline_ctx)
     first_batch, cursor_id = _split_into_cursor(
         docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
     )

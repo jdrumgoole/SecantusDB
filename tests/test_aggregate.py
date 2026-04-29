@@ -227,6 +227,32 @@ def test_bucket_basic_ranges() -> None:
     assert by_id["other"] == 1
 
 
+def test_bucket_auto_even_split() -> None:
+    docs = [{"v": i} for i in range(10)]
+    out = apply_pipeline(docs, [{"$bucketAuto": {"groupBy": "$v", "buckets": 5}}])
+    assert len(out) == 5
+    assert sum(b["count"] for b in out) == 10
+    assert out[0]["_id"]["min"] == 0
+
+
+def test_bucket_auto_with_output() -> None:
+    docs = [{"v": i, "n": i * 2} for i in range(8)]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$bucketAuto": {
+                    "groupBy": "$v",
+                    "buckets": 4,
+                    "output": {"total_n": {"$sum": "$n"}},
+                }
+            }
+        ],
+    )
+    assert len(out) == 4
+    assert sum(b["total_n"] for b in out) == sum(d["n"] for d in docs)
+
+
 def test_lookup_requires_storage_context() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline(

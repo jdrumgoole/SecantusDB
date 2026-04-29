@@ -1043,6 +1043,39 @@ def test_documents_stage(client: MongoClient) -> None:
     assert sorted(d["_id"] for d in out) == [1, 2]
 
 
+def test_coll_stats_aggregation_stage(client: MongoClient) -> None:
+    db = client["collstats_agg_db"]
+    db["things"].insert_many([{"_id": i} for i in range(5)])
+    out = list(db["things"].aggregate([{"$collStats": {"storageStats": {}}}]))
+    assert len(out) == 1
+    assert out[0]["ns"] == "collstats_agg_db.things"
+    assert out[0]["storageStats"]["count"] == 5
+
+
+def test_index_stats_aggregation_stage(client: MongoClient) -> None:
+    db = client["indexstats_db"]
+    db["things"].insert_one({"x": 1})
+    db["things"].create_index("x")
+    out = list(db["things"].aggregate([{"$indexStats": {}}]))
+    names = sorted(d["name"] for d in out)
+    assert names == ["_id_", "x_1"]
+
+
+def test_bucket_auto_via_pymongo(coll) -> None:
+    coll.insert_many([{"v": i} for i in range(10)])
+    pipeline = [{"$bucketAuto": {"groupBy": "$v", "buckets": 4}}]
+    out = list(coll.aggregate(pipeline))
+    assert len(out) == 4
+    assert sum(b["count"] for b in out) == 10
+
+
+def test_rename_with_positional_via_pymongo(coll) -> None:
+    coll.insert_one({"_id": 1, "items": [{"a": 1}, {"a": 2}]})
+    coll.update_one({"_id": 1}, {"$rename": {"items.$[].a": "items.$[].b"}})
+    out = coll.find_one({"_id": 1})
+    assert out["items"] == [{"b": 1}, {"b": 2}]
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(

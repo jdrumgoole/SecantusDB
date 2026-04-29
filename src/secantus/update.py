@@ -294,10 +294,18 @@ def _apply_op(
                         arr.pop(0)
     elif op == "$rename":
         for old, new in payload.items():
-            if has_path(doc, old):
-                value = get_path(doc, old)
-                unset_path(doc, old)
-                set_path(doc, new, value)
+            old_paths = _expand(doc, old, array_filters, positional_matches)
+            new_paths = _expand(doc, new, array_filters, positional_matches)
+            if len(old_paths) != len(new_paths):
+                raise UpdateError(
+                    "$rename source and target positional expansions must produce "
+                    "the same number of concrete paths"
+                )
+            for op_path, np_path in zip(old_paths, new_paths):
+                if has_path(doc, op_path):
+                    value = get_path(doc, op_path)
+                    unset_path(doc, op_path)
+                    set_path(doc, np_path, value)
     elif op == "$bit":
         for path, ops in payload.items():
             if not isinstance(ops, Mapping) or len(ops) != 1:

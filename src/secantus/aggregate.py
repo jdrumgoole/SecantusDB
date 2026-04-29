@@ -22,12 +22,14 @@ class AggregateError(Exception):
 class PipelineContext:
     storage: Storage | None = None
     db_name: str = ""
+    coll_name: str = ""
     vars: dict[str, Any] = _dc_field(default_factory=dict)
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
             storage=self.storage,
             db_name=self.db_name,
+            coll_name=self.coll_name,
             vars={**self.vars, **more},
         )
 
@@ -582,6 +584,98 @@ def _stage_merge(
     return []
 
 
+def _stage_coll_stats(
+    spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if ctx.storage is None or not ctx.coll_name:
+        raise AggregateError("$collStats requires storage and a collection")
+    import datetime as _dt
+
+    count = ctx.storage.count_matching(ctx.db_name, ctx.coll_name, None)
+    indexes = ctx.storage.list_indexes(ctx.db_name, ctx.coll_name)
+    out: dict[str, Any] = {
+        "ns": f"{ctx.db_name}.{ctx.coll_name}",
+        "host": "secantus",
+        "localTime": _dt.datetime.now(_dt.UTC),
+    }
+    spec = spec if isinstance(spec, Mapping) else {}
+    if "storageStats" in spec:
+        out["storageStats"] = {
+            "size": 0,
+            "count": count,
+            "avgObjSize": 0,
+            "storageSize": 0,
+            "indexSizes": {i["name"]: 0 for i in indexes},
+            "totalIndexSize": 0,
+            "scaleFactor": 1,
+            "nindexes": len(indexes),
+        }
+    if "latencyStats" in spec:
+        out["latencyStats"] = {
+            "reads": {"latency": 0, "ops": 0},
+            "writes": {"latency": 0, "ops": 0},
+            "commands": {"latency": 0, "ops": 0},
+        }
+    if "count" in spec:
+        out["count"] = count
+    return [out]
+
+
+def _stage_index_stats(
+    _spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if ctx.storage is None or not ctx.coll_name:
+        raise AggregateError("$indexStats requires storage and a collection")
+    indexes = ctx.storage.list_indexes(ctx.db_name, ctx.coll_name)
+    return [
+        {
+            "name": i["name"],
+            "key": i["key"],
+            "host": "secantus",
+            "accesses": {"ops": 0, "since": None},
+        }
+        for i in indexes
+    ]
+
+
+def _stage_bucket_auto(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$bucketAuto requires a document spec")
+    group_by = spec.get("groupBy")
+    n_buckets = spec.get("buckets")
+    if group_by is None or not isinstance(n_buckets, int) or n_buckets < 1:
+        raise AggregateError("$bucketAuto requires groupBy and a positive buckets int")
+    output_spec = spec.get("output") or {"count": {"$sum": 1}}
+
+    from secantus.storage import _SortKey
+
+    pairs = [(evaluate(group_by, d, ctx.vars), d) for d in docs]
+    pairs.sort(key=lambda p: _SortKey(p[0]))
+    if not pairs:
+        return []
+    bucket_size = max(1, len(pairs) // n_buckets)
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(pairs) and len(out) < n_buckets:
+        is_last = len(out) == n_buckets - 1
+        chunk = pairs[i:] if is_last else pairs[i : i + bucket_size]
+        if not chunk:
+            break
+        if not is_last and i + bucket_size < len(pairs):
+            upper = pairs[i + bucket_size][0]
+        else:
+            upper = chunk[-1][0]
+        bucket: dict[str, Any] = {"_id": {"min": chunk[0][0], "max": upper}}
+        for field_name, accumulator in output_spec.items():
+            for _, d in chunk:
+                _accumulate(bucket, field_name, accumulator, d, ctx.vars)
+        out.append(_finalize(bucket))
+        i += len(chunk)
+    return out
+
+
 def _stage_graph_lookup(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -678,6 +772,9 @@ _STAGES = {
     "$sortByCount": _stage_sort_by_count,
     "$facet": _stage_facet,
     "$bucket": _stage_bucket,
+    "$bucketAuto": _stage_bucket_auto,
+    "$collStats": _stage_coll_stats,
+    "$indexStats": _stage_index_stats,
     "$out": _stage_out,
     "$merge": _stage_merge,
     "$graphLookup": _stage_graph_lookup,

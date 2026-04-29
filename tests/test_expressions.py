@@ -540,9 +540,7 @@ def test_convert_string_to_int() -> None:
 
 
 def test_convert_with_on_error() -> None:
-    out = evaluate(
-        {"$convert": {"input": "not a number", "to": "int", "onError": -1}}, {}
-    )
+    out = evaluate({"$convert": {"input": "not a number", "to": "int", "onError": -1}}, {})
     assert out == -1
 
 
