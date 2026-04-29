@@ -430,3 +430,66 @@ def test_date_diff_units() -> None:
     assert evaluate(spec_month, {"a": a, "b": b}) == 15
     spec_day = {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "day"}}
     assert evaluate(spec_day, {"a": a, "b": b}) == (b - a).days
+
+
+def test_index_of_array() -> None:
+    assert evaluate({"$indexOfArray": [["a", "b", "c"], "b"]}, {}) == 1
+    assert evaluate({"$indexOfArray": [["a", "b", "c"], "z"]}, {}) == -1
+    assert evaluate({"$indexOfArray": [["a", "b", "c", "b"], "b", 2]}, {}) == 3
+
+
+def test_index_of_bytes_and_str_len_bytes() -> None:
+    assert evaluate({"$indexOfBytes": ["hello", "ll"]}, {}) == 2
+    assert evaluate({"$strLenBytes": "héllo"}, {}) == 6  # é is 2 UTF-8 bytes
+
+
+def test_substr_bytes() -> None:
+    assert evaluate({"$substrBytes": ["hello world", 6, 5]}, {}) == "world"
+
+
+def test_let_binds_variables() -> None:
+    expr = {
+        "$let": {
+            "vars": {"a": 5, "b": {"$multiply": ["$x", 2]}},
+            "in": {"$add": ["$$a", "$$b"]},
+        }
+    }
+    assert evaluate(expr, {"x": 10}) == 25
+
+
+def test_range_default_step() -> None:
+    assert evaluate({"$range": [0, 5]}, {}) == [0, 1, 2, 3, 4]
+
+
+def test_range_with_step() -> None:
+    assert evaluate({"$range": [0, 10, 3]}, {}) == [0, 3, 6, 9]
+
+
+def test_zip_min_length() -> None:
+    out = evaluate({"$zip": {"inputs": [[1, 2, 3], ["a", "b"]]}}, {})
+    assert out == [[1, "a"], [2, "b"]]
+
+
+def test_zip_longest_with_defaults() -> None:
+    out = evaluate(
+        {
+            "$zip": {
+                "inputs": [[1, 2, 3], ["a"]],
+                "useLongestLength": True,
+                "defaults": [0, "?"],
+            }
+        },
+        {},
+    )
+    assert out == [[1, "a"], [2, "?"], [3, "?"]]
+
+
+def test_sort_array_scalar() -> None:
+    assert evaluate({"$sortArray": {"input": [3, 1, 2], "sortBy": 1}}, {}) == [1, 2, 3]
+    assert evaluate({"$sortArray": {"input": [3, 1, 2], "sortBy": -1}}, {}) == [3, 2, 1]
+
+
+def test_sort_array_by_doc_field() -> None:
+    arr = [{"n": 3}, {"n": 1}, {"n": 2}]
+    out = evaluate({"$sortArray": {"input": "$arr", "sortBy": {"n": 1}}}, {"arr": arr})
+    assert [d["n"] for d in out] == [1, 2, 3]

@@ -647,6 +647,158 @@ def _op_index_of_cp(arg: Any, ctx: _Ctx) -> Any:
     return s.find(needle, start, end)
 
 
+def _op_index_of_bytes(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or not 2 <= len(arg) <= 4:
+        raise ExpressionError("$indexOfBytes requires [string, search, start?, end?]")
+    s = _eval(arg[0], ctx)
+    needle = _eval(arg[1], ctx)
+    if s is None:
+        return None
+    if not isinstance(s, str) or not isinstance(needle, str):
+        raise ExpressionError("$indexOfBytes requires string operands")
+    start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
+    end = _eval(arg[3], ctx) if len(arg) >= 4 else len(s.encode("utf-8"))
+    if not isinstance(start, int) or not isinstance(end, int):
+        return -1
+    haystack = s.encode("utf-8")
+    needle_b = needle.encode("utf-8")
+    return haystack.find(needle_b, start, end)
+
+
+def _op_str_len_bytes(arg: Any, ctx: _Ctx) -> Any:
+    s = _eval(arg, ctx)
+    if not isinstance(s, str):
+        raise ExpressionError("$strLenBytes requires a string")
+    return len(s.encode("utf-8"))
+
+
+def _op_substr_bytes(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or len(arg) != 3:
+        raise ExpressionError("$substrBytes requires [string, start, length]")
+    s = _eval(arg[0], ctx)
+    start = _eval(arg[1], ctx)
+    length = _eval(arg[2], ctx)
+    if s is None:
+        return ""
+    if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
+        raise ExpressionError("$substrBytes requires string + ints")
+    encoded = s.encode("utf-8")
+    if length < 0:
+        return encoded[start:].decode("utf-8", errors="replace")
+    return encoded[start : start + length].decode("utf-8", errors="replace")
+
+
+def _op_index_of_array(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or not 2 <= len(arg) <= 4:
+        raise ExpressionError("$indexOfArray requires [array, search, start?, end?]")
+    arr = _eval(arg[0], ctx)
+    if arr is None:
+        return None
+    if not isinstance(arr, list):
+        raise ExpressionError("$indexOfArray first argument must be an array")
+    needle = _eval(arg[1], ctx)
+    start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
+    end = _eval(arg[3], ctx) if len(arg) >= 4 else len(arr)
+    if not isinstance(start, int) or not isinstance(end, int):
+        return -1
+    for i in range(max(0, start), min(len(arr), end)):
+        if arr[i] == needle:
+            return i
+    return -1
+
+
+def _op_let(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping) or "vars" not in arg or "in" not in arg:
+        raise ExpressionError("$let requires {vars, in}")
+    bindings = arg["vars"]
+    if not isinstance(bindings, Mapping):
+        raise ExpressionError("$let.vars must be a document")
+    inner = ctx
+    for name, value_expr in bindings.items():
+        inner = inner.with_var(name, _eval(value_expr, ctx))
+    return _eval(arg["in"], inner)
+
+
+def _op_range(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or not 2 <= len(arg) <= 3:
+        raise ExpressionError("$range requires [start, end, step?]")
+    start = _eval(arg[0], ctx)
+    end = _eval(arg[1], ctx)
+    step = _eval(arg[2], ctx) if len(arg) == 3 else 1
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (start, end, step)):
+        raise ExpressionError("$range requires integer arguments")
+    if step == 0:
+        raise ExpressionError("$range step cannot be zero")
+    return list(range(start, end, step))
+
+
+def _op_zip(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping) or "inputs" not in arg:
+        raise ExpressionError("$zip requires {inputs, useLongestLength?, defaults?}")
+    inputs = _eval(arg["inputs"], ctx)
+    if inputs is None:
+        return None
+    if not isinstance(inputs, list) or not all(isinstance(a, list) for a in inputs):
+        raise ExpressionError("$zip inputs must be an array of arrays")
+    use_longest = bool(arg.get("useLongestLength"))
+    defaults = arg.get("defaults") or [None] * len(inputs)
+    if not isinstance(defaults, list):
+        raise ExpressionError("$zip defaults must be an array")
+    if use_longest:
+        n = max((len(a) for a in inputs), default=0)
+        out: list[list[Any]] = []
+        for i in range(n):
+            row = []
+            for j, a in enumerate(inputs):
+                if i < len(a):
+                    row.append(a[i])
+                else:
+                    row.append(defaults[j] if j < len(defaults) else None)
+            out.append(row)
+        return out
+    n = min((len(a) for a in inputs), default=0)
+    return [[a[i] for a in inputs] for i in range(n)]
+
+
+def _op_sort_array(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping) or "input" not in arg or "sortBy" not in arg:
+        raise ExpressionError("$sortArray requires {input, sortBy}")
+    arr = _eval(arg["input"], ctx)
+    if arr is None:
+        return None
+    if not isinstance(arr, list):
+        raise ExpressionError("$sortArray input must be an array")
+    sort_by = arg["sortBy"]
+    if isinstance(sort_by, int):
+        return sorted(arr, reverse=(sort_by == -1))
+    if not isinstance(sort_by, Mapping):
+        raise ExpressionError("$sortArray sortBy must be int or document")
+
+    def _key(elem: Any) -> tuple[Any, ...]:
+        from secantus.storage import _SortKey
+
+        return tuple(
+            _SortKey(get_path(elem if isinstance(elem, dict) else {}, field))
+            for field in sort_by
+        )
+
+    result = list(arr)
+    for field, direction in reversed(list(sort_by.items())):
+        result.sort(
+            key=lambda d, f=field: _make_sort_key(d, f),
+            reverse=(int(direction) == -1),
+        )
+    return result
+
+
+def _make_sort_key(elem: Any, field: str) -> Any:
+    from secantus.storage import _SortKey
+
+    if isinstance(elem, Mapping):
+        return _SortKey(get_path(dict(elem), field))
+    return _SortKey(elem)
+
+
 def _ensure_datetime(value: Any) -> _dt.datetime | None:
     if isinstance(value, _dt.datetime):
         return value
@@ -947,6 +1099,14 @@ _OPS = {
     "$substrCP": _op_substr_cp,
     "$strLenCP": _op_str_len_cp,
     "$indexOfCP": _op_index_of_cp,
+    "$indexOfBytes": _op_index_of_bytes,
+    "$strLenBytes": _op_str_len_bytes,
+    "$substrBytes": _op_substr_bytes,
+    "$indexOfArray": _op_index_of_array,
+    "$let": _op_let,
+    "$range": _op_range,
+    "$zip": _op_zip,
+    "$sortArray": _op_sort_array,
     "$year": _op_year,
     "$month": _op_month,
     "$dayOfMonth": _op_day_of_month,
