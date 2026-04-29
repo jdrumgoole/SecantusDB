@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import bson
-
-from collections.abc import Mapping
 
 from secantus.aggregate import PipelineContext, apply_pipeline
 from secantus.cursors import CursorNotFound, CursorRegistry

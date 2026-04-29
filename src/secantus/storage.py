@@ -110,6 +110,49 @@ def _index_key(
     return b"\x00".join(_canon_value(get_path(dict(doc), field)) for field in key_spec)
 
 
+def _to_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal128):
+        return value.to_decimal()
+    if isinstance(value, float):
+        return Decimal(repr(value))
+    return Decimal(value)
+
+
+def _bson_type_rank(value: Any) -> int:
+    """Rank for MongoDB's cross-type sort order. Lower rank sorts first."""
+    import datetime as _dt
+
+    from bson import Binary, MaxKey, MinKey, ObjectId, Regex, Timestamp
+
+    if isinstance(value, MinKey):
+        return 1
+    if value is None:
+        return 2
+    if isinstance(value, bool):
+        return 9  # bool is a separate rank below numbers
+    if isinstance(value, (int, float, Decimal128)):
+        return 3
+    if isinstance(value, str):
+        return 4
+    if isinstance(value, Mapping):
+        return 5
+    if isinstance(value, list):
+        return 6
+    if isinstance(value, (bytes, Binary)):
+        return 7
+    if isinstance(value, ObjectId):
+        return 8
+    if isinstance(value, _dt.datetime):
+        return 10
+    if isinstance(value, Timestamp):
+        return 11
+    if isinstance(value, Regex):
+        return 12
+    if isinstance(value, MaxKey):
+        return 13
+    return 5  # unknown -> object-rank
+
+
 class _SortKey:
     __slots__ = ("val",)
 
@@ -118,12 +161,19 @@ class _SortKey:
 
     def __lt__(self, other: _SortKey) -> bool:
         a, b = self.val, other.val
-        if a is None and b is None:
+        ra = _bson_type_rank(a)
+        rb = _bson_type_rank(b)
+        if ra != rb:
+            return ra < rb
+        if a is None or b is None:
             return False
-        if a is None:
-            return True
-        if b is None:
-            return False
+        if isinstance(a, Decimal128) or isinstance(b, Decimal128):
+            try:
+                ad = _to_decimal(a)
+                bd = _to_decimal(b)
+                return bool(ad < bd)
+            except (InvalidOperation, ValueError):
+                pass
         try:
             return bool(a < b)
         except TypeError:

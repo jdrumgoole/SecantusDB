@@ -301,7 +301,7 @@ def _apply_op(
                     "$rename source and target positional expansions must produce "
                     "the same number of concrete paths"
                 )
-            for op_path, np_path in zip(old_paths, new_paths):
+            for op_path, np_path in zip(old_paths, new_paths, strict=True):
                 if has_path(doc, op_path):
                     value = get_path(doc, op_path)
                     unset_path(doc, op_path)

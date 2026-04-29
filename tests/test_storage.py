@@ -165,3 +165,31 @@ def test_rename_collection_across_databases(storage: Storage) -> None:
     assert ok
     assert storage.find_matching("dba", "c", {}) == []
     assert storage.find_matching("dbb", "c2", {}) == [{"_id": 1}]
+
+
+def test_sort_cross_type_order(storage: Storage) -> None:
+    from bson import ObjectId
+
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "v": "string"},
+            {"_id": 2, "v": 5},
+            {"_id": 3, "v": True},
+            {"_id": 4, "v": None},
+            {"_id": 5, "v": [1, 2]},
+            {"_id": 6, "v": {"x": 1}},
+            {"_id": 7, "v": ObjectId()},
+        ],
+    )
+    out = storage.find_matching("db", "c", {}, sort={"v": 1})
+    ids = [d["_id"] for d in out]
+    # MongoDB order: null < numbers < string < object < array < ObjectId < bool
+    pos = {i: ids.index(i) for i in range(1, 8)}
+    assert pos[4] < pos[2]  # null < num
+    assert pos[2] < pos[1]  # num < string
+    assert pos[1] < pos[6]  # string < object
+    assert pos[6] < pos[5]  # object < array
+    assert pos[5] < pos[7]  # array < ObjectId
+    assert pos[7] < pos[3]  # ObjectId < bool
