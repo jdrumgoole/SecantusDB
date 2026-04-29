@@ -533,3 +533,39 @@ def test_date_to_parts() -> None:
         "second": 15,
         "millisecond": 678,
     }
+
+
+def test_convert_string_to_int() -> None:
+    assert evaluate({"$convert": {"input": "42", "to": "int"}}, {}) == 42
+
+
+def test_convert_with_on_error() -> None:
+    out = evaluate(
+        {"$convert": {"input": "not a number", "to": "int", "onError": -1}}, {}
+    )
+    assert out == -1
+
+
+def test_convert_with_on_null() -> None:
+    out = evaluate({"$convert": {"input": None, "to": "int", "onNull": 0}}, {})
+    assert out == 0
+
+
+def test_convert_int_to_string() -> None:
+    assert evaluate({"$convert": {"input": 42, "to": "string"}}, {}) == "42"
+
+
+def test_convert_to_objectid() -> None:
+    from bson import ObjectId
+
+    hex_id = "507f1f77bcf86cd799439011"
+    out = evaluate({"$convert": {"input": hex_id, "to": "objectId"}}, {})
+    assert isinstance(out, ObjectId)
+    assert str(out) == hex_id
+
+
+def test_convert_to_date_from_string() -> None:
+    import datetime as dt
+
+    out = evaluate({"$convert": {"input": "2026-04-28T12:00:00", "to": "date"}}, {})
+    assert out == dt.datetime(2026, 4, 28, 12, 0, 0)

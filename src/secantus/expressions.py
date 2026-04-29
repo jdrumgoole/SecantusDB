@@ -1059,6 +1059,109 @@ def _op_to_bool(arg: Any, ctx: _Ctx) -> Any:
     return True
 
 
+_CONVERT_TARGETS = {
+    "double": 1,
+    1: 1,
+    "string": 2,
+    2: 2,
+    "objectId": 7,
+    7: 7,
+    "bool": 8,
+    8: 8,
+    "date": 9,
+    9: 9,
+    "int": 16,
+    16: 16,
+    "long": 18,
+    18: 18,
+    "decimal": 19,
+    19: 19,
+}
+
+
+def _convert_value(value: Any, target: Any) -> Any:
+    from bson import ObjectId as _ObjectId
+
+    code = _CONVERT_TARGETS.get(target)
+    if code is None:
+        raise ExpressionError(f"$convert unsupported target type {target!r}")
+    if code == 1:
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, Decimal128):
+            return float(value.to_decimal())
+        if isinstance(value, str):
+            return float(value)
+        if isinstance(value, _dt.datetime):
+            return value.timestamp() * 1000.0
+    elif code == 2:
+        if isinstance(value, _dt.datetime):
+            return value.isoformat()
+        return str(value)
+    elif code == 7:
+        if isinstance(value, _ObjectId):
+            return value
+        if isinstance(value, str):
+            return _ObjectId(value)
+    elif code == 8:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, Decimal128):
+            return value.to_decimal() != Decimal(0)
+        if isinstance(value, str):
+            return len(value) > 0
+        return True
+    elif code == 9:
+        if isinstance(value, _dt.datetime):
+            return value
+        if isinstance(value, str):
+            return _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if isinstance(value, (int, float)):
+            return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.UTC)
+    elif code in (16, 18):
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, Decimal128):
+            return int(value.to_decimal())
+        if isinstance(value, str):
+            return int(value)
+    elif code == 19:
+        if isinstance(value, Decimal128):
+            return value
+        if isinstance(value, bool):
+            return Decimal128(Decimal(1 if value else 0))
+        if isinstance(value, int):
+            return Decimal128(Decimal(value))
+        if isinstance(value, float):
+            return Decimal128(Decimal(repr(value)))
+        if isinstance(value, str):
+            return Decimal128(value)
+    raise ExpressionError(f"$convert cannot convert {type(value).__name__} to {target!r}")
+
+
+def _op_convert(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping) or "input" not in arg or "to" not in arg:
+        raise ExpressionError("$convert requires {input, to}")
+    value = _eval(arg["input"], ctx)
+    target = _eval(arg["to"], ctx)
+    if value is None:
+        return _eval(arg["onNull"], ctx) if "onNull" in arg else None
+    try:
+        return _convert_value(value, target)
+    except (ValueError, TypeError, InvalidOperation, ExpressionError) as exc:
+        if "onError" in arg:
+            return _eval(arg["onError"], ctx)
+        raise ExpressionError(f"$convert failed: {exc}") from exc
+
+
 def _op_to_decimal(arg: Any, ctx: _Ctx) -> Any:
     value = _eval(arg, ctx)
     if value is None:
@@ -1200,6 +1303,7 @@ _OPS = {
     "$toDouble": _op_to_double,
     "$toBool": _op_to_bool,
     "$toDecimal": _op_to_decimal,
+    "$convert": _op_convert,
     "$filter": _op_filter,
     "$map": _op_map,
     "$reduce": _op_reduce,
