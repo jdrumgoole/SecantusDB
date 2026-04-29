@@ -980,6 +980,69 @@ def test_positional_dollar_via_pymongo(coll) -> None:
     assert out["items"][2].get("tag") is None
 
 
+def test_graph_lookup_traverses_chain(client: MongoClient) -> None:
+    db = client["graph_db"]
+    db["people"].insert_many(
+        [
+            {"_id": "alice", "reports_to": "bob"},
+            {"_id": "bob", "reports_to": "carol"},
+            {"_id": "carol", "reports_to": None},
+            {"_id": "dave", "reports_to": None},
+        ]
+    )
+    db["start"].insert_one({"_id": 1, "name": "alice"})
+    pipeline = [
+        {
+            "$graphLookup": {
+                "from": "people",
+                "startWith": "$name",
+                "connectFromField": "reports_to",
+                "connectToField": "_id",
+                "as": "chain",
+                "depthField": "depth",
+            }
+        }
+    ]
+    out = list(db["start"].aggregate(pipeline))[0]
+    chain_ids = sorted((d["_id"], d["depth"]) for d in out["chain"])
+    assert chain_ids == [("alice", 0), ("bob", 1), ("carol", 2)]
+
+
+def test_graph_lookup_max_depth(client: MongoClient) -> None:
+    db = client["graph_max_depth_db"]
+    db["people"].insert_many(
+        [
+            {"_id": "a", "next": "b"},
+            {"_id": "b", "next": "c"},
+            {"_id": "c", "next": "d"},
+            {"_id": "d", "next": None},
+        ]
+    )
+    db["start"].insert_one({"_id": 1, "seed": "a"})
+    pipeline = [
+        {
+            "$graphLookup": {
+                "from": "people",
+                "startWith": "$seed",
+                "connectFromField": "next",
+                "connectToField": "_id",
+                "as": "chain",
+                "maxDepth": 1,
+            }
+        }
+    ]
+    out = list(db["start"].aggregate(pipeline))[0]
+    assert sorted(d["_id"] for d in out["chain"]) == ["a", "b"]
+
+
+def test_documents_stage(client: MongoClient) -> None:
+    db = client["documents_db"]
+    db["any"].insert_one({"x": 1})  # need some collection to attach to
+    pipeline = [{"$documents": [{"_id": 1, "n": 10}, {"_id": 2, "n": 20}]}]
+    out = list(db["any"].aggregate(pipeline))
+    assert sorted(d["_id"] for d in out) == [1, 2]
+
+
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     db = client["lookup_pipe_db"]
     db["orders"].insert_many(

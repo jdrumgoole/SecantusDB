@@ -582,6 +582,83 @@ def _stage_merge(
     return []
 
 
+def _stage_graph_lookup(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$graphLookup requires a document spec")
+    from_coll = spec.get("from")
+    start_with = spec.get("startWith")
+    connect_from = spec.get("connectFromField")
+    connect_to = spec.get("connectToField")
+    as_field = spec.get("as")
+    max_depth = spec.get("maxDepth")
+    depth_field = spec.get("depthField")
+    if not all(isinstance(x, str) for x in (from_coll, connect_from, connect_to, as_field)):
+        raise AggregateError(
+            "$graphLookup requires from/connectFromField/connectToField/as as strings"
+        )
+    if ctx.storage is None:
+        raise AggregateError("$graphLookup requires storage context")
+    foreign = ctx.storage.find_matching(ctx.db_name, from_coll, {})
+
+    def _walk(seed_value: Any) -> list[dict[str, Any]]:
+        seen_ids: set[Any] = set()
+        out_docs: list[dict[str, Any]] = []
+        frontier: list[tuple[Any, int]] = [(seed_value, 0)]
+        while frontier:
+            value, depth = frontier.pop(0)
+            if max_depth is not None and depth > int(max_depth):
+                continue
+            for fdoc in foreign:
+                fid = fdoc.get("_id")
+                if fid in seen_ids:
+                    continue
+                target = get_path(fdoc, connect_to)
+                if _values_match(value, target):
+                    seen_ids.add(fid)
+                    new_doc = copy.deepcopy(fdoc)
+                    if depth_field:
+                        new_doc[depth_field] = depth
+                    out_docs.append(new_doc)
+                    next_value = get_path(fdoc, connect_from)
+                    if next_value is not None:
+                        frontier.append((next_value, depth + 1))
+        return out_docs
+
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        seed = evaluate(start_with, doc, ctx.vars)
+        new = copy.deepcopy(doc)
+        new[as_field] = _walk(seed)
+        out.append(new)
+    return out
+
+
+def _values_match(a: Any, b: Any) -> bool:
+    if isinstance(a, list) and isinstance(b, list):
+        return any(x == y for x in a for y in b)
+    if isinstance(a, list):
+        return b in a
+    if isinstance(b, list):
+        return a in b
+    return a == b
+
+
+def _stage_documents(
+    spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    if not isinstance(spec, list):
+        raise AggregateError("$documents requires an array of documents")
+    out: list[dict[str, Any]] = []
+    for entry in spec:
+        evaluated = evaluate(entry, {}, ctx.vars)
+        if not isinstance(evaluated, Mapping):
+            raise AggregateError("$documents entries must evaluate to documents")
+        out.append(dict(evaluated))
+    return out
+
+
 _STAGES = {
     "$match": _stage_match,
     "$count": _stage_count,
@@ -603,4 +680,6 @@ _STAGES = {
     "$bucket": _stage_bucket,
     "$out": _stage_out,
     "$merge": _stage_merge,
+    "$graphLookup": _stage_graph_lookup,
+    "$documents": _stage_documents,
 }
