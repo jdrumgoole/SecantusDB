@@ -40,12 +40,11 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
-- [ ] **`$` first-match positional update operator** — would require `query.matches` to return the matched array index, not just a boolean. Skipped from the positional-array-updates slice. `$[]` and `$[<name>]` work; `$` does not.
-- [ ] **`$rename` with positional placeholders** — `$rename` doesn't currently expand `$[]` / `$[<name>]` in source or destination paths. Rare combination.
-- [ ] **More aggregation expressions**: `$dateTrunc`, `$dateToParts`, `$convert` (the typed-conversion form), `$range`, `$zip`, `$sortArray`, `$mergeAll`, `$bitwise*`, `$indexOfArray`, `$indexOfBytes`, `$let`, `$function` (JS — also out of scope).
-- [ ] **More aggregation stages**: `$densify`, `$fill`, `$documents`, `$graphLookup` (recursive joins), `$indexStats`, `$collStats` (as a stage; the command form is stubbed).
-- [ ] **`$bit` update operator** — bitwise updates. Rare.
+- [ ] **`$rename` with positional placeholders** — `$rename` doesn't currently expand `$[]` / `$[<name>]` / `$` in source or destination paths. Rare combination.
+- [ ] **More aggregation expressions**: `$convert` (the typed-conversion form with onError/onNull), `$mergeAll`, `$function` (JS — also out of scope).
+- [ ] **More aggregation stages**: `$densify`, `$fill`, `$indexStats`, `$collStats` (as a stage; the command form is stubbed), `$bucketAuto`.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
+- [ ] **`$jsonSchema`** query operator — schema validation. Niche but used by some test suites.
 
 ## 4. Out of scope (intentional, with reasoning)
 
