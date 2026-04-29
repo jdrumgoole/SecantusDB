@@ -475,6 +475,78 @@ def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
     return _shift_date(start, unit, -amount)
 
 
+def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateTrunc requires a document spec")
+    date = _eval(arg.get("date"), ctx)
+    if date is None:
+        return None
+    if not isinstance(date, _dt.datetime):
+        raise ExpressionError("$dateTrunc date must be a datetime")
+    unit = _eval(arg.get("unit"), ctx)
+    if not isinstance(unit, str):
+        raise ExpressionError("$dateTrunc unit must be a string")
+    bin_size = _eval(arg.get("binSize"), ctx) if "binSize" in arg else 1
+    if not isinstance(bin_size, int) or bin_size < 1:
+        raise ExpressionError("$dateTrunc binSize must be a positive integer")
+    if unit == "year":
+        new_year = date.year - ((date.year - 1) % bin_size)
+        return _dt.datetime(new_year, 1, 1, tzinfo=date.tzinfo)
+    if unit == "quarter":
+        q_index = (date.month - 1) // 3
+        q_index -= q_index % bin_size
+        return _dt.datetime(date.year, q_index * 3 + 1, 1, tzinfo=date.tzinfo)
+    if unit == "month":
+        m = date.month - ((date.month - 1) % bin_size)
+        return _dt.datetime(date.year, m, 1, tzinfo=date.tzinfo)
+    if unit == "week":
+        epoch = _dt.datetime(1970, 1, 5, tzinfo=date.tzinfo)  # Mondays
+        weeks = (date - epoch).days // 7
+        weeks -= weeks % bin_size
+        return epoch + _dt.timedelta(weeks=weeks)
+    if unit == "day":
+        epoch = _dt.datetime(1970, 1, 1, tzinfo=date.tzinfo)
+        days = (date - epoch).days
+        days -= days % bin_size
+        return epoch + _dt.timedelta(days=days)
+    if unit == "hour":
+        zeroed = date.replace(minute=0, second=0, microsecond=0)
+        zeroed = zeroed.replace(hour=zeroed.hour - (zeroed.hour % bin_size))
+        return zeroed
+    if unit == "minute":
+        zeroed = date.replace(second=0, microsecond=0)
+        zeroed = zeroed.replace(minute=zeroed.minute - (zeroed.minute % bin_size))
+        return zeroed
+    if unit == "second":
+        zeroed = date.replace(microsecond=0)
+        zeroed = zeroed.replace(second=zeroed.second - (zeroed.second % bin_size))
+        return zeroed
+    if unit == "millisecond":
+        ms = date.microsecond // 1000
+        ms -= ms % bin_size
+        return date.replace(microsecond=ms * 1000)
+    raise ExpressionError(f"unsupported $dateTrunc unit: {unit!r}")
+
+
+def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateToParts requires a document spec")
+    date = _eval(arg.get("date"), ctx)
+    if date is None:
+        return None
+    if not isinstance(date, _dt.datetime):
+        raise ExpressionError("$dateToParts date must be a datetime")
+    return {
+        "year": date.year,
+        "month": date.month,
+        "day": date.day,
+        "hour": date.hour,
+        "minute": date.minute,
+        "second": date.second,
+        "millisecond": date.microsecond // 1000,
+    }
+
+
 def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateDiff requires a document spec")
@@ -1091,6 +1163,8 @@ _OPS = {
     "$dateAdd": _op_date_add,
     "$dateSubtract": _op_date_subtract,
     "$dateDiff": _op_date_diff,
+    "$dateTrunc": _op_date_trunc,
+    "$dateToParts": _op_date_to_parts,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,

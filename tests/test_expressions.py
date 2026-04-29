@@ -493,3 +493,45 @@ def test_sort_array_by_doc_field() -> None:
     arr = [{"n": 3}, {"n": 1}, {"n": 2}]
     out = evaluate({"$sortArray": {"input": "$arr", "sortBy": {"n": 1}}}, {"arr": arr})
     assert [d["n"] for d in out] == [1, 2, 3]
+
+
+def test_date_trunc_to_month() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 4, 28, 13, 14, 15)
+    out = evaluate({"$dateTrunc": {"date": "$d", "unit": "month"}}, {"d": when})
+    assert out == dt.datetime(2026, 4, 1)
+
+
+def test_date_trunc_to_hour_with_bin_size() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 4, 28, 13, 47, 0)
+    out = evaluate(
+        {"$dateTrunc": {"date": "$d", "unit": "hour", "binSize": 6}}, {"d": when}
+    )
+    assert out == dt.datetime(2026, 4, 28, 12, 0, 0)
+
+
+def test_date_trunc_to_day() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 4, 28, 13, 14, 15)
+    out = evaluate({"$dateTrunc": {"date": "$d", "unit": "day"}}, {"d": when})
+    assert out == dt.datetime(2026, 4, 28)
+
+
+def test_date_to_parts() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 4, 28, 13, 14, 15, 678000)
+    out = evaluate({"$dateToParts": {"date": "$d"}}, {"d": when})
+    assert out == {
+        "year": 2026,
+        "month": 4,
+        "day": 28,
+        "hour": 13,
+        "minute": 14,
+        "second": 15,
+        "millisecond": 678,
+    }
