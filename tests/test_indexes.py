@@ -107,3 +107,115 @@ def test_drop_collection_drops_indexes(storage: Storage) -> None:
     storage.create_index("db", "c", "x_1", {"x": 1}, {})
     storage.drop_collection("db", "c")
     assert storage.list_indexes("db", "c") == []
+
+
+def _index_entry_count(storage: Storage, db: str, coll: str, name: str | None = None) -> int:
+    from secantus.storage import _IDX_ENTRIES_TABLE
+
+    prefix: tuple = (db, coll) if name is None else (db, coll, name)
+    return len(storage._collect_prefix(_IDX_ENTRIES_TABLE, prefix))
+
+
+def test_index_lookup_uses_index_for_equality(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i % 5} for i in range(20)])
+    docs = storage.find_matching("db", "c", {"x": 3})
+    ids = sorted(d["_id"] for d in docs)
+    assert ids == [3, 8, 13, 18]
+
+
+def test_index_lookup_avoids_full_scan(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i % 5} for i in range(20)])
+    calls: list[tuple[str, str]] = []
+    real_scan = storage._scan_docs
+
+    def spy(db: str, coll: str):
+        calls.append((db, coll))
+        return real_scan(db, coll)
+
+    monkeypatch.setattr(storage, "_scan_docs", spy)
+    docs = storage.find_matching("db", "c", {"x": 2})
+    assert len(docs) == 4
+    assert calls == [], "find_matching should not full-scan when an index covers the filter"
+
+
+def test_index_lookup_falls_back_when_no_index(storage: Storage) -> None:
+    storage.insert("db", "c", [{"_id": 1, "x": 1}, {"_id": 2, "x": 2}])
+    docs = storage.find_matching("db", "c", {"x": 1})
+    assert [d["_id"] for d in docs] == [1]
+
+
+def test_index_entries_track_updates(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 10}, {"_id": 2, "x": 20}])
+    storage.update_matching("db", "c", {"_id": 1}, {"$set": {"x": 99}})
+    assert [d["_id"] for d in storage.find_matching("db", "c", {"x": 10})] == []
+    assert [d["_id"] for d in storage.find_matching("db", "c", {"x": 99})] == [1]
+
+
+def test_index_entries_removed_on_delete(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 10}, {"_id": 2, "x": 10}])
+    assert _index_entry_count(storage, "db", "c", "x_1") == 2
+    storage.delete_matching("db", "c", {"_id": 1})
+    assert _index_entry_count(storage, "db", "c", "x_1") == 1
+    assert [d["_id"] for d in storage.find_matching("db", "c", {"x": 10})] == [2]
+
+
+def test_drop_index_removes_entries(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 10}, {"_id": 2, "x": 20}])
+    assert _index_entry_count(storage, "db", "c", "x_1") == 2
+    storage.drop_index("db", "c", "x_1")
+    assert _index_entry_count(storage, "db", "c", "x_1") == 0
+
+
+def test_drop_collection_removes_index_entries(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 10}, {"_id": 2, "x": 20}])
+    storage.drop_collection("db", "c")
+    assert _index_entry_count(storage, "db", "c") == 0
+
+
+def test_drop_database_removes_index_entries(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 10}])
+    storage.drop_database("db")
+    assert _index_entry_count(storage, "db", "c") == 0
+
+
+def test_drop_all_indexes_clears_entries(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.create_index("db", "c", "y_1", {"y": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 1, "y": 2}])
+    assert _index_entry_count(storage, "db", "c") == 2
+    storage.drop_all_indexes("db", "c")
+    assert _index_entry_count(storage, "db", "c") == 0
+
+
+def test_rename_collection_moves_index_entries(storage: Storage) -> None:
+    storage.create_index("db", "src", "x_1", {"x": 1}, {})
+    storage.insert("db", "src", [{"_id": 1, "x": 10}, {"_id": 2, "x": 20}])
+    assert _index_entry_count(storage, "db", "src", "x_1") == 2
+    storage.rename_collection("db", "src", "db", "dst")
+    assert _index_entry_count(storage, "db", "src", "x_1") == 0
+    assert _index_entry_count(storage, "db", "dst", "x_1") == 2
+    docs = storage.find_matching("db", "dst", {"x": 10})
+    assert [d["_id"] for d in docs] == [1]
+
+
+def test_create_index_after_inserts_populates_entries(storage: Storage) -> None:
+    storage.insert("db", "c", [{"_id": i, "x": i % 3} for i in range(9)])
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    assert _index_entry_count(storage, "db", "c", "x_1") == 9
+    docs = storage.find_matching("db", "c", {"x": 2})
+    assert sorted(d["_id"] for d in docs) == [2, 5, 8]
+
+
+def test_unique_index_uses_entry_probe(storage: Storage) -> None:
+    storage.create_index("db", "c", "email_1", {"email": 1}, {"unique": True})
+    storage.insert("db", "c", [{"_id": 1, "email": "a@x"}])
+    _, errors = storage.insert("db", "c", [{"_id": 2, "email": "a@x"}])
+    assert errors and errors[0]["code"] == 11000
+    assert _index_entry_count(storage, "db", "c", "email_1") == 1

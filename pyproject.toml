@@ -7,6 +7,7 @@ authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
 license = { text = "MIT" }
 dependencies = [
     "pymongo>=4.6",
+    "wiredtiger>=11.3.1",
 ]
 
 [project.optional-dependencies]

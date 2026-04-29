@@ -34,32 +34,33 @@ Layers, roughly outermost-in:
 - `src/secantus/aggregate.py` — `apply_pipeline(docs, pipeline, ctx)`. Stages: `$match`, `$count`, `$limit`, `$skip`, `$sort`, `$project` (with computed fields), `$addFields`/`$set`, `$unset`, `$unwind`, `$replaceRoot`/`$replaceWith`, `$group`, `$lookup` (both simple and `let`/`pipeline` forms), `$sample`, `$sortByCount`, `$facet`, `$bucket`. `$group` accumulators: `$sum`, `$count`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`. `PipelineContext` carries the `Storage`, current `db_name`, and a `vars` map (for `$lookup` `let` bindings, threaded through every stage that calls the expression evaluator).
 - `src/secantus/cursors.py` — `CursorRegistry`. Per-server, thread-safe map of int64 cursor id → remaining docs. Used by `find` and `aggregate` to support pagination via `getMore`/`killCursors`.
 - `src/secantus/paths.py` — shared dotted-path helpers (`get_path`/`set_path`/`unset_path`/`has_path`/`walk_to_parent`). Used by `update`, `projection`, `aggregate`, and storage's sort.
-- `src/secantus/storage.py` — SQLite-backed store. Schema:
-  - `_secantus_collections(db_name, coll_name, options)`
-  - `_secantus_documents(db_name, coll_name, id_key BLOB, doc BLOB)` — full document is `bson.encode(doc)`; `id_key` is the canonical-numeric-or-BSON-blob form so int/float/Decimal128 collide. `RLock`-serialized; `check_same_thread=False` connection. Public `sort_docs` helper used by both find and aggregate's `$sort`.
-  - `_secantus_indexes(db_name, coll_name, index_name, key_spec BLOB, options BLOB)` — see "Indexes are a stopgap" below.
+- `src/secantus/storage.py` — WiredTiger-backed store (same engine MongoDB uses). Four tables in one WT connection:
+  - `table:secantus_collections` (key_format=`SS`, value=BSON options blob) — `(db, coll)` registry.
+  - `table:secantus_documents` (key_format=`SSu`, value=`u`) — `(db, coll, id_key) → bson.encode(doc)`. `id_key` is the canonical-numeric-or-BSON-blob form so int/float/Decimal128 collide on `_id`.
+  - `table:secantus_indexes` (key_format=`SSS`, value=`u`) — `(db, coll, name) → bson.encode({key, options})`.
+  - `table:secantus_index_entries` (key_format=`SSSuu`, value=`u`) — `(db, coll, name, value_bytes, id_key) → b""`. `value_bytes` is `_canon_value` joined with `\x00`. Maintained on every insert/update/delete.
+  WT sessions are thread-affine, kept in `threading.local()`; cursors per session per table are cached and `reset()` between calls. A global `RLock` serializes all public methods so we never have to think about WT's MVCC at the storage layer. `:memory:` is mapped to a `tempfile.mkdtemp()` opened with `in_memory=true` and rmtree'd on `close()`.
 
-### Indexes are a stopgap
+### Indexes: equality fast, range/sort still scan
 
-`createIndex` records the definition (so `listIndexes` returns it accurately) and enforces `unique` constraints by full-scanning the collection on every write. **There is no lookup acceleration** — every query still full-scans the document table and filters in Python; `hint` parameters are accepted and ignored. Sparse uniqueness is honored. Compound unique indexes work. `_id_` cannot be dropped.
+Equality lookup is accelerated. `find_matching` detects single-field equality filters (`{field: value}` where `value` isn't a dict and `field` isn't a `$`-operator) and uses the entries table to walk only the matching `id_key`s. Unique enforcement probes the entries table by `value_bytes` prefix instead of full-scanning the collection.
 
-Out of scope: text / geo / hashed / wildcard indexes, `partialFilterExpression`, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
+Still missing: range queries (`$gt`/`$gte`/`$lt`/`$lte`), `$in`, sort-by-indexed-field, compound-prefix lookup, and `hint` actually picking an index. These need a typed sort-key value encoding (1-byte BSON-cross-type rank + byte-sortable bytes) so the WT B-tree can answer ordered queries directly. The current `_canon_value` is byte-equal but **not** byte-sortable, so it can't drive range scans yet.
 
-The eventual fix when this becomes a real bottleneck is **typed sort-key BLOB columns** — 1-byte type tag matching MongoDB's cross-type sort order, then a byte-sortable encoding of the value, with a SQLite B-tree index. Byte-lex comparison on those gives MongoDB-correct ordering and equality through any SQLite index. Don't take a shortcut with raw SQLite-typed columns — SQLite's NULL/INT/REAL/TEXT/BLOB ordering does not match MongoDB's, and Decimal128/ObjectId/Regex have no clean SQLite native type.
+Out of scope regardless: text / geo / hashed / wildcard indexes, `partialFilterExpression`, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
 
 ### Type-mapping strategy (the critical decision)
 
-Documents are stored as **opaque BSON blobs** in SQLite. All filtering, projection, sorting, and updates happen in Python after `bson.decode`. SQLite is a persistence and indexing layer only; it never inspects document content.
+Documents are stored as **opaque BSON blobs**. All filtering, projection, sorting, and updates happen in Python after `bson.decode`. The storage layer never inspects document content. This is deliberate: SecantusDB's whole point is that `pymongo` cannot tell us apart from `mongod`, and any lossy intermediate representation (JSON, native column types, etc.) would break that for ObjectId / Decimal128 / int32-vs-int64 / Date-with-tz / Binary / Regex.
 
-This is deliberate. SQLite's storage classes (NULL/INT/REAL/TEXT/BLOB) cannot represent ObjectId, Decimal128, the int32-vs-int64 distinction, Date with timezone, Binary, or Regex — and SecantusDB's whole point is that `pymongo` cannot tell us apart from `mongod`. A lossy JSON-text mapping would break that.
-
-When secondary indexes land they will use **typed sort-key columns** (1-byte type tag matching BSON's cross-type sort order, then a byte-sortable value encoding) — not JSON1, not numeric coercion.
+When secondary indexes land they will be WT indexes over typed sort-key columns derived from BSON values — not JSON, not coerced numerics.
 
 ## Tooling
 
 - Python 3.12 pinned via `.python-version`. Managed with `uv`. Always invoke Python via `uv run python -m ...` so `pyenv` doesn't intercept.
 - Build/admin tasks: `tasks.py` (`invoke`). `invoke test`, `invoke lint`, `invoke fmt`, `invoke docs`, `invoke serve`.
-- `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`). Tests must use `port=0` and `:memory:` storage — no shared ports, no shared SQLite files.
+- `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`). Tests must use `port=0` and `:memory:` storage — no shared ports, no shared WT homes.
+- WiredTiger ships as `wiredtiger>=11.3.1` from PyPI. There are no binary wheels yet, so installing from source needs `cmake`, `ninja`, and `swig` available in `PATH`. On macOS: `uv tool install cmake && uv tool install ninja && brew install swig`. Building binary wheels via `cibuildwheel` is the next infra task.
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
 - PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.

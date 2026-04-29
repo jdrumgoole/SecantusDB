@@ -24,7 +24,7 @@ These commands accept the request and return a wire-valid response, but the resp
 
 These work end-to-end but cut corners.
 
-- [ ] **Indexes** — definitions are tracked, `unique` is enforced. **No lookup acceleration**: every query full-scans the document table and filters in Python. `hint` is accepted and ignored. The eventual fix is typed sort-key BLOB columns (see CLAUDE.md "Indexes are a stopgap" for the full plan).
+- [ ] **Index range / sort acceleration** — single-field **equality** lookup is now accelerated through the WT-backed `secantus_index_entries` table, and unique enforcement is O(log n) instead of O(n). Still missing: range queries (`$gt`/`$gte`/`$lt`/`$lte`), `$in`, compound-prefix equality, sort-by-indexed-field, and `hint` actually picking an index. The eventual fix is a typed sort-key encoder (1-byte BSON-cross-type rank + byte-sortable value bytes) — see CLAUDE.md "Indexes: equality fast, range/sort still scan".
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
 - [ ] **`$lookup`** — full-scan of the foreign collection per outer doc; no use of indexes for the join. Both simple (`localField`/`foreignField`) and `let`/`pipeline` forms are supported. If both are specified, both are applied (simple-form pre-filter, then pipeline). MongoDB's actual behavior with both is more nuanced.
 - [ ] **`$merge` whenMatched: "merge"** — shallow `{**existing, **new}` merge with new winning per-key. MongoDB has deeper semantics for nested docs (recursive merge for sub-documents); we do not.
@@ -41,6 +41,7 @@ Specific items that were left out of the slice that introduced their feature are
 - [ ] **More aggregation expressions**: `$mergeAll`, `$function` (JS — also out of scope).
 - [ ] **More aggregation stages**: `$densify`, `$fill`.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
+- [ ] **WiredTiger binary wheels** — `pip install secantus` currently triggers a from-source build of `wiredtiger==11.3.1` which needs `cmake`, `ninja`, and `swig` on `PATH`. The fix is `cibuildwheel` jobs in CI that produce `wiredtiger` wheels for macOS x86_64/arm64, manylinux x86_64/arm64, and Windows x86_64, then host them on GitHub releases or PyPI under the secantus namespace. Until then, document the prerequisites in the README.
 
 ## 4. Out of scope (intentional, with reasoning)
 
@@ -61,10 +62,10 @@ These are explicit non-goals. Don't add them without a reason.
 
 Subtler than the above; these may bite specific test suites.
 
-- [ ] **Iteration order of `find()` without sort** is SQLite primary-key order, which is `id_key` byte-lex order. For consecutive integer `_id` values this happens to match insertion order. For `_id` types with large or unordered byte representations (e.g. `ObjectId` with embedded timestamps + counter) it'll differ from a real `mongod`'s natural order. Tests that assert order without an explicit `sort` may be brittle.
+- [ ] **Iteration order of `find()` without sort** is WT B-tree order on `id_key`, which is `id_key` byte-lex order. For consecutive integer `_id` values this happens to match insertion order. For `_id` types with large or unordered byte representations (e.g. `ObjectId` with embedded timestamps + counter) it'll differ from a real `mongod`'s natural order. Tests that assert order without an explicit `sort` may be brittle.
 - [ ] **`_id` uniqueness check via canonical bytes** — for non-numeric BSON values the check is byte-equality on `bson.encode({"_": value})`. Two different Python values that happen to encode to the same bytes (rare) would falsely collide.
 - [ ] **`$sample`** — uses `random.sample` without a fixed seed. Deterministic only if test does `random.seed(...)` first.
-- [ ] **`update_matching` with `multi=False`** stops at the first SQLite-PK-ordered match. Real MongoDB stops at the first natural-order match. Same for most cases (see iteration-order note above) but not for all `_id` types.
+- [ ] **`update_matching` with `multi=False`** stops at the first WT-key-ordered match. Real MongoDB stops at the first natural-order match. Same for most cases (see iteration-order note above) but not for all `_id` types.
 - [ ] **`$type: "number"`** in queries — handles `int`, `float`, `Decimal128`, but the int32-vs-int64 distinction depends on Python value range, not the original BSON type tag (which we throw away on decode). A doc inserted as `Int64(5)` reads back as a small Python int and matches `$type: "int"`, not `"long"`.
 - [ ] **`$lookup` simple-form-plus-pipeline** — when both `localField`/`foreignField` and `pipeline` are present, we pre-filter by the simple form and then run the pipeline. Real MongoDB does this too in modern versions, but the documentation isn't crystal clear on the order. If a test breaks here, this is the place to look.
 - [ ] **Aggregation `$group` stable order** — group buckets are emitted in first-seen order, not sorted. Matches MongoDB for unsharded but might differ from sharded behavior (which we don't model).
