@@ -310,9 +310,7 @@ class Storage:
                     continue
                 matched += 1
                 pos = find_positional_matches(doc, filter)
-                new = apply_update(
-                    doc, update, array_filters=array_filters, positional_matches=pos
-                )
+                new = apply_update(doc, update, array_filters=array_filters, positional_matches=pos)
                 if new != doc:
                     new_id_key = _id_key(new["_id"])
                     conflict = self._unique_conflict(

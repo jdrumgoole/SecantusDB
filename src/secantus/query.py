@@ -178,9 +178,7 @@ def _resolve_bitmask(arg: Any) -> int:
     raise QueryError("bitwise operator requires an int or list of bit positions")
 
 
-def _op_bitwise(
-    values: list[Any], arg: Any, predicate: Callable[[int, int], bool]
-) -> bool:
+def _op_bitwise(values: list[Any], arg: Any, predicate: Callable[[int, int], bool]) -> bool:
     mask = _resolve_bitmask(arg)
     for v in values:
         if isinstance(v, int) and not isinstance(v, bool) and predicate(v, mask):

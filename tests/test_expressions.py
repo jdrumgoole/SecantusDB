@@ -507,9 +507,7 @@ def test_date_trunc_to_hour_with_bin_size() -> None:
     import datetime as dt
 
     when = dt.datetime(2026, 4, 28, 13, 47, 0)
-    out = evaluate(
-        {"$dateTrunc": {"date": "$d", "unit": "hour", "binSize": 6}}, {"d": when}
-    )
+    out = evaluate({"$dateTrunc": {"date": "$d", "unit": "hour", "binSize": 6}}, {"d": when})
     assert out == dt.datetime(2026, 4, 28, 12, 0, 0)
 
 

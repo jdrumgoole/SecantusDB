@@ -850,14 +850,13 @@ def _op_sort_array(arg: Any, ctx: _Ctx) -> Any:
         from secantus.storage import _SortKey
 
         return tuple(
-            _SortKey(get_path(elem if isinstance(elem, dict) else {}, field))
-            for field in sort_by
+            _SortKey(get_path(elem if isinstance(elem, dict) else {}, field)) for field in sort_by
         )
 
     result = list(arr)
-    for field, direction in reversed(list(sort_by.items())):
+    for sort_field, direction in reversed(list(sort_by.items())):
         result.sort(
-            key=lambda d, f=field: _make_sort_key(d, f),
+            key=lambda d, f=sort_field: _make_sort_key(d, f),
             reverse=(int(direction) == -1),
         )
     return result

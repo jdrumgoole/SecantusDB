@@ -45,9 +45,7 @@ def apply_update(
     return new
 
 
-def find_positional_matches(
-    doc: Mapping[str, Any], filter_: Mapping[str, Any]
-) -> dict[str, int]:
+def find_positional_matches(doc: Mapping[str, Any], filter_: Mapping[str, Any]) -> dict[str, int]:
     from secantus.query import matches as _matches
 
     out: dict[str, int] = {}
@@ -98,11 +96,7 @@ def _expand_path(
 
 
 def _is_positional_token(part: str) -> bool:
-    return (
-        part == "$"
-        or part == "$[]"
-        or (part.startswith("$[") and part.endswith("]"))
-    )
+    return part == "$" or part == "$[]" or (part.startswith("$[") and part.endswith("]"))
 
 
 def _walk_positional(
@@ -134,9 +128,7 @@ def _walk_positional(
         if not isinstance(cur, list):
             return
         for i, elem in enumerate(cur):
-            _walk_positional(
-                elem, rest, prefix + [str(i)], out, array_filters, positional_matches
-            )
+            _walk_positional(elem, rest, prefix + [str(i)], out, array_filters, positional_matches)
         return
     if head.startswith("$[") and head.endswith("]"):
         name = head[2:-1]
