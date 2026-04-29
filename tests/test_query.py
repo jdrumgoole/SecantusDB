@@ -226,3 +226,39 @@ def test_bits_any_clear() -> None:
 def test_bits_skip_non_int_values() -> None:
     assert not matches({"flags": "abc"}, {"flags": {"$bitsAllSet": 0b1}})
     assert not matches({"flags": True}, {"flags": {"$bitsAllSet": 0b1}})
+
+
+def test_json_schema_required() -> None:
+    schema = {"required": ["name"], "properties": {"name": {"bsonType": "string"}}}
+    assert matches({"name": "alice"}, {"$jsonSchema": schema})
+    assert not matches({"age": 30}, {"$jsonSchema": schema})
+
+
+def test_json_schema_property_type_check() -> None:
+    schema = {"properties": {"age": {"bsonType": "int", "minimum": 0}}}
+    assert matches({"age": 30}, {"$jsonSchema": schema})
+    assert not matches({"age": "thirty"}, {"$jsonSchema": schema})
+    assert not matches({"age": -1}, {"$jsonSchema": schema})
+
+
+def test_json_schema_string_length_and_pattern() -> None:
+    schema = {
+        "properties": {
+            "code": {"bsonType": "string", "minLength": 2, "maxLength": 4, "pattern": "^[A-Z]+$"}
+        }
+    }
+    assert matches({"code": "ABC"}, {"$jsonSchema": schema})
+    assert not matches({"code": "A"}, {"$jsonSchema": schema})
+    assert not matches({"code": "abc"}, {"$jsonSchema": schema})
+
+
+def test_json_schema_enum() -> None:
+    schema = {"properties": {"status": {"enum": ["active", "inactive"]}}}
+    assert matches({"status": "active"}, {"$jsonSchema": schema})
+    assert not matches({"status": "pending"}, {"$jsonSchema": schema})
+
+
+def test_json_schema_array_items() -> None:
+    schema = {"properties": {"tags": {"bsonType": "array", "items": {"bsonType": "string"}}}}
+    assert matches({"tags": ["a", "b"]}, {"$jsonSchema": schema})
+    assert not matches({"tags": ["a", 1]}, {"$jsonSchema": schema})

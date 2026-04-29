@@ -56,9 +56,87 @@ def _match_clause(
         return _truthy(evaluate(condition, doc, vars))
     if key == "$comment":
         return True
+    if key == "$jsonSchema":
+        return _validate_json_schema(doc, condition)
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
     return _field_matches(_resolve_path(doc, key), condition)
+
+
+def _validate_json_schema(value: Any, schema: Any) -> bool:
+    if not isinstance(schema, Mapping):
+        return False
+    if "bsonType" in schema:
+        types = schema["bsonType"]
+        if not isinstance(types, list):
+            types = [types]
+        if not any(_matches_type(value, t) for t in types):
+            return False
+    if "type" in schema:
+        types = schema["type"]
+        if not isinstance(types, list):
+            types = [types]
+        if not any(_matches_json_type(value, t) for t in types):
+            return False
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            return False
+        if "maximum" in schema and value > schema["maximum"]:
+            return False
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            return False
+        if "exclusiveMaximum" in schema and value >= schema["exclusiveMaximum"]:
+            return False
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            return False
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            return False
+        if "pattern" in schema and not re.search(schema["pattern"], value):
+            return False
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            return False
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            return False
+        if "items" in schema:
+            for item in value:
+                if not _validate_json_schema(item, schema["items"]):
+                    return False
+    if isinstance(value, Mapping):
+        if "required" in schema:
+            for required_key in schema["required"]:
+                if required_key not in value:
+                    return False
+        if "properties" in schema:
+            for prop, prop_schema in schema["properties"].items():
+                if prop in value and not _validate_json_schema(value[prop], prop_schema):
+                    return False
+        if "minProperties" in schema and len(value) < schema["minProperties"]:
+            return False
+        if "maxProperties" in schema and len(value) > schema["maxProperties"]:
+            return False
+    return True
+
+
+def _matches_json_type(value: Any, json_type: str) -> bool:
+    if json_type == "string":
+        return isinstance(value, str)
+    if json_type == "number":
+        return isinstance(value, (int, float, Decimal128)) and not isinstance(value, bool)
+    if json_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if json_type == "boolean":
+        return isinstance(value, bool)
+    if json_type == "null":
+        return value is None
+    if json_type == "array":
+        return isinstance(value, list)
+    if json_type == "object":
+        return isinstance(value, Mapping)
+    return False
 
 
 def _truthy(value: Any) -> bool:
