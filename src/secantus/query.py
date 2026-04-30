@@ -191,11 +191,31 @@ def _eq_with_array(values: list[Any], expected: Any) -> bool:
             if expected is None:
                 return True
             continue
-        if v == expected:
+        if _eq_numeric_aware(v, expected):
             return True
-        if isinstance(v, list) and any(e == expected for e in v):
+        if isinstance(v, list) and any(_eq_numeric_aware(e, expected) for e in v):
             return True
     return False
+
+
+def _eq_numeric_aware(a: Any, b: Any) -> bool:
+    """Equality that bridges int / float / Decimal128 but keeps bool distinct.
+
+    MongoDB treats int / float / Decimal128 as a single numeric type for
+    equality but ranks bool as a separate type — ``{x: 1}`` does not match
+    ``x: true``. Python's ``True == 1`` and ``Decimal128.__eq__`` are both
+    wrong for our purposes, so we have to handle both directions here.
+    """
+    a_bool = isinstance(a, bool)
+    b_bool = isinstance(b, bool)
+    if a_bool != b_bool:
+        return False
+    if a == b:
+        return True
+    a2, b2 = _coerce_numeric(a, b)
+    if a2 is a:
+        return False
+    return a2 == b2
 
 
 def _op_matches(values: list[Any], op: str, arg: Any) -> bool:

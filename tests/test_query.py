@@ -262,3 +262,45 @@ def test_json_schema_array_items() -> None:
     schema = {"properties": {"tags": {"bsonType": "array", "items": {"bsonType": "string"}}}}
     assert matches({"tags": ["a", "b"]}, {"$jsonSchema": schema})
     assert not matches({"tags": ["a", 1]}, {"$jsonSchema": schema})
+
+
+def test_eq_decimal128_matches_int() -> None:
+    assert matches({"x": Decimal128("5")}, {"x": 5})
+    assert matches({"x": 5}, {"x": Decimal128("5")})
+
+
+def test_eq_decimal128_matches_float() -> None:
+    assert matches({"x": Decimal128("3.5")}, {"x": 3.5})
+    assert matches({"x": 3.5}, {"x": Decimal128("3.5")})
+
+
+def test_eq_decimal128_distinct_values() -> None:
+    assert not matches({"x": Decimal128("5")}, {"x": 6})
+    assert not matches({"x": Decimal128("3.5")}, {"x": 3})
+
+
+def test_eq_decimal128_in_array() -> None:
+    assert matches({"x": [Decimal128("5"), Decimal128("6")]}, {"x": 6})
+
+
+def test_eq_decimal128_in_in_clause() -> None:
+    assert matches({"x": Decimal128("5")}, {"x": {"$in": [3, 5, 7]}})
+    assert not matches({"x": Decimal128("5")}, {"x": {"$in": [3, 7]}})
+
+
+def test_eq_bool_does_not_bridge_to_int() -> None:
+    """MongoDB ranks bool separately from numbers — they should not equate."""
+    assert not matches({"x": True}, {"x": 1})
+    assert not matches({"x": 1}, {"x": True})
+    assert not matches({"x": False}, {"x": 0})
+
+
+def test_gt_decimal128_vs_int() -> None:
+    assert matches({"x": Decimal128("3.5")}, {"x": {"$gt": 2}})
+    assert matches({"x": 3.5}, {"x": {"$gt": Decimal128("2")}})
+    assert not matches({"x": Decimal128("1.5")}, {"x": {"$gt": 2}})
+
+
+def test_lte_decimal128_vs_float() -> None:
+    assert matches({"x": Decimal128("3.5")}, {"x": {"$lte": 4.0}})
+    assert not matches({"x": Decimal128("4.1")}, {"x": {"$lte": 4.0}})
