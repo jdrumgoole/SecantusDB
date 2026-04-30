@@ -1147,3 +1147,19 @@ def test_find_with_natural_hint_is_collection_scan(coll) -> None:
     coll.insert_many([{"_id": i, "x": i} for i in range(3)])
     docs = list(coll.find({"x": 1}, hint="$natural"))
     assert [d["_id"] for d in docs] == [1]
+
+
+def test_aggregate_with_hint(coll) -> None:
+    coll.create_index("x")
+    coll.insert_many([{"_id": i, "x": i} for i in range(5)])
+    docs = list(coll.aggregate([{"$match": {"x": 3}}], hint="x_1"))
+    assert [d["_id"] for d in docs] == [3]
+
+
+def test_aggregate_with_unknown_hint(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"x": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$match": {}}], hint="nonexistent"))
+    assert exc.value.code == 2

@@ -53,7 +53,9 @@ Sort-by-indexed-field rides the same B-tree. The walk direction is chosen so the
 
 Unique enforcement is a prefix probe on the entries table, not a full scan.
 
-`hint` is honored: pass an index name string, a key-spec dict, `"$natural"` (forces a collection scan even when an index would match), or `"_id_"` / `{_id: 1}` (walks doc-table order). An unknown hint surfaces as a `BadValue` (code 2) error to the client. The hint can also align with the sort spec to skip the post-sort step when the leading field matches.
+`hint` is honored on both `find` and `aggregate`: pass an index name string, a key-spec dict, `"$natural"` (forces a collection scan even when an index would match), or `"_id_"` / `{_id: 1}` (walks doc-table order). An unknown hint surfaces as a `BadValue` (code 2) error to the client. The hint can also align with the sort spec to skip the post-sort step when the leading field matches.
+
+`aggregate` also lifts a leading `$match` stage into the initial fetch's filter so a pipeline starting with `[{$match: {...}}]` benefits from the same index acceleration as `find`. The `$match` stage is then skipped in the pipeline so the filter isn't re-applied.
 
 **Direction support**: single-field indexes can be ASC (`{f: 1}`) or DESC (`{f: -1}`). The encoder inverts the bytes for DESC so the WT B-tree gives us descending order with a forward walk. Equality, `$in`, range (`$gt`/`$gte`/`$lt`/`$lte`) — operator semantics flip automatically when targeting a DESC index — and direction-aware sort acceleration all work end-to-end. Compound indexes still build with all-ASC byte ordering today; mixed-direction compound (e.g. `{a:1, b:-1}`) is a future iteration.
 
