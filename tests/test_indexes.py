@@ -794,3 +794,118 @@ def test_hint_with_sort_on_different_field_still_sorts(storage: Storage) -> None
     storage.insert("db", "c", [{"_id": i, "x": i, "y": -i} for i in range(5)])
     docs = storage.find_matching("db", "c", {}, sort={"y": 1}, hint="x_1")
     assert [d["_id"] for d in docs] == [4, 3, 2, 1, 0]
+
+
+def test_desc_index_equality_lookup(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i % 5} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": 3})
+    assert sorted(d["_id"] for d in docs) == [3, 8, 13, 18]
+    assert calls == []
+
+
+def test_desc_index_in_lookup(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$in": [2, 5, 9]}})
+    assert sorted(d["_id"] for d in docs) == [2, 5, 9]
+    assert calls == []
+
+
+def test_desc_index_gt_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$gt": 6}})
+    assert sorted(d["_id"] for d in docs) == [7, 8, 9]
+    assert calls == []
+
+
+def test_desc_index_lt_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$lt": 3}})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2]
+    assert calls == []
+
+
+def test_desc_index_range_both_bounds(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$gte": 5, "$lt": 10}})
+    assert sorted(d["_id"] for d in docs) == [5, 6, 7, 8, 9]
+    assert calls == []
+
+
+def test_desc_index_sort_descending_walks_forward(storage: Storage, monkeypatch) -> None:
+    """Sort {x:-1} on a {x:-1} index should walk forward (no list-reversal)."""
+    import secantus.storage as st
+
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(8)])
+    sort_calls = [0]
+    real = st.sort_docs
+
+    def counting(*a, **kw):
+        sort_calls[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(st, "sort_docs", counting)
+    docs = storage.find_matching("db", "c", {}, sort={"x": -1})
+    assert [d["x"] for d in docs] == [7, 6, 5, 4, 3, 2, 1, 0]
+    assert sort_calls[0] == 0
+
+
+def test_desc_index_sort_ascending_reverses(storage: Storage) -> None:
+    """Sort {x:1} on a {x:-1} index walks backward through the descending bytes."""
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(5)])
+    docs = storage.find_matching("db", "c", {}, sort={"x": 1})
+    assert [d["x"] for d in docs] == [0, 1, 2, 3, 4]
+
+
+def test_desc_index_filter_plus_sort_no_resort(storage: Storage, monkeypatch) -> None:
+    """Range filter + matching DESC sort: index walk already in order."""
+    import secantus.storage as st
+
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(20)])
+    sort_calls = [0]
+    real = st.sort_docs
+
+    def counting(*a, **kw):
+        sort_calls[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(st, "sort_docs", counting)
+    docs = storage.find_matching("db", "c", {"x": {"$gte": 5, "$lt": 10}}, sort={"x": -1})
+    assert [d["_id"] for d in docs] == [9, 8, 7, 6, 5]
+    assert sort_calls[0] == 0
+
+
+def test_desc_index_unique_enforcement(storage: Storage) -> None:
+    storage.create_index("db", "c", "email_-1", {"email": -1}, {"unique": True})
+    storage.insert("db", "c", [{"_id": 1, "email": "a@x"}])
+    _, errors = storage.insert("db", "c", [{"_id": 2, "email": "a@x"}])
+    assert errors and errors[0]["code"] == 11000
+
+
+def test_desc_index_update_maintains_entries(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 10}])
+    storage.update_matching("db", "c", {"_id": 1}, {"$set": {"x": 99}})
+    assert storage.find_matching("db", "c", {"x": 10}) == []
+    assert [d["_id"] for d in storage.find_matching("db", "c", {"x": 99})] == [1]
+
+
+def test_desc_index_via_hint(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(5)])
+    docs = storage.find_matching("db", "c", {}, hint="x_-1", sort={"x": -1})
+    assert [d["x"] for d in docs] == [4, 3, 2, 1, 0]
+    docs = storage.find_matching("db", "c", {}, hint={"x": -1}, sort={"x": -1})
+    assert [d["x"] for d in docs] == [4, 3, 2, 1, 0]

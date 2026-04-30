@@ -33,7 +33,12 @@ from bson import Decimal128
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
-from secantus.sortkey import COMPOUND_SEP, encode_compound, encode_value
+from secantus.sortkey import (
+    COMPOUND_SEP,
+    encode_compound,
+    encode_value,
+    encode_value_directed,
+)
 from secantus.update import apply_update, find_positional_matches
 
 _COLL_TABLE = "table:secantus_collections"
@@ -116,11 +121,12 @@ def _id_key(doc_id: Any) -> bytes:
 def _index_key(
     doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
 ) -> bytes | None:
-    """Byte-sortable encoding of a document's value for an index ``key_spec``.
+    """Direction-aware byte-sortable encoding for an index ``key_spec``.
 
-    Single-field indexes use ``encode_value``; compound indexes use
-    ``encode_compound`` with ``\\x00\\x00`` between components after each
-    component's null bytes are escaped.
+    Each field is encoded with ``encode_value_directed`` so ``-1``
+    (descending) fields get bitwise-inverted bytes, making a forward
+    B-tree walk yield values in descending order. Compound keys are
+    joined with ``\\x00\\x00`` between components.
     """
     if sparse:
         for field in key_spec:
@@ -128,8 +134,10 @@ def _index_key(
                 return None
     fields = list(key_spec)
     if len(fields) == 1:
-        return encode_value(get_path(dict(doc), fields[0]))
-    return encode_compound([get_path(dict(doc), f) for f in fields])
+        d = int(key_spec[fields[0]])
+        return encode_value_directed(get_path(dict(doc), fields[0]), d)
+    parts = [encode_value_directed(get_path(dict(doc), f), int(key_spec[f])) for f in fields]
+    return COMPOUND_SEP.join(parts)
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -429,14 +437,18 @@ class Storage:
                         and next(iter(filter)) == sort_field
                     ):
                         in_sort_order = True
-                        if sort_dir == -1:
+                        idx = self._single_field_index_for(db, coll, sort_field)
+                        idx_dir = idx[1] if idx else 1
+                        if sort_dir != idx_dir:
                             candidates = list(reversed(candidates))
                 elif candidates is None and not filter and sort_field is not None:
-                    idx_name = self._single_field_index_for(db, coll, sort_field)
-                    if idx_name is not None:
-                        candidates = self._walk_index_in_order(
-                            db, coll, idx_name, reverse=(sort_dir == -1)
-                        )
+                    idx = self._single_field_index_for(db, coll, sort_field)
+                    if idx is not None:
+                        idx_name, idx_dir = idx
+                        # If the index direction matches the sort direction,
+                        # walk forward; if it's opposite, walk backward.
+                        reverse = sort_dir != idx_dir
+                        candidates = self._walk_index_in_order(db, coll, idx_name, reverse=reverse)
                         in_sort_order = True
                 if candidates is None:
                     candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
@@ -503,15 +515,18 @@ class Storage:
             if in_order and sort_dir == -1:
                 docs = list(reversed(docs))
             return docs, in_order
-        # Find the index's leading field
+        # Find the index's leading field and its direction
         leading: str | None = None
+        leading_dir = 1
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             if name == resolved:
-                leading = next(iter(key_spec))
+                first = next(iter(key_spec))
+                leading = first
+                leading_dir = int(key_spec[first])
                 break
         candidates = self._walk_index_in_order(db, coll, resolved, reverse=False)
         in_order = sort_field is not None and sort_field == leading
-        if in_order and sort_dir == -1:
+        if in_order and sort_dir != leading_dir:
             candidates = list(reversed(candidates))
         return candidates, in_order
 
@@ -531,10 +546,15 @@ class Storage:
             return None, 0
         return f, di
 
-    def _single_field_index_for(self, db: str, coll: str, field: str) -> str | None:
+    def _single_field_index_for(self, db: str, coll: str, field: str) -> tuple[str, int] | None:
+        """Return ``(index_name, direction)`` for a single-field index on
+        ``field``, or ``None`` if no such index exists. Direction is the
+        index's stored sort direction (`+1` for ASC, `-1` for DESC)."""
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if list(key_spec.keys()) == [field] and int(key_spec[field]) == 1:
-                return name
+            if list(key_spec.keys()) == [field]:
+                d = int(key_spec[field])
+                if d in (1, -1):
+                    return name, d
         return None
 
     def _walk_index_in_order(
@@ -1025,15 +1045,18 @@ class Storage:
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
-        index_name: str | None = None
+        idx_match: tuple[str, int] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if list(key_spec.keys()) == [field] and int(key_spec[field]) == 1:
-                index_name = name
-                break
-        if index_name is None:
+            if list(key_spec.keys()) == [field]:
+                d = int(key_spec[field])
+                if d in (1, -1):
+                    idx_match = (name, d)
+                    break
+        if idx_match is None:
             return None
+        index_name, direction = idx_match
         if not isinstance(value, dict):
-            kb = encode_value(value)
+            kb = encode_value_directed(value, direction)
             id_keys = self._scan_index_for_id_keys(db, coll, index_name, kb)
             return self._docs_by_id_keys(db, coll, id_keys)
         if not value or not all(k.startswith("$") for k in value):
@@ -1049,7 +1072,7 @@ class Storage:
             for v in value["$in"]:
                 if isinstance(v, dict):
                     return None
-                kb = encode_value(v)
+                kb = encode_value_directed(v, direction)
                 for id_k in self._scan_index_for_id_keys(db, coll, index_name, kb):
                     if id_k not in seen:
                         seen.add(id_k)
@@ -1063,17 +1086,22 @@ class Storage:
             if isinstance(bound, dict):
                 return None
             if op == "$eq":
-                kb = encode_value(bound)
+                kb = encode_value_directed(bound, direction)
                 id_keys = self._scan_index_for_id_keys(db, coll, index_name, kb)
                 return self._docs_by_id_keys(db, coll, id_keys)
-            kb = encode_value(bound)
-            if op == "$gt":
+            kb = encode_value_directed(bound, direction)
+            # Operator semantics flip when stored bytes are inverted: in a
+            # DESC index, "x > 5" means we want stored bytes < enc_desc(5).
+            effective_op = op
+            if direction == -1:
+                effective_op = {"$gt": "$lt", "$gte": "$lte", "$lt": "$gt", "$lte": "$gte"}[op]
+            if effective_op == "$gt":
                 lower, lower_inclusive = kb, False
-            elif op == "$gte":
+            elif effective_op == "$gte":
                 lower, lower_inclusive = kb, True
-            elif op == "$lt":
+            elif effective_op == "$lt":
                 upper, upper_inclusive = kb, False
-            elif op == "$lte":
+            elif effective_op == "$lte":
                 upper, upper_inclusive = kb, True
         id_keys = self._range_scan_index(
             db, coll, index_name, lower, lower_inclusive, upper, upper_inclusive

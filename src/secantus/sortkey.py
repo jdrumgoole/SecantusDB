@@ -265,6 +265,21 @@ def encode_compound(values: list[Any]) -> bytes:
     return COMPOUND_SEP.join(encode_value(v) for v in values)
 
 
+def invert_bytes(b: bytes) -> bytes:
+    """Bitwise-NOT every byte. Order-reversing: if a < b byte-wise, then ~a > ~b.
+
+    Used to store descending-direction index entries so a forward B-tree
+    walk yields values in descending order without per-row reversal.
+    """
+    return bytes(x ^ 0xFF for x in b)
+
+
+def encode_value_directed(value: Any, direction: int = 1) -> bytes:
+    """Like ``encode_value`` but inverts bytes when ``direction == -1``."""
+    e = encode_value(value)
+    return invert_bytes(e) if direction == -1 else e
+
+
 # Range-query bound helpers. Bounds are returned as (key_bytes, inclusive)
 # tuples so the WT range scan can apply them with the right boundary
 # semantics. ``None`` for a bound means open-ended.
