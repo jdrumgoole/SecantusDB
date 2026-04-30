@@ -5,12 +5,14 @@ engine here so that on-disk semantics line up with what test code would
 see against a real ``mongod``.
 
 Indexes use a sidecar entries table (``table:secantus_index_entries``)
-keyed by ``(db, coll, name, value_bytes, id_key)``. ``value_bytes`` comes
-from ``_canon_value`` so byte-equal values collide — that's enough for
-equality lookup and unique enforcement. Single-field equality filters
-are routed through the index in ``find_matching``; everything else still
-falls back to a full collection scan. Range / sort acceleration needs a
-typed sort-key encoder (see backlog).
+with a single trailing ``u`` column packing
+``escape(sortkey) + b"\\x00\\x00" + id_key``. The sortkey comes from
+``secantus.sortkey`` (typed, byte-sortable BSON encoding), so the WT
+B-tree gives us ordered access for free. ``find_matching`` routes a wide
+range of filter shapes through the index — equality, ``$eq``, ``$in``,
+``$gt``/``$gte``/``$lt``/``$lte`` on a single field, plus compound
+indexes when filter fields cover a leading prefix (with optional range
+on the next field). Sort-by-indexed-field walks the B-tree in order.
 """
 
 from __future__ import annotations
@@ -935,11 +937,14 @@ class Storage:
         if any(f.startswith("$") for f in filter):
             return None
         # Bare-equality filters of any size can use a compound index whose
-        # leading fields cover the filter set. Operator-form filters
-        # ($eq/$in/$gt/...) are still handled by the single-field path
-        # below — range on a compound prefix is a future iteration.
+        # leading fields cover the filter set.
         if all(not isinstance(v, dict) for v in filter.values()):
             result = self._try_compound_eq_lookup(db, coll, filter)
+            if result is not None:
+                return result
+        # Compound prefix + trailing operator field (eq fields then range/in).
+        if len(filter) >= 2:
+            result = self._try_compound_range_lookup(db, coll, filter)
             if result is not None:
                 return result
         if len(filter) != 1:
@@ -1038,6 +1043,116 @@ class Storage:
             id_keys = self._scan_index_for_id_keys(db, coll, name, kb, prefix=True)
         return self._docs_by_id_keys(db, coll, id_keys)
 
+    def _try_compound_range_lookup(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        """Compound-prefix lookup with a trailing operator field.
+
+        Filters of the form ``{a: 5, b: 10, c: {$gt: 20}}`` (any number of
+        leading bare-equality fields followed by exactly one operator-form
+        field) walk the compound index by pinning the prefix from the
+        equalities and applying the operator's bounds to the next field.
+        """
+        eq_fields: dict[str, Any] = {}
+        operator_field: str | None = None
+        operator_ops: dict[str, Any] | None = None
+        for f, v in filter.items():
+            if isinstance(v, dict):
+                if not v or not all(k.startswith("$") for k in v):
+                    return None
+                if not all(op in self._RANGE_OPS for op in v):
+                    return None
+                if operator_field is not None:
+                    return None
+                operator_field = f
+                operator_ops = v
+            else:
+                eq_fields[f] = v
+        if operator_field is None or not eq_fields:
+            return None
+        eq_set = set(eq_fields)
+        if operator_field in eq_set:
+            return None
+        target_eq_count = len(eq_set)
+        best: tuple[str, list[str]] | None = None
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            idx_fields = list(key_spec.keys())
+            if any(int(key_spec[f]) != 1 for f in idx_fields):
+                continue
+            if len(idx_fields) <= target_eq_count:
+                continue
+            if set(idx_fields[:target_eq_count]) != eq_set:
+                continue
+            if idx_fields[target_eq_count] != operator_field:
+                continue
+            if best is None or len(best[1]) > len(idx_fields):
+                best = (name, idx_fields)
+            if len(idx_fields) == target_eq_count + 1:
+                break
+        if best is None:
+            return None
+        name, idx_fields = best
+        values = [eq_fields[f] for f in idx_fields[:target_eq_count]]
+        prefix_kb = encode_compound(values) if len(values) > 1 else encode_value(values[0])
+        prefix_with_sep = prefix_kb + COMPOUND_SEP
+        if "$in" in operator_ops:
+            if len(operator_ops) != 1 or not isinstance(operator_ops["$in"], list):
+                return None
+            seen: set[bytes] = set()
+            id_keys: list[bytes] = []
+            for v in operator_ops["$in"]:
+                if isinstance(v, dict):
+                    return None
+                kb = prefix_with_sep + encode_value(v)
+                # Exact equality if this is the last field of the index;
+                # prefix scan otherwise (more index fields beyond op_field).
+                use_prefix = len(idx_fields) > target_eq_count + 1
+                inner_kb = kb + COMPOUND_SEP if use_prefix else kb
+                for id_k in self._scan_index_for_id_keys(
+                    db, coll, name, inner_kb, prefix=use_prefix
+                ):
+                    if id_k not in seen:
+                        seen.add(id_k)
+                        id_keys.append(id_k)
+            return self._docs_by_id_keys(db, coll, id_keys)
+        if "$eq" in operator_ops:
+            if len(operator_ops) != 1:
+                return None
+            kb = prefix_with_sep + encode_value(operator_ops["$eq"])
+            use_prefix = len(idx_fields) > target_eq_count + 1
+            inner_kb = kb + COMPOUND_SEP if use_prefix else kb
+            id_keys = self._scan_index_for_id_keys(db, coll, name, inner_kb, prefix=use_prefix)
+            return self._docs_by_id_keys(db, coll, id_keys)
+        lower: bytes | None = None
+        lower_inclusive = True
+        upper: bytes | None = None
+        upper_inclusive = True
+        for op, bound in operator_ops.items():
+            if isinstance(bound, dict):
+                return None
+            full = prefix_with_sep + encode_value(bound)
+            if op == "$gt":
+                lower, lower_inclusive = full, False
+            elif op == "$gte":
+                lower, lower_inclusive = full, True
+            elif op == "$lt":
+                upper, upper_inclusive = full, False
+            elif op == "$lte":
+                upper, upper_inclusive = full, True
+            else:
+                return None
+        id_keys = self._range_scan_index(
+            db,
+            coll,
+            name,
+            lower,
+            lower_inclusive,
+            upper,
+            upper_inclusive,
+            prefix=prefix_with_sep,
+        )
+        return self._docs_by_id_keys(db, coll, id_keys)
+
     def _range_scan_index(
         self,
         db: str,
@@ -1047,11 +1162,25 @@ class Storage:
         lower_inclusive: bool,
         upper: bytes | None,
         upper_inclusive: bool,
+        *,
+        prefix: bytes | None = None,
     ) -> list[bytes]:
+        """Range-scan the index entries for ``name``.
+
+        Optional ``prefix`` constrains the scan to entries whose escaped
+        kb starts with ``escape(prefix)`` — used by compound-index
+        prefix+range queries where leading equalities pin part of the kb.
+        """
         c = self._cursor(_IDX_ENTRIES_TABLE)
+        esc_prefix = _escape_kb(prefix) if prefix is not None else None
         esc_lower = _escape_kb(lower) if lower is not None else None
         esc_upper = _escape_kb(upper) if upper is not None else None
-        seed = (esc_lower or b"") + _ENTRY_SEP if lower is not None else b""
+        if esc_lower is not None:
+            seed = esc_lower + _ENTRY_SEP
+        elif esc_prefix is not None:
+            seed = esc_prefix
+        else:
+            seed = b""
         c.set_key(db, coll, name, seed)
         rc = c.search_near()
         if rc == wt.WT_NOTFOUND:
@@ -1065,6 +1194,8 @@ class Storage:
                 break
             packed = bytes(k[3])
             row_esc, row_id = _unpack_entry(packed)
+            if esc_prefix is not None and not row_esc.startswith(esc_prefix):
+                break
             if esc_lower is not None and not lower_inclusive and row_esc == esc_lower:
                 if c.next() != 0:
                     break
