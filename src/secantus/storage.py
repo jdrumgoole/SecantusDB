@@ -31,12 +31,36 @@ from bson import Decimal128
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
+from secantus.sortkey import encode_compound, encode_value
 from secantus.update import apply_update, find_positional_matches
 
 _COLL_TABLE = "table:secantus_collections"
 _DOC_TABLE = "table:secantus_documents"
 _IDX_TABLE = "table:secantus_indexes"
 _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
+
+_ENTRY_SEP = b"\x00\x00"
+
+
+def _escape_kb(kb: bytes) -> bytes:
+    """Order-preserving escape so ``\\x00\\x00`` is unambiguous as a separator."""
+    return kb.replace(b"\x00", b"\x00\xff")
+
+
+def _pack_entry(kb: bytes, id_key: bytes) -> bytes:
+    """Pack a sortable index-entry payload into a single ``u`` column.
+
+    WiredTiger length-prefixes ``u`` columns when they're not last in the
+    key, which breaks lexicographic comparison. Packing both fields into
+    one trailing ``u`` column lets the B-tree do the sort for us.
+    """
+    return _escape_kb(kb) + _ENTRY_SEP + id_key
+
+
+def _unpack_entry(packed: bytes) -> tuple[bytes, bytes]:
+    """Return ``(escaped_kb, id_key)`` from a packed entry."""
+    sep = packed.find(_ENTRY_SEP)
+    return packed[:sep], packed[sep + 2 :]
 
 
 class DuplicateKeyError(Exception):
@@ -90,11 +114,20 @@ def _id_key(doc_id: Any) -> bytes:
 def _index_key(
     doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
 ) -> bytes | None:
+    """Byte-sortable encoding of a document's value for an index ``key_spec``.
+
+    Single-field indexes use ``encode_value``; compound indexes use
+    ``encode_compound`` with ``\\x00\\x00`` between components after each
+    component's null bytes are escaped.
+    """
     if sparse:
         for field in key_spec:
             if not has_path(dict(doc), field):
                 return None
-    return b"\x00".join(_canon_value(get_path(dict(doc), field)) for field in key_spec)
+    fields = list(key_spec)
+    if len(fields) == 1:
+        return encode_value(get_path(dict(doc), fields[0]))
+    return encode_compound([get_path(dict(doc), f) for f in fields])
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -215,7 +248,7 @@ class Storage:
             boot.create(_COLL_TABLE, "key_format=SS,value_format=u")
             boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
-            boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSuu,value_format=u")
+            boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
         finally:
             boot.close()
 
@@ -469,7 +502,7 @@ class Storage:
             _COLL_TABLE: "SS",
             _DOC_TABLE: "SSu",
             _IDX_TABLE: "SSS",
-            _IDX_ENTRIES_TABLE: "SSSuu",
+            _IDX_ENTRIES_TABLE: "SSSu",
         }[table]
 
     @staticmethod
@@ -638,7 +671,7 @@ class Storage:
                 if kb is None:
                     continue
                 entry_cur.reset()
-                entry_cur[db, coll, name, kb, _id_key(d["_id"])] = b""
+                entry_cur[db, coll, name, _pack_entry(kb, _id_key(d["_id"]))] = b""
             return True
 
     def list_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
@@ -717,7 +750,7 @@ class Storage:
             if kb is None:
                 continue
             c.reset()
-            c[db, coll, name, kb, id_k] = b""
+            c[db, coll, name, _pack_entry(kb, id_k)] = b""
 
     def _delete_index_entries(
         self,
@@ -735,7 +768,7 @@ class Storage:
             if kb is None:
                 continue
             c.reset()
-            c.set_key(db, coll, name, kb, id_k)
+            c.set_key(db, coll, name, _pack_entry(kb, id_k))
             if c.search() == 0:
                 c.remove()
 
@@ -757,8 +790,10 @@ class Storage:
             kb = _index_key(candidate_doc, key_spec, sparse=sparse)
             if kb is None:
                 continue
+            esc_kb = _escape_kb(kb)
+            seed = esc_kb + _ENTRY_SEP
             c.reset()
-            c.set_key(db, coll, name, kb, b"")
+            c.set_key(db, coll, name, seed)
             rc = c.search_near()
             if rc == wt.WT_NOTFOUND:
                 continue
@@ -766,10 +801,13 @@ class Storage:
                 continue
             while True:
                 k = c.get_key()
-                if (k[0], k[1], k[2]) != (db, coll, name) or bytes(k[3]) != kb:
+                if (k[0], k[1], k[2]) != (db, coll, name):
                     break
-                other_id = bytes(k[4])
-                if exclude_id_key is None or other_id != exclude_id_key:
+                packed = bytes(k[3])
+                row_esc, row_id = _unpack_entry(packed)
+                if row_esc != esc_kb:
+                    break
+                if exclude_id_key is None or row_id != exclude_id_key:
                     return name
                 if c.next() != 0:
                     break
@@ -777,7 +815,8 @@ class Storage:
 
     def _scan_index_for_id_keys(self, db: str, coll: str, name: str, kb: bytes) -> list[bytes]:
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        c.set_key(db, coll, name, kb, b"")
+        esc_kb = _escape_kb(kb)
+        c.set_key(db, coll, name, esc_kb + _ENTRY_SEP)
         rc = c.search_near()
         if rc == wt.WT_NOTFOUND:
             return []
@@ -786,9 +825,13 @@ class Storage:
         out: list[bytes] = []
         while True:
             k = c.get_key()
-            if (k[0], k[1], k[2]) != (db, coll, name) or bytes(k[3]) != kb:
+            if (k[0], k[1], k[2]) != (db, coll, name):
                 break
-            out.append(bytes(k[4]))
+            packed = bytes(k[3])
+            row_esc, row_id = _unpack_entry(packed)
+            if row_esc != esc_kb:
+                break
+            out.append(row_id)
             if c.next() != 0:
                 break
         return out
@@ -805,6 +848,8 @@ class Storage:
                 out.append(bson.decode(bytes(c.get_value())))
         return out
 
+    _RANGE_OPS: tuple[str, ...] = ("$eq", "$gt", "$gte", "$lt", "$lte", "$in")
+
     def _try_index_lookup(
         self, db: str, coll: str, filter: dict[str, Any]
     ) -> list[dict[str, Any]] | None:
@@ -813,11 +858,99 @@ class Storage:
         field, value = next(iter(filter.items()))
         if field.startswith("$"):
             return None
-        if isinstance(value, dict):
-            return None
+        index_name: str | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             if list(key_spec.keys()) == [field]:
-                kb = _canon_value(value)
-                id_keys = self._scan_index_for_id_keys(db, coll, name, kb)
+                index_name = name
+                break
+        if index_name is None:
+            return None
+        if not isinstance(value, dict):
+            kb = encode_value(value)
+            id_keys = self._scan_index_for_id_keys(db, coll, index_name, kb)
+            return self._docs_by_id_keys(db, coll, id_keys)
+        if not value or not all(k.startswith("$") for k in value):
+            # Mixed (some non-$ keys) means subdocument equality — skip.
+            return None
+        if not all(op in self._RANGE_OPS for op in value):
+            return None
+        if "$in" in value:
+            if len(value) != 1 or not isinstance(value["$in"], list):
+                return None
+            seen: set[bytes] = set()
+            id_keys = []
+            for v in value["$in"]:
+                if isinstance(v, dict):
+                    return None
+                kb = encode_value(v)
+                for id_k in self._scan_index_for_id_keys(db, coll, index_name, kb):
+                    if id_k not in seen:
+                        seen.add(id_k)
+                        id_keys.append(id_k)
+            return self._docs_by_id_keys(db, coll, id_keys)
+        lower: bytes | None = None
+        lower_inclusive = True
+        upper: bytes | None = None
+        upper_inclusive = True
+        for op, bound in value.items():
+            if isinstance(bound, dict):
+                return None
+            if op == "$eq":
+                kb = encode_value(bound)
+                id_keys = self._scan_index_for_id_keys(db, coll, index_name, kb)
                 return self._docs_by_id_keys(db, coll, id_keys)
-        return None
+            kb = encode_value(bound)
+            if op == "$gt":
+                lower, lower_inclusive = kb, False
+            elif op == "$gte":
+                lower, lower_inclusive = kb, True
+            elif op == "$lt":
+                upper, upper_inclusive = kb, False
+            elif op == "$lte":
+                upper, upper_inclusive = kb, True
+        id_keys = self._range_scan_index(
+            db, coll, index_name, lower, lower_inclusive, upper, upper_inclusive
+        )
+        return self._docs_by_id_keys(db, coll, id_keys)
+
+    def _range_scan_index(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        lower: bytes | None,
+        lower_inclusive: bool,
+        upper: bytes | None,
+        upper_inclusive: bool,
+    ) -> list[bytes]:
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        esc_lower = _escape_kb(lower) if lower is not None else None
+        esc_upper = _escape_kb(upper) if upper is not None else None
+        seed = (esc_lower or b"") + _ENTRY_SEP if lower is not None else b""
+        c.set_key(db, coll, name, seed)
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return []
+        if rc < 0 and c.next() != 0:
+            return []
+        out: list[bytes] = []
+        while True:
+            k = c.get_key()
+            if (k[0], k[1], k[2]) != (db, coll, name):
+                break
+            packed = bytes(k[3])
+            row_esc, row_id = _unpack_entry(packed)
+            if esc_lower is not None and not lower_inclusive and row_esc == esc_lower:
+                if c.next() != 0:
+                    break
+                continue
+            if esc_upper is not None:
+                if upper_inclusive:
+                    if row_esc > esc_upper:
+                        break
+                elif row_esc >= esc_upper:
+                    break
+            out.append(row_id)
+            if c.next() != 0:
+                break
+        return out

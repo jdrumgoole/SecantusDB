@@ -34,18 +34,19 @@ Layers, roughly outermost-in:
 - `src/secantus/aggregate.py` — `apply_pipeline(docs, pipeline, ctx)`. Stages: `$match`, `$count`, `$limit`, `$skip`, `$sort`, `$project` (with computed fields), `$addFields`/`$set`, `$unset`, `$unwind`, `$replaceRoot`/`$replaceWith`, `$group`, `$lookup` (both simple and `let`/`pipeline` forms), `$sample`, `$sortByCount`, `$facet`, `$bucket`. `$group` accumulators: `$sum`, `$count`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`. `PipelineContext` carries the `Storage`, current `db_name`, and a `vars` map (for `$lookup` `let` bindings, threaded through every stage that calls the expression evaluator).
 - `src/secantus/cursors.py` — `CursorRegistry`. Per-server, thread-safe map of int64 cursor id → remaining docs. Used by `find` and `aggregate` to support pagination via `getMore`/`killCursors`.
 - `src/secantus/paths.py` — shared dotted-path helpers (`get_path`/`set_path`/`unset_path`/`has_path`/`walk_to_parent`). Used by `update`, `projection`, `aggregate`, and storage's sort.
+- `src/secantus/sortkey.py` — pure `encode_value(v)` and `encode_compound([v1, v2, ...])` that produce **byte-sortable** bytes whose lex order matches MongoDB's BSON cross-type sort order. Layout: `<rank_byte><payload>`. Numbers go through a "lexical decimal" form (sign byte + bias-shifted exponent + paired BCD digits + terminator) so int / long / double / Decimal128 collide on equal value and order correctly across the unified numeric type. NaN / ±Infinity get dedicated bracketing markers. Strings, binary, regex are null-escaped (`\x00 → \x00\xff`) so `\x00\x00` is a safe compound separator.
 - `src/secantus/storage.py` — WiredTiger-backed store (same engine MongoDB uses). Four tables in one WT connection:
   - `table:secantus_collections` (key_format=`SS`, value=BSON options blob) — `(db, coll)` registry.
   - `table:secantus_documents` (key_format=`SSu`, value=`u`) — `(db, coll, id_key) → bson.encode(doc)`. `id_key` is the canonical-numeric-or-BSON-blob form so int/float/Decimal128 collide on `_id`.
   - `table:secantus_indexes` (key_format=`SSS`, value=`u`) — `(db, coll, name) → bson.encode({key, options})`.
-  - `table:secantus_index_entries` (key_format=`SSSuu`, value=`u`) — `(db, coll, name, value_bytes, id_key) → b""`. `value_bytes` is `_canon_value` joined with `\x00`. Maintained on every insert/update/delete.
+  - `table:secantus_index_entries` (key_format=`SSSu`, value=`u`) — `(db, coll, name, packed) → b""` where `packed = escape(sortkey) + b"\x00\x00" + id_key`. The packed form is in a single trailing `u` column on purpose: WT length-prefixes non-trailing `u` columns, which would break lex order on the sort-key bytes. Maintained on every insert/update/delete.
   WT sessions are thread-affine, kept in `threading.local()`; cursors per session per table are cached and `reset()` between calls. A global `RLock` serializes all public methods so we never have to think about WT's MVCC at the storage layer. `:memory:` is mapped to a `tempfile.mkdtemp()` opened with `in_memory=true` and rmtree'd on `close()`.
 
-### Indexes: equality fast, range/sort still scan
+### Indexes: equality + range, no compound or sort yet
 
-Equality lookup is accelerated. `find_matching` detects single-field equality filters (`{field: value}` where `value` isn't a dict and `field` isn't a `$`-operator) and uses the entries table to walk only the matching `id_key`s. Unique enforcement probes the entries table by `value_bytes` prefix instead of full-scanning the collection.
+`find_matching` routes through the index entries table for single-field filters of these shapes: bare equality (`{field: v}`), `$eq`, `$in`, and any combination of `$gt`/`$gte`/`$lt`/`$lte`. The B-tree gives us `O(log n + k)` for each. Unique enforcement is a prefix probe on the entries table, not a full scan.
 
-Still missing: range queries (`$gt`/`$gte`/`$lt`/`$lte`), `$in`, sort-by-indexed-field, compound-prefix lookup, and `hint` actually picking an index. These need a typed sort-key value encoding (1-byte BSON-cross-type rank + byte-sortable bytes) so the WT B-tree can answer ordered queries directly. The current `_canon_value` is byte-equal but **not** byte-sortable, so it can't drive range scans yet.
+Still missing: sort-by-indexed-field acceleration, compound-prefix lookup, descending-direction indexes, and `hint` actually picking an index (it's accepted and ignored). All of those are wiring work on top of the existing sort-key encoder, not new encoding work.
 
 Out of scope regardless: text / geo / hashed / wildcard indexes, `partialFilterExpression`, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
 
