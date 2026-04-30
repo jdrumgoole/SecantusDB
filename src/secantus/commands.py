@@ -714,8 +714,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus.storage import BadHint
+
     coll = doc["aggregate"]
     pipeline = doc.get("pipeline", [])
+    hint = doc.get("hint")
     cursor_opts = doc.get("cursor") or {}
     batch_size = int(cursor_opts.get("batchSize", 0) or 0)
     coll_name = ""
@@ -729,7 +732,21 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         ):
             docs: list[dict[str, Any]] = []
         else:
-            docs = ctx.storage.find_matching(ctx.db_name, coll, {})
+            # If the first stage is $match, lift its filter into the initial
+            # fetch so the index planner can use it. Skip the stage in the
+            # pipeline so we don't apply the same filter twice.
+            initial_filter: dict[str, Any] = {}
+            if (
+                isinstance(first_stage, Mapping)
+                and "$match" in first_stage
+                and isinstance(first_stage["$match"], Mapping)
+            ):
+                initial_filter = dict(first_stage["$match"])
+                pipeline = list(pipeline[1:])
+            try:
+                docs = ctx.storage.find_matching(ctx.db_name, coll, initial_filter, hint=hint)
+            except BadHint as exc:
+                return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
         ns = _ns(ctx.db_name, coll)
     else:
         docs = []
