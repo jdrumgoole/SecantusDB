@@ -42,17 +42,18 @@ Layers, roughly outermost-in:
   - `table:secantus_index_entries` (key_format=`SSSu`, value=`u`) — `(db, coll, name, packed) → b""` where `packed = escape(sortkey) + b"\x00\x00" + id_key`. The packed form is in a single trailing `u` column on purpose: WT length-prefixes non-trailing `u` columns, which would break lex order on the sort-key bytes. Maintained on every insert/update/delete.
   WT sessions are thread-affine, kept in `threading.local()`; cursors per session per table are cached and `reset()` between calls. A global `RLock` serializes all public methods so we never have to think about WT's MVCC at the storage layer. `:memory:` is mapped to a `tempfile.mkdtemp()` opened with `in_memory=true` and rmtree'd on `close()`.
 
-### Indexes: equality (incl. compound prefix) + range + sort
+### Indexes: equality (incl. compound prefix) + range (incl. compound trailing) + sort
 
 `find_matching` routes through the index entries table for:
 - **Single-field filters**: bare equality (`{field: v}`), `$eq`, `$in`, and any combination of `$gt`/`$gte`/`$lt`/`$lte` against a single-field ASC index.
 - **Multi-field bare-equality filters**: when the filter's fields are a leading prefix (set-wise) of an ASC compound index, an exact match (filter covers the whole index) or a prefix scan (strict leading prefix) runs. Filter field order doesn't matter — `{b: 20, a: 1}` finds the same `{a:1, b:1}` index as `{a: 1, b: 20}`. Single-field filters can also use a compound index whose leading field matches.
+- **Compound prefix + trailing operator**: filters of the form `{a: 5, b: {$gt: 10}}` (any number of leading bare-equality fields followed by exactly one operator-form field, where that operator field is the next field in the index after the equality prefix) prefix-pin the equalities and apply the operator's bounds to the next column. Supports `$eq`/`$in`/`$gt`/`$gte`/`$lt`/`$lte` on the trailing field.
 
 Sort-by-indexed-field rides the same B-tree: if `sort` is a single-field `+1` or `-1` on a field with an ASC index, results come back in order (reversed for `-1`) and the post-sort step is skipped.
 
 Unique enforcement is a prefix probe on the entries table, not a full scan.
 
-Still missing: range queries against a compound-prefix scan (operator forms still need a single-field index), native descending-direction indexes (we only build `{field: 1}` indexes; sort `-1` reverses in Python), and `hint` actually picking an index (it's accepted and ignored).
+Still missing: native descending-direction indexes (we only build `{field: 1}` indexes; sort `-1` reverses in Python), `hint` actually picking an index (accepted and ignored), and operator forms on a compound's leading field with no equality prefix (single-field-only-index path still applies — but a compound's leading field accepts only bare equality today).
 
 Out of scope regardless: text / geo / hashed / wildcard indexes, `partialFilterExpression`, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
 

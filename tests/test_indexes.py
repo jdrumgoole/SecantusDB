@@ -569,3 +569,131 @@ def test_compound_index_update_maintains_entries(storage: Storage) -> None:
     assert storage.find_matching("db", "c", {"a": 1, "b": 10}) == []
     docs = storage.find_matching("db", "c", {"a": 1, "b": 99})
     assert [d["_id"] for d in docs] == [1]
+
+
+def test_compound_index_eq_plus_gt_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": (i // 5) + 1, "b": i % 5} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 2, "b": {"$gt": 2}})
+    assert sorted(d["_id"] for d in docs) == [8, 9]
+    assert calls == []
+
+
+def test_compound_index_eq_plus_gte_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": (i // 5) + 1, "b": i % 5} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 2, "b": {"$gte": 3}})
+    assert sorted(d["_id"] for d in docs) == [8, 9]
+    assert calls == []
+
+
+def test_compound_index_eq_plus_lt_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": (i // 5) + 1, "b": i % 5} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 2, "b": {"$lt": 2}})
+    assert sorted(d["_id"] for d in docs) == [5, 6]
+    assert calls == []
+
+
+def test_compound_index_eq_plus_range_both_bounds(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": i, "a": 1, "b": i} for i in range(20)]
+        + [{"_id": 100 + i, "a": 2, "b": i} for i in range(5)],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$gte": 5, "$lt": 10}})
+    assert sorted(d["_id"] for d in docs) == [5, 6, 7, 8, 9]
+    assert calls == []
+
+
+def test_compound_index_eq_plus_in_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+            {"_id": 3, "a": 1, "b": 30},
+            {"_id": 4, "a": 2, "b": 10},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$in": [10, 30]}})
+    assert sorted(d["_id"] for d in docs) == [1, 3]
+    assert calls == []
+
+
+def test_compound_index_eq_plus_eq_operator(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$eq": 20}})
+    assert [d["_id"] for d in docs] == [2]
+    assert calls == []
+
+
+def test_compound_three_field_eq_plus_range_on_third(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "abc_1", {"a": 1, "b": 1, "c": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": i, "a": 1, "b": 10, "c": i} for i in range(10)]
+        + [{"_id": 100 + i, "a": 1, "b": 20, "c": i} for i in range(5)]
+        + [{"_id": 200 + i, "a": 2, "b": 10, "c": i} for i in range(5)],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 10, "c": {"$gt": 5}})
+    assert sorted(d["_id"] for d in docs) == [6, 7, 8, 9]
+    assert calls == []
+
+
+def test_compound_range_does_not_leak_across_eq_prefix(storage: Storage, monkeypatch) -> None:
+    """A range that would match docs in another (a) bucket must stop at the prefix boundary."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 100},
+            {"_id": 2, "a": 1, "b": 200},
+            {"_id": 3, "a": 2, "b": 1},
+            {"_id": 4, "a": 2, "b": 5},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$gte": 50}})
+    assert sorted(d["_id"] for d in docs) == [1, 2]
+    assert calls == []
+
+
+def test_compound_index_range_skipping_middle_field_falls_back(
+    storage: Storage, monkeypatch
+) -> None:
+    """Index {a,b,c}; filter {a:1, c:{$gt:5}} skips b — planner can't use the index."""
+    storage.create_index("db", "c", "abc_1", {"a": 1, "b": 1, "c": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": 1, "b": i, "c": i * 2} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "c": {"$gt": 10}})
+    assert sorted(d["_id"] for d in docs) == [6, 7, 8, 9]
+    assert calls != []
+
+
+def test_compound_index_range_in_with_empty_list(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "a": 1, "b": 10}])
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$in": []}})
+    assert docs == []
