@@ -257,12 +257,12 @@ def encode_value(value: Any) -> bytes:
     return head  # unreachable
 
 
-_COMPOUND_SEP = b"\x00\x00"
+COMPOUND_SEP = b"\x00\x00"
 
 
 def encode_compound(values: list[Any]) -> bytes:
     """Compound key. Components are null-escaped; ``\\x00\\x00`` separates."""
-    return _COMPOUND_SEP.join(encode_value(v) for v in values)
+    return COMPOUND_SEP.join(encode_value(v) for v in values)
 
 
 # Range-query bound helpers. Bounds are returned as (key_bytes, inclusive)

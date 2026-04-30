@@ -415,3 +415,157 @@ def test_sort_index_walk_does_not_leak_other_indexes(storage: Storage) -> None:
     assert [d["_id"] for d in docs] == [0, 1, 2, 3, 4]
     docs = storage.find_matching("db", "c", {}, sort={"y": 1})
     assert [d["_id"] for d in docs] == [4, 3, 2, 1, 0]
+
+
+def test_compound_index_full_match_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+            {"_id": 3, "a": 2, "b": 10},
+            {"_id": 4, "a": 2, "b": 20},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 20})
+    assert [d["_id"] for d in docs] == [2]
+    assert calls == []
+
+
+def test_compound_index_leading_prefix_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+            {"_id": 3, "a": 2, "b": 10},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1})
+    assert sorted(d["_id"] for d in docs) == [1, 2]
+    assert calls == []
+
+
+def test_compound_index_three_field_prefix(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "abc_1", {"a": 1, "b": 1, "c": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10, "c": "x"},
+            {"_id": 2, "a": 1, "b": 10, "c": "y"},
+            {"_id": 3, "a": 1, "b": 20, "c": "x"},
+            {"_id": 4, "a": 2, "b": 10, "c": "x"},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 10})
+    assert sorted(d["_id"] for d in docs) == [1, 2]
+    assert calls == []
+
+
+def test_compound_index_filter_field_order_does_not_matter(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"b": 20, "a": 1})  # filter order: b first
+    assert [d["_id"] for d in docs] == [2]
+    assert calls == []
+
+
+def test_compound_index_skipping_leading_field_falls_back(storage: Storage, monkeypatch) -> None:
+    """Filter on b alone (not the leading field) cannot use the {a,b} index."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": 1, "b": i} for i in range(5)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"b": 3})
+    assert [d["_id"] for d in docs] == [3]
+    assert calls != []  # full scan
+
+
+def test_compound_index_filter_with_extra_fields_falls_back(storage: Storage, monkeypatch) -> None:
+    """Filter has fields beyond what the index covers — needs post-filter, defer."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10, "z": "x"},
+            {"_id": 2, "a": 1, "b": 10, "z": "y"},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 10, "z": "x"})
+    assert [d["_id"] for d in docs] == [1]
+    # Index covers only {a, b}; the z filter forced a full scan in this MVP.
+    assert calls != []
+
+
+def test_single_field_filter_uses_compound_index_when_no_single_index(
+    storage: Storage, monkeypatch
+) -> None:
+    """Single-field bare-equality on the leading field of a compound index uses it."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 2, "b": 20},
+            {"_id": 3, "a": 1, "b": 30},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1})
+    assert sorted(d["_id"] for d in docs) == [1, 3]
+    assert calls == []
+
+
+def test_compound_index_prefers_exact_cover_over_longer_index(
+    storage: Storage, monkeypatch
+) -> None:
+    """Two indexes match the prefix; pick the tighter one."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.create_index("db", "c", "abc_1", {"a": 1, "b": 1, "c": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10, "c": "x"},
+            {"_id": 2, "a": 1, "b": 10, "c": "y"},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 10})
+    assert sorted(d["_id"] for d in docs) == [1, 2]
+    assert calls == []
+
+
+def test_compound_index_unique_violation_detected(storage: Storage) -> None:
+    """Unique compound enforcement still works through the new path."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {"unique": True})
+    storage.insert("db", "c", [{"_id": 1, "a": 1, "b": 10}])
+    _, errors = storage.insert("db", "c", [{"_id": 2, "a": 1, "b": 10}])
+    assert errors and errors[0]["code"] == 11000
+
+
+def test_compound_index_update_maintains_entries(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "a": 1, "b": 10}])
+    storage.update_matching("db", "c", {"_id": 1}, {"$set": {"b": 99}})
+    assert storage.find_matching("db", "c", {"a": 1, "b": 10}) == []
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 99})
+    assert [d["_id"] for d in docs] == [1]
