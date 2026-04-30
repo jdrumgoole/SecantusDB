@@ -31,7 +31,7 @@ from bson import Decimal128
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
-from secantus.sortkey import encode_compound, encode_value
+from secantus.sortkey import COMPOUND_SEP, encode_compound, encode_value
 from secantus.update import apply_update, find_positional_matches
 
 _COLL_TABLE = "table:secantus_collections"
@@ -877,10 +877,20 @@ class Storage:
                     break
         return None
 
-    def _scan_index_for_id_keys(self, db: str, coll: str, name: str, kb: bytes) -> list[bytes]:
+    def _scan_index_for_id_keys(
+        self, db: str, coll: str, name: str, kb: bytes, *, prefix: bool = False
+    ) -> list[bytes]:
+        """Walk the index entries for ``name`` matching ``kb``.
+
+        With ``prefix=False`` (default), only rows whose ``escaped_kb`` is
+        exactly equal to ``escape(kb)`` are returned — equality lookup.
+        With ``prefix=True``, any row whose ``escaped_kb`` starts with
+        ``escape(kb)`` is returned — compound-prefix lookup.
+        """
         c = self._cursor(_IDX_ENTRIES_TABLE)
         esc_kb = _escape_kb(kb)
-        c.set_key(db, coll, name, esc_kb + _ENTRY_SEP)
+        seed = esc_kb if prefix else esc_kb + _ENTRY_SEP
+        c.set_key(db, coll, name, seed)
         rc = c.search_near()
         if rc == wt.WT_NOTFOUND:
             return []
@@ -893,7 +903,10 @@ class Storage:
                 break
             packed = bytes(k[3])
             row_esc, row_id = _unpack_entry(packed)
-            if row_esc != esc_kb:
+            if prefix:
+                if not row_esc.startswith(esc_kb):
+                    break
+            elif row_esc != esc_kb:
                 break
             out.append(row_id)
             if c.next() != 0:
@@ -917,14 +930,24 @@ class Storage:
     def _try_index_lookup(
         self, db: str, coll: str, filter: dict[str, Any]
     ) -> list[dict[str, Any]] | None:
-        if not filter or len(filter) != 1:
+        if not filter:
+            return None
+        if any(f.startswith("$") for f in filter):
+            return None
+        # Bare-equality filters of any size can use a compound index whose
+        # leading fields cover the filter set. Operator-form filters
+        # ($eq/$in/$gt/...) are still handled by the single-field path
+        # below — range on a compound prefix is a future iteration.
+        if all(not isinstance(v, dict) for v in filter.values()):
+            result = self._try_compound_eq_lookup(db, coll, filter)
+            if result is not None:
+                return result
+        if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
-        if field.startswith("$"):
-            return None
         index_name: str | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if list(key_spec.keys()) == [field]:
+            if list(key_spec.keys()) == [field] and int(key_spec[field]) == 1:
                 index_name = name
                 break
         if index_name is None:
@@ -975,6 +998,44 @@ class Storage:
         id_keys = self._range_scan_index(
             db, coll, index_name, lower, lower_inclusive, upper, upper_inclusive
         )
+        return self._docs_by_id_keys(db, coll, id_keys)
+
+    def _try_compound_eq_lookup(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        """Bare-equality filter against a compound (or single-field) index prefix.
+
+        Picks an ASC index whose leading fields (set-wise) match the filter's
+        fields exactly, and runs an equality (full-cover) or prefix
+        (strict-leading-prefix) scan against it.
+        """
+        filter_fields = set(filter)
+        best: tuple[str, list[str]] | None = None
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            idx_fields = list(key_spec.keys())
+            if any(int(key_spec[f]) != 1 for f in idx_fields):
+                continue
+            if len(idx_fields) < len(filter_fields):
+                continue
+            if set(idx_fields[: len(filter_fields)]) != filter_fields:
+                continue
+            # Prefer an index whose total field count matches the filter (exact cover)
+            # over one with extra trailing fields (prefix scan).
+            if best is None or (len(best[1]) > len(idx_fields)):
+                best = (name, idx_fields)
+            if len(idx_fields) == len(filter_fields):
+                break
+        if best is None:
+            return None
+        name, idx_fields = best
+        values = [filter[f] for f in idx_fields[: len(filter_fields)]]
+        if len(filter_fields) == len(idx_fields):
+            kb = encode_compound(values) if len(values) > 1 else encode_value(values[0])
+            id_keys = self._scan_index_for_id_keys(db, coll, name, kb)
+        else:
+            kb = encode_compound(values) if len(values) > 1 else encode_value(values[0])
+            kb = kb + COMPOUND_SEP
+            id_keys = self._scan_index_for_id_keys(db, coll, name, kb, prefix=True)
         return self._docs_by_id_keys(db, coll, id_keys)
 
     def _range_scan_index(
