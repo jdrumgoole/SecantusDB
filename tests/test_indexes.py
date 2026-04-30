@@ -219,3 +219,131 @@ def test_unique_index_uses_entry_probe(storage: Storage) -> None:
     _, errors = storage.insert("db", "c", [{"_id": 2, "email": "a@x"}])
     assert errors and errors[0]["code"] == 11000
     assert _index_entry_count(storage, "db", "c", "email_1") == 1
+
+
+def _spy_scans(storage: Storage, monkeypatch) -> list[tuple[str, str]]:
+    calls: list[tuple[str, str]] = []
+    real_scan = storage._scan_docs
+
+    def spy(db: str, coll: str):
+        calls.append((db, coll))
+        return real_scan(db, coll)
+
+    monkeypatch.setattr(storage, "_scan_docs", spy)
+    return calls
+
+
+def test_index_range_gt_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$gt": 6}})
+    assert sorted(d["_id"] for d in docs) == [7, 8, 9]
+    assert calls == []
+
+
+def test_index_range_gte_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$gte": 6}})
+    assert sorted(d["_id"] for d in docs) == [6, 7, 8, 9]
+    assert calls == []
+
+
+def test_index_range_lt_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$lt": 3}})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2]
+    assert calls == []
+
+
+def test_index_range_lte_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$lte": 3}})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2, 3]
+    assert calls == []
+
+
+def test_index_range_compound_bounds(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$gte": 5, "$lt": 10}})
+    assert sorted(d["_id"] for d in docs) == [5, 6, 7, 8, 9]
+    assert calls == []
+
+
+def test_index_in_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$in": [2, 5, 9]}})
+    assert sorted(d["_id"] for d in docs) == [2, 5, 9]
+    assert calls == []
+
+
+def test_index_eq_operator_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i % 3} for i in range(9)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$eq": 1}})
+    assert sorted(d["_id"] for d in docs) == [1, 4, 7]
+    assert calls == []
+
+
+def test_index_range_with_unsupported_op_falls_back(storage: Storage, monkeypatch) -> None:
+    """A range op mixed with an op the planner doesn't handle falls back."""
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$gt": 3, "$ne": 5}})
+    assert sorted(d["_id"] for d in docs) == [4, 6, 7, 8, 9]
+    assert calls != []
+
+
+def test_index_range_string(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "name_1", {"name": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "name": "alice"},
+            {"_id": 2, "name": "bob"},
+            {"_id": 3, "name": "carol"},
+            {"_id": 4, "name": "dave"},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"name": {"$gte": "b", "$lt": "d"}})
+    assert sorted(d["_id"] for d in docs) == [2, 3]
+    assert calls == []
+
+
+def test_index_range_mixed_int_and_decimal(storage: Storage) -> None:
+    from bson import Decimal128
+
+    storage.create_index("db", "c", "n_1", {"n": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "n": 1},
+            {"_id": 2, "n": 2.5},
+            {"_id": 3, "n": Decimal128("3.5")},
+            {"_id": 4, "n": 5},
+        ],
+    )
+    docs = storage.find_matching("db", "c", {"n": {"$gte": 2, "$lte": 4}})
+    assert sorted(d["_id"] for d in docs) == [2, 3]
+
+
+def test_index_in_with_empty_list(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "x": 1}, {"_id": 2, "x": 2}])
+    docs = storage.find_matching("db", "c", {"x": {"$in": []}})
+    assert docs == []

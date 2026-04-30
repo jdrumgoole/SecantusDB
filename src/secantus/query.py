@@ -278,10 +278,45 @@ def _cmp(values: list[Any], target: Any, op: Callable[[Any, Any], bool]) -> bool
 
 
 def _try_cmp(a: Any, b: Any, op: Callable[[Any, Any], bool]) -> bool:
+    a, b = _coerce_numeric(a, b)
     try:
         return bool(op(a, b))
     except TypeError:
         return False
+
+
+def _coerce_numeric(a: Any, b: Any) -> tuple[Any, Any]:
+    """Bridge numeric BSON types so $gt/$lt etc. compare across int/float/Decimal128.
+
+    Bool is intentionally excluded — MongoDB ranks bools as a separate type
+    from numbers and they should not silently bridge.
+    """
+    if (
+        not isinstance(a, bool)
+        and not isinstance(b, bool)
+        and isinstance(a, (int, float, Decimal128))
+        and isinstance(b, (int, float, Decimal128))
+        and (isinstance(a, Decimal128) or isinstance(b, Decimal128))
+    ):
+        from decimal import Decimal, InvalidOperation
+
+        def _to_dec(v: Any) -> Decimal | None:
+            if isinstance(v, Decimal128):
+                try:
+                    return v.to_decimal()
+                except (InvalidOperation, ValueError):
+                    return None
+            if isinstance(v, float):
+                try:
+                    return Decimal(repr(v))
+                except (InvalidOperation, ValueError):
+                    return None
+            return Decimal(int(v))
+
+        ad, bd = _to_dec(a), _to_dec(b)
+        if ad is not None and bd is not None and ad.is_finite() and bd.is_finite():
+            return ad, bd
+    return a, b
 
 
 _MONGO_FLAG_MAP = {
