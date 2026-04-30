@@ -697,3 +697,100 @@ def test_compound_index_range_in_with_empty_list(storage: Storage) -> None:
     storage.insert("db", "c", [{"_id": 1, "a": 1, "b": 10}])
     docs = storage.find_matching("db", "c", {"a": 1, "b": {"$in": []}})
     assert docs == []
+
+
+def test_hint_by_name_walks_named_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(5)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": 3}, hint="x_1")
+    assert [d["_id"] for d in docs] == [3]
+    assert calls == []
+
+
+def test_hint_by_key_spec_walks_matching_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(5)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, hint={"x": 1})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2, 3, 4]
+    assert calls == []
+
+
+def test_hint_unknown_index_raises(storage: Storage) -> None:
+    from secantus.storage import BadHint
+
+    storage.insert("db", "c", [{"x": 1}])
+    with pytest.raises(BadHint):
+        storage.find_matching("db", "c", {}, hint="nonexistent")
+    with pytest.raises(BadHint):
+        storage.find_matching("db", "c", {}, hint={"nonexistent": 1})
+
+
+def test_hint_natural_uses_collection_scan(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(3)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": 1}, hint="$natural")
+    assert [d["_id"] for d in docs] == [1]
+    assert calls != []
+
+
+def test_hint_natural_dict_form(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(3)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": 1}, hint={"$natural": 1})
+    assert [d["_id"] for d in docs] == [1]
+    assert calls != []
+
+
+def test_hint_id_index(storage: Storage) -> None:
+    storage.insert("db", "c", [{"_id": i, "x": -i} for i in range(5)])
+    docs = storage.find_matching("db", "c", {}, hint="_id_")
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2, 3, 4]
+    docs = storage.find_matching("db", "c", {}, hint={"_id": 1})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2, 3, 4]
+
+
+def test_hint_with_filter_post_filters(storage: Storage, monkeypatch) -> None:
+    """hint forces using the named index even when the filter doesn't fit."""
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i, "y": i % 2} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"y": 1}, hint="x_1")
+    assert sorted(d["_id"] for d in docs) == [1, 3, 5, 7, 9]
+    assert calls == []
+
+
+def test_hint_with_sort_matching_index_skips_sort(storage: Storage, monkeypatch) -> None:
+    import secantus.storage as st
+
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": (i * 7) % 11} for i in range(11)])
+    sort_calls = [0]
+    real = st.sort_docs
+
+    def counting(*a, **kw):
+        sort_calls[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(st, "sort_docs", counting)
+    docs = storage.find_matching("db", "c", {}, sort={"x": 1}, hint="x_1")
+    xs = [d["x"] for d in docs]
+    assert xs == sorted(xs)
+    assert sort_calls[0] == 0
+
+
+def test_hint_with_descending_sort_reverses(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(5)])
+    docs = storage.find_matching("db", "c", {}, sort={"x": -1}, hint="x_1")
+    assert [d["x"] for d in docs] == [4, 3, 2, 1, 0]
+
+
+def test_hint_with_sort_on_different_field_still_sorts(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i, "y": -i} for i in range(5)])
+    docs = storage.find_matching("db", "c", {}, sort={"y": 1}, hint="x_1")
+    assert [d["_id"] for d in docs] == [4, 3, 2, 1, 0]

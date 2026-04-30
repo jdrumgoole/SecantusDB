@@ -264,23 +264,30 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus.storage import BadHint
+
     coll = doc["find"]
     filter_ = doc.get("filter") or {}
     skip = int(doc.get("skip", 0) or 0)
     limit = int(doc.get("limit", 0) or 0)
     sort = doc.get("sort") or None
     projection = doc.get("projection") or None
+    hint = doc.get("hint")
     batch_size = int(doc.get("batchSize", 0) or 0)
     single_batch = bool(doc.get("singleBatch", False))
-    docs = ctx.storage.find_matching(
-        ctx.db_name,
-        coll,
-        filter_,
-        skip=skip,
-        limit=limit,
-        sort=sort,
-        projection=projection,
-    )
+    try:
+        docs = ctx.storage.find_matching(
+            ctx.db_name,
+            coll,
+            filter_,
+            skip=skip,
+            limit=limit,
+            sort=sort,
+            projection=projection,
+            hint=hint,
+        )
+    except BadHint as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     ns = _ns(ctx.db_name, coll)
     if single_batch:
         first_batch, cursor_id = docs, 0

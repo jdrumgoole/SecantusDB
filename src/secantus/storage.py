@@ -229,6 +229,10 @@ class IndexConflict(Exception):
         self.doc_id = doc_id
 
 
+class BadHint(Exception):
+    """The ``hint`` passed to ``find_matching`` doesn't name an existing index."""
+
+
 class Storage:
     def __init__(self, path: str = ":memory:") -> None:
         self._lock = threading.RLock()
@@ -405,30 +409,37 @@ class Storage:
         limit: int = 0,
         sort: Mapping[str, Any] | None = None,
         projection: Mapping[str, Any] | None = None,
+        hint: str | Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         filter = filter or {}
         in_sort_order = False
         with self._lock:
-            candidates = self._try_index_lookup(db, coll, filter)
             sort_field, sort_dir = self._single_sort_spec(sort)
-            if candidates is not None and sort_field is not None:
-                if (
-                    len(filter) == 1
-                    and not next(iter(filter)).startswith("$")
-                    and next(iter(filter)) == sort_field
-                ):
-                    in_sort_order = True
-                    if sort_dir == -1:
-                        candidates = list(reversed(candidates))
-            elif candidates is None and not filter and sort_field is not None:
-                idx_name = self._single_field_index_for(db, coll, sort_field)
-                if idx_name is not None:
-                    candidates = self._walk_index_in_order(
-                        db, coll, idx_name, reverse=(sort_dir == -1)
-                    )
-                    in_sort_order = True
-            if candidates is None:
-                candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
+            if hint is not None:
+                resolved = self._resolve_hint(db, coll, hint)
+                candidates, in_sort_order = self._candidates_from_hint(
+                    db, coll, resolved, sort_field, sort_dir
+                )
+            else:
+                candidates = self._try_index_lookup(db, coll, filter)
+                if candidates is not None and sort_field is not None:
+                    if (
+                        len(filter) == 1
+                        and not next(iter(filter)).startswith("$")
+                        and next(iter(filter)) == sort_field
+                    ):
+                        in_sort_order = True
+                        if sort_dir == -1:
+                            candidates = list(reversed(candidates))
+                elif candidates is None and not filter and sort_field is not None:
+                    idx_name = self._single_field_index_for(db, coll, sort_field)
+                    if idx_name is not None:
+                        candidates = self._walk_index_in_order(
+                            db, coll, idx_name, reverse=(sort_dir == -1)
+                        )
+                        in_sort_order = True
+                if candidates is None:
+                    candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
         out = [d for d in candidates if matches(d, filter)]
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
@@ -439,6 +450,70 @@ class Storage:
         if projection:
             out = [apply_projection(d, projection) for d in out]
         return out
+
+    def _resolve_hint(self, db: str, coll: str, hint: str | Mapping[str, Any]) -> str:
+        """Resolve ``hint`` to an index name (or ``$natural``).
+
+        ``hint`` may be an index name string, a key-spec dict matching an
+        existing index, ``"$natural"``, or ``{"$natural": +/-1}``. Anything
+        else raises ``BadHint`` so the command layer can return a Mongo
+        ``BadValue`` error.
+        """
+        if isinstance(hint, str):
+            if hint == "$natural":
+                return "$natural"
+            if hint == _ID_INDEX_NAME:
+                return _ID_INDEX_NAME
+            for name, _key_spec, _sparse, _unique in self._all_indexes(db, coll):
+                if name == hint:
+                    return name
+            raise BadHint(f"hint {hint!r} does not correspond to an existing index")
+        if isinstance(hint, Mapping):
+            if list(hint) == ["$natural"]:
+                return "$natural"
+            if list(hint) == ["_id"] and int(hint["_id"]) == 1:
+                return _ID_INDEX_NAME
+            for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+                if dict(key_spec) == dict(hint):
+                    return name
+            raise BadHint(f"hint {dict(hint)!r} does not correspond to an existing index")
+        raise BadHint(f"invalid hint type: {type(hint).__name__}")
+
+    def _candidates_from_hint(
+        self,
+        db: str,
+        coll: str,
+        resolved: str,
+        sort_field: str | None,
+        sort_dir: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Walk the index named by ``resolved`` (or full collection for $natural).
+
+        Returns ``(candidates, in_sort_order)`` where ``in_sort_order`` is
+        True when the hint's leading field matches the sort field — in
+        which case ``find_matching`` skips the post-sort step.
+        """
+        if resolved == "$natural":
+            return [bson.decode(b) for _, b in self._scan_docs(db, coll)], False
+        if resolved == _ID_INDEX_NAME:
+            # The doc table is keyed by id_key; iterating it gives entries
+            # sorted by encoded _id, which matches the _id_ index walk.
+            docs = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
+            in_order = sort_field == "_id"
+            if in_order and sort_dir == -1:
+                docs = list(reversed(docs))
+            return docs, in_order
+        # Find the index's leading field
+        leading: str | None = None
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if name == resolved:
+                leading = next(iter(key_spec))
+                break
+        candidates = self._walk_index_in_order(db, coll, resolved, reverse=False)
+        in_order = sort_field is not None and sort_field == leading
+        if in_order and sort_dir == -1:
+            candidates = list(reversed(candidates))
+        return candidates, in_order
 
     @staticmethod
     def _single_sort_spec(sort: Mapping[str, Any] | None) -> tuple[str | None, int]:
