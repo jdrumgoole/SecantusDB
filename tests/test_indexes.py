@@ -347,3 +347,71 @@ def test_index_in_with_empty_list(storage: Storage) -> None:
     storage.insert("db", "c", [{"_id": 1, "x": 1}, {"_id": 2, "x": 2}])
     docs = storage.find_matching("db", "c", {"x": {"$in": []}})
     assert docs == []
+
+
+def test_sort_indexed_field_no_filter_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": (i * 7) % 11} for i in range(11)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, sort={"x": 1})
+    xs = [d["x"] for d in docs]
+    assert xs == sorted(xs)
+    assert calls == []
+
+
+def test_sort_indexed_field_descending_uses_index(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(8)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, sort={"x": -1})
+    assert [d["x"] for d in docs] == [7, 6, 5, 4, 3, 2, 1, 0]
+    assert calls == []
+
+
+def test_sort_indexed_field_with_range_filter_no_resort(storage: Storage, monkeypatch) -> None:
+    import secantus.storage as st
+
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    sort_docs_call_count = [0]
+    real = st.sort_docs
+
+    def counting_sort(*a, **kw):
+        sort_docs_call_count[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(st, "sort_docs", counting_sort)
+    docs = storage.find_matching("db", "c", {"x": {"$gte": 5, "$lt": 10}}, sort={"x": 1})
+    assert [d["_id"] for d in docs] == [5, 6, 7, 8, 9]
+    assert calls == []
+    assert sort_docs_call_count[0] == 0
+
+
+def test_sort_indexed_field_descending_with_filter_reverses(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"x": {"$gte": 5, "$lt": 10}}, sort={"x": -1})
+    assert [d["_id"] for d in docs] == [9, 8, 7, 6, 5]
+    assert calls == []
+
+
+def test_sort_on_unindexed_field_falls_back(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i, "y": -i} for i in range(5)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, sort={"y": 1})
+    assert [d["_id"] for d in docs] == [4, 3, 2, 1, 0]
+    assert calls != []
+
+
+def test_sort_index_walk_does_not_leak_other_indexes(storage: Storage) -> None:
+    """Walking one index shouldn't include entries from another index of the same coll."""
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    storage.create_index("db", "c", "y_1", {"y": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "x": i, "y": 100 - i} for i in range(5)])
+    docs = storage.find_matching("db", "c", {}, sort={"x": 1})
+    assert [d["_id"] for d in docs] == [0, 1, 2, 3, 4]
+    docs = storage.find_matching("db", "c", {}, sort={"y": 1})
+    assert [d["_id"] for d in docs] == [4, 3, 2, 1, 0]
