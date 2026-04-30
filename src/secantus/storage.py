@@ -405,12 +405,30 @@ class Storage:
         projection: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         filter = filter or {}
+        in_sort_order = False
         with self._lock:
             candidates = self._try_index_lookup(db, coll, filter)
+            sort_field, sort_dir = self._single_sort_spec(sort)
+            if candidates is not None and sort_field is not None:
+                if (
+                    len(filter) == 1
+                    and not next(iter(filter)).startswith("$")
+                    and next(iter(filter)) == sort_field
+                ):
+                    in_sort_order = True
+                    if sort_dir == -1:
+                        candidates = list(reversed(candidates))
+            elif candidates is None and not filter and sort_field is not None:
+                idx_name = self._single_field_index_for(db, coll, sort_field)
+                if idx_name is not None:
+                    candidates = self._walk_index_in_order(
+                        db, coll, idx_name, reverse=(sort_dir == -1)
+                    )
+                    in_sort_order = True
             if candidates is None:
                 candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
         out = [d for d in candidates if matches(d, filter)]
-        if sort:
+        if sort and not in_sort_order:
             out = sort_docs(out, sort)
         if skip:
             out = out[skip:]
@@ -419,6 +437,52 @@ class Storage:
         if projection:
             out = [apply_projection(d, projection) for d in out]
         return out
+
+    @staticmethod
+    def _single_sort_spec(sort: Mapping[str, Any] | None) -> tuple[str | None, int]:
+        """Return ``(field, direction)`` if ``sort`` is single-field +/-1, else ``(None, 0)``."""
+        if not sort or len(sort) != 1:
+            return None, 0
+        f, d = next(iter(sort.items()))
+        if f.startswith("$"):
+            return None, 0
+        try:
+            di = int(d)
+        except (TypeError, ValueError):
+            return None, 0
+        if di not in (-1, 1):
+            return None, 0
+        return f, di
+
+    def _single_field_index_for(self, db: str, coll: str, field: str) -> str | None:
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if list(key_spec.keys()) == [field] and int(key_spec[field]) == 1:
+                return name
+        return None
+
+    def _walk_index_in_order(
+        self, db: str, coll: str, name: str, *, reverse: bool = False
+    ) -> list[dict[str, Any]]:
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        c.set_key(db, coll, name, b"")
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return []
+        if rc < 0 and c.next() != 0:
+            return []
+        id_keys: list[bytes] = []
+        while True:
+            k = c.get_key()
+            if (k[0], k[1], k[2]) != (db, coll, name):
+                break
+            packed = bytes(k[3])
+            _esc, row_id = _unpack_entry(packed)
+            id_keys.append(row_id)
+            if c.next() != 0:
+                break
+        if reverse:
+            id_keys.reverse()
+        return self._docs_by_id_keys(db, coll, id_keys)
 
     def count_matching(self, db: str, coll: str, filter: dict[str, Any] | None = None) -> int:
         if not filter:
