@@ -53,7 +53,9 @@ Sort-by-indexed-field rides the same B-tree: if `sort` is a single-field `+1` or
 
 Unique enforcement is a prefix probe on the entries table, not a full scan.
 
-Still missing: native descending-direction indexes (we only build `{field: 1}` indexes; sort `-1` reverses in Python), `hint` actually picking an index (accepted and ignored), and operator forms on a compound's leading field with no equality prefix (single-field-only-index path still applies — but a compound's leading field accepts only bare equality today).
+`hint` is honored: pass an index name string, a key-spec dict, `"$natural"` (forces a collection scan even when an index would match), or `"_id_"` / `{_id: 1}` (walks doc-table order). An unknown hint surfaces as a `BadValue` (code 2) error to the client. The hint can also align with the sort spec to skip the post-sort step when the leading field matches.
+
+Still missing: native descending-direction indexes (we only build `{field: 1}` indexes; sort `-1` reverses in Python) and operator forms on a compound's leading field with no equality prefix (single-field-only-index path still applies — but a compound's leading field accepts only bare equality today).
 
 Out of scope regardless: text / geo / hashed / wildcard indexes, `partialFilterExpression`, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
 

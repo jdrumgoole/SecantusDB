@@ -1117,3 +1117,33 @@ def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:
     assert len(out[0]["inv_match"]) == 1  # abc qty=5 >= min 1
     assert out[0]["inv_match"][0]["_id"] == "abc"
     assert out[1]["inv_match"] == []  # xyz qty=1 < min 5
+
+
+def test_find_with_hint_uses_named_index(coll) -> None:
+    coll.create_index("x")
+    coll.insert_many([{"_id": i, "x": i} for i in range(5)])
+    docs = list(coll.find({"x": 3}, hint="x_1"))
+    assert [d["_id"] for d in docs] == [3]
+
+
+def test_find_with_hint_by_key_spec(coll) -> None:
+    coll.create_index("x")
+    coll.insert_many([{"_id": i, "x": i} for i in range(5)])
+    docs = list(coll.find({}, hint=[("x", 1)]))
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2, 3, 4]
+
+
+def test_find_with_unknown_hint_returns_bad_value(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"x": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.find({}, hint="nonexistent"))
+    assert exc.value.code == 2  # BadValue
+
+
+def test_find_with_natural_hint_is_collection_scan(coll) -> None:
+    coll.create_index("x")
+    coll.insert_many([{"_id": i, "x": i} for i in range(3)])
+    docs = list(coll.find({"x": 1}, hint="$natural"))
+    assert [d["_id"] for d in docs] == [1]
