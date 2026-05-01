@@ -1040,22 +1040,49 @@ class Storage:
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
-        idx_match: tuple[str, int] | None = None
-        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if list(key_spec.keys()) == [field]:
-                d = int(key_spec[field])
-                if d in (1, -1):
-                    idx_match = (name, d)
-                    break
+        idx_match = self._find_leading_field_index(db, coll, field)
         if idx_match is None:
             return None
-        index_name, direction = idx_match
+        return self._lookup_via_leading_field(db, coll, idx_match, value)
+
+    def _find_leading_field_index(
+        self, db: str, coll: str, field: str
+    ) -> tuple[str, int, bool] | None:
+        """Best index whose leading field is ``field``.
+
+        Returns ``(name, direction, is_compound)``. Single-field indexes
+        win over compound (tighter scan, no separator math). All fields
+        must be ASC or DESC.
+        """
+        compound_fallback: tuple[str, int, bool] | None = None
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            idx_fields = list(key_spec)
+            if not idx_fields or idx_fields[0] != field:
+                continue
+            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
+                continue
+            d = int(key_spec[field])
+            if len(idx_fields) == 1:
+                return name, d, False
+            if compound_fallback is None:
+                compound_fallback = (name, d, True)
+        return compound_fallback
+
+    def _lookup_via_leading_field(
+        self,
+        db: str,
+        coll: str,
+        idx_match: tuple[str, int, bool],
+        value: Any,
+    ) -> list[dict[str, Any]] | None:
+        name, direction, is_compound = idx_match
         if not isinstance(value, dict):
-            kb = encode_value_directed(value, direction)
-            id_keys = self._scan_index_for_id_keys(db, coll, index_name, kb)
-            return self._docs_by_id_keys(db, coll, id_keys)
+            return self._docs_by_id_keys(
+                db,
+                coll,
+                self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, value),
+            )
         if not value or not all(k.startswith("$") for k in value):
-            # Mixed (some non-$ keys) means subdocument equality — skip.
             return None
         if not all(op in self._RANGE_OPS for op in value):
             return None
@@ -1063,12 +1090,11 @@ class Storage:
             if len(value) != 1 or not isinstance(value["$in"], list):
                 return None
             seen: set[bytes] = set()
-            id_keys = []
+            id_keys: list[bytes] = []
             for v in value["$in"]:
                 if isinstance(v, dict):
                     return None
-                kb = encode_value_directed(v, direction)
-                for id_k in self._scan_index_for_id_keys(db, coll, index_name, kb):
+                for id_k in self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, v):
                     if id_k not in seen:
                         seen.add(id_k)
                         id_keys.append(id_k)
@@ -1081,9 +1107,11 @@ class Storage:
             if isinstance(bound, dict):
                 return None
             if op == "$eq":
-                kb = encode_value_directed(bound, direction)
-                id_keys = self._scan_index_for_id_keys(db, coll, index_name, kb)
-                return self._docs_by_id_keys(db, coll, id_keys)
+                return self._docs_by_id_keys(
+                    db,
+                    coll,
+                    self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, bound),
+                )
             kb = encode_value_directed(bound, direction)
             # Operator semantics flip when stored bytes are inverted: in a
             # DESC index, "x > 5" means we want stored bytes < enc_desc(5).
@@ -1098,10 +1126,29 @@ class Storage:
                 upper, upper_inclusive = kb, False
             elif effective_op == "$lte":
                 upper, upper_inclusive = kb, True
-        id_keys = self._range_scan_index(
-            db, coll, index_name, lower, lower_inclusive, upper, upper_inclusive
-        )
+        if is_compound:
+            id_keys = self._range_scan_index_leading(
+                db, coll, name, lower, lower_inclusive, upper, upper_inclusive
+            )
+        else:
+            id_keys = self._range_scan_index(
+                db, coll, name, lower, lower_inclusive, upper, upper_inclusive
+            )
         return self._docs_by_id_keys(db, coll, id_keys)
+
+    def _eq_id_keys_via_leading(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        direction: int,
+        is_compound: bool,
+        value: Any,
+    ) -> list[bytes]:
+        kb = encode_value_directed(value, direction)
+        if is_compound:
+            return self._scan_index_for_id_keys(db, coll, name, kb + COMPOUND_SEP, prefix=True)
+        return self._scan_index_for_id_keys(db, coll, name, kb)
 
     def _try_compound_eq_lookup(
         self, db: str, coll: str, filter: dict[str, Any]
@@ -1305,6 +1352,65 @@ class Storage:
             if esc_upper is not None:
                 if upper_inclusive:
                     if row_esc > esc_upper:
+                        break
+                elif row_esc >= esc_upper:
+                    break
+            out.append(row_id)
+            if c.next() != 0:
+                break
+        return out
+
+    def _range_scan_index_leading(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        lower: bytes | None,
+        lower_inclusive: bool,
+        upper: bytes | None,
+        upper_inclusive: bool,
+    ) -> list[bytes]:
+        """Range-scan a compound index using only its leading field.
+
+        Each row's escaped kb is
+        ``escape(enc(leading)) + escape(COMPOUND_SEP) + escape(enc(trailing...))``.
+        Boundary detection uses ``startswith(esc_X + esc_compound_sep)`` to
+        identify rows whose leading field equals ``X`` — the terminator
+        bytes of an escaped numeric encoding can overlap with the start of
+        the escaped compound separator, so a literal find/split on the
+        separator is unreliable.
+        """
+        esc_compound_sep = _escape_kb(COMPOUND_SEP)
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        esc_lower = _escape_kb(lower) if lower is not None else None
+        esc_upper = _escape_kb(upper) if upper is not None else None
+        seed = esc_lower if esc_lower is not None else b""
+        c.set_key(db, coll, name, seed)
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return []
+        if rc < 0 and c.next() != 0:
+            return []
+        lower_eq_prefix = esc_lower + esc_compound_sep if esc_lower is not None else None
+        upper_eq_prefix = esc_upper + esc_compound_sep if esc_upper is not None else None
+        out: list[bytes] = []
+        while True:
+            k = c.get_key()
+            if (k[0], k[1], k[2]) != (db, coll, name):
+                break
+            packed = bytes(k[3])
+            row_esc, row_id = _unpack_entry(packed)
+            if (
+                lower_eq_prefix is not None
+                and not lower_inclusive
+                and row_esc.startswith(lower_eq_prefix)
+            ):
+                if c.next() != 0:
+                    break
+                continue
+            if esc_upper is not None:
+                if upper_inclusive:
+                    if row_esc > esc_upper and not row_esc.startswith(upper_eq_prefix):
                         break
                 elif row_esc >= esc_upper:
                     break

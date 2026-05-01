@@ -1013,3 +1013,111 @@ def test_pure_desc_compound_eq(storage: Storage, monkeypatch) -> None:
     docs = storage.find_matching("db", "c", {"a": 1, "b": 4})
     assert [d["_id"] for d in docs] == [4]
     assert calls == []
+
+
+def test_leading_field_gt_on_compound(storage: Storage, monkeypatch) -> None:
+    """`{a: {$gt: V}}` against `{a:1, b:1}` index uses the index."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$gt": 6}})
+    assert sorted(d["_id"] for d in docs) == [7, 8, 9]
+    assert calls == []
+
+
+def test_leading_field_gte_on_compound(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$gte": 6}})
+    assert sorted(d["_id"] for d in docs) == [6, 7, 8, 9]
+    assert calls == []
+
+
+def test_leading_field_lt_on_compound(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$lt": 3}})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2]
+    assert calls == []
+
+
+def test_leading_field_lte_on_compound(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$lte": 3}})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2, 3]
+    assert calls == []
+
+
+def test_leading_field_compound_bounds_on_compound(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$gte": 5, "$lt": 10}})
+    assert sorted(d["_id"] for d in docs) == [5, 6, 7, 8, 9]
+    assert calls == []
+
+
+def test_leading_field_in_on_compound(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$in": [2, 5, 9]}})
+    assert sorted(d["_id"] for d in docs) == [2, 5, 9]
+    assert calls == []
+
+
+def test_leading_field_eq_op_on_compound(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i % 3, "b": i} for i in range(9)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$eq": 1}})
+    assert sorted(d["_id"] for d in docs) == [1, 4, 7]
+    assert calls == []
+
+
+def test_leading_field_gt_on_desc_compound(storage: Storage, monkeypatch) -> None:
+    """`{a: {$gt: V}}` against `{a:-1, b:1}` flips operator semantics correctly."""
+    storage.create_index("db", "c", "ab_desc1", {"a": -1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$gt": 6}})
+    assert sorted(d["_id"] for d in docs) == [7, 8, 9]
+    assert calls == []
+
+
+def test_leading_field_lt_on_desc_compound(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_desc1", {"a": -1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$lt": 3}})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2]
+    assert calls == []
+
+
+def test_leading_field_range_with_three_field_compound(storage: Storage, monkeypatch) -> None:
+    """Leading-field range works against a 3-field compound."""
+    storage.create_index("db", "c", "abc_1", {"a": 1, "b": 1, "c": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": i, "a": i, "b": i * 2, "c": i * 3} for i in range(10)],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$gte": 7}})
+    assert sorted(d["_id"] for d in docs) == [7, 8, 9]
+    assert calls == []
+
+
+def test_leading_field_range_prefers_single_field_index(storage: Storage, monkeypatch) -> None:
+    """When both single and compound indexes exist, the single-field one is preferred."""
+    storage.create_index("db", "c", "a_1", {"a": 1}, {})
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": {"$gt": 6}})
+    assert sorted(d["_id"] for d in docs) == [7, 8, 9]
+    assert calls == []
