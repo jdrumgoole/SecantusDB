@@ -1121,3 +1121,86 @@ def test_leading_field_range_prefers_single_field_index(storage: Storage, monkey
     docs = storage.find_matching("db", "c", {"a": {"$gt": 6}})
     assert sorted(d["_id"] for d in docs) == [7, 8, 9]
     assert calls == []
+
+
+def test_sort_by_compound_leading_no_filter_uses_index(storage: Storage, monkeypatch) -> None:
+    """Sort by leading field of a compound index walks the index, no full scan."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": (i * 7) % 11, "b": i} for i in range(11)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, sort={"a": 1})
+    a_vals = [d["a"] for d in docs]
+    assert a_vals == sorted(a_vals)
+    assert calls == []
+
+
+def test_sort_by_compound_leading_descending(storage: Storage, monkeypatch) -> None:
+    """Sort {a: -1} against an ASC compound index walks it backward."""
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(8)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, sort={"a": -1})
+    assert [d["a"] for d in docs] == [7, 6, 5, 4, 3, 2, 1, 0]
+    assert calls == []
+
+
+def test_sort_by_compound_leading_with_eq_filter(storage: Storage, monkeypatch) -> None:
+    """Filter {a: V} sorted by a uses the compound index and skips post-sort."""
+    import secantus.storage as st
+
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i % 3, "b": i} for i in range(9)])
+    calls = _spy_scans(storage, monkeypatch)
+    sort_count = [0]
+    real = st.sort_docs
+
+    def counting(*a, **kw):
+        sort_count[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(st, "sort_docs", counting)
+    docs = storage.find_matching("db", "c", {"a": 1}, sort={"a": 1})
+    assert sorted(d["_id"] for d in docs) == [1, 4, 7]
+    assert calls == []
+    assert sort_count[0] == 0
+
+
+def test_sort_by_compound_leading_with_range_filter(storage: Storage, monkeypatch) -> None:
+    """Range filter on leading field + sort by leading field skips post-sort."""
+    import secantus.storage as st
+
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i * 10} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    sort_count = [0]
+    real = st.sort_docs
+
+    def counting(*a, **kw):
+        sort_count[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(st, "sort_docs", counting)
+    docs = storage.find_matching("db", "c", {"a": {"$gte": 5, "$lt": 10}}, sort={"a": 1})
+    assert [d["_id"] for d in docs] == [5, 6, 7, 8, 9]
+    assert calls == []
+    assert sort_count[0] == 0
+
+
+def test_sort_by_compound_leading_desc_index(storage: Storage, monkeypatch) -> None:
+    """DESC compound index can serve sort {a:-1} via a forward walk."""
+    storage.create_index("db", "c", "ab_-1_1", {"a": -1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i} for i in range(6)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, sort={"a": -1})
+    assert [d["a"] for d in docs] == [5, 4, 3, 2, 1, 0]
+    assert calls == []
+
+
+def test_sort_by_compound_leading_desc_index_asc_sort(storage: Storage, monkeypatch) -> None:
+    """DESC compound index can serve sort {a:1} via reversed walk."""
+    storage.create_index("db", "c", "ab_-1_1", {"a": -1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i, "b": i} for i in range(6)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {}, sort={"a": 1})
+    assert [d["a"] for d in docs] == [0, 1, 2, 3, 4, 5]
+    assert calls == []
