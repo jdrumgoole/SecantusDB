@@ -1204,3 +1204,127 @@ def test_sort_by_compound_leading_desc_index_asc_sort(storage: Storage, monkeypa
     docs = storage.find_matching("db", "c", {}, sort={"a": 1})
     assert [d["a"] for d in docs] == [0, 1, 2, 3, 4, 5]
     assert calls == []
+
+
+# ----------------------------------------------------------------------
+# explain_plan: index-aware plan summaries (replaces the always-COLLSCAN stub).
+
+
+def test_explain_plan_no_filter_is_collscan(storage: Storage) -> None:
+    storage.insert("db", "c", [{"_id": i} for i in range(3)])
+    plan = storage.explain_plan("db", "c", {})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_explain_plan_no_index_is_collscan(storage: Storage) -> None:
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(3)])
+    plan = storage.explain_plan("db", "c", {"x": 1})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_explain_plan_single_field_eq_uses_index(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    plan = storage.explain_plan("db", "c", {"x": 5})
+    assert plan == {
+        "kind": "IXSCAN",
+        "index_name": "x_1",
+        "key_pattern": {"x": 1},
+        "direction": "forward",
+    }
+
+
+def test_explain_plan_single_field_range_uses_index(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    plan = storage.explain_plan("db", "c", {"x": {"$gt": 5}})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "x_1"
+
+
+def test_explain_plan_compound_eq_uses_compound_index(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    plan = storage.explain_plan("db", "c", {"a": 1, "b": 2})
+    assert plan == {
+        "kind": "IXSCAN",
+        "index_name": "ab_1",
+        "key_pattern": {"a": 1, "b": 1},
+        "direction": "forward",
+    }
+
+
+def test_explain_plan_compound_range_uses_compound_index(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    plan = storage.explain_plan("db", "c", {"a": 1, "b": {"$gt": 5}})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "ab_1"
+
+
+def test_explain_plan_leading_field_on_compound(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    plan = storage.explain_plan("db", "c", {"a": {"$gt": 5}})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "ab_1"
+
+
+def test_explain_plan_prefers_single_field_over_compound(storage: Storage) -> None:
+    storage.create_index("db", "c", "a_1", {"a": 1}, {})
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    plan = storage.explain_plan("db", "c", {"a": 5})
+    assert plan["index_name"] == "a_1"
+
+
+def test_explain_plan_hint_by_name(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    plan = storage.explain_plan("db", "c", {}, hint="x_1")
+    assert plan == {
+        "kind": "IXSCAN",
+        "index_name": "x_1",
+        "key_pattern": {"x": 1},
+        "direction": "forward",
+    }
+
+
+def test_explain_plan_hint_by_keyspec(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    plan = storage.explain_plan("db", "c", {}, hint={"x": 1})
+    assert plan["index_name"] == "x_1"
+
+
+def test_explain_plan_hint_natural_is_collscan(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    plan = storage.explain_plan("db", "c", {"x": 5}, hint="$natural")
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_explain_plan_hint_id_index(storage: Storage) -> None:
+    plan = storage.explain_plan("db", "c", {}, hint="_id_")
+    assert plan == {
+        "kind": "IXSCAN",
+        "index_name": "_id_",
+        "key_pattern": {"_id": 1},
+        "direction": "forward",
+    }
+
+
+def test_explain_plan_sort_no_filter_uses_index(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    plan = storage.explain_plan("db", "c", {}, sort={"x": 1})
+    assert plan == {
+        "kind": "IXSCAN",
+        "index_name": "x_1",
+        "key_pattern": {"x": 1},
+        "direction": "forward",
+    }
+
+
+def test_explain_plan_sort_no_filter_descending_uses_backward(storage: Storage) -> None:
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    plan = storage.explain_plan("db", "c", {}, sort={"x": -1})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["direction"] == "backward"
+
+
+def test_explain_plan_sort_no_filter_desc_index_forward(storage: Storage) -> None:
+    """DESC index walked forward already gives DESC order."""
+    storage.create_index("db", "c", "x_-1", {"x": -1}, {})
+    plan = storage.explain_plan("db", "c", {}, sort={"x": -1})
+    assert plan["direction"] == "forward"

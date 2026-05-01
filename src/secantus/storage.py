@@ -576,6 +576,117 @@ class Storage:
             id_keys.reverse()
         return self._docs_by_id_keys(db, coll, id_keys)
 
+    def explain_plan(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any] | None = None,
+        *,
+        sort: Mapping[str, Any] | None = None,
+        hint: str | Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Plan summary for what ``find_matching`` would do with these args.
+
+        No execution; mirrors the same routing decisions. Returns
+        ``{"kind": "COLLSCAN"}`` or ``{"kind": "IXSCAN", "index_name",
+        "key_pattern", "direction"}``. ``direction`` is ``"forward"``
+        unless a sort spec inverts it relative to the chosen index.
+        """
+        filter = filter or {}
+        with self._lock:
+            sort_field, sort_dir = self._single_sort_spec(sort)
+            if hint is not None:
+                try:
+                    resolved = self._resolve_hint(db, coll, hint)
+                except BadHint:
+                    return {"kind": "COLLSCAN"}
+                if resolved == "$natural":
+                    return {"kind": "COLLSCAN"}
+                if resolved == _ID_INDEX_NAME:
+                    direction = "forward"
+                    if sort_field == "_id" and sort_dir == -1:
+                        direction = "backward"
+                    return {
+                        "kind": "IXSCAN",
+                        "index_name": _ID_INDEX_NAME,
+                        "key_pattern": {"_id": 1},
+                        "direction": direction,
+                    }
+                key_spec = self._key_spec_for(db, coll, resolved)
+                if key_spec is None:
+                    return {"kind": "COLLSCAN"}
+                return self._make_ixscan_plan(resolved, key_spec, sort_field, sort_dir)
+            picked = self._pick_index_for_filter(db, coll, filter)
+            if picked is not None:
+                name, key_spec = picked
+                return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
+            if not filter and sort_field is not None:
+                idx = self._find_leading_field_index(db, coll, sort_field)
+                if idx is not None:
+                    name, _idx_dir, _is_compound = idx
+                    key_spec = self._key_spec_for(db, coll, name)
+                    if key_spec is not None:
+                        return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
+            return {"kind": "COLLSCAN"}
+
+    def _key_spec_for(self, db: str, coll: str, name: str) -> dict[str, Any] | None:
+        for n, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if n == name:
+                return dict(key_spec)
+        return None
+
+    def _pick_index_for_filter(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Mirror ``_try_index_lookup``'s index-selection (no execution)."""
+        if not filter:
+            return None
+        if any(f.startswith("$") for f in filter):
+            return None
+        if all(not isinstance(v, dict) for v in filter.values()):
+            picked = self._pick_compound_eq_index(db, coll, filter)
+            if picked is not None:
+                return picked
+        if len(filter) >= 2:
+            picked = self._pick_compound_range_index(db, coll, filter)
+            if picked is not None:
+                return picked
+        if len(filter) != 1:
+            return None
+        field, value = next(iter(filter.items()))
+        idx_match = self._find_leading_field_index(db, coll, field)
+        if idx_match is None:
+            return None
+        if isinstance(value, dict):
+            if not value or not all(k.startswith("$") for k in value):
+                return None
+            if not all(op in self._RANGE_OPS for op in value):
+                return None
+        name, _direction, _is_compound = idx_match
+        key_spec = self._key_spec_for(db, coll, name)
+        if key_spec is None:
+            return None
+        return name, key_spec
+
+    @staticmethod
+    def _make_ixscan_plan(
+        name: str,
+        key_spec: Mapping[str, Any],
+        sort_field: str | None,
+        sort_dir: int,
+    ) -> dict[str, Any]:
+        direction = "forward"
+        if sort_field is not None and sort_field in key_spec:
+            idx_dir = int(key_spec[sort_field])
+            if sort_dir != 0 and sort_dir != idx_dir:
+                direction = "backward"
+        return {
+            "kind": "IXSCAN",
+            "index_name": name,
+            "key_pattern": dict(key_spec),
+            "direction": direction,
+        }
+
     def count_matching(self, db: str, coll: str, filter: dict[str, Any] | None = None) -> int:
         if not filter:
             with self._lock:
@@ -1150,15 +1261,14 @@ class Storage:
             return self._scan_index_for_id_keys(db, coll, name, kb + COMPOUND_SEP, prefix=True)
         return self._scan_index_for_id_keys(db, coll, name, kb)
 
-    def _try_compound_eq_lookup(
+    def _pick_compound_eq_index(
         self, db: str, coll: str, filter: dict[str, Any]
-    ) -> list[dict[str, Any]] | None:
-        """Bare-equality filter against a compound (or single-field) index prefix.
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Find the index that ``_try_compound_eq_lookup`` would walk for ``filter``.
 
-        Picks an index whose leading fields (set-wise) match the filter's
-        fields, and runs an equality (full-cover) or prefix
-        (strict-leading-prefix) scan against it. Per-field index direction
-        is honoured by encoding each value with ``encode_value_directed``.
+        Returns ``(name, key_spec)`` of the chosen index, or ``None`` if no
+        index covers the filter as a leading prefix. Pure picker — does
+        not scan.
         """
         filter_fields = set(filter)
         best: tuple[str, dict[str, Any]] | None = None
@@ -1174,10 +1284,24 @@ class Storage:
                 best = (name, dict(key_spec))
             if len(idx_fields) == len(filter_fields):
                 break
-        if best is None:
+        return best
+
+    def _try_compound_eq_lookup(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        """Bare-equality filter against a compound (or single-field) index prefix.
+
+        Picks an index whose leading fields (set-wise) match the filter's
+        fields, and runs an equality (full-cover) or prefix
+        (strict-leading-prefix) scan against it. Per-field index direction
+        is honoured by encoding each value with ``encode_value_directed``.
+        """
+        picked = self._pick_compound_eq_index(db, coll, filter)
+        if picked is None:
             return None
-        name, key_spec = best
+        name, key_spec = picked
         idx_fields = list(key_spec)
+        filter_fields = set(filter)
         prefix_fields = idx_fields[: len(filter_fields)]
         parts = [encode_value_directed(filter[f], int(key_spec[f])) for f in prefix_fields]
         kb = COMPOUND_SEP.join(parts) if len(parts) > 1 else parts[0]
@@ -1188,15 +1312,14 @@ class Storage:
             id_keys = self._scan_index_for_id_keys(db, coll, name, kb, prefix=True)
         return self._docs_by_id_keys(db, coll, id_keys)
 
-    def _try_compound_range_lookup(
-        self, db: str, coll: str, filter: dict[str, Any]
-    ) -> list[dict[str, Any]] | None:
-        """Compound-prefix lookup with a trailing operator field.
+    def _partition_compound_range_filter(
+        self, filter: dict[str, Any]
+    ) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
+        """Split a filter into ``(eq_fields, operator_field, operator_ops)``.
 
-        Filters of the form ``{a: 5, b: 10, c: {$gt: 20}}`` (any number of
-        leading bare-equality fields followed by exactly one operator-form
-        field) walk the compound index by pinning the prefix from the
-        equalities and applying the operator's bounds to the next field.
+        Returns ``None`` if the filter doesn't fit the compound-range
+        shape (any number of bare-equality fields plus exactly one
+        operator-form field whose ops are all in ``_RANGE_OPS``).
         """
         eq_fields: dict[str, Any] = {}
         operator_field: str | None = None
@@ -1215,9 +1338,19 @@ class Storage:
                 eq_fields[f] = v
         if operator_field is None or not eq_fields:
             return None
-        eq_set = set(eq_fields)
-        if operator_field in eq_set:
+        if operator_field in eq_fields:
             return None
+        return eq_fields, operator_field, operator_ops or {}
+
+    def _pick_compound_range_index(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Find the index that ``_try_compound_range_lookup`` would walk."""
+        parts = self._partition_compound_range_filter(filter)
+        if parts is None:
+            return None
+        eq_fields, operator_field, _operator_ops = parts
+        eq_set = set(eq_fields)
         target_eq_count = len(eq_set)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
@@ -1234,10 +1367,28 @@ class Storage:
                 best = (name, dict(key_spec))
             if len(idx_fields) == target_eq_count + 1:
                 break
-        if best is None:
+        return best
+
+    def _try_compound_range_lookup(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        """Compound-prefix lookup with a trailing operator field.
+
+        Filters of the form ``{a: 5, b: 10, c: {$gt: 20}}`` (any number of
+        leading bare-equality fields followed by exactly one operator-form
+        field) walk the compound index by pinning the prefix from the
+        equalities and applying the operator's bounds to the next field.
+        """
+        parts = self._partition_compound_range_filter(filter)
+        if parts is None:
             return None
-        name, key_spec = best
+        eq_fields, operator_field, operator_ops = parts
+        picked = self._pick_compound_range_index(db, coll, filter)
+        if picked is None:
+            return None
+        name, key_spec = picked
         idx_fields = list(key_spec)
+        target_eq_count = len(eq_fields)
         eq_field_names = idx_fields[:target_eq_count]
         op_dir = int(key_spec[operator_field])
         eq_parts = [encode_value_directed(eq_fields[f], int(key_spec[f])) for f in eq_field_names]
