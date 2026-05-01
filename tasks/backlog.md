@@ -10,7 +10,6 @@ Each item should have enough context for a future session to pick it up cold: wh
 
 These commands accept the request and return a wire-valid response, but the response is fabricated — they do no real work.
 
-- [ ] **`explain`** — always returns a `COLLSCAN` plan; never actually plans or executes. Fine because we don't have lookup acceleration yet, but the day we add real indexes we should report `IXSCAN` for indexed queries.
 - [ ] **`serverStatus`** — returns version + zeroed metrics (uptime, connections). No real metrics tracking.
 - [ ] **`connectionStatus`** — empty `authInfo` (no auth implemented).
 - [ ] **`dbStats`** / **`collStats`** — counts are real, sizes are zeroed (we don't track storage size). If a tool depends on `dataSize`/`storageSize`/`avgObjSize`, it'll see 0.

@@ -212,21 +212,47 @@ def _coll_stats(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     inner = doc.get("explain") or {}
+    coll = ""
+    filter_: dict[str, Any] = {}
+    sort = None
+    hint = None
     if isinstance(inner, dict):
         cmd_name = next(iter(inner), "")
         coll_value = inner.get(cmd_name)
         coll = coll_value if isinstance(coll_value, str) else ""
         filter_ = inner.get("filter") or inner.get("query") or {}
-    else:
-        coll = ""
-        filter_ = {}
+        sort = inner.get("sort")
+        hint = inner.get("hint")
     namespace = _ns(ctx.db_name, coll) if coll else f"{ctx.db_name}.$cmd"
+    if coll:
+        plan = ctx.storage.explain_plan(ctx.db_name, coll, filter_, sort=sort, hint=hint)
+    else:
+        plan = {"kind": "COLLSCAN"}
+    if plan["kind"] == "IXSCAN":
+        winning_plan = {
+            "stage": "FETCH",
+            "filter": filter_,
+            "inputStage": {
+                "stage": "IXSCAN",
+                "indexName": plan["index_name"],
+                "keyPattern": plan["key_pattern"],
+                "direction": plan["direction"],
+            },
+        }
+        execution_stage = {
+            "stage": "FETCH",
+            "nReturned": 0,
+            "inputStage": {"stage": "IXSCAN", "nReturned": 0},
+        }
+    else:
+        winning_plan = {"stage": "COLLSCAN", "filter": filter_}
+        execution_stage = {"stage": "COLLSCAN", "nReturned": 0}
     return {
         "queryPlanner": {
             "namespace": namespace,
             "indexFilterSet": False,
             "parsedQuery": filter_,
-            "winningPlan": {"stage": "COLLSCAN", "filter": filter_},
+            "winningPlan": winning_plan,
             "rejectedPlans": [],
         },
         "executionStats": {
@@ -235,7 +261,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "executionTimeMillis": 0,
             "totalKeysExamined": 0,
             "totalDocsExamined": 0,
-            "executionStages": {"stage": "COLLSCAN", "nReturned": 0},
+            "executionStages": execution_stage,
         },
         "command": inner if isinstance(inner, dict) else {},
         "serverInfo": {

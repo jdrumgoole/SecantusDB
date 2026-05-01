@@ -779,6 +779,41 @@ def test_explain_find_returns_query_planner(coll) -> None:
     assert "serverInfo" in explanation
 
 
+def test_explain_find_collscan_when_no_index(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    plan = coll.find({"n": 2}).explain()["queryPlanner"]["winningPlan"]
+    assert plan["stage"] == "COLLSCAN"
+
+
+def test_explain_find_ixscan_when_indexed(coll) -> None:
+    coll.create_index("n")
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    plan = coll.find({"n": 2}).explain()["queryPlanner"]["winningPlan"]
+    # MongoDB shape: FETCH wraps an IXSCAN inputStage.
+    assert plan["stage"] == "FETCH"
+    inner = plan["inputStage"]
+    assert inner["stage"] == "IXSCAN"
+    assert inner["indexName"] == "n_1"
+    assert inner["keyPattern"] == {"n": 1}
+    assert inner["direction"] == "forward"
+
+
+def test_explain_find_ixscan_with_compound_index(coll) -> None:
+    coll.create_index([("a", 1), ("b", 1)])
+    coll.insert_many([{"_id": i, "a": i, "b": i * 10} for i in range(5)])
+    plan = coll.find({"a": 1, "b": 10}).explain()["queryPlanner"]["winningPlan"]
+    assert plan["stage"] == "FETCH"
+    assert plan["inputStage"]["stage"] == "IXSCAN"
+    assert plan["inputStage"]["keyPattern"] == {"a": 1, "b": 1}
+
+
+def test_explain_find_with_hint_uses_hinted_index(coll) -> None:
+    coll.create_index("n")
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    plan = coll.find({"n": 2}).hint("$natural").explain()["queryPlanner"]["winningPlan"]
+    assert plan["stage"] == "COLLSCAN"
+
+
 def test_pipeline_update_via_pymongo(coll) -> None:
     coll.insert_one({"_id": 1, "a": 1, "b": 2})
     coll.update_one({"_id": 1}, [{"$set": {"sum": {"$add": ["$a", "$b"]}}}])
