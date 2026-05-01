@@ -24,7 +24,7 @@ These commands accept the request and return a wire-valid response, but the resp
 These work end-to-end but cut corners.
 
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
-- [ ] **`$lookup`** — full-scan of the foreign collection per outer doc; no use of indexes for the join. Both simple (`localField`/`foreignField`) and `let`/`pipeline` forms are supported. If both are specified, both are applied (simple-form pre-filter, then pipeline). MongoDB's actual behavior with both is more nuanced.
+- [ ] **`$lookup` does not use storage indexes** — joins are O(N+M) via an in-memory hash table built once over the foreign collection (covers array-valued local/foreign fields correctly via element expansion). Both simple (`localField`/`foreignField`) and `let`/`pipeline` forms are accelerated; if both are specified, the simple-form hash-join pre-filters the candidates fed to the pipeline. Storage indexes on the foreign field are NOT consulted; a true index-driven join would skip materialising the foreign collection but needs multikey-index support to stay correct for array-valued foreign fields.
 - [ ] **`$merge` whenMatched: "merge"** — shallow `{**existing, **new}` merge with new winning per-key. MongoDB has deeper semantics for nested docs (recursive merge for sub-documents); we do not.
 - [ ] **Cursors never expire** — `CursorRegistry` keeps cursors until `killCursors` or batch-exhaustion. Real MongoDB has a 10-minute idle TTL.
 - [ ] **`$dateFromString`** — uses Python's `strptime` codes (or `fromisoformat` if no format). No full MongoDB format spec, no `timezone` argument, no `%G`/`%V` ISO-week support.

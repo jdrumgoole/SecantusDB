@@ -381,12 +381,11 @@ def _stage_lookup(
     if not (isinstance(local_field, str) and isinstance(foreign_field, str)):
         raise AggregateError("$lookup requires localField+foreignField, or pipeline form")
     foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
+    join_index = _build_lookup_index(foreign_docs, foreign_field)
     out: list[dict[str, Any]] = []
     for doc in docs:
         local_value = get_path(doc, local_field)
-        matches_list = [
-            fd for fd in foreign_docs if _lookup_match(local_value, get_path(fd, foreign_field))
-        ]
+        matches_list = _hash_join_lookup(local_value, foreign_docs, foreign_field, join_index)
         new = copy.deepcopy(doc)
         new[as_field] = matches_list
         out.append(new)
@@ -406,14 +405,16 @@ def _stage_lookup_pipeline(
     foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
     local_field = full_spec.get("localField")
     foreign_field = full_spec.get("foreignField")
+    join_index = (
+        _build_lookup_index(foreign_docs, foreign_field) if isinstance(foreign_field, str) else None
+    )
     out: list[dict[str, Any]] = []
     for doc in docs:
         bound = {name: evaluate(expr, doc, ctx.vars) for name, expr in let_spec.items()}
         if isinstance(local_field, str) and isinstance(foreign_field, str):
             local_value = get_path(doc, local_field)
-            candidates = [
-                fd for fd in foreign_docs if _lookup_match(local_value, get_path(fd, foreign_field))
-            ]
+            assert join_index is not None
+            candidates = _hash_join_lookup(local_value, foreign_docs, foreign_field, join_index)
         else:
             candidates = list(foreign_docs)
         sub_ctx = ctx.with_vars(bound)
@@ -421,6 +422,77 @@ def _stage_lookup_pipeline(
         new = copy.deepcopy(doc)
         new[as_field] = joined
         out.append(new)
+    return out
+
+
+class _LookupIndex:
+    """Hash-join index from foreign-field value → list of foreign docs.
+
+    ``hashable`` covers scalar/hashable values; ``unhashable`` retains
+    foreign docs whose foreign-field value contains an unhashable element
+    (e.g. nested dicts) so they can be checked via ``_lookup_match``.
+    """
+
+    __slots__ = ("hashable", "unhashable")
+
+    def __init__(self) -> None:
+        self.hashable: dict[Any, list[dict[str, Any]]] = {}
+        self.unhashable: list[dict[str, Any]] = []
+
+
+def _build_lookup_index(foreign_docs: list[dict[str, Any]], foreign_field: str) -> _LookupIndex:
+    idx = _LookupIndex()
+    for fd in foreign_docs:
+        fv = get_path(fd, foreign_field)
+        keys = list(fv) if isinstance(fv, list) else [fv]
+        added = False
+        for k in keys:
+            try:
+                idx.hashable.setdefault(k, []).append(fd)
+                added = True
+            except TypeError:
+                continue
+        if not added:
+            idx.unhashable.append(fd)
+    return idx
+
+
+def _hash_join_lookup(
+    local_value: Any,
+    foreign_docs: list[dict[str, Any]],
+    foreign_field: str,
+    idx: _LookupIndex,
+) -> list[dict[str, Any]]:
+    lookups = list(local_value) if isinstance(local_value, list) else [local_value]
+    seen: set[int] = set()
+    out: list[dict[str, Any]] = []
+    local_unhashable = False
+    for lv in lookups:
+        try:
+            hits = idx.hashable.get(lv)
+        except TypeError:
+            local_unhashable = True
+            continue
+        if hits:
+            for fd in hits:
+                key = id(fd)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(fd)
+    if local_unhashable:
+        for fd in foreign_docs:
+            if id(fd) in seen:
+                continue
+            if _lookup_match(local_value, get_path(fd, foreign_field)):
+                seen.add(id(fd))
+                out.append(fd)
+    else:
+        for fd in idx.unhashable:
+            if id(fd) in seen:
+                continue
+            if _lookup_match(local_value, get_path(fd, foreign_field)):
+                seen.add(id(fd))
+                out.append(fd)
     return out
 
 
