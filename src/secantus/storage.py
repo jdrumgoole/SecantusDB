@@ -33,12 +33,7 @@ from bson import Decimal128
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
-from secantus.sortkey import (
-    COMPOUND_SEP,
-    encode_compound,
-    encode_value,
-    encode_value_directed,
-)
+from secantus.sortkey import COMPOUND_SEP, encode_value_directed
 from secantus.update import apply_update, find_positional_matches
 
 _COLL_TABLE = "table:secantus_collections"
@@ -1113,35 +1108,35 @@ class Storage:
     ) -> list[dict[str, Any]] | None:
         """Bare-equality filter against a compound (or single-field) index prefix.
 
-        Picks an ASC index whose leading fields (set-wise) match the filter's
-        fields exactly, and runs an equality (full-cover) or prefix
-        (strict-leading-prefix) scan against it.
+        Picks an index whose leading fields (set-wise) match the filter's
+        fields, and runs an equality (full-cover) or prefix
+        (strict-leading-prefix) scan against it. Per-field index direction
+        is honoured by encoding each value with ``encode_value_directed``.
         """
         filter_fields = set(filter)
-        best: tuple[str, list[str]] | None = None
+        best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             idx_fields = list(key_spec.keys())
-            if any(int(key_spec[f]) != 1 for f in idx_fields):
+            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
                 continue
             if len(idx_fields) < len(filter_fields):
                 continue
             if set(idx_fields[: len(filter_fields)]) != filter_fields:
                 continue
-            # Prefer an index whose total field count matches the filter (exact cover)
-            # over one with extra trailing fields (prefix scan).
-            if best is None or (len(best[1]) > len(idx_fields)):
-                best = (name, idx_fields)
+            if best is None or (len(list(best[1])) > len(idx_fields)):
+                best = (name, dict(key_spec))
             if len(idx_fields) == len(filter_fields):
                 break
         if best is None:
             return None
-        name, idx_fields = best
-        values = [filter[f] for f in idx_fields[: len(filter_fields)]]
+        name, key_spec = best
+        idx_fields = list(key_spec)
+        prefix_fields = idx_fields[: len(filter_fields)]
+        parts = [encode_value_directed(filter[f], int(key_spec[f])) for f in prefix_fields]
+        kb = COMPOUND_SEP.join(parts) if len(parts) > 1 else parts[0]
         if len(filter_fields) == len(idx_fields):
-            kb = encode_compound(values) if len(values) > 1 else encode_value(values[0])
             id_keys = self._scan_index_for_id_keys(db, coll, name, kb)
         else:
-            kb = encode_compound(values) if len(values) > 1 else encode_value(values[0])
             kb = kb + COMPOUND_SEP
             id_keys = self._scan_index_for_id_keys(db, coll, name, kb, prefix=True)
         return self._docs_by_id_keys(db, coll, id_keys)
@@ -1177,10 +1172,10 @@ class Storage:
         if operator_field in eq_set:
             return None
         target_eq_count = len(eq_set)
-        best: tuple[str, list[str]] | None = None
+        best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             idx_fields = list(key_spec.keys())
-            if any(int(key_spec[f]) != 1 for f in idx_fields):
+            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
                 continue
             if len(idx_fields) <= target_eq_count:
                 continue
@@ -1188,15 +1183,18 @@ class Storage:
                 continue
             if idx_fields[target_eq_count] != operator_field:
                 continue
-            if best is None or len(best[1]) > len(idx_fields):
-                best = (name, idx_fields)
+            if best is None or len(list(best[1])) > len(idx_fields):
+                best = (name, dict(key_spec))
             if len(idx_fields) == target_eq_count + 1:
                 break
         if best is None:
             return None
-        name, idx_fields = best
-        values = [eq_fields[f] for f in idx_fields[:target_eq_count]]
-        prefix_kb = encode_compound(values) if len(values) > 1 else encode_value(values[0])
+        name, key_spec = best
+        idx_fields = list(key_spec)
+        eq_field_names = idx_fields[:target_eq_count]
+        op_dir = int(key_spec[operator_field])
+        eq_parts = [encode_value_directed(eq_fields[f], int(key_spec[f])) for f in eq_field_names]
+        prefix_kb = COMPOUND_SEP.join(eq_parts) if len(eq_parts) > 1 else eq_parts[0]
         prefix_with_sep = prefix_kb + COMPOUND_SEP
         if "$in" in operator_ops:
             if len(operator_ops) != 1 or not isinstance(operator_ops["$in"], list):
@@ -1206,9 +1204,7 @@ class Storage:
             for v in operator_ops["$in"]:
                 if isinstance(v, dict):
                     return None
-                kb = prefix_with_sep + encode_value(v)
-                # Exact equality if this is the last field of the index;
-                # prefix scan otherwise (more index fields beyond op_field).
+                kb = prefix_with_sep + encode_value_directed(v, op_dir)
                 use_prefix = len(idx_fields) > target_eq_count + 1
                 inner_kb = kb + COMPOUND_SEP if use_prefix else kb
                 for id_k in self._scan_index_for_id_keys(
@@ -1221,7 +1217,7 @@ class Storage:
         if "$eq" in operator_ops:
             if len(operator_ops) != 1:
                 return None
-            kb = prefix_with_sep + encode_value(operator_ops["$eq"])
+            kb = prefix_with_sep + encode_value_directed(operator_ops["$eq"], op_dir)
             use_prefix = len(idx_fields) > target_eq_count + 1
             inner_kb = kb + COMPOUND_SEP if use_prefix else kb
             id_keys = self._scan_index_for_id_keys(db, coll, name, inner_kb, prefix=use_prefix)
@@ -1233,14 +1229,17 @@ class Storage:
         for op, bound in operator_ops.items():
             if isinstance(bound, dict):
                 return None
-            full = prefix_with_sep + encode_value(bound)
-            if op == "$gt":
+            full = prefix_with_sep + encode_value_directed(bound, op_dir)
+            effective_op = op
+            if op_dir == -1:
+                effective_op = {"$gt": "$lt", "$gte": "$lte", "$lt": "$gt", "$lte": "$gte"}[op]
+            if effective_op == "$gt":
                 lower, lower_inclusive = full, False
-            elif op == "$gte":
+            elif effective_op == "$gte":
                 lower, lower_inclusive = full, True
-            elif op == "$lt":
+            elif effective_op == "$lt":
                 upper, upper_inclusive = full, False
-            elif op == "$lte":
+            elif effective_op == "$lte":
                 upper, upper_inclusive = full, True
             else:
                 return None
