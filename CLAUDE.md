@@ -79,7 +79,7 @@ When secondary indexes land they will be WT indexes over typed sort-key columns 
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
 - PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.
-- The on-disk repo path is still `/Users/jdrumgoole/GIT/fongo` (legacy from the `fongo` → `fongodb` → `secantus` rename history); the package and PyPI name are `secantus`. Renaming the directory is fine, not required.
+- The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The package and PyPI name are `secantus`.
 
 ## Backlog of stubs and stopgaps
 
