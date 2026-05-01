@@ -432,14 +432,14 @@ class Storage:
                         and next(iter(filter)) == sort_field
                     ):
                         in_sort_order = True
-                        idx = self._single_field_index_for(db, coll, sort_field)
+                        idx = self._find_leading_field_index(db, coll, sort_field)
                         idx_dir = idx[1] if idx else 1
                         if sort_dir != idx_dir:
                             candidates = list(reversed(candidates))
                 elif candidates is None and not filter and sort_field is not None:
-                    idx = self._single_field_index_for(db, coll, sort_field)
+                    idx = self._find_leading_field_index(db, coll, sort_field)
                     if idx is not None:
-                        idx_name, idx_dir = idx
+                        idx_name, idx_dir, _is_compound = idx
                         # If the index direction matches the sort direction,
                         # walk forward; if it's opposite, walk backward.
                         reverse = sort_dir != idx_dir

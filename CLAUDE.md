@@ -50,7 +50,7 @@ Layers, roughly outermost-in:
 - **Compound prefix + trailing operator**: filters of the form `{a: 5, b: {$gt: 10}}` (any number of leading bare-equality fields followed by exactly one operator-form field, where that operator field is the next field in the index after the equality prefix) prefix-pin the equalities and apply the operator's bounds to the next column. Supports `$eq`/`$in`/`$gt`/`$gte`/`$lt`/`$lte` on the trailing field.
 - **Mixed-direction compound indexes**: compound indexes accept any per-field direction (`{a:1, b:-1}`, `{a:-1, b:-1}`, etc.). Each field is byte-encoded with `encode_value_directed(value, dir)` so the entries table sorts in the index's natural order. Equality prefix lookups, prefix scans, and the trailing-operator path all work; when the trailing field is DESC the operator semantics flip (`$gt` becomes upper-exclusive in byte order), and unique enforcement still uses a prefix probe.
 
-Sort-by-indexed-field rides the same B-tree. The walk direction is chosen so the result is already in sort order: if the index direction matches the sort direction, walk forward; if they're opposite, walk backward. Both ASC and DESC single-field indexes can serve any single-field sort with no Python list reversal in the common path. The post-sort step is skipped.
+Sort-by-indexed-field rides the same B-tree. The walk direction is chosen so the result is already in sort order: if the index direction matches the sort direction, walk forward; if they're opposite, walk backward. A single-field sort can be served by any index whose leading field matches — single-field or compound, ASC or DESC — with no Python list reversal in the common path. The post-sort step is skipped.
 
 Unique enforcement is a prefix probe on the entries table, not a full scan.
 
@@ -60,7 +60,7 @@ Unique enforcement is a prefix probe on the entries table, not a full scan.
 
 **Direction support**: single-field and compound indexes accept any per-field direction. The encoder bitwise-inverts the bytes for DESC fields so the WT B-tree gives us the index's natural order with a forward walk. Equality, `$in`, range (`$gt`/`$gte`/`$lt`/`$lte`) — operator semantics flip automatically when targeting a DESC field — and direction-aware sort acceleration all work end-to-end on single-field indexes, and the equality/prefix/trailing-operator paths all work on mixed-direction compound indexes.
 
-Still missing: native sort acceleration on compound indexes (only single-field today), and `partialFilterExpression` / `collation`.
+Still missing: multi-field sort acceleration (a sort `{a:1, b:1}` matching a compound index `{a:1, b:1}` would skip post-sort entirely; today only single-field sort is index-accelerated), and `partialFilterExpression` / `collation`.
 
 Out of scope regardless: text / geo / hashed / wildcard indexes, `partialFilterExpression`, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
 
