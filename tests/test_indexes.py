@@ -909,3 +909,107 @@ def test_desc_index_via_hint(storage: Storage) -> None:
     assert [d["x"] for d in docs] == [4, 3, 2, 1, 0]
     docs = storage.find_matching("db", "c", {}, hint={"x": -1}, sort={"x": -1})
     assert [d["x"] for d in docs] == [4, 3, 2, 1, 0]
+
+
+def test_mixed_compound_eq_full_match(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+            {"_id": 3, "a": 2, "b": 10},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 10})
+    assert [d["_id"] for d in docs] == [1]
+    assert calls == []
+
+
+def test_mixed_compound_prefix_lookup(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+            {"_id": 3, "a": 2, "b": 30},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1})
+    assert sorted(d["_id"] for d in docs) == [1, 2]
+    assert calls == []
+
+
+def test_mixed_compound_eq_plus_gt_on_desc_trailing(storage: Storage, monkeypatch) -> None:
+    """Filter {a:1, b:{$gt:15}} on {a:1, b:-1} index: bounds flip for the DESC b."""
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": 1, "b": i} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$gt": 15}})
+    assert sorted(d["_id"] for d in docs) == [16, 17, 18, 19]
+    assert calls == []
+
+
+def test_mixed_compound_eq_plus_lt_on_desc_trailing(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": 1, "b": i} for i in range(10)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$lt": 3}})
+    assert sorted(d["_id"] for d in docs) == [0, 1, 2]
+    assert calls == []
+
+
+def test_mixed_compound_eq_plus_in(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": 10},
+            {"_id": 2, "a": 1, "b": 20},
+            {"_id": 3, "a": 1, "b": 30},
+            {"_id": 4, "a": 2, "b": 10},
+        ],
+    )
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$in": [10, 30]}})
+    assert sorted(d["_id"] for d in docs) == [1, 3]
+    assert calls == []
+
+
+def test_mixed_compound_eq_plus_range_both_bounds(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": 1, "b": i} for i in range(20)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": {"$gte": 5, "$lt": 10}})
+    assert sorted(d["_id"] for d in docs) == [5, 6, 7, 8, 9]
+    assert calls == []
+
+
+def test_mixed_compound_unique_enforcement(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {"unique": True})
+    storage.insert("db", "c", [{"_id": 1, "a": 1, "b": 10}])
+    _, errors = storage.insert("db", "c", [{"_id": 2, "a": 1, "b": 10}])
+    assert errors and errors[0]["code"] == 11000
+
+
+def test_mixed_compound_update_maintains_entries(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_mixed", {"a": 1, "b": -1}, {})
+    storage.insert("db", "c", [{"_id": 1, "a": 1, "b": 10}])
+    storage.update_matching("db", "c", {"_id": 1}, {"$set": {"b": 99}})
+    assert storage.find_matching("db", "c", {"a": 1, "b": 10}) == []
+    assert [d["_id"] for d in storage.find_matching("db", "c", {"a": 1, "b": 99})] == [1]
+
+
+def test_pure_desc_compound_eq(storage: Storage, monkeypatch) -> None:
+    storage.create_index("db", "c", "ab_-1", {"a": -1, "b": -1}, {})
+    storage.insert("db", "c", [{"_id": i, "a": i % 3, "b": i} for i in range(9)])
+    calls = _spy_scans(storage, monkeypatch)
+    docs = storage.find_matching("db", "c", {"a": 1, "b": 4})
+    assert [d["_id"] for d in docs] == [4]
+    assert calls == []

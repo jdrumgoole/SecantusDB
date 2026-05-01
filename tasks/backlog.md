@@ -24,7 +24,6 @@ These commands accept the request and return a wire-valid response, but the resp
 
 These work end-to-end but cut corners.
 
-- [ ] **Mixed-direction compound indexes** — single-field ASC and DESC indexes both work end-to-end (equality, `$in`, range, sort-by-indexed-field, `hint`). Pure-ASC compound indexes also work for prefix lookup, prefix + trailing operator, and sort. What's still missing: compound indexes with mixed directions like `{a: 1, b: -1}` — the encoder already supports per-field direction via `encode_value_directed`, but the lookup planners only consider all-ASC compound indexes. Wiring work, no encoding work.
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
 - [ ] **`$lookup`** — full-scan of the foreign collection per outer doc; no use of indexes for the join. Both simple (`localField`/`foreignField`) and `let`/`pipeline` forms are supported. If both are specified, both are applied (simple-form pre-filter, then pipeline). MongoDB's actual behavior with both is more nuanced.
 - [ ] **`$merge` whenMatched: "merge"** — shallow `{**existing, **new}` merge with new winning per-key. MongoDB has deeper semantics for nested docs (recursive merge for sub-documents); we do not.
