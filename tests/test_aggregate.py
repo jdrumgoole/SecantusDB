@@ -268,3 +268,189 @@ def test_lookup_requires_storage_context() -> None:
                 }
             ],
         )
+
+
+# ---------------------------------------------------------------------
+# $lookup hash-join correctness, especially for array-valued fields.
+
+
+def _setup_lookup_storage(outer_docs, foreign_docs, foreign_coll="f"):
+    from secantus.aggregate import PipelineContext
+    from secantus.storage import Storage
+
+    storage = Storage(":memory:")
+    storage.insert("db", foreign_coll, foreign_docs)
+    ctx = PipelineContext(storage=storage, db_name="db")
+    return storage, ctx
+
+
+def test_lookup_simple_form_hash_join_correctness() -> None:
+    foreign = [
+        {"_id": "abc", "stock": 100},
+        {"_id": "xyz", "stock": 50},
+    ]
+    storage, ctx = _setup_lookup_storage([], foreign, foreign_coll="inv")
+    docs = [
+        {"_id": 1, "item": "abc"},
+        {"_id": 2, "item": "xyz"},
+        {"_id": 3, "item": "missing"},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$lookup": {
+                    "from": "inv",
+                    "localField": "item",
+                    "foreignField": "_id",
+                    "as": "j",
+                }
+            }
+        ],
+        ctx,
+    )
+    assert [d["j"] for d in out] == [
+        [{"_id": "abc", "stock": 100}],
+        [{"_id": "xyz", "stock": 50}],
+        [],
+    ]
+
+
+def test_lookup_foreign_field_is_array_each_element_matches() -> None:
+    """Foreign doc with an array foreign_field matches against any element."""
+    foreign = [
+        {"_id": "x", "tags": ["python", "go"]},
+        {"_id": "y", "tags": ["rust"]},
+    ]
+    storage, ctx = _setup_lookup_storage([], foreign, foreign_coll="f")
+    docs = [{"_id": 1, "want": "python"}, {"_id": 2, "want": "rust"}]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$lookup": {
+                    "from": "f",
+                    "localField": "want",
+                    "foreignField": "tags",
+                    "as": "j",
+                }
+            }
+        ],
+        ctx,
+    )
+    assert [fd["_id"] for fd in out[0]["j"]] == ["x"]
+    assert [fd["_id"] for fd in out[1]["j"]] == ["y"]
+
+
+def test_lookup_local_field_is_array_each_element_lookups() -> None:
+    foreign = [
+        {"_id": "py", "lang": "python"},
+        {"_id": "go", "lang": "go"},
+        {"_id": "rs", "lang": "rust"},
+    ]
+    storage, ctx = _setup_lookup_storage([], foreign, foreign_coll="f")
+    docs = [{"_id": 1, "wants": ["python", "rust"]}]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$lookup": {
+                    "from": "f",
+                    "localField": "wants",
+                    "foreignField": "lang",
+                    "as": "j",
+                }
+            }
+        ],
+        ctx,
+    )
+    found = sorted(fd["_id"] for fd in out[0]["j"])
+    assert found == ["py", "rs"]
+
+
+def test_lookup_both_sides_arrays_intersection_match() -> None:
+    foreign = [
+        {"_id": "x", "tags": ["a", "b"]},
+        {"_id": "y", "tags": ["c", "d"]},
+        {"_id": "z", "tags": ["b", "c"]},
+    ]
+    storage, ctx = _setup_lookup_storage([], foreign, foreign_coll="f")
+    docs = [{"_id": 1, "want": ["a", "c"]}]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$lookup": {
+                    "from": "f",
+                    "localField": "want",
+                    "foreignField": "tags",
+                    "as": "j",
+                }
+            }
+        ],
+        ctx,
+    )
+    found = sorted(fd["_id"] for fd in out[0]["j"])
+    # x matches via "a", y matches via "c", z matches via "c".
+    assert found == ["x", "y", "z"]
+
+
+def test_lookup_hash_join_does_not_call_lookup_match_for_hashable_values(monkeypatch) -> None:
+    """O(N+M) hash-join: per-pair _lookup_match should not fire for hashable scalars."""
+    import secantus.aggregate as agg
+
+    foreign = [{"_id": i, "k": i} for i in range(50)]
+    storage, ctx = _setup_lookup_storage([], foreign, foreign_coll="f")
+    docs = [{"_id": j, "k": j % 50} for j in range(20)]
+
+    call_count = [0]
+    real = agg._lookup_match
+
+    def counting(local, foreign):
+        call_count[0] += 1
+        return real(local, foreign)
+
+    monkeypatch.setattr(agg, "_lookup_match", counting)
+    apply_pipeline(
+        docs,
+        [
+            {
+                "$lookup": {
+                    "from": "f",
+                    "localField": "k",
+                    "foreignField": "k",
+                    "as": "j",
+                }
+            }
+        ],
+        ctx,
+    )
+    # With nested-loop O(N×M) we'd see 20 × 50 = 1000 calls. Hash-join
+    # uses dict lookups for hashable scalars and never reaches _lookup_match.
+    assert call_count[0] == 0
+
+
+def test_lookup_pipeline_form_simple_prefilter_hash_join() -> None:
+    """Pipeline form with localField+foreignField also hash-joins the prefilter."""
+    foreign = [{"_id": i, "user_id": i % 5, "v": i} for i in range(20)]
+    storage, ctx = _setup_lookup_storage([], foreign, foreign_coll="orders")
+    docs = [{"_id": "u3", "uid": 3}]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$lookup": {
+                    "from": "orders",
+                    "localField": "uid",
+                    "foreignField": "user_id",
+                    "let": {"u": "$uid"},
+                    "pipeline": [{"$match": {"$expr": {"$gt": ["$v", 5]}}}],
+                    "as": "j",
+                }
+            }
+        ],
+        ctx,
+    )
+    matched_v = sorted(fd["v"] for fd in out[0]["j"])
+    # user_id=3 → v ∈ {3, 8, 13, 18}. After $gt: 5 → {8, 13, 18}.
+    assert matched_v == [8, 13, 18]
