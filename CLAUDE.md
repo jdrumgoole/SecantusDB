@@ -54,6 +54,8 @@ Sort-by-indexed-field rides the same B-tree. The walk direction is chosen so the
 
 Unique enforcement is a prefix probe on the entries table, not a full scan.
 
+**Multikey fallback**: indexes don't yet support per-element entries for array values, so an index where any doc has a list value on an indexed field is flagged `multikey: True` (sticky — never cleared) at insert / update / `create_index` time. Pickers skip multikey indexes, and `find_matching` falls back to a full scan + `matches()` so array-element queries (e.g. `{tags: "python"}` against `{tags: ["python", "go"]}`) return the correct rows. The flag is persisted in the index options blob and surfaced through `list_indexes`.
+
 `hint` is honored on both `find` and `aggregate`: pass an index name string, a key-spec dict, `"$natural"` (forces a collection scan even when an index would match), or `"_id_"` / `{_id: 1}` (walks doc-table order). An unknown hint surfaces as a `BadValue` (code 2) error to the client. The hint can also align with the sort spec to skip the post-sort step when the leading field matches.
 
 `aggregate` also lifts a leading `$match` stage into the initial fetch's filter so a pipeline starting with `[{$match: {...}}]` benefits from the same index acceleration as `find`. The `$match` stage is then skipped in the pipeline so the filter isn't re-applied.

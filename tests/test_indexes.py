@@ -1328,3 +1328,95 @@ def test_explain_plan_sort_no_filter_desc_index_forward(storage: Storage) -> Non
     storage.create_index("db", "c", "x_-1", {"x": -1}, {})
     plan = storage.explain_plan("db", "c", {}, sort={"x": -1})
     assert plan["direction"] == "forward"
+
+
+# ----------------------------------------------------------------------
+# Multikey-aware fallback: queries against indexes flagged multikey must
+# fall back to a full scan because we don't have multi-key indexing.
+
+
+def test_array_value_after_insert_marks_index_multikey(storage: Storage) -> None:
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "tags": ["python", "go"]}])
+    plan = storage.explain_plan("db", "c", {"tags": "python"})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_scalar_only_inserts_keep_index_non_multikey(storage: Storage) -> None:
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    storage.insert("db", "c", [{"_id": i, "tags": f"t{i}"} for i in range(3)])
+    plan = storage.explain_plan("db", "c", {"tags": "t1"})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "tags_1"
+
+
+def test_multikey_index_falls_back_returns_array_element_match(
+    storage: Storage, monkeypatch
+) -> None:
+    """The bug being fixed: tags=python must find docs with tags=[python, go]."""
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "tags": ["python", "go"]},
+            {"_id": 2, "tags": "python"},
+            {"_id": 3, "tags": "rust"},
+        ],
+    )
+    docs = storage.find_matching("db", "c", {"tags": "python"})
+    assert sorted(d["_id"] for d in docs) == [1, 2]
+
+
+def test_multikey_flag_is_sticky(storage: Storage) -> None:
+    """Once an index is flagged multikey, it stays multikey even if the array doc is removed."""
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "tags": ["a", "b"]}])
+    storage.delete_matching("db", "c", {"_id": 1})
+    storage.insert("db", "c", [{"_id": 2, "tags": "a"}])
+    plan = storage.explain_plan("db", "c", {"tags": "a"})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_create_index_on_existing_array_data_marks_multikey(storage: Storage) -> None:
+    storage.insert("db", "c", [{"_id": 1, "tags": ["a", "b"]}])
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    plan = storage.explain_plan("db", "c", {"tags": "a"})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_update_to_array_value_marks_multikey(storage: Storage) -> None:
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "tags": "scalar"}])
+    plan = storage.explain_plan("db", "c", {"tags": "scalar"})
+    assert plan["kind"] == "IXSCAN"
+    storage.update_matching("db", "c", {"_id": 1}, {"$set": {"tags": ["a", "b"]}})
+    plan = storage.explain_plan("db", "c", {"tags": "a"})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_compound_index_array_in_any_field_marks_multikey(storage: Storage) -> None:
+    storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "a": 5, "b": ["x", "y"]}])
+    plan = storage.explain_plan("db", "c", {"a": 5, "b": "x"})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_multikey_set_in_list_indexes_output(storage: Storage) -> None:
+    """list_indexes surfaces the multikey flag once an array doc is inserted."""
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "tags": ["a", "b"]}])
+    [idx] = [i for i in storage.list_indexes("db", "c") if i["name"] == "tags_1"]
+    assert idx.get("multikey") is True
+
+
+def test_non_multikey_index_still_used_when_other_index_is_multikey(
+    storage: Storage, monkeypatch
+) -> None:
+    """A multikey index for one field shouldn't disqualify a clean index on another."""
+    storage.create_index("db", "c", "tags_1", {"tags": 1}, {})
+    storage.create_index("db", "c", "n_1", {"n": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "tags": ["a"], "n": 7}])
+    plan = storage.explain_plan("db", "c", {"n": 7})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "n_1"
