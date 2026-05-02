@@ -20,6 +20,19 @@ set(WT_SOURCE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/wiredtiger)
 set(WT_BINARY_DIR  ${CMAKE_CURRENT_BINARY_DIR}/wt-build)
 set(WT_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wt-install)
 
+# Known iteration point on first CI run:
+#   mongodb-7.0.33's CMake adds -Werror at the WT-target level. Modern Clang
+#   (>= 21) added several warnings (-Wreserved-identifier,
+#   -Wimplicit-void-ptr-cast, -Wdeprecated-non-prototype) that turn those
+#   targets red. Wrapper-level CMAKE_C_FLAGS injection is overridden by WT's
+#   per-target add_compile_options, so suppression has to happen inside WT
+#   or via a small patch to its CMake. CI runners typically have older Clang
+#   and may not hit this — start there. If they do, options are:
+#     - bump submodule to a newer mongodb-X.Y.Z that handles modern Clang;
+#     - apply a small patch to wiredtiger/cmake/strict/strict_*.cmake to
+#       drop -Werror or selectively suppress the new warnings;
+#     - inject -Wno-error via CMAKE_USER_MAKE_RULES_OVERRIDE.
+
 ExternalProject_Add(wiredtiger_ext
     SOURCE_DIR        ${WT_SOURCE_DIR}
     BINARY_DIR        ${WT_BINARY_DIR}
