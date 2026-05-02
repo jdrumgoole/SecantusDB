@@ -47,8 +47,11 @@ sdist.exclude = [
 
 [tool.cibuildwheel]
 # Skip 32-bit and pypy targets; only CPython 3.12 on supported platforms.
+# Also skip musllinux: cibuildwheel builds it by default on Linux and Alpine
+# has neither dnf nor yum, so our before-build can't install swig there.
+# manylinux2014 (CentOS 7, yum) is enough for our target audience.
 build = "cp312-*"
-skip = ["*-win32", "*-manylinux_i686", "pp*"]
+skip = ["*-win32", "*-manylinux_i686", "pp*", "*-musllinux*"]
 build-verbosity = 1
 test-command = "python -c \"import secantus, wiredtiger; print(secantus.__name__, wiredtiger.wiredtiger_version())\""
 

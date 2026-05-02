@@ -23,7 +23,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-PATCH_MARKER = "# secantus-patch: Development → Development.Module (manylinux compat)"
+PATCH_MARKER = "# secantus-patch: Development -> Development.Module (manylinux compat)"
 
 ORIGINAL = (
     "find_package(Python3 ${required_version} COMPONENTS Interpreter Development REQUIRED)"
@@ -48,7 +48,7 @@ def main() -> int:
         print(f"error: target find_package(Python3 ... Development) not in {path}", file=sys.stderr)
         return 1
     path.write_text(text.replace(ORIGINAL, PATCHED))
-    print(f"patched Development → Development.Module in {path}")
+    print(f"patched Development -> Development.Module in {path}")
     return 0
 
 
