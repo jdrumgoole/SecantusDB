@@ -12,7 +12,6 @@ These commands accept the request and return a wire-valid response, but the resp
 
 - [ ] **`serverStatus`** — returns version + zeroed metrics (uptime, connections). No real metrics tracking.
 - [ ] **`connectionStatus`** — empty `authInfo` (no auth implemented).
-- [ ] **`dbStats`** / **`collStats`** — counts are real, sizes are zeroed (we don't track storage size). If a tool depends on `dataSize`/`storageSize`/`avgObjSize`, it'll see 0.
 - [ ] **`hostInfo`** / **`whatsmyuri`** / **`buildInfo`** — hardcoded values. `buildInfo.version` is literally `"7.0.0"`.
 - [ ] **`getLog`** — empty log array.
 - [ ] **`startSession`** / **`endSessions`** / **`refreshSessions`** — `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced.
