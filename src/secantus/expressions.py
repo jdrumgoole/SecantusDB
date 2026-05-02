@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -911,6 +912,33 @@ def _op_second(arg: Any, ctx: _Ctx) -> Any:
     return d.second if d is not None else None
 
 
+def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
+    """Resolve MongoDB-style timezone strings to a Python ``tzinfo``.
+
+    Accepts IANA names ("Europe/Dublin"), UTC offsets ("+05:30",
+    "-04:00", "+0530"), and the aliases "GMT" / "UTC". ``None`` yields
+    ``None`` (caller treats input as already in its own zone).
+    """
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise ExpressionError(f"timezone must be a string, got {type(name).__name__}")
+    if name in ("UTC", "GMT", "Etc/UTC", "Etc/GMT"):
+        return _dt.UTC
+    if name and name[0] in ("+", "-"):
+        sign = 1 if name[0] == "+" else -1
+        digits = name[1:].replace(":", "")
+        if len(digits) == 4 and digits.isdigit():
+            hours = int(digits[:2])
+            minutes = int(digits[2:])
+            return _dt.timezone(sign * _dt.timedelta(hours=hours, minutes=minutes))
+        raise ExpressionError(f"unknown timezone: {name!r}")
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except zoneinfo.ZoneInfoNotFoundError as exc:
+        raise ExpressionError(f"unknown timezone: {name!r}") from exc
+
+
 def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateFromString requires a document spec")
@@ -920,14 +948,19 @@ def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(raw, str):
         raise ExpressionError("$dateFromString dateString must be a string")
     fmt = arg.get("format")
+    tz = _resolve_timezone(arg.get("timezone"))
     try:
         if isinstance(fmt, str):
-            return _dt.datetime.strptime(raw, fmt)
-        return _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            parsed = _dt.datetime.strptime(raw, fmt)
+        else:
+            parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError as exc:
         if "onError" in arg:
             return _eval(arg["onError"], ctx)
         raise ExpressionError(f"$dateFromString cannot parse {raw!r}: {exc}") from exc
+    if tz is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed
 
 
 def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
@@ -939,6 +972,11 @@ def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
     fmt = arg.get("format", "%Y-%m-%dT%H:%M:%S.%LZ")
     if not isinstance(fmt, str):
         raise ExpressionError("$dateToString format must be a string")
+    tz = _resolve_timezone(arg.get("timezone"))
+    if tz is not None:
+        # Naive input is treated as UTC, matching MongoDB's BSON Date semantics.
+        d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.UTC)
+        d = d_aware.astimezone(tz)
     out = fmt
     if "%L" in out:
         out = out.replace("%L", f"{d.microsecond // 1000:03d}")
