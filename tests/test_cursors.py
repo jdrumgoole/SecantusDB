@@ -56,3 +56,66 @@ def test_unknown_cursor_raises_not_found() -> None:
     reg = CursorRegistry()
     with pytest.raises(CursorNotFound):
         reg.next_batch(12345, 10)
+
+
+# ---- TTL expiry: idle cursors are pruned and surface as CursorNotFound. ----
+
+
+class _ManualClock:
+    def __init__(self, t: float = 0.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+def test_default_ttl_is_ten_minutes() -> None:
+    reg = CursorRegistry()
+    assert reg.idle_ttl_seconds == 600.0
+
+
+def test_idle_cursor_expires_after_ttl() -> None:
+    clock = _ManualClock()
+    reg = CursorRegistry(idle_ttl_seconds=60.0, time_func=clock)
+    cid = reg.register("db.c", [{"i": i} for i in range(3)])
+    clock.advance(61.0)
+    with pytest.raises(CursorNotFound):
+        reg.next_batch(cid, 10)
+
+
+def test_active_cursor_does_not_expire_while_used() -> None:
+    clock = _ManualClock()
+    reg = CursorRegistry(idle_ttl_seconds=60.0, time_func=clock)
+    cid = reg.register("db.c", [{"i": i} for i in range(10)])
+    for _ in range(5):
+        clock.advance(30.0)
+        reg.next_batch(cid, 1)
+    # Total elapsed: 150s, but each idle gap was only 30s — well under TTL.
+    batch, _ = reg.next_batch(cid, 5)
+    assert len(batch) == 5
+
+
+def test_expiry_purges_from_registry_len() -> None:
+    clock = _ManualClock()
+    reg = CursorRegistry(idle_ttl_seconds=10.0, time_func=clock)
+    reg.register("db.c", [{"x": 1}])
+    reg.register("db.c", [{"x": 2}])
+    assert len(reg) == 2
+    clock.advance(11.0)
+    # Touch the registry — opportunistic prune fires.
+    reg.register("db.c", [{"x": 3}])
+    assert len(reg) == 1
+
+
+def test_killed_cursor_idempotent_after_expiry() -> None:
+    clock = _ManualClock()
+    reg = CursorRegistry(idle_ttl_seconds=10.0, time_func=clock)
+    cid = reg.register("db.c", [{"x": 1}])
+    clock.advance(11.0)
+    killed, not_found = reg.kill([cid])
+    # Already expired → reported as not-found, not killed.
+    assert killed == []
+    assert not_found == [cid]
