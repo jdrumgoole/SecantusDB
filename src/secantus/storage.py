@@ -113,6 +113,16 @@ def _id_key(doc_id: Any) -> bytes:
     return _canon_value(doc_id)
 
 
+def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:
+    """True if any field in ``key_spec`` resolves to a list value in ``doc``.
+
+    Such a value is encoded as a single composite array sortkey, so a
+    later scalar-equality query against this index would silently miss
+    the doc — the index must fall back to a full scan.
+    """
+    return any(isinstance(get_path(dict(doc), field), list) for field in key_spec)
+
+
 def _index_key(
     doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
 ) -> bytes | None:
@@ -362,6 +372,7 @@ class Storage:
         with self._lock:
             self._ensure_collection(db, coll)
             indexes = self._all_indexes(db, coll)
+            multikey_names = self._multikey_index_names(db, coll)
             for index, doc in enumerate(docs):
                 if "_id" not in doc:
                     doc["_id"] = bson.ObjectId()
@@ -399,6 +410,7 @@ class Storage:
                         break
                     continue
                 self._write_index_entries(db, coll, doc, indexes)
+                multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
         return inserted, errors
 
@@ -710,6 +722,7 @@ class Storage:
         with self._lock:
             self._ensure_collection(db, coll)
             indexes = self._all_indexes(db, coll)
+            multikey_names = self._multikey_index_names(db, coll)
             for doc in self._all_docs(db, coll):
                 if not matches(doc, filter):
                     continue
@@ -728,6 +741,9 @@ class Storage:
                     doc_cur = self._cursor(_DOC_TABLE)
                     doc_cur[db, coll, new_id_key] = bson.encode(new)
                     self._write_index_entries(db, coll, new, indexes)
+                    multikey_names = self._maybe_mark_multikey(
+                        db, coll, new, indexes, multikey_names
+                    )
                 if not multi:
                     break
             if matched == 0 and upsert:
@@ -745,6 +761,7 @@ class Storage:
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
                 self._write_index_entries(db, coll, new, indexes)
+                self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
 
     def delete_matching(self, db: str, coll: str, filter: dict[str, Any], *, limit: int = 0) -> int:
@@ -929,6 +946,13 @@ class Storage:
                     if key in seen:
                         raise IndexConflict(name, d.get("_id"))
                     seen[key] = d.get("_id")
+            multikey = False
+            for d in self._all_docs(db, coll):
+                if _doc_makes_multikey(d, key_spec):
+                    multikey = True
+                    break
+            if multikey:
+                options["multikey"] = True
             payload = bson.encode({"key": dict(key_spec), "options": options})
             c.reset()
             c[db, coll, name] = payload
@@ -1000,6 +1024,52 @@ class Storage:
         for name, key_spec, opts in list(self._iter_indexes(db, coll)):
             out.append((name, key_spec, bool(opts.get("sparse")), bool(opts.get("unique"))))
         return out
+
+    def _multikey_index_names(self, db: str, coll: str) -> set[str]:
+        """Names of indexes flagged ``multikey`` (must fall back to scan).
+
+        Without true multi-key indexing, an index where any doc has a
+        list-valued field can't serve scalar-element matches — so the
+        pickers skip these names and ``find_matching`` falls back to a
+        full scan.
+        """
+        return {
+            name for name, _key_spec, opts in self._iter_indexes(db, coll) if opts.get("multikey")
+        }
+
+    def _maybe_mark_multikey(
+        self,
+        db: str,
+        coll: str,
+        doc: Mapping[str, Any],
+        indexes: list[tuple[str, dict[str, Any], bool, bool]],
+        already_multikey: set[str],
+    ) -> set[str]:
+        """For each non-multikey index, flag it if ``doc`` has an array
+        value on any indexed field. Returns the (possibly grown) set of
+        multikey index names so the caller can avoid re-checking.
+        """
+        c = self._cursor(_IDX_TABLE)
+        for name, key_spec, _sparse, _unique in indexes:
+            if name in already_multikey:
+                continue
+            if not _doc_makes_multikey(doc, key_spec):
+                continue
+            c.reset()
+            c.set_key(db, coll, name)
+            if c.search() != 0:
+                continue
+            payload = bson.decode(bytes(c.get_value()))
+            opts = dict(payload.get("options") or {})
+            if opts.get("multikey"):
+                already_multikey.add(name)
+                continue
+            opts["multikey"] = True
+            payload["options"] = opts
+            c.reset()
+            c[db, coll, name] = bson.encode(payload)
+            already_multikey.add(name)
+        return already_multikey
 
     def _write_index_entries(
         self,
@@ -1165,8 +1235,11 @@ class Storage:
         win over compound (tighter scan, no separator math). All fields
         must be ASC or DESC.
         """
+        multikey = self._multikey_index_names(db, coll)
         compound_fallback: tuple[str, int, bool] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if name in multikey:
+                continue
             idx_fields = list(key_spec)
             if not idx_fields or idx_fields[0] != field:
                 continue
@@ -1271,8 +1344,11 @@ class Storage:
         not scan.
         """
         filter_fields = set(filter)
+        multikey = self._multikey_index_names(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if name in multikey:
+                continue
             idx_fields = list(key_spec.keys())
             if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
                 continue
@@ -1352,8 +1428,11 @@ class Storage:
         eq_fields, operator_field, _operator_ops = parts
         eq_set = set(eq_fields)
         target_eq_count = len(eq_set)
+        multikey = self._multikey_index_names(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if name in multikey:
+                continue
             idx_fields = list(key_spec.keys())
             if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
                 continue
