@@ -47,21 +47,21 @@ sdist.exclude = [
 
 [tool.cibuildwheel]
 # Skip 32-bit and pypy targets; only CPython 3.12 on supported platforms.
-# Also skip musllinux: cibuildwheel builds it by default on Linux and Alpine
-# has neither dnf nor yum, so our before-build can't install swig there.
-# manylinux2014 (CentOS 7, yum) is enough for our target audience.
 build = "cp312-*"
-skip = ["*-win32", "*-manylinux_i686", "pp*", "*-musllinux*"]
+skip = ["*-win32", "*-manylinux_i686", "pp*"]
 build-verbosity = 1
 test-command = "python -c \"import secantus, wiredtiger; print(secantus.__name__, wiredtiger.wiredtiger_version())\""
 
 [tool.cibuildwheel.linux]
-# manylinux x86_64 + aarch64; install swig in the build container.
-# cibuildwheel 2.21 defaults to manylinux_2_28 (AlmaLinux 8, dnf); the older
-# manylinux2014 image (CentOS 7) ships yum. Try both so a future bump back to
-# the older image still works.
+# manylinux x86_64 + aarch64 + musllinux x86_64 + aarch64; install swig in
+# whichever container cibuildwheel is using:
+#   - manylinux2014: CentOS 7 (yum)
+#   - manylinux_2_28: AlmaLinux 8 (dnf)
+#   - musllinux_1_2: Alpine (apk)
+# Each image ships exactly one of these, so the chained `||` picks the right
+# one and the others fail fast with command-not-found.
 archs = ["x86_64", "aarch64"]
-before-build = "dnf install -y swig || yum install -y swig"
+before-build = "apk add --no-cache swig || dnf install -y swig || yum install -y swig"
 
 [tool.cibuildwheel.macos]
 archs = ["x86_64", "arm64"]
