@@ -79,3 +79,14 @@ do so they can run in parallel (`pytest-xdist`-friendly).
 ## Documentation
 
 Full Sphinx docs live in `docs/`; build them with `uv run python -m invoke docs`.
+
+## License
+
+SecantusDB is licensed under **GPL-2.0-only**. See [`LICENSE`](LICENSE).
+
+The license is GPL because SecantusDB depends on (and intends to bundle) the
+[WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine, which is
+itself GPL-2/GPL-3. Bundling GPL code requires a GPL-compatible license on the
+combined work; GPL-2-only is the closest match to WiredTiger's primary license.
+
+If you need other terms, contact the author for a commercial arrangement.

@@ -5,7 +5,8 @@ description = "A fake MongoDB server in Python for testing pymongo applications 
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
-license = { text = "MIT" }
+license = "GPL-2.0-only"
+license-files = ["LICENSE"]
 dependencies = [
     "pymongo>=4.6",
     "wiredtiger>=11.3.1",
