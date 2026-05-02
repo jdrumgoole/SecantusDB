@@ -1,12 +1,14 @@
 # SecantusDB
 
-A fake MongoDB server in Python. SecantusDB speaks the subset of the
-MongoDB wire protocol that [`pymongo`](https://pymongo.readthedocs.io/en/stable/)
-emits, so application test suites can talk to it instead of starting a real
-`mongod`.
+A **surrogate single-node MongoDB server** in Python. SecantusDB speaks the
+subset of the MongoDB wire protocol that
+[`pymongo`](https://pymongo.readthedocs.io/en/stable/) emits, so application
+test suites can talk to it instead of standing up a real `mongod`.
 
 The audience is developers who want **fast, ephemeral, in-process MongoDB
-behaviour for tests**. Not a production-grade emulator.
+behaviour for tests**. SecantusDB is intentionally scoped to single-node
+operation — replica sets, sharding, and other cluster-only features are out
+of scope by design — so it stays simple, fast, and easy to embed.
 
 ## What it is
 
