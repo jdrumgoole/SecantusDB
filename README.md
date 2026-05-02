@@ -1,68 +1,13 @@
 # SecantusDB
 
+[![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
+[![License: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue)](LICENSE)
+[![Python: 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
+
 A fake MongoDB server in Python. SecantusDB speaks the subset of the MongoDB
 wire protocol that [`pymongo`](https://pymongo.readthedocs.io/en/stable/) emits,
-so test suites can talk to it instead of starting a real `mongod`. Replica sets,
-sharding, and cluster-only features are out of scope.
-
-## Installation
-
-`secantus` depends on the third-party
-[`wiredtiger`](https://pypi.org/project/wiredtiger/) PyPI package, which
-currently ships only as a source distribution. Until binary wheels are
-available, `pip install secantus` triggers a from-source build of WiredTiger
-that needs three native build tools on `PATH`:
-
-- **`cmake`** (>= 3.21)
-- **`ninja`**
-- **`swig`** (>= 4.0)
-
-Install the prerequisites first, then `secantus`.
-
-### macOS
-
-```bash
-brew install cmake ninja swig
-pip install secantus
-```
-
-If you use `uv`-managed Python, prefer:
-
-```bash
-uv tool install cmake
-uv tool install ninja
-brew install swig
-uv pip install secantus
-```
-
-### Linux (Debian/Ubuntu)
-
-```bash
-sudo apt-get install -y cmake ninja-build swig
-pip install secantus
-```
-
-### Linux (Fedora/RHEL)
-
-```bash
-sudo dnf install -y cmake ninja-build swig
-pip install secantus
-```
-
-### Windows
-
-WiredTiger's Python bindings have not been validated on Windows by the
-SecantusDB project. macOS and Linux are the supported development targets.
-
-## Quick start
-
-Run a standalone server on a fixed port:
-
-```bash
-uv run python -m secantus --host 127.0.0.1 --port 27117
-```
-
-Or embed one in a pytest fixture:
+so test suites can talk to it **instead of** starting a real `mongod`. No
+binary to install, no port conflicts, parallel-test friendly.
 
 ```python
 from pymongo import MongoClient
@@ -70,23 +15,81 @@ from secantus import SecantusDBServer
 
 with SecantusDBServer(port=0) as server:
     client = MongoClient(server.uri)
-    # ... run pymongo calls against secantus ...
+    db = client["mydb"]
+    db["users"].insert_one({"_id": 1, "name": "Joe"})
+    assert db["users"].find_one({"_id": 1})["name"] == "Joe"
 ```
 
-The `port=0` form lets the OS pick a free port, which is what tests should
-do so they can run in parallel (`pytest-xdist`-friendly).
+## What's in scope
+
+The subset of MongoDB that `pymongo` actually drives — connection handshake,
+CRUD, cursors, aggregation, `findAndModify` — backed by a real query
+planner with **index acceleration** (single-field, compound,
+mixed-direction, partial, TTL, sort), proper `explain` output (`IXSCAN`
+vs `COLLSCAN`), and a hash-join `$lookup`.
+
+What's **out of scope:** replica sets, sharding, change streams,
+authentication, TLS, text/geo/wildcard indexes, `$where`, real transaction
+rollback. If your test depends on those, run a real `mongod`.
+
+## Installation
+
+`secantus` requires Python 3.12+ and depends on the
+[`wiredtiger`](https://pypi.org/project/wiredtiger/) PyPI package, which
+ships as source. `pip install secantus` triggers a from-source build that
+needs `cmake`, `ninja`, and `swig` on `PATH`.
+
+```bash
+# macOS
+brew install cmake ninja swig
+pip install secantus
+
+# Linux (Debian/Ubuntu)
+sudo apt-get install -y cmake ninja-build swig
+pip install secantus
+
+# Linux (Fedora/RHEL)
+sudo dnf install -y cmake ninja-build swig
+pip install secantus
+```
+
+Windows isn't validated. See [Installation](docs/installation.md) for full
+details and dev-install instructions.
 
 ## Documentation
 
-Full Sphinx docs live in `docs/`; build them with `uv run python -m invoke docs`.
+Full docs are in `docs/`; build them with `uv run python -m invoke docs`
+and open `docs/_build/html/index.html`. Highlights:
+
+- [Quickstart](docs/quickstart.md) — embedding in tests, running standalone.
+- [Architecture](docs/architecture.md) — the layered design.
+- [Indexes](docs/indexes.md) — what `find()` and `aggregate` accelerate,
+  `explain` semantics, hints, partial indexes, TTL.
+- [Aggregation](docs/aggregation.md) — supported pipeline stages and
+  expression operators.
+- [Compatibility](docs/compatibility.md) — the divergences you should know
+  about before you trust SecantusDB for a given test.
+
+## Development
+
+```bash
+git clone https://github.com/jdrumgoole/SecantusDB.git
+cd SecantusDB
+uv sync --extra dev
+uv run python -m pytest    # 584 tests, runs in parallel under pytest-xdist
+```
+
+Common workflows:
+
+```bash
+uv run python -m invoke fmt    # ruff format
+uv run python -m invoke lint   # ruff check
+uv run python -m invoke test   # pytest, parallel
+uv run python -m invoke docs   # build Sphinx docs (warnings as errors)
+```
 
 ## License
 
-SecantusDB is licensed under **GPL-2.0-only**. See [`LICENSE`](LICENSE).
-
-The license is GPL because SecantusDB depends on (and intends to bundle) the
-[WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine, which is
-itself GPL-2/GPL-3. Bundling GPL code requires a GPL-compatible license on the
-combined work; GPL-2-only is the closest match to WiredTiger's primary license.
-
-If you need other terms, contact the author for a commercial arrangement.
+GPL-2.0-only. See [`LICENSE`](LICENSE). SecantusDB intends to bundle the
+[WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine
+(itself GPL-2/GPL-3), so the combined work is GPL.
