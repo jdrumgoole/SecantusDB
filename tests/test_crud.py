@@ -935,6 +935,58 @@ def test_coll_stats_missing_namespace(client: MongoClient) -> None:
         db.command("collStats", "missing")
 
 
+def test_coll_stats_reports_real_data_size(client: MongoClient) -> None:
+    """collStats.size and avgObjSize reflect actual bson-encoded bytes."""
+    db = client["coll_stats_size_db"]
+    db["things"].insert_many([{"_id": i, "n": i} for i in range(5)])
+    out = db.command("collStats", "things")
+    assert out["count"] == 5
+    assert out["size"] > 0
+    assert out["storageSize"] == out["size"]
+    assert out["avgObjSize"] > 0
+    # Roughly avgObjSize == size / count.
+    assert abs(out["avgObjSize"] - out["size"] / 5) < 1e-9
+
+
+def test_coll_stats_reports_index_sizes(client: MongoClient) -> None:
+    """Each created secondary index appears in indexSizes with a positive size,
+    and _id_ is always included."""
+    db = client["coll_stats_idx_db"]
+    db["things"].create_index("n")
+    db["things"].insert_many([{"_id": i, "n": i * 2} for i in range(4)])
+    out = db.command("collStats", "things")
+    assert "_id_" in out["indexSizes"]
+    assert "n_1" in out["indexSizes"]
+    assert out["indexSizes"]["_id_"] > 0
+    assert out["indexSizes"]["n_1"] > 0
+    assert out["totalIndexSize"] == sum(out["indexSizes"].values())
+    # nindexes includes the implicit _id_ index, matching MongoDB.
+    assert out["nindexes"] == 2
+
+
+def test_db_stats_reports_real_data_and_index_size(client: MongoClient) -> None:
+    db = client["db_stats_size_db"]
+    db["a"].create_index("v")
+    db["a"].insert_many([{"_id": i, "v": i} for i in range(3)])
+    db["b"].insert_one({"_id": 1, "x": "hello"})
+    out = db.command("dbStats")
+    assert out["objects"] == 4
+    assert out["dataSize"] > 0
+    assert out["indexSize"] > 0
+    assert out["totalSize"] == out["dataSize"] + out["indexSize"]
+    assert out["avgObjSize"] > 0
+
+
+def test_coll_stats_empty_collection(client: MongoClient) -> None:
+    """avgObjSize is 0 for an empty collection (no division by zero)."""
+    db = client["coll_stats_empty_db"]
+    db.create_collection("empty")
+    out = db.command("collStats", "empty")
+    assert out["count"] == 0
+    assert out["size"] == 0
+    assert out["avgObjSize"] == 0
+
+
 def test_query_with_comment_via_pymongo(coll) -> None:
     coll.insert_many([{"_id": i} for i in range(3)])
     found = list(coll.find({"$comment": "audit-trail"}))

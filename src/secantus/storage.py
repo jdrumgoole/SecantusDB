@@ -706,6 +706,34 @@ class Storage:
                 return sum(1 for _ in self._scan_docs(db, coll))
         return sum(1 for doc in self._all_docs(db, coll) if matches(doc, filter))
 
+    def collection_data_size(self, db: str, coll: str) -> int:
+        """Sum of bson-encoded doc bytes for ``coll``.
+
+        Used by ``collStats`` / ``dbStats`` for ``size`` / ``dataSize``.
+        Best-effort estimate — doesn't include WT block overhead.
+        """
+        with self._lock:
+            return sum(len(blob) for _id_k, blob in self._scan_docs(db, coll))
+
+    def index_sizes(self, db: str, coll: str) -> dict[str, int]:
+        """Map of index name → sum of packed entry-key bytes.
+
+        ``_id_`` is reported separately as ``len(id_key)`` summed across
+        the doc table, so callers can include it alongside secondary
+        indexes for an accurate ``totalIndexSize``.
+        """
+        with self._lock:
+            sizes: dict[str, int] = {}
+            id_size = sum(len(id_k) for id_k, _blob in self._scan_docs(db, coll))
+            if id_size:
+                sizes[_ID_INDEX_NAME] = id_size
+            entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
+            for k, _v in entry_rows:
+                name = k[2]
+                packed = bytes(k[3])
+                sizes[name] = sizes.get(name, 0) + len(packed)
+            return sizes
+
     def update_matching(
         self,
         db: str,

@@ -164,16 +164,19 @@ def _connection_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, 
 def _db_stats(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     colls = ctx.storage.list_collections(ctx.db_name)
     objects = sum(ctx.storage.count_matching(ctx.db_name, c, None) for c in colls)
+    data_size = sum(ctx.storage.collection_data_size(ctx.db_name, c) for c in colls)
+    index_size = sum(sum(ctx.storage.index_sizes(ctx.db_name, c).values()) for c in colls)
+    avg_obj_size = (data_size / objects) if objects else 0
     return {
         "db": ctx.db_name,
         "collections": len(colls),
         "objects": objects,
-        "avgObjSize": 0,
-        "dataSize": 0,
-        "storageSize": 0,
+        "avgObjSize": avg_obj_size,
+        "dataSize": data_size,
+        "storageSize": data_size,
         "indexes": sum(len(ctx.storage.list_indexes(ctx.db_name, c)) for c in colls),
-        "indexSize": 0,
-        "totalSize": 0,
+        "indexSize": index_size,
+        "totalSize": data_size + index_size,
         "scaleFactor": 1,
         "ok": 1.0,
     }
@@ -195,14 +198,19 @@ def _coll_stats(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    count = ctx.storage.count_matching(ctx.db_name, coll, None)
+    data_size = ctx.storage.collection_data_size(ctx.db_name, coll)
+    index_sizes = ctx.storage.index_sizes(ctx.db_name, coll)
+    total_index_size = sum(index_sizes.values())
+    avg_obj_size = (data_size / count) if count else 0
     return {
         "ns": f"{ctx.db_name}.{coll}",
-        "count": ctx.storage.count_matching(ctx.db_name, coll, None),
-        "size": 0,
-        "avgObjSize": 0,
-        "storageSize": 0,
-        "totalIndexSize": 0,
-        "indexSizes": {},
+        "count": count,
+        "size": data_size,
+        "avgObjSize": avg_obj_size,
+        "storageSize": data_size,
+        "totalIndexSize": total_index_size,
+        "indexSizes": index_sizes,
         "nindexes": len(ctx.storage.list_indexes(ctx.db_name, coll)),
         "scaleFactor": 1,
         "capped": False,
