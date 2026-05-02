@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-SecantusDB is a fake MongoDB server written in Python. It speaks the MongoDB wire protocol well enough to satisfy the `pymongo` driver, so application tests can run against it instead of a real `mongod`. The package is `secantus`; the public class is `SecantusDBServer`.
+SecantusDB is a **surrogate single-node MongoDB server** written in Python. It speaks the MongoDB wire protocol well enough to satisfy the `pymongo` driver, so application tests can run against it instead of standing up a real `mongod`. The package is `secantus`; the public class is `SecantusDBServer`. "Surrogate" rather than "fake" — it really is a MongoDB server, just intentionally scoped to single-node operation.
 
 The name was chosen to dodge brand-clash risk: an early prototype was called "fongo", a follow-on was called "fongodb", and the current name avoids both the existing "Fongo" brand and any confusion with MongoDB itself. Internal references to `fongo` or `fongodb` are stale — flag and rename to `secantus` (or `SecantusDB` for the brand form).
 

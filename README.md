@@ -4,10 +4,12 @@
 [![License: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue)](LICENSE)
 [![Python: 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 
-A fake MongoDB server in Python. SecantusDB speaks the subset of the MongoDB
-wire protocol that [`pymongo`](https://pymongo.readthedocs.io/en/stable/) emits,
-so test suites can talk to it **instead of** starting a real `mongod`. No
-binary to install, no port conflicts, parallel-test friendly.
+A **surrogate single-node MongoDB server** in Python. SecantusDB speaks the
+subset of the MongoDB wire protocol that
+[`pymongo`](https://pymongo.readthedocs.io/en/stable/) emits, so test suites
+can talk to it **instead of** standing up a real `mongod`. No binary to
+install, no port conflicts, parallel-test friendly. Single-node only —
+replica sets and sharding are out of scope by design.
 
 ```python
 from pymongo import MongoClient
