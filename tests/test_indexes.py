@@ -1420,3 +1420,119 @@ def test_non_multikey_index_still_used_when_other_index_is_multikey(
     plan = storage.explain_plan("db", "c", {"n": 7})
     assert plan["kind"] == "IXSCAN"
     assert plan["index_name"] == "n_1"
+
+
+# ----------------------------------------------------------------------
+# partialFilterExpression: docs that don't match the filter are excluded
+# from the index entries; the picker may use the index only when the
+# user's filter is a superset of the partial filter.
+
+
+def test_partial_filter_excludes_non_matching_docs_from_entries(storage: Storage) -> None:
+    storage.create_index(
+        "db",
+        "c",
+        "active_n",
+        {"n": 1},
+        {"partialFilterExpression": {"status": "active"}},
+    )
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "status": "active", "n": 1},
+            {"_id": 2, "status": "inactive", "n": 1},
+            {"_id": 3, "status": "active", "n": 2},
+        ],
+    )
+    assert _index_entry_count(storage, "db", "c", "active_n") == 2
+
+
+def test_partial_filter_picker_used_when_query_implies_filter(storage: Storage) -> None:
+    """{status: 'active', n: 1} contains {status: 'active'} → picker uses the index."""
+    storage.create_index(
+        "db",
+        "c",
+        "active_n",
+        {"n": 1},
+        {"partialFilterExpression": {"status": "active"}},
+    )
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": i, "status": "active" if i % 2 else "inactive", "n": i} for i in range(20)],
+    )
+    plan = storage.explain_plan("db", "c", {"status": "active", "n": 5})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "active_n"
+
+
+def test_partial_filter_picker_skipped_when_query_lacks_filter(storage: Storage) -> None:
+    """{n: 5} alone doesn't imply {status: 'active'}; must scan."""
+    storage.create_index(
+        "db",
+        "c",
+        "active_n",
+        {"n": 1},
+        {"partialFilterExpression": {"status": "active"}},
+    )
+    plan = storage.explain_plan("db", "c", {"n": 5})
+    assert plan == {"kind": "COLLSCAN"}
+
+
+def test_partial_filter_query_uses_full_picker_then_index(storage: Storage) -> None:
+    """Index lookup returns only docs matching both n=V AND status=active."""
+    storage.create_index(
+        "db",
+        "c",
+        "active_n",
+        {"n": 1},
+        {"partialFilterExpression": {"status": "active"}},
+    )
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "status": "active", "n": 5},
+            {"_id": 2, "status": "inactive", "n": 5},
+            {"_id": 3, "status": "active", "n": 5},
+        ],
+    )
+    docs = storage.find_matching("db", "c", {"status": "active", "n": 5})
+    assert sorted(d["_id"] for d in docs) == [1, 3]
+
+
+def test_partial_filter_update_maintains_entries(storage: Storage) -> None:
+    """Doc moving from non-matching → matching adds an entry; reverse removes one."""
+    storage.create_index(
+        "db",
+        "c",
+        "active_n",
+        {"n": 1},
+        {"partialFilterExpression": {"status": "active"}},
+    )
+    storage.insert("db", "c", [{"_id": 1, "status": "inactive", "n": 5}])
+    assert _index_entry_count(storage, "db", "c", "active_n") == 0
+    storage.update_matching("db", "c", {"_id": 1}, {"$set": {"status": "active"}})
+    assert _index_entry_count(storage, "db", "c", "active_n") == 1
+    storage.update_matching("db", "c", {"_id": 1}, {"$set": {"status": "inactive"}})
+    assert _index_entry_count(storage, "db", "c", "active_n") == 0
+
+
+def test_partial_filter_create_index_on_existing_data(storage: Storage) -> None:
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "status": "active", "n": 1},
+            {"_id": 2, "status": "inactive", "n": 2},
+        ],
+    )
+    storage.create_index(
+        "db",
+        "c",
+        "active_n",
+        {"n": 1},
+        {"partialFilterExpression": {"status": "active"}},
+    )
+    assert _index_entry_count(storage, "db", "c", "active_n") == 1

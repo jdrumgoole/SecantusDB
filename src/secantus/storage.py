@@ -444,12 +444,12 @@ class Storage:
                         and next(iter(filter)) == sort_field
                     ):
                         in_sort_order = True
-                        idx = self._find_leading_field_index(db, coll, sort_field)
+                        idx = self._find_leading_field_index(db, coll, sort_field, filter)
                         idx_dir = idx[1] if idx else 1
                         if sort_dir != idx_dir:
                             candidates = list(reversed(candidates))
                 elif candidates is None and not filter and sort_field is not None:
-                    idx = self._find_leading_field_index(db, coll, sort_field)
+                    idx = self._find_leading_field_index(db, coll, sort_field, filter)
                     if idx is not None:
                         idx_name, idx_dir, _is_compound = idx
                         # If the index direction matches the sort direction,
@@ -633,7 +633,7 @@ class Storage:
                 name, key_spec = picked
                 return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
             if not filter and sort_field is not None:
-                idx = self._find_leading_field_index(db, coll, sort_field)
+                idx = self._find_leading_field_index(db, coll, sort_field, filter)
                 if idx is not None:
                     name, _idx_dir, _is_compound = idx
                     key_spec = self._key_spec_for(db, coll, name)
@@ -666,7 +666,7 @@ class Storage:
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field)
+        idx_match = self._find_leading_field_index(db, coll, field, filter)
         if idx_match is None:
             return None
         if isinstance(value, dict):
@@ -937,9 +937,14 @@ class Storage:
                 return False
             sparse = bool(options.get("sparse"))
             unique = bool(options.get("unique"))
+            partial_filter = options.get("partialFilterExpression")
+            if not isinstance(partial_filter, Mapping) or not partial_filter:
+                partial_filter = None
             if unique:
                 seen: dict[bytes, Any] = {}
                 for d in self._all_docs(db, coll):
+                    if partial_filter is not None and not matches(d, partial_filter):
+                        continue
                     key = _index_key(d, key_spec, sparse=sparse)
                     if key is None:
                         continue
@@ -948,6 +953,8 @@ class Storage:
                     seen[key] = d.get("_id")
             multikey = False
             for d in self._all_docs(db, coll):
+                if partial_filter is not None and not matches(d, partial_filter):
+                    continue
                 if _doc_makes_multikey(d, key_spec):
                     multikey = True
                     break
@@ -958,6 +965,8 @@ class Storage:
             c[db, coll, name] = payload
             entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
             for d in self._all_docs(db, coll):
+                if partial_filter is not None and not matches(d, partial_filter):
+                    continue
                 kb = _index_key(d, dict(key_spec), sparse=sparse)
                 if kb is None:
                     continue
@@ -1025,6 +1034,32 @@ class Storage:
             out.append((name, key_spec, bool(opts.get("sparse")), bool(opts.get("unique"))))
         return out
 
+    def _partial_filters(self, db: str, coll: str) -> dict[str, dict[str, Any]]:
+        """Map of index name → ``partialFilterExpression`` for indexes that have one.
+
+        Indexes without a partial filter are absent from the dict.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for name, _key_spec, opts in self._iter_indexes(db, coll):
+            pf = opts.get("partialFilterExpression")
+            if isinstance(pf, Mapping) and pf:
+                out[name] = dict(pf)
+        return out
+
+    @staticmethod
+    def _query_implies_partial(query: Mapping[str, Any], partial: Mapping[str, Any]) -> bool:
+        """True if ``query`` is at least as restrictive as ``partial`` — every
+        key/value pair in ``partial`` appears with the same bare value in
+        ``query``. Conservative: anything more sophisticated (operator-form
+        clauses, $and, etc.) is treated as not implying the partial filter.
+        """
+        for key, value in partial.items():
+            if key not in query:
+                return False
+            if query[key] != value:
+                return False
+        return True
+
     def _multikey_index_names(self, db: str, coll: str) -> set[str]:
         """Names of indexes flagged ``multikey`` (must fall back to scan).
 
@@ -1082,7 +1117,11 @@ class Storage:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
         id_k = _id_key(doc["_id"])
+        partials = self._partial_filters(db, coll)
         for name, key_spec, sparse, _unique in indexes:
+            pf = partials.get(name)
+            if pf is not None and not matches(doc, pf):
+                continue
             kb = _index_key(doc, key_spec, sparse=sparse)
             if kb is None:
                 continue
@@ -1100,7 +1139,11 @@ class Storage:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
         id_k = _id_key(doc["_id"])
+        partials = self._partial_filters(db, coll)
         for name, key_spec, sparse, _unique in indexes:
+            pf = partials.get(name)
+            if pf is not None and not matches(doc, pf):
+                continue
             kb = _index_key(doc, key_spec, sparse=sparse)
             if kb is None:
                 continue
@@ -1121,8 +1164,12 @@ class Storage:
         if not indexes:
             return None
         c = self._cursor(_IDX_ENTRIES_TABLE)
+        partials = self._partial_filters(db, coll)
         for name, key_spec, sparse, unique in indexes:
             if not unique:
+                continue
+            pf = partials.get(name)
+            if pf is not None and not matches(candidate_doc, pf):
                 continue
             kb = _index_key(candidate_doc, key_spec, sparse=sparse)
             if kb is None:
@@ -1221,24 +1268,34 @@ class Storage:
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field)
+        idx_match = self._find_leading_field_index(db, coll, field, filter)
         if idx_match is None:
             return None
         return self._lookup_via_leading_field(db, coll, idx_match, value)
 
     def _find_leading_field_index(
-        self, db: str, coll: str, field: str
+        self,
+        db: str,
+        coll: str,
+        field: str,
+        query: Mapping[str, Any] | None = None,
     ) -> tuple[str, int, bool] | None:
         """Best index whose leading field is ``field``.
 
         Returns ``(name, direction, is_compound)``. Single-field indexes
         win over compound (tighter scan, no separator math). All fields
-        must be ASC or DESC.
+        must be ASC or DESC. Partial indexes are skipped unless ``query``
+        implies their ``partialFilterExpression``.
         """
         multikey = self._multikey_index_names(db, coll)
+        partials = self._partial_filters(db, coll)
+        query = query or {}
         compound_fallback: tuple[str, int, bool] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             if name in multikey:
+                continue
+            pf = partials.get(name)
+            if pf is not None and not self._query_implies_partial(query, pf):
                 continue
             idx_fields = list(key_spec)
             if not idx_fields or idx_fields[0] != field:
@@ -1345,20 +1402,30 @@ class Storage:
         """
         filter_fields = set(filter)
         multikey = self._multikey_index_names(db, coll)
+        partials = self._partial_filters(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             if name in multikey:
                 continue
+            pf = partials.get(name)
+            if pf is not None:
+                if not self._query_implies_partial(filter, pf):
+                    continue
+                # Partial-filter clauses are guaranteed by the index itself,
+                # so they don't have to appear in the index key.
+                eff_fields = filter_fields - set(pf)
+            else:
+                eff_fields = filter_fields
             idx_fields = list(key_spec.keys())
             if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
                 continue
-            if len(idx_fields) < len(filter_fields):
+            if len(idx_fields) < len(eff_fields):
                 continue
-            if set(idx_fields[: len(filter_fields)]) != filter_fields:
+            if set(idx_fields[: len(eff_fields)]) != eff_fields:
                 continue
             if best is None or (len(list(best[1])) > len(idx_fields)):
                 best = (name, dict(key_spec))
-            if len(idx_fields) == len(filter_fields):
+            if len(idx_fields) == len(eff_fields):
                 break
         return best
 
@@ -1377,11 +1444,12 @@ class Storage:
             return None
         name, key_spec = picked
         idx_fields = list(key_spec)
-        filter_fields = set(filter)
-        prefix_fields = idx_fields[: len(filter_fields)]
+        # Build kb from the filter fields that are in the index (partial-filter
+        # clauses live outside the key and are guaranteed by index population).
+        prefix_fields = [f for f in idx_fields if f in filter]
         parts = [encode_value_directed(filter[f], int(key_spec[f])) for f in prefix_fields]
         kb = COMPOUND_SEP.join(parts) if len(parts) > 1 else parts[0]
-        if len(filter_fields) == len(idx_fields):
+        if len(prefix_fields) == len(idx_fields):
             id_keys = self._scan_index_for_id_keys(db, coll, name, kb)
         else:
             kb = kb + COMPOUND_SEP
@@ -1429,9 +1497,13 @@ class Storage:
         eq_set = set(eq_fields)
         target_eq_count = len(eq_set)
         multikey = self._multikey_index_names(db, coll)
+        partials = self._partial_filters(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             if name in multikey:
+                continue
+            pf = partials.get(name)
+            if pf is not None and not self._query_implies_partial(filter, pf):
                 continue
             idx_fields = list(key_spec.keys())
             if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
