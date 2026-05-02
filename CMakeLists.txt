@@ -31,12 +31,24 @@ set(WT_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wt-install)
 
 set(WT_PATCH_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_strict.py)
 set(WT_STRICT_HELPERS ${WT_SOURCE_DIR}/cmake/strict/strict_flags_helpers.cmake)
+set(WT_PATCH_PYTHON_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_python.py)
+set(WT_PYTHON_CMAKE ${WT_SOURCE_DIR}/lang/python/CMakeLists.txt)
+
+# Python C extension filename: .so on POSIX, .pyd on Windows. WT only sets the
+# Darwin SUFFIX itself; the Windows branch is added by patch_wt_python.py so
+# Python's import machinery (which only looks for .pyd) can find the module.
+if(WIN32)
+    set(WT_PYEXT_NAME "_wiredtiger.pyd")
+else()
+    set(WT_PYEXT_NAME "_wiredtiger.so")
+endif()
 
 ExternalProject_Add(wiredtiger_ext
     SOURCE_DIR        ${WT_SOURCE_DIR}
     BINARY_DIR        ${WT_BINARY_DIR}
     INSTALL_DIR       ${WT_INSTALL_DIR}
     PATCH_COMMAND     ${Python3_EXECUTABLE} ${WT_PATCH_SCRIPT} ${WT_STRICT_HELPERS}
+              COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_PYTHON_SCRIPT} ${WT_PYTHON_CMAKE}
     CMAKE_ARGS
         -G Ninja
         -DCMAKE_BUILD_TYPE=Release
@@ -48,7 +60,7 @@ ExternalProject_Add(wiredtiger_ext
         -DENABLE_PYTHON=ON
         -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
     BUILD_BYPRODUCTS
-        ${WT_BINARY_DIR}/lang/python/_wiredtiger.so
+        ${WT_BINARY_DIR}/lang/python/${WT_PYEXT_NAME}
         ${WT_BINARY_DIR}/lang/python/wiredtiger/swig_wiredtiger.py
     BUILD_ALWAYS OFF
 )
@@ -66,7 +78,7 @@ add_custom_target(wt_python_outputs ALL
 #   <site-packages>/wiredtiger/_wiredtiger.so     (build dir; compiled extension)
 #   <site-packages>/wiredtiger/{fpacking,intpacking,packing,packutil}.py (source dir; not copied by WT)
 install(FILES
-    ${WT_BINARY_DIR}/lang/python/_wiredtiger.so
+    ${WT_BINARY_DIR}/lang/python/${WT_PYEXT_NAME}
     DESTINATION wiredtiger
     OPTIONAL
 )

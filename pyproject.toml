@@ -54,8 +54,11 @@ test-command = "python -c \"import secantus, wiredtiger; print(secantus.__name__
 
 [tool.cibuildwheel.linux]
 # manylinux x86_64 + aarch64; install swig in the build container.
+# cibuildwheel 2.21 defaults to manylinux_2_28 (AlmaLinux 8, dnf); the older
+# manylinux2014 image (CentOS 7) ships yum. Try both so a future bump back to
+# the older image still works.
 archs = ["x86_64", "aarch64"]
-before-build = "yum install -y swig || apt-get update && apt-get install -y swig"
+before-build = "dnf install -y swig || yum install -y swig"
 
 [tool.cibuildwheel.macos]
 archs = ["x86_64", "arm64"]
