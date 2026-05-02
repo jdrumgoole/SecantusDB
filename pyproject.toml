@@ -2,6 +2,7 @@
 name = "secantus"
 version = "0.1.0"
 description = "A fake MongoDB server in Python for testing pymongo applications without running a real mongod."
+readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
 license = { text = "MIT" }
