@@ -1,0 +1,3 @@
+[submodule "vendor/wiredtiger"]
+	path = vendor/wiredtiger
+	url = https://github.com/wiredtiger/wiredtiger.git

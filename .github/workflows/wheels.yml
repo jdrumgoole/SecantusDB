@@ -1,0 +1,62 @@
+name: Build wheels
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:  # Manual trigger for iteration during scaffold tuning.
+
+jobs:
+  build_wheels:
+    name: Build ${{ matrix.platform }} wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            platform: macos-x86_64
+            cibw_archs: x86_64
+          - os: macos-14
+            platform: macos-arm64
+            cibw_archs: arm64
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            cibw_archs: x86_64
+          - os: ubuntu-22.04-arm
+            platform: linux-aarch64
+            cibw_archs: aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheels with cibuildwheel
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+
+  build_sdist:
+    name: Build sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
