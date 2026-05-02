@@ -56,10 +56,7 @@ These are explicit non-goals. Don't add them without a reason.
 
 Subtler than the above; these may bite specific test suites.
 
-- [ ] **Iteration order of `find()` without sort** is WT B-tree order on `id_key`, which is `id_key` byte-lex order. For consecutive integer `_id` values this happens to match insertion order. For `_id` types with large or unordered byte representations (e.g. `ObjectId` with embedded timestamps + counter) it'll differ from a real `mongod`'s natural order. Tests that assert order without an explicit `sort` may be brittle.
-- [ ] **`_id` uniqueness check via canonical bytes** — for non-numeric BSON values the check is byte-equality on `bson.encode({"_": value})`. Two different Python values that happen to encode to the same bytes (rare) would falsely collide.
 - [ ] **`$sample`** — uses `random.sample` without a fixed seed. Deterministic only if test does `random.seed(...)` first.
-- [ ] **`update_matching` with `multi=False`** stops at the first WT-key-ordered match. Real MongoDB stops at the first natural-order match. Same for most cases (see iteration-order note above) but not for all `_id` types.
 - [ ] **`$type: "number"`** in queries — handles `int`, `float`, `Decimal128`, but the int32-vs-int64 distinction depends on Python value range, not the original BSON type tag (which we throw away on decode). A doc inserted as `Int64(5)` reads back as a small Python int and matches `$type: "int"`, not `"long"`.
 - [ ] **`$lookup` simple-form-plus-pipeline** — when both `localField`/`foreignField` and `pipeline` are present, we pre-filter by the simple form and then run the pipeline. Real MongoDB does this too in modern versions, but the documentation isn't crystal clear on the order. If a test breaks here, this is the place to look.
 - [ ] **Aggregation `$group` stable order** — group buckets are emitted in first-seen order, not sorted. Matches MongoDB for unsharded but might differ from sharded behavior (which we don't model).
