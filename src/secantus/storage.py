@@ -34,7 +34,7 @@ from bson import Decimal128
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
-from secantus.sortkey import COMPOUND_SEP, encode_value_directed
+from secantus.sortkey import COMPOUND_SEP, encode_value, encode_value_directed
 from secantus.update import apply_update, find_positional_matches
 
 _COLL_TABLE = "table:secantus_collections"
@@ -72,46 +72,20 @@ class DuplicateKeyError(Exception):
         self.doc_id = doc_id
 
 
-_NUM_PREFIX = b"\x01n:"
-_OTHER_PREFIX = b"\x01o:"
-
-
-def _canon_decimal(d: Decimal) -> bytes | None:
-    if not d.is_finite():
-        return None
-    if d == d.to_integral_value():
-        return str(int(d)).encode()
-    return format(d.normalize(), "f").encode()
-
-
-def _canon_value(value: Any) -> bytes:
-    if isinstance(value, bool):
-        return _OTHER_PREFIX + bson.encode({"_": value})
-    if isinstance(value, int):
-        canon = _canon_decimal(Decimal(value))
-        if canon is not None:
-            return _NUM_PREFIX + canon
-    elif isinstance(value, float):
-        try:
-            d = Decimal(repr(value))
-        except (InvalidOperation, ValueError):
-            d = None
-        if d is not None:
-            canon = _canon_decimal(d)
-            if canon is not None:
-                return _NUM_PREFIX + canon
-    elif isinstance(value, Decimal128):
-        try:
-            canon = _canon_decimal(value.to_decimal())
-        except (InvalidOperation, ValueError):
-            canon = None
-        if canon is not None:
-            return _NUM_PREFIX + canon
-    return _OTHER_PREFIX + bson.encode({"_": value})
-
-
 def _id_key(doc_id: Any) -> bytes:
-    return _canon_value(doc_id)
+    """Byte-sortable canonical bytes for an ``_id`` value.
+
+    Uses the same byte-sortable encoding the secondary-index entries
+    table relies on. Two consequences worth knowing:
+
+    * Cross-numeric collision: ``1 == 1.0 == Decimal128("1")`` produce
+      identical bytes (so they hit the same doc / clash on uniqueness),
+      because ``encode_value`` normalises numerics through ``Decimal``.
+    * Natural iteration: walking the doc table in WT-key order yields
+      docs in BSON cross-type sort order, which matches what real
+      MongoDB calls "natural order" for non-capped collections.
+    """
+    return encode_value(doc_id)
 
 
 def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:

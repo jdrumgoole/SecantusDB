@@ -1661,3 +1661,72 @@ def test_ttl_prune_removes_index_entries_too(storage: Storage) -> None:
     assert _index_entry_count(storage, "db", "c", "ttl_1") == 1
     storage.prune_ttl("db", "c", now=base)
     assert _index_entry_count(storage, "db", "c", "ttl_1") == 0
+
+
+# ----------------------------------------------------------------------
+# Natural iteration order: doc table walks return docs in BSON natural
+# order, matching real MongoDB's "natural" cursor for non-capped colls.
+
+
+def test_find_no_sort_int_ids_in_numeric_order(storage: Storage) -> None:
+    """Inserting ints 0..19 in arbitrary order; find() returns numeric order."""
+    import random
+
+    rng = random.Random(42)
+    ids = list(range(20))
+    rng.shuffle(ids)
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in ids])
+    docs = storage.find_matching("db", "c", {})
+    assert [d["_id"] for d in docs] == sorted(ids)
+
+
+def test_find_no_sort_string_ids_lexical(storage: Storage) -> None:
+    storage.insert("db", "c", [{"_id": s} for s in ["banana", "apple", "cherry", "date"]])
+    docs = storage.find_matching("db", "c", {})
+    assert [d["_id"] for d in docs] == ["apple", "banana", "cherry", "date"]
+
+
+def test_find_no_sort_objectid_chronological(storage: Storage) -> None:
+    """ObjectIds inserted in time order come back in time order."""
+    import datetime as _dt
+
+    import bson
+
+    base = _dt.datetime(2026, 5, 2, tzinfo=_dt.UTC)
+    oids = [bson.ObjectId.from_datetime(base + _dt.timedelta(seconds=i)) for i in range(5)]
+    # Insert reversed; expect chronological retrieval.
+    storage.insert("db", "c", [{"_id": oid} for oid in reversed(oids)])
+    docs = storage.find_matching("db", "c", {})
+    assert [d["_id"] for d in docs] == oids
+
+
+def test_update_multi_false_updates_natural_first_match(storage: Storage) -> None:
+    """multi=False updates the first doc in natural (insertion-numeric) order."""
+    import random
+
+    rng = random.Random(7)
+    ids = list(range(10))
+    rng.shuffle(ids)
+    storage.insert("db", "c", [{"_id": i, "tag": "a"} for i in ids])
+    result = storage.update_matching("db", "c", {"tag": "a"}, {"$set": {"tag": "b"}}, multi=False)
+    assert result["modified"] == 1
+    # The doc that flipped to "b" is the one with the smallest _id (natural-first).
+    [updated] = storage.find_matching("db", "c", {"tag": "b"})
+    assert updated["_id"] == 0
+
+
+def test_id_uniqueness_still_collides_int_float_decimal(storage: Storage) -> None:
+    from bson import Decimal128
+
+    inserted, errs = storage.insert("db", "c", [{"_id": 1}])
+    assert inserted == 1
+    inserted, errs = storage.insert("db", "c", [{"_id": 1.0}])
+    assert inserted == 0 and errs and errs[0]["code"] == 11000
+    inserted, errs = storage.insert("db", "c", [{"_id": Decimal128("1")}])
+    assert inserted == 0 and errs and errs[0]["code"] == 11000
+
+
+def test_id_bool_distinct_from_int(storage: Storage) -> None:
+    """True must not collide with 1 — different BSON types."""
+    inserted, _ = storage.insert("db", "c", [{"_id": 1}, {"_id": True}])
+    assert inserted == 2
