@@ -599,6 +599,22 @@ def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> l
     return []
 
 
+def _deep_merge_docs(existing: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, Any]:
+    """Recursive merge for ``$merge whenMatched: "merge"``.
+
+    For overlapping keys: if both sides are sub-documents, merge them; for
+    arrays or scalars, the new value wins (matches MongoDB's behaviour).
+    Non-overlapping keys from both sides are kept.
+    """
+    result: dict[str, Any] = copy.deepcopy(dict(existing))
+    for key, value in new.items():
+        if key in result and isinstance(result[key], Mapping) and isinstance(value, Mapping):
+            result[key] = _deep_merge_docs(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
 def _stage_merge(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -643,7 +659,8 @@ def _stage_merge(
                 new.setdefault("_id", existing[0]["_id"])
                 ctx.storage.insert(target_db, target_coll, [new])
             else:  # default "merge"
-                merged = {**existing[0], **doc, "_id": existing[0]["_id"]}
+                merged = _deep_merge_docs(existing[0], doc)
+                merged["_id"] = existing[0]["_id"]
                 ctx.storage.update_matching(
                     target_db, target_coll, {"_id": existing[0]["_id"]}, merged
                 )

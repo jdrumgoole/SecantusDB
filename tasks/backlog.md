@@ -25,7 +25,6 @@ These work end-to-end but cut corners.
 
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
 - [ ] **`$lookup` does not use storage indexes** — joins are O(N+M) via an in-memory hash table built once over the foreign collection (covers array-valued local/foreign fields correctly via element expansion). Both simple (`localField`/`foreignField`) and `let`/`pipeline` forms are accelerated; if both are specified, the simple-form hash-join pre-filters the candidates fed to the pipeline. Storage indexes on the foreign field are NOT consulted; a true index-driven join would skip materialising the foreign collection but needs multikey-index support to stay correct for array-valued foreign fields.
-- [ ] **`$merge` whenMatched: "merge"** — shallow `{**existing, **new}` merge with new winning per-key. MongoDB has deeper semantics for nested docs (recursive merge for sub-documents); we do not.
 - [ ] **`$dateFromString`** — uses Python's `strptime` codes (or `fromisoformat` if no format). No full MongoDB format spec, no `timezone` argument, no `%G`/`%V` ISO-week support.
 - [ ] **`$dateToString`** — Python `strftime` + `%L` for millisecond extension. No `timezone` argument.
 - [ ] **`renameCollection`** — atomic per the storage `RLock`, but no protection against concurrent writers across worktrees. Tests are single-process so this is fine.

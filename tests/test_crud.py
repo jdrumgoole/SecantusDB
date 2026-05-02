@@ -987,6 +987,46 @@ def test_aggregate_merge_when_not_matched_discard(client: MongoClient) -> None:
     assert list(db["dst"].find()) == []
 
 
+def test_aggregate_merge_recursively_merges_nested_documents(client: MongoClient) -> None:
+    """$merge whenMatched=merge descends into sub-docs rather than overwriting them."""
+    db = client["merge_deep_db"]
+    db["src"].insert_one({"_id": 1, "addr": {"city": "Dublin", "country": "IE"}})
+    db["dst"].insert_one({"_id": 1, "addr": {"street": "Main", "city": "OldCity"}})
+    list(db["src"].aggregate([{"$merge": "dst"}]))
+    [doc] = list(db["dst"].find())
+    # New "city" wins, "country" added, existing "street" preserved.
+    assert doc == {"_id": 1, "addr": {"street": "Main", "city": "Dublin", "country": "IE"}}
+
+
+def test_aggregate_merge_arrays_replace_not_concatenate(client: MongoClient) -> None:
+    """Arrays under $merge replace whole, matching real Mongo behaviour."""
+    db = client["merge_arr_db"]
+    db["src"].insert_one({"_id": 1, "tags": ["a", "b"]})
+    db["dst"].insert_one({"_id": 1, "tags": ["x", "y", "z"]})
+    list(db["src"].aggregate([{"$merge": "dst"}]))
+    [doc] = list(db["dst"].find())
+    assert doc == {"_id": 1, "tags": ["a", "b"]}
+
+
+def test_aggregate_merge_deeply_nested_three_levels(client: MongoClient) -> None:
+    db = client["merge_3lvl_db"]
+    db["src"].insert_one({"_id": 1, "a": {"b": {"c": 2, "d": 3}}})
+    db["dst"].insert_one({"_id": 1, "a": {"b": {"c": 99, "e": 5}, "x": 10}})
+    list(db["src"].aggregate([{"$merge": "dst"}]))
+    [doc] = list(db["dst"].find())
+    assert doc == {"_id": 1, "a": {"b": {"c": 2, "d": 3, "e": 5}, "x": 10}}
+
+
+def test_aggregate_merge_scalar_overwrites_subdoc(client: MongoClient) -> None:
+    """If the new doc replaces a sub-doc with a scalar, scalar wins."""
+    db = client["merge_scalar_db"]
+    db["src"].insert_one({"_id": 1, "addr": "just a string"})
+    db["dst"].insert_one({"_id": 1, "addr": {"street": "Main"}})
+    list(db["src"].aggregate([{"$merge": "dst"}]))
+    [doc] = list(db["dst"].find())
+    assert doc == {"_id": 1, "addr": "just a string"}
+
+
 def test_positional_all_via_pymongo(coll) -> None:
     coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 2}, {"qty": 3}]})
     coll.update_one({"_id": 1}, {"$set": {"items.$[].qty": 0}})
