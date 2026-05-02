@@ -279,6 +279,80 @@ def test_date_from_string_on_error_fallback() -> None:
     assert out == "FAILED"
 
 
+def test_date_to_string_with_iana_timezone() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.UTC)
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%H:%M %Z", "timezone": "Europe/Dublin"}},
+        {"ts": when},
+    )
+    # Dublin is UTC+1 in May (BST).
+    assert out.startswith("13:00 ")
+
+
+def test_date_to_string_with_utc_offset() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.UTC)
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%H:%M", "timezone": "+05:30"}},
+        {"ts": when},
+    )
+    assert out == "17:30"
+
+
+def test_date_to_string_with_gmt_alias() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.UTC)
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%H:%M", "timezone": "GMT"}},
+        {"ts": when},
+    )
+    assert out == "12:00"
+
+
+def test_date_to_string_treats_naive_input_as_utc() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2026, 5, 2, 12, 0, 0)  # naive
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%H:%M", "timezone": "+02:00"}},
+        {"ts": when},
+    )
+    assert out == "14:00"
+
+
+def test_date_from_string_with_timezone_interprets_naive_input() -> None:
+    import datetime as dt
+
+    out = evaluate(
+        {
+            "$dateFromString": {
+                "dateString": "2026-05-02 12:00:00",
+                "format": "%Y-%m-%d %H:%M:%S",
+                "timezone": "+02:00",
+            }
+        },
+        {},
+    )
+    # 12:00 in +02:00 represents the instant 10:00 UTC.
+    assert out == dt.datetime(2026, 5, 2, 10, 0, 0, tzinfo=dt.UTC)
+    # Returned datetime is tz-aware in the requested zone.
+    assert out.utcoffset() == dt.timedelta(hours=2)
+
+
+def test_date_from_string_unknown_timezone_raises() -> None:
+    from secantus.expressions import ExpressionError
+
+    with pytest.raises(ExpressionError):
+        evaluate(
+            {"$dateFromString": {"dateString": "2026-05-02", "timezone": "Mars/Olympus"}},
+            {},
+        )
+
+
 def test_date_from_string_on_null_fallback() -> None:
     out = evaluate({"$dateFromString": {"dateString": None, "onNull": "missing"}}, {})
     assert out == "missing"
