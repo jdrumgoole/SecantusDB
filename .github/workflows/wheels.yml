@@ -26,6 +26,9 @@ jobs:
           - os: ubuntu-22.04-arm
             platform: linux-aarch64
             cibw_archs: aarch64
+          - os: windows-2022
+            platform: windows-x86_64
+            cibw_archs: AMD64
     steps:
       - uses: actions/checkout@v4
         with:

@@ -61,6 +61,12 @@ before-build = "yum install -y swig || apt-get update && apt-get install -y swig
 archs = ["x86_64", "arm64"]
 before-build = "brew install swig"
 
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+# SWIG ships preinstalled on windows-2022 runners; choco re-installs it idempotently
+# so a refreshed runner image without it still works.
+before-build = "choco install -y swig"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-n auto"
