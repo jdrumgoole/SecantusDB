@@ -66,9 +66,11 @@ Unique enforcement is a prefix probe on the entries table, not a full scan.
 
 **Partial indexes**: indexes accept a `partialFilterExpression` option (e.g. `{status: "active"}`); only docs that `matches()` the expression get entries written, and pickers may use a partial index only when the user query implies the partial filter (every key/value in the partial filter appears with the same bare value in the user filter). Conservative: operator-form clauses or document-level operators in the partial filter aren't recognised as implied. The picker strips partial-filter keys when matching the user filter against the index key spec, so a query like `{status: "active", n: 5}` against a partial index on `{n: 1}` with filter `{status: "active"}` correctly uses the index.
 
+**TTL indexes**: `expireAfterSeconds` is honoured by `Storage.prune_ttl(db, coll, *, now=None)` which walks the collection, deletes docs whose indexed `datetime` field is older than `now - expireAfterSeconds`, and removes their index entries. The clock is injectable so tests can drive expiry deterministically. There is **no background sweeper** — real MongoDB prunes every 60s; SecantusDB requires the caller to invoke `prune_ttl` explicitly. Docs without the TTL field, with non-date values, or with values inside the window are left untouched.
+
 Still missing: multi-field sort acceleration (a sort `{a:1, b:1}` matching a compound index `{a:1, b:1}` would skip post-sort entirely; today only single-field sort is index-accelerated), and `collation`.
 
-Out of scope regardless: text / geo / hashed / wildcard indexes, TTL semantics (`expireAfterSeconds` is accepted but no expiration), collation.
+Out of scope regardless: text / geo / hashed / wildcard indexes, collation.
 
 ### Type-mapping strategy (the critical decision)
 

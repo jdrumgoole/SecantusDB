@@ -1536,3 +1536,128 @@ def test_partial_filter_create_index_on_existing_data(storage: Storage) -> None:
         {"partialFilterExpression": {"status": "active"}},
     )
     assert _index_entry_count(storage, "db", "c", "active_n") == 1
+
+
+# ----------------------------------------------------------------------
+# TTL indexes: prune_ttl removes docs whose indexed Date field is older
+# than now - expireAfterSeconds.
+
+
+def test_ttl_prune_deletes_expired_docs(storage: Storage) -> None:
+    import datetime as _dt
+
+    storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "createdAt": base - _dt.timedelta(seconds=120)},  # expired
+            {"_id": 2, "createdAt": base - _dt.timedelta(seconds=30)},  # fresh
+            {"_id": 3, "createdAt": base},  # fresh
+        ],
+    )
+    pruned = storage.prune_ttl("db", "c", now=base)
+    assert pruned == 1
+    docs = storage.find_matching("db", "c", {})
+    assert sorted(d["_id"] for d in docs) == [2, 3]
+
+
+def test_ttl_prune_no_op_when_nothing_expired(storage: Storage) -> None:
+    import datetime as _dt
+
+    storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 3600})
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": i, "createdAt": base - _dt.timedelta(seconds=i * 60)} for i in range(5)],
+    )
+    assert storage.prune_ttl("db", "c", now=base) == 0
+    assert len(storage.find_matching("db", "c", {})) == 5
+
+
+def test_ttl_prune_skips_non_ttl_indexes(storage: Storage) -> None:
+    """Indexes without expireAfterSeconds are ignored by prune_ttl."""
+    import datetime as _dt
+
+    storage.create_index("db", "c", "n_1", {"n": 1}, {})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": i, "n": i, "createdAt": _dt.datetime(2020, 1, 1, tzinfo=_dt.UTC)}
+            for i in range(3)
+        ],
+    )
+    pruned = storage.prune_ttl("db", "c", now=_dt.datetime(2026, 5, 2, tzinfo=_dt.UTC))
+    assert pruned == 0
+
+
+def test_ttl_prune_skips_docs_without_indexed_field(storage: Storage) -> None:
+    """A doc missing the TTL field stays (matches MongoDB behaviour)."""
+    import datetime as _dt
+
+    storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "createdAt": base - _dt.timedelta(seconds=120)},
+            {"_id": 2},  # no createdAt
+        ],
+    )
+    pruned = storage.prune_ttl("db", "c", now=base)
+    assert pruned == 1
+    docs = storage.find_matching("db", "c", {})
+    assert sorted(d["_id"] for d in docs) == [2]
+
+
+def test_ttl_prune_skips_non_date_field(storage: Storage) -> None:
+    """If the indexed field is not a date, the doc is left alone."""
+    import datetime as _dt
+
+    storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "createdAt": "not a date"},
+            {"_id": 2, "createdAt": base - _dt.timedelta(seconds=120)},
+        ],
+    )
+    pruned = storage.prune_ttl("db", "c", now=base)
+    assert pruned == 1
+    [doc] = storage.find_matching("db", "c", {})
+    assert doc["_id"] == 1
+
+
+def test_ttl_prune_uses_real_now_when_omitted(storage: Storage) -> None:
+    import datetime as _dt
+
+    storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 1})
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": 1, "createdAt": _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)}],
+    )
+    # Default now() resolves to actual current time → epoch is way past TTL.
+    pruned = storage.prune_ttl("db", "c")
+    assert pruned == 1
+
+
+def test_ttl_prune_removes_index_entries_too(storage: Storage) -> None:
+    import datetime as _dt
+
+    storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": 1, "createdAt": base - _dt.timedelta(seconds=120)}],
+    )
+    assert _index_entry_count(storage, "db", "c", "ttl_1") == 1
+    storage.prune_ttl("db", "c", now=base)
+    assert _index_entry_count(storage, "db", "c", "ttl_1") == 0

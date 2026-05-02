@@ -17,7 +17,6 @@ These commands accept the request and return a wire-valid response, but the resp
 - [ ] **`getLog`** — empty log array.
 - [ ] **`startSession`** / **`endSessions`** / **`refreshSessions`** — `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced.
 - [ ] **`abortTransaction`** / **`commitTransaction`** — return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod`.
-- [ ] **`$comment`** query operator — accepted and ignored.
 
 ## 2. Stopgaps (functional but with significant limitations)
 
@@ -28,7 +27,8 @@ These work end-to-end but cut corners.
 - [ ] **`$dateFromString`** — uses Python's `strptime` codes (or `fromisoformat` if no format). No full MongoDB format spec, no `timezone` argument, no `%G`/`%V` ISO-week support.
 - [ ] **`$dateToString`** — Python `strftime` + `%L` for millisecond extension. No `timezone` argument.
 - [ ] **`renameCollection`** — atomic per the storage `RLock`, but no protection against concurrent writers across worktrees. Tests are single-process so this is fine.
-- [ ] **`createIndexes` options that are accepted but not enforced**: `expireAfterSeconds` (no TTL), `collation` (Python compares with default locale).
+- [ ] **`createIndexes` options that are accepted but not enforced**: `collation` (Python compares with default locale).
+- [ ] **TTL is opt-in, not automatic** — `expireAfterSeconds` is honoured by `Storage.prune_ttl(db, coll, *, now=None)` which deletes expired docs and their index entries. Real MongoDB runs this on a 60s background sweeper; SecantusDB does not, so tests that depend on TTL behaviour must call `prune_ttl` explicitly.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 

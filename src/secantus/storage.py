@@ -18,6 +18,7 @@ on the next field). Sort-by-indexed-field walks the B-tree in order.
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import os
 import shutil
 import tempfile
@@ -779,6 +780,60 @@ class Storage:
                 if limit > 0 and deleted >= limit:
                     break
         return deleted
+
+    def prune_ttl(
+        self,
+        db: str,
+        coll: str,
+        *,
+        now: _dt.datetime | None = None,
+    ) -> int:
+        """Delete docs whose indexed Date field is older than now - TTL.
+
+        For every index on ``coll`` with an ``expireAfterSeconds`` option,
+        walks the collection and deletes docs whose indexed field resolves
+        to a ``datetime`` older than ``now - expireAfterSeconds``. Docs
+        without the field, with non-date values, or with values inside the
+        TTL window are left in place. Real MongoDB runs this on a 60s
+        background sweeper; SecantusDB invokes it explicitly so tests can
+        drive expiry with an injected ``now``. Returns the number of docs
+        pruned.
+        """
+        ttl_indexes: list[tuple[str, str, float]] = []
+        for name, key_spec, opts in self._iter_indexes(db, coll):
+            ttl = opts.get("expireAfterSeconds")
+            if not isinstance(ttl, (int, float)) or ttl < 0:
+                continue
+            field = next(iter(key_spec), None)
+            if not isinstance(field, str):
+                continue
+            ttl_indexes.append((name, field, float(ttl)))
+        if not ttl_indexes:
+            return 0
+        when = now if now is not None else _dt.datetime.now(_dt.UTC)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.UTC)
+        pruned = 0
+        with self._lock:
+            indexes = self._all_indexes(db, coll)
+            for doc in list(self._all_docs(db, coll)):
+                expired = False
+                for _name, field, ttl_seconds in ttl_indexes:
+                    value = get_path(doc, field)
+                    if not isinstance(value, _dt.datetime):
+                        continue
+                    value_aware = value if value.tzinfo else value.replace(tzinfo=_dt.UTC)
+                    if (when - value_aware).total_seconds() > ttl_seconds:
+                        expired = True
+                        break
+                if not expired:
+                    continue
+                self._delete_index_entries(db, coll, doc, indexes)
+                doc_cur = self._cursor(_DOC_TABLE)
+                doc_cur.set_key(db, coll, _id_key(doc["_id"]))
+                doc_cur.remove()
+                pruned += 1
+        return pruned
 
     @staticmethod
     def _table_kf(table: str) -> str:
