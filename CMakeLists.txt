@@ -33,6 +33,8 @@ set(WT_PATCH_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_strict.py)
 set(WT_STRICT_HELPERS ${WT_SOURCE_DIR}/cmake/strict/strict_flags_helpers.cmake)
 set(WT_PATCH_PYTHON_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_python.py)
 set(WT_PYTHON_CMAKE ${WT_SOURCE_DIR}/lang/python/CMakeLists.txt)
+set(WT_PATCH_HELPERS_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_helpers.py)
+set(WT_HELPERS_CMAKE ${WT_SOURCE_DIR}/cmake/helpers.cmake)
 
 # Python C extension filename: .so on POSIX, .pyd on Windows. WT only sets the
 # Darwin SUFFIX itself; the Windows branch is added by patch_wt_python.py so
@@ -47,10 +49,16 @@ ExternalProject_Add(wiredtiger_ext
     SOURCE_DIR        ${WT_SOURCE_DIR}
     BINARY_DIR        ${WT_BINARY_DIR}
     INSTALL_DIR       ${WT_INSTALL_DIR}
+    # ExternalProject inherits the parent generator unless CMAKE_GENERATOR is
+    # set explicitly (per-arg, NOT via -G in CMAKE_ARGS — that's silently
+    # ignored). On Windows the parent uses MSBuild by default, which puts
+    # build outputs under a per-config subdir (lang/python/Release/...) and
+    # breaks our install paths. Force Ninja everywhere for a uniform layout.
+    CMAKE_GENERATOR   Ninja
     PATCH_COMMAND     ${Python3_EXECUTABLE} ${WT_PATCH_SCRIPT} ${WT_STRICT_HELPERS}
               COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_PYTHON_SCRIPT} ${WT_PYTHON_CMAKE}
+              COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_HELPERS_SCRIPT} ${WT_HELPERS_CMAKE}
     CMAKE_ARGS
-        -G Ninja
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_INSTALL_PREFIX=${WT_INSTALL_DIR}
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON

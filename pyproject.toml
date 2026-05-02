@@ -50,7 +50,7 @@ sdist.exclude = [
 build = "cp312-*"
 skip = ["*-win32", "*-manylinux_i686", "pp*"]
 build-verbosity = 1
-test-command = "python -c \"import secantus, wiredtiger; print(secantus.__name__, wiredtiger.__version__)\""
+test-command = "python -c \"import secantus, wiredtiger; print(secantus.__name__, wiredtiger.wiredtiger_version())\""
 
 [tool.cibuildwheel.linux]
 # manylinux x86_64 + aarch64; install swig in the build container.
