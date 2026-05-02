@@ -197,6 +197,119 @@ def _stage_unset(
     return out
 
 
+def _stage_densify(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """Numeric ``$densify``: fill gaps between consecutive values.
+
+    Output is each input doc plus filler docs (containing only the
+    densify field, plus any partitionByFields) at every multiple of
+    ``step`` strictly between consecutive input values within a
+    partition. ``bounds`` may be ``"full"`` (use min/max from input) or
+    a two-element ``[min, max]`` array (clamp/extend to those bounds);
+    ``"partition"`` is treated like ``"full"`` per partition because we
+    don't yet plumb a partition-wide range distinct from each
+    partition's observed extremes.
+
+    Date densify (``unit``) is deferred — see ``tasks/backlog.md``.
+    """
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$densify requires a document spec")
+    field = spec.get("field")
+    if not isinstance(field, str):
+        raise AggregateError("$densify requires a field name")
+    range_spec = spec.get("range")
+    if not isinstance(range_spec, Mapping):
+        raise AggregateError("$densify requires range")
+    if "unit" in range_spec:
+        raise AggregateError("$densify date ranges (unit) not yet supported")
+    step = range_spec.get("step")
+    if not isinstance(step, (int, float)) or step <= 0:
+        raise AggregateError("$densify step must be a positive number")
+    bounds = range_spec.get("bounds")
+    partition_fields = list(spec.get("partitionByFields") or [])
+
+    def partition_key(doc: Mapping[str, Any]) -> tuple[Any, ...]:
+        return tuple(get_path(doc, f) for f in partition_fields)
+
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    insertion_order: list[tuple[Any, ...]] = []
+    for d in docs:
+        key = partition_key(d)
+        if key not in grouped:
+            grouped[key] = []
+            insertion_order.append(key)
+        grouped[key].append(d)
+
+    if not grouped and isinstance(bounds, list) and len(bounds) == 2:
+        # No input docs but explicit bounds — emit fillers across the
+        # whole range with no partition keys.
+        return _densify_fill_range(field, bounds[0], bounds[1], step, {})
+
+    out: list[dict[str, Any]] = []
+    for key in insertion_order:
+        partition_docs = sorted(grouped[key], key=lambda d: get_path(d, field))
+        partition_carry = {f: get_path(partition_docs[0], f) for f in partition_fields}
+        if isinstance(bounds, list) and len(bounds) == 2:
+            lo, hi = bounds[0], bounds[1]
+        else:  # "full" or "partition"
+            lo = get_path(partition_docs[0], field)
+            hi = get_path(partition_docs[-1], field)
+        out.extend(_densify_partition(field, partition_docs, lo, hi, step, partition_carry))
+    return out
+
+
+def _densify_fill_range(
+    field: str, lo: Any, hi: Any, step: float, carry: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    cursor = lo
+    while cursor < hi:
+        filler = dict(carry)
+        filler[field] = _densify_canon(cursor)
+        out.append(filler)
+        cursor = cursor + step
+    return out
+
+
+def _densify_partition(
+    field: str,
+    partition_docs: list[dict[str, Any]],
+    lo: Any,
+    hi: Any,
+    step: float,
+    carry: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Emit fillers + originals for one partition, sorted by ``field``."""
+    existing_values = {get_path(d, field) for d in partition_docs}
+    out: list[dict[str, Any]] = []
+    cursor = lo
+    iter_docs = iter(partition_docs)
+    next_doc: dict[str, Any] | None = next(iter_docs, None)
+    while cursor < hi:
+        next_val = get_path(next_doc, field) if next_doc is not None else None
+        if next_doc is not None and next_val == cursor:
+            out.append(copy.deepcopy(next_doc))
+            next_doc = next(iter_docs, None)
+        elif cursor not in existing_values:
+            filler = dict(carry)
+            filler[field] = _densify_canon(cursor)
+            out.append(filler)
+        cursor = cursor + step
+    # Append any docs at or beyond hi (originals must always appear).
+    while next_doc is not None:
+        out.append(copy.deepcopy(next_doc))
+        next_doc = next(iter_docs, None)
+    return out
+
+
+def _densify_canon(value: Any) -> Any:
+    """Normalise the cursor value so int+int step yields int rather than float."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
 def _stage_unwind(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -853,6 +966,7 @@ _STAGES = {
     "$set": _stage_add_fields,
     "$unset": _stage_unset,
     "$unwind": _stage_unwind,
+    "$densify": _stage_densify,
     "$replaceRoot": _stage_replace_root,
     "$replaceWith": _stage_replace_with,
     "$group": _stage_group,

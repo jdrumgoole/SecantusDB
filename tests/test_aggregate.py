@@ -454,3 +454,102 @@ def test_lookup_pipeline_form_simple_prefilter_hash_join() -> None:
     matched_v = sorted(fd["v"] for fd in out[0]["j"])
     # user_id=3 → v ∈ {3, 8, 13, 18}. After $gt: 5 → {8, 13, 18}.
     assert matched_v == [8, 13, 18]
+
+
+# ----------------------------------------------------------------------
+# $densify (numeric): fills gaps between consecutive values in the input
+# with filler docs that have only the densify field set.
+
+
+def test_densify_full_bounds_fills_inner_gaps() -> None:
+    docs = [{"_id": 1, "n": 1}, {"_id": 2, "n": 4}, {"_id": 3, "n": 7}]
+    out = apply_pipeline(
+        docs,
+        [{"$densify": {"field": "n", "range": {"bounds": "full", "step": 1}}}],
+    )
+    assert [d["n"] for d in out] == [1, 2, 3, 4, 5, 6, 7]
+    # Original docs keep all fields; fillers have only n.
+    [filler] = [d for d in out if d["n"] == 2]
+    assert filler == {"n": 2}
+
+
+def test_densify_explicit_bounds_extends_below_and_above() -> None:
+    docs = [{"_id": 1, "n": 5}]
+    out = apply_pipeline(
+        docs,
+        [{"$densify": {"field": "n", "range": {"bounds": [3, 9], "step": 2}}}],
+    )
+    # Fillers at 3 (below), 7 (above), bounded by [3, 9) — 9 itself excluded.
+    assert [d["n"] for d in out] == [3, 5, 7]
+
+
+def test_densify_step_emits_at_multiples_of_step_strictly_between() -> None:
+    docs = [{"_id": 1, "n": 0}, {"_id": 2, "n": 5}]
+    out = apply_pipeline(
+        docs,
+        [{"$densify": {"field": "n", "range": {"bounds": "full", "step": 2}}}],
+    )
+    # Fillers at 2, 4 between 0 and 5.
+    assert [d["n"] for d in out] == [0, 2, 4, 5]
+
+
+def test_densify_no_input_with_explicit_bounds_emits_full_range() -> None:
+    out = apply_pipeline(
+        [],
+        [{"$densify": {"field": "n", "range": {"bounds": [0, 5], "step": 1}}}],
+    )
+    assert [d["n"] for d in out] == [0, 1, 2, 3, 4]
+
+
+def test_densify_no_input_with_full_bounds_returns_empty() -> None:
+    """`bounds: 'full'` needs at least one existing doc to derive min/max."""
+    out = apply_pipeline(
+        [],
+        [{"$densify": {"field": "n", "range": {"bounds": "full", "step": 1}}}],
+    )
+    assert out == []
+
+
+def test_densify_partitions_independently() -> None:
+    docs = [
+        {"_id": 1, "g": "a", "n": 1},
+        {"_id": 2, "g": "a", "n": 3},
+        {"_id": 3, "g": "b", "n": 10},
+        {"_id": 4, "g": "b", "n": 12},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "n",
+                    "partitionByFields": ["g"],
+                    "range": {"bounds": "full", "step": 1},
+                }
+            }
+        ],
+    )
+    by_partition: dict[str, list[int]] = {"a": [], "b": []}
+    for d in out:
+        by_partition[d["g"]].append(d["n"])
+    assert by_partition == {"a": [1, 2, 3], "b": [10, 11, 12]}
+    # Filler in partition 'a' carries the partition key.
+    [filler_a] = [d for d in out if d["g"] == "a" and d["n"] == 2]
+    assert filler_a == {"g": "a", "n": 2}
+
+
+def test_densify_existing_values_inside_bounds_kept_not_duplicated() -> None:
+    docs = [{"_id": 1, "n": 2}, {"_id": 2, "n": 4}]
+    out = apply_pipeline(
+        docs,
+        [{"$densify": {"field": "n", "range": {"bounds": [0, 6], "step": 2}}}],
+    )
+    assert [d["n"] for d in out] == [0, 2, 4]
+
+
+def test_densify_invalid_step_raises() -> None:
+    with pytest.raises(AggregateError):
+        apply_pipeline(
+            [{"n": 1}],
+            [{"$densify": {"field": "n", "range": {"bounds": "full", "step": 0}}}],
+        )

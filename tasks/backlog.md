@@ -33,7 +33,7 @@ These work end-to-end but cut corners.
 Specific items that were left out of the slice that introduced their feature area.
 
 - [ ] **More aggregation expressions**: `$mergeAll`, `$function` (JS — also out of scope).
-- [ ] **More aggregation stages**: `$densify`, `$fill`.
+- [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for numeric ranges (`bounds: "full"` / `[min, max]`, `partitionByFields`); date densify (`unit: "day" | "hour" | ...`) is deferred — needs date-arithmetic step iteration that isn't a one-line addition.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
 - [ ] **WiredTiger binary wheels** — `pip install secantus` triggers a from-source build of `wiredtiger==11.3.1`. The README now lists the `cmake` / `ninja` / `swig` prerequisites for macOS and Linux, which unblocks most users. The full fix (binary wheels) is bigger than a single slice: either land a cibuildwheel pipeline upstream in `apache/wiredtiger` (or wherever the `wiredtiger` PyPI package is built from), or vendor WiredTiger's source into `secantus` and ship `secantus` itself as a per-platform binary wheel. Both need hands-on iteration against real CI runners on macOS x86_64/arm64, manylinux x86_64/arm64, and Windows x86_64.
 
