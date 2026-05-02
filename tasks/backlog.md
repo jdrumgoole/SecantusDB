@@ -28,7 +28,7 @@ These work end-to-end but cut corners.
 - [ ] **`$dateFromString`** — uses Python's `strptime` codes (or `fromisoformat` if no format). No full MongoDB format spec, no `timezone` argument, no `%G`/`%V` ISO-week support.
 - [ ] **`$dateToString`** — Python `strftime` + `%L` for millisecond extension. No `timezone` argument.
 - [ ] **`renameCollection`** — atomic per the storage `RLock`, but no protection against concurrent writers across worktrees. Tests are single-process so this is fine.
-- [ ] **`createIndexes` options that are accepted but not enforced**: `expireAfterSeconds` (no TTL), `partialFilterExpression` (full collection participates), `collation` (Python compares with default locale).
+- [ ] **`createIndexes` options that are accepted but not enforced**: `expireAfterSeconds` (no TTL), `collation` (Python compares with default locale).
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
