@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bson
 import pytest
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -40,6 +41,22 @@ def test_server_info_returns_version(client: MongoClient) -> None:
     assert info.get("ok") == 1.0
     assert "version" in info
     assert isinstance(info["version"], str)
+
+
+def test_hello_emits_int64_for_topology_counter_and_connection_id(
+    client: MongoClient,
+) -> None:
+    """Regression for the mongo-go-driver compatibility break.
+
+    The official Go driver (mongodump/mongorestore + everything else built
+    on mongo-go-driver) hard-fails the handshake with "expected 'counter'
+    to be an int64 but it's a BSON 32-bit integer" when these fields are
+    encoded as int32. pymongo is permissive here so the bug only surfaces
+    against Go clients. Decode the raw BSON and assert the type tags.
+    """
+    raw = client.admin.command("hello", codec_options=bson.CodecOptions(document_class=dict))
+    assert isinstance(raw["topologyVersion"]["counter"], bson.Int64)
+    assert isinstance(raw["connectionId"], bson.Int64)
 
 
 def test_unknown_command_does_not_crash_connection(client: MongoClient) -> None:

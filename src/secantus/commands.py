@@ -50,19 +50,23 @@ CommandHandler = Callable[[dict[str, Any], CommandContext], dict[str, Any]]
 
 
 def _hello(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # `topologyVersion.counter` and `connectionId` MUST be int64 on the wire.
+    # pymongo accepts either, but the official Go driver (mongodump/restore,
+    # mongo-go-driver) refuses the handshake with "expected 'counter' to be
+    # an int64 but it's a BSON 32-bit integer" when these are int32.
     response: dict[str, Any] = {
         "isWritablePrimary": True,
         "ismaster": True,
         "topologyVersion": {
             "processId": bson.ObjectId.from_datetime(_dt.datetime.now(_dt.UTC)),
-            "counter": 0,
+            "counter": bson.Int64(0),
         },
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
         "maxMessageSizeBytes": MAX_MESSAGE_SIZE,
         "maxWriteBatchSize": 100_000,
         "localTime": _dt.datetime.now(_dt.UTC),
         "logicalSessionTimeoutMinutes": 30,
-        "connectionId": ctx.connection_id,
+        "connectionId": bson.Int64(ctx.connection_id),
         "minWireVersion": 0,
         "maxWireVersion": WIRE_VERSION,
         "readOnly": False,
@@ -354,7 +358,8 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
         )
     return {
-        "cursor": {"firstBatch": first_batch, "id": cursor_id, "ns": ns},
+        # Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
+        "cursor": {"firstBatch": first_batch, "id": bson.Int64(cursor_id), "ns": ns},
         "ok": 1.0,
     }
 
@@ -636,7 +641,7 @@ def _list_collections(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
     return {
         "cursor": {
             "firstBatch": batch,
-            "id": 0,
+            "id": bson.Int64(0),
             "ns": f"{ctx.db_name}.$cmd.listCollections",
         },
         "ok": 1.0,
@@ -665,7 +670,7 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {
         "cursor": {
             "firstBatch": indexes,
-            "id": 0,
+            "id": bson.Int64(0),
             "ns": f"{ctx.db_name}.$cmd.listIndexes.{coll}",
         },
         "ok": 1.0,
@@ -797,7 +802,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return {
             "cursor": {
                 "nextBatch": batch,
-                "id": 0 if exhausted else cursor_id,
+                "id": bson.Int64(0 if exhausted else cursor_id),
                 "ns": ns,
             },
             "ok": 1.0,
@@ -806,7 +811,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if entry.invalidated and not entry.final_event_pending and not entry.remaining:
         ctx.cursors.kill([cursor_id])
         return {
-            "cursor": {"nextBatch": [], "id": 0, "ns": ns},
+            "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
             "ok": 1.0,
         }
     # Drain any already-buffered events first.
@@ -838,7 +843,8 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {
         "cursor": {
             "nextBatch": batch,
-            "id": cursor_id if cursor_alive else 0,
+            # Cursor `id` MUST be int64 — Go driver hard-fails int32.
+            "id": bson.Int64(cursor_id if cursor_alive else 0),
             "ns": ns,
         },
         "ok": 1.0,
@@ -898,7 +904,8 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # Silence unused import in this branch.
     _ = changestreams
     return {
-        "cursor": {"firstBatch": first_batch, "id": cursor_id, "ns": ns},
+        # Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
+        "cursor": {"firstBatch": first_batch, "id": bson.Int64(cursor_id), "ns": ns},
         "ok": 1.0,
     }
 
@@ -1049,7 +1056,7 @@ def _aggregate_change_stream(
     entry_ref["entry"] = ctx.cursors.get(cursor_id)
     _ = batch_size  # firstBatch is empty by design for change streams
     return {
-        "cursor": {"firstBatch": [], "id": cursor_id, "ns": ns},
+        "cursor": {"firstBatch": [], "id": bson.Int64(cursor_id), "ns": ns},
         "operationTime": ctx.storage.current_cluster_time(),
         "ok": 1.0,
     }
