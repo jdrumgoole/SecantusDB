@@ -53,10 +53,12 @@ git commit -am "Bump pymongo validation target -> vX.Y.Z"
    under `vendor/pymongo-tests/test/`.
 
 Tests gated on topology that SecantusDB doesn't aim to support
-(replica set, sharding, change streams, transactions w/ rollback,
+(real multi-node replica sets, sharding, transactions w/ rollback,
 encryption, auth, TLS, sessions w/ correlation, retryable writes /
 reads) self-skip via pymongo's own decorators — those skips are honest
-gaps, not failures.
+gaps, not failures. Change streams ARE in scope via the single-node
+oplog implementation; `hello` advertises a fictional `setName:
+"secantus"` so pymongo's topology check accepts `watch()`.
 
 ## Files
 

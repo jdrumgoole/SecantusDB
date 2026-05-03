@@ -2,11 +2,13 @@
 
 The list is intentionally conservative — anything that requires a
 topology, behaviour, or feature SecantusDB doesn't aim to support
-(replica sets, sharding, change streams, transactions w/ rollback,
+(real multi-node replica sets, sharding, transactions w/ rollback,
 GridFS, encryption, auth, TLS, retryable writes / reads, server
 selection algorithms, sessions w/ correlation, async, performance,
 mockup-driven tests, search indexes, time series, clustered indexes)
-is excluded.
+is excluded. Change streams ARE in scope (single-node, oplog-backed
+implementation; pymongo accepts them because ``hello`` advertises a
+fictional single-node replica-set primary).
 
 The result of running pytest against just this list is the
 "MongoDB compatibility" gauge published in docs/validation-report.md.
@@ -59,9 +61,13 @@ INCLUDE: list[str] = [
     # Common helpers + errors.
     "vendor/pymongo-tests/test/test_common.py",
     "vendor/pymongo-tests/test/test_errors.py",
+    # Change streams. test_change_stream.py also loads the JSON unified
+    # specs from change_streams/unified/ via its own runner. Tests that
+    # require multi-node oplog semantics (e.g. mongos cluster-wide
+    # change streams) self-skip via pymongo's topology decorators.
+    "vendor/pymongo-tests/test/test_change_stream.py",
     # Explicitly EXCLUDED (out of scope per CLAUDE.md):
     #   test_index_management.py     — Atlas search indexes, integration only
-    #   test_change_stream.py        — change streams (oplog)
     #   test_transactions*           — real transaction rollback
     #   test_session*                — session correlation
     #   test_retryable_*             — retryable writes/reads (replica set)
