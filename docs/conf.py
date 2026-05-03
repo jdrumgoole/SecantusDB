@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 project = "SecantusDB"
 author = "Joe Drumgoole"
 copyright = "2026, Joe Drumgoole"
-release = "0.2.0a17"
+release = "0.2.0a18"
 
 extensions = [
     "myst_parser",

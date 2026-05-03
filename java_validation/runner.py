@@ -150,8 +150,27 @@ def main() -> int:
         # Gradle returns non-zero on any test failure but still writes the
         # JUnit XML; capture stderr to surface real build errors but don't
         # fail the whole step.
-        proc = subprocess.run(cmd, cwd=VENDOR, env=env)
-        gradle_rc = proc.returncode
+        #
+        # Hard wall-clock timeout (env-tunable, default 30 min). A Spock
+        # spec that opens an awaitData change-stream cursor and never sees
+        # an event can hang the test JVM indefinitely; without this cap the
+        # whole run dies silently and no JUnit XML is written. With the
+        # cap, gradle gets SIGTERM, finalises the per-class XML it has,
+        # and the report harvests partial results — telling us *which*
+        # test class hung instead of just "the suite hung somewhere".
+        timeout_s = int(os.environ.get("VALIDATE_JAVA_TIMEOUT_S", "1800"))
+        try:
+            proc = subprocess.run(cmd, cwd=VENDOR, env=env, timeout=timeout_s)
+            gradle_rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            print(
+                f"java_validation: gradle exceeded {timeout_s}s wall clock; "
+                "killing and harvesting partial JUnit XML. Look in the report "
+                "for the test class that ran last — most likely the one that "
+                "hung. Override with VALIDATE_JAVA_TIMEOUT_S=<seconds>.",
+                file=sys.stderr,
+            )
+            gradle_rc = 124  # conventional timeout exit code
 
         # Copy JUnit XML out of the source tree to keep our parser simple
         # and avoid touching the submodule.
