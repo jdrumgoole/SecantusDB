@@ -44,9 +44,30 @@ with SecantusDBServer(port=27017) as server:
     assert db["users"].find_one({"_id": 1})["name"] == "Joe"
 ```
 
+## Storage engine
+
+SecantusDB uses **the same WiredTiger C library mongod ships** —
+vendored at `vendor/wiredtiger/` (mongodb-7.0.33), built from source
+into the wheel, called via WT's official Python SWIG bindings. There
+is no Python re-implementation of the storage engine: B-trees, page
+eviction, write-ahead logging, durability, on-disk format are all
+pure WiredTiger. Your data lives on the same battle-tested engine
+mongod uses.
+
+That doesn't make SecantusDB *as fast* as mongod — the layers above
+storage (command dispatch, query planner, aggregation pipeline) are
+Python, and a like-for-like benchmark currently has SecantusDB
+~8×–46× slower per operation than mongod. CRUD reads sit near the
+lower end of that; bulk update / delete and aggregation sit at the
+upper end where Python loop overhead dominates. See
+[`docs/benchmark.md`](docs/benchmark.md) for current numbers and
+methodology. The right use is tests, dev, embedded apps, and
+single-node prototypes where conformance + WT durability matter
+more than per-op latency.
+
 ## What's in scope
 
-Everything a single-node application or test needs from the wire — the
+Everything a single-node application needs from the wire — the
 handshake (`hello` / `isMaster` / `ping` / `buildInfo` / ...), CRUD
 (`insert` / `find` / `update` / `delete` / `findAndModify` / `count` /
 `drop`), cursors with `getMore` / `killCursors`, aggregation pipelines
@@ -139,9 +160,9 @@ see [pymongo validation report](docs/validation-report.md) and
 
 ## Examples
 
-A walk through the operations a typical test exercises — connect, insert,
-index, query, drop. Full version with explanations: [examples in the
-docs](https://secantusdb.readthedocs.io/en/latest/examples.html).
+A walk through the operations a typical application exercises — connect,
+insert, index, query, drop. Full version with explanations: [examples in
+the docs](https://secantusdb.readthedocs.io/en/latest/examples.html).
 
 ```python
 from pymongo import MongoClient
@@ -206,7 +227,7 @@ and open `docs/_build/html/index.html`. Highlights:
 - [Aggregation](docs/aggregation.md) — supported pipeline stages and
   expression operators.
 - [Compatibility](docs/compatibility.md) — the divergences you should know
-  about before you trust SecantusDB for a given test.
+  about before you point an application at SecantusDB.
 - [pymongo validation report](docs/validation-report.md) — per-category
   pass / fail / skip rate from running **pymongo's own test suite,
   unmodified**, against SecantusDB. The submodule at
@@ -254,6 +275,6 @@ uv run python -m invoke docs   # build Sphinx docs (warnings as errors)
 
 ## License
 
-GPL-2.0-only. See [`LICENSE`](LICENSE). SecantusDB intends to bundle the
+GPL-2.0-only. See [`LICENSE`](LICENSE). SecantusDB bundles the
 [WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine
 (itself GPL-2/GPL-3), so the combined work is GPL.

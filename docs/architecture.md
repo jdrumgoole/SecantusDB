@@ -103,8 +103,16 @@ bracketing markers.
 
 ### `src/secantus/storage.py` — `Storage`
 
-WiredTiger-backed store (the same engine MongoDB itself uses). Four
-tables in one WT connection:
+Backed by **the same WiredTiger C library mongod ships** — vendored at
+`vendor/wiredtiger/` (mongodb-7.0.33), built from source as part of the
+wheel via scikit-build-core, and called via WT's official Python SWIG
+bindings. There is no Python re-implementation of the storage engine:
+B-tree pages, page eviction, checkpoint cadence, write-ahead logging,
+durability, and the on-disk format are all pure WiredTiger. That's the
+durability story — your data lives on the same battle-tested engine
+mongod uses.
+
+The four tables we keep in one WT connection:
 
 | Table | Key format | Value | Purpose |
 | --- | --- | --- | --- |
@@ -134,7 +142,8 @@ WT's MVCC at the storage layer.
 
 - **Server:** one daemon thread per accepted connection.
 - **Storage:** all public methods acquire a global `RLock`; thread-safe
-  by serialization, not by fine-grained locking. Fine for test workloads.
+  by serialization, not by fine-grained locking. Fine for single-node
+  workloads — write throughput is bounded by one writer at a time.
 - **Cursors:** internal `Lock`, separate from storage.
 - **Tests:** must run with `port=0` and `:memory:` storage. Multiple
   `SecantusDBServer` instances coexist freely.
@@ -151,3 +160,33 @@ types, etc.) would break that for `ObjectId` / `Decimal128` /
 
 Secondary indexes are typed **sort-key columns** derived from BSON
 values via `sortkey.encode_value` — not JSON, not coerced numerics.
+
+## Performance
+
+Storage is fast (it's WiredTiger). The layers above storage are pure
+Python. That trade-off shapes the performance profile.
+
+A like-for-like benchmark — both servers running the same WT engine
+on the same machine, driven by the same `pymongo` client over a TCP
+socket — currently shows SecantusDB **8×–46× slower than mongod** per
+operation. CRUD reads (`find` with an indexed equality / range) sit
+near the lower end of that range; aggregation and bulk write
+operations (`update_many`, `delete_many`) sit at the upper end where
+Python-loop overhead dominates over the WT page reads / writes.
+
+See [`docs/benchmark.md`](benchmark.md) for the current numbers and
+the methodology to reproduce.
+
+What this means for use:
+
+- **Tests and dev**: SecantusDB is the right choice. Per-op latency
+  is in the hundreds of milliseconds for thousands of docs, which is
+  fine when the alternative is a `mongod` install in your CI image.
+- **Embedded single-node apps with modest throughput**: also a good
+  fit. WT durability + on-disk format mean your data survives restart
+  exactly the way it would under mongod.
+- **High-throughput production replacement for mongod**: not yet, and
+  honestly not the design goal. Hot-path Cython / native-code work in
+  the command dispatcher and query planner is the obvious lever if
+  the project ever decides to chase parity, but the current focus is
+  conformance, not throughput.

@@ -22,9 +22,10 @@ the application only needs single-node behaviour.
 
 There are two ways to use it:
 
-- **Embedded** — `with SecantusDBServer(...) as server:` inside your test
-  or app process. No subprocess, no port collision (use `port=0`), no
-  separate daemon to manage. Ideal for tests under `pytest-xdist`.
+- **Embedded** — `with SecantusDBServer(...) as server:` inside your
+  application or test process. No subprocess, no port collision (use
+  `port=0`), no separate daemon to manage. Also ideal for tests under
+  `pytest-xdist`.
 - **Standalone daemon** — `pip install` puts a `secantusdb` script on
   `PATH` that runs the server like a `mongod`. Drop-in replacement for a
   single-node `mongod` in dev / CI / small production-shaped workloads
@@ -83,7 +84,7 @@ pass-rates per feature category.
 
 ## What's in scope
 
-Everything a single-node application or test driver needs from the wire:
+Everything a single-node application needs from the wire:
 
 - Connection handshake (`hello` / `isMaster` / `ping` / `buildInfo` / ...).
 - CRUD: `insert`, `find`, `update`, `delete`, `findAndModify`, `count`, `drop`.
@@ -109,8 +110,8 @@ not supported.
 ## What's out of scope
 
 Anything that depends on **real** cluster topology — multi-node replica
-sets, sharding, election, cross-node oplog — and anything tangential to
-test-harness use:
+sets, sharding, election, cross-node oplog — and the infrastructure
+features tangential to single-node operation:
 
 - Authentication mechanisms beyond SCRAM-SHA-256 (x509, LDAP, Kerberos,
   GSSAPI, MONGODB-AWS, MONGODB-OIDC). SCRAM-SHA-256 itself **is**
@@ -124,15 +125,17 @@ test-harness use:
 - Real transaction rollback (we accept `commitTransaction` /
   `abortTransaction` but operations take effect immediately).
 
-If a test depends on those features, it needs a real `mongod`. SecantusDB
-is the right tool when the test is exercising your application's MongoDB
-usage, not the database's clustering or auth.
+If your application or test depends on those features, run a real
+`mongod`. SecantusDB is the right tool when you need a single-node
+MongoDB server — embedded in a process, run as a daemon for dev / CI, or
+shared across multiple language runtimes — without standing up the
+clustering and infrastructure that `mongod` brings.
 
 ## Quick links
 
 - [Installation](installation.md) — `pip install` and the WiredTiger build
   prerequisites.
-- [Quickstart](quickstart.md) — embedding in tests, running standalone.
+- [Quickstart](quickstart.md) — embedded in your app, run as a daemon, or wired into tests.
 - [Examples](examples.md) — connect, insert, index, query, drop.
 - [Architecture](architecture.md) — wire / commands / query / aggregate /
   storage layers.
@@ -149,7 +152,7 @@ usage, not the database's clustering or auth.
 
 ## License
 
-GPL-2.0-only. SecantusDB depends on (and intends to bundle) the
+GPL-2.0-only. SecantusDB bundles the
 [WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine,
 which is itself GPL-2/GPL-3, so the combined work is GPL.
 
@@ -167,6 +170,7 @@ aggregation
 change-streams
 authentication
 compatibility
+benchmark
 validation-report
 validation-report-go
 validation-report-node
