@@ -49,6 +49,9 @@ The subset of MongoDB that `pymongo` actually drives:
 - Indexes — single-field, compound, mixed-direction, partial, TTL — with a
   real query planner that chooses the right index and reports it through
   `explain`.
+- Change streams — single-node, oplog-backed; collection / db / cluster
+  scope; resume tokens; `fullDocument: "updateLookup"`; pre-images via
+  `fullDocumentBeforeChange`; blocking `awaitData` getMore.
 
 See [Indexes](indexes.md) and [Aggregation](aggregation.md) for the full
 inventory, and [Compatibility](compatibility.md) for what's intentionally
@@ -56,8 +59,9 @@ not supported.
 
 ## What's out of scope
 
-Anything that depends on cluster topology — replica sets, sharding, change
-streams, oplog tailing — and anything tangential to test-harness use:
+Anything that depends on **real** cluster topology — multi-node replica
+sets, sharding, election, cross-node oplog — and anything tangential to
+test-harness use:
 
 - Authentication (SCRAM / x509 / LDAP / Kerberos).
 - TLS / SSL.
@@ -82,6 +86,8 @@ usage, not the database's clustering or auth.
   TTL, hint, sort acceleration, `explain`.
 - [Aggregation](aggregation.md) — supported pipeline stages and expression
   operators.
+- [Change streams](change-streams.md) — `watch()` against SecantusDB,
+  resume tokens, pre-images, retention.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
 - [API reference](api.md) — `SecantusDBServer`, `Storage`, public surface.
 
@@ -102,6 +108,7 @@ examples
 architecture
 indexes
 aggregation
+change-streams
 compatibility
 api
 ```

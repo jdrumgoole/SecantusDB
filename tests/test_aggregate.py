@@ -553,3 +553,18 @@ def test_densify_invalid_step_raises() -> None:
             [{"n": 1}],
             [{"$densify": {"field": "n", "range": {"bounds": "full", "step": 0}}}],
         )
+
+
+def test_change_stream_stage_stashes_spec_and_returns_empty() -> None:
+    """`$changeStream` is a source stage: ignores input, stashes spec on ctx."""
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    ctx = PipelineContext()
+    out = apply_pipeline(
+        [{"x": 1}],  # would-be input docs are ignored
+        [{"$changeStream": {"fullDocument": "updateLookup"}}],
+        ctx,
+    )
+    assert out == []
+    assert ctx.change_stream is not None
+    assert ctx.change_stream.full_document_mode == "updateLookup"
