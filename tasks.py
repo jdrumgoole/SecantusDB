@@ -43,10 +43,15 @@ def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
 
 @task
 def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
+    # --no-sync skips uv's project rebuild check: docs only need the Python
+    # source for autodoc, never a fresh WiredTiger C-extension build. Falling
+    # through to `uv sync` here would invoke scikit-build-core's isolated
+    # build env, which is sensitive to host cmake/swig setup and unnecessary
+    # for a docs build.
     if clean:
         c.run("rm -rf docs/_build", pty=True)
     c.run(
-        f"uv run sphinx-build -W --keep-going -b {builder} docs docs/_build/{builder}",
+        f"uv run --no-sync sphinx-build -W --keep-going -b {builder} docs docs/_build/{builder}",
         pty=True,
     )
 
@@ -55,7 +60,7 @@ def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
 def docs_serve(c: Context, port: int = 8000) -> None:
     docs(c)
     c.run(
-        f"uv run python -m http.server {port} --directory docs/_build/html",
+        f"uv run --no-sync python -m http.server {port} --directory docs/_build/html",
         pty=True,
     )
 
