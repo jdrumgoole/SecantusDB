@@ -1,5 +1,9 @@
 [project]
-name = "secantus"
+# PyPI project name. The Python *import* name stays `secantus` (the package
+# at src/secantus/) — pip-the-PyPI-name vs import-the-module-name is normal
+# Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
+# `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
+name = "SecantusDB"
 version = "0.1.0"
 description = "A surrogate single-node MongoDB server in Python for testing pymongo applications without running a real mongod."
 readme = "README.md"

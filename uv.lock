@@ -543,7 +543,7 @@ wheels = [
 ]
 
 [[package]]
-name = "secantus"
+name = "secantusdb"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

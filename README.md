@@ -47,7 +47,7 @@ rollback. If your test depends on those, run a real `mongod`.
 ## Installation
 
 ```bash
-pip install secantus
+pip install SecantusDB
 ```
 
 Pre-built wheels are published for CPython **3.12** and **3.13** on:
@@ -64,7 +64,7 @@ compile step, no system build tools required.
 
 ### Building from source (unsupported platforms only)
 
-If your platform isn't in the matrix above, `pip install secantus`
+If your platform isn't in the matrix above, `pip install SecantusDB`
 falls back to the sdist and compiles WiredTiger from source. That
 needs three native build tools on `PATH`:
 

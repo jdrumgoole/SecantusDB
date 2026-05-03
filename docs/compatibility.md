@@ -85,10 +85,6 @@ MongoDB's 10-minute cursor TTL). The clock is injectable via
 - Aggregation stages: `$fill` (planned), `$densify` with `unit:` for
   date ranges (planned; numeric `$densify` is implemented).
 - `mapReduce` — deprecated by MongoDB; not implemented.
-- WiredTiger binary wheels — `pip install secantus` triggers a
-  from-source build of `wiredtiger==11.3.1`. The README documents the
-  prerequisites; binary wheels are scaffolded on the `wt-vendoring`
-  branch.
 
 ## Out of scope
 
