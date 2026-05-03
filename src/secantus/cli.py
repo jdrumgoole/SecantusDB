@@ -41,9 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    server = SecantusDBServer(
-        host=args.host, port=args.port, storage_path=args.storage_path
-    )
+    server = SecantusDBServer(host=args.host, port=args.port, storage_path=args.storage_path)
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:
         server.stop()

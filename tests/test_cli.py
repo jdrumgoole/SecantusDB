@@ -25,10 +25,14 @@ def test_storage_path_overrides_default() -> None:
 def test_all_flags_together() -> None:
     args = build_parser().parse_args(
         [
-            "--host", "0.0.0.0",
-            "--port", "27018",
-            "--storage-path", "/tmp/secantus-data",
-            "--log-level", "DEBUG",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "27018",
+            "--storage-path",
+            "/tmp/secantus-data",
+            "--log-level",
+            "DEBUG",
         ]
     )
     assert args.host == "0.0.0.0"

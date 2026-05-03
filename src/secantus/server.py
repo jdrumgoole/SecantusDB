@@ -45,9 +45,12 @@ class SecantusDBServer:
         host: str = "127.0.0.1",
         port: int = 0,
         storage_path: str = "./secantus-data",
+        *,
+        replica_set_name: str | None = "secantus",
     ) -> None:
         self.host = host
         self.port = port
+        self.replica_set_name = replica_set_name
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -127,6 +130,10 @@ class SecantusDBServer:
                         return
 
                     op = message.op
+                    try:
+                        server_addr = self.address if self._socket is not None else None
+                    except RuntimeError:
+                        server_addr = None
                     if isinstance(op, OpMsg):
                         body = _merge_op_msg_body(op)
                         ctx = CommandContext(
@@ -134,6 +141,8 @@ class SecantusDBServer:
                             storage=self.storage,
                             cursors=self.cursors,
                             db_name=body.get("$db", "admin"),
+                            server_address=server_addr,
+                            replica_set_name=self.replica_set_name,
                         )
                         response_doc = dispatch(body, ctx)
                         reply = build_op_msg_reply(
@@ -147,6 +156,8 @@ class SecantusDBServer:
                             storage=self.storage,
                             cursors=self.cursors,
                             db_name=_db_from_namespace(op.full_collection_name),
+                            server_address=server_addr,
+                            replica_set_name=self.replica_set_name,
                         )
                         response_doc = dispatch(op.query, ctx)
                         reply = build_op_reply(

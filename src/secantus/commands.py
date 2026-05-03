@@ -26,6 +26,8 @@ class CommandContext:
     storage: Storage
     cursors: CursorRegistry
     db_name: str = "admin"
+    server_address: tuple[str, int] | None = None
+    replica_set_name: str | None = None
 
 
 def _split_into_cursor(
@@ -48,7 +50,7 @@ CommandHandler = Callable[[dict[str, Any], CommandContext], dict[str, Any]]
 
 
 def _hello(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    return {
+    response: dict[str, Any] = {
         "isWritablePrimary": True,
         "ismaster": True,
         "topologyVersion": {
@@ -66,6 +68,28 @@ def _hello(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "readOnly": False,
         "ok": 1.0,
     }
+    if ctx.replica_set_name and ctx.server_address is not None:
+        addr = f"{ctx.server_address[0]}:{ctx.server_address[1]}"
+        cluster_time = ctx.storage.current_cluster_time()
+        response.update(
+            {
+                "setName": ctx.replica_set_name,
+                "setVersion": 1,
+                "hosts": [addr],
+                "passives": [],
+                "arbiters": [],
+                "primary": addr,
+                "me": addr,
+                "electionId": bson.ObjectId("7fffffff0000000000000001"),
+                "lastWrite": {
+                    "opTime": {"ts": cluster_time, "t": 1},
+                    "lastWriteDate": _dt.datetime.now(_dt.UTC),
+                    "majorityOpTime": {"ts": cluster_time, "t": 1},
+                    "majorityWriteDate": _dt.datetime.now(_dt.UTC),
+                },
+            }
+        )
+    return response
 
 
 def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
@@ -579,6 +603,28 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
 def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["create"]
     ctx.storage.create_collection(ctx.db_name, coll)
+    pre_post = doc.get("changeStreamPreAndPostImages")
+    if isinstance(pre_post, Mapping):
+        ctx.storage.set_collection_options(
+            ctx.db_name, coll, changeStreamPreAndPostImages=dict(pre_post)
+        )
+    return {"ok": 1.0}
+
+
+def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    coll = doc["collMod"]
+    if not ctx.storage.collection_exists(ctx.db_name, coll):
+        return {
+            "ok": 0.0,
+            "errmsg": f"ns not found: {ctx.db_name}.{coll}",
+            "code": 26,
+            "codeName": "NamespaceNotFound",
+        }
+    pre_post = doc.get("changeStreamPreAndPostImages")
+    if isinstance(pre_post, Mapping):
+        ctx.storage.set_collection_options(
+            ctx.db_name, coll, changeStreamPreAndPostImages=dict(pre_post)
+        )
     return {"ok": 1.0}
 
 
@@ -726,10 +772,11 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_id = int(doc["getMore"])
     coll = doc.get("collection", "")
-    batch_size = int(doc.get("batchSize", 0) or 0)
+    batch_size = int(doc.get("batchSize", 0) or 0) or DEFAULT_BATCH_SIZE
+    max_time_ms = int(doc.get("maxTimeMS", 0) or 0)
     ns = _ns(ctx.db_name, coll)
     try:
-        batch, exhausted = ctx.cursors.next_batch(cursor_id, batch_size or DEFAULT_BATCH_SIZE)
+        entry = ctx.cursors.get(cursor_id)
     except CursorNotFound:
         return {
             "ok": 0.0,
@@ -737,10 +784,61 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 43,
             "codeName": "CursorNotFound",
         }
+    if not entry.tailable:
+        try:
+            batch, exhausted = ctx.cursors.next_batch(cursor_id, batch_size)
+        except CursorNotFound:
+            return {
+                "ok": 0.0,
+                "errmsg": f"cursor id {cursor_id} not found",
+                "code": 43,
+                "codeName": "CursorNotFound",
+            }
+        return {
+            "cursor": {
+                "nextBatch": batch,
+                "id": 0 if exhausted else cursor_id,
+                "ns": ns,
+            },
+            "ok": 1.0,
+        }
+    # Tailable path.
+    if entry.invalidated and not entry.final_event_pending and not entry.remaining:
+        ctx.cursors.kill([cursor_id])
+        return {
+            "cursor": {"nextBatch": [], "id": 0, "ns": ns},
+            "ok": 1.0,
+        }
+    # Drain any already-buffered events first.
+    if not entry.remaining and entry.producer is not None:
+        new_events = entry.producer()
+        if new_events:
+            entry.remaining.extend(new_events)
+    if not entry.remaining and entry.await_data and not entry.invalidated:
+        # PyMongo does not always pass maxTimeMS on getMore for change streams;
+        # real mongod treats that as "wait indefinitely". We bound the wait so
+        # the connection thread can be reaped on shutdown.
+        wait_seconds = max_time_ms / 1000.0 if max_time_ms > 0 else 1.0
+        captured_tail = ctx.storage.oplog_tail_seq()
+        with ctx.storage._oplog_cv:
+            ctx.storage._oplog_cv.wait_for(
+                lambda: ctx.storage.oplog_tail_seq() > captured_tail or entry.invalidated,
+                timeout=wait_seconds,
+            )
+        if entry.producer is not None and not entry.remaining:
+            new_events = entry.producer()
+            if new_events:
+                entry.remaining.extend(new_events)
+    batch = entry.remaining[:batch_size]
+    entry.remaining = entry.remaining[batch_size:]
+    if not entry.remaining and entry.invalidated and entry.final_event_pending:
+        # The invalidate event has now been delivered.
+        entry.final_event_pending = False
+    cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
     return {
         "cursor": {
             "nextBatch": batch,
-            "id": 0 if exhausted else cursor_id,
+            "id": cursor_id if cursor_alive else 0,
             "ns": ns,
         },
         "ok": 1.0,
@@ -748,6 +846,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus import changestreams
     from secantus.storage import BadHint
 
     coll = doc["aggregate"]
@@ -756,9 +855,15 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_opts = doc.get("cursor") or {}
     batch_size = int(cursor_opts.get("batchSize", 0) or 0)
     coll_name = ""
+
+    first_stage = pipeline[0] if pipeline else {}
+    is_change_stream = isinstance(first_stage, Mapping) and "$changeStream" in first_stage
+
+    if is_change_stream:
+        return _aggregate_change_stream(doc, ctx, coll, pipeline, batch_size)
+
     if isinstance(coll, str):
         coll_name = coll
-        first_stage = pipeline[0] if pipeline else {}
         if isinstance(first_stage, Mapping) and (
             "$collStats" in first_stage
             or "$indexStats" in first_stage
@@ -790,8 +895,162 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     first_batch, cursor_id = _split_into_cursor(
         docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
     )
+    # Silence unused import in this branch.
+    _ = changestreams
     return {
         "cursor": {"firstBatch": first_batch, "id": cursor_id, "ns": ns},
+        "ok": 1.0,
+    }
+
+
+def _aggregate_change_stream(
+    doc: dict[str, Any],
+    ctx: CommandContext,
+    coll: Any,
+    pipeline: list[dict[str, Any]],
+    batch_size: int,
+) -> dict[str, Any]:
+    from secantus import changestreams
+
+    storage = ctx.storage
+    spec = pipeline[0]["$changeStream"]
+    if not isinstance(spec, Mapping):
+        return {
+            "ok": 0.0,
+            "errmsg": "$changeStream spec must be a document",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    cs_spec = changestreams.parse_spec(spec)
+
+    # Determine scope.
+    if isinstance(coll, str):
+        scope = {"kind": "coll", "db": ctx.db_name, "coll": coll}
+        ns = _ns(ctx.db_name, coll)
+        coll_name = coll
+        coll_uuid = None
+        if storage.collection_exists(ctx.db_name, coll):
+            coll_uuid = storage.collection_uuid(ctx.db_name, coll)
+    else:
+        if ctx.db_name == "admin":
+            scope = {"kind": "cluster"}
+            ns = f"{ctx.db_name}.$cmd.aggregate"
+        else:
+            scope = {"kind": "db", "db": ctx.db_name}
+            ns = f"{ctx.db_name}.$cmd.aggregate"
+        coll_name = ""
+        coll_uuid = None
+
+    # Resolve start position.
+    floor = storage.oplog_floor_seq()
+    tail = storage.oplog_tail_seq()
+    if cs_spec.resume_after is not None or cs_spec.start_after is not None:
+        token = cs_spec.resume_after or cs_spec.start_after
+        try:
+            data = changestreams.parse_resume_token(token)
+        except (ValueError, KeyError) as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": f"invalid resume token: {exc}",
+                "code": 9,
+                "codeName": "FailedToParse",
+            }
+        history_lost = False
+        if floor > 0 and data.seq < floor:
+            history_lost = True
+        # Empty oplog after pruning: any token referencing a past-emitted seq
+        # is unresumable.
+        if floor == 0 and tail > 0 and data.seq <= tail:
+            history_lost = True
+        if history_lost:
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "Resume of change stream was not possible, as the resume "
+                    "point may no longer be in the oplog."
+                ),
+                "code": changestreams.ChangeStreamHistoryLost.code,
+                "codeName": changestreams.ChangeStreamHistoryLost.codeName,
+            }
+        start_seq = data.seq + 1
+    elif cs_spec.start_at_operation_time is not None:
+        start_seq = storage.find_seq_for_ts(cs_spec.start_at_operation_time)
+    else:
+        start_seq = storage.oplog_tail_seq() + 1
+
+    # Build the namespace filter once for cheap reuse.
+    def _ns_filter(entry_ns: str) -> bool:
+        kind = scope.get("kind")
+        if kind == "cluster":
+            return True
+        if kind == "db":
+            db_target = scope.get("db")
+            return entry_ns.startswith(f"{db_target}.")
+        if kind == "coll":
+            db_target = scope.get("db")
+            coll_target = scope.get("coll")
+            return entry_ns == f"{db_target}.{coll_target}" or entry_ns == f"{db_target}.$cmd"
+        return False
+
+    pipeline_after_cs = list(pipeline[1:])
+    pipeline_ctx = PipelineContext(
+        storage=storage, db_name=ctx.db_name, coll_name=coll_name, change_stream=cs_spec
+    )
+
+    # Bind the entry by reference; producer closes over it.
+    entry_ref: dict[str, Any] = {"entry": None}
+
+    def producer() -> list[dict[str, Any]]:
+        entry = entry_ref["entry"]
+        if entry is None:
+            return []
+        rows = storage.read_oplog(start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter)
+        if not rows:
+            return []
+        events: list[dict[str, Any]] = []
+        last_seen = entry.position_seq
+        for seq, oplog_entry in rows:
+            try:
+                ev, invalidates = changestreams.project(
+                    seq,
+                    oplog_entry,
+                    storage=storage,
+                    full_document_mode=cs_spec.full_document_mode,
+                    full_document_before_change_mode=cs_spec.full_document_before_change_mode,
+                    scope=scope,
+                )
+            except changestreams.ChangeStreamFatalError as exc:
+                # Best effort: surface as an empty batch and let the next
+                # poll retry. A nicer surface would be a server-side error
+                # cursor; defer.
+                _ = exc
+                last_seen = seq
+                continue
+            if ev is not None:
+                events.append(ev)
+            last_seen = seq
+            if invalidates:
+                events.append(changestreams.invalidate_event(seq, oplog_entry))
+                entry.invalidated = True
+                entry.final_event_pending = True
+                break
+        entry.position_seq = last_seen
+        if pipeline_after_cs:
+            events = apply_pipeline(events, pipeline_after_cs, pipeline_ctx)
+        return events
+
+    cursor_id = ctx.cursors.register_tailable(
+        ns,
+        producer,
+        await_data=True,
+        position_seq=start_seq - 1,
+        collection_uuid=coll_uuid,
+    )
+    entry_ref["entry"] = ctx.cursors.get(cursor_id)
+    _ = batch_size  # firstBatch is empty by design for change streams
+    return {
+        "cursor": {"firstBatch": [], "id": cursor_id, "ns": ns},
+        "operationTime": ctx.storage.current_cluster_time(),
         "ok": 1.0,
     }
 
@@ -826,6 +1085,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "findandmodify": _find_and_modify,
     "drop": _drop,
     "create": _create,
+    "collMod": _coll_mod,
     "dropDatabase": _drop_database,
     "renameCollection": _rename_collection,
     "listCollections": _list_collections,

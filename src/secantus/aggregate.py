@@ -24,6 +24,7 @@ class PipelineContext:
     db_name: str = ""
     coll_name: str = ""
     vars: dict[str, Any] = _dc_field(default_factory=dict)
+    change_stream: Any = None  # changestreams.ChangeStreamSpec | None — set by $changeStream stage
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
@@ -31,6 +32,7 @@ class PipelineContext:
             db_name=self.db_name,
             coll_name=self.coll_name,
             vars={**self.vars, **more},
+            change_stream=self.change_stream,
         )
 
 
@@ -941,6 +943,24 @@ def _values_match(a: Any, b: Any) -> bool:
     return a == b
 
 
+def _stage_change_stream(
+    spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """Source-style stage: stashes the parsed spec on ``ctx`` and yields no docs.
+
+    The real work — reading the oplog, projecting events, blocking on
+    ``getMore`` — happens in a producer closure installed by the
+    ``aggregate`` command handler. Subsequent pipeline stages run on the
+    produced events, not on stored documents.
+    """
+    from secantus import changestreams
+
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$changeStream spec must be a document")
+    ctx.change_stream = changestreams.parse_spec(spec)
+    return []
+
+
 def _stage_documents(
     spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -982,4 +1002,5 @@ _STAGES = {
     "$merge": _stage_merge,
     "$graphLookup": _stage_graph_lookup,
     "$documents": _stage_documents,
+    "$changeStream": _stage_change_stream,
 }

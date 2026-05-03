@@ -36,11 +36,24 @@ Specific items that were left out of the slice that introduced their feature are
 - [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for numeric ranges (`bounds: "full"` / `[min, max]`, `partitionByFields`); date densify (`unit: "day" | "hour" | ...`) is deferred — needs date-arithmetic step iteration that isn't a one-line addition.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
 
+### Change-stream limitations
+
+Single-node change streams are implemented and conformant for typical pymongo `watch()` flows, but the following are deferred or intentionally diverge from real `mongod`:
+
+- [ ] **Multi-document transactions in change events** — `txnNumber` and `lsid` are never present on change events; SecantusDB has no real transaction state.
+- [ ] **`splitLargeChangeStreamEvents`** — not implemented. Events are emitted whole.
+- [ ] **`noop` heartbeat events** — real `mongod` writes periodic no-ops to advance cluster time even when no real ops happen; SecantusDB does not. Resume tokens advance only on real ops.
+- [ ] **DDL `createIndexes`/`dropIndexes` change events** — oplog has the entries but the projection drops them. Apps that watch for index lifecycle events won't see them.
+- [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
+- [ ] **`showExpandedEvents`** — accepted, ignored.
+- [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
+- [ ] **`updateDescription.truncatedArrays`** — emitted only when the post array is a strict head-prefix of the pre array. Other array reshapes produce a wholesale `updatedFields` entry rather than the in-place diff mongod would produce.
+
 ## 4. Out of scope (intentional, with reasoning)
 
 These are explicit non-goals. Don't add them without a reason.
 
-- **Replica sets / sharding / change streams** — depend on cluster topology or oplog. SecantusDB is single-process; not the target use.
+- **Real replica sets / sharding** — depend on cluster topology and cross-node consistency. SecantusDB advertises `setName: "secantus"` to satisfy pymongo's change-stream topology check, but the topology is fictional — there are no other members, no elections, no cross-node oplog. Change streams are still in scope (single-node, oplog-backed); see `## 3. Deferred work / Change-stream limitations`.
 - **Authentication** (SCRAM-SHA-256, x509, LDAP, Kerberos) — production auth is not the test-harness concern. `connectionStatus` returns an empty `authInfo` so clients that probe see "no auth required."
 - **TLS / SSL** — same reason.
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told the server doesn't support compression; nothing to do.
@@ -49,7 +62,7 @@ These are explicit non-goals. Don't add them without a reason.
 - **`$where`** — runs JavaScript. We don't ship a JS runtime.
 - **Capped collections** — fixed-size, FIFO collections. Implementable later if needed.
 - **Profiling** (`setProfilingLevel`, `system.profile` collection) — real `mongod` self-profiles; we don't.
-- **Tailable / awaitData cursors** — depend on oplog or capped collections.
+- ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`). Outside change streams (e.g. capped-collection tailables) still depend on capped-collection support, which remains out of scope.
 
 ## 5. Known bugs and edge cases to watch
 

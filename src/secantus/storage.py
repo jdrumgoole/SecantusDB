@@ -23,14 +23,18 @@ import os
 import shutil
 import tempfile
 import threading
-from collections.abc import Iterable, Mapping
+import time as _time
+import uuid as _uuid
+from collections.abc import Callable, Iterable, Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
 import wiredtiger as wt
 from bson import Decimal128
+from bson.timestamp import Timestamp
 
+from secantus.diff import compute_update_description
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
@@ -41,6 +45,11 @@ _COLL_TABLE = "table:secantus_collections"
 _DOC_TABLE = "table:secantus_documents"
 _IDX_TABLE = "table:secantus_indexes"
 _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
+_OPLOG_TABLE = "table:secantus_oplog"
+_PREIMAGE_TABLE = "table:secantus_preimages"
+_OPLOG_META_TABLE = "table:secantus_oplog_meta"
+
+_OPLOG_PRUNE_INTERVAL = 1000  # call prune_oplog every N emits
 
 _ENTRY_SEP = b"\x00\x00"
 
@@ -222,7 +231,14 @@ class BadHint(Exception):
 
 
 class Storage:
-    def __init__(self, path: str = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str = ":memory:",
+        *,
+        oplog_retention_seconds: float = 3600.0,
+        oplog_max_entries: int = 100_000,
+        time_func: Callable[[], float] | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._closed = False
         self._tempdir: str | None = None
@@ -243,8 +259,369 @@ class Storage:
             boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
+            boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
+            boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
+            boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
         finally:
             boot.close()
+
+        # Oplog state — durable across restart via _OPLOG_META_TABLE.
+        self.oplog_retention_seconds = float(oplog_retention_seconds)
+        self.oplog_max_entries = int(oplog_max_entries)
+        self._time = time_func or _time.time
+        self._oplog_cv = threading.Condition(threading.Lock())
+        self._oplog_emit_count = 0
+        with self._lock:
+            self._next_seq, self._last_ts_secs, self._last_ts_ord = self._load_oplog_meta()
+
+    def _load_oplog_meta(self) -> tuple[int, int, int]:
+        c = self._cursor(_OPLOG_META_TABLE)
+        c.set_key("state")
+        if c.search() == 0:
+            blob = bytes(c.get_value())
+            if blob:
+                state = bson.decode(blob)
+                return (
+                    int(state.get("next_seq", 1)),
+                    int(state.get("last_ts_secs", 0)),
+                    int(state.get("last_ts_ord", 0)),
+                )
+        # Fallback: scan oplog table for max key + reconstruct from entry.
+        c2 = self._cursor(_OPLOG_TABLE)
+        # Walk to last row.
+        last_seq = 0
+        last_secs = 0
+        last_ord = 0
+        rc = c2.next()
+        while rc == 0:
+            seq = int(c2.get_key())
+            if seq > last_seq:
+                last_seq = seq
+                blob = bytes(c2.get_value())
+                if blob:
+                    entry = bson.decode(blob)
+                    ts = entry.get("ts")
+                    if isinstance(ts, Timestamp):
+                        last_secs, last_ord = ts.time, ts.inc
+            rc = c2.next()
+        return last_seq + 1, last_secs, last_ord
+
+    def _persist_oplog_meta(self) -> None:
+        c = self._cursor(_OPLOG_META_TABLE)
+        c["state"] = bson.encode(
+            {
+                "next_seq": self._next_seq,
+                "last_ts_secs": self._last_ts_secs,
+                "last_ts_ord": self._last_ts_ord,
+            }
+        )
+
+    def _mint_ts(self) -> Timestamp:
+        """Return a strictly-monotonic ``Timestamp(secs, ord)``.
+
+        Caller must hold ``self._lock``. Within a single wall-clock second
+        ``ord`` increments; on a new second it resets to 1. Recovered state
+        on startup ensures the first mint after restart is strictly greater
+        than any previously-emitted timestamp.
+        """
+        now = int(self._time())
+        if now > self._last_ts_secs:
+            self._last_ts_secs = now
+            self._last_ts_ord = 1
+        else:
+            self._last_ts_ord += 1
+        return Timestamp(self._last_ts_secs, self._last_ts_ord)
+
+    def _collection_uuid(self, db: str, coll: str) -> _uuid.UUID:
+        """Return the collection's UUID, minting and persisting on first call.
+
+        Safe to call from inside or outside the storage lock — re-acquires
+        the ``RLock`` either way.
+        """
+        with self._lock:
+            opts = self._coll_options(db, coll) or {}
+            existing = opts.get("uuid")
+            if isinstance(existing, _uuid.UUID):
+                return existing
+            if isinstance(existing, bson.Binary) and len(existing) == 16:
+                return _uuid.UUID(bytes=bytes(existing))
+            if isinstance(existing, bytes) and len(existing) == 16:
+                return _uuid.UUID(bytes=existing)
+            new_uuid = _uuid.uuid4()
+            opts["uuid"] = new_uuid
+            self._write_coll_options(db, coll, opts)
+            return new_uuid
+
+    def collection_uuid(self, db: str, coll: str) -> _uuid.UUID:
+        """Public alias for ``_collection_uuid``."""
+        return self._collection_uuid(db, coll)
+
+    def current_cluster_time(self) -> Timestamp:
+        """Return a strictly-monotonic ``Timestamp`` advancing the cluster clock."""
+        with self._lock:
+            ts = self._mint_ts()
+            self._persist_oplog_meta()
+            return ts
+
+    def _write_coll_options(self, db: str, coll: str, opts: Mapping[str, Any]) -> None:
+        c = self._cursor(_COLL_TABLE)
+        # bson can't directly encode a uuid.UUID without a codec, so store as Binary subtype 4.
+        encoded: dict[str, Any] = {}
+        for k, v in opts.items():
+            if isinstance(v, _uuid.UUID):
+                encoded[k] = bson.Binary(v.bytes, subtype=4)
+            else:
+                encoded[k] = v
+        c[db, coll] = bson.encode(encoded) if encoded else b""
+
+    def set_collection_options(self, db: str, coll: str, **opts: Any) -> None:
+        """Merge ``opts`` into the collection's options blob (creates if absent)."""
+        with self._lock:
+            self._ensure_collection(db, coll)
+            current = self._coll_options(db, coll) or {}
+            current.update(opts)
+            self._write_coll_options(db, coll, current)
+
+    def get_collection_options(self, db: str, coll: str) -> dict[str, Any]:
+        """Return the collection's options blob, or ``{}`` if absent."""
+        with self._lock:
+            opts = self._coll_options(db, coll) or {}
+            # Decode UUID Binary back into uuid.UUID for callers.
+            decoded: dict[str, Any] = {}
+            for k, v in opts.items():
+                if k == "uuid" and isinstance(v, bson.Binary) and len(v) == 16:
+                    decoded[k] = _uuid.UUID(bytes=bytes(v))
+                else:
+                    decoded[k] = v
+            return decoded
+
+    def _emit_oplog(
+        self,
+        entries: list[dict[str, Any]],
+        pre_images: list[bytes | None] | None = None,
+    ) -> int:
+        """Append ``entries`` to the oplog table under ``self._lock``.
+
+        ``pre_images`` is parallel to ``entries``; non-None elements are
+        stored under the matching seq in ``_PREIMAGE_TABLE``. Returns the
+        highest seq emitted (0 if ``entries`` is empty). Notifies waiters
+        on ``self._oplog_cv`` once writes have committed.
+        """
+        if not entries:
+            return 0
+        if pre_images is None:
+            pre_images = [None] * len(entries)
+        assert len(pre_images) == len(entries)
+        op_cur = self._cursor(_OPLOG_TABLE)
+        pre_cur = None
+        last_seq = 0
+        for entry, pre in zip(entries, pre_images, strict=True):
+            seq = self._next_seq
+            self._next_seq += 1
+            entry_with_ts = dict(entry)
+            if "ts" not in entry_with_ts:
+                entry_with_ts["ts"] = self._mint_ts()
+            if "wall" not in entry_with_ts:
+                entry_with_ts["wall"] = _dt.datetime.now(_dt.UTC)
+            op_cur[seq] = bson.encode(entry_with_ts)
+            if pre is not None:
+                if pre_cur is None:
+                    pre_cur = self._cursor(_PREIMAGE_TABLE)
+                pre_cur[seq] = pre
+            last_seq = seq
+        self._persist_oplog_meta()
+        self._oplog_emit_count += len(entries)
+        if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
+            self._oplog_emit_count = 0
+            self._prune_oplog_locked(now=self._time())
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+        return last_seq
+
+    def read_oplog(
+        self,
+        *,
+        start_seq: int,
+        limit: int,
+        ns_filter: Callable[[str], bool] | None = None,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Forward-scan the oplog from ``start_seq`` (inclusive).
+
+        Uses a private short-lived session so the read view always reflects
+        rows committed by other sessions. The cached per-thread session's
+        snapshot is sticky — under WiredTiger's MVCC, reusing it across
+        getMore polls would never observe oplog rows produced by a writer
+        running on a different connection thread.
+        """
+        out: list[tuple[int, dict[str, Any]]] = []
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_OPLOG_TABLE, None)
+                try:
+                    c.set_key(int(start_seq))
+                    rc = c.search_near()
+                    if rc == wt.WT_NOTFOUND:
+                        return out
+                    if rc < 0 and c.next() != 0:
+                        return out
+                    while True:
+                        seq = int(c.get_key())
+                        blob = bytes(c.get_value())
+                        if blob:
+                            entry = bson.decode(blob)
+                            if ns_filter is None or ns_filter(str(entry.get("ns", ""))):
+                                out.append((seq, entry))
+                        if len(out) >= limit:
+                            break
+                        if c.next() != 0:
+                            break
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+        return out
+
+    def read_preimage(self, seq: int) -> dict[str, Any] | None:
+        """Return the pre-image doc for ``seq`` if one was stored, else ``None``.
+
+        Uses a private session for cross-thread visibility (see ``read_oplog``).
+        """
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_PREIMAGE_TABLE, None)
+                try:
+                    c.set_key(int(seq))
+                    if c.search() != 0:
+                        return None
+                    blob = bytes(c.get_value())
+                    if not blob:
+                        return None
+                    return bson.decode(blob)
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+
+    def oplog_tail_seq(self) -> int:
+        """Highest seq currently present (or last emitted). 0 if empty."""
+        with self._lock:
+            return self._next_seq - 1
+
+    def oplog_floor_seq(self) -> int:
+        """Smallest seq currently present after pruning. 0 if empty.
+
+        Uses a private session for cross-thread visibility.
+        """
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_OPLOG_TABLE, None)
+                try:
+                    rc = c.next()
+                    if rc != 0:
+                        return 0
+                    return int(c.get_key())
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+
+    def find_seq_for_ts(self, ts: Timestamp) -> int:
+        """Smallest seq whose entry ``ts >= target``. Tail+1 if none qualify.
+
+        Uses a private session for cross-thread visibility.
+        """
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_OPLOG_TABLE, None)
+                try:
+                    rc = c.next()
+                    while rc == 0:
+                        seq = int(c.get_key())
+                        blob = bytes(c.get_value())
+                        if blob:
+                            entry = bson.decode(blob)
+                            entry_ts = entry.get("ts")
+                            if isinstance(entry_ts, Timestamp) and (
+                                entry_ts.time > ts.time
+                                or (entry_ts.time == ts.time and entry_ts.inc >= ts.inc)
+                            ):
+                                return seq
+                        rc = c.next()
+                    return self._next_seq
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+
+    def prune_oplog(self, *, now: float | None = None) -> int:
+        """Drop oplog rows older than retention or above the entry cap."""
+        with self._lock:
+            return self._prune_oplog_locked(now=now)
+
+    def _ns(self, db: str, coll: str) -> str:
+        return f"{db}.{coll}"
+
+    def _pre_post_images_enabled(self, db: str, coll: str) -> bool:
+        opts = self._coll_options(db, coll) or {}
+        cfg = opts.get("changeStreamPreAndPostImages")
+        return isinstance(cfg, Mapping) and bool(cfg.get("enabled"))
+
+    def _prune_oplog_locked(self, *, now: float | None = None) -> int:
+        when = now if now is not None else self._time()
+        cutoff_secs = int(when - self.oplog_retention_seconds)
+        # Two-phase: collect doomed seqs, then delete (avoid mutating during scan).
+        doomed: list[int] = []
+        all_seqs: list[int] = []
+        c = self._cursor(_OPLOG_TABLE)
+        rc = c.next()
+        while rc == 0:
+            seq = int(c.get_key())
+            blob = bytes(c.get_value())
+            all_seqs.append(seq)
+            if blob:
+                entry = bson.decode(blob)
+                ts = entry.get("ts")
+                if isinstance(ts, Timestamp) and ts.time < cutoff_secs:
+                    doomed.append(seq)
+            rc = c.next()
+        # Trim to entry cap by extending doom set to oldest entries.
+        kept_count = len(all_seqs) - len(doomed)
+        if kept_count > self.oplog_max_entries:
+            extra = kept_count - self.oplog_max_entries
+            doomed_set = set(doomed)
+            for seq in all_seqs:
+                if extra <= 0:
+                    break
+                if seq not in doomed_set:
+                    doomed.append(seq)
+                    doomed_set.add(seq)
+                    extra -= 1
+        if not doomed:
+            return 0
+        op_del = self._cursor(_OPLOG_TABLE)
+        pre_del = self._cursor(_PREIMAGE_TABLE)
+        for seq in doomed:
+            op_del.set_key(seq)
+            with contextlib.suppress(wt.WiredTigerError):
+                op_del.remove()
+            op_del.reset()
+            pre_del.set_key(seq)
+            with contextlib.suppress(wt.WiredTigerError):
+                pre_del.remove()
+            pre_del.reset()
+        return len(doomed)
 
     def close(self) -> None:
         with self._lock:
@@ -313,6 +690,21 @@ class Storage:
                 return False
             c.reset()
             c[db, coll] = b""
+            self._collection_uuid(db, coll)  # mint and persist
+            ui = self._collection_uuid(db, coll)
+            self._emit_oplog(
+                [
+                    {
+                        "op": "c",
+                        "ns": f"{db}.$cmd",
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": {
+                            "create": coll,
+                            "idIndex": {"v": 2, "key": {"_id": 1}, "name": "_id_"},
+                        },
+                    }
+                ]
+            )
             return True
 
     def _scan_docs(self, db: str, coll: str) -> Iterable[tuple[bytes, bytes]]:
@@ -344,8 +736,11 @@ class Storage:
     ) -> tuple[int, list[dict[str, Any]]]:
         inserted = 0
         errors: list[dict[str, Any]] = []
+        oplog_entries: list[dict[str, Any]] = []
         with self._lock:
             self._ensure_collection(db, coll)
+            ns = self._ns(db, coll)
+            ui = self._collection_uuid(db, coll)
             indexes = self._all_indexes(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
             for index, doc in enumerate(docs):
@@ -387,6 +782,17 @@ class Storage:
                 self._write_index_entries(db, coll, doc, indexes)
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
+                oplog_entries.append(
+                    {
+                        "op": "i",
+                        "ns": ns,
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": dict(doc),
+                        "o2": {"_id": doc["_id"]},
+                    }
+                )
+            if oplog_entries:
+                self._emit_oplog(oplog_entries)
         return inserted, errors
 
     def find_matching(
@@ -722,8 +1128,13 @@ class Storage:
         matched = 0
         modified = 0
         upserted_id: Any = None
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
         with self._lock:
             self._ensure_collection(db, coll)
+            ns = self._ns(db, coll)
+            ui = self._collection_uuid(db, coll)
+            preimages_on = self._pre_post_images_enabled(db, coll)
             indexes = self._all_indexes(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
             for doc in self._all_docs(db, coll):
@@ -747,6 +1158,16 @@ class Storage:
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
+                    oplog_entries.append(
+                        {
+                            "op": "u",
+                            "ns": ns,
+                            "ui": bson.Binary(ui.bytes, subtype=4),
+                            "o": {"$v": 2, "diff": compute_update_description(doc, new)},
+                            "o2": {"_id": doc["_id"]},
+                        }
+                    )
+                    pre_images.append(bson.encode(doc) if preimages_on else None)
                 if not multi:
                     break
             if matched == 0 and upsert:
@@ -765,11 +1186,32 @@ class Storage:
                 doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
                 self._write_index_entries(db, coll, new, indexes)
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
+                oplog_entries.append(
+                    {
+                        "op": "i",
+                        "ns": ns,
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": dict(new),
+                        "o2": {"_id": upserted_id},
+                    }
+                )
+                pre_images.append(None)
+            if oplog_entries:
+                self._emit_oplog(oplog_entries, pre_images)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
 
     def delete_matching(self, db: str, coll: str, filter: dict[str, Any], *, limit: int = 0) -> int:
         deleted = 0
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
         with self._lock:
+            ns = self._ns(db, coll)
+            preimages_on = self._pre_post_images_enabled(db, coll)
+            ui = (
+                self._collection_uuid(db, coll)
+                if self._coll_options(db, coll) is not None
+                else None
+            )
             indexes = self._all_indexes(db, coll)
             for doc in self._all_docs(db, coll):
                 if not matches(doc, filter):
@@ -779,8 +1221,20 @@ class Storage:
                 doc_cur.set_key(db, coll, _id_key(doc["_id"]))
                 doc_cur.remove()
                 deleted += 1
+                entry: dict[str, Any] = {
+                    "op": "d",
+                    "ns": ns,
+                    "o": {"_id": doc["_id"]},
+                    "o2": {"_id": doc["_id"]},
+                }
+                if ui is not None:
+                    entry["ui"] = bson.Binary(ui.bytes, subtype=4)
+                oplog_entries.append(entry)
+                pre_images.append(bson.encode(doc) if preimages_on else None)
                 if limit > 0 and deleted >= limit:
                     break
+            if oplog_entries:
+                self._emit_oplog(oplog_entries, pre_images)
         return deleted
 
     def prune_ttl(
@@ -816,7 +1270,16 @@ class Storage:
         if when.tzinfo is None:
             when = when.replace(tzinfo=_dt.UTC)
         pruned = 0
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
         with self._lock:
+            ns = self._ns(db, coll)
+            preimages_on = self._pre_post_images_enabled(db, coll)
+            ui = (
+                self._collection_uuid(db, coll)
+                if self._coll_options(db, coll) is not None
+                else None
+            )
             indexes = self._all_indexes(db, coll)
             for doc in list(self._all_docs(db, coll)):
                 expired = False
@@ -835,6 +1298,18 @@ class Storage:
                 doc_cur.set_key(db, coll, _id_key(doc["_id"]))
                 doc_cur.remove()
                 pruned += 1
+                entry: dict[str, Any] = {
+                    "op": "d",
+                    "ns": ns,
+                    "o": {"_id": doc["_id"]},
+                    "o2": {"_id": doc["_id"]},
+                }
+                if ui is not None:
+                    entry["ui"] = bson.Binary(ui.bytes, subtype=4)
+                oplog_entries.append(entry)
+                pre_images.append(bson.encode(doc) if preimages_on else None)
+            if oplog_entries:
+                self._emit_oplog(oplog_entries, pre_images)
         return pruned
 
     @staticmethod
@@ -885,6 +1360,7 @@ class Storage:
     def drop_collection(self, db: str, coll: str) -> bool:
         with self._lock:
             existed = self._coll_options(db, coll) is not None
+            ui = self._collection_uuid(db, coll) if existed else None
             for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
                 rows = self._collect_prefix(tbl, (db, coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
@@ -892,13 +1368,40 @@ class Storage:
             c.set_key(db, coll)
             if c.search() == 0:
                 c.remove()
+            if existed and ui is not None:
+                self._emit_oplog(
+                    [
+                        {
+                            "op": "c",
+                            "ns": f"{db}.$cmd",
+                            "ui": bson.Binary(ui.bytes, subtype=4),
+                            "o": {"drop": coll},
+                        }
+                    ]
+                )
             return existed
 
     def drop_database(self, db: str) -> None:
         with self._lock:
+            colls_with_ui: list[tuple[str, _uuid.UUID]] = []
+            for c_name in self.list_collections(db):
+                ui = self._collection_uuid(db, c_name)
+                colls_with_ui.append((c_name, ui))
             for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE, _COLL_TABLE):
                 rows = self._collect_prefix(tbl, (db,))
                 self._delete_keys(tbl, [k for k, _ in rows])
+            entries: list[dict[str, Any]] = []
+            for c_name, ui in colls_with_ui:
+                entries.append(
+                    {
+                        "op": "c",
+                        "ns": f"{db}.$cmd",
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": {"drop": c_name},
+                    }
+                )
+            entries.append({"op": "c", "ns": f"{db}.$cmd", "o": {"dropDatabase": 1}})
+            self._emit_oplog(entries)
 
     def rename_collection(
         self,
@@ -914,7 +1417,10 @@ class Storage:
                 return False, f"source namespace does not exist: {src_db}.{src_coll}"
             if (src_db, src_coll) == (dst_db, dst_coll):
                 return True, None
-            if self._coll_options(dst_db, dst_coll) is not None:
+            ui = self._collection_uuid(src_db, src_coll)
+            dst_existed = self._coll_options(dst_db, dst_coll) is not None
+            dst_ui = self._collection_uuid(dst_db, dst_coll) if dst_existed else None
+            if dst_existed:
                 if not drop_target:
                     return False, f"target namespace exists: {dst_db}.{dst_coll}"
                 for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
@@ -943,6 +1449,28 @@ class Storage:
             ensure.set_key(src_db, src_coll)
             if ensure.search() == 0:
                 ensure.remove()
+            entries: list[dict[str, Any]] = []
+            if dst_existed and dst_ui is not None:
+                entries.append(
+                    {
+                        "op": "c",
+                        "ns": f"{dst_db}.$cmd",
+                        "ui": bson.Binary(dst_ui.bytes, subtype=4),
+                        "o": {"drop": dst_coll},
+                    }
+                )
+            entries.append(
+                {
+                    "op": "c",
+                    "ns": f"{src_db}.$cmd",
+                    "ui": bson.Binary(ui.bytes, subtype=4),
+                    "o": {
+                        "renameCollection": f"{src_db}.{src_coll}",
+                        "to": f"{dst_db}.{dst_coll}",
+                    },
+                }
+            )
+            self._emit_oplog(entries)
             return True, None
 
     def list_collections(self, db: str) -> list[str]:
@@ -1029,6 +1557,20 @@ class Storage:
                     continue
                 entry_cur.reset()
                 entry_cur[db, coll, name, _pack_entry(kb, _id_key(d["_id"]))] = b""
+            ui = self._collection_uuid(db, coll)
+            self._emit_oplog(
+                [
+                    {
+                        "op": "c",
+                        "ns": f"{db}.$cmd",
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": {
+                            "createIndexes": coll,
+                            "indexes": [{"v": 2, "key": dict(key_spec), "name": name, **options}],
+                        },
+                    }
+                ]
+            )
             return True
 
     def list_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
@@ -1074,14 +1616,39 @@ class Storage:
             c.remove()
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, name))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            ui = self._collection_uuid(db, coll)
+            self._emit_oplog(
+                [
+                    {
+                        "op": "c",
+                        "ns": f"{db}.$cmd",
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": {"dropIndexes": coll, "index": name},
+                    }
+                ]
+            )
             return True
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
         with self._lock:
             rows = self._collect_prefix(_IDX_TABLE, (db, coll))
+            names = [k[2] for k, _ in rows]
             self._delete_keys(_IDX_TABLE, [k for k, _ in rows])
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            if names:
+                ui = self._collection_uuid(db, coll)
+                self._emit_oplog(
+                    [
+                        {
+                            "op": "c",
+                            "ns": f"{db}.$cmd",
+                            "ui": bson.Binary(ui.bytes, subtype=4),
+                            "o": {"dropIndexes": coll, "index": n},
+                        }
+                        for n in names
+                    ]
+                )
             return len(rows)
 
     def _all_indexes(self, db: str, coll: str) -> list[tuple[str, dict[str, Any], bool, bool]]:
