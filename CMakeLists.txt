@@ -35,6 +35,8 @@ set(WT_PATCH_PYTHON_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_python.py)
 set(WT_PYTHON_CMAKE ${WT_SOURCE_DIR}/lang/python/CMakeLists.txt)
 set(WT_PATCH_HELPERS_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_helpers.py)
 set(WT_HELPERS_CMAKE ${WT_SOURCE_DIR}/cmake/helpers.cmake)
+set(WT_PATCH_MUSL_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_musl.py)
+set(WT_OS_FS_C ${WT_SOURCE_DIR}/src/os_posix/os_fs.c)
 
 # Python C extension filename: .so on POSIX, .pyd on Windows. WT only sets the
 # Darwin SUFFIX itself; the Windows branch is added by patch_wt_python.py so
@@ -58,6 +60,7 @@ ExternalProject_Add(wiredtiger_ext
     PATCH_COMMAND     ${Python3_EXECUTABLE} ${WT_PATCH_SCRIPT} ${WT_STRICT_HELPERS}
               COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_PYTHON_SCRIPT} ${WT_PYTHON_CMAKE}
               COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_HELPERS_SCRIPT} ${WT_HELPERS_CMAKE}
+              COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_MUSL_SCRIPT} ${WT_OS_FS_C}
     CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_INSTALL_PREFIX=${WT_INSTALL_DIR}
