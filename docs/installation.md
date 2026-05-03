@@ -1,12 +1,12 @@
 # Installation
 
-SecantusDB requires **Python 3.12** or newer.
+SecantusDB requires **Python 3.10** or newer.
 
 ```bash
 pip install SecantusDB
 ```
 
-Pre-built wheels are published for CPython **3.12** and **3.13** on:
+Pre-built wheels are published for CPython **3.10**, **3.11**, **3.12**, and **3.13** on:
 
 - macOS arm64 (Apple Silicon)
 - Linux x86_64 and aarch64 (manylinux2014 / glibc, and musllinux_1_2 / Alpine)

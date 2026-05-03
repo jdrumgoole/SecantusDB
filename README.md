@@ -3,7 +3,7 @@
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](#alpha-software)
 [![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
 [![License: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue)](LICENSE)
-[![Python: 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
+[![Python: 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![Documentation Status](https://readthedocs.org/projects/secantusdb/badge/?version=latest)](https://secantusdb.readthedocs.io/en/latest/)
 
 > [!WARNING]
@@ -51,7 +51,7 @@ rollback. If your test depends on those, run a real `mongod`.
 pip install SecantusDB
 ```
 
-Pre-built wheels are published for CPython **3.12** and **3.13** on:
+Pre-built wheels are published for CPython **3.10**, **3.11**, **3.12**, and **3.13** on:
 
 - macOS arm64 (Apple Silicon)
 - Linux x86_64 and aarch64 (manylinux2014 / glibc, and musllinux_1_2 / Alpine)

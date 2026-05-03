@@ -6,7 +6,10 @@ import logging
 import socket
 import threading
 from types import TracebackType
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from typing import Self
 
 from secantus.commands import CommandContext, dispatch
 from secantus.cursors import CursorRegistry

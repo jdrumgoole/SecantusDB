@@ -4,10 +4,10 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.2.0a3"
+version = "0.2.0a4"
 description = "A surrogate single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
 license = "GPL-2.0-only"
 license-files = ["LICENSE"]
@@ -51,10 +51,9 @@ sdist.exclude = [
 
 [tool.cibuildwheel]
 # Skip 32-bit and pypy targets. Build for every supported CPython ABI
-# so users on cp312 or cp313 always pip-install a pre-built wheel.
-# requires-python is ">=3.12"; cp310/cp311 users are blocked at install
-# time (no compile attempted), so we don't need wheels for them.
-build = "cp312-* cp313-*"
+# (requires-python is ">=3.10") so users on cp310/cp311/cp312/cp313
+# always pip-install a pre-built wheel.
+build = "cp310-* cp311-* cp312-* cp313-*"
 skip = ["*-win32", "*-manylinux_i686", "pp*"]
 build-verbosity = 1
 # Real smoke tests against the installed wheel: server bind, pymongo
@@ -94,7 +93,7 @@ addopts = "-n auto"
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py310"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
