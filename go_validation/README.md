@@ -21,8 +21,16 @@ the submodule is empty. The integration is entirely external.
 
 ```bash
 git submodule update --init --recursive   # pulls vendor/mongo-go-driver
+                                          # AND its nested testdata/specifications
 uv run python -m invoke validate-go       # builds + runs + regenerates report
 ```
+
+The `--recursive` flag is critical — `mongo-go-driver` itself has a
+nested `testdata/specifications/` submodule that holds the MongoDB
+driver-spec JSON corpus. Without it the bson-corpus tests all fail
+on missing files (silently, in the form of FAIL with no useful
+error). The `invoke validate-go` task checks for it and re-runs
+submodule init if it's missing.
 
 Requires the Go toolchain on `PATH` (1.21+). On macOS:
 `brew install go`. On Linux: distro package or upstream tarball.

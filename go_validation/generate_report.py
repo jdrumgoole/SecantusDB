@@ -127,15 +127,18 @@ def render(ndjson_path: Path, out_path: Path) -> None:
     md.append(
         "**mongo-go-driver's tests are run unmodified, against a standalone "
         "SecantusDB daemon.** The submodule at `vendor/mongo-go-driver/` is "
-        "checked out at the pinned upstream tag with zero local edits. "
-        "`go_validation/runner.py` spawns `python -m secantus --host 127.0.0.1 "
-        "--port <free> --storage-path :memory:` as a subprocess, waits for "
-        "its TCP listener, exports `MONGODB_URI` (the env var "
-        "`internal/integtest.MongoDBURI` and `internal/integration/mtest` "
-        "read at setup), then runs `go test -json -count=1 <packages>` for "
-        "the in-scope set in `go_validation/include_packages.py`. From the "
-        "go-driver's point of view it's connecting to a real `mongod` over "
-        "TCP — exactly like its CI does."
+        "checked out at the pinned upstream tag with zero local edits. A "
+        "nested submodule `testdata/specifications/` (the MongoDB driver-spec "
+        "JSON corpus) is also pulled — without it the bson-corpus tests "
+        "fail on missing files. `go_validation/runner.py` spawns "
+        "`python -m secantus --host 127.0.0.1 --port <free> --storage-path "
+        "':memory:'` as a subprocess, waits for its TCP listener, exports "
+        "`MONGODB_URI` (the env var `internal/integtest.MongoDBURI` and "
+        "`internal/integration/mtest` read at setup), then runs "
+        "`go test -json -count=1 <packages>` for the in-scope set in "
+        "`go_validation/include_packages.py`. From the go-driver's point of "
+        "view it's connecting to a real `mongod` over TCP — exactly like "
+        "its CI does."
     )
     md.append("")
     md.append(

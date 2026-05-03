@@ -61,6 +61,15 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if not (VENDOR / "testdata" / "specifications" / "source").is_dir():
+        print(
+            "vendor/mongo-go-driver/testdata/specifications/ is empty (nested "
+            "submodule). Run `git submodule update --init --recursive` from "
+            "the repo root — without the spec data the bson-corpus tests "
+            "fail on missing JSON files.",
+            file=sys.stderr,
+        )
+        return 2
 
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 

@@ -117,7 +117,12 @@ def validate_go(c: Context) -> None:
     """
     import pathlib
 
-    if not pathlib.Path("vendor/mongo-go-driver/go.mod").exists():
+    # Need both the outer submodule AND its nested `testdata/specifications`
+    # submodule (driver-spec test data — without it the bson-corpus tests
+    # fail on missing JSON files).
+    if not pathlib.Path("vendor/mongo-go-driver/go.mod").exists() or not pathlib.Path(
+        "vendor/mongo-go-driver/testdata/specifications/source"
+    ).is_dir():
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
