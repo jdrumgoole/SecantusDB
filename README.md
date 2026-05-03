@@ -7,52 +7,35 @@ sharding, and cluster-only features are out of scope.
 
 ## Installation
 
-`secantus` depends on the third-party
-[`wiredtiger`](https://pypi.org/project/wiredtiger/) PyPI package, which
-currently ships only as a source distribution. Until binary wheels are
-available, `pip install secantus` triggers a from-source build of WiredTiger
-that needs three native build tools on `PATH`:
+```bash
+pip install secantus
+```
+
+Pre-built wheels are published for CPython **3.12** and **3.13** on:
+
+- macOS (x86_64 and arm64)
+- Linux x86_64 and aarch64 (manylinux2014 / glibc, and musllinux_1_2 / Alpine)
+- Windows AMD64
+
+WiredTiger is vendored inside the wheel — no separate package, no
+compile step, no system build tools required.
+
+### Building from source (unsupported platforms only)
+
+If your platform isn't in the matrix above, `pip install secantus`
+falls back to the sdist and compiles WiredTiger from source. That
+needs three native build tools on `PATH`:
 
 - **`cmake`** (>= 3.21)
 - **`ninja`**
 - **`swig`** (>= 4.0)
 
-Install the prerequisites first, then `secantus`.
-
-### macOS
-
-```bash
-brew install cmake ninja swig
-pip install secantus
-```
-
-If you use `uv`-managed Python, prefer:
-
-```bash
-uv tool install cmake
-uv tool install ninja
-brew install swig
-uv pip install secantus
-```
-
-### Linux (Debian/Ubuntu)
-
-```bash
-sudo apt-get install -y cmake ninja-build swig
-pip install secantus
-```
-
-### Linux (Fedora/RHEL)
-
-```bash
-sudo dnf install -y cmake ninja-build swig
-pip install secantus
-```
-
-### Windows
-
-WiredTiger's Python bindings have not been validated on Windows by the
-SecantusDB project. macOS and Linux are the supported development targets.
+| Platform | Install prerequisites |
+|---|---|
+| macOS (Homebrew) | `brew install cmake ninja swig` |
+| Debian/Ubuntu | `sudo apt-get install -y cmake ninja-build swig` |
+| Fedora/RHEL | `sudo dnf install -y cmake ninja-build swig` |
+| Alpine | `apk add --no-cache cmake ninja swig build-base` |
 
 ## Quick start
 
