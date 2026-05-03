@@ -1,12 +1,12 @@
 name: Build wheels
 
 on:
+  # Tag-triggered release builds belong to publish.yml (which also publishes).
+  # wheels.yml is the on-demand / continuous-validation matrix.
   push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
     branches:
-      - wt-vendoring  # Iterate on the vendoring scaffold; remove before merging to main.
-  workflow_dispatch:  # Manual trigger for iteration during scaffold tuning.
+      - main  # Catch wheel regressions before they reach a tag.
+  workflow_dispatch:  # Manual ad-hoc trigger.
 
 jobs:
   build_wheels:
