@@ -6,6 +6,13 @@ on:
   push:
     branches:
       - main  # Catch wheel regressions before they reach a tag.
+    # Docs- and license-only commits don't affect the wheel; skip the
+    # cibuildwheel matrix when nothing else changed. Pattern matches the
+    # ignores in test.yml.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - 'docs/**'
   workflow_dispatch:  # Manual ad-hoc trigger.
 
 jobs:

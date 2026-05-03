@@ -3,8 +3,20 @@ name: Tests
 on:
   push:
     branches: [main]
+    # Skip the matrix when a commit only touches docs / license / markdown.
+    # GitHub considers paths-ignore satisfied (and skips the run) when EVERY
+    # changed file matches one of these patterns. Anything else here — code,
+    # tests, pyproject.toml, the workflows themselves — runs the full matrix.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - 'docs/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - 'docs/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
