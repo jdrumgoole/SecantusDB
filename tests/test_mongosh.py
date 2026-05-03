@@ -98,9 +98,9 @@ def test_mongosh_index_round_trip() -> None:
         out = _run_mongosh(
             f"{server.uri}wine_cellar",
             (
-                'db.bottles.insertOne({_id: 1, year: 2018}); '
-                'db.bottles.createIndex({year: 1}); '
-                'JSON.stringify(db.bottles.getIndexes().map(i => i.name))'
+                "db.bottles.insertOne({_id: 1, year: 2018}); "
+                "db.bottles.createIndex({year: 1}); "
+                "JSON.stringify(db.bottles.getIndexes().map(i => i.name))"
             ),
         )
         # Last line of stdout is the JSON.stringify result; createIndex
