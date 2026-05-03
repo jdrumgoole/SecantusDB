@@ -226,6 +226,13 @@ and open `docs/_build/html/index.html`. Highlights:
   the import-clean subset of unit tests because of an unrelated
   ESM/TypeScript loader quirk in node-mongodb-native v7.2.0; see
   `node_validation/include_paths.py` for the rationale.
+- [Java-driver validation report](docs/validation-report-java.md) —
+  same shape against **mongo-java-driver's own test suite, unmodified**.
+  Spawns a standalone SecantusDB daemon and invokes the driver's
+  bundled `./gradlew` with `-Dorg.mongodb.test.uri=mongodb://...`.
+  Initial baseline is the `:bson:test` module (BSON serialization,
+  ~289 test files); the JDBC-style integration modules can be added
+  to `java_validation/include_modules.py` as we widen.
 
 ## Development
 

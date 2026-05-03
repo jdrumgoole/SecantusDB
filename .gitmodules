@@ -10,3 +10,6 @@
 [submodule "vendor/node-mongodb-native"]
 	path = vendor/node-mongodb-native
 	url = https://github.com/mongodb/node-mongodb-native.git
+[submodule "vendor/mongo-java-driver"]
+	path = vendor/mongo-java-driver
+	url = https://github.com/mongodb/mongo-java-driver.git

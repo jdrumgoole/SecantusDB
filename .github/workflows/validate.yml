@@ -42,6 +42,12 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
       - name: Run pymongo validation
         run: uv run python -m invoke validate
 
@@ -50,6 +56,9 @@ jobs:
 
       - name: Run node-driver validation
         run: uv run python -m invoke validate-node
+
+      - name: Run java-driver validation
+        run: uv run python -m invoke validate-java
 
       - name: Show report summaries
         run: |
@@ -61,6 +70,9 @@ jobs:
           echo
           echo "=== node-driver ==="
           head -50 docs/validation-report-node.md
+          echo
+          echo "=== java-driver ==="
+          head -50 docs/validation-report-java.md
 
       # If either report changed, open a PR rather than committing directly to
       # main — keeps a human in the loop on coverage shifts.
@@ -68,7 +80,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md; then
+          if git diff --quiet docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md; then
             echo "No change to validation reports."
             exit 0
           fi
@@ -76,8 +88,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md
-          git commit -m "Refresh validation reports (pymongo + go + node)"
+          git add docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md
+          git commit -m "Refresh validation reports (pymongo + go + node + java)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \

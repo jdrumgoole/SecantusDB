@@ -168,6 +168,36 @@ def validate_node(c: Context) -> None:
     print("\nWrote docs/validation-report-node.md")
 
 
+@task(name="validate-java")
+def validate_java(c: Context) -> None:
+    """Run mongo-java-driver's tests against an embedded SecantusDB.
+
+    Generates docs/validation-report-java.md with a per-module pass /
+    fail / skipped / pass-rate breakdown — the Java-driver analogue of
+    the pymongo / Go / Node gauges. Requires a JDK (>=8) on PATH; uses
+    the gradle wrapper the driver ships, so no system Gradle install
+    needed. First run downloads the gradle distribution + dependencies
+    (~150 MB) into ~/.gradle/.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/mongo-java-driver/gradlew").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m java_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m java_validation.generate_report "
+        ".validation/java-results docs/validation-report-java.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-java.md")
+
+
 @task
 def clean(c: Context) -> None:
     c.run(

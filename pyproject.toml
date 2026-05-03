@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.2.0a10"
+version = "0.2.0a11"
 description = "A drop-in single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -63,6 +63,8 @@ sdist.exclude = [
     "go_validation/**",
     "vendor/node-mongodb-native/**",
     "node_validation/**",
+    "vendor/mongo-java-driver/**",
+    "java_validation/**",
     ".validation/**",
 ]
 
