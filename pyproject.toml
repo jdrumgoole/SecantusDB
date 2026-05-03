@@ -55,6 +55,8 @@ sdist.exclude = [
     "vendor/pymongo-tests/**",
     "pymongo_validation/**",
     "pymongo-validation/**",
+    "vendor/mongo-go-driver/**",
+    "go_validation/**",
     ".validation/**",
 ]
 

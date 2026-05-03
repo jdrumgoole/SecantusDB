@@ -107,6 +107,33 @@ def validate(c: Context) -> None:
     print("\nWrote docs/validation-report.md")
 
 
+@task(name="validate-go")
+def validate_go(c: Context) -> None:
+    """Run mongo-go-driver's tests against an embedded SecantusDB.
+
+    Generates docs/validation-report-go.md with a per-package pass /
+    fail / skip / pass-rate breakdown — the Go-driver analogue of the
+    pymongo gauge. Requires `go` on PATH (1.21+).
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/mongo-go-driver/go.mod").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m go_validation.runner",
+        pty=True,
+        warn=True,  # report is the deliverable
+    )
+    c.run(
+        "uv run --no-sync python -m go_validation.generate_report "
+        ".validation/go-raw.ndjson docs/validation-report-go.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-go.md")
+
+
 @task
 def clean(c: Context) -> None:
     c.run(

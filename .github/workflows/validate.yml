@@ -32,29 +32,42 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra dev   # builds vendored WT, installs pytest-json-report
 
-      - name: Run validation
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Run pymongo validation
         run: uv run python -m invoke validate
 
-      - name: Show report summary
-        run: head -50 docs/validation-report.md
+      - name: Run go-driver validation
+        run: uv run python -m invoke validate-go
 
-      # If the report changed, open a PR rather than committing directly to
+      - name: Show report summaries
+        run: |
+          echo "=== pymongo ==="
+          head -50 docs/validation-report.md
+          echo
+          echo "=== go-driver ==="
+          head -50 docs/validation-report-go.md
+
+      # If either report changed, open a PR rather than committing directly to
       # main — keeps a human in the loop on coverage shifts.
-      - name: Open PR if report changed
+      - name: Open PR if reports changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet docs/validation-report.md; then
-            echo "No change to docs/validation-report.md."
+          if git diff --quiet docs/validation-report.md docs/validation-report-go.md; then
+            echo "No change to validation reports."
             exit 0
           fi
           branch="validation-report-$(date +%Y%m%d)"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add docs/validation-report.md
-          git commit -m "Refresh pymongo validation report"
+          git add docs/validation-report.md docs/validation-report-go.md
+          git commit -m "Refresh validation reports (pymongo + go-driver)"
           git push -u origin "$branch"
           gh pr create \
-            --title "Refresh pymongo validation report" \
-            --body "Automated weekly refresh of \`docs/validation-report.md\`. Inspect the per-category numbers for regressions or new pass-rate wins."
+            --title "Refresh validation reports" \
+            --body "Automated weekly refresh of \`docs/validation-report.md\` and \`docs/validation-report-go.md\`. Inspect the per-category numbers for regressions or new pass-rate wins."

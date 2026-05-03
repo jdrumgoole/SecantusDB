@@ -152,12 +152,19 @@ and open `docs/_build/html/index.html`. Highlights:
   expression operators.
 - [Compatibility](docs/compatibility.md) — the divergences you should know
   about before you trust SecantusDB for a given test.
-- [Validation report](docs/validation-report.md) — per-category pass / fail
-  / skip rate from running **pymongo's own test suite, unmodified**, against
-  SecantusDB. The submodule at `vendor/pymongo-tests/` is checked out at the
-  pinned upstream tag with zero local edits; the integration is entirely
-  external (a pytest plugin that starts an embedded server and points
-  pymongo's `DB_IP`/`DB_PORT` at it).
+- [pymongo validation report](docs/validation-report.md) — per-category
+  pass / fail / skip rate from running **pymongo's own test suite,
+  unmodified**, against SecantusDB. The submodule at
+  `vendor/pymongo-tests/` is checked out at the pinned upstream tag with
+  zero local edits; a pytest plugin starts an embedded server and points
+  pymongo's `DB_IP`/`DB_PORT` at it.
+- [Go-driver validation report](docs/validation-report-go.md) —
+  same shape against **mongo-go-driver's own test suite, unmodified**.
+  Spawns a standalone SecantusDB daemon and runs `go test` with
+  `MONGODB_URI` pointed at it. The Go driver is what `mongodump` /
+  `mongorestore` / `mongosh` and most non-Python tooling are built on,
+  so this gauge catches type-strict wire bugs (int32 vs int64) that
+  pymongo accepts silently.
 
 ## Development
 
