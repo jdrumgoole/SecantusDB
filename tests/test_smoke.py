@@ -11,7 +11,7 @@ def test_version_string_set() -> None:
 
 
 def test_server_binds_ephemeral_port() -> None:
-    with SecantusDBServer(host="127.0.0.1", port=0) as server:
+    with SecantusDBServer(host="127.0.0.1", port=0, storage_path=":memory:") as server:
         host, port = server.address
         assert host == "127.0.0.1"
         assert port > 0
@@ -20,6 +20,6 @@ def test_server_binds_ephemeral_port() -> None:
 
 
 def test_uri_property_uses_bound_address() -> None:
-    with SecantusDBServer(host="127.0.0.1", port=0) as server:
+    with SecantusDBServer(host="127.0.0.1", port=0, storage_path=":memory:") as server:
         host, port = server.address
         assert server.uri == f"mongodb://{host}:{port}/"

@@ -1,12 +1,15 @@
 # Examples
 
 Each example below runs end-to-end against an embedded `SecantusDBServer`.
-The server starts on an OS-assigned port (`port=0`) and uses an in-memory
-WiredTiger store, so you can copy any snippet into a `python` session or
-test file and it will work without external setup.
 
-The running theme is a small wine-cellar app — bottles, regions, vintages —
-that exercises the operations a real test suite tends to drive.
+Snippets use `port=0, storage_path=":memory:"` so each one is
+self-contained: an OS-assigned port avoids collisions, and the in-memory
+store leaves nothing behind on disk. **Production usage is on-disk and
+single-port** — drop `storage_path` (defaults to `./secantus-data`) and
+pick a fixed port like `27117`. See [Quickstart](quickstart.md) for the
+real-usage shape.
+
+The running theme is a small wine-cellar app — bottles, regions, vintages.
 
 ## Connect
 
@@ -14,7 +17,7 @@ that exercises the operations a real test suite tends to drive.
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     client = MongoClient(server.uri)
     db = client["wine_cellar"]
     print(db.command("ping"))   # {'ok': 1.0}
@@ -30,7 +33,7 @@ WiredTiger cleanup, and the `:memory:` temp directory.
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
 
     one = bottles.insert_one(
@@ -64,7 +67,7 @@ which index was used.
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
 
     # Single-field ascending.
@@ -102,7 +105,7 @@ For TTL indexes (`expireAfterSeconds`) and the full picker semantics, see
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
     bottles.insert_many(
         [
@@ -154,7 +157,7 @@ with SecantusDBServer(port=0) as server:
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
     bottles.insert_one({"_id": 1, "name": "Pommard 2018", "drunk": False})
 
@@ -175,7 +178,7 @@ with SecantusDBServer(port=0) as server:
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     client = MongoClient(server.uri)
     cellar = client["wine_cellar"]
     cellar["bottles"].insert_one({"name": "Pommard 2018"})
@@ -208,7 +211,7 @@ from secantus import SecantusDBServer
 
 @pytest.fixture
 def db():
-    with SecantusDBServer(port=0) as server:
+    with SecantusDBServer(port=0, storage_path=":memory:") as server:
         client = MongoClient(server.uri)
         try:
             yield client["wine_cellar"]
@@ -234,16 +237,19 @@ def test_index_picks_correctly(db):
 
 ## Persistent storage
 
-All examples above use `:memory:` storage (the default). For a persistent
-WiredTiger home — useful for ad-hoc inspection or cross-process scenarios:
+All examples above explicitly request `:memory:` so each snippet is
+independent. The actual default is on-disk at `./secantus-data`. To use
+a different on-disk location:
 
 ```python
 from secantus import SecantusDBServer
 
-server = SecantusDBServer(host="127.0.0.1", port=27117, storage_path="/tmp/cellar-data")
+# Drop the storage_path arg entirely to get the default ./secantus-data,
+# or pass any directory path. Created on first run, reopened intact later.
+server = SecantusDBServer(host="127.0.0.1", port=27117, storage_path="/var/lib/cellar")
 server.start()
 try:
-    # ... server is now persistent at /tmp/cellar-data ...
+    # ... server is now persistent at /var/lib/cellar ...
     pass
 finally:
     server.stop()

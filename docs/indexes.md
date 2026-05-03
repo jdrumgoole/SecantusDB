@@ -144,7 +144,7 @@ prune itself.
 from secantus import SecantusDBServer
 import datetime as dt
 
-with SecantusDBServer(port=0) as server:
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     client = MongoClient(server.uri)
     coll = client["db"]["events"]
     coll.create_index("createdAt", expireAfterSeconds=60)

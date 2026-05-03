@@ -25,7 +25,8 @@ replica sets and sharding are out of scope by design.
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+# On-disk by default at ./secantus-data; pass storage_path=":memory:" for ephemeral.
+with SecantusDBServer(port=27117) as server:
     client = MongoClient(server.uri)
     db = client["mydb"]
     db["users"].insert_one({"_id": 1, "name": "Joe"})
@@ -91,7 +92,9 @@ docs](https://secantusdb.readthedocs.io/en/latest/examples.html).
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+# Ephemeral here so the snippet is self-contained; the production default
+# is on-disk at ./secantus-data — drop storage_path or set a real path.
+with SecantusDBServer(port=0, storage_path=":memory:") as server:
     client = MongoClient(server.uri)
     cellar = client["wine_cellar"]
     bottles = cellar["bottles"]

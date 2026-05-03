@@ -18,12 +18,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=27117)
     parser.add_argument(
         "--storage-path",
-        default=":memory:",
+        default="./secantus-data",
         metavar="PATH",
         help=(
-            "WiredTiger home directory (default: ':memory:'). Pass a real "
-            "directory path to make the daemon persistent across restarts; "
-            "the directory is created if missing and reopened intact later."
+            "WiredTiger home directory (default: './secantus-data'). Created "
+            "if missing; reopened intact across restarts. Pass ':memory:' "
+            "for an ephemeral temp dir cleaned up on shutdown (test mode)."
         ),
     )
     parser.add_argument(

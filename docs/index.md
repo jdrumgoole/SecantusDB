@@ -25,17 +25,18 @@ of scope by design — so it stays simple, fast, and easy to embed.
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=0) as server:
+# On-disk by default at ./secantus-data; ":memory:" for ephemeral.
+with SecantusDBServer(port=27117) as server:
     client = MongoClient(server.uri)
     db = client["mydb"]
     db["users"].insert_one({"_id": 1, "name": "Joe"})
     assert db["users"].find_one({"_id": 1})["name"] == "Joe"
 ```
 
-That's it. No `mongod` to install, no port conflicts, no test isolation
-gymnastics — every `SecantusDBServer(port=0)` gets its own OS-assigned port
-and its own `:memory:` WiredTiger storage, so suites run cleanly under
-`pytest-xdist`.
+That's it. No `mongod` to install. The on-disk store keeps your data
+across restarts; for tests, swap in `port=0, storage_path=":memory:"`
+so each `SecantusDBServer` instance gets an OS-assigned port and an
+ephemeral WiredTiger home — suites then run cleanly under `pytest-xdist`.
 
 ## What's in scope
 

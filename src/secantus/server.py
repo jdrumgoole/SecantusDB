@@ -41,7 +41,7 @@ class SecantusDBServer:
         self,
         host: str = "127.0.0.1",
         port: int = 0,
-        storage_path: str = ":memory:",
+        storage_path: str = "./secantus-data",
     ) -> None:
         self.host = host
         self.port = port
