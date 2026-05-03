@@ -36,27 +36,40 @@ rollback. If your test depends on those, run a real `mongod`.
 
 ## Installation
 
-`secantus` requires Python 3.12+ and depends on the
-[`wiredtiger`](https://pypi.org/project/wiredtiger/) PyPI package, which
-ships as source. `pip install secantus` triggers a from-source build that
-needs `cmake`, `ninja`, and `swig` on `PATH`.
-
 ```bash
-# macOS
-brew install cmake ninja swig
-pip install secantus
-
-# Linux (Debian/Ubuntu)
-sudo apt-get install -y cmake ninja-build swig
-pip install secantus
-
-# Linux (Fedora/RHEL)
-sudo dnf install -y cmake ninja-build swig
 pip install secantus
 ```
 
-Windows isn't validated. See [Installation](docs/installation.md) for full
-details and dev-install instructions.
+Pre-built wheels are published for CPython **3.12** and **3.13** on:
+
+- macOS arm64 (Apple Silicon)
+- Linux x86_64 and aarch64 (manylinux2014 / glibc, and musllinux_1_2 / Alpine)
+- Windows AMD64
+
+macOS Intel (x86_64) is not in the wheel matrix; use a from-source
+install if you need it.
+
+WiredTiger is vendored inside the wheel — no separate package, no
+compile step, no system build tools required.
+
+### Building from source (unsupported platforms only)
+
+If your platform isn't in the matrix above, `pip install secantus`
+falls back to the sdist and compiles WiredTiger from source. That
+needs three native build tools on `PATH`:
+
+- **`cmake`** (>= 3.21)
+- **`ninja`**
+- **`swig`** (>= 4.0)
+
+| Platform | Install prerequisites |
+|---|---|
+| macOS (Homebrew) | `brew install cmake ninja swig` |
+| Debian/Ubuntu | `sudo apt-get install -y cmake ninja-build swig` |
+| Fedora/RHEL | `sudo dnf install -y cmake ninja-build swig` |
+| Alpine | `apk add --no-cache cmake ninja swig build-base` |
+
+See [Installation](docs/installation.md) for dev-install instructions.
 
 ## Documentation
 

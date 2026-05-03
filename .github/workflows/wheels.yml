@@ -1,0 +1,67 @@
+name: Build wheels
+
+on:
+  # Tag-triggered release builds belong to publish.yml (which also publishes).
+  # wheels.yml is the on-demand / continuous-validation matrix.
+  push:
+    branches:
+      - main  # Catch wheel regressions before they reach a tag.
+  workflow_dispatch:  # Manual ad-hoc trigger.
+
+jobs:
+  build_wheels:
+    name: Build ${{ matrix.platform }} wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-x86_64 (macos-13 runners) is not supported. The runner
+          # queue is too scarce for reliable CI, and Apple Silicon is the
+          # active development target.
+          - os: macos-14
+            platform: macos-arm64
+            cibw_archs: arm64
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            cibw_archs: x86_64
+          - os: ubuntu-22.04-arm
+            platform: linux-aarch64
+            cibw_archs: aarch64
+          - os: windows-2022
+            platform: windows-x86_64
+            cibw_archs: AMD64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheels with cibuildwheel
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+
+  build_sdist:
+    name: Build sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz

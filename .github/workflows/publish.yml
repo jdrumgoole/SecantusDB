@@ -6,16 +6,16 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
 jobs:
-  build:
+  # Fail-fast guard: refuse to publish a tag that doesn't agree with
+  # pyproject's version. Cheap to run; gates the matrix below so a
+  # mistake doesn't burn 15+ minutes of cibuildwheel time.
+  verify_tag:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
-
-      - name: Set up Python
-        run: uv python install 3.12
 
       - name: Verify tag matches project version
         run: |
@@ -26,16 +26,72 @@ jobs:
             exit 1
           fi
 
-      - name: Build distribution
-        run: uv build
+  # Same matrix and config as wheels.yml. Keeping them in sync by
+  # convention rather than abstraction — GitHub Actions doesn't have
+  # a clean "import job from another workflow" primitive, and a
+  # cibuildwheel matrix is short enough to duplicate. wheels.yml
+  # remains for on-demand iteration via workflow_dispatch.
+  build_wheels:
+    needs: verify_tag
+    name: Build ${{ matrix.platform }} wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-x86_64 intentionally absent — see wheels.yml comment.
+          - os: macos-14
+            platform: macos-arm64
+            cibw_archs: arm64
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            cibw_archs: x86_64
+          - os: ubuntu-22.04-arm
+            platform: linux-aarch64
+            cibw_archs: aarch64
+          - os: windows-2022
+            platform: windows-x86_64
+            cibw_archs: AMD64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheels with cibuildwheel
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+
+  build_sdist:
+    needs: verify_tag
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build sdist
+        run: uv build --sdist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/
+          name: sdist
+          path: dist/*.tar.gz
 
+  # PyPI trusted-publisher: bound on the PyPI side to this repo +
+  # workflow filename (publish.yml) + environment (pypi). Don't rename
+  # the file or change the environment without re-binding on PyPI.
   publish:
-    needs: build
+    needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -43,10 +99,13 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all wheel and sdist artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: dist
           path: dist/
+          merge-multiple: true
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
