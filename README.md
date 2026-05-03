@@ -153,7 +153,11 @@ and open `docs/_build/html/index.html`. Highlights:
 - [Compatibility](docs/compatibility.md) — the divergences you should know
   about before you trust SecantusDB for a given test.
 - [Validation report](docs/validation-report.md) — per-category pass / fail
-  / skip rate from running pymongo's own test suite against SecantusDB.
+  / skip rate from running **pymongo's own test suite, unmodified**, against
+  SecantusDB. The submodule at `vendor/pymongo-tests/` is checked out at the
+  pinned upstream tag with zero local edits; the integration is entirely
+  external (a pytest plugin that starts an embedded server and points
+  pymongo's `DB_IP`/`DB_PORT` at it).
 
 ## Development
 

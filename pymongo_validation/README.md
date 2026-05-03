@@ -1,10 +1,17 @@
 # pymongo-validation
 
-Runs (a curated subset of) pymongo's own test suite against an embedded
-`SecantusDBServer` and emits a markdown report at
+Runs **(a curated subset of) pymongo's own test suite, unmodified**,
+against an embedded `SecantusDBServer` and emits a markdown report at
 `docs/validation-report.md` showing pass / fail / skip per category.
 The pass rate is the most honest "how close is SecantusDB to a complete
 MongoDB surrogate" number we can publish.
+
+The submodule at `vendor/pymongo-tests/` is checked out at the pinned
+upstream tag with zero local edits — `git diff HEAD` inside the
+submodule is empty. The integration is entirely external (this
+directory's pytest plugin), so the validation runs **the same tests
+pymongo runs in its own CI**, just pointed at our embedded server
+instead of an orchestration-managed `mongod`.
 
 ## How to run
 

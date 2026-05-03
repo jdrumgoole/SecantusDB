@@ -40,4 +40,6 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 
 ## How this is generated
 
-`pymongo_validation/plugin.py` starts an embedded `SecantusDBServer(host='127.0.0.1', port=0, storage_path=':memory:')` in `pytest_configure`, sets `DB_IP` + `DB_PORT` env vars (the seam pymongo's test bootstrap reads), then pytest collects and runs the in-scope test paths defined in `pymongo_validation/include_paths.py`. Tests gated on replica-set / sharding / auth / TLS / encryption topology self-skip — those skips are honest gaps, not failures.
+**pymongo's tests are run unmodified.** The submodule at `vendor/pymongo-tests/` is checked out at the pinned upstream tag with zero local edits — `git diff HEAD` inside the submodule is empty. The integration is entirely external: `pymongo_validation/plugin.py` starts an embedded `SecantusDBServer(host='127.0.0.1', port=0, storage_path=':memory:')` in `pytest_configure` and writes the bound host/port into `DB_IP` + `DB_PORT` — the env vars pymongo's own `helpers_shared.py` reads at import time. Pytest then collects and runs the in-scope test paths defined in `pymongo_validation/include_paths.py`.
+
+Tests gated on replica-set / sharding / auth / TLS / encryption topology self-skip — those skips are honest gaps, not failures. The pass rate above is therefore a meaningful conformance number: those are pymongo's actual tests, exercising SecantusDB the same way they exercise a real `mongod` in pymongo's CI.
