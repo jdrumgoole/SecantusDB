@@ -1,0 +1,111 @@
+"""End-to-end mongosh smoke against an embedded SecantusDB.
+
+mongosh is the official MongoDB shell — Node.js-based, built on
+mongo-node-driver. Like mongodump/mongorestore (Go-driver-based),
+it's a real third-party client that exercises wire-protocol
+compatibility independent of pymongo's permissiveness. Round-tripping
+through it proves the surface real users hit isn't quietly broken.
+
+The test skips gracefully if `mongosh` isn't on PATH so it doesn't
+break local runs without it (CI image must install it explicitly).
+
+Two-direction round-trip:
+  - mongosh writes, pymongo reads.
+  - pymongo writes, mongosh reads (output parsed from JSON).
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+
+import pytest
+from pymongo import MongoClient
+
+from secantus import SecantusDBServer
+
+MONGOSH = shutil.which("mongosh")
+
+pytestmark = pytest.mark.skipif(
+    MONGOSH is None,
+    reason="mongosh not on PATH (install MongoDB Shell)",
+)
+
+
+def _run_mongosh(uri: str, eval_script: str) -> str:
+    """Run a one-shot mongosh script and return stdout (stripped)."""
+    assert MONGOSH is not None  # narrowed by skipif
+    result = subprocess.run(
+        [MONGOSH, uri, "--quiet", "--eval", eval_script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return result.stdout.strip()
+
+
+def test_mongosh_writes_pymongo_reads() -> None:
+    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+        # mongosh inserts.
+        out = _run_mongosh(
+            f"{server.uri}wine_cellar",
+            'JSON.stringify(db.bottles.insertOne({_id: 1, name: "Pommard 2018", year: 2018}))',
+        )
+        # mongosh's JSON.stringify wraps Long/ObjectId types specially; we
+        # only need confirmation the insert acknowledged.
+        assert "acknowledged" in out
+
+        # pymongo reads back.
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            doc = client["wine_cellar"]["bottles"].find_one({"_id": 1})
+            assert doc == {"_id": 1, "name": "Pommard 2018", "year": 2018}
+        finally:
+            client.close()
+
+
+def test_pymongo_writes_mongosh_reads() -> None:
+    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+        # pymongo inserts.
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            client["wine_cellar"]["bottles"].insert_many(
+                [
+                    {"_id": 1, "name": "Pommard 2018", "year": 2018},
+                    {"_id": 2, "name": "Brunello 2015", "year": 2015},
+                ]
+            )
+        finally:
+            client.close()
+
+        # mongosh reads back via JSON.stringify.
+        out = _run_mongosh(
+            f"{server.uri}wine_cellar",
+            "JSON.stringify(db.bottles.find({}).sort({_id: 1}).toArray())",
+        )
+        docs = json.loads(out)
+        assert docs == [
+            {"_id": 1, "name": "Pommard 2018", "year": 2018},
+            {"_id": 2, "name": "Brunello 2015", "year": 2015},
+        ]
+
+
+def test_mongosh_index_round_trip() -> None:
+    """mongosh's createIndex + listIndexes round-trip through SecantusDB."""
+    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+        out = _run_mongosh(
+            f"{server.uri}wine_cellar",
+            (
+                'db.bottles.insertOne({_id: 1, year: 2018}); '
+                'db.bottles.createIndex({year: 1}); '
+                'JSON.stringify(db.bottles.getIndexes().map(i => i.name))'
+            ),
+        )
+        # Last line of stdout is the JSON.stringify result; createIndex
+        # may print intermediate output, so parse the last `[...]` line.
+        last_json = [line for line in out.splitlines() if line.startswith("[")][-1]
+        names = json.loads(last_json)
+        assert "_id_" in names
+        assert "year_1" in names
