@@ -19,6 +19,9 @@ htmlcov/
 
 docs/_build/
 
+# pymongo-validation pytest-json-report raw output (regenerated each run).
+.validation/
+
 .DS_Store
 .idea/
 .vscode/

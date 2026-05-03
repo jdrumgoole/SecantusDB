@@ -1,3 +1,6 @@
 [submodule "vendor/wiredtiger"]
 	path = vendor/wiredtiger
 	url = https://github.com/wiredtiger/wiredtiger.git
+[submodule "vendor/pymongo-tests"]
+	path = vendor/pymongo-tests
+	url = https://github.com/mongodb/mongo-python-driver.git

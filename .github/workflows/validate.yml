@@ -1,0 +1,60 @@
+name: Validate (pymongo conformance)
+
+# Runs the vendored pymongo test suite against an embedded SecantusDB
+# and regenerates docs/validation-report.md. Slow (~1-2 min on a fresh
+# WT build) so this is NOT on every push — it runs weekly on Monday and
+# can be triggered manually.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Monday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # pulls vendor/wiredtiger AND vendor/pymongo-tests
+
+      - name: Install swig
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --extra dev   # builds vendored WT, installs pytest-json-report
+
+      - name: Run validation
+        run: uv run python -m invoke validate
+
+      - name: Show report summary
+        run: head -50 docs/validation-report.md
+
+      # If the report changed, open a PR rather than committing directly to
+      # main — keeps a human in the loop on coverage shifts.
+      - name: Open PR if report changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet docs/validation-report.md; then
+            echo "No change to docs/validation-report.md."
+            exit 0
+          fi
+          branch="validation-report-$(date +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add docs/validation-report.md
+          git commit -m "Refresh pymongo validation report"
+          git push -u origin "$branch"
+          gh pr create \
+            --title "Refresh pymongo validation report" \
+            --body "Automated weekly refresh of \`docs/validation-report.md\`. Inspect the per-category numbers for regressions or new pass-rate wins."

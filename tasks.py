@@ -61,6 +61,53 @@ def docs_serve(c: Context, port: int = 8000) -> None:
 
 
 @task
+def validate(c: Context) -> None:
+    """Run pymongo's vendored test suite against an embedded SecantusDB.
+
+    Generates docs/validation-report.md with a per-category pass / fail /
+    skip / pass-rate breakdown — the "MongoDB compatibility" gauge.
+    """
+    import pathlib
+
+    from pymongo_validation.include_paths import INCLUDE
+
+    if not pathlib.Path("vendor/pymongo-tests/test").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    paths = " ".join(INCLUDE)
+    # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
+    # `-p no:xdist -o addopts=`: pymongo's tests aren't xdist-safe (shared DBs);
+    #   override the project-wide `addopts="-n auto"` from pyproject.toml.
+    # `-p pymongo_validation.plugin`: load our embedded-server bootstrap.
+    # `--continue-on-collection-errors`: a collection failure in one file
+    #   shouldn't abort the whole run — we want every category measured.
+    # `-c pyproject.toml` forces pytest to use OUR config; without it pytest
+    # picks up vendor/pymongo-tests/pyproject.toml (closer to the test files)
+    # which has options for plugins we don't load (pytest-asyncio etc).
+    # `-o addopts= -o testpaths=`: clear the project-wide xdist + tests/ scoping
+    # from our pyproject; this run uses positional paths.
+    # PYTHONPATH=. so pytest can import our `pymongo_validation` plugin.
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m pytest "
+        "-c pyproject.toml "
+        "-o addopts= -o testpaths= "
+        "-p no:cacheprovider -p no:xdist -p pymongo_validation.plugin "
+        "--continue-on-collection-errors "
+        "--json-report --json-report-file=.validation/raw.json "
+        f"--no-header --tb=no -q {paths}",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m pymongo_validation.generate_report "
+        ".validation/raw.json docs/validation-report.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report.md")
+
+
+@task
 def clean(c: Context) -> None:
     c.run(
         "rm -rf build dist *.egg-info .pytest_cache .ruff_cache "

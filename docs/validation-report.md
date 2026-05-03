@@ -1,0 +1,43 @@
+# pymongo Validation Report
+
+Generated 2026-05-03 — SecantusDB 0.2.0a4 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+
+Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
+
+## Summary by category
+
+| Category | Passed | Failed | Errored | Skipped | Total | Pass rate |
+|---|---:|---:|---:|---:|---:|---:|
+| `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
+| `test_bson.py` | 86 | 0 | 0 | 2 | 88 | 100.0% |
+| `test_bson_corpus.py` | 31 | 0 | 0 | 0 | 31 | 100.0% |
+| `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
+| `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
+| `test_collection.py` | 86 | 0 | 0 | 5 | 91 | 100.0% |
+| `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
+| `test_command_monitoring.py` | 32 | 0 | 0 | 6 | 38 | 100.0% |
+| `test_comment.py` | 0 | 0 | 1 | 2 | 3 | 0.0% |
+| `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
+| `test_crud_unified.py` | 336 | 0 | 0 | 150 | 486 | 100.0% |
+| `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
+| `test_cursor.py` | 59 | 0 | 0 | 13 | 72 | 100.0% |
+| `test_custom_types.py` | 39 | 0 | 0 | 12 | 51 | 100.0% |
+| `test_database.py` | 34 | 0 | 0 | 2 | 36 | 100.0% |
+| `test_dbref.py` | 8 | 0 | 4 | 0 | 12 | 66.7% |
+| `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
+| `test_default_exports.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
+| `test_errors.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
+| `test_examples.py` | 14 | 0 | 0 | 6 | 20 | 100.0% |
+| `test_json_util.py` | 24 | 0 | 0 | 0 | 24 | 100.0% |
+| `test_objectid.py` | 15 | 0 | 0 | 0 | 15 | 100.0% |
+| `test_operations.py` | 2 | 0 | 0 | 0 | 2 | 100.0% |
+| `test_raw_bson.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
+| `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
+| `test_run_command.py` | 14 | 0 | 0 | 7 | 21 | 100.0% |
+| `test_son.py` | 11 | 0 | 0 | 0 | 11 | 100.0% |
+| `test_timestamp.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
+| **Overall** | **931** | **0** | **5** | **209** | **1145** | **99.5%** |
+
+## How this is generated
+
+`pymongo_validation/plugin.py` starts an embedded `SecantusDBServer(host='127.0.0.1', port=0, storage_path=':memory:')` in `pytest_configure`, sets `DB_IP` + `DB_PORT` env vars (the seam pymongo's test bootstrap reads), then pytest collects and runs the in-scope test paths defined in `pymongo_validation/include_paths.py`. Tests gated on replica-set / sharding / auth / TLS / encryption topology self-skip — those skips are honest gaps, not failures.

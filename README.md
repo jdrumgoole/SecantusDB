@@ -152,6 +152,8 @@ and open `docs/_build/html/index.html`. Highlights:
   expression operators.
 - [Compatibility](docs/compatibility.md) — the divergences you should know
   about before you trust SecantusDB for a given test.
+- [Validation report](docs/validation-report.md) — per-category pass / fail
+  / skip rate from running pymongo's own test suite against SecantusDB.
 
 ## Development
 

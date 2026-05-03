@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",
+    "pytest-json-report>=1.5",  # for pymongo-validation report generation
     "invoke>=2.2",
     "ruff>=0.6",
     "sphinx>=7.2",
@@ -47,6 +48,14 @@ sdist.exclude = [
     "vendor/wiredtiger/test/**",
     "vendor/wiredtiger/bench/**",
     "vendor/wiredtiger/examples/**",
+    # pymongo-validation is a dev-only fixture: pymongo's tests live as a
+    # git submodule (Apache-2.0; we don't redistribute), and our adapter
+    # code is invoked locally via `invoke validate`. Neither belongs in
+    # the wheel or the sdist.
+    "vendor/pymongo-tests/**",
+    "pymongo_validation/**",
+    "pymongo-validation/**",
+    ".validation/**",
 ]
 
 [tool.cibuildwheel]
