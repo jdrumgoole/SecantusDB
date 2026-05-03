@@ -3,6 +3,7 @@
 [![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
 [![License: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue)](LICENSE)
 [![Python: 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
+[![Documentation Status](https://readthedocs.org/projects/secantusdb/badge/?version=latest)](https://secantusdb.readthedocs.io/en/latest/)
 
 A **surrogate single-node MongoDB server** in Python. SecantusDB speaks the
 subset of the MongoDB wire protocol that

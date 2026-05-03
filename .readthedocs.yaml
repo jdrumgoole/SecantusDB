@@ -1,17 +1,32 @@
+# Read the Docs build configuration.
+# https://docs.readthedocs.com/platform/stable/config-file/v2.html
+
 version: 2
 
 build:
   os: ubuntu-22.04
   tools:
     python: "3.12"
+  jobs:
+    # The vendored WiredTiger source lives in vendor/wiredtiger as a
+    # git submodule. Without this, scikit-build-core's CMake configure
+    # fails because vendor/wiredtiger/ is empty.
+    post_checkout:
+      - git submodule update --init --recursive
+
+sphinx:
+  configuration: docs/conf.py
+  # Match the local `invoke docs` build (uses -W). Catches drift
+  # between docs and code on RTD before it ships to readers.
+  fail_on_warning: true
 
 python:
   install:
     - method: pip
       path: .
+      # `dev` extras pull sphinx, myst-parser, furo. Installing the
+      # project itself triggers a full WT build (~3-5 min on the
+      # RTD container) so autodoc can import secantus and introspect
+      # the classes referenced from docs/api.md.
       extra_requirements:
         - dev
-
-sphinx:
-  configuration: docs/conf.py
-  fail_on_warning: false
