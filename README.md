@@ -1,9 +1,18 @@
 # SecantusDB
 
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](#alpha-software)
 [![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
 [![License: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue)](LICENSE)
 [![Python: 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![Documentation Status](https://readthedocs.org/projects/secantusdb/badge/?version=latest)](https://secantusdb.readthedocs.io/en/latest/)
+
+> [!WARNING]
+> **Alpha software — not for production use.** <a id="alpha-software"></a>
+>
+> SecantusDB is in early development. The API surface and on-disk format
+> can change between point releases. It exists today as a developer tool
+> for exercising application code against a MongoDB-shaped surrogate; it
+> is **not** a database for storing data you can't recreate.
 
 A **surrogate single-node MongoDB server** in Python. SecantusDB speaks the
 subset of the MongoDB wire protocol that
@@ -71,6 +80,61 @@ needs three native build tools on `PATH`:
 | Alpine | `apk add --no-cache cmake ninja swig build-base` |
 
 See [Installation](docs/installation.md) for dev-install instructions.
+
+## Examples
+
+A walk through the operations a typical test exercises — connect, insert,
+index, query, drop. Full version with explanations: [examples in the
+docs](https://secantusdb.readthedocs.io/en/latest/examples.html).
+
+```python
+from pymongo import MongoClient
+from secantus import SecantusDBServer
+
+with SecantusDBServer(port=0) as server:
+    client = MongoClient(server.uri)
+    cellar = client["wine_cellar"]
+    bottles = cellar["bottles"]
+
+    # --- Insert ---
+    bottles.insert_one(
+        {"_id": 1, "name": "Pommard 2018", "region": "Burgundy", "year": 2018}
+    )
+    bottles.insert_many(
+        [
+            {"_id": 2, "name": "Brunello 2015", "region": "Tuscany", "year": 2015},
+            {"_id": 3, "name": "Barolo 2017", "region": "Piedmont", "year": 2017},
+            {"_id": 4, "name": "Pommard 2020", "region": "Burgundy", "year": 2020},
+        ]
+    )
+
+    # --- Indexes ---
+    bottles.create_index([("year", 1)])                     # single-field
+    bottles.create_index([("region", 1), ("year", -1)])     # compound
+
+    # --- Query ---
+    drinkable_now = list(
+        bottles.find({"year": {"$lte": 2018}}).sort("year")
+    )
+    assert [b["name"] for b in drinkable_now] == [
+        "Brunello 2015",
+        "Barolo 2017",
+        "Pommard 2018",
+    ]
+
+    by_region = list(
+        bottles.aggregate(
+            [
+                {"$group": {"_id": "$region", "count": {"$sum": 1}}},
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+
+    # --- Drop ---
+    bottles.drop()                              # one collection
+    client.drop_database("wine_cellar")         # whole database
+```
 
 ## Documentation
 

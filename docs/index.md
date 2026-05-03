@@ -1,5 +1,14 @@
 # SecantusDB
 
+:::{warning}
+**Alpha software — not for production use.**
+
+SecantusDB is in early development. The API surface and on-disk format
+can change between point releases. It exists today as a developer tool
+for exercising application code against a MongoDB-shaped surrogate; it
+is **not** a database for storing data you can't recreate.
+:::
+
 A **surrogate single-node MongoDB server** in Python. SecantusDB speaks the
 subset of the MongoDB wire protocol that
 [`pymongo`](https://pymongo.readthedocs.io/en/stable/) emits, so application
@@ -65,6 +74,7 @@ usage, not the database's clustering or auth.
 - [Installation](installation.md) — `pip install` and the WiredTiger build
   prerequisites.
 - [Quickstart](quickstart.md) — embedding in tests, running standalone.
+- [Examples](examples.md) — connect, insert, index, query, drop.
 - [Architecture](architecture.md) — wire / commands / query / aggregate /
   storage layers.
 - [Indexes](indexes.md) — single-field, compound, mixed-direction, partial,
@@ -87,6 +97,7 @@ which is itself GPL-2/GPL-3, so the combined work is GPL.
 
 installation
 quickstart
+examples
 architecture
 indexes
 aggregation
