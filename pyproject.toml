@@ -53,7 +53,14 @@ sdist.exclude = [
 build = "cp312-* cp313-*"
 skip = ["*-win32", "*-manylinux_i686", "pp*"]
 build-verbosity = 1
-test-command = "python -c \"import secantus, wiredtiger; print(secantus.__name__, wiredtiger.wiredtiger_version())\""
+# Real smoke tests against the installed wheel: server bind, pymongo
+# handshake (hello/ping/serverInfo), unknown-command resilience. A broken
+# wheel that imports cleanly but mishandles requests fails here, not
+# silently in the user's pip install. pytest-xdist is needed because
+# pyproject.toml's [tool.pytest.ini_options] addopts="-n auto" is picked
+# up when pytest walks up from {project}/tests/.
+test-requires = ["pytest", "pytest-xdist"]
+test-command = "pytest -v {project}/tests/test_smoke.py {project}/tests/test_pymongo_smoke.py"
 
 [tool.cibuildwheel.linux]
 # manylinux x86_64 + aarch64 + musllinux x86_64 + aarch64; install swig in
