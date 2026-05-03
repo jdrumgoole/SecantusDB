@@ -800,7 +800,7 @@ def _stage_coll_stats(
     out: dict[str, Any] = {
         "ns": f"{ctx.db_name}.{ctx.coll_name}",
         "host": "secantus",
-        "localTime": _dt.datetime.now(_dt.UTC),
+        "localTime": _dt.datetime.now(_dt.timezone.utc),
     }
     spec = spec if isinstance(spec, Mapping) else {}
     if "storageStats" in spec:

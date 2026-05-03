@@ -69,13 +69,13 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "isWritablePrimary": True,
         "ismaster": True,
         "topologyVersion": {
-            "processId": bson.ObjectId.from_datetime(_dt.datetime.now(_dt.UTC)),
+            "processId": bson.ObjectId.from_datetime(_dt.datetime.now(_dt.timezone.utc)),
             "counter": bson.Int64(0),
         },
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
         "maxMessageSizeBytes": MAX_MESSAGE_SIZE,
         "maxWriteBatchSize": 100_000,
-        "localTime": _dt.datetime.now(_dt.UTC),
+        "localTime": _dt.datetime.now(_dt.timezone.utc),
         "logicalSessionTimeoutMinutes": 30,
         "connectionId": bson.Int64(ctx.connection_id),
         "minWireVersion": 0,
@@ -98,9 +98,9 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "electionId": bson.ObjectId("7fffffff0000000000000001"),
                 "lastWrite": {
                     "opTime": {"ts": cluster_time, "t": 1},
-                    "lastWriteDate": _dt.datetime.now(_dt.UTC),
+                    "lastWriteDate": _dt.datetime.now(_dt.timezone.utc),
                     "majorityOpTime": {"ts": cluster_time, "t": 1},
-                    "majorityWriteDate": _dt.datetime.now(_dt.UTC),
+                    "majorityWriteDate": _dt.datetime.now(_dt.timezone.utc),
                 },
             }
         )
@@ -173,7 +173,7 @@ def _whatsmyuri(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
 def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     return {
         "system": {
-            "currentTime": _dt.datetime.now(_dt.UTC),
+            "currentTime": _dt.datetime.now(_dt.timezone.utc),
             "hostname": "secantus",
             "cpuAddrSize": 64,
             "memSizeMB": 0,
@@ -195,7 +195,7 @@ def _server_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]
         "uptime": 0,
         "uptimeMillis": 0,
         "uptimeEstimate": 0,
-        "localTime": _dt.datetime.now(_dt.UTC),
+        "localTime": _dt.datetime.now(_dt.timezone.utc),
         "ok": 1.0,
     }
 

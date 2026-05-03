@@ -215,12 +215,12 @@ def _apply_op(
         for path, opts in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 if opts is True:
-                    set_path(doc, concrete, _dt.datetime.now(_dt.UTC))
+                    set_path(doc, concrete, _dt.datetime.now(_dt.timezone.utc))
                     continue
                 if isinstance(opts, Mapping):
                     kind = opts.get("$type")
                     if kind == "date":
-                        set_path(doc, concrete, _dt.datetime.now(_dt.UTC))
+                        set_path(doc, concrete, _dt.datetime.now(_dt.timezone.utc))
                         continue
                     if kind == "timestamp":
                         import time as _time

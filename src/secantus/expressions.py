@@ -924,7 +924,7 @@ def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
     if not isinstance(name, str):
         raise ExpressionError(f"timezone must be a string, got {type(name).__name__}")
     if name in ("UTC", "GMT", "Etc/UTC", "Etc/GMT"):
-        return _dt.UTC
+        return _dt.timezone.utc
     if name and name[0] in ("+", "-"):
         sign = 1 if name[0] == "+" else -1
         digits = name[1:].replace(":", "")
@@ -975,7 +975,7 @@ def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
     tz = _resolve_timezone(arg.get("timezone"))
     if tz is not None:
         # Naive input is treated as UTC, matching MongoDB's BSON Date semantics.
-        d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.UTC)
+        d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
         d = d_aware.astimezone(tz)
     out = fmt
     if "%L" in out:
@@ -1159,7 +1159,7 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, str):
             return _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
         if isinstance(value, (int, float)):
-            return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.UTC)
+            return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.timezone.utc)
     elif code in (16, 18):
         if isinstance(value, bool):
             return 1 if value else 0

@@ -424,7 +424,7 @@ class Storage:
             if "ts" not in entry_with_ts:
                 entry_with_ts["ts"] = self._mint_ts()
             if "wall" not in entry_with_ts:
-                entry_with_ts["wall"] = _dt.datetime.now(_dt.UTC)
+                entry_with_ts["wall"] = _dt.datetime.now(_dt.timezone.utc)
             op_cur[seq] = bson.encode(entry_with_ts)
             if pre is not None:
                 if pre_cur is None:
@@ -1340,9 +1340,9 @@ class Storage:
             ttl_indexes.append((name, field, float(ttl)))
         if not ttl_indexes:
             return 0
-        when = now if now is not None else _dt.datetime.now(_dt.UTC)
+        when = now if now is not None else _dt.datetime.now(_dt.timezone.utc)
         if when.tzinfo is None:
-            when = when.replace(tzinfo=_dt.UTC)
+            when = when.replace(tzinfo=_dt.timezone.utc)
         pruned = 0
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
@@ -1361,7 +1361,7 @@ class Storage:
                     value = get_path(doc, field)
                     if not isinstance(value, _dt.datetime):
                         continue
-                    value_aware = value if value.tzinfo else value.replace(tzinfo=_dt.UTC)
+                    value_aware = value if value.tzinfo else value.replace(tzinfo=_dt.timezone.utc)
                     if (when - value_aware).total_seconds() > ttl_seconds:
                         expired = True
                         break
