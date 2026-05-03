@@ -11,8 +11,10 @@ from secantus.server import SecantusDBServer
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="secantus",
-        description="Fake MongoDB server speaking the pymongo wire protocol.",
+        description=(
+            "Run a SecantusDB standalone single-node MongoDB server "
+            "speaking the pymongo wire protocol."
+        ),
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=27117)

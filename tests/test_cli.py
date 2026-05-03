@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from secantus.cli import build_parser
 
 
@@ -39,3 +41,12 @@ def test_all_flags_together() -> None:
     assert args.port == 27018
     assert args.storage_path == "/tmp/secantus-data"
     assert args.log_level == "DEBUG"
+
+
+def test_console_scripts_declared() -> None:
+    # Both `secantusdb` (primary, matches PyPI dist) and `secantus`
+    # (legacy alias) must be wired to the same entry point.
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    text = pyproject.read_text()
+    assert 'secantusdb = "secantus.cli:main"' in text
+    assert 'secantus = "secantus.cli:main"' in text

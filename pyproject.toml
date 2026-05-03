@@ -30,6 +30,10 @@ dev = [
 ]
 
 [project.scripts]
+# `secantusdb` is the primary console script, matching the PyPI distribution
+# name. `secantus` is kept as a shorter legacy alias — both invoke the same
+# entry point and start a standalone single-node server.
+secantusdb = "secantus.cli:main"
 secantus = "secantus.cli:main"
 
 [build-system]
