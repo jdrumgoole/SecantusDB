@@ -48,6 +48,7 @@ _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
 _OPLOG_TABLE = "table:secantus_oplog"
 _PREIMAGE_TABLE = "table:secantus_preimages"
 _OPLOG_META_TABLE = "table:secantus_oplog_meta"
+_USERS_TABLE = "table:secantus_users"
 
 _OPLOG_PRUNE_INTERVAL = 1000  # call prune_oplog every N emits
 
@@ -262,6 +263,7 @@ class Storage:
             boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
+            boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
         finally:
             boot.close()
 
@@ -622,6 +624,78 @@ class Storage:
                 pre_del.remove()
             pre_del.reset()
         return len(doomed)
+
+    # --- Users (auth) ---
+
+    def add_user(
+        self,
+        db: str,
+        username: str,
+        record: Mapping[str, Any],
+        *,
+        replace: bool = False,
+    ) -> bool:
+        """Persist a user record. Returns True if added; False if it already
+        existed and ``replace=False``.
+
+        ``record`` is a BSON-encodable dict of arbitrary shape (the
+        commands layer owns the structure). Stored verbatim.
+        """
+        with self._lock:
+            c = self._cursor(_USERS_TABLE)
+            c.set_key(db, username)
+            if c.search() == 0 and not replace:
+                return False
+            c.reset()
+            c[db, username] = bson.encode(dict(record))
+            return True
+
+    def get_user(self, db: str, username: str) -> dict[str, Any] | None:
+        with self._lock:
+            c = self._cursor(_USERS_TABLE)
+            c.set_key(db, username)
+            if c.search() != 0:
+                return None
+            blob = bytes(c.get_value())
+            return bson.decode(blob) if blob else None
+
+    def drop_user(self, db: str, username: str) -> bool:
+        with self._lock:
+            c = self._cursor(_USERS_TABLE)
+            c.set_key(db, username)
+            if c.search() != 0:
+                return False
+            c.remove()
+            return True
+
+    def list_users(
+        self,
+        db: str | None = None,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Paginated user listing. ``db=None`` lists across all databases."""
+        if limit <= 0 or limit > 1000:
+            limit = 1000
+        out: list[dict[str, Any]] = []
+        with self._lock:
+            c = self._cursor(_USERS_TABLE)
+            rc = c.next()
+            seen = 0
+            while rc == 0:
+                k = c.get_key()
+                row_db = k[0]
+                if db is None or row_db == db:
+                    if seen >= skip:
+                        blob = bytes(c.get_value())
+                        if blob:
+                            out.append(bson.decode(blob))
+                        if len(out) >= limit:
+                            break
+                    seen += 1
+                rc = c.next()
+        return out
 
     def close(self) -> None:
         with self._lock:

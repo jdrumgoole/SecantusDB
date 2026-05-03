@@ -58,8 +58,17 @@ a real query planner with **index acceleration** — single-field,
 compound, mixed-direction, partial, TTL, sort — proper `explain` output
 (`IXSCAN` vs `COLLSCAN`), and a hash-join `$lookup`.
 
-What's **out of scope:** real replica sets, sharding, authentication
-(SCRAM / x509 / LDAP), TLS, text / geo / wildcard indexes, `$where`,
+**Authentication**: SCRAM-SHA-256 — MongoDB's default since 4.0 — is
+implemented end-to-end on the wire. Off by default; flip on with
+`secantusdb --auth` (or `SecantusDBServer(..., require_auth=True)`),
+provision users with `createUser`, then connect with the standard
+`MongoClient(uri, username=, password=)` shape. See
+[Authentication](docs/authentication.md). Authorization (RBAC), x509,
+LDAP, Kerberos, and TLS are *not* implemented — an authenticated
+principal is currently treated as fully privileged.
+
+What's **out of scope:** real replica sets, sharding, RBAC, x509 /
+LDAP / Kerberos auth, TLS, text / geo / wildcard indexes, `$where`,
 real transaction rollback. If you need those, run a real `mongod`.
 
 ## Installation

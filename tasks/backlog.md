@@ -36,6 +36,20 @@ Specific items that were left out of the slice that introduced their feature are
 - [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for numeric ranges (`bounds: "full"` / `[min, max]`, `partitionByFields`); date densify (`unit: "day" | "hour" | ...`) is deferred — needs date-arithmetic step iteration that isn't a one-line addition.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
 
+### Authentication
+
+SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
+
+- [ ] **Authorization (RBAC)** — `createUser` accepts a `roles` array and persists it, but no command enforces roles or privileges. An authenticated principal is treated as fully privileged. Real role enforcement needs a per-handler privilege-set check + builtin role definitions (`root`, `readWrite`, `read`, `dbAdmin`, `userAdmin`, ...) + `grantRolesToUser` / `revokeRolesFromUser` / `rolesInfo` / custom `createRole`.
+- [ ] **`updateUser`** — not implemented. Today: drop + recreate. Real `updateUser` rotates passwords without invalidating other connections.
+- [ ] **SCRAM-SHA-1** — legacy mechanism. Modern drivers default to SCRAM-SHA-256 since pymongo 3.7 / driver-spec 2018; we only advertise the modern one. Add if a downstream tool insists on SHA-1.
+- [ ] **SASLprep (RFC 4013)** password normalisation — passwords go to PBKDF2 as raw UTF-8 with no normalisation. ASCII passwords work byte-identically against real `mongod`; non-ASCII (combining marks, full-width digits, etc.) may diverge from a SASLprepping client's expectation.
+- [ ] **Speculative authentication** — pymongo / mongo-go-driver can fold the first SCRAM round-trip into the `hello` reply via `speculativeAuthenticate`. Not implemented; the explicit two-round-trip path works fine but adds one RTT to connection setup.
+- [ ] **x509 / LDAP / Kerberos / GSSAPI / MONGODB-AWS / MONGODB-OIDC** — alternative mechanisms. Out of scope for the first auth slice.
+- [ ] **Internal cluster auth (keyfile / x509)** — only meaningful with replica sets / sharding, both out of scope.
+- [ ] **`system.users` collection visibility** — credentials live in a dedicated WT table (`secantus_users`), not surfaced via `find` / `aggregate` on `admin.system.users`. Tools that poke at the system collection won't see them; use `usersInfo` instead.
+- [ ] **`system.version` `authSchema`** — not maintained. Tools that read the auth-schema version will get nothing.
+
 ### Change-stream limitations
 
 Single-node change streams are implemented and conformant for typical pymongo `watch()` flows, but the following are deferred or intentionally diverge from real `mongod`:
@@ -54,7 +68,7 @@ Single-node change streams are implemented and conformant for typical pymongo `w
 These are explicit non-goals. Don't add them without a reason.
 
 - **Real replica sets / sharding** — depend on cluster topology and cross-node consistency. SecantusDB advertises `setName: "secantus"` to satisfy pymongo's change-stream topology check, but the topology is fictional — there are no other members, no elections, no cross-node oplog. Change streams are still in scope (single-node, oplog-backed); see `## 3. Deferred work / Change-stream limitations`.
-- **Authentication** (SCRAM-SHA-256, x509, LDAP, Kerberos) — production auth is not the test-harness concern. `connectionStatus` returns an empty `authInfo` so clients that probe see "no auth required."
+- ~~Authentication (SCRAM-SHA-256)~~ — implemented. `--auth` (CLI) / `require_auth=True` (constructor) gates non-handshake commands behind a successful `saslStart`/`saslContinue` round-trip. Provision users via `createUser`; manage with `dropUser` / `usersInfo`. The remaining auth gaps are tracked under `## 3. Deferred work / Authentication` below.
 - **TLS / SSL** — same reason.
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told the server doesn't support compression; nothing to do.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes) — would need a full-text index implementation.

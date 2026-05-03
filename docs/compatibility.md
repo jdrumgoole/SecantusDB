@@ -12,7 +12,7 @@ response is fabricated.
 | Command | Behaviour |
 | --- | --- |
 | `serverStatus` | Version + zeroed metrics (uptime, connections) |
-| `connectionStatus` | Empty `authInfo` (no auth implemented) |
+| `connectionStatus` | Real `authenticatedUsers` (from SCRAM-SHA-256). `authenticatedUserRoles` / `authenticatedUserPrivileges` are empty (RBAC not enforced — see [Authentication](authentication.md)) |
 | `hostInfo` / `whatsmyuri` / `buildInfo` | Hardcoded values; `buildInfo.version` is `"7.0.0"` |
 | `getLog` | Empty log array |
 | `startSession` / `endSessions` / `refreshSessions` | `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced |
@@ -93,8 +93,15 @@ These are explicit non-goals:
 - **Replica sets / sharding** — depend on multi-node cluster topology.
   SecantusDB is single-process. (Change streams *are* supported —
   oplog-backed and single-node — see [Change streams](change-streams.md).)
-- **Authentication** (SCRAM-SHA-256, x509, LDAP, Kerberos).
-- **TLS / SSL.**
+- **Authentication mechanisms beyond SCRAM-SHA-256** — x509, LDAP,
+  Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC. SCRAM-SHA-256 itself
+  *is* implemented; SCRAM-SHA-1 is not advertised (modern drivers
+  default to SHA-256). See [Authentication](authentication.md).
+- **Authorization (RBAC)** — `createUser` accepts a `roles` array but
+  no command consults it. An authenticated principal is treated as
+  fully privileged.
+- **TLS / SSL.** SCRAM credentials therefore travel in plaintext —
+  use only on a trusted network.
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told
   the server doesn't support compression.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes).

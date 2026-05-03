@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from typing import Self
 
+from secantus.auth import ConnectionAuth
 from secantus.commands import CommandContext, dispatch
 from secantus.cursors import CursorRegistry
 from secantus.storage import Storage
@@ -47,10 +48,12 @@ class SecantusDBServer:
         storage_path: str = "./secantus-data",
         *,
         replica_set_name: str | None = "secantus",
+        require_auth: bool = False,
     ) -> None:
         self.host = host
         self.port = port
         self.replica_set_name = replica_set_name
+        self.require_auth = require_auth
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -117,6 +120,7 @@ class SecantusDBServer:
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         connection_id = next(self._connection_ids)
         reply_ids = itertools.count(1)
+        connection_auth = ConnectionAuth()
         logger.debug("client %d connected from %s", connection_id, addr)
         try:
             with conn:
@@ -143,6 +147,8 @@ class SecantusDBServer:
                             db_name=body.get("$db", "admin"),
                             server_address=server_addr,
                             replica_set_name=self.replica_set_name,
+                            connection_auth=connection_auth,
+                            require_auth=self.require_auth,
                         )
                         response_doc = dispatch(body, ctx)
                         reply = build_op_msg_reply(
@@ -158,6 +164,8 @@ class SecantusDBServer:
                             db_name=_db_from_namespace(op.full_collection_name),
                             server_address=server_addr,
                             replica_set_name=self.replica_set_name,
+                            connection_auth=connection_auth,
+                            require_auth=self.require_auth,
                         )
                         response_doc = dispatch(op.query, ctx)
                         reply = build_op_reply(

@@ -9,6 +9,15 @@ from typing import Any
 import bson
 
 from secantus.aggregate import PipelineContext, apply_pipeline
+from secantus.auth import (
+    SCRAM_SHA_256,
+    AuthError,
+    ConnectionAuth,
+    StoredCredentials,
+    begin_scram,
+    continue_scram,
+    derive_credentials,
+)
 from secantus.cursors import CursorNotFound, CursorRegistry
 from secantus.projection import apply_projection
 from secantus.storage import Storage
@@ -28,6 +37,8 @@ class CommandContext:
     db_name: str = "admin"
     server_address: tuple[str, int] | None = None
     replica_set_name: str | None = None
+    connection_auth: ConnectionAuth | None = None
+    require_auth: bool = False
 
 
 def _split_into_cursor(
@@ -49,7 +60,7 @@ def _split_into_cursor(
 CommandHandler = Callable[[dict[str, Any], CommandContext], dict[str, Any]]
 
 
-def _hello(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # `topologyVersion.counter` and `connectionId` MUST be int64 on the wire.
     # pymongo accepts either, but the official Go driver (mongodump/restore,
     # mongo-go-driver) refuses the handshake with "expected 'counter' to be
@@ -93,6 +104,17 @@ def _hello(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 },
             }
         )
+    # saslSupportedMechs: drivers pass `saslSupportedMechs: "<db>.<user>"`
+    # to discover which mechanisms they should attempt for that principal.
+    # We always advertise SCRAM-SHA-256 (the modern MongoDB default); older
+    # SCRAM-SHA-1 is intentionally not offered.
+    sasl_mechs_for = doc.get("saslSupportedMechs")
+    if isinstance(sasl_mechs_for, str):
+        response["saslSupportedMechs"] = [SCRAM_SHA_256]
+    if ctx.require_auth:
+        # Tell the client this server has access control on so it knows
+        # to treat the connection as needing auth before commands flow.
+        response["accessControlEnabled"] = True
     return response
 
 
@@ -178,10 +200,14 @@ def _server_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]
     }
 
 
-def _connection_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _connection_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    principals = ctx.connection_auth.authenticated_principals if ctx.connection_auth else []
     return {
         "authInfo": {
-            "authenticatedUsers": [],
+            "authenticatedUsers": [{"user": user, "db": db} for db, user in principals],
+            # RBAC isn't implemented; an authenticated user is treated as
+            # fully privileged. Surface an empty role/privilege list — most
+            # clients only check authenticatedUsers.
             "authenticatedUserRoles": [],
             "authenticatedUserPrivileges": [],
         },
@@ -1062,6 +1088,249 @@ def _aggregate_change_stream(
     }
 
 
+# --- Authentication (SCRAM-SHA-256) ---
+
+# MongoDB error codes used in this section.
+_AUTHENTICATION_FAILED = 18
+_USER_NOT_FOUND = 11
+_USER_ALREADY_EXISTS = 51003
+_NO_SUCH_USER_GENERIC = 11
+_AUTH_NOT_REQUIRED = "Auth not required by server configuration"
+
+
+def _auth_failure(msg: str = "Authentication failed.") -> dict[str, Any]:
+    return {
+        "ok": 0.0,
+        "errmsg": msg,
+        "code": _AUTHENTICATION_FAILED,
+        "codeName": "AuthenticationFailed",
+    }
+
+
+def _payload_bytes(value: Any) -> bytes:
+    """SCRAM payload arrives as BSON Binary; getter handles both Binary and bytes."""
+    if isinstance(value, bson.Binary):
+        return bytes(value)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    return b""
+
+
+def _payload_binary(b: bytes) -> bson.Binary:
+    return bson.Binary(b, subtype=0)
+
+
+def _ensure_conn_auth(ctx: CommandContext) -> ConnectionAuth:
+    if ctx.connection_auth is None:
+        # Should never happen in production paths — server.py always
+        # constructs one. Fail closed.
+        raise RuntimeError("connection auth state missing")
+    return ctx.connection_auth
+
+
+def _lookup_creds(storage: Storage, db: str, username: str) -> StoredCredentials | None:
+    record = storage.get_user(db, username)
+    if record is None:
+        return None
+    creds_doc = record.get("credentials")
+    if not isinstance(creds_doc, dict) or SCRAM_SHA_256 not in creds_doc:
+        return None
+    return StoredCredentials.from_doc(creds_doc)
+
+
+def _sasl_start(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    conn = _ensure_conn_auth(ctx)
+    mechanism = doc.get("mechanism", "")
+    if mechanism != SCRAM_SHA_256:
+        return _auth_failure(
+            f"Unsupported SASL mechanism: {mechanism!r} (only {SCRAM_SHA_256} is supported)"
+        )
+    payload = _payload_bytes(doc.get("payload"))
+    db_name = ctx.db_name or "admin"
+    creds = _lookup_creds(ctx.storage, db_name, _peek_scram_username(payload))
+    try:
+        server_first, state = begin_scram(
+            conversation_id=conn.new_conversation_id(),
+            db_name=db_name,
+            payload=payload,
+            creds=creds,
+        )
+    except AuthError as exc:
+        return _auth_failure(str(exc))
+    conn.scram = state
+    return {
+        "conversationId": state.conversation_id,
+        "done": False,
+        "payload": _payload_binary(server_first),
+        "ok": 1.0,
+    }
+
+
+def _peek_scram_username(payload: bytes) -> str:
+    """Best-effort SCRAM `n=user` extraction for credential lookup.
+
+    A malformed payload returns "" here, which makes ``_lookup_creds``
+    return None, which makes ``begin_scram`` fabricate credentials and
+    surface AuthError on the proof step — same shape as a wrong-password
+    attempt. Reusing the parser keeps the lookup path single-source.
+    """
+    if not payload.startswith(b"n,"):
+        return ""
+    gs2_end = payload.find(b",", 2)
+    if gs2_end < 0:
+        return ""
+    bare = payload[gs2_end + 1 :]
+    for chunk in bare.split(b","):
+        if chunk.startswith(b"n="):
+            return chunk[2:].decode("utf-8", errors="replace")
+    return ""
+
+
+def _sasl_continue(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    conn = _ensure_conn_auth(ctx)
+    state = conn.scram
+    if state is None:
+        return _auth_failure("No SCRAM conversation in progress")
+    incoming_id = doc.get("conversationId")
+    if incoming_id != state.conversation_id:
+        return _auth_failure("SCRAM conversation id mismatch")
+    payload = _payload_bytes(doc.get("payload"))
+    try:
+        server_final = continue_scram(state, payload)
+    except AuthError as exc:
+        conn.scram = None
+        return _auth_failure(str(exc))
+    # Successful proof. Mark the principal authenticated and clear the
+    # in-flight conversation. MongoDB returns done=True from the second
+    # server message (skipping the spec's optional 3rd round-trip).
+    principal = (state.db_name, state.username)
+    if principal not in conn.authenticated_principals:
+        conn.authenticated_principals.append(principal)
+    conn.scram = None
+    return {
+        "conversationId": state.conversation_id,
+        "done": True,
+        "payload": _payload_binary(server_final),
+        "ok": 1.0,
+    }
+
+
+def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    username = doc.get("createUser")
+    pwd = doc.get("pwd")
+    if not isinstance(username, str) or not username:
+        return {
+            "ok": 0.0,
+            "errmsg": "createUser: username (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if not isinstance(pwd, str) or not pwd:
+        return {
+            "ok": 0.0,
+            "errmsg": "createUser: pwd (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    creds = derive_credentials(pwd)
+    roles = doc.get("roles", []) or []
+    record = {
+        "_id": f"{db_name}.{username}",
+        "user": username,
+        "db": db_name,
+        "credentials": creds.to_doc(),
+        "roles": list(roles),
+        "mechanisms": [SCRAM_SHA_256],
+    }
+    added = ctx.storage.add_user(db_name, username, record, replace=False)
+    if not added:
+        return {
+            "ok": 0.0,
+            "errmsg": f'User "{username}@{db_name}" already exists',
+            "code": _USER_ALREADY_EXISTS,
+            "codeName": "Location51003",
+        }
+    return {"ok": 1.0}
+
+
+def _drop_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    username = doc.get("dropUser")
+    if not isinstance(username, str) or not username:
+        return {
+            "ok": 0.0,
+            "errmsg": "dropUser: username (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    removed = ctx.storage.drop_user(db_name, username)
+    if not removed:
+        return {
+            "ok": 0.0,
+            "errmsg": f"User '{username}@{db_name}' not found",
+            "code": _USER_NOT_FOUND,
+            "codeName": "UserNotFound",
+        }
+    # Drop any active auth state for this principal on the calling
+    # connection. Other connections keep theirs until they reconnect —
+    # matches mongod's behaviour.
+    conn = ctx.connection_auth
+    if conn is not None:
+        conn.authenticated_principals = [
+            p for p in conn.authenticated_principals if p != (db_name, username)
+        ]
+    return {"ok": 1.0}
+
+
+def _users_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    db_name = ctx.db_name or "admin"
+    arg = doc.get("usersInfo")
+    show_credentials = bool(doc.get("showCredentials", False))
+
+    def _public(record: dict[str, Any]) -> dict[str, Any]:
+        out = dict(record)
+        if not show_credentials:
+            out.pop("credentials", None)
+        return out
+
+    users: list[dict[str, Any]]
+    if arg == 1 or arg is True:
+        # All users in this database.
+        users = [_public(r) for r in ctx.storage.list_users(db_name)]
+    elif isinstance(arg, str):
+        record = ctx.storage.get_user(db_name, arg)
+        users = [_public(record)] if record else []
+    elif isinstance(arg, dict):
+        # `{user: "name", db: "other"}` — single specific principal.
+        u = arg.get("user")
+        d = arg.get("db", db_name)
+        if isinstance(u, str) and isinstance(d, str):
+            record = ctx.storage.get_user(d, u)
+            users = [_public(record)] if record else []
+        else:
+            users = []
+    elif isinstance(arg, list):
+        users = []
+        for entry in arg:
+            if isinstance(entry, str):
+                record = ctx.storage.get_user(db_name, entry)
+            elif isinstance(entry, dict):
+                u = entry.get("user")
+                d = entry.get("db", db_name)
+                if isinstance(u, str) and isinstance(d, str):
+                    record = ctx.storage.get_user(d, u)
+                else:
+                    record = None
+            else:
+                record = None
+            if record is not None:
+                users.append(_public(record))
+    else:
+        users = []
+    return {"users": users, "ok": 1.0}
+
+
 _HANDLERS: dict[str, CommandHandler] = {
     "hello": _hello,
     "isMaster": _hello,
@@ -1103,7 +1372,31 @@ _HANDLERS: dict[str, CommandHandler] = {
     "killCursors": _kill_cursors,
     "getMore": _get_more,
     "aggregate": _aggregate,
+    "saslStart": _sasl_start,
+    "saslContinue": _sasl_continue,
+    "createUser": _create_user,
+    "dropUser": _drop_user,
+    "usersInfo": _users_info,
 }
+
+# Commands a connection may invoke before authenticating, when
+# require_auth=True. The handshake plus the auth handshake itself.
+_PRE_AUTH_COMMANDS = frozenset(
+    {
+        "hello",
+        "isMaster",
+        "ismaster",
+        "ping",
+        "buildInfo",
+        "buildinfo",
+        "saslStart",
+        "saslContinue",
+        "endSessions",
+        "getLog",
+        "whatsmyuri",
+        "hostInfo",
+    }
+)
 
 
 def command_name(doc: dict[str, Any]) -> str:
@@ -1119,6 +1412,17 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "errmsg": f"no such command: '{name}'",
             "code": 59,
             "codeName": "CommandNotFound",
+        }
+    if (
+        ctx.require_auth
+        and name not in _PRE_AUTH_COMMANDS
+        and (ctx.connection_auth is None or not ctx.connection_auth.is_authenticated)
+    ):
+        return {
+            "ok": 0.0,
+            "errmsg": (f"command {name} requires authentication"),
+            "code": 13,
+            "codeName": "Unauthorized",
         }
     try:
         return handler(doc, ctx)

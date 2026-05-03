@@ -93,6 +93,12 @@ Everything a single-node application or test driver needs from the wire:
 - Change streams — single-node, oplog-backed; collection / db / cluster
   scope; resume tokens; `fullDocument: "updateLookup"`; pre-images via
   `fullDocumentBeforeChange`; blocking `awaitData` getMore.
+- **Authentication** — SCRAM-SHA-256 over the standard wire protocol,
+  with `createUser` / `dropUser` / `usersInfo` admin commands and
+  per-connection state. Off by default; flip on with `--auth` /
+  `require_auth=True`. See [Authentication](authentication.md).
+  (Authorization / RBAC is *not* enforced — an authenticated principal
+  is treated as fully privileged.)
 
 See [Indexes](indexes.md) and [Aggregation](aggregation.md) for the full
 inventory, and [Compatibility](compatibility.md) for what's intentionally
@@ -104,7 +110,12 @@ Anything that depends on **real** cluster topology — multi-node replica
 sets, sharding, election, cross-node oplog — and anything tangential to
 test-harness use:
 
-- Authentication (SCRAM / x509 / LDAP / Kerberos).
+- Authentication mechanisms beyond SCRAM-SHA-256 (x509, LDAP, Kerberos,
+  GSSAPI, MONGODB-AWS, MONGODB-OIDC). SCRAM-SHA-256 itself **is**
+  supported — see [Authentication](authentication.md).
+- Authorization (RBAC) — `createUser` accepts a `roles` array but no
+  command consults it; an authenticated principal is treated as fully
+  privileged.
 - TLS / SSL.
 - Text search and geo indexes.
 - `$where` (no JS runtime).
@@ -129,6 +140,8 @@ usage, not the database's clustering or auth.
   operators.
 - [Change streams](change-streams.md) — `watch()` against SecantusDB,
   resume tokens, pre-images, retention.
+- [Authentication](authentication.md) — SCRAM-SHA-256, `--auth`,
+  `createUser` / `dropUser` / `usersInfo`.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
 - [API reference](api.md) — `SecantusDBServer`, `Storage`, public surface.
 
@@ -150,6 +163,7 @@ architecture
 indexes
 aggregation
 change-streams
+authentication
 compatibility
 validation-report
 validation-report-go

@@ -33,6 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--auth",
+        action="store_true",
+        help=(
+            "Require SCRAM-SHA-256 authentication for non-handshake commands. "
+            "Provision users by connecting once without auth and running "
+            "createUser, then restart with --auth. Off by default."
+        ),
+    )
     return parser
 
 
@@ -43,7 +52,12 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    server = SecantusDBServer(host=args.host, port=args.port, storage_path=args.storage_path)
+    server = SecantusDBServer(
+        host=args.host,
+        port=args.port,
+        storage_path=args.storage_path,
+        require_auth=args.auth,
+    )
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:
         server.stop()
