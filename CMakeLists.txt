@@ -69,6 +69,12 @@ ExternalProject_Add(wiredtiger_ext
         -DWITH_PIC=ON
         -DENABLE_SHARED=OFF
         -DENABLE_PYTHON=ON
+        # We don't ship WT's C++ test harness. It also has missing-include
+        # bugs that gcc 10 (manylinux devtoolset) tolerated but the modern
+        # gcc on musllinux rejects ('std::string' undeclared without an
+        # explicit #include <string>). Skipping the whole target avoids
+        # both the build cost and the per-toolchain compatibility risk.
+        -DENABLE_CPPSUITE=OFF
         -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
     BUILD_BYPRODUCTS
         ${WT_BINARY_DIR}/lang/python/${WT_PYEXT_NAME}
