@@ -181,7 +181,13 @@ def validate_java(c: Context) -> None:
     """
     import pathlib
 
-    if not pathlib.Path("vendor/mongo-java-driver/gradlew").exists():
+    # The driver pulls in MongoDB driver-spec test data via a nested
+    # submodule (testing/resources/specifications) — without it the
+    # bson corpus / vector tests fail with `initializationError` on
+    # missing JSON files. Same pattern as the go-driver gauge.
+    if not pathlib.Path("vendor/mongo-java-driver/gradlew").exists() or not pathlib.Path(
+        "vendor/mongo-java-driver/testing/resources/specifications/source"
+    ).is_dir():
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)

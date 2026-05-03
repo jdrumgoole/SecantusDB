@@ -24,6 +24,7 @@ Run via `uv run python -m invoke validate-java`.
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -68,10 +69,37 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    # The driver pins gradle 8.12 (caps at JDK 23) and its buildSrc
+    # toolchain requires `languageVersion=17` exactly — JDK 21 / 25 won't
+    # substitute. Prefer JDK 17 if installed; fall back to 21 with a
+    # warning (works for `:bson:test` itself, fails on toolchain query in
+    # buildSrc). CI sets JAVA_HOME via actions/setup-java to JDK 17 so
+    # this auto-detection only kicks in for local runs.
+    java_home_override: str | None = None
+    if not os.environ.get("JAVA_HOME"):
+        for candidate in (
+            "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
+            "/usr/lib/jvm/java-17-openjdk-amd64",
+            "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home",
+            "/usr/lib/jvm/java-21-openjdk-amd64",
+        ):
+            if Path(candidate).is_dir():
+                java_home_override = candidate
+                break
     if not VENDOR.is_dir() or not (VENDOR / "gradlew").is_file():
         print(
             f"vendor/mongo-java-driver/ missing or not initialised "
             f"({VENDOR}); run `git submodule update --init --recursive`",
+            file=sys.stderr,
+        )
+        return 2
+    if not (VENDOR / "testing" / "resources" / "specifications" / "source").is_dir():
+        print(
+            "vendor/mongo-java-driver/testing/resources/specifications/ is empty "
+            "(nested submodule). Run `git submodule update --init --recursive` "
+            "from the repo root — without the spec data the bson-corpus and "
+            "binary-vector tests fail with `initializationError` on missing files.",
             file=sys.stderr,
         )
         return 2
@@ -105,6 +133,15 @@ def main() -> int:
             f"-Dorg.mongodb.test.uri={uri}",
             *INCLUDE,
         ]
+        env = os.environ.copy()
+        if java_home_override:
+            env["JAVA_HOME"] = java_home_override
+            env["PATH"] = f"{java_home_override}/bin:" + env.get("PATH", "")
+            print(
+                f"java_validation: using JAVA_HOME={java_home_override} "
+                f"(gradle 8.12 doesn't support JDK 24+)",
+                file=sys.stderr,
+            )
         print(
             f"java_validation: `{' '.join(cmd)}` in {VENDOR} "
             f"(URI={uri})",
@@ -113,7 +150,7 @@ def main() -> int:
         # Gradle returns non-zero on any test failure but still writes the
         # JUnit XML; capture stderr to surface real build errors but don't
         # fail the whole step.
-        proc = subprocess.run(cmd, cwd=VENDOR)
+        proc = subprocess.run(cmd, cwd=VENDOR, env=env)
         gradle_rc = proc.returncode
 
         # Copy JUnit XML out of the source tree to keep our parser simple
