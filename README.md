@@ -7,19 +7,30 @@
 [![Documentation Status](https://readthedocs.org/projects/secantusdb/badge/?version=latest)](https://secantusdb.readthedocs.io/en/latest/)
 
 > [!WARNING]
-> **Alpha software — not for production use.** <a id="alpha-software"></a>
+> **Alpha software.** <a id="alpha-software"></a>
 >
 > SecantusDB is in early development. The API surface and on-disk format
-> can change between point releases. It exists today as a developer tool
-> for exercising application code against a MongoDB-shaped surrogate; it
-> is **not** a database for storing data you can't recreate.
+> can change between point releases. The wire-protocol behaviour and
+> driver compatibility are stabilising — but if you adopt SecantusDB as
+> a single-node `mongod` replacement today, **be prepared to lose
+> on-disk data on upgrade**. Production deployments that need durable
+> data across upgrades should still run a real `mongod`.
 
-A **surrogate single-node MongoDB server** in Python. SecantusDB speaks the
-subset of the MongoDB wire protocol that
-[`pymongo`](https://pymongo.readthedocs.io/en/stable/) emits, so test suites
-can talk to it **instead of** standing up a real `mongod`. No binary to
-install, no port conflicts, parallel-test friendly. Single-node only —
-replica sets and sharding are out of scope by design.
+**Drop-in MongoDB for single-node applications.** SecantusDB is a real
+MongoDB server written in Python: it speaks the MongoDB wire protocol on
+the same TCP socket a `mongod` would, so any standard MongoDB driver or
+tool — [`pymongo`](https://pymongo.readthedocs.io/en/stable/),
+[`mongo-go-driver`](https://github.com/mongodb/mongo-go-driver),
+`mongosh`, `mongodump` / `mongorestore` — connects unchanged. Point a
+`MongoClient` at it and your application code doesn't know the
+difference, as long as the application only needs single-node behaviour.
+No `mongod` to install, no port conflicts, parallel-test friendly,
+embedded or as a standalone daemon (`secantusdb`).
+
+Single-node only by design: replica sets, sharding, and anything that
+depends on real cluster topology are out of scope. Within that
+single-node scope, SecantusDB is the database your driver thinks it's
+talking to — same handshake, same wire frames, same error codes.
 
 ```python
 from pymongo import MongoClient
@@ -35,15 +46,21 @@ with SecantusDBServer(port=27117) as server:
 
 ## What's in scope
 
-The subset of MongoDB that `pymongo` actually drives — connection handshake,
-CRUD, cursors, aggregation, `findAndModify` — backed by a real query
-planner with **index acceleration** (single-field, compound,
-mixed-direction, partial, TTL, sort), proper `explain` output (`IXSCAN`
-vs `COLLSCAN`), and a hash-join `$lookup`.
+Everything a single-node application or test needs from the wire — the
+handshake (`hello` / `isMaster` / `ping` / `buildInfo` / ...), CRUD
+(`insert` / `find` / `update` / `delete` / `findAndModify` / `count` /
+`drop`), cursors with `getMore` / `killCursors`, aggregation pipelines
+and the expression language they need, and **change streams**
+(single-node, oplog-backed; collection / db / cluster scope; resume
+tokens; `fullDocument: "updateLookup"`; pre-images via
+`fullDocumentBeforeChange`; blocking `awaitData` getMore). All backed by
+a real query planner with **index acceleration** — single-field,
+compound, mixed-direction, partial, TTL, sort — proper `explain` output
+(`IXSCAN` vs `COLLSCAN`), and a hash-join `$lookup`.
 
-What's **out of scope:** replica sets, sharding, change streams,
-authentication, TLS, text/geo/wildcard indexes, `$where`, real transaction
-rollback. If your test depends on those, run a real `mongod`.
+What's **out of scope:** real replica sets, sharding, authentication
+(SCRAM / x509 / LDAP), TLS, text / geo / wildcard indexes, `$where`,
+real transaction rollback. If you need those, run a real `mongod`.
 
 ## Installation
 
@@ -81,6 +98,35 @@ needs three native build tools on `PATH`:
 | Alpine | `apk add --no-cache cmake ninja swig build-base` |
 
 See [Installation](docs/installation.md) for dev-install instructions.
+
+## Standalone daemon (drop-in `mongod` replacement)
+
+`pip install` puts a `secantusdb` script on your `PATH`. Run it like
+you'd run `mongod`:
+
+```bash
+secantusdb --host 127.0.0.1 --port 27117
+# storage at ./secantus-data by default; pass --storage-path :memory:
+# for an ephemeral temp dir cleaned up on shutdown.
+```
+
+Then point any MongoDB driver or tool at it — **no application code
+changes**, just the URI:
+
+```bash
+mongosh mongodb://127.0.0.1:27117
+mongodump --uri mongodb://127.0.0.1:27117 --out ./dump
+```
+
+```python
+from pymongo import MongoClient
+client = MongoClient("mongodb://127.0.0.1:27117")  # same code as for mongod
+```
+
+The conformance gauges back this up: pymongo's own test suite and
+mongo-go-driver's own test suite run **unmodified** against SecantusDB —
+see [pymongo validation report](docs/validation-report.md) and
+[Go-driver validation report](docs/validation-report-go.md).
 
 ## Examples
 

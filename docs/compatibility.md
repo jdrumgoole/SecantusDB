@@ -90,8 +90,9 @@ MongoDB's 10-minute cursor TTL). The clock is injectable via
 
 These are explicit non-goals:
 
-- **Replica sets / sharding / change streams** — depend on cluster
-  topology or oplog. SecantusDB is single-process.
+- **Replica sets / sharding** — depend on multi-node cluster topology.
+  SecantusDB is single-process. (Change streams *are* supported —
+  oplog-backed and single-node — see [Change streams](change-streams.md).)
 - **Authentication** (SCRAM-SHA-256, x509, LDAP, Kerberos).
 - **TLS / SSL.**
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told
@@ -102,8 +103,10 @@ These are explicit non-goals:
 - **`$where`** — runs JavaScript. We don't ship a JS runtime.
 - **Capped collections** — fixed-size, FIFO collections.
 - **Profiling** (`setProfilingLevel`, `system.profile` collection).
-- **Tailable / awaitData cursors** — depend on oplog or capped
-  collections.
+- **Tailable cursors on capped collections** — capped collections are
+  out of scope, so tailable-on-capped is too. (The change-stream
+  cursors *are* tailable with `awaitData` blocking against the oplog —
+  see [Change streams](change-streams.md).)
 
 ## Known edge cases
 

@@ -5,7 +5,11 @@ SecantusDB runs in two modes from the same `SecantusDBServer` class:
 - **Embedded** — the server runs on a daemon thread inside your Python
   process. Best when your application owns the database lifetime.
 - **Standalone daemon** — a long-running process that other tools,
-  processes, or language runtimes connect to over TCP.
+  processes, or language runtimes connect to over TCP. **This is the
+  drop-in `mongod` replacement**: any standard MongoDB driver or
+  command-line tool (`pymongo`, `mongo-go-driver`, `mongosh`,
+  `mongodump`, `mongorestore`, ...) connects unchanged — just point
+  the URI at SecantusDB's host:port.
 
 Both modes default to **on-disk storage** at `./secantus-data` so data
 survives restarts. Pass `storage_path=":memory:"` (or `--storage-path
@@ -66,10 +70,12 @@ secantusdb --host 127.0.0.1 --port 27117
 SecantusDB`. The legacy alias `secantus` and the module form
 `python -m secantus` invoke the same entry point.
 
-Then from another shell:
+Then from another shell — same commands you'd run against `mongod`:
 
 ```bash
 mongosh mongodb://127.0.0.1:27117
+mongodump   --uri mongodb://127.0.0.1:27117 --out ./dump
+mongorestore --uri mongodb://127.0.0.1:27117 ./dump
 ```
 
 Or from a Python script connecting to the running daemon:
@@ -79,6 +85,13 @@ from pymongo import MongoClient
 
 client = MongoClient("mongodb://127.0.0.1:27117")
 client["wine_cellar"]["bottles"].insert_one({"_id": 1, "name": "Pommard 2018"})
+```
+
+Or from Go — `mongo-go-driver` works the same way (see the
+[Go-driver validation report](validation-report-go.md)):
+
+```go
+client, _ := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
 ```
 
 CLI flags:
