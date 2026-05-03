@@ -240,7 +240,7 @@ WiredTiger home — useful for ad-hoc inspection or cross-process scenarios:
 ```python
 from secantus import SecantusDBServer
 
-server = SecantusDBServer(host="127.0.0.1", port=27117, db_home="/tmp/cellar-data")
+server = SecantusDBServer(host="127.0.0.1", port=27117, storage_path="/tmp/cellar-data")
 server.start()
 try:
     # ... server is now persistent at /tmp/cellar-data ...
@@ -249,5 +249,5 @@ finally:
     server.stop()
 ```
 
-Reopening the same `db_home` later restores all collections, indexes, and
+Reopening the same `storage_path` later restores all collections, indexes, and
 documents.

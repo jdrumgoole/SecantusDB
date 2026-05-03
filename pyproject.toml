@@ -4,8 +4,8 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.2.0a1"
-description = "A surrogate single-node MongoDB server in Python for testing pymongo applications without running a real mongod."
+version = "0.2.0a2"
+description = "A surrogate single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]

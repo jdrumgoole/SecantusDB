@@ -17,6 +17,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=27117)
     parser.add_argument(
+        "--storage-path",
+        default=":memory:",
+        metavar="PATH",
+        help=(
+            "WiredTiger home directory (default: ':memory:'). Pass a real "
+            "directory path to make the daemon persistent across restarts; "
+            "the directory is created if missing and reopened intact later."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -31,7 +41,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    server = SecantusDBServer(host=args.host, port=args.port)
+    server = SecantusDBServer(
+        host=args.host, port=args.port, storage_path=args.storage_path
+    )
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:
         server.stop()
