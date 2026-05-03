@@ -152,9 +152,16 @@ clustering and infrastructure that `mongod` brings.
 
 ## License
 
-GPL-2.0-only. SecantusDB bundles the
-[WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine,
-which is itself GPL-2/GPL-3, so the combined work is GPL.
+SecantusDB is dual-licensed:
+
+- **Code** — GPL-2.0-only. SecantusDB bundles the
+  [WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine,
+  which is itself GPL-2/GPL-3, so the combined work is GPL.
+- **Written content** — [Creative Commons Attribution 4.0
+  International](https://creativecommons.org/licenses/by/4.0/) (CC-BY
+  4.0). Covers this documentation, the project README, the validation
+  reports, and `pymongo_validation/README.md`. Reuse and adapt freely
+  with attribution.
 
 ```{toctree}
 :maxdepth: 2

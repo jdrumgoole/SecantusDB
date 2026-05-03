@@ -70,3 +70,10 @@ oplog implementation; `hello` advertises a fictional `setName:
 
 Nothing under `pymongo-validation/` or `vendor/pymongo-tests/` ships in
 the SecantusDB wheel or sdist. This is dev-only infrastructure.
+
+## License
+
+This README, like the rest of SecantusDB's written content, is licensed
+[CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). The Python
+code in `plugin.py`, `include_paths.py`, and `generate_report.py` is
+GPL-2.0-only (the project's code license).

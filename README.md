@@ -275,6 +275,14 @@ uv run python -m invoke docs   # build Sphinx docs (warnings as errors)
 
 ## License
 
-GPL-2.0-only. See [`LICENSE`](LICENSE). SecantusDB bundles the
-[WiredTiger](https://github.com/wiredtiger/wiredtiger) storage engine
-(itself GPL-2/GPL-3), so the combined work is GPL.
+SecantusDB is dual-licensed:
+
+- **Code** — GPL-2.0-only. See [`LICENSE`](LICENSE). SecantusDB bundles
+  the [WiredTiger](https://github.com/wiredtiger/wiredtiger) storage
+  engine (itself GPL-2/GPL-3), so the combined work is GPL.
+- **Written content** — [Creative Commons Attribution 4.0
+  International (CC-BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+  See [`LICENSE-DOCS`](LICENSE-DOCS). Covers `README.md`, everything
+  under `docs/`, the validation reports, and `pymongo_validation/README.md`.
+  Operational instructions to AI assistants (`CLAUDE.md`) and vendored
+  third-party content (under `vendor/`) are out of scope.
