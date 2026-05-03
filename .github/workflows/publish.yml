@@ -18,9 +18,13 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Verify tag matches project version
+        # `--no-project` is critical: without it, `uv run` tries to install
+        # the current project (because pyproject.toml is present), which
+        # triggers a full WT build (no submodule, no swig in this job) and
+        # fails before the tag check ever runs.
         run: |
           tag="${GITHUB_REF#refs/tags/v}"
-          pyver=$(uv run python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          pyver=$(uv run --no-project python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
           if [ "$tag" != "$pyver" ]; then
             echo "Tag $tag does not match pyproject version $pyver" >&2
             exit 1
