@@ -3,7 +3,12 @@ name: Publish to PyPI
 on:
   push:
     tags:
+      # Final releases: vX.Y.Z
       - "v[0-9]+.[0-9]+.[0-9]+"
+      # PEP 440 pre-releases: vX.Y.ZaN, vX.Y.ZbN, vX.Y.ZrcN
+      - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+b[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
 
 jobs:
   # Fail-fast guard: refuse to publish a tag that doesn't agree with
