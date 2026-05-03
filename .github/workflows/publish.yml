@@ -39,9 +39,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13
-            platform: macos-x86_64
-            cibw_archs: x86_64
+          # macos-x86_64 intentionally absent — see wheels.yml comment.
           - os: macos-14
             platform: macos-arm64
             cibw_archs: arm64

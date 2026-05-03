@@ -74,7 +74,8 @@ archs = ["x86_64", "aarch64"]
 before-build = "apk add --no-cache swig || dnf install -y swig || yum install -y swig"
 
 [tool.cibuildwheel.macos]
-archs = ["x86_64", "arm64"]
+# arm64 only; x86_64 isn't a supported wheel target.
+archs = ["arm64"]
 before-build = "brew install swig"
 
 [tool.cibuildwheel.windows]

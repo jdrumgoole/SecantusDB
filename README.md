@@ -13,9 +13,12 @@ pip install secantus
 
 Pre-built wheels are published for CPython **3.12** and **3.13** on:
 
-- macOS (x86_64 and arm64)
+- macOS arm64 (Apple Silicon)
 - Linux x86_64 and aarch64 (manylinux2014 / glibc, and musllinux_1_2 / Alpine)
 - Windows AMD64
+
+macOS Intel (x86_64) is not in the wheel matrix; use a from-source
+install if you need it.
 
 WiredTiger is vendored inside the wheel — no separate package, no
 compile step, no system build tools required.
