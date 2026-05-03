@@ -69,13 +69,22 @@ ExternalProject_Add(wiredtiger_ext
         -DWITH_PIC=ON
         -DENABLE_SHARED=OFF
         -DENABLE_PYTHON=ON
-        # We don't ship WT's C++ test harness. It also has missing-include
-        # bugs that gcc 10 (manylinux devtoolset) tolerated but the modern
-        # gcc on musllinux rejects ('std::string' undeclared without an
-        # explicit #include <string>). Skipping the whole target avoids
-        # both the build cost and the per-toolchain compatibility risk.
+        # Belt-and-braces with BUILD_COMMAND below; ENABLE_CPPSUITE=OFF
+        # also short-circuits the configure-time SWIG/Catch2 lookups.
         -DENABLE_CPPSUITE=OFF
         -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
+    # Build only the SWIG Python module (CMake pulls in wiredtiger_static
+    # and the compression-extension shared libs via target dependencies).
+    # WT's tests, benchmarks, examples, and simulator targets stay unbuilt.
+    # That's a faster build and — more importantly — sidesteps missing-#include
+    # bugs in WT's test/bench code that gcc 10 (manylinux's devtoolset)
+    # tolerates but modern gcc on musllinux rejects (e.g. <string>, <cstdint>
+    # transitive includes that libstdc++ 13+ no longer provides for free).
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . --target wiredtiger_python
+    # Our outer install() rules read directly from WT_BINARY_DIR; no need
+    # for WT's own `cmake --install` step. Skipping it also avoids errors
+    # from WT install rules that reference targets we deliberately didn't build.
+    INSTALL_COMMAND ${CMAKE_COMMAND} -E echo "skipping WT install (handled by outer wheel install)"
     BUILD_BYPRODUCTS
         ${WT_BINARY_DIR}/lang/python/${WT_PYEXT_NAME}
         ${WT_BINARY_DIR}/lang/python/wiredtiger/swig_wiredtiger.py
