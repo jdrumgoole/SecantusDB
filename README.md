@@ -37,7 +37,7 @@ from pymongo import MongoClient
 from secantus import SecantusDBServer
 
 # On-disk by default at ./secantus-data; pass storage_path=":memory:" for ephemeral.
-with SecantusDBServer(port=27117) as server:
+with SecantusDBServer(port=27017) as server:
     client = MongoClient(server.uri)
     db = client["mydb"]
     db["users"].insert_one({"_id": 1, "name": "Joe"})
@@ -105,7 +105,7 @@ See [Installation](docs/installation.md) for dev-install instructions.
 you'd run `mongod`:
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27117
+secantusdb --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default; pass --storage-path :memory:
 # for an ephemeral temp dir cleaned up on shutdown.
 ```
@@ -114,13 +114,13 @@ Then point any MongoDB driver or tool at it — **no application code
 changes**, just the URI:
 
 ```bash
-mongosh mongodb://127.0.0.1:27117
-mongodump --uri mongodb://127.0.0.1:27117 --out ./dump
+mongosh mongodb://127.0.0.1:27017
+mongodump --uri mongodb://127.0.0.1:27017 --out ./dump
 ```
 
 ```python
 from pymongo import MongoClient
-client = MongoClient("mongodb://127.0.0.1:27117")  # same code as for mongod
+client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 ```
 
 The conformance gauges back this up: pymongo's own test suite and
@@ -207,10 +207,16 @@ and open `docs/_build/html/index.html`. Highlights:
 - [Go-driver validation report](docs/validation-report-go.md) —
   same shape against **mongo-go-driver's own test suite, unmodified**.
   Spawns a standalone SecantusDB daemon and runs `go test` with
-  `MONGODB_URI` pointed at it. The Go driver is what `mongodump` /
-  `mongorestore` / `mongosh` and most non-Python tooling are built on,
-  so this gauge catches type-strict wire bugs (int32 vs int64) that
-  pymongo accepts silently.
+  `MONGODB_URI` pointed at it. The Go driver underpins `mongodump` /
+  `mongorestore` and most non-Python tooling, so this gauge catches
+  type-strict wire bugs (int32 vs int64) that pymongo accepts silently.
+- [Node-driver validation report](docs/validation-report-node.md) —
+  same shape against **mongo-node-driver's own test suite, unmodified**.
+  Spawns a standalone SecantusDB daemon and runs mocha with
+  `MONGODB_URI` pointed at it. Initial baseline is restricted to
+  the import-clean subset of unit tests because of an unrelated
+  ESM/TypeScript loader quirk in node-mongodb-native v7.2.0; see
+  `node_validation/include_paths.py` for the rationale.
 
 ## Development
 

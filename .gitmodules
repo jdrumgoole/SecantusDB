@@ -7,3 +7,6 @@
 [submodule "vendor/mongo-go-driver"]
 	path = vendor/mongo-go-driver
 	url = https://github.com/mongodb/mongo-go-driver.git
+[submodule "vendor/node-mongodb-native"]
+	path = vendor/node-mongodb-native
+	url = https://github.com/mongodb/node-mongodb-native.git

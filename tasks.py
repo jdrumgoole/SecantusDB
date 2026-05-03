@@ -37,7 +37,7 @@ def fmt(c: Context) -> None:
 
 
 @task
-def serve(c: Context, host: str = "127.0.0.1", port: int = 27117) -> None:
+def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(f"uv run python -m secantus --host {host} --port {port}", pty=True)
 
 
@@ -137,6 +137,35 @@ def validate_go(c: Context) -> None:
         pty=True,
     )
     print("\nWrote docs/validation-report-go.md")
+
+
+@task(name="validate-node")
+def validate_node(c: Context) -> None:
+    """Run mongo-node-driver's tests against an embedded SecantusDB.
+
+    Generates docs/validation-report-node.md with a per-category pass /
+    fail / pending / pass-rate breakdown — the Node-driver analogue of
+    the pymongo and Go-driver gauges. Requires Node.js (>=20) and npm
+    on PATH. First run does a one-time `npm install` (~1-2 min) inside
+    vendor/node-mongodb-native/.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/node-mongodb-native/package.json").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m node_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m node_validation.generate_report "
+        ".validation/node-raw.json docs/validation-report-node.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-node.md")
 
 
 @task

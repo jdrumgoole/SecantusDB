@@ -42,7 +42,7 @@ from pymongo import MongoClient
 from secantus import SecantusDBServer
 
 # On-disk by default at ./secantus-data; ":memory:" for ephemeral.
-with SecantusDBServer(port=27117) as server:
+with SecantusDBServer(port=27017) as server:
     client = MongoClient(server.uri)
     db = client["mydb"]
     db["users"].insert_one({"_id": 1, "name": "Joe"})
@@ -57,20 +57,20 @@ ephemeral WiredTiger home — suites then run cleanly under `pytest-xdist`.
 ## Standalone daemon
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27117
+secantusdb --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default
 ```
 
 Then connect with **any** MongoDB driver or tool, unchanged:
 
 ```bash
-mongosh mongodb://127.0.0.1:27117
-mongodump --uri mongodb://127.0.0.1:27117 --out ./dump
+mongosh mongodb://127.0.0.1:27017
+mongodump --uri mongodb://127.0.0.1:27017 --out ./dump
 ```
 
 ```python
 from pymongo import MongoClient
-client = MongoClient("mongodb://127.0.0.1:27117")  # same code as for mongod
+client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 ```
 
 The conformance evidence: pymongo's own test suite and mongo-go-driver's

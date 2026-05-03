@@ -37,11 +37,19 @@ jobs:
         with:
           go-version: "1.25"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Run pymongo validation
         run: uv run python -m invoke validate
 
       - name: Run go-driver validation
         run: uv run python -m invoke validate-go
+
+      - name: Run node-driver validation
+        run: uv run python -m invoke validate-node
 
       - name: Show report summaries
         run: |
@@ -50,6 +58,9 @@ jobs:
           echo
           echo "=== go-driver ==="
           head -50 docs/validation-report-go.md
+          echo
+          echo "=== node-driver ==="
+          head -50 docs/validation-report-node.md
 
       # If either report changed, open a PR rather than committing directly to
       # main — keeps a human in the loop on coverage shifts.
@@ -57,7 +68,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet docs/validation-report.md docs/validation-report-go.md; then
+          if git diff --quiet docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md; then
             echo "No change to validation reports."
             exit 0
           fi
@@ -65,9 +76,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add docs/validation-report.md docs/validation-report-go.md
-          git commit -m "Refresh validation reports (pymongo + go-driver)"
+          git add docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md
+          git commit -m "Refresh validation reports (pymongo + go + node)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of \`docs/validation-report.md\` and \`docs/validation-report-go.md\`. Inspect the per-category numbers for regressions or new pass-rate wins."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins."

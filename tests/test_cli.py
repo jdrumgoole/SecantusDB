@@ -8,7 +8,7 @@ from secantus.cli import build_parser
 def test_defaults() -> None:
     args = build_parser().parse_args([])
     assert args.host == "127.0.0.1"
-    assert args.port == 27117
+    assert args.port == 27017
     # On-disk default; ":memory:" is opt-in via the same flag.
     assert args.storage_path == "./secantus-data"
     assert args.log_level == "INFO"

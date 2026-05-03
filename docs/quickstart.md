@@ -25,7 +25,7 @@ created on first run and reopened intact on later runs.
 from pymongo import MongoClient
 from secantus import SecantusDBServer
 
-with SecantusDBServer(port=27117) as server:
+with SecantusDBServer(port=27017) as server:
     client = MongoClient(server.uri)
     bottles = client["wine_cellar"]["bottles"]
 
@@ -50,7 +50,7 @@ sees them again.
 For a different on-disk location, pass `storage_path=`:
 
 ```python
-with SecantusDBServer(port=27117, storage_path="/var/lib/cellar") as server:
+with SecantusDBServer(port=27017, storage_path="/var/lib/cellar") as server:
     ...
 ```
 
@@ -62,7 +62,7 @@ connect to it over TCP. Two ways to launch.
 ### CLI
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27117
+secantusdb --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default
 ```
 
@@ -73,9 +73,9 @@ SecantusDB`. The legacy alias `secantus` and the module form
 Then from another shell — same commands you'd run against `mongod`:
 
 ```bash
-mongosh mongodb://127.0.0.1:27117
-mongodump   --uri mongodb://127.0.0.1:27117 --out ./dump
-mongorestore --uri mongodb://127.0.0.1:27117 ./dump
+mongosh mongodb://127.0.0.1:27017
+mongodump   --uri mongodb://127.0.0.1:27017 --out ./dump
+mongorestore --uri mongodb://127.0.0.1:27017 ./dump
 ```
 
 Or from a Python script connecting to the running daemon:
@@ -83,7 +83,7 @@ Or from a Python script connecting to the running daemon:
 ```python
 from pymongo import MongoClient
 
-client = MongoClient("mongodb://127.0.0.1:27117")
+client = MongoClient("mongodb://127.0.0.1:27017")
 client["wine_cellar"]["bottles"].insert_one({"_id": 1, "name": "Pommard 2018"})
 ```
 
@@ -91,7 +91,7 @@ Or from Go — `mongo-go-driver` works the same way (see the
 [Go-driver validation report](validation-report-go.md)):
 
 ```go
-client, _ := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
+client, _ := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
 ```
 
 CLI flags:
@@ -99,7 +99,7 @@ CLI flags:
 | Flag | Default | Notes |
 |---|---|---|
 | `--host` | `127.0.0.1` | bind address |
-| `--port` | `27117` | TCP port (vs MongoDB's default 27017, to avoid clashes) |
+| `--port` | `27017` | TCP port (matches MongoDB's standard so existing tools just work) |
 | `--storage-path` | `./secantus-data` | WiredTiger home; pass `:memory:` for ephemeral |
 | `--log-level` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 
@@ -115,7 +115,7 @@ supervisor, sandbox harness, etc.):
 ```python
 from secantus import SecantusDBServer
 
-server = SecantusDBServer(host="127.0.0.1", port=27117, storage_path="/var/lib/cellar")
+server = SecantusDBServer(host="127.0.0.1", port=27017, storage_path="/var/lib/cellar")
 server.start()       # returns once the listener is bound
 server.wait()        # blocks until server.stop() from another thread / signal
 ```

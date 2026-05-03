@@ -6,7 +6,7 @@ Snippets use `port=0, storage_path=":memory:"` so each one is
 self-contained: an OS-assigned port avoids collisions, and the in-memory
 store leaves nothing behind on disk. **Production usage is on-disk and
 single-port** — drop `storage_path` (defaults to `./secantus-data`) and
-pick a fixed port like `27117`. See [Quickstart](quickstart.md) for the
+pick a fixed port like `27017`. See [Quickstart](quickstart.md) for the
 real-usage shape.
 
 The running theme is a small wine-cellar app — bottles, regions, vintages.
@@ -246,7 +246,7 @@ from secantus import SecantusDBServer
 
 # Drop the storage_path arg entirely to get the default ./secantus-data,
 # or pass any directory path. Created on first run, reopened intact later.
-server = SecantusDBServer(host="127.0.0.1", port=27117, storage_path="/var/lib/cellar")
+server = SecantusDBServer(host="127.0.0.1", port=27017, storage_path="/var/lib/cellar")
 server.start()
 try:
     # ... server is now persistent at /var/lib/cellar ...
