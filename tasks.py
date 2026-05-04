@@ -278,9 +278,11 @@ def release(c: Context, version: str) -> None:
       2. Run perf regression gates serially.
       3. Bump pyproject.toml + src/secantus/__init__.py + uv.lock.
       4. Commit, annotate-tag, push commit + tag.
-      5. Wait for GitHub `Publish to PyPI` workflow to succeed.
-      6. Wait for PyPI to list the new version.
-      7. Wait for Read the Docs to publish a successful build of the
+      5. Create a GitHub Release for `vX.Y.Z` with auto-generated
+         notes (marked pre-release for `aN` / `bN` / `rcN` versions).
+      6. Wait for GitHub `Publish to PyPI` workflow to succeed.
+      7. Wait for PyPI to list the new version.
+      8. Wait for Read the Docs to publish a successful build of the
          release commit.
 
     Aborts on any failure — leaves working tree as it was before the
@@ -304,12 +306,25 @@ def release(c: Context, version: str) -> None:
     _bump_version_files(version)
     c.run("uv lock", pty=True)
 
-    print(f"==> [4/7] Committing + tagging v{version}")
+    print(f"==> [4/8] Committing + tagging v{version}")
     c.run("git add pyproject.toml src/secantus/__init__.py uv.lock", pty=True)
     c.run(f'git commit -m "Release v{version}"', pty=True)
     c.run(f'git tag -a v{version} -m "Release v{version}"', pty=True)
     c.run("git push origin main", pty=True)
     c.run(f"git push origin v{version}", pty=True)
+
+    print(f"==> [5/8] Creating GitHub Release v{version}")
+    # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
+    is_prerelease = bool(re.search(r"[abc]\d+$|rc\d+$", version))
+    cmd = (
+        f"gh release create v{version} "
+        f"--title 'v{version}' "
+        f"--generate-notes "
+        f"--target $(git rev-parse HEAD)"
+    )
+    if is_prerelease:
+        cmd += " --prerelease"
+    c.run(cmd, pty=True)
 
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -317,14 +332,14 @@ def release(c: Context, version: str) -> None:
         text=True,
         check=True,
     ).stdout.strip()
-    print(f"\n==> [5/7] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
+    print(f"\n==> [6/8] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
     _wait_for_publish_workflow(commit)
-    print(f"==> [6/7] Waiting for PyPI to list {version}")
+    print(f"==> [7/8] Waiting for PyPI to list {version}")
     _wait_for_pypi_version(version)
-    print(f"==> [7/7] Waiting for Read the Docs to build {commit[:7]}")
+    print(f"==> [8/8] Waiting for Read the Docs to build {commit[:7]}")
     _wait_for_rtd_build(commit)
 
-    print(f"\nv{version} released; PyPI + RTD up to date.")
+    print(f"\nv{version} released; GitHub Release, PyPI, and RTD up to date.")
 
 
 def _ensure_main_branch_clean() -> None:

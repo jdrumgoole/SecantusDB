@@ -128,9 +128,10 @@ The task itself does:
 3. Perf regression gates (serial — six benchmarks with hard upper bounds).
 4. Bump `pyproject.toml` + `src/secantus/__init__.py` + `uv.lock`.
 5. `git commit -m "Release vX.Y.Z"` + `git tag -a vX.Y.Z` + push both.
-6. Wait for the GitHub `Publish to PyPI` workflow to conclude `success`.
-7. Wait for PyPI's JSON API to list the new version under `releases`.
-8. Wait for Read the Docs to publish a successful build for the release commit.
+6. `gh release create vX.Y.Z --generate-notes` — creates the user-facing GitHub Release page with auto-generated notes (marked `--prerelease` for `aN` / `bN` / `rcN` versions).
+7. Wait for the GitHub `Publish to PyPI` workflow to conclude `success`.
+8. Wait for PyPI's JSON API to list the new version under `releases`.
+9. Wait for Read the Docs to publish a successful build for the release commit.
 
 Aborts cleanly on any failure — leaves the working tree as it was before the bump so the user can fix and re-run.
 
