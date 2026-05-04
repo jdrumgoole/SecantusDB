@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-05-04 — SecantusDB 0.2.0a18 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-05-04 — SecantusDB 0.3.0a1 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -9,7 +9,8 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `bson` | 3809 | 0 | 11 | 3820 | 100.0% |
-| **Overall** | **3809** | **0** | **11** | **3820** | **100.0%** |
+| `driver-core` | 4214 | 0 | 143 | 4357 | 100.0% |
+| **Overall** | **8023** | **0** | **154** | **8177** | **100.0%** |
 
 ## How this is generated
 

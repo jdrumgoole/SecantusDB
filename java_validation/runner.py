@@ -164,13 +164,6 @@ def main() -> int:
         _wait_for_listener(host, port)
 
         uri = f"mongodb://{host}:{port}"
-        # `--no-daemon` so Gradle doesn't leave a long-lived process behind
-        # after the run; matters more for CI than dev but the cost is low.
-        cmd = [
-            "./gradlew", "--no-daemon", "--console=plain",
-            f"-Dorg.mongodb.test.uri={uri}",
-            *INCLUDE,
-        ]
         env = os.environ.copy()
         if java_home_override:
             env["JAVA_HOME"] = java_home_override
@@ -180,20 +173,12 @@ def main() -> int:
                 f"(gradle 8.12 doesn't support JDK 24+)",
                 file=sys.stderr,
             )
-        print(
-            f"java_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(URI={uri})",
-            file=sys.stderr,
-        )
-        # Hard wall-clock timeout (env-tunable). PLUS jstack-on-hang: if
-        # gradle stops emitting stdout for VALIDATE_JAVA_JSTACK_IDLE_S
-        # seconds (default 120), we jstack every java PID and write the
-        # dumps under .validation/java-stacks/. That gives us the test
-        # JVM's thread state at the moment of the hang — typically:
-        #   - which test class is running
-        #   - whether @After / @AfterAll cleanup is blocked
-        #   - whether SDAM heartbeat / connection pool teardown is stuck
-        # Repeat up to MAX_DUMPS times so we get a few snapshots if the
+
+        # Per-module configuration. Hard wall-clock timeout (env-tunable),
+        # plus jstack-on-hang: if gradle stops emitting stdout for
+        # VALIDATE_JAVA_JSTACK_IDLE_S seconds (default 120), we jstack
+        # every java PID and write the dumps under .validation/java-stacks/.
+        # Repeat up to MAX_DUMPS times so we get snapshots even if the
         # hang is "slow drift" rather than fully wedged.
         timeout_s = int(os.environ.get("VALIDATE_JAVA_TIMEOUT_S", "1800"))
         idle_s = int(os.environ.get("VALIDATE_JAVA_JSTACK_IDLE_S", "120"))
@@ -203,65 +188,92 @@ def main() -> int:
             shutil.rmtree(jstack_dir)
         jstack_dir.mkdir(parents=True)
 
-        proc = subprocess.Popen(
-            cmd, cwd=VENDOR, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=1, text=True,
-        )
-        last_output_ts = [time.monotonic()]
-        forward_done = threading.Event()
+        # One gradle invocation per module so a `--tests` filter applied
+        # to one module (driver-core) doesn't accidentally clamp another
+        # module (bson). Each invocation pays gradle's startup cost (~10s
+        # without --daemon), but the alternative is a single multi-task
+        # invocation where Gradle CLI's `--tests` would apply globally.
+        gradle_rcs: list[int] = []
+        for spec in INCLUDE:
+            cmd = [
+                "./gradlew", "--no-daemon", "--console=plain",
+                f"-Dorg.mongodb.test.uri={uri}",
+                spec.task,
+            ]
+            for fqn in spec.test_classes:
+                cmd.extend(["--tests", fqn])
+            filter_msg = (
+                f" ({len(spec.test_classes)} --tests filters)"
+                if spec.test_classes
+                else ""
+            )
+            print(
+                f"java_validation: running {spec.task}{filter_msg} "
+                f"in {VENDOR} (URI={uri})",
+                file=sys.stderr,
+            )
 
-        def _forward() -> None:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                last_output_ts[0] = time.monotonic()
-            forward_done.set()
+            proc = subprocess.Popen(
+                cmd, cwd=VENDOR, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                bufsize=1, text=True,
+            )
+            last_output_ts = [time.monotonic()]
+            forward_done = threading.Event()
 
-        threading.Thread(target=_forward, daemon=True).start()
+            def _forward(p=proc, ts=last_output_ts, done=forward_done) -> None:
+                assert p.stdout is not None
+                for line in p.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    ts[0] = time.monotonic()
+                done.set()
 
-        deadline = time.monotonic() + timeout_s
-        dumps = 0
-        timed_out = False
-        while True:
-            try:
-                rc = proc.wait(timeout=15)
-                gradle_rc = rc
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            now = time.monotonic()
-            if now >= deadline:
-                print(
-                    f"java_validation: gradle exceeded {timeout_s}s wall clock; "
-                    "SIGTERM-ing and harvesting partial JUnit XML. Override with "
-                    "VALIDATE_JAVA_TIMEOUT_S=<seconds>.",
-                    file=sys.stderr,
-                )
-                proc.terminate()
+            threading.Thread(target=_forward, daemon=True).start()
+
+            deadline = time.monotonic() + timeout_s
+            dumps = 0
+            timed_out = False
+            while True:
                 try:
-                    gradle_rc = proc.wait(timeout=10)
+                    rc = proc.wait(timeout=15)
+                    gradle_rc = rc
+                    break
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    gradle_rc = proc.wait()
-                timed_out = True
-                break
-            if now - last_output_ts[0] > idle_s and dumps < max_dumps:
-                print(
-                    f"jstack-on-hang: no gradle output for "
-                    f"{int(now - last_output_ts[0])}s; dumping java threads "
-                    f"({dumps + 1}/{max_dumps})",
-                    file=sys.stderr,
-                )
-                _jstack_all_javas(jstack_dir, java_home_override)
-                dumps += 1
-                # Reset the idle clock so we don't dump again immediately.
-                last_output_ts[0] = now
+                    pass
+                now = time.monotonic()
+                if now >= deadline:
+                    print(
+                        f"java_validation: gradle exceeded {timeout_s}s wall clock "
+                        f"on {spec.task}; SIGTERM-ing and harvesting partial JUnit "
+                        "XML. Override with VALIDATE_JAVA_TIMEOUT_S=<seconds>.",
+                        file=sys.stderr,
+                    )
+                    proc.terminate()
+                    try:
+                        gradle_rc = proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        gradle_rc = proc.wait()
+                    timed_out = True
+                    break
+                if now - last_output_ts[0] > idle_s and dumps < max_dumps:
+                    print(
+                        f"jstack-on-hang: no gradle output for "
+                        f"{int(now - last_output_ts[0])}s on {spec.task}; "
+                        f"dumping java threads ({dumps + 1}/{max_dumps})",
+                        file=sys.stderr,
+                    )
+                    _jstack_all_javas(jstack_dir, java_home_override)
+                    dumps += 1
+                    last_output_ts[0] = now
 
-        if timed_out:
-            gradle_rc = 124
-        forward_done.wait(timeout=2)
+            if timed_out:
+                gradle_rc = 124
+            forward_done.wait(timeout=2)
+            gradle_rcs.append(gradle_rc)
+
+        gradle_rc = max(gradle_rcs) if gradle_rcs else 0
 
         # Copy JUnit XML out of the source tree to keep our parser simple
         # and avoid touching the submodule.
