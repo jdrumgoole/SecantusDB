@@ -373,15 +373,19 @@ def _ensure_main_branch_clean() -> None:
         text=True,
         check=True,
     ).stdout
-    # Submodule "modified content" rows look like " m vendor/foo" (lowercase
-    # m, leading space). Those reflect build-time patching of vendored
-    # WiredTiger and unrelated parallel-session state — they don't go
-    # into commits, so the release task tolerates them. Anything else is
-    # uncommitted work the release would either include or shadow.
+    # Vendored-submodule drift comes in two flavours, both tolerated:
+    #   " m vendor/foo" — modified content inside the submodule (build-time
+    #     WiredTiger patching, etc.).
+    #   " M vendor/foo" — submodule HEAD shifted because a parallel worktree
+    #     pulled or updated the submodule SHA.
+    # Neither goes into the release commit (the task only `git add`s
+    # pyproject.toml + __init__.py + uv.lock), so they're safe to ignore.
+    # Anything else is uncommitted work the release would either include
+    # or shadow — reject it.
     bad = [
         line
         for line in status.splitlines()
-        if line and not (line.startswith(" m ") and "vendor/" in line)
+        if line and not (line.startswith((" m ", " M ")) and "vendor/" in line)
     ]
     if bad:
         raise SystemExit("working tree has uncommitted changes:\n" + "\n".join(bad))
