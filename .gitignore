@@ -25,3 +25,7 @@ docs/_build/
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code's per-worktree harness config (hooks, plugins, settings).
+# Local to the developer; never committed.
+.claude/
