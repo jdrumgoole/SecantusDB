@@ -120,8 +120,7 @@ def test_mongosh_index_round_trip() -> None:
         # parallel load.
         _run_mongosh(
             f"{server.uri}wine_cellar",
-            "db.bottles.insertOne({_id: 1, year: 2018}); "
-            "db.bottles.createIndex({year: 1});",
+            "db.bottles.insertOne({_id: 1, year: 2018}); db.bottles.createIndex({year: 1});",
         )
         out = _run_mongosh(
             f"{server.uri}wine_cellar",

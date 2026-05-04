@@ -2020,9 +2020,7 @@ class Storage:
             return None
         return self._docs_by_id_keys(db, coll, id_keys)
 
-    def _try_index_id_keys(
-        self, db: str, coll: str, filter: dict[str, Any]
-    ) -> list[bytes] | None:
+    def _try_index_id_keys(self, db: str, coll: str, filter: dict[str, Any]) -> list[bytes] | None:
         """Same dispatch as ``_try_index_lookup`` but returns id_keys instead
         of materialised docs. Used by the write paths (update / delete) so
         only matching docs pay ``bson.decode``.

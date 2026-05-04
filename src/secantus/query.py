@@ -320,6 +320,7 @@ def _coerce_numeric(a: Any, b: Any) -> tuple[Any, Any]:
         and isinstance(b, (int, float, Decimal128))
         and (isinstance(a, Decimal128) or isinstance(b, Decimal128))
     ):
+
         def _to_dec(v: Any) -> Decimal | None:
             if isinstance(v, Decimal128):
                 try:

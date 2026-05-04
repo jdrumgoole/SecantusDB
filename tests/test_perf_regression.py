@@ -15,6 +15,7 @@ gate against regressions, or directly via:
 When you intentionally improve a hot path, lower the matching ``LIMIT_*``
 in this file so the gate keeps tracking the floor.
 """
+
 from __future__ import annotations
 
 import pytest
