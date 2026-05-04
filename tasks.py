@@ -25,6 +25,28 @@ def test_one(c: Context, nodeid: str) -> None:
 
 
 @task
+def perf(c: Context) -> None:
+    """Run the performance regression suite (serially, no xdist).
+
+    Benchmarks fight for CPU under parallel workers, amplifying noise to
+    the point that the gate becomes flappy — so this task forces serial
+    execution and explicitly opts in to the ``perf`` marker excluded
+    from the default ``invoke test``. Median time per workload is
+    asserted against a hard upper bound calibrated for ``:memory:``
+    storage on a quiet 2024-era arm64 mac. Lower the bounds in
+    ``tests/test_perf_regression.py`` when an optimisation moves the
+    floor.
+    """
+    c.run(
+        "uv run python -m pytest -p no:xdist "
+        "-o addopts= -m perf "
+        "--benchmark-columns=min,median,max -v "
+        "tests/test_perf_regression.py",
+        pty=True,
+    )
+
+
+@task
 def lint(c: Context) -> None:
     c.run("uv run ruff check src tests", pty=True)
     c.run("uv run ruff format --check src tests", pty=True)
