@@ -257,74 +257,78 @@ _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([ab]\d+|rc\d+)?$")
 
 @task
 def release(c: Context, version: str) -> None:
-    """Cut a release: test, bump, commit, tag, push, validate PyPI + RTD.
+    """Cut a release: prepare + finalize, end-to-end.
 
-    The canonical release workflow (see `## Releases` in CLAUDE.md).
+    The canonical one-shot release workflow (see `## Releases` in
+    CLAUDE.md). Internally calls ``release-prepare`` (fast,
+    foreground-friendly) followed by ``release-finalize`` (long
+    polling). When invoked from a sub-agent, prefer running the two
+    phases separately so the polling phase can use
+    ``run_in_background=true`` and escape the per-Bash 10-minute cap.
+    """
+    release_prepare(c, version)
+    release_finalize(c, version)
 
-    Usage:
-        uv run python -m invoke release 0.3.0a5
-        uv run python -m invoke release 1.0.0
 
-    `version` is the pyproject form (no leading 'v'); the tag is created
-    with the leading 'v' to match `.github/workflows/publish.yml`.
+@task(name="release-prepare")
+def release_prepare(c: Context, version: str) -> None:
+    """Phase 1 of the release.
+
+    Pre-flight → tests → perf → bump → commit → tag → push → GitHub
+    Release. Fits comfortably in 5–7 min on a quiet machine. Sub-agents can run
+    this in the foreground with the harness's default Bash timeout.
+    Pushing the tag triggers the `Publish to PyPI` workflow
+    asynchronously; pushing main triggers the RTD `latest` build
+    asynchronously. Both finish independently of this task — wait for
+    them via ``release-finalize``.
 
     Pre-flight requirements (all enforced):
       - On `main` branch.
-      - Working tree clean (submodule "modified content" markers OK,
-        any other unstaged / untracked files reject).
+      - Working tree clean (vendored-submodule drift in either
+        lowercase ` m vendor/...` or capital ` M vendor/...` form is
+        tolerated; everything else rejects).
       - HEAD == origin/main (no unpushed commits).
       - Tag `vX.Y.Z` not already on origin.
-      - `READTHEDOCS_TOKEN` available — either exported in the shell
-        env, or as a `READTHEDOCS_TOKEN=…` line in a `.env` file at
-        the repo root (gitignored). Mint at
-        https://app.readthedocs.org/accounts/tokens/ — read+write.
+      - `READTHEDOCS_TOKEN` available — exported or in `.env` (this
+        phase doesn't use the token, but rejecting now means we don't
+        push a release and then discover the token is missing in
+        finalize).
 
     Pipeline:
-      1. Run full default test suite (`pytest` parallel, perf-excluded).
-      2. Run perf regression gates serially.
+      1. Full default test suite (`pytest` parallel, perf-excluded).
+      2. Perf regression gates (serial).
       3. Bump pyproject.toml + src/secantus/__init__.py + uv.lock.
       4. Commit, annotate-tag, push commit + tag.
       5. Create a GitHub Release for `vX.Y.Z` with auto-generated
-         notes (marked pre-release for `aN` / `bN` / `rcN` versions).
-      6. Wait for GitHub `Publish to PyPI` workflow to succeed.
-      7. Wait for PyPI to list the new version.
-      8. Wait for Read the Docs to publish a successful build of the
-         release commit on the `latest` slug.
-      9. Activate the `vX.Y.Z` slug on RTD and wait for its build to
-         finish (so users can deep-link to the tagged version).
-     10. Set RTD's `default_version` to `vX.Y.Z` so the bare RTD URL
-         tracks the just-released tag rather than `stable`/`latest`.
-
-    Aborts on any failure — leaves working tree as it was before the
-    bump so the user can fix and re-run.
+         notes (marked pre-release for `aN`/`bN`/`rcN` versions).
     """
     if not _VERSION_RE.match(version):
         raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
     _ensure_main_branch_clean()
     _ensure_in_sync_with_origin()
     _ensure_tag_unused(version)
-    rtd_token = _ensure_rtd_token()
+    _ensure_rtd_token()
 
-    print("==> [1/10] Full default test suite")
+    print("==> [1/5] Full default test suite")
     c.run("uv run python -m pytest", pty=True)
-    print("==> [2/10] Perf regression gates")
+    print("==> [2/5] Perf regression gates")
     c.run(
         "uv run python -m pytest -p no:xdist -o addopts= -m perf tests/test_perf_regression.py",
         pty=True,
     )
 
-    print(f"==> [3/10] Bumping version files to {version}")
+    print(f"==> [3/5] Bumping version files to {version}")
     _bump_version_files(version)
     c.run("uv lock", pty=True)
 
-    print(f"==> [4/10] Committing + tagging v{version}")
+    print(f"==> [4/5] Committing + tagging v{version}")
     c.run("git add pyproject.toml src/secantus/__init__.py uv.lock", pty=True)
     c.run(f'git commit -m "Release v{version}"', pty=True)
     c.run(f'git tag -a v{version} -m "Release v{version}"', pty=True)
     c.run("git push origin main", pty=True)
     c.run(f"git push origin v{version}", pty=True)
 
-    print(f"==> [5/10] Creating GitHub Release v{version}")
+    print(f"==> [5/5] Creating GitHub Release v{version}")
     # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
     is_prerelease = bool(re.search(r"[abc]\d+$|rc\d+$", version))
     cmd = (
@@ -337,13 +341,51 @@ def release(c: Context, version: str) -> None:
         cmd += " --prerelease"
     c.run(cmd, pty=True)
 
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    print(f"\n==> [6/10] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
+    print(
+        f"\nv{version} prepared, tag pushed, GitHub Release created.\n"
+        f"Run `invoke release-finalize {version}` next to wait for the\n"
+        f"publish workflow + PyPI + RTD propagation."
+    )
+
+
+@task(name="release-finalize")
+def release_finalize(c: Context, version: str) -> None:
+    """Phase 2 of the release.
+
+    Poll publish workflow → PyPI → RTD `latest` → activate `vX.Y.Z`
+    slug → poll its build → PATCH RTD `default_version`.
+
+    Polling can run for 15–25 min in the worst case (publish workflow
+    builds wheels for cp310-cp313 across 4 platforms; RTD compiles
+    WiredTiger from source twice — once for `latest`, once for the
+    tag). Sub-agents must call this with ``run_in_background=true``
+    on the Bash invocation to escape the harness's 10-min per-call
+    cap; foreground in a developer's shell is fine.
+
+    Idempotent: every step short-circuits if the desired state is
+    already true (publish workflow already concluded, PyPI already
+    lists the version, RTD build already finished, version already
+    active, `default_version` already set). Safe to re-run after any
+    timeout or interruption.
+
+    Pre-flight requirements:
+      - Tag `vX.Y.Z` exists on origin (the prepare phase pushed it).
+      - `READTHEDOCS_TOKEN` available.
+
+    Pipeline:
+      6. Wait for GitHub `Publish to PyPI` workflow to succeed.
+      7. Wait for PyPI to list the new version.
+      8. Wait for RTD `latest` to publish a successful build of the
+         release commit.
+      9. Activate the `vX.Y.Z` slug on RTD and wait for its build.
+     10. Set RTD's `default_version` to `vX.Y.Z`.
+    """
+    if not _VERSION_RE.match(version):
+        raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
+    rtd_token = _ensure_rtd_token()
+    commit = _resolve_tag_commit(version)
+
+    print(f"==> [6/10] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
     _wait_for_publish_workflow(commit)
     print(f"==> [7/10] Waiting for PyPI to list {version}")
     _wait_for_pypi_version(version)
@@ -356,6 +398,37 @@ def release(c: Context, version: str) -> None:
     _set_rtd_default_version(version, rtd_token)
 
     print(f"\nv{version} released; GitHub Release, PyPI, and RTD up to date.")
+
+
+def _resolve_tag_commit(version: str) -> str:
+    """Resolve the commit SHA for ``vX.Y.Z`` on origin.
+
+    Used by ``release-finalize`` to find the release commit when re-run
+    later (after any ``main`` HEAD drift). The annotated tag's target
+    is the release commit itself, regardless of what's on ``main`` now.
+    """
+    out = subprocess.run(
+        ["git", "rev-parse", f"v{version}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        # Fall back to the remote ref so finalize works even if the
+        # local tag was pruned.
+        out = subprocess.run(
+            ["git", "ls-remote", "origin", f"refs/tags/v{version}^{{}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        line = out.stdout.strip().split("\n", 1)[0]
+        if not line:
+            raise SystemExit(
+                f"tag v{version} not found on origin — "
+                f"run `invoke release-prepare {version}` first."
+            )
+        return line.split()[0]
+    return out.stdout.strip()
 
 
 def _ensure_main_branch_clean() -> None:

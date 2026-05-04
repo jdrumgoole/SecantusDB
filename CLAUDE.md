@@ -115,31 +115,35 @@ When secondary indexes land they will be WT indexes over typed sort-key columns 
 
 ## Releases
 
-**The canonical release path is `uv run python -m invoke release X.Y.Z`, and it must run inside a sub-agent.** A release end-to-end takes ~15-25 minutes (full default suite + perf gates + tag push + GitHub Actions publish + PyPI propagation + RTD build), and the polling output is verbose. Putting it in a sub-agent keeps the main session's context clean and lets the user keep working in parallel; the sub-agent reports a concise final result back.
+**The canonical release path is two sub-agent steps: `release-prepare` synchronously, then `release-finalize` with `run_in_background=true`.** A release end-to-end takes ~15-25 minutes; the polling phase routinely exceeds the harness's 10-minute per-Bash-call cap, so it must run in background. Putting both phases in a sub-agent keeps the main session's context clean and lets the user keep working in parallel; the sub-agent reports a concise pass/fail back.
 
 Sub-agent invocation pattern (use `general-purpose`, not Explore — it needs to run shell commands):
 
-> Run `uv run python -m invoke release X.Y.Z` from `/Users/jdrumgoole/GIT/SecantusDB`. The task does pre-flight checks, runs the full test suite + perf gates, bumps version files + uv.lock, commits, creates and pushes the `vX.Y.Z` annotated tag, opens a GitHub Release with auto-generated notes, then polls until the GitHub `Publish to PyPI` workflow succeeds, PyPI lists the new version, and Read the Docs has built both the release commit on `latest` and the `vX.Y.Z` slug — finally setting RTD's `default_version` to `vX.Y.Z`. The task auto-loads `READTHEDOCS_TOKEN` from `.env` at the repo root (gitignored); export it manually only if it's missing from `.env`. Do not modify the workflow — invoke it as-is and report success or the first failure with stderr/stdout.
+> **Step 1 (foreground).** Run `cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-prepare X.Y.Z`. This runs pre-flight, full pytest, perf gates, bumps version files + uv.lock, commits, creates and pushes the `vX.Y.Z` tag, and opens a GitHub Release with auto-generated notes. Fits in 5–7 min on a quiet machine. `READTHEDOCS_TOKEN` auto-loads from `.env` at the repo root.
+>
+> **Step 2 (background).** Run `cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-finalize X.Y.Z` with `run_in_background=true` on the Bash call. This polls the GitHub `Publish to PyPI` workflow to success, PyPI for the new version, RTD `latest` for the release commit's build, then activates the `vX.Y.Z` RTD slug, waits for its build, and PATCHes RTD's `default_version` to `vX.Y.Z`. You'll get a completion notification when it finishes; do **not** poll the output file. If finalize times out or fails for any reason, re-run it — every step is idempotent.
 
-The task itself does:
+`invoke release X.Y.Z` is a thin wrapper that calls both phases in sequence — fine for a developer running it locally, **not safe for sub-agents** because the second half exceeds the per-Bash 10-min cap.
 
-1. Pre-flight: branch=`main`, working tree clean (vendored-submodule "modified content" markers tolerated, everything else rejects), `HEAD == origin/main`, tag `vX.Y.Z` not already on origin, `READTHEDOCS_TOKEN` available (either in the shell env or in `.env` at the repo root).
+Combined pipeline (the two phases together):
+
+1. Pre-flight: branch=`main`, working tree clean (vendored-submodule drift in either ` m vendor/...` or ` M vendor/...` form tolerated, everything else rejects), `HEAD == origin/main`, tag `vX.Y.Z` not already on origin, `READTHEDOCS_TOKEN` available (either in the shell env or in `.env` at the repo root).
 2. Full default test suite (parallel, perf-excluded — currently 653 tests).
 3. Perf regression gates (serial — six benchmarks with hard upper bounds).
 4. Bump `pyproject.toml` + `src/secantus/__init__.py` + `uv.lock`.
 5. `git commit -m "Release vX.Y.Z"` + `git tag -a vX.Y.Z` + push both.
-6. `gh release create vX.Y.Z --generate-notes` — creates the user-facing GitHub Release page with auto-generated notes (marked `--prerelease` for `aN` / `bN` / `rcN` versions).
-7. Wait for the GitHub `Publish to PyPI` workflow to conclude `success`.
+6. `gh release create vX.Y.Z --generate-notes` — creates the user-facing GitHub Release page with auto-generated notes (marked `--prerelease` for `aN` / `bN` / `rcN` versions). **End of `release-prepare`.**
+7. Wait for the GitHub `Publish to PyPI` workflow to conclude `success`. **Start of `release-finalize`.**
 8. Wait for PyPI's JSON API to list the new version under `releases`.
 9. Wait for Read the Docs to publish a successful build for the release commit on the `latest` slug.
 10. Activate the `vX.Y.Z` RTD slug and wait for its build to finish — gives users a stable deep link to that release's docs.
 11. PATCH RTD's `default_version` to `vX.Y.Z` so `secantusdb.readthedocs.io/` redirects to the freshly-released tag instead of the previous default (`stable` was pinned to v0.1.0 because RTD's `stable` only tracks non-prereleases; this step is the cure).
 
-Aborts cleanly on any failure — leaves the working tree as it was before the bump so the user can fix and re-run.
+`release-prepare` aborts cleanly on any failure — leaves the working tree as it was before the bump. `release-finalize` is idempotent: every step short-circuits if the desired state is already true (publish workflow already concluded, PyPI already lists the version, RTD build already finished, slug already active, `default_version` already set), so re-running after any timeout or interruption picks up where it left off.
 
-Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_TOKEN`. The release task resolves it from (1) the process env, then (2) a `READTHEDOCS_TOKEN=…` line in `.env` at the repo root (gitignored — `.env` is on `.gitignore`). Mint at https://app.readthedocs.org/accounts/tokens/. The pre-flight refuses to start without it, since steps 10–11 are the whole reason the docs version stays in sync with PyPI.
+Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_TOKEN`. The release tasks resolve it from (1) the process env, then (2) a `READTHEDOCS_TOKEN=…` line in `.env` at the repo root (gitignored — `.env` is on `.gitignore`). Mint at https://app.readthedocs.org/accounts/tokens/. Both `release-prepare` and `release-finalize` refuse to start without it, since steps 10–11 are the whole reason the docs version stays in sync with PyPI.
 
-Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases, and do **not** edit RTD's default_version through the dashboard — the release task owns that value. The only sanctioned path is `invoke release` via sub-agent. The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation, RTD default left dangling).
+Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases, and do **not** edit RTD's default_version through the dashboard — `release-finalize` owns that value. The only sanctioned path is `invoke release-prepare` + `invoke release-finalize` via sub-agent (or `invoke release` for a developer running it directly). The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation, RTD default left dangling).
 
 ## Backlog of stubs and stopgaps
 
