@@ -115,13 +115,27 @@ When secondary indexes land they will be WT indexes over typed sort-key columns 
 
 ## Releases
 
-**The canonical release path is two sub-agent steps: `release-prepare` synchronously, then `release-finalize` with `run_in_background=true`.** A release end-to-end takes ~15-25 minutes; the polling phase routinely exceeds the harness's 10-minute per-Bash-call cap, so it must run in background. Putting both phases in a sub-agent keeps the main session's context clean and lets the user keep working in parallel; the sub-agent reports a concise pass/fail back.
+**The canonical release path: `release-prepare` once in foreground, then `release-finalize` in a foreground retry loop until exit-0.** A release end-to-end takes ~15-25 minutes; the polling phase routinely exceeds the harness's 10-minute per-Bash-call cap. Sub-agents handle this by retrying the idempotent finalize step — a single 10-min Bash call can't cover the whole polling window, but each attempt picks up exactly where the prior one left off because every step short-circuits on already-done state.
+
+The `run_in_background=true` pattern is **broken by design** for agents: dispatching a bg task and then waiting for the completion notification doesn't keep the agent's tool loop alive — agents terminate after the dispatch and the bg process gets killed with them. Foreground + retry is the reliable pattern; the agent's natural tool calls keep the loop active.
 
 Sub-agent invocation pattern (use `general-purpose`, not Explore — it needs to run shell commands):
 
-> **Step 1 (foreground).** Run `cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-prepare X.Y.Z`. This runs pre-flight, full pytest, perf gates, bumps version files + uv.lock, commits, creates and pushes the `vX.Y.Z` tag, and opens a GitHub Release with auto-generated notes. Fits in 5–7 min on a quiet machine. `READTHEDOCS_TOKEN` auto-loads from `.env` at the repo root.
+> **Step 1 — `release-prepare` (single attempt, ~5–7 min).** Bash call with `timeout: 600000`:
 >
-> **Step 2 (background).** Run `cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-finalize X.Y.Z` with `run_in_background=true` on the Bash call. This polls the GitHub `Publish to PyPI` workflow to success, PyPI for the new version, RTD `latest` for the release commit's build, then activates the `vX.Y.Z` RTD slug, waits for its build, and PATCHes RTD's `default_version` to `vX.Y.Z`. You'll get a completion notification when it finishes; do **not** poll the output file. If finalize times out or fails for any reason, re-run it — every step is idempotent.
+> ```
+> cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-prepare X.Y.Z
+> ```
+>
+> Runs pre-flight, full pytest, perf gates, version bump, commit, tag, push, GitHub Release. `READTHEDOCS_TOKEN` auto-loads from `.env` at the repo root. **If this step fails, abort the whole release and report — don't retry.** Failures here mean tests broke or pre-flight rejected the working tree, neither of which retrying fixes.
+>
+> **Step 2 — `release-finalize` retry loop (up to 4 attempts × 10 min each = 40 min total budget).** For attempt in 1..4:
+>
+> ```
+> cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-finalize X.Y.Z
+> ```
+>
+> with `timeout: 600000`. Exit code 0 → done, verify externally and report PASS. Non-zero exit code (typically a SIGKILL at the 10-min wall) → polling was interrupted mid-step; **immediately re-run the same command**. Every step in `release-finalize` is idempotent (publish workflow already concluded → short-circuits; PyPI already lists version → short-circuits; RTD build already finished → short-circuits; etc.), so retries pick up where the prior 10-min window left off. Bail and report FAIL only after **4 consecutive non-zero exits** — that's 40 minutes of polling, well over the 25-minute worst-case release time.
 
 `invoke release X.Y.Z` is a thin wrapper that calls both phases in sequence — fine for a developer running it locally, **not safe for sub-agents** because the second half exceeds the per-Bash 10-min cap.
 
