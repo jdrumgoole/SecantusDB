@@ -58,7 +58,11 @@ class SecantusDBServer:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._connection_ids = itertools.count(1)
-        self.storage = Storage(storage_path)
+        # Oplog writes are only useful when change-stream clients can
+        # connect, which requires replica-set advertisement in `hello`.
+        # Skip them in pure-standalone mode to drop a per-write BSON
+        # encode + oplog-table cursor write per modified document.
+        self.storage = Storage(storage_path, enable_oplog=replica_set_name is not None)
         self.cursors = CursorRegistry()
 
     @property

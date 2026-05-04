@@ -174,13 +174,23 @@ def _bson_type_rank(value: Any) -> int:
 
 
 class _SortKey:
-    __slots__ = ("val",)
+    __slots__ = ("val", "_reverse")
 
-    def __init__(self, val: Any) -> None:
+    def __init__(self, val: Any, reverse: bool = False) -> None:
         self.val = val
+        self._reverse = reverse
 
     def __lt__(self, other: _SortKey) -> bool:
-        a, b = self.val, other.val
+        # Swap operands when this key is descending — the same comparison
+        # logic then yields the correct order for desc fields, and the
+        # equal-keys case still returns False on both sides (stable sort
+        # preserves doc order). Both sides of the comparison must agree on
+        # direction (they're in the same column), which our caller
+        # guarantees.
+        if self._reverse:
+            a, b = other.val, self.val
+        else:
+            a, b = self.val, other.val
         ra = _bson_type_rank(a)
         rb = _bson_type_rank(b)
         if ra != rb:
@@ -208,13 +218,13 @@ def sort_docs(
 ) -> list[dict[str, Any]]:
     if not sort_spec:
         return docs
-    result = list(docs)
-    for field, direction in reversed(list(sort_spec.items())):
-        result.sort(
-            key=lambda d, f=field: _SortKey(get_path(d, f)),
-            reverse=(int(direction) == -1),
-        )
-    return result
+    fields = [(f, int(d) == -1) for f, d in sort_spec.items()]
+    # Single sort over a precomputed tuple key rather than N stable passes:
+    # one pass through Timsort, get_path called once per field per doc.
+    return sorted(
+        docs,
+        key=lambda d: tuple(_SortKey(get_path(d, f), reverse=rev) for f, rev in fields),
+    )
 
 
 _ID_INDEX_NAME = "_id_"
@@ -239,7 +249,14 @@ class Storage:
         oplog_retention_seconds: float = 3600.0,
         oplog_max_entries: int = 100_000,
         time_func: Callable[[], float] | None = None,
+        enable_oplog: bool = True,
     ) -> None:
+        # When False, _emit_oplog short-circuits and writes nothing —
+        # used in standalone (non-replica-set) mode to skip the per-write
+        # BSON encode + WT cursor write cost of oplog entries that no
+        # change-stream client will ever read. The oplog WT tables are
+        # still created so toggling at runtime stays safe.
+        self.enable_oplog = enable_oplog
         self._lock = threading.RLock()
         self._closed = False
         self._tempdir: str | None = None
@@ -408,7 +425,16 @@ class Storage:
         stored under the matching seq in ``_PREIMAGE_TABLE``. Returns the
         highest seq emitted (0 if ``entries`` is empty). Notifies waiters
         on ``self._oplog_cv`` once writes have committed.
+
+        If ``self.enable_oplog`` is False, returns 0 immediately — the
+        caller's prebuilt ``entries`` list is discarded. The change-stream
+        condvar is still notified so any tailable getMore wakes up and
+        observes the (empty) state.
         """
+        if not self.enable_oplog:
+            with self._oplog_cv:
+                self._oplog_cv.notify_all()
+            return 0
         if not entries:
             return 0
         if pre_images is None:
@@ -811,17 +837,21 @@ class Storage:
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
+        oplog_on = self.enable_oplog
         with self._lock:
             self._ensure_collection(db, coll)
-            ns = self._ns(db, coll)
-            ui = self._collection_uuid(db, coll)
+            ns = self._ns(db, coll) if oplog_on else ""
+            ui = self._collection_uuid(db, coll) if oplog_on else None
             indexes = self._all_indexes(db, coll)
+            partials = self._partial_filters(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
             for index, doc in enumerate(docs):
                 if "_id" not in doc:
                     doc["_id"] = bson.ObjectId()
                 key = _id_key(doc["_id"])
-                conflict = self._unique_conflict(db, coll, doc, indexes, exclude_id_key=None)
+                conflict = self._unique_conflict(
+                    db, coll, doc, indexes, exclude_id_key=None, partials=partials
+                )
                 if conflict is not None:
                     errors.append(
                         {
@@ -853,18 +883,19 @@ class Storage:
                     if ordered:
                         break
                     continue
-                self._write_index_entries(db, coll, doc, indexes)
+                self._write_index_entries(db, coll, doc, indexes, partials)
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
-                oplog_entries.append(
-                    {
-                        "op": "i",
-                        "ns": ns,
-                        "ui": bson.Binary(ui.bytes, subtype=4),
-                        "o": dict(doc),
-                        "o2": {"_id": doc["_id"]},
-                    }
-                )
+                if oplog_on:
+                    oplog_entries.append(
+                        {
+                            "op": "i",
+                            "ns": ns,
+                            "ui": bson.Binary(ui.bytes, subtype=4),
+                            "o": dict(doc),
+                            "o2": {"_id": doc["_id"]},
+                        }
+                    )
             if oplog_entries:
                 self._emit_oplog(oplog_entries)
         return inserted, errors
@@ -1204,14 +1235,22 @@ class Storage:
         upserted_id: Any = None
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
+        oplog_on = self.enable_oplog
         with self._lock:
             self._ensure_collection(db, coll)
             ns = self._ns(db, coll)
-            ui = self._collection_uuid(db, coll)
-            preimages_on = self._pre_post_images_enabled(db, coll)
+            ui = self._collection_uuid(db, coll) if oplog_on else None
+            preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
             indexes = self._all_indexes(db, coll)
+            partials = self._partial_filters(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
-            for doc in self._all_docs(db, coll):
+            # Index-routed when the filter is covered (only matching id_keys
+            # come back from the index walk); full scan otherwise. Either
+            # way the doc cursor isn't held across writes — bytes are
+            # eagerly buffered. Only matching docs pay ``bson.decode``.
+            candidates = self._candidates_iter(db, coll, filter)
+            for id_k, blob in candidates:
+                doc = bson.decode(blob)
                 if not matches(doc, filter):
                     continue
                 matched += 1
@@ -1220,28 +1259,29 @@ class Storage:
                 if new != doc:
                     new_id_key = _id_key(new["_id"])
                     conflict = self._unique_conflict(
-                        db, coll, new, indexes, exclude_id_key=_id_key(doc["_id"])
+                        db, coll, new, indexes, exclude_id_key=id_k, partials=partials
                     )
                     if conflict is not None:
                         raise IndexConflict(conflict, new["_id"])
                     modified += 1
-                    self._delete_index_entries(db, coll, doc, indexes)
+                    self._delete_index_entries(db, coll, doc, indexes, partials)
                     doc_cur = self._cursor(_DOC_TABLE)
                     doc_cur[db, coll, new_id_key] = bson.encode(new)
-                    self._write_index_entries(db, coll, new, indexes)
+                    self._write_index_entries(db, coll, new, indexes, partials)
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
-                    oplog_entries.append(
-                        {
-                            "op": "u",
-                            "ns": ns,
-                            "ui": bson.Binary(ui.bytes, subtype=4),
-                            "o": {"$v": 2, "diff": compute_update_description(doc, new)},
-                            "o2": {"_id": doc["_id"]},
-                        }
-                    )
-                    pre_images.append(bson.encode(doc) if preimages_on else None)
+                    if oplog_on:
+                        oplog_entries.append(
+                            {
+                                "op": "u",
+                                "ns": ns,
+                                "ui": bson.Binary(ui.bytes, subtype=4),
+                                "o": {"$v": 2, "diff": compute_update_description(doc, new)},
+                                "o2": {"_id": doc["_id"]},
+                            }
+                        )
+                        pre_images.append(bson.encode(doc) if preimages_on else None)
                 if not multi:
                     break
             if matched == 0 and upsert:
@@ -1253,23 +1293,26 @@ class Storage:
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
                 upserted_id = new["_id"]
-                conflict = self._unique_conflict(db, coll, new, indexes, exclude_id_key=None)
+                conflict = self._unique_conflict(
+                    db, coll, new, indexes, exclude_id_key=None, partials=partials
+                )
                 if conflict is not None:
                     raise IndexConflict(conflict, new["_id"])
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
-                self._write_index_entries(db, coll, new, indexes)
+                self._write_index_entries(db, coll, new, indexes, partials)
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
-                oplog_entries.append(
-                    {
-                        "op": "i",
-                        "ns": ns,
-                        "ui": bson.Binary(ui.bytes, subtype=4),
-                        "o": dict(new),
-                        "o2": {"_id": upserted_id},
-                    }
-                )
-                pre_images.append(None)
+                if oplog_on:
+                    oplog_entries.append(
+                        {
+                            "op": "i",
+                            "ns": ns,
+                            "ui": bson.Binary(ui.bytes, subtype=4),
+                            "o": dict(new),
+                            "o2": {"_id": upserted_id},
+                        }
+                    )
+                    pre_images.append(None)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
@@ -1278,33 +1321,40 @@ class Storage:
         deleted = 0
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
+        oplog_on = self.enable_oplog
         with self._lock:
-            ns = self._ns(db, coll)
-            preimages_on = self._pre_post_images_enabled(db, coll)
+            ns = self._ns(db, coll) if oplog_on else ""
+            preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
             ui = (
                 self._collection_uuid(db, coll)
-                if self._coll_options(db, coll) is not None
+                if oplog_on and self._coll_options(db, coll) is not None
                 else None
             )
             indexes = self._all_indexes(db, coll)
-            for doc in self._all_docs(db, coll):
+            partials = self._partial_filters(db, coll)
+            # Index-routed candidates when the filter is covered; full scan
+            # otherwise. See update_matching for the full-scan rationale.
+            candidates = self._candidates_iter(db, coll, filter)
+            for id_k, blob in candidates:
+                doc = bson.decode(blob)
                 if not matches(doc, filter):
                     continue
-                self._delete_index_entries(db, coll, doc, indexes)
+                self._delete_index_entries(db, coll, doc, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
-                doc_cur.set_key(db, coll, _id_key(doc["_id"]))
+                doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
                 deleted += 1
-                entry: dict[str, Any] = {
-                    "op": "d",
-                    "ns": ns,
-                    "o": {"_id": doc["_id"]},
-                    "o2": {"_id": doc["_id"]},
-                }
-                if ui is not None:
-                    entry["ui"] = bson.Binary(ui.bytes, subtype=4)
-                oplog_entries.append(entry)
-                pre_images.append(bson.encode(doc) if preimages_on else None)
+                if oplog_on:
+                    entry: dict[str, Any] = {
+                        "op": "d",
+                        "ns": ns,
+                        "o": {"_id": doc["_id"]},
+                        "o2": {"_id": doc["_id"]},
+                    }
+                    if ui is not None:
+                        entry["ui"] = bson.Binary(ui.bytes, subtype=4)
+                    oplog_entries.append(entry)
+                    pre_images.append(bson.encode(doc) if preimages_on else None)
                 if limit > 0 and deleted >= limit:
                     break
             if oplog_entries:
@@ -1355,7 +1405,10 @@ class Storage:
                 else None
             )
             indexes = self._all_indexes(db, coll)
-            for doc in list(self._all_docs(db, coll)):
+            partials = self._partial_filters(db, coll)
+            candidates = list(self._scan_docs(db, coll))
+            for id_k, blob in candidates:
+                doc = bson.decode(blob)
                 expired = False
                 for _name, field, ttl_seconds in ttl_indexes:
                     value = get_path(doc, field)
@@ -1367,9 +1420,9 @@ class Storage:
                         break
                 if not expired:
                     continue
-                self._delete_index_entries(db, coll, doc, indexes)
+                self._delete_index_entries(db, coll, doc, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
-                doc_cur.set_key(db, coll, _id_key(doc["_id"]))
+                doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
                 pruned += 1
                 entry: dict[str, Any] = {
@@ -1599,38 +1652,39 @@ class Storage:
             partial_filter = options.get("partialFilterExpression")
             if not isinstance(partial_filter, Mapping) or not partial_filter:
                 partial_filter = None
-            if unique:
-                seen: dict[bytes, Any] = {}
-                for d in self._all_docs(db, coll):
-                    if partial_filter is not None and not matches(d, partial_filter):
-                        continue
-                    key = _index_key(d, key_spec, sparse=sparse)
-                    if key is None:
-                        continue
-                    if key in seen:
-                        raise IndexConflict(name, d.get("_id"))
-                    seen[key] = d.get("_id")
+            # Single doc-table walk: decode each blob once and fold all
+            # three checks (uniqueness, multikey detection, entry build)
+            # into one pass. Replaces three separate _all_docs() walks.
+            # Entries are buffered and only written after the uniqueness
+            # check has cleared, preserving the original "no partial
+            # writes on conflict" semantics.
+            key_spec_dict = dict(key_spec)
+            seen: dict[bytes, Any] | None = {} if unique else None
             multikey = False
-            for d in self._all_docs(db, coll):
+            entries: list[tuple[bytes, bytes]] = []
+            for id_k, blob in self._scan_docs(db, coll):
+                d = bson.decode(blob)
                 if partial_filter is not None and not matches(d, partial_filter):
                     continue
-                if _doc_makes_multikey(d, key_spec):
+                if not multikey and _doc_makes_multikey(d, key_spec_dict):
                     multikey = True
-                    break
+                kb = _index_key(d, key_spec_dict, sparse=sparse)
+                if kb is None:
+                    continue
+                if seen is not None:
+                    if kb in seen:
+                        raise IndexConflict(name, d.get("_id"))
+                    seen[kb] = d.get("_id")
+                entries.append((kb, id_k))
             if multikey:
                 options["multikey"] = True
             payload = bson.encode({"key": dict(key_spec), "options": options})
             c.reset()
             c[db, coll, name] = payload
             entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
-            for d in self._all_docs(db, coll):
-                if partial_filter is not None and not matches(d, partial_filter):
-                    continue
-                kb = _index_key(d, dict(key_spec), sparse=sparse)
-                if kb is None:
-                    continue
+            for kb, id_k in entries:
                 entry_cur.reset()
-                entry_cur[db, coll, name, _pack_entry(kb, _id_key(d["_id"]))] = b""
+                entry_cur[db, coll, name, _pack_entry(kb, id_k)] = b""
             ui = self._collection_uuid(db, coll)
             self._emit_oplog(
                 [
@@ -1810,12 +1864,14 @@ class Storage:
         coll: str,
         doc: dict[str, Any],
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
+        partials: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
         id_k = _id_key(doc["_id"])
-        partials = self._partial_filters(db, coll)
+        if partials is None:
+            partials = self._partial_filters(db, coll)
         for name, key_spec, sparse, _unique in indexes:
             pf = partials.get(name)
             if pf is not None and not matches(doc, pf):
@@ -1832,12 +1888,14 @@ class Storage:
         coll: str,
         doc: dict[str, Any],
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
+        partials: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
         id_k = _id_key(doc["_id"])
-        partials = self._partial_filters(db, coll)
+        if partials is None:
+            partials = self._partial_filters(db, coll)
         for name, key_spec, sparse, _unique in indexes:
             pf = partials.get(name)
             if pf is not None and not matches(doc, pf):
@@ -1858,11 +1916,13 @@ class Storage:
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         *,
         exclude_id_key: bytes | None,
+        partials: dict[str, dict[str, Any]] | None = None,
     ) -> str | None:
         if not indexes:
             return None
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        partials = self._partial_filters(db, coll)
+        if partials is None:
+            partials = self._partial_filters(db, coll)
         for name, key_spec, sparse, unique in indexes:
             if not unique:
                 continue
@@ -1948,6 +2008,18 @@ class Storage:
     def _try_index_lookup(
         self, db: str, coll: str, filter: dict[str, Any]
     ) -> list[dict[str, Any]] | None:
+        id_keys = self._try_index_id_keys(db, coll, filter)
+        if id_keys is None:
+            return None
+        return self._docs_by_id_keys(db, coll, id_keys)
+
+    def _try_index_id_keys(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> list[bytes] | None:
+        """Same dispatch as ``_try_index_lookup`` but returns id_keys instead
+        of materialised docs. Used by the write paths (update / delete) so
+        only matching docs pay ``bson.decode``.
+        """
         if not filter:
             return None
         if any(f.startswith("$") for f in filter):
@@ -1955,12 +2027,12 @@ class Storage:
         # Bare-equality filters of any size can use a compound index whose
         # leading fields cover the filter set.
         if all(not isinstance(v, dict) for v in filter.values()):
-            result = self._try_compound_eq_lookup(db, coll, filter)
+            result = self._try_compound_eq_id_keys(db, coll, filter)
             if result is not None:
                 return result
         # Compound prefix + trailing operator field (eq fields then range/in).
         if len(filter) >= 2:
-            result = self._try_compound_range_lookup(db, coll, filter)
+            result = self._try_compound_range_id_keys(db, coll, filter)
             if result is not None:
                 return result
         if len(filter) != 1:
@@ -1969,7 +2041,31 @@ class Storage:
         idx_match = self._find_leading_field_index(db, coll, field, filter)
         if idx_match is None:
             return None
-        return self._lookup_via_leading_field(db, coll, idx_match, value)
+        return self._lookup_id_keys_via_leading_field(db, coll, idx_match, value)
+
+    def _candidates_iter(
+        self, db: str, coll: str, filter: dict[str, Any] | None
+    ) -> list[tuple[bytes, bytes]]:
+        """Return (id_key, blob) pairs that the write paths should consider.
+        If an index covers the filter, only the indexed candidates are
+        fetched; otherwise the full doc table is scanned. Either way,
+        BSON decode is left to the caller so non-matching docs don't pay
+        for it. Caller still applies ``matches()`` to the decoded doc —
+        index lookups can produce false-positive candidates for partial
+        scans (multikey, prefix overlap, etc).
+        """
+        if filter:
+            id_keys = self._try_index_id_keys(db, coll, filter)
+            if id_keys is not None:
+                c = self._cursor(_DOC_TABLE)
+                out: list[tuple[bytes, bytes]] = []
+                for id_k in id_keys:
+                    c.reset()
+                    c.set_key(db, coll, id_k)
+                    if c.search() == 0:
+                        out.append((id_k, bytes(c.get_value())))
+                return out
+        return list(self._scan_docs(db, coll))
 
     def _find_leading_field_index(
         self,
@@ -2007,20 +2103,16 @@ class Storage:
                 compound_fallback = (name, d, True)
         return compound_fallback
 
-    def _lookup_via_leading_field(
+    def _lookup_id_keys_via_leading_field(
         self,
         db: str,
         coll: str,
         idx_match: tuple[str, int, bool],
         value: Any,
-    ) -> list[dict[str, Any]] | None:
+    ) -> list[bytes] | None:
         name, direction, is_compound = idx_match
         if not isinstance(value, dict):
-            return self._docs_by_id_keys(
-                db,
-                coll,
-                self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, value),
-            )
+            return self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, value)
         if not value or not all(k.startswith("$") for k in value):
             return None
         if not all(op in self._RANGE_OPS for op in value):
@@ -2037,7 +2129,7 @@ class Storage:
                     if id_k not in seen:
                         seen.add(id_k)
                         id_keys.append(id_k)
-            return self._docs_by_id_keys(db, coll, id_keys)
+            return id_keys
         lower: bytes | None = None
         lower_inclusive = True
         upper: bytes | None = None
@@ -2046,11 +2138,7 @@ class Storage:
             if isinstance(bound, dict):
                 return None
             if op == "$eq":
-                return self._docs_by_id_keys(
-                    db,
-                    coll,
-                    self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, bound),
-                )
+                return self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, bound)
             kb = encode_value_directed(bound, direction)
             # Operator semantics flip when stored bytes are inverted: in a
             # DESC index, "x > 5" means we want stored bytes < enc_desc(5).
@@ -2066,14 +2154,12 @@ class Storage:
             elif effective_op == "$lte":
                 upper, upper_inclusive = kb, True
         if is_compound:
-            id_keys = self._range_scan_index_leading(
+            return self._range_scan_index_leading(
                 db, coll, name, lower, lower_inclusive, upper, upper_inclusive
             )
-        else:
-            id_keys = self._range_scan_index(
-                db, coll, name, lower, lower_inclusive, upper, upper_inclusive
-            )
-        return self._docs_by_id_keys(db, coll, id_keys)
+        return self._range_scan_index(
+            db, coll, name, lower, lower_inclusive, upper, upper_inclusive
+        )
 
     def _eq_id_keys_via_leading(
         self,
@@ -2092,7 +2178,7 @@ class Storage:
     def _pick_compound_eq_index(
         self, db: str, coll: str, filter: dict[str, Any]
     ) -> tuple[str, dict[str, Any]] | None:
-        """Find the index that ``_try_compound_eq_lookup`` would walk for ``filter``.
+        """Find the index that ``_try_compound_eq_id_keys`` would walk for ``filter``.
 
         Returns ``(name, key_spec)`` of the chosen index, or ``None`` if no
         index covers the filter as a leading prefix. Pure picker — does
@@ -2127,9 +2213,9 @@ class Storage:
                 break
         return best
 
-    def _try_compound_eq_lookup(
+    def _try_compound_eq_id_keys(
         self, db: str, coll: str, filter: dict[str, Any]
-    ) -> list[dict[str, Any]] | None:
+    ) -> list[bytes] | None:
         """Bare-equality filter against a compound (or single-field) index prefix.
 
         Picks an index whose leading fields (set-wise) match the filter's
@@ -2148,11 +2234,9 @@ class Storage:
         parts = [encode_value_directed(filter[f], int(key_spec[f])) for f in prefix_fields]
         kb = COMPOUND_SEP.join(parts) if len(parts) > 1 else parts[0]
         if len(prefix_fields) == len(idx_fields):
-            id_keys = self._scan_index_for_id_keys(db, coll, name, kb)
-        else:
-            kb = kb + COMPOUND_SEP
-            id_keys = self._scan_index_for_id_keys(db, coll, name, kb, prefix=True)
-        return self._docs_by_id_keys(db, coll, id_keys)
+            return self._scan_index_for_id_keys(db, coll, name, kb)
+        kb = kb + COMPOUND_SEP
+        return self._scan_index_for_id_keys(db, coll, name, kb, prefix=True)
 
     def _partition_compound_range_filter(
         self, filter: dict[str, Any]
@@ -2187,7 +2271,7 @@ class Storage:
     def _pick_compound_range_index(
         self, db: str, coll: str, filter: dict[str, Any]
     ) -> tuple[str, dict[str, Any]] | None:
-        """Find the index that ``_try_compound_range_lookup`` would walk."""
+        """Find the index that ``_try_compound_range_id_keys`` would walk."""
         parts = self._partition_compound_range_filter(filter)
         if parts is None:
             return None
@@ -2218,9 +2302,9 @@ class Storage:
                 break
         return best
 
-    def _try_compound_range_lookup(
+    def _try_compound_range_id_keys(
         self, db: str, coll: str, filter: dict[str, Any]
-    ) -> list[dict[str, Any]] | None:
+    ) -> list[bytes] | None:
         """Compound-prefix lookup with a trailing operator field.
 
         Filters of the form ``{a: 5, b: 10, c: {$gt: 20}}`` (any number of
@@ -2260,15 +2344,14 @@ class Storage:
                     if id_k not in seen:
                         seen.add(id_k)
                         id_keys.append(id_k)
-            return self._docs_by_id_keys(db, coll, id_keys)
+            return id_keys
         if "$eq" in operator_ops:
             if len(operator_ops) != 1:
                 return None
             kb = prefix_with_sep + encode_value_directed(operator_ops["$eq"], op_dir)
             use_prefix = len(idx_fields) > target_eq_count + 1
             inner_kb = kb + COMPOUND_SEP if use_prefix else kb
-            id_keys = self._scan_index_for_id_keys(db, coll, name, inner_kb, prefix=use_prefix)
-            return self._docs_by_id_keys(db, coll, id_keys)
+            return self._scan_index_for_id_keys(db, coll, name, inner_kb, prefix=use_prefix)
         lower: bytes | None = None
         lower_inclusive = True
         upper: bytes | None = None
@@ -2290,7 +2373,7 @@ class Storage:
                 upper, upper_inclusive = full, True
             else:
                 return None
-        id_keys = self._range_scan_index(
+        return self._range_scan_index(
             db,
             coll,
             name,
@@ -2300,7 +2383,6 @@ class Storage:
             upper_inclusive,
             prefix=prefix_with_sep,
         )
-        return self._docs_by_id_keys(db, coll, id_keys)
 
     def _range_scan_index(
         self,
