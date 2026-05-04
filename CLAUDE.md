@@ -113,6 +113,22 @@ When secondary indexes land they will be WT indexes over typed sort-key columns 
 - PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.
 - The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The package and PyPI name are `secantus`.
 
+## Releases
+
+**Always release via `uv run python -m invoke release X.Y.Z`** — that task is the canonical release path. It runs the full default test suite, then the perf regression gates, then bumps `pyproject.toml` + `src/secantus/__init__.py` + `uv.lock`, commits, creates a `vX.Y.Z` annotated tag, pushes both, and waits for the downstream systems to confirm:
+
+1. GitHub Actions `Publish to PyPI` workflow concludes `success`.
+2. PyPI's JSON API lists the new version under `releases`.
+3. Read the Docs publishes a successful build for the release commit.
+
+Pre-flight requirements (all enforced — the task aborts cleanly if any fail):
+
+- On `main` branch with the working tree clean (vendored-submodule "modified content" markers are tolerated; anything else rejects).
+- `HEAD == origin/main` — push or pull first if not.
+- Tag `vX.Y.Z` not already on origin.
+
+Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases. The only path to a published release is `invoke release`. The publish workflow refuses to ship a tag whose version doesn't match `pyproject.toml`, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation).
+
 ## Backlog of stubs and stopgaps
 
 `tasks/backlog.md` is the canonical list of commands that are stubbed, features with simplified implementations, and work explicitly deferred from a slice. **Update it whenever you stub something, defer a slice, or discover a limitation. When you fix an item, delete its line.** Future sessions should treat that file as load-bearing — it's the only honest record of where SecantusDB's behaviour diverges from real MongoDB.

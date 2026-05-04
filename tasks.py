@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import json
+import pathlib
+import re
+import subprocess
+import time
+import urllib.request
+
 from invoke.context import Context
 from invoke.tasks import task
 
@@ -147,9 +154,10 @@ def validate_go(c: Context) -> None:
     # Need both the outer submodule AND its nested `testdata/specifications`
     # submodule (driver-spec test data — without it the bson-corpus tests
     # fail on missing JSON files).
-    if not pathlib.Path("vendor/mongo-go-driver/go.mod").exists() or not pathlib.Path(
-        "vendor/mongo-go-driver/testdata/specifications/source"
-    ).is_dir():
+    if (
+        not pathlib.Path("vendor/mongo-go-driver/go.mod").exists()
+        or not pathlib.Path("vendor/mongo-go-driver/testdata/specifications/source").is_dir()
+    ):
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
@@ -212,9 +220,12 @@ def validate_java(c: Context) -> None:
     # submodule (testing/resources/specifications) — without it the
     # bson corpus / vector tests fail with `initializationError` on
     # missing JSON files. Same pattern as the go-driver gauge.
-    if not pathlib.Path("vendor/mongo-java-driver/gradlew").exists() or not pathlib.Path(
-        "vendor/mongo-java-driver/testing/resources/specifications/source"
-    ).is_dir():
+    if (
+        not pathlib.Path("vendor/mongo-java-driver/gradlew").exists()
+        or not pathlib.Path(
+            "vendor/mongo-java-driver/testing/resources/specifications/source"
+        ).is_dir()
+    ):
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
@@ -234,7 +245,260 @@ def validate_java(c: Context) -> None:
 @task
 def clean(c: Context) -> None:
     c.run(
-        "rm -rf build dist *.egg-info .pytest_cache .ruff_cache "
-        ".coverage htmlcov docs/_build",
+        "rm -rf build dist *.egg-info .pytest_cache .ruff_cache .coverage htmlcov docs/_build",
         pty=True,
     )
+
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([ab]\d+|rc\d+)?$")
+
+
+@task
+def release(c: Context, version: str) -> None:
+    """Cut a release: test, bump, commit, tag, push, validate PyPI + RTD.
+
+    The canonical release workflow (see `## Releases` in CLAUDE.md).
+
+    Usage:
+        uv run python -m invoke release 0.3.0a5
+        uv run python -m invoke release 1.0.0
+
+    `version` is the pyproject form (no leading 'v'); the tag is created
+    with the leading 'v' to match `.github/workflows/publish.yml`.
+
+    Pre-flight requirements (all enforced):
+      - On `main` branch.
+      - Working tree clean (submodule "modified content" markers OK,
+        any other unstaged / untracked files reject).
+      - HEAD == origin/main (no unpushed commits).
+      - Tag `vX.Y.Z` not already on origin.
+
+    Pipeline:
+      1. Run full default test suite (`pytest` parallel, perf-excluded).
+      2. Run perf regression gates serially.
+      3. Bump pyproject.toml + src/secantus/__init__.py + uv.lock.
+      4. Commit, annotate-tag, push commit + tag.
+      5. Wait for GitHub `Publish to PyPI` workflow to succeed.
+      6. Wait for PyPI to list the new version.
+      7. Wait for Read the Docs to publish a successful build of the
+         release commit.
+
+    Aborts on any failure — leaves working tree as it was before the
+    bump so the user can fix and re-run.
+    """
+    if not _VERSION_RE.match(version):
+        raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
+    _ensure_main_branch_clean()
+    _ensure_in_sync_with_origin()
+    _ensure_tag_unused(version)
+
+    print("==> [1/7] Full default test suite")
+    c.run("uv run python -m pytest", pty=True)
+    print("==> [2/7] Perf regression gates")
+    c.run(
+        "uv run python -m pytest -p no:xdist -o addopts= -m perf tests/test_perf_regression.py",
+        pty=True,
+    )
+
+    print(f"==> [3/7] Bumping version files to {version}")
+    _bump_version_files(version)
+    c.run("uv lock", pty=True)
+
+    print(f"==> [4/7] Committing + tagging v{version}")
+    c.run("git add pyproject.toml src/secantus/__init__.py uv.lock", pty=True)
+    c.run(f'git commit -m "Release v{version}"', pty=True)
+    c.run(f'git tag -a v{version} -m "Release v{version}"', pty=True)
+    c.run("git push origin main", pty=True)
+    c.run(f"git push origin v{version}", pty=True)
+
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    print(f"\n==> [5/7] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
+    _wait_for_publish_workflow(commit)
+    print(f"==> [6/7] Waiting for PyPI to list {version}")
+    _wait_for_pypi_version(version)
+    print(f"==> [7/7] Waiting for Read the Docs to build {commit[:7]}")
+    _wait_for_rtd_build(commit)
+
+    print(f"\nv{version} released; PyPI + RTD up to date.")
+
+
+def _ensure_main_branch_clean() -> None:
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if branch != "main":
+        raise SystemExit(f"release must run on main; on {branch!r}")
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    # Submodule "modified content" rows look like " m vendor/foo" (lowercase
+    # m, leading space). Those reflect build-time patching of vendored
+    # WiredTiger and unrelated parallel-session state — they don't go
+    # into commits, so the release task tolerates them. Anything else is
+    # uncommitted work the release would either include or shadow.
+    bad = [
+        line
+        for line in status.splitlines()
+        if line and not (line.startswith(" m ") and "vendor/" in line)
+    ]
+    if bad:
+        raise SystemExit("working tree has uncommitted changes:\n" + "\n".join(bad))
+
+
+def _ensure_in_sync_with_origin() -> None:
+    subprocess.run(["git", "fetch", "origin"], check=True, capture_output=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    origin = subprocess.run(
+        ["git", "rev-parse", "origin/main"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if head != origin:
+        raise SystemExit(
+            f"local main ({head[:7]}) is not in sync with origin/main "
+            f"({origin[:7]}) — push or pull first."
+        )
+
+
+def _ensure_tag_unused(version: str) -> None:
+    out = subprocess.run(
+        ["git", "ls-remote", "--tags", "origin", f"v{version}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if out:
+        raise SystemExit(f"tag v{version} already exists on origin — pick a new version.")
+
+
+def _bump_version_files(version: str) -> None:
+    py = pathlib.Path("pyproject.toml")
+    init = pathlib.Path("src/secantus/__init__.py")
+    py.write_text(
+        re.sub(
+            r'^version = "[^"]+"',
+            f'version = "{version}"',
+            py.read_text(),
+            count=1,
+            flags=re.MULTILINE,
+        )
+    )
+    init.write_text(
+        re.sub(
+            r'^__version__ = "[^"]+"',
+            f'__version__ = "{version}"',
+            init.read_text(),
+            count=1,
+            flags=re.MULTILINE,
+        )
+    )
+
+
+def _wait_for_publish_workflow(commit: str, *, timeout_s: int = 1200) -> None:
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        out = subprocess.run(
+            [
+                "gh",
+                "run",
+                "list",
+                "--workflow=publish.yml",
+                f"--commit={commit}",
+                "--json=status,conclusion,databaseId",
+                "--limit=1",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        runs = json.loads(out or "[]")
+        if not runs:
+            line = "    no publish run for this commit yet; waiting"
+        else:
+            r = runs[0]
+            conc = r.get("conclusion") or ""
+            line = f"    run {r['databaseId']}: status={r['status']} conclusion={conc}"
+            if r["status"] == "completed":
+                if r.get("conclusion") == "success":
+                    print(line)
+                    return
+                raise SystemExit(
+                    f"publish workflow {r['databaseId']} concluded {r.get('conclusion')!r}"
+                )
+        if line != last:
+            print(line)
+            last = line
+        time.sleep(20)
+    raise SystemExit(f"timed out after {timeout_s}s waiting for publish workflow")
+
+
+def _wait_for_pypi_version(version: str, *, timeout_s: int = 600) -> None:
+    url = "https://pypi.org/pypi/SecantusDB/json"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.load(resp)
+        except Exception as e:
+            print(f"    PyPI API error: {e}; retrying")
+            time.sleep(20)
+            continue
+        latest = data["info"]["version"]
+        if version in data.get("releases", {}):
+            print(f"    PyPI lists {version} (info.version={latest})")
+            return
+        print(f"    PyPI does not list {version} yet (info.version={latest}); waiting")
+        time.sleep(20)
+    raise SystemExit(f"timed out after {timeout_s}s waiting for PyPI to list {version}")
+
+
+def _wait_for_rtd_build(commit: str, *, timeout_s: int = 900) -> None:
+    url = "https://readthedocs.org/api/v3/projects/secantusdb/builds/?limit=5"
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.load(resp)
+        except Exception as e:
+            print(f"    RTD API error: {e}; retrying")
+            time.sleep(30)
+            continue
+        match = next(
+            (b for b in data.get("results", []) if (b.get("commit") or "").startswith(commit[:12])),
+            None,
+        )
+        if match is None:
+            line = f"    no RTD build found for {commit[:7]} yet; waiting"
+        else:
+            state = match["state"]["code"]
+            success = match.get("success")
+            line = f"    build {match['id']}: state={state} success={success}"
+            if state == "finished":
+                if success:
+                    print(line)
+                    return
+                raise SystemExit(f"RTD build {match['id']} for {commit[:7]} failed")
+        if line != last:
+            print(line)
+            last = line
+        time.sleep(30)
+    raise SystemExit(f"timed out after {timeout_s}s waiting for RTD build of {commit[:7]}")
