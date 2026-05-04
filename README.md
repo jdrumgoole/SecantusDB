@@ -2,7 +2,7 @@
 
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](#alpha-software)
 [![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
-[![License: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue)](LICENSE)
+[![License: GPL-2.0-only (code) + CC-BY-4.0 (content)](https://img.shields.io/badge/license-GPL--2.0--only%20%2B%20CC--BY--4.0-blue)](#license)
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![Documentation Status](https://readthedocs.org/projects/secantusdb/badge/?version=latest)](https://secantusdb.readthedocs.io/en/latest/)
 
