@@ -115,19 +115,26 @@ When secondary indexes land they will be WT indexes over typed sort-key columns 
 
 ## Releases
 
-**Always release via `uv run python -m invoke release X.Y.Z`** — that task is the canonical release path. It runs the full default test suite, then the perf regression gates, then bumps `pyproject.toml` + `src/secantus/__init__.py` + `uv.lock`, commits, creates a `vX.Y.Z` annotated tag, pushes both, and waits for the downstream systems to confirm:
+**The canonical release path is `uv run python -m invoke release X.Y.Z`, and it must run inside a sub-agent.** A release end-to-end takes ~15-25 minutes (full default suite + perf gates + tag push + GitHub Actions publish + PyPI propagation + RTD build), and the polling output is verbose. Putting it in a sub-agent keeps the main session's context clean and lets the user keep working in parallel; the sub-agent reports a concise final result back.
 
-1. GitHub Actions `Publish to PyPI` workflow concludes `success`.
-2. PyPI's JSON API lists the new version under `releases`.
-3. Read the Docs publishes a successful build for the release commit.
+Sub-agent invocation pattern (use `general-purpose`, not Explore — it needs to run shell commands):
 
-Pre-flight requirements (all enforced — the task aborts cleanly if any fail):
+> Run `uv run python -m invoke release X.Y.Z` from `/Users/jdrumgoole/GIT/SecantusDB`. The task does pre-flight checks, runs the full test suite + perf gates, bumps version files + uv.lock, commits, creates and pushes the `vX.Y.Z` annotated tag, then polls until the GitHub `Publish to PyPI` workflow succeeds, PyPI lists the new version, and Read the Docs publishes a successful build for the release commit. Do not modify the workflow — invoke it as-is and report success or the first failure with stderr/stdout.
 
-- On `main` branch with the working tree clean (vendored-submodule "modified content" markers are tolerated; anything else rejects).
-- `HEAD == origin/main` — push or pull first if not.
-- Tag `vX.Y.Z` not already on origin.
+The task itself does:
 
-Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases. The only path to a published release is `invoke release`. The publish workflow refuses to ship a tag whose version doesn't match `pyproject.toml`, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation).
+1. Pre-flight: branch=`main`, working tree clean (vendored-submodule "modified content" markers tolerated, everything else rejects), `HEAD == origin/main`, tag `vX.Y.Z` not already on origin.
+2. Full default test suite (parallel, perf-excluded — currently 653 tests).
+3. Perf regression gates (serial — six benchmarks with hard upper bounds).
+4. Bump `pyproject.toml` + `src/secantus/__init__.py` + `uv.lock`.
+5. `git commit -m "Release vX.Y.Z"` + `git tag -a vX.Y.Z` + push both.
+6. Wait for the GitHub `Publish to PyPI` workflow to conclude `success`.
+7. Wait for PyPI's JSON API to list the new version under `releases`.
+8. Wait for Read the Docs to publish a successful build for the release commit.
+
+Aborts cleanly on any failure — leaves the working tree as it was before the bump so the user can fix and re-run.
+
+Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases. The only sanctioned path is `invoke release` via sub-agent. The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation).
 
 ## Backlog of stubs and stopgaps
 
