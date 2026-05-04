@@ -48,9 +48,23 @@ class CursorRegistry:
         self.idle_ttl_seconds = idle_ttl_seconds
         self.tailable_idle_ttl_seconds = tailable_idle_ttl_seconds
         self._time = time_func or time.monotonic
+        # Last successful prune timestamp; -inf means never. Used to amortise
+        # the O(N) prune walk across operations rather than running it on
+        # every register / get / next_batch / kill / __len__ call.
+        self._last_prune: float = float("-inf")
+
+    def _prune_interval(self) -> float:
+        # Cap the prune cadence at 60s and at one-tenth of the (smaller) TTL,
+        # so a cursor can't outlive its TTL by more than ~10%.
+        ttl = self.idle_ttl_seconds
+        if ttl <= 0:
+            return float("inf")
+        return min(60.0, ttl / 10.0)
 
     def _prune_locked(self) -> None:
         now = self._time()
+        if now - self._last_prune < self._prune_interval():
+            return
         expired: list[int] = []
         for cid, e in self._cursors.items():
             if e.no_cursor_timeout:
@@ -62,6 +76,7 @@ class CursorRegistry:
                 expired.append(cid)
         for cid in expired:
             del self._cursors[cid]
+        self._last_prune = now
 
     def register(self, namespace: str, remaining: list[dict[str, Any]]) -> int:
         with self._lock:

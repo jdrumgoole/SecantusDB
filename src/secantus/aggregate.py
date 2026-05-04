@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
@@ -391,6 +391,18 @@ def _stage_group(
         raise AggregateError("$group requires an _id expression")
     id_expr = spec["_id"]
     accumulators = {k: v for k, v in spec.items() if k != "_id"}
+    # Pre-compile accumulators once: each entry is (field, handler, arg) where
+    # handler is a per-op callable bound on (bucket, field, arg, doc, vars).
+    # Replaces a 9-way if/elif chain in the per-doc loop.
+    compiled: list[tuple[str, _AccHandler, Any]] = []
+    for field, accumulator in accumulators.items():
+        if not isinstance(accumulator, Mapping) or len(accumulator) != 1:
+            raise AggregateError(f"$group accumulator for {field!r} must be a single-op doc")
+        op, arg = next(iter(accumulator.items()))
+        handler = _ACC_DISPATCH.get(op)
+        if handler is None:
+            raise AggregateError(f"unsupported $group accumulator: {op}")
+        compiled.append((field, handler, arg))
 
     groups: dict[Any, dict[str, Any]] = {}
     order: list[Any] = []
@@ -401,8 +413,8 @@ def _stage_group(
             groups[hashable_key] = {"_id": key}
             order.append(hashable_key)
         bucket = groups[hashable_key]
-        for field, accumulator in accumulators.items():
-            _accumulate(bucket, field, accumulator, d, ctx.vars)
+        for field, handler, arg in compiled:
+            handler(bucket, field, arg, d, ctx.vars)
     return [_finalize(groups[k]) for k in order]
 
 
@@ -411,6 +423,97 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
         if isinstance(v, dict) and "_avg_total" in v and "_avg_n" in v:
             bucket[k] = v["_avg_total"] / v["_avg_n"] if v["_avg_n"] else None
     return bucket
+
+
+_AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
+
+
+def _acc_sum(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    increment = 1 if arg == 1 else evaluate(arg, doc, vars)
+    if increment is None:
+        increment = 0
+    bucket[field] = bucket.get(field, 0) + increment
+
+
+def _acc_count(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    bucket[field] = bucket.get(field, 0) + 1
+
+
+def _acc_avg(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    v = evaluate(arg, doc, vars)
+    if v is None:
+        return
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_avg_total" not in state:
+        state = {"_avg_total": 0, "_avg_n": 0}
+        bucket[field] = state
+    state["_avg_total"] += v
+    state["_avg_n"] += 1
+
+
+def _acc_max(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    v = evaluate(arg, doc, vars)
+    cur = bucket.get(field)
+    if cur is None or (v is not None and v > cur):
+        bucket[field] = v
+
+
+def _acc_min(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    v = evaluate(arg, doc, vars)
+    cur = bucket.get(field)
+    if cur is None or (v is not None and v < cur):
+        bucket[field] = v
+
+
+def _acc_first(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    if field not in bucket:
+        bucket[field] = evaluate(arg, doc, vars)
+
+
+def _acc_last(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    bucket[field] = evaluate(arg, doc, vars)
+
+
+def _acc_push(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    bucket.setdefault(field, []).append(evaluate(arg, doc, vars))
+
+
+def _acc_add_to_set(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    v = evaluate(arg, doc, vars)
+    bucket.setdefault(field, [])
+    if v not in bucket[field]:
+        bucket[field].append(v)
+
+
+_ACC_DISPATCH: dict[str, _AccHandler] = {
+    "$sum": _acc_sum,
+    "$count": _acc_count,
+    "$avg": _acc_avg,
+    "$max": _acc_max,
+    "$min": _acc_min,
+    "$first": _acc_first,
+    "$last": _acc_last,
+    "$push": _acc_push,
+    "$addToSet": _acc_add_to_set,
+}
 
 
 def _accumulate(
@@ -423,47 +526,10 @@ def _accumulate(
     if not isinstance(accumulator, Mapping) or len(accumulator) != 1:
         raise AggregateError(f"$group accumulator for {field!r} must be a single-op doc")
     op, arg = next(iter(accumulator.items()))
-    if op == "$sum":
-        increment = 1 if arg == 1 else evaluate(arg, doc, vars)
-        if increment is None:
-            increment = 0
-        bucket[field] = bucket.get(field, 0) + increment
-    elif op == "$count":
-        bucket[field] = bucket.get(field, 0) + 1
-    elif op == "$avg":
-        v = evaluate(arg, doc, vars)
-        if v is None:
-            return
-        state = bucket.get(field)
-        if not isinstance(state, dict) or "_avg_total" not in state:
-            state = {"_avg_total": 0, "_avg_n": 0}
-            bucket[field] = state
-        state["_avg_total"] += v
-        state["_avg_n"] += 1
-    elif op == "$max":
-        v = evaluate(arg, doc, vars)
-        cur = bucket.get(field)
-        if cur is None or (v is not None and v > cur):
-            bucket[field] = v
-    elif op == "$min":
-        v = evaluate(arg, doc, vars)
-        cur = bucket.get(field)
-        if cur is None or (v is not None and v < cur):
-            bucket[field] = v
-    elif op == "$first":
-        if field not in bucket:
-            bucket[field] = evaluate(arg, doc, vars)
-    elif op == "$last":
-        bucket[field] = evaluate(arg, doc, vars)
-    elif op == "$push":
-        bucket.setdefault(field, []).append(evaluate(arg, doc, vars))
-    elif op == "$addToSet":
-        v = evaluate(arg, doc, vars)
-        bucket.setdefault(field, [])
-        if v not in bucket[field]:
-            bucket[field].append(v)
-    else:
+    handler = _ACC_DISPATCH.get(op)
+    if handler is None:
         raise AggregateError(f"unsupported $group accumulator: {op}")
+    handler(bucket, field, arg, doc, vars)
 
 
 def _hashable(value: Any) -> Any:

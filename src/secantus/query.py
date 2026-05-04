@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as _dt
 import re
 from collections.abc import Callable, Mapping
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Any
 
 from bson import Binary, Decimal128, ObjectId, Regex
@@ -318,8 +320,6 @@ def _coerce_numeric(a: Any, b: Any) -> tuple[Any, Any]:
         and isinstance(b, (int, float, Decimal128))
         and (isinstance(a, Decimal128) or isinstance(b, Decimal128))
     ):
-        from decimal import Decimal, InvalidOperation
-
         def _to_dec(v: Any) -> Decimal | None:
             if isinstance(v, Decimal128):
                 try:
@@ -358,6 +358,11 @@ def _re_flags(flags_input: Any) -> int:
     return flags
 
 
+@lru_cache(maxsize=1024)
+def _compile_regex(pattern: str | bytes, flags: int) -> re.Pattern:
+    return re.compile(pattern, flags)
+
+
 def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
     flags = _re_flags(options)
     if isinstance(pattern, Regex):
@@ -366,9 +371,18 @@ def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
     else:
         regex_pattern = pattern
     try:
-        compiled = re.compile(regex_pattern, flags)
+        compiled = _compile_regex(regex_pattern, flags)
     except re.error as exc:
         raise QueryError(f"invalid regex: {exc}") from exc
+    except TypeError as exc:
+        # Unhashable pattern (e.g. a non-str/bytes input) — fall back to
+        # an uncached compile so the caller still gets a real re.error.
+        try:
+            compiled = re.compile(regex_pattern, flags)
+        except re.error as e:
+            raise QueryError(f"invalid regex: {e}") from e
+        except Exception as e:
+            raise QueryError(f"invalid regex: {exc}") from e
     for v in values:
         if v is MISSING:
             continue
