@@ -7,6 +7,14 @@ build:
   os: ubuntu-22.04
   tools:
     python: "3.12"
+  apt_packages:
+    # WiredTiger's CMake build needs SWIG for the Python bindings.
+    # `[build-system].requires` deliberately doesn't pull the PyPI
+    # `swig` package because its `swig4.0 -help` shim trips CMake's
+    # FindSWIG language-detection probe — see pyproject.toml. RTD's
+    # ubuntu-22.04 image has no system swig by default; install it
+    # via apt so cmake's FindSWIG resolves.
+    - swig
   jobs:
     # The vendored WiredTiger source lives in vendor/wiredtiger as a
     # git submodule. Without this, scikit-build-core's CMake configure
