@@ -34,15 +34,26 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run_mongosh(uri: str, eval_script: str) -> str:
-    """Run a one-shot mongosh script and return stdout (stripped)."""
+    """Run a one-shot mongosh script and return stdout (stripped).
+
+    On non-zero exit, the assertion message includes both stdout and
+    stderr so xdist test failures stay diagnosable — the default
+    ``CalledProcessError`` repr drops both streams.
+    """
     assert MONGOSH is not None  # narrowed by skipif
     result = subprocess.run(
         [MONGOSH, uri, "--quiet", "--eval", eval_script],
-        check=True,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=30,
     )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"mongosh exited with code {result.returncode}\n"
+            f"--- script ---\n{eval_script}\n"
+            f"--- stdout ---\n{result.stdout}\n"
+            f"--- stderr ---\n{result.stderr}"
+        )
     return result.stdout.strip()
 
 
@@ -85,7 +96,12 @@ def test_pymongo_writes_mongosh_reads() -> None:
             f"{server.uri}wine_cellar",
             "JSON.stringify(db.bottles.find({}).sort({_id: 1}).toArray())",
         )
-        docs = json.loads(out)
+        try:
+            docs = json.loads(out)
+        except json.JSONDecodeError as e:
+            raise AssertionError(
+                f"could not parse mongosh stdout as JSON: {e}\n--- stdout ---\n{out}"
+            ) from e
         assert docs == [
             {"_id": 1, "name": "Pommard 2018", "year": 2018},
             {"_id": 2, "name": "Brunello 2015", "year": 2015},
@@ -95,17 +111,27 @@ def test_pymongo_writes_mongosh_reads() -> None:
 def test_mongosh_index_round_trip() -> None:
     """mongosh's createIndex + listIndexes round-trip through SecantusDB."""
     with SecantusDBServer(port=0, storage_path=":memory:") as server:
+        # Split into two mongosh invocations: the first does the writes
+        # (whose return values mongosh would otherwise auto-print and
+        # complicate parsing); the second runs the single read whose
+        # JSON.stringify result is the only line of stdout we then parse.
+        # Earlier single-invocation form scanned for the last line
+        # starting with '[' and was occasionally fragile under heavy
+        # parallel load.
+        _run_mongosh(
+            f"{server.uri}wine_cellar",
+            "db.bottles.insertOne({_id: 1, year: 2018}); "
+            "db.bottles.createIndex({year: 1});",
+        )
         out = _run_mongosh(
             f"{server.uri}wine_cellar",
-            (
-                "db.bottles.insertOne({_id: 1, year: 2018}); "
-                "db.bottles.createIndex({year: 1}); "
-                "JSON.stringify(db.bottles.getIndexes().map(i => i.name))"
-            ),
+            "JSON.stringify(db.bottles.getIndexes().map(i => i.name))",
         )
-        # Last line of stdout is the JSON.stringify result; createIndex
-        # may print intermediate output, so parse the last `[...]` line.
-        last_json = [line for line in out.splitlines() if line.startswith("[")][-1]
-        names = json.loads(last_json)
-        assert "_id_" in names
-        assert "year_1" in names
+        try:
+            names = json.loads(out)
+        except json.JSONDecodeError as e:
+            raise AssertionError(
+                f"could not parse mongosh stdout as JSON: {e}\n--- stdout ---\n{out}"
+            ) from e
+        assert "_id_" in names, f"_id_ missing from {names}"
+        assert "year_1" in names, f"year_1 missing from {names}"
