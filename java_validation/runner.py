@@ -29,10 +29,48 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from .include_modules import INCLUDE
+
+
+def _jstack_all_javas(jstack_dir: Path, java_home: str | None) -> None:
+    """jstack every java PID currently visible. Writes one file per PID
+    under `jstack_dir/jstack-<HHMMSS>-<pid>.txt`. Best-effort — silent on
+    individual failures; surfaces a count to stderr."""
+    jstack_bin = "jstack"
+    if java_home:
+        candidate = Path(java_home) / "bin" / "jstack"
+        if candidate.is_file():
+            jstack_bin = str(candidate)
+    pids_proc = subprocess.run(
+        ["pgrep", "-f", "java"], capture_output=True, text=True
+    )
+    pids = [p for p in pids_proc.stdout.split() if p.strip()]
+    if not pids:
+        print("jstack-on-hang: no java PIDs to dump", file=sys.stderr)
+        return
+    ts = time.strftime("%H%M%S")
+    written = 0
+    for pid in pids:
+        out_path = jstack_dir / f"jstack-{ts}-{pid}.txt"
+        try:
+            with out_path.open("w") as fh:
+                subprocess.run(
+                    [jstack_bin, pid],
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    timeout=10,
+                )
+            written += 1
+        except Exception as exc:
+            print(f"jstack-on-hang: failed for pid {pid}: {exc}", file=sys.stderr)
+    print(
+        f"jstack-on-hang: wrote {written} thread dump(s) to {jstack_dir}",
+        file=sys.stderr,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-java-driver"
@@ -147,30 +185,83 @@ def main() -> int:
             f"(URI={uri})",
             file=sys.stderr,
         )
-        # Gradle returns non-zero on any test failure but still writes the
-        # JUnit XML; capture stderr to surface real build errors but don't
-        # fail the whole step.
-        #
-        # Hard wall-clock timeout (env-tunable, default 30 min). A Spock
-        # spec that opens an awaitData change-stream cursor and never sees
-        # an event can hang the test JVM indefinitely; without this cap the
-        # whole run dies silently and no JUnit XML is written. With the
-        # cap, gradle gets SIGTERM, finalises the per-class XML it has,
-        # and the report harvests partial results — telling us *which*
-        # test class hung instead of just "the suite hung somewhere".
+        # Hard wall-clock timeout (env-tunable). PLUS jstack-on-hang: if
+        # gradle stops emitting stdout for VALIDATE_JAVA_JSTACK_IDLE_S
+        # seconds (default 120), we jstack every java PID and write the
+        # dumps under .validation/java-stacks/. That gives us the test
+        # JVM's thread state at the moment of the hang — typically:
+        #   - which test class is running
+        #   - whether @After / @AfterAll cleanup is blocked
+        #   - whether SDAM heartbeat / connection pool teardown is stuck
+        # Repeat up to MAX_DUMPS times so we get a few snapshots if the
+        # hang is "slow drift" rather than fully wedged.
         timeout_s = int(os.environ.get("VALIDATE_JAVA_TIMEOUT_S", "1800"))
-        try:
-            proc = subprocess.run(cmd, cwd=VENDOR, env=env, timeout=timeout_s)
-            gradle_rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            print(
-                f"java_validation: gradle exceeded {timeout_s}s wall clock; "
-                "killing and harvesting partial JUnit XML. Look in the report "
-                "for the test class that ran last — most likely the one that "
-                "hung. Override with VALIDATE_JAVA_TIMEOUT_S=<seconds>.",
-                file=sys.stderr,
-            )
-            gradle_rc = 124  # conventional timeout exit code
+        idle_s = int(os.environ.get("VALIDATE_JAVA_JSTACK_IDLE_S", "120"))
+        max_dumps = int(os.environ.get("VALIDATE_JAVA_JSTACK_MAX", "5"))
+        jstack_dir = REPO_ROOT / ".validation" / "java-stacks"
+        if jstack_dir.exists():
+            shutil.rmtree(jstack_dir)
+        jstack_dir.mkdir(parents=True)
+
+        proc = subprocess.Popen(
+            cmd, cwd=VENDOR, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=1, text=True,
+        )
+        last_output_ts = [time.monotonic()]
+        forward_done = threading.Event()
+
+        def _forward() -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                last_output_ts[0] = time.monotonic()
+            forward_done.set()
+
+        threading.Thread(target=_forward, daemon=True).start()
+
+        deadline = time.monotonic() + timeout_s
+        dumps = 0
+        timed_out = False
+        while True:
+            try:
+                rc = proc.wait(timeout=15)
+                gradle_rc = rc
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            if now >= deadline:
+                print(
+                    f"java_validation: gradle exceeded {timeout_s}s wall clock; "
+                    "SIGTERM-ing and harvesting partial JUnit XML. Override with "
+                    "VALIDATE_JAVA_TIMEOUT_S=<seconds>.",
+                    file=sys.stderr,
+                )
+                proc.terminate()
+                try:
+                    gradle_rc = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    gradle_rc = proc.wait()
+                timed_out = True
+                break
+            if now - last_output_ts[0] > idle_s and dumps < max_dumps:
+                print(
+                    f"jstack-on-hang: no gradle output for "
+                    f"{int(now - last_output_ts[0])}s; dumping java threads "
+                    f"({dumps + 1}/{max_dumps})",
+                    file=sys.stderr,
+                )
+                _jstack_all_javas(jstack_dir, java_home_override)
+                dumps += 1
+                # Reset the idle clock so we don't dump again immediately.
+                last_output_ts[0] = now
+
+        if timed_out:
+            gradle_rc = 124
+        forward_done.wait(timeout=2)
 
         # Copy JUnit XML out of the source tree to keep our parser simple
         # and avoid touching the submodule.

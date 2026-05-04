@@ -1290,3 +1290,29 @@ def test_aggregate_with_unknown_hint(coll) -> None:
     with pytest.raises(OperationFailure) as exc:
         list(coll.aggregate([{"$match": {}}], hint="nonexistent"))
     assert exc.value.code == 2
+
+
+def test_unacknowledged_writes_do_not_desync_connection(server: SecantusDBServer) -> None:
+    # `writeConcern: {w: 0}` triggers OP_MSG with the moreToCome flag set
+    # — server must not reply. If it does, the next genuine response is
+    # mis-paired and pymongo / Java driver close the connection with a
+    # responseTo/requestId mismatch error.
+    from pymongo.write_concern import WriteConcern
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        coll_w0 = mc["unack_db"]["things"].with_options(write_concern=WriteConcern(w=0))
+        # Several fire-and-forget writes interleaved with normal commands
+        # over the same connection. Pre-fix, the second normal command
+        # would receive the moreToCome echo and bomb.
+        for i in range(10):
+            coll_w0.insert_one({"_id": i, "x": i * 2})
+        # Acknowledged read on the same client must succeed.
+        ack_coll = mc["unack_db"]["things"]
+        docs = list(ack_coll.find().sort("_id"))
+        assert [d["_id"] for d in docs] == list(range(10))
+        # Ack write after w:0 writes — verifies connection still healthy.
+        ack_coll.insert_one({"_id": 99})
+        assert ack_coll.find_one({"_id": 99}) == {"_id": 99}
+    finally:
+        mc.close()

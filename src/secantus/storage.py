@@ -1232,12 +1232,19 @@ class Storage:
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
+                    is_replacement = not any(
+                        isinstance(k, str) and k.startswith("$") for k in update
+                    )
+                    if is_replacement:
+                        o_field: dict[str, Any] = dict(new)
+                    else:
+                        o_field = {"$v": 2, "diff": compute_update_description(doc, new)}
                     oplog_entries.append(
                         {
                             "op": "u",
                             "ns": ns,
                             "ui": bson.Binary(ui.bytes, subtype=4),
-                            "o": {"$v": 2, "diff": compute_update_description(doc, new)},
+                            "o": o_field,
                             "o2": {"_id": doc["_id"]},
                         }
                     )

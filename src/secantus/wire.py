@@ -13,6 +13,11 @@ OP_GET_MORE = 2005
 OP_MSG = 2013
 OP_COMPRESSED = 2012
 
+# OP_MSG flag bits.
+OP_MSG_FLAG_CHECKSUM_PRESENT = 1 << 0
+OP_MSG_FLAG_MORE_TO_COME = 1 << 1
+OP_MSG_FLAG_EXHAUST_ALLOWED = 1 << 16
+
 _HEADER = struct.Struct("<iiii")
 _INT32 = struct.Struct("<i")
 _UINT32 = struct.Struct("<I")
