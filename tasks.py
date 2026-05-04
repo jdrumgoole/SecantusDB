@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -273,9 +274,10 @@ def release(c: Context, version: str) -> None:
         any other unstaged / untracked files reject).
       - HEAD == origin/main (no unpushed commits).
       - Tag `vX.Y.Z` not already on origin.
-      - `READTHEDOCS_TOKEN` set so the task can promote the tag's
-        version to RTD's default. (Mint at
-        https://app.readthedocs.org/accounts/tokens/ — read+write.)
+      - `READTHEDOCS_TOKEN` available — either exported in the shell
+        env, or as a `READTHEDOCS_TOKEN=…` line in a `.env` file at
+        the repo root (gitignored). Mint at
+        https://app.readthedocs.org/accounts/tokens/ — read+write.
 
     Pipeline:
       1. Run full default test suite (`pytest` parallel, perf-excluded).
@@ -538,19 +540,48 @@ _RTD_PROJECT_API = "https://readthedocs.org/api/v3/projects/secantusdb"
 
 def _ensure_rtd_token() -> str:
     """Pre-flight: require READTHEDOCS_TOKEN so the post-publish RTD admin
-    operations (activate version, set default_version) can run."""
-    import os
+    operations (activate version, set default_version) can run.
 
+    Resolution order:
+      1. ``READTHEDOCS_TOKEN`` already in the process env (e.g. set in
+         the user's shell rc).
+      2. ``READTHEDOCS_TOKEN=…`` line in a project-root ``.env`` file
+         (gitignored). This is the recommended on-disk store.
+    """
     token = os.environ.get("READTHEDOCS_TOKEN")
+    if not token:
+        token = _read_dotenv_var("READTHEDOCS_TOKEN")
     if not token:
         raise SystemExit(
             "READTHEDOCS_TOKEN is required for the release task — without it,\n"
             "RTD's default version stays pinned to whatever it was before this\n"
             "release. Mint one (read+write) at\n"
             "    https://app.readthedocs.org/accounts/tokens/\n"
-            "and re-run with `READTHEDOCS_TOKEN=<token> uv run python -m invoke release X.Y.Z`."
+            "and either export it in your shell or put `READTHEDOCS_TOKEN=…`\n"
+            "into a `.env` file at the repo root (which is gitignored)."
         )
     return token
+
+
+def _read_dotenv_var(key: str) -> str | None:
+    """Tiny ``.env`` parser: ``KEY=VALUE`` lines, optional surrounding
+    quotes, ``#`` comments. No interpolation, no exports — that would
+    duplicate python-dotenv for one variable."""
+    env_path = pathlib.Path(".env")
+    if not env_path.is_file():
+        return None
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() != key:
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        return v or None
+    return None
 
 
 def _rtd_request(method: str, path: str, token: str, body: dict | None = None) -> dict:

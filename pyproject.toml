@@ -4,15 +4,16 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.3.0a10"
+version = "0.3.0a11"
 description = "A drop-in single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
-license = "GPL-2.0-only"
-# `license` is the SPDX expression for the *code*. Documentation and other
-# written content (README.md, docs/, pymongo_validation/README.md) are
-# additionally licensed CC-BY 4.0 — see LICENSE-DOCS.
+license = "GPL-2.0-only AND CC-BY-4.0"
+# Compound SPDX expression: code (src/, build glue, vendored WiredTiger
+# headers we ship) is GPL-2.0-only; written content (README.md, docs/,
+# validation reports, pymongo_validation/README.md) is CC-BY-4.0. Both
+# license files travel with the wheel via `license-files` below.
 license-files = ["LICENSE", "LICENSE-DOCS"]
 dependencies = [
     "pymongo>=4.6",

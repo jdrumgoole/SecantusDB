@@ -119,11 +119,11 @@ When secondary indexes land they will be WT indexes over typed sort-key columns 
 
 Sub-agent invocation pattern (use `general-purpose`, not Explore — it needs to run shell commands):
 
-> Run `uv run python -m invoke release X.Y.Z` from `/Users/jdrumgoole/GIT/SecantusDB`. The task does pre-flight checks, runs the full test suite + perf gates, bumps version files + uv.lock, commits, creates and pushes the `vX.Y.Z` annotated tag, opens a GitHub Release with auto-generated notes, then polls until the GitHub `Publish to PyPI` workflow succeeds, PyPI lists the new version, and Read the Docs has built both the release commit on `latest` and the `vX.Y.Z` slug — finally setting RTD's `default_version` to `vX.Y.Z`. Make sure `READTHEDOCS_TOKEN` is in the env before invocation. Do not modify the workflow — invoke it as-is and report success or the first failure with stderr/stdout.
+> Run `uv run python -m invoke release X.Y.Z` from `/Users/jdrumgoole/GIT/SecantusDB`. The task does pre-flight checks, runs the full test suite + perf gates, bumps version files + uv.lock, commits, creates and pushes the `vX.Y.Z` annotated tag, opens a GitHub Release with auto-generated notes, then polls until the GitHub `Publish to PyPI` workflow succeeds, PyPI lists the new version, and Read the Docs has built both the release commit on `latest` and the `vX.Y.Z` slug — finally setting RTD's `default_version` to `vX.Y.Z`. The task auto-loads `READTHEDOCS_TOKEN` from `.env` at the repo root (gitignored); export it manually only if it's missing from `.env`. Do not modify the workflow — invoke it as-is and report success or the first failure with stderr/stdout.
 
 The task itself does:
 
-1. Pre-flight: branch=`main`, working tree clean (vendored-submodule "modified content" markers tolerated, everything else rejects), `HEAD == origin/main`, tag `vX.Y.Z` not already on origin, `READTHEDOCS_TOKEN` set.
+1. Pre-flight: branch=`main`, working tree clean (vendored-submodule "modified content" markers tolerated, everything else rejects), `HEAD == origin/main`, tag `vX.Y.Z` not already on origin, `READTHEDOCS_TOKEN` available (either in the shell env or in `.env` at the repo root).
 2. Full default test suite (parallel, perf-excluded — currently 653 tests).
 3. Perf regression gates (serial — six benchmarks with hard upper bounds).
 4. Bump `pyproject.toml` + `src/secantus/__init__.py` + `uv.lock`.
@@ -137,7 +137,7 @@ The task itself does:
 
 Aborts cleanly on any failure — leaves the working tree as it was before the bump so the user can fix and re-run.
 
-Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_TOKEN`. Mint at https://app.readthedocs.org/accounts/tokens/. The pre-flight refuses to start without it, since steps 10–11 are the whole reason the docs version stays in sync with PyPI.
+Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_TOKEN`. The release task resolves it from (1) the process env, then (2) a `READTHEDOCS_TOKEN=…` line in `.env` at the repo root (gitignored — `.env` is on `.gitignore`). Mint at https://app.readthedocs.org/accounts/tokens/. The pre-flight refuses to start without it, since steps 10–11 are the whole reason the docs version stays in sync with PyPI.
 
 Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases, and do **not** edit RTD's default_version through the dashboard — the release task owns that value. The only sanctioned path is `invoke release` via sub-agent. The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation, RTD default left dangling).
 
