@@ -790,6 +790,27 @@ def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_ids = [int(c) for c in doc.get("cursors", [])]
+    # Wake any in-flight `_get_more` on these cursors BEFORE removing them
+    # from the registry. The tailable getMore handler holds an `entry`
+    # reference fetched at command start and sleeps in
+    # `_oplog_cv.wait_for(...)` for up to its maxTimeMS / 1s budget. If we
+    # only `pop` from the registry without touching `entry.invalidated` or
+    # notifying the cv, that thread sleeps the full budget, wakes, sees
+    # `entry.invalidated == False`, and returns `cursor.id != 0` — telling
+    # the client the cursor is still alive after the client just killed it.
+    # Drivers like the official Java driver then block in
+    # `waitForLastRelease(...)` waiting for the connection holding that
+    # zombie getMore to go idle, which manifests as the validate-java
+    # suite hanging on `ChangeStreamOperationProseTestSpecification`.
+    for cid in cursor_ids:
+        try:
+            entry = ctx.cursors.get(cid)
+        except CursorNotFound:
+            continue
+        entry.invalidated = True
+    if cursor_ids:
+        with ctx.storage._oplog_cv:
+            ctx.storage._oplog_cv.notify_all()
     killed, not_found = ctx.cursors.kill(cursor_ids)
     return {
         "cursorsKilled": killed,

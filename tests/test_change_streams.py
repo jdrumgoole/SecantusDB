@@ -301,6 +301,50 @@ def test_change_stream_with_post_match_filters_events(client: MongoClient) -> No
     assert {e["documentKey"]["_id"] for e in events} == {1, 2}
 
 
+def test_replace_emits_replace_operation_type(client: MongoClient) -> None:
+    db = client["csdb_replace"]
+    coll = db["c"]
+    db.create_collection("c")
+    coll.insert_one({"_id": 7, "x": 1})
+
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+
+    coll.replace_one({"_id": 7}, {"_id": 7, "x": 99, "y": "added"})
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    e = events[0]
+    assert e["operationType"] == "replace"
+    assert e["documentKey"] == {"_id": 7}
+    assert e["fullDocument"] == {"_id": 7, "x": 99, "y": "added"}
+    assert "updateDescription" not in e
+
+
+def test_replace_with_match_filter_on_replace_operation_type(client: MongoClient) -> None:
+    db = client["csdb_replace_match"]
+    coll = db["c"]
+    db.create_collection("c")
+    coll.insert_one({"_id": 1, "x": 1})
+
+    cs = coll.watch(
+        [{"$match": {"operationType": "replace"}}],
+        full_document="updateLookup",
+        max_await_time_ms=2000,
+    )
+    time.sleep(0.3)
+
+    coll.update_one({"_id": 1}, {"$set": {"x": 2}})  # operator update — should be filtered out
+    coll.replace_one({"_id": 1}, {"_id": 1, "x": 3})  # replacement — should pass
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    assert events[0]["operationType"] == "replace"
+    assert events[0]["fullDocument"] == {"_id": 1, "x": 3}
+
+
 def test_cursor_id_is_int64_random(client: MongoClient) -> None:
     db = client["csdb_cid"]
     db.create_collection("c")

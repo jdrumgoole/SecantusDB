@@ -16,6 +16,7 @@ from secantus.commands import CommandContext, dispatch
 from secantus.cursors import CursorRegistry
 from secantus.storage import Storage
 from secantus.wire import (
+    OP_MSG_FLAG_MORE_TO_COME,
     ConnectionClosed,
     OpMsg,
     OpQuery,
@@ -155,6 +156,14 @@ class SecantusDBServer:
                             require_auth=self.require_auth,
                         )
                         response_doc = dispatch(body, ctx)
+                        # `moreToCome` (bit 1) is the wire signal for
+                        # fire-and-forget requests — `writeConcern: {w: 0}`
+                        # unacknowledged writes use it. The spec requires the
+                        # server NOT to send a reply; if we do, the driver
+                        # mis-pairs it with the next response and aborts the
+                        # connection with a responseTo/requestId mismatch.
+                        if op.flags & OP_MSG_FLAG_MORE_TO_COME:
+                            continue
                         reply = build_op_msg_reply(
                             response_to=message.header.request_id,
                             request_id=next(reply_ids),

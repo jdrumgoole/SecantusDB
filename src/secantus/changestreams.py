@@ -140,6 +140,12 @@ def _attach_full_document(
         if full_document_mode != FULL_DOC_OFF:
             event["fullDocument"] = dict(oplog_entry["o"])
         return
+    if event.get("operationType") == "replace":
+        # Replacement-style updates emit the full new doc as `o` (mirroring
+        # mongod). The change-stream contract says replace events always
+        # carry fullDocument; no separate updateLookup is required.
+        event["fullDocument"] = dict(oplog_entry["o"])
+        return
     if op == "u" and full_document_mode in (
         FULL_DOC_UPDATE_LOOKUP,
         FULL_DOC_REQUIRED,
@@ -203,7 +209,16 @@ def project(
         if not _scope_matches(ns, scope):
             return None, False
         document_key = dict(oplog_entry.get("o2", {"_id": None}))
+        # `op:"u"` carries either an operator-style diff (`o = {$v: 2, diff: {...}}`)
+        # or a full replacement doc (`o = {_id: ..., ...}` with no `$v`/`diff`).
+        # Mongod uses the same op code for both; the change stream distinguishes
+        # them as `update` vs `replace`. A diff-shaped `o` always has `$v` set,
+        # so absence of `$v` is the signal for replacement.
         op_type = {"i": "insert", "u": "update", "d": "delete"}[op]
+        if op == "u":
+            o = oplog_entry.get("o", {})
+            if isinstance(o, Mapping) and "$v" not in o and "diff" not in o:
+                op_type = "replace"
         token = make_resume_token(ResumeTokenData(seq, ts, ns, document_key))
         event: dict[str, Any] = {
             "_id": token,
@@ -214,7 +229,7 @@ def project(
         }
         if isinstance(wall, object) and wall is not None:
             event["wallTime"] = wall
-        if op == "u":
+        if op == "u" and op_type == "update":
             o = oplog_entry.get("o", {})
             diff = o.get("diff") if isinstance(o, Mapping) else None
             if isinstance(diff, Mapping):
