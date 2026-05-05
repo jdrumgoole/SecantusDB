@@ -3,12 +3,16 @@
 :::{warning}
 **Alpha software.**
 
-SecantusDB is in early development. The API surface and on-disk format
-can change between point releases. The wire-protocol behaviour and
-driver compatibility are stabilising — but if you adopt SecantusDB as
-a single-node `mongod` replacement today, **be prepared to lose on-disk
-data on upgrade**. Production deployments that need durable data across
-upgrades should still run a real `mongod`.
+SecantusDB is in early development. The Python API surface (CLI flags,
+public class signatures) is still settling and may shift between point
+releases. **The on-disk format is WiredTiger's** — the same engine
+MongoDB uses — and the schema we layer on top (collection / index /
+oplog tables) has been stable across releases; the test suite runs
+against real on-disk WiredTiger storage and the persistence tests
+explicitly verify close-and-reopen round-trips. That said, we don't
+yet ship a migration tool or a formal compatibility guarantee, so
+please don't put production data here yet — production deployments
+that need durable data across upgrades should still run a real `mongod`.
 :::
 
 **Drop-in MongoDB for single-node applications.** SecantusDB is a real

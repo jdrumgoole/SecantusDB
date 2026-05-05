@@ -9,8 +9,8 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def server():
-    with SecantusDBServer(port=0, storage_path=":memory:") as srv:
+def server(tmp_path):
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
         yield srv
 
 

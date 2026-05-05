@@ -145,8 +145,11 @@ WT's MVCC at the storage layer.
   by serialization, not by fine-grained locking. Fine for single-node
   workloads — write throughput is bounded by one writer at a time.
 - **Cursors:** internal `Lock`, separate from storage.
-- **Tests:** must run with `port=0` and `:memory:` storage. Multiple
-  `SecantusDBServer` instances coexist freely.
+- **Tests:** must run with `port=0` and a unique `storage_path` per
+  test (we use pytest's `tmp_path` fixture). Real on-disk WiredTiger
+  storage exercises the full schema; `:memory:` is reserved for the
+  perf-regression suite where in-memory baselines control variance.
+  Multiple `SecantusDBServer` instances coexist freely.
 
 ## Type-mapping strategy
 
