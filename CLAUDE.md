@@ -138,6 +138,8 @@ Sub-agent invocation pattern (use `general-purpose`, not Explore — it needs to
 > ```
 >
 > with `timeout: 600000`. Exit code 0 → done, verify externally and report PASS. Non-zero exit code (typically a SIGKILL at the 10-min wall) → polling was interrupted mid-step; **immediately re-run the same command**. Every step in `release-finalize` is idempotent (publish workflow already concluded → short-circuits; PyPI already lists version → short-circuits; RTD build already finished → short-circuits; etc.), so retries pick up where the prior 10-min window left off. Bail and report FAIL only after **4 consecutive non-zero exits** — that's 40 minutes of polling, well over the 25-minute worst-case release time.
+>
+> ⚠️ **Watch the Bash response carefully on each finalize attempt.** The harness sometimes auto-backgrounds long-timeout Bash calls — instead of stdout you'll get a `Command running in background with ID: <id>. Output is being written to: <file>` message. **That's a foreground-mode failure**, not the pattern this contract is built on. If you see it: immediately call `TaskStop` with that task ID, then re-issue the same Bash call. The bg task is fine to kill — `release-finalize` is idempotent and the next foreground attempt picks up cleanly.
 
 `invoke release X.Y.Z` is a thin wrapper that calls both phases in sequence — fine for a developer running it locally, **not safe for sub-agents** because the second half exceeds the per-Bash 10-min cap.
 
