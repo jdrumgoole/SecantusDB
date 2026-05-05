@@ -19,6 +19,7 @@ from secantus.auth import (
     derive_credentials,
 )
 from secantus.cursors import CursorNotFound, CursorRegistry
+from secantus.metrics import Metrics
 from secantus.projection import apply_projection
 from secantus.rbac import (
     A_CHANGE_PASSWORD,
@@ -75,6 +76,7 @@ class CommandContext:
     replica_set_name: str | None = None
     connection_auth: ConnectionAuth | None = None
     require_auth: bool = False
+    metrics: Metrics | None = None
 
 
 def _split_into_cursor(
@@ -222,29 +224,56 @@ def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     }
 
 
-def _server_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {
+def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Real metrics from :class:`secantus.metrics.Metrics` if the server
+    constructed one (production path); falls back to zeroed values for
+    embedded callers that didn't thread a metrics instance through (e.g.
+    ad-hoc test harnesses that use ``CommandContext`` directly)."""
+    base: dict[str, Any] = {
         "host": "secantus",
         "version": SERVER_VERSION,
         "process": "secantus",
         "pid": os.getpid(),
-        "uptime": 0,
-        "uptimeMillis": 0,
-        "uptimeEstimate": 0,
         "localTime": _dt.datetime.now(_dt.timezone.utc),
         "ok": 1.0,
     }
+    if ctx.metrics is not None:
+        base.update(ctx.metrics.snapshot())
+    else:
+        base.update(
+            {
+                "uptime": 0,
+                "uptimeMillis": 0,
+                "uptimeEstimate": 0,
+                "connections": {
+                    "current": 0,
+                    "available": 0,
+                    "totalCreated": 0,
+                },
+                "opcounters": {
+                    "insert": 0,
+                    "query": 0,
+                    "update": 0,
+                    "delete": 0,
+                    "getmore": 0,
+                    "command": 0,
+                },
+                "network": {"numRequests": 0, "bytesIn": 0, "bytesOut": 0},
+            }
+        )
+    return base
 
 
 def _connection_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     principals = ctx.connection_auth.authenticated_principals if ctx.connection_auth else []
+    roles = list(ctx.connection_auth.effective_roles) if ctx.connection_auth else []
     return {
         "authInfo": {
             "authenticatedUsers": [{"user": user, "db": db} for db, user in principals],
-            # RBAC isn't implemented; an authenticated user is treated as
-            # fully privileged. Surface an empty role/privilege list — most
-            # clients only check authenticatedUsers.
-            "authenticatedUserRoles": [],
+            "authenticatedUserRoles": roles,
+            # Per-action expansion is heavy and clients rarely check;
+            # leave empty for now (mongod also surfaces this with a
+            # `showPrivileges` toggle which we don't honour).
             "authenticatedUserPrivileges": [],
         },
         "ok": 1.0,
@@ -1875,6 +1904,12 @@ def command_name(doc: dict[str, Any]) -> str:
 
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
+    # Count every dispatched command — even unknown / unauth-rejected
+    # ones — so serverStatus.network.numRequests reflects raw wire
+    # traffic, not just the successful subset. Mongod's accounting is
+    # the same.
+    if ctx.metrics is not None:
+        ctx.metrics.record_command(name)
     handler = _HANDLERS.get(name)
     if handler is None:
         return {

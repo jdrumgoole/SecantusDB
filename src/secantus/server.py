@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from secantus.auth import ConnectionAuth
 from secantus.commands import CommandContext, dispatch
 from secantus.cursors import CursorRegistry
+from secantus.metrics import Metrics
 from secantus.storage import Storage
 from secantus.wire import (
     OP_MSG_FLAG_MORE_TO_COME,
@@ -65,6 +66,10 @@ class SecantusDBServer:
         # encode + oplog-table cursor write per modified document.
         self.storage = Storage(storage_path, enable_oplog=replica_set_name is not None)
         self.cursors = CursorRegistry()
+        # Per-server counters surfaced through `serverStatus`. Started
+        # eagerly so `start_monotonic` reflects construction time, not
+        # the first command — uptime then matches what users expect.
+        self.metrics = Metrics()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -126,6 +131,7 @@ class SecantusDBServer:
         connection_id = next(self._connection_ids)
         reply_ids = itertools.count(1)
         connection_auth = ConnectionAuth()
+        self.metrics.connection_opened()
         logger.debug("client %d connected from %s", connection_id, addr)
         try:
             with conn:
@@ -154,6 +160,7 @@ class SecantusDBServer:
                             replica_set_name=self.replica_set_name,
                             connection_auth=connection_auth,
                             require_auth=self.require_auth,
+                            metrics=self.metrics,
                         )
                         response_doc = dispatch(body, ctx)
                         # `moreToCome` (bit 1) is the wire signal for
@@ -179,6 +186,7 @@ class SecantusDBServer:
                             replica_set_name=self.replica_set_name,
                             connection_auth=connection_auth,
                             require_auth=self.require_auth,
+                            metrics=self.metrics,
                         )
                         response_doc = dispatch(op.query, ctx)
                         reply = build_op_reply(
@@ -197,6 +205,7 @@ class SecantusDBServer:
         except Exception:
             logger.exception("unhandled error on connection %d", connection_id)
         finally:
+            self.metrics.connection_closed()
             logger.debug("client %d disconnected", connection_id)
 
     def __enter__(self) -> Self:
