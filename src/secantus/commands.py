@@ -723,22 +723,19 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     capped = bool(doc.get("capped", False))
     if capped:
         size = doc.get("size")
-        if (
-            not isinstance(size, (int, float))
-            or isinstance(size, bool)
-            or size <= 0
-        ):
+        if not isinstance(size, (int, float)) or isinstance(size, bool) or size <= 0:
             return {
                 "ok": 0.0,
-                "errmsg": "the 'size' field is required when 'capped' is true and must be a positive number",
+                "errmsg": (
+                    "the 'size' field is required when 'capped' is true "
+                    "and must be a positive number"
+                ),
                 "code": 72,
                 "codeName": "InvalidOptions",
             }
         max_docs = doc.get("max")
         if max_docs is not None and (
-            not isinstance(max_docs, (int, float))
-            or isinstance(max_docs, bool)
-            or max_docs <= 0
+            not isinstance(max_docs, (int, float)) or isinstance(max_docs, bool) or max_docs <= 0
         ):
             return {
                 "ok": 0.0,
