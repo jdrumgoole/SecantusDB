@@ -298,9 +298,13 @@ def release_prepare(c: Context, version: str) -> None:
       1. Full default test suite (`pytest` parallel, perf-excluded).
       2. Perf regression gates (serial).
       3. Bump pyproject.toml + src/secantus/__init__.py + uv.lock.
-      4. Commit, annotate-tag, push commit + tag.
+      4. Commit, annotate-tag, push commit + tag (combined push).
       5. Create a GitHub Release for `vX.Y.Z` with auto-generated
          notes (marked pre-release for `aN`/`bN`/`rcN` versions).
+      6. Activate the RTD `vX.Y.Z` slug (best-effort) so its build
+         runs concurrent with the GitHub `Publish to PyPI` workflow
+         rather than after it. Failure here is non-fatal; finalize
+         retries the activation idempotently.
     """
     if not _VERSION_RE.match(version):
         raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
@@ -321,14 +325,16 @@ def release_prepare(c: Context, version: str) -> None:
     _bump_version_files(version)
     c.run("uv lock", pty=True)
 
-    print(f"==> [4/5] Committing + tagging v{version}")
+    print(f"==> [4/6] Committing + tagging v{version}")
     c.run("git add pyproject.toml src/secantus/__init__.py uv.lock", pty=True)
     c.run(f'git commit -m "Release v{version}"', pty=True)
     c.run(f'git tag -a v{version} -m "Release v{version}"', pty=True)
-    c.run("git push origin main", pty=True)
-    c.run(f"git push origin v{version}", pty=True)
+    # Combine the branch and tag pushes into one network round-trip.
+    # The publish workflow still fires on the tag ref; nothing else
+    # depends on the order of branch-then-tag.
+    c.run(f"git push origin main v{version}", pty=True)
 
-    print(f"==> [5/5] Creating GitHub Release v{version}")
+    print(f"==> [5/6] Creating GitHub Release v{version}")
     # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
     is_prerelease = bool(re.search(r"[abc]\d+$|rc\d+$", version))
     cmd = (
@@ -341,8 +347,19 @@ def release_prepare(c: Context, version: str) -> None:
         cmd += " --prerelease"
     c.run(cmd, pty=True)
 
+    # Activate the RTD slug as early as possible so its build runs
+    # concurrent with the GitHub `Publish to PyPI` workflow rather
+    # than after it. Best-effort: if the RTD API errors here, finalize
+    # will retry — better to push the release than to abort prepare
+    # over a transient RTD blip.
+    print(f"==> [6/6] Activating RTD `v{version}` slug for early build")
+    try:
+        _activate_rtd_version(version, _ensure_rtd_token())
+    except SystemExit as e:
+        print(f"    warning: RTD activate failed in prepare ({e}); finalize will retry")
+
     print(
-        f"\nv{version} prepared, tag pushed, GitHub Release created.\n"
+        f"\nv{version} prepared, tag pushed, GitHub Release created, RTD build queued.\n"
         f"Run `invoke release-finalize {version}` next to wait for the\n"
         f"publish workflow + PyPI + RTD propagation."
     )
