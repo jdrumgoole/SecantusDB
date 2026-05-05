@@ -2233,9 +2233,9 @@ class Storage:
                 center, max_d, _min_d, _spherical = self._near_query_geom(arg)
                 if max_d is None:
                     return None
-                from secantus.geo import _SphericalCircle
-
                 from shapely.geometry import Point as _Point
+
+                from secantus.geo import _SphericalCircle
 
                 if geo_type == _GEO_2DSPHERE:
                     from secantus.geo import EARTH_RADIUS_METERS

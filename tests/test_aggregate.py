@@ -395,7 +395,9 @@ def test_lookup_both_sides_arrays_intersection_match(tmp_path) -> None:
     assert found == ["x", "y", "z"]
 
 
-def test_lookup_hash_join_does_not_call_lookup_match_for_hashable_values(monkeypatch, tmp_path) -> None:
+def test_lookup_hash_join_does_not_call_lookup_match_for_hashable_values(
+    monkeypatch, tmp_path
+) -> None:
     """O(N+M) hash-join: per-pair _lookup_match should not fire for hashable scalars."""
     import secantus.aggregate as agg
 

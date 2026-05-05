@@ -25,10 +25,9 @@ import struct
 from collections.abc import Mapping
 from typing import Any
 
+import s2sphere as s2
 from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
-
-import s2sphere as s2
 
 from secantus.geo import _SphericalCircle
 

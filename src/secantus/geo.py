@@ -89,13 +89,15 @@ def parse_doc_geometry(value: Any) -> BaseGeometry | None:
                 except (TypeError, ValueError):
                     return None
         return None
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        # Legacy `[x, y]` pair.
-        if len(value) == 2:
-            try:
-                return Point(float(value[0]), float(value[1]))
-            except (TypeError, ValueError):
-                return None
+    if (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes))
+        and len(value) == 2
+    ):
+        try:
+            return Point(float(value[0]), float(value[1]))
+        except (TypeError, ValueError):
+            return None
     return None
 
 
@@ -130,7 +132,7 @@ def _from_geojson(value: Mapping[str, Any]) -> BaseGeometry | None:
 
 def parse_query_geometry(
     spec: Mapping[str, Any],
-) -> tuple[BaseGeometry | "_SphericalCircle", bool]:
+) -> tuple[BaseGeometry | _SphericalCircle, bool]:
     """Build a query geometry from ``$geoWithin`` / ``$geoIntersects`` arg.
 
     Returns ``(geometry, is_spherical)``. ``is_spherical`` is True only for
@@ -250,7 +252,7 @@ class _SphericalCircle:
 
 def geo_within(
     doc_geom: BaseGeometry | None,
-    query_geom: BaseGeometry | "_SphericalCircle",
+    query_geom: BaseGeometry | _SphericalCircle,
 ) -> bool:
     """True iff `doc_geom` is fully contained by `query_geom`.
 
@@ -265,10 +267,9 @@ def geo_within(
         if isinstance(doc_geom, Point):
             return query_geom.contains_point(doc_geom.x, doc_geom.y)
         # For non-point doc geometry, require every vertex inside the cap.
-        for x, y in _iter_coords(doc_geom):
-            if not query_geom.contains_point(x, y):
-                return False
-        return True
+        return all(
+            query_geom.contains_point(x, y) for x, y in _iter_coords(doc_geom)
+        )
     try:
         return bool(doc_geom.within(query_geom)) or bool(
             doc_geom.equals(query_geom)
@@ -279,7 +280,7 @@ def geo_within(
 
 def geo_intersects(
     doc_geom: BaseGeometry | None,
-    query_geom: BaseGeometry | "_SphericalCircle",
+    query_geom: BaseGeometry | _SphericalCircle,
 ) -> bool:
     """True iff `doc_geom` and `query_geom` share at least one point.
 
@@ -370,7 +371,7 @@ def _great_circle_radians(
 
 
 def bounding_box(
-    geom: BaseGeometry | "_SphericalCircle",
+    geom: BaseGeometry | _SphericalCircle,
 ) -> tuple[float, float, float, float]:
     """Return ``(min_x, min_y, max_x, max_y)`` for `geom`."""
     if isinstance(geom, _SphericalCircle):
