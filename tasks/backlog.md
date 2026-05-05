@@ -10,8 +10,6 @@ Each item should have enough context for a future session to pick it up cold: wh
 
 These commands accept the request and return a wire-valid response, but the response is fabricated — they do no real work.
 
-- [ ] **`serverStatus`** — returns version + zeroed metrics (uptime, connections). No real metrics tracking.
-- [ ] **`connectionStatus`** — empty `authInfo` (no auth implemented).
 - [ ] **`hostInfo`** / **`whatsmyuri`** / **`buildInfo`** — hardcoded values. `buildInfo.version` is literally `"7.0.0"`.
 - [ ] **`getLog`** — empty log array.
 - [ ] **`startSession`** / **`endSessions`** / **`refreshSessions`** — `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced.
