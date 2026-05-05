@@ -35,7 +35,7 @@ from bson import Decimal128
 from bson.timestamp import Timestamp
 
 from secantus.diff import compute_update_description
-from secantus.geo import parse_doc_geometry, parse_query_geometry
+from secantus.geo import GeoError, parse_doc_geometry, parse_query_geometry, validate_coordinates
 from secantus.geo_index import (
     encode_cell,
     planar_2d_covering,
@@ -75,25 +75,49 @@ def _doc_geo_cells(
     field: str,
     geo_type: str,
     options: Mapping[str, Any],
+    *,
+    index_name: str = "",
 ) -> list[bytes]:
-    """Encoded cell bytes for the doc's geo field — empty if no geometry.
+    """Encoded cell bytes for the doc's geo field.
 
-    For 2dsphere we get an S2-cell covering of the geometry (multi-entry
-    for non-Points). For 2d we always get a single bucket because the
-    legacy index only supports point-typed values.
+    Returns an empty list when the indexed field is missing or null
+    (sparse-by-default semantics, matching mongod's 2dsphere/2d).
+
+    Raises :class:`GeoExtractError` when the value is *present* but
+    can't be indexed — unparseable shape, wrong type for a 2d index,
+    or coordinates outside the valid range. The caller propagates this
+    to the wire as a write error (code 16572 "Can't extract geo keys").
     """
     value = get_path(dict(doc), field)
+    if value is None:
+        # Field missing or explicitly null — sparse semantics, no entry.
+        return []
     geom = parse_doc_geometry(value)
     if geom is None:
-        return []
+        raise GeoExtractError(
+            index_name,
+            field,
+            doc.get("_id"),
+            f"value {value!r} is not a recognised geometry",
+        )
+    try:
+        validate_coordinates(geom, geo_type=geo_type, options=options)
+    except GeoError as exc:
+        raise GeoExtractError(
+            index_name, field, doc.get("_id"), str(exc)
+        ) from exc
     if geo_type == _GEO_2DSPHERE:
         return [encode_cell(c) for c in s2_doc_covering(geom)]
-    # 2d: single point only. Non-points are silently skipped — matches
-    # mongod's "stored bad geometry doesn't match" rule.
+    # 2d: single point only.
     from shapely.geometry import Point as _Point
 
     if not isinstance(geom, _Point):
-        return []
+        raise GeoExtractError(
+            index_name,
+            field,
+            doc.get("_id"),
+            "2d index requires a point; got a non-point geometry",
+        )
     return [encode_cell(planar_2d_index_for_point(geom.x, geom.y, options))]
 
 _COLL_TABLE = "table:secantus_collections"
@@ -290,6 +314,27 @@ class IndexConflict(Exception):
         super().__init__(f"E11000 duplicate key error in index {index_name}: _id={doc_id!r}")
         self.index_name = index_name
         self.doc_id = doc_id
+
+
+class GeoExtractError(Exception):
+    """Doc's geo field can't be indexed — bad shape or out-of-bounds coords.
+
+    Raised from the geo-index write path when an insert / update / index
+    creation hits a doc the geo extractor can't make sense of (bad
+    GeoJSON, non-numeric coordinates, longitude / latitude outside the
+    valid range, etc.). Caught at the command-layer write boundary and
+    surfaced as a wire-level write error with mongod's documented code
+    16572 ("Can't extract geo keys").
+    """
+
+    def __init__(self, index_name: str, field: str, doc_id: Any, reason: str) -> None:
+        super().__init__(
+            f"Can't extract geo keys for index {index_name!r} on field {field!r}: {reason}"
+        )
+        self.index_name = index_name
+        self.field = field
+        self.doc_id = doc_id
+        self.reason = reason
 
 
 class BadHint(Exception):
@@ -921,6 +966,19 @@ class Storage:
                     if ordered:
                         break
                     continue
+                # Pre-flight every geo index: a bad geometry should reject
+                # the doc *before* it lands in the doc table, so we don't
+                # leave a half-indexed write behind. Validation is cheap;
+                # _write_index_entries below recomputes the same cells.
+                try:
+                    self._validate_geo_indexes(db, coll, doc, indexes, partials)
+                except GeoExtractError as exc:
+                    errors.append(
+                        {"index": index, "code": 16572, "errmsg": str(exc)}
+                    )
+                    if ordered:
+                        break
+                    continue
                 blob = bson.encode(doc)
                 doc_cur = self._cursor(_DOC_TABLE, overwrite=False)
                 doc_cur.set_key(db, coll, key)
@@ -1344,6 +1402,10 @@ class Storage:
                     )
                     if conflict is not None:
                         raise IndexConflict(conflict, new["_id"])
+                    # Geo validation must reject the update before any
+                    # write happens, otherwise we'd be left with a
+                    # half-deleted set of index entries.
+                    self._validate_geo_indexes(db, coll, new, indexes, partials)
                     modified += 1
                     self._delete_index_entries(db, coll, doc, indexes, partials)
                     doc_cur = self._cursor(_DOC_TABLE)
@@ -1386,6 +1448,7 @@ class Storage:
                 )
                 if conflict is not None:
                     raise IndexConflict(conflict, new["_id"])
+                self._validate_geo_indexes(db, coll, new, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
                 self._write_index_entries(db, coll, new, indexes, partials)
@@ -1759,7 +1822,9 @@ class Storage:
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
                         continue
-                    for cell_bytes in _doc_geo_cells(d, geo_field, geo_type, options):
+                    for cell_bytes in _doc_geo_cells(
+                        d, geo_field, geo_type, options, index_name=name
+                    ):
                         entries.append((cell_bytes, id_k))
                 payload = bson.encode({"key": dict(key_spec), "options": options})
                 c.reset()
@@ -1994,7 +2059,9 @@ class Storage:
             if geo is not None:
                 geo_field, geo_type = geo
                 opts = index_options.get(name, {})
-                for cell_bytes in _doc_geo_cells(doc, geo_field, geo_type, opts):
+                for cell_bytes in _doc_geo_cells(
+                    doc, geo_field, geo_type, opts, index_name=name
+                ):
                     c.reset()
                     c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
                 continue
@@ -2027,7 +2094,19 @@ class Storage:
             if geo is not None:
                 geo_field, geo_type = geo
                 opts = index_options.get(name, {})
-                for cell_bytes in _doc_geo_cells(doc, geo_field, geo_type, opts):
+                # On the delete path, swallow GeoExtractError. A doc that
+                # was inserted before geo validation became strict might
+                # have bad geometry; we still need to allow it to be
+                # deleted. The index may end up with stale entries we
+                # can't match, but the next compact / drop_index cleans
+                # those up. Insert/update remain strict.
+                try:
+                    cells = _doc_geo_cells(
+                        doc, geo_field, geo_type, opts, index_name=name
+                    )
+                except GeoExtractError:
+                    continue
+                for cell_bytes in cells:
                     c.reset()
                     c.set_key(db, coll, name, _pack_entry(cell_bytes, id_k))
                     if c.search() == 0:
@@ -2040,6 +2119,41 @@ class Storage:
             c.set_key(db, coll, name, _pack_entry(kb, id_k))
             if c.search() == 0:
                 c.remove()
+
+    def _validate_geo_indexes(
+        self,
+        db: str,
+        coll: str,
+        doc: dict[str, Any],
+        indexes: list[tuple[str, dict[str, Any], bool, bool]],
+        partials: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Pre-flight every geo index for ``doc``: raise on bad geometry.
+
+        Used by the insert / update paths to reject docs *before* writing
+        them, so a single bad geo coordinate doesn't leave a half-indexed
+        document behind. The work duplicates ``_write_index_entries``'s
+        cell computation but is cheap (one Shapely parse + bounds check
+        per indexed field).
+        """
+        if not indexes:
+            return
+        if partials is None:
+            partials = self._partial_filters(db, coll)
+        options_map = self._index_options_map(db, coll)
+        for name, key_spec, _sparse, _unique in indexes:
+            geo = _geo_type_of(key_spec)
+            if geo is None:
+                continue
+            pf = partials.get(name)
+            if pf is not None and not matches(doc, pf):
+                continue
+            geo_field, geo_type = geo
+            opts = options_map.get(name, {})
+            # Compute & discard — `_doc_geo_cells` raises GeoExtractError
+            # on bad shape or out-of-bounds coords; that's the signal we
+            # want to bubble up.
+            _doc_geo_cells(doc, geo_field, geo_type, opts, index_name=name)
 
     def _index_options_map(self, db: str, coll: str) -> dict[str, dict[str, Any]]:
         """Map of index name → its full options blob.

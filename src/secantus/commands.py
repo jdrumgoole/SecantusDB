@@ -391,7 +391,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import IndexConflict
+    from secantus.storage import GeoExtractError, IndexConflict
 
     coll = doc["update"]
     updates = doc.get("updates", [])
@@ -413,6 +413,14 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             )
         except IndexConflict as exc:
             write_errors.append({"index": index, "code": 11000, "errmsg": str(exc)})
+            if ordered:
+                break
+            continue
+        except GeoExtractError as exc:
+            # Mongod's documented code for "Can't extract geo keys from
+            # object" — surfaces to the driver as a write error on the
+            # specific operation index without aborting unordered batches.
+            write_errors.append({"index": index, "code": 16572, "errmsg": str(exc)})
             if ordered:
                 break
             continue
@@ -484,7 +492,7 @@ def _key_present(doc: dict[str, Any], path: str) -> bool:
 
 
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import IndexConflict
+    from secantus.storage import GeoExtractError, IndexConflict
 
     coll = doc["findAndModify"]
     query = doc.get("query") or {}
@@ -524,6 +532,13 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                     "errmsg": str(exc),
                     "code": 11000,
                     "codeName": "DuplicateKey",
+                }
+            except GeoExtractError as exc:
+                return {
+                    "ok": 0.0,
+                    "errmsg": str(exc),
+                    "code": 16572,
+                    "codeName": "Location16572",
                 }
             upserted_id = result["upserted_id"]
             value: Any = None
@@ -570,6 +585,13 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             "errmsg": str(exc),
             "code": 11000,
             "codeName": "DuplicateKey",
+        }
+    except GeoExtractError as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": 16572,
+            "codeName": "Location16572",
         }
 
     if return_new:
@@ -704,7 +726,7 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import IndexConflict
+    from secantus.storage import GeoExtractError, IndexConflict
 
     coll = doc["createIndexes"]
     indexes = doc.get("indexes", [])
@@ -738,6 +760,17 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "errmsg": str(exc),
                 "code": 11000,
                 "codeName": "DuplicateKey",
+            }
+        except GeoExtractError as exc:
+            # `createIndex` on existing docs hit a doc the geo extractor
+            # can't make sense of — fail the whole index creation, like
+            # mongod. The collection is left without the index; the
+            # client must clean up bad docs before retrying.
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 16572,
+                "codeName": "Location16572",
             }
         if new:
             created += 1
