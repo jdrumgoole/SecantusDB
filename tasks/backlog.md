@@ -40,8 +40,7 @@ Specific items that were left out of the slice that introduced their feature are
 
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 
-- [ ] **Authorization (RBAC)** — `createUser` accepts a `roles` array and persists it, but no command enforces roles or privileges. An authenticated principal is treated as fully privileged. Real role enforcement needs a per-handler privilege-set check + builtin role definitions (`root`, `readWrite`, `read`, `dbAdmin`, `userAdmin`, ...) + `grantRolesToUser` / `revokeRolesFromUser` / `rolesInfo` / custom `createRole`.
-- [ ] **`updateUser`** — not implemented. Today: drop + recreate. Real `updateUser` rotates passwords without invalidating other connections.
+- [ ] **Custom roles** (`createRole` / `dropRole` / `updateRole` / `grantPrivilegesToRole` / `revokePrivilegesFromRole`) — built-in roles (`read`, `readWrite`, `dbAdmin`, `userAdmin`, the `*AnyDatabase` variants, and `root`) are enforced via `secantus.rbac` and the per-command action map in `secantus.commands`. Custom user-defined roles, `clusterAdmin` / `clusterMonitor` / `backup` / `restore`, and role-inheritance graphs aren't implemented yet.
 - [ ] **SCRAM-SHA-1** — legacy mechanism. Modern drivers default to SCRAM-SHA-256 since pymongo 3.7 / driver-spec 2018; we only advertise the modern one. Add if a downstream tool insists on SHA-1.
 - [ ] **SASLprep (RFC 4013)** password normalisation — passwords go to PBKDF2 as raw UTF-8 with no normalisation. ASCII passwords work byte-identically against real `mongod`; non-ASCII (combining marks, full-width digits, etc.) may diverge from a SASLprepping client's expectation.
 - [ ] **Speculative authentication** — pymongo / mongo-go-driver can fold the first SCRAM round-trip into the `hello` reply via `speculativeAuthenticate`. Not implemented; the explicit two-round-trip path works fine but adds one RTT to connection setup.
@@ -57,7 +56,6 @@ Single-node change streams are implemented and conformant for typical pymongo `w
 - [ ] **Multi-document transactions in change events** — `txnNumber` and `lsid` are never present on change events; SecantusDB has no real transaction state.
 - [ ] **`splitLargeChangeStreamEvents`** — not implemented. Events are emitted whole.
 - [ ] **`noop` heartbeat events** — real `mongod` writes periodic no-ops to advance cluster time even when no real ops happen; SecantusDB does not. Resume tokens advance only on real ops.
-- [ ] **DDL `createIndexes`/`dropIndexes` change events** — oplog has the entries but the projection drops them. Apps that watch for index lifecycle events won't see them.
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **`showExpandedEvents`** — accepted, ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.

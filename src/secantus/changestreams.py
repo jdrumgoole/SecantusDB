@@ -304,7 +304,55 @@ def project(
                 event["wallTime"] = wall
             invalidates = scope.get("kind") == "coll"
             return event, invalidates
-        # createIndexes / dropIndexes: deferred (filtered out per backlog).
+        if "createIndexes" in cmd:
+            affected_ns = f"{cmd_db}.{cmd['createIndexes']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            indexes = cmd.get("indexes") or []
+            # mongod emits one event per index in a multi-index createIndexes
+            # call. We mirror that: surface the *first* index's spec on this
+            # event and rely on the oplog entry split (real mongod writes one
+            # oplog entry per index too, so when SecantusDB emits multi-
+            # index createIndexes, future iterations should split it).
+            # Today our storage layer only ever creates one index per
+            # createIndexes call, so the loop below collapses to one event.
+            spec = indexes[0] if isinstance(indexes, list) and indexes else {}
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            event = {
+                "_id": token,
+                "operationType": "createIndexes",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": {
+                    "indexes": [
+                        {
+                            "v": spec.get("v", 2),
+                            "key": dict(spec.get("key", {})),
+                            "name": spec.get("name", ""),
+                        }
+                    ]
+                    if spec
+                    else []
+                },
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
+        if "dropIndexes" in cmd:
+            affected_ns = f"{cmd_db}.{cmd['dropIndexes']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            event = {
+                "_id": token,
+                "operationType": "dropIndexes",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": {"indexes": [{"name": cmd.get("index", "")}]},
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
         return None, False
     return None, False
 

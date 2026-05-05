@@ -647,3 +647,108 @@ def test_no_auth_mode_bypasses_rbac(server_no_auth) -> None:
         assert plain["dbA"]["c"].count_documents({}) == 1
     finally:
         plain.close()
+
+
+# ----------------------------------------------------------------------
+# updateUser: rotate password / replace roles in place
+# ----------------------------------------------------------------------
+
+
+def test_update_user_rotates_password(server_with_auth) -> None:
+    """`updateUser` with a new `pwd` re-derives credentials. The calling
+    connection (already authed under the old password) keeps working;
+    new connections must use the new password."""
+    _make_user_with_roles(
+        server_with_auth, "admin", "alice", "orig", [{"role": "root", "db": "admin"}]
+    )
+
+    cli = _client_for(server_with_auth, user="alice", password="orig")
+    try:
+        cli["admin"].command("ping")
+        cli["admin"].command({"updateUser": "alice", "pwd": "rotated"})
+        # Same connection still works — rotation doesn't kick the caller.
+        cli["admin"].command("ping")
+    finally:
+        cli.close()
+
+    # Old password no longer accepted.
+    cli_old = _client_for(server_with_auth, user="alice", password="orig")
+    try:
+        with pytest.raises(OperationFailure):
+            cli_old["admin"].command("ping")
+    finally:
+        cli_old.close()
+
+    # New password accepted.
+    cli_new = _client_for(server_with_auth, user="alice", password="rotated")
+    try:
+        cli_new["admin"].command("ping")
+    finally:
+        cli_new.close()
+
+
+def test_update_user_replaces_roles(server_with_auth) -> None:
+    """`updateUser` with a `roles` argument REPLACES (not appends) the
+    user's role bindings — matches mongod."""
+    _make_user_with_roles(server_with_auth, "shop", "rocky", "p", [{"role": "read", "db": "shop"}])
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        root_cli["shop"].command(
+            {
+                "updateUser": "rocky",
+                "roles": [{"role": "readWrite", "db": "shop"}],
+            }
+        )
+    finally:
+        root_cli.close()
+
+    # rocky now has readWrite, not read — insert should succeed.
+    cli = _client_for(server_with_auth, user="rocky", password="p", db="shop")
+    try:
+        cli["shop"]["c"].insert_one({"x": 1})
+    finally:
+        cli.close()
+
+
+def test_update_user_rejects_unknown_role(server_with_auth) -> None:
+    _make_user_with_roles(
+        server_with_auth, "admin", "alice", "p", [{"role": "read", "db": "admin"}]
+    )
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            root_cli["admin"].command(
+                {
+                    "updateUser": "alice",
+                    "roles": [{"role": "fakeRole", "db": "admin"}],
+                }
+            )
+        assert exc.value.code == 31  # RoleNotFound
+    finally:
+        root_cli.close()
+
+
+def test_update_user_requires_at_least_one_field(server_with_auth) -> None:
+    """`updateUser` with no `pwd` and no `roles` is a client error
+    (BadValue) — there's nothing to update."""
+    _make_user_with_roles(
+        server_with_auth, "admin", "alice", "p", [{"role": "read", "db": "admin"}]
+    )
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            root_cli["admin"].command({"updateUser": "alice"})
+        assert exc.value.code == 2
+    finally:
+        root_cli.close()
+
+
+def test_update_user_unknown_user_errors(server_with_auth) -> None:
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            root_cli["admin"].command({"updateUser": "ghost", "pwd": "p"})
+        # mongod's UserNotFound code is 11.
+        assert exc.value.code == 11
+    finally:
+        root_cli.close()
