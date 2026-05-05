@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.3.0a37"
+version = "0.3.0a38"
 description = "A drop-in single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,15 @@ dev = [
     "sphinx>=7.2",
     "myst-parser>=2.0",
     "furo>=2024.1",
+]
+website = [
+    # Pelican + markdown plugin pull in Jinja2, feedgenerator, etc.
+    "pelican>=4.9",
+    "markdown>=3.6",
+    # AWS SDK for the boto3-based provisioner / deployer in
+    # website/infra/aws.py. Confined to the website extra so it never
+    # ships in the runtime dependency closure.
+    "boto3>=1.34",
 ]
 
 [project.scripts]
@@ -84,6 +93,9 @@ sdist.exclude = [
     # docs/_static/ (a small subset checked in there too). Cloners
     # and the GitHub release page are the right place for the full kit.
     "brandkit/**",
+    # website/ is the marketing site (Pelican source + boto3 provisioner).
+    # Dev-only; never shipped in the wheel or sdist.
+    "website/**",
 ]
 
 [tool.cibuildwheel]

@@ -43,11 +43,12 @@ html_static_path = ["_static"]
 # brandkit/brand.html for the guided tour. The light/dark wordmark
 # pair gives furo a logo per colour scheme; the favicon is one inline
 # SVG.
-html_logo = "_static/wordmark-horizontal.svg"
+#
+# Don't set `html_logo` alongside Furo's `light_logo`/`dark_logo` —
+# Furo renders BOTH and the sidebar shows two stacked wordmarks.
+# We're locked to Furo, so the theme-specific options are enough.
 html_favicon = "_static/favicon.svg"
 html_theme_options = {
-    # Furo prefers `light_logo` / `dark_logo` when both are set;
-    # `html_logo` above stays as a fallback for alternate themes.
     "light_logo": "wordmark-horizontal.svg",
     "dark_logo": "wordmark-horizontal-on-dark.svg",
     # Brand palette: slate (neutral) + cyan (accent), matching
