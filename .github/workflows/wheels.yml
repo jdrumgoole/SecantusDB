@@ -43,10 +43,41 @@ jobs:
         with:
           submodules: recursive
 
+      # Same ccache plumbing as publish.yml — see comments there.
+      # Sharing the cache key (ccache-<platform>-wt-<sha>) across the
+      # two workflows means every main-branch wheels.yml run primes the
+      # cache that publish.yml will hit warm at tag time.
+      - name: Compute WT submodule SHA
+        id: wt-sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        if: matrix.platform != 'windows-x86_64'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.platform }}-wt-${{ steps.wt-sha.outputs.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform }}-
+
       - name: Build wheels with cibuildwheel
         uses: pypa/cibuildwheel@v2.21
         env:
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
+          CIBW_BEFORE_ALL_LINUX: |
+            yum install -y ccache 2>/dev/null \
+              || dnf install -y ccache 2>/dev/null \
+              || apk add --no-cache ccache
+          CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
+          CIBW_ENVIRONMENT_LINUX: >-
+            CCACHE_DIR=/host_ccache
+            CMAKE_C_COMPILER_LAUNCHER=ccache
+            CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          CIBW_BEFORE_ALL_MACOS: brew install ccache
+          CIBW_ENVIRONMENT_MACOS: >-
+            CMAKE_C_COMPILER_LAUNCHER=ccache
+            CMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4

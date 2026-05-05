@@ -66,10 +66,55 @@ jobs:
         with:
           submodules: recursive
 
+      # Cache the ccache directory across builds keyed on the WiredTiger
+      # submodule SHA (changes only when we bump the vendored WT pin —
+      # months apart). The actual cache hit happens across the four
+      # cp31x wheel builds within a single runner: cp310 misses (warms
+      # the cache); cp311/12/13 hit warm and skip the WT C compile,
+      # which is the bulk of the runner's wall-clock. wheels.yml shares
+      # the same key so main-branch CI runs warm the cache for the
+      # next tag-triggered publish run.
+      - name: Compute WT submodule SHA
+        id: wt-sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        if: matrix.platform != 'windows-x86_64'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.platform }}-wt-${{ steps.wt-sha.outputs.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform }}-
+
       - name: Build wheels with cibuildwheel
         uses: pypa/cibuildwheel@v2.21
         env:
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
+          # Linux: install ccache once in the manylinux/musllinux
+          # container, mount the host's actions/cache-restored ccache
+          # dir into the container, point CMake's compiler launcher at
+          # ccache so per-file compiles route through the cache.
+          CIBW_BEFORE_ALL_LINUX: |
+            yum install -y ccache 2>/dev/null \
+              || dnf install -y ccache 2>/dev/null \
+              || apk add --no-cache ccache
+          CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
+          CIBW_ENVIRONMENT_LINUX: >-
+            CCACHE_DIR=/host_ccache
+            CMAKE_C_COMPILER_LAUNCHER=ccache
+            CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # macOS: ccache via Homebrew. The macos-14 runner image
+          # already has it — `brew install` is idempotent and a few
+          # seconds when already present.
+          CIBW_BEFORE_ALL_MACOS: brew install ccache
+          CIBW_ENVIRONMENT_MACOS: >-
+            CMAKE_C_COMPILER_LAUNCHER=ccache
+            CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # Windows: ccache + MSVC is historically fragile, so the
+          # Windows wheel build runs without ccache. If Windows becomes
+          # the publish-workflow bottleneck, switch to sccache.
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
