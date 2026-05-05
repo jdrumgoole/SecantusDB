@@ -260,7 +260,140 @@ def _op_matches(values: list[Any], op: str, arg: Any) -> bool:
         return _op_bitwise(values, arg, lambda v, m: (v & m) == 0)
     if op == "$bitsAnyClear":
         return _op_bitwise(values, arg, lambda v, m: (v & m) != m)
+    if op == "$geoWithin":
+        return _op_geo_within(values, arg)
+    if op == "$geoIntersects":
+        return _op_geo_intersects(values, arg)
+    if op == "$near":
+        return _op_geo_near(values, arg, default_spherical=False)
+    if op == "$nearSphere":
+        return _op_geo_near(values, arg, default_spherical=True)
     raise QueryError(f"unsupported query operator: {op}")
+
+
+def _op_geo_within(values: list[Any], arg: Any) -> bool:
+    from secantus.geo import GeoError, geo_within, parse_doc_geometry, parse_query_geometry
+
+    if not isinstance(arg, Mapping):
+        raise QueryError("$geoWithin requires an object")
+    try:
+        query_geom, _spherical = parse_query_geometry(arg)
+    except GeoError as exc:
+        raise QueryError(str(exc)) from exc
+    for v in values:
+        if v is MISSING:
+            continue
+        doc_geom = parse_doc_geometry(v)
+        if doc_geom is not None and geo_within(doc_geom, query_geom):
+            return True
+    return False
+
+
+def _op_geo_intersects(values: list[Any], arg: Any) -> bool:
+    from secantus.geo import GeoError, geo_intersects, parse_doc_geometry, parse_query_geometry
+
+    if not isinstance(arg, Mapping):
+        raise QueryError("$geoIntersects requires an object")
+    if "$geometry" not in arg:
+        # mongod restricts $geoIntersects to GeoJSON via $geometry; mirror.
+        raise QueryError("$geoIntersects requires $geometry (GeoJSON)")
+    try:
+        query_geom, _spherical = parse_query_geometry(arg)
+    except GeoError as exc:
+        raise QueryError(str(exc)) from exc
+    for v in values:
+        if v is MISSING:
+            continue
+        doc_geom = parse_doc_geometry(v)
+        if doc_geom is not None and geo_intersects(doc_geom, query_geom):
+            return True
+    return False
+
+
+def _op_geo_near(
+    values: list[Any], arg: Any, *, default_spherical: bool
+) -> bool:
+    """Match (without ranking) for ``$near`` / ``$nearSphere``.
+
+    ``$near`` is a hybrid operator: real ``mongod`` *also* sorts results
+    by distance and requires a geo index. In :mod:`matches`-only contexts
+    we treat it purely as a containment test (within ``$maxDistance``,
+    outside ``$minDistance``). Sort-by-distance is the caller's
+    responsibility — handled in :mod:`commands` for top-level ``find``.
+    """
+    from shapely.geometry import Point
+
+    from secantus.geo import distance, parse_doc_geometry
+
+    center, max_distance, min_distance, spherical = _parse_near_spec(
+        arg, default_spherical=default_spherical
+    )
+    center_geom = Point(center[0], center[1])
+    for v in values:
+        if v is MISSING:
+            continue
+        doc_geom = parse_doc_geometry(v)
+        if doc_geom is None:
+            continue
+        d = distance(doc_geom, center_geom, spherical=spherical)
+        if d is None:
+            continue
+        if max_distance is not None and d > max_distance:
+            continue
+        if min_distance is not None and d < min_distance:
+            continue
+        return True
+    return False
+
+
+def _parse_near_spec(
+    arg: Any, *, default_spherical: bool
+) -> tuple[tuple[float, float], float | None, float | None, bool]:
+    """Normalize ``$near`` arg into ``(center, max_distance, min_distance, spherical)``.
+
+    Three shapes are accepted:
+
+    * GeoJSON: ``{$geometry: {type:"Point", coordinates:[lng,lat]},
+      $maxDistance: meters, $minDistance: meters}`` — always spherical.
+    * Legacy 2-element list: ``[x, y]`` — distances in input units
+      (planar for ``$near``, radians for ``$nearSphere``).
+    * Legacy 3-element list: ``[x, y, max]`` — same as above plus a
+      max-distance bound.
+    """
+    if isinstance(arg, Mapping):
+        if "$geometry" in arg:
+            geom = arg["$geometry"]
+            if (
+                not isinstance(geom, Mapping)
+                or geom.get("type") != "Point"
+                or not isinstance(geom.get("coordinates"), list)
+                or len(geom["coordinates"]) != 2
+            ):
+                raise QueryError("$near $geometry must be a GeoJSON Point")
+            cx, cy = geom["coordinates"]
+            return (
+                (float(cx), float(cy)),
+                _opt_number(arg.get("$maxDistance"), "$maxDistance"),
+                _opt_number(arg.get("$minDistance"), "$minDistance"),
+                True,
+            )
+        raise QueryError("$near requires $geometry or a coordinate pair")
+    if isinstance(arg, list) and len(arg) in (2, 3):
+        try:
+            cx, cy = float(arg[0]), float(arg[1])
+        except (TypeError, ValueError) as exc:
+            raise QueryError("$near coordinate pair must be numeric") from exc
+        max_d = float(arg[2]) if len(arg) == 3 else None
+        return ((cx, cy), max_d, None, default_spherical)
+    raise QueryError("$near must be a GeoJSON-shaped doc or a coordinate pair")
+
+
+def _opt_number(value: Any, label: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise QueryError(f"{label} must be a number")
+    return float(value)
 
 
 def _resolve_bitmask(arg: Any) -> int:

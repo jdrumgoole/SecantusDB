@@ -1041,6 +1041,93 @@ def _stage_documents(
     return out
 
 
+def _stage_geo_near(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$geoNear`` — proximity search with attached distances.
+
+    Walks every doc, optionally pre-filters via ``query``, computes the
+    distance from each doc's ``key`` field to ``near``, drops docs that
+    fall outside [``minDistance``, ``maxDistance``], attaches the
+    distance under ``distanceField`` (with dotted-path support), and
+    returns docs sorted ascending by distance. Real ``mongod`` requires
+    an index for ``$geoNear``; the surrogate works without one and will
+    use an index when Phase 2's ``_pick_geo_index`` lands.
+    """
+    from shapely.geometry import Point
+
+    from secantus.geo import distance, parse_doc_geometry
+
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$geoNear requires an object")
+    near = spec.get("near")
+    if near is None:
+        raise AggregateError("$geoNear requires `near`")
+    distance_field = spec.get("distanceField")
+    if not isinstance(distance_field, str) or not distance_field:
+        raise AggregateError("$geoNear requires a string `distanceField`")
+    key = spec.get("key")
+    if not isinstance(key, str) or not key:
+        # Phase 1 requires explicit `key`; Phase 2 will infer from indexes.
+        raise AggregateError("$geoNear requires a `key` (Phase 1 limitation)")
+    pre_filter = spec.get("query")
+    distance_multiplier = spec.get("distanceMultiplier", 1.0)
+    if not isinstance(distance_multiplier, (int, float)) or isinstance(
+        distance_multiplier, bool
+    ):
+        raise AggregateError("$geoNear distanceMultiplier must be a number")
+
+    spherical, center = _parse_geo_near_origin(near, spec.get("spherical"))
+
+    max_distance = spec.get("maxDistance")
+    min_distance = spec.get("minDistance")
+
+    results: list[tuple[float, dict[str, Any]]] = []
+    for doc in docs:
+        if pre_filter is not None and not matches(doc, pre_filter, vars=ctx.vars):
+            continue
+        # `key` is a dotted path into the doc.
+        value = get_path(doc, key)
+        if value is None:
+            continue
+        doc_geom = parse_doc_geometry(value)
+        if doc_geom is None:
+            continue
+        d = distance(doc_geom, Point(*center), spherical=spherical)
+        if d is None:
+            continue
+        if max_distance is not None and d > max_distance:
+            continue
+        if min_distance is not None and d < min_distance:
+            continue
+        out = copy.deepcopy(doc)
+        set_path(out, distance_field, d * float(distance_multiplier))
+        results.append((d, out))
+    results.sort(key=lambda pair: pair[0])
+    return [doc for _d, doc in results]
+
+
+def _parse_geo_near_origin(
+    near: Any, spherical_opt: Any
+) -> tuple[bool, tuple[float, float]]:
+    """Extract ``(spherical, (x, y))`` from ``$geoNear`` ``near`` value.
+
+    A GeoJSON Point implies spherical; a legacy ``[x, y]`` is planar
+    unless ``spherical: true`` is explicitly set, matching ``mongod``.
+    """
+    if isinstance(near, Mapping) and near.get("type") == "Point":
+        coords = near.get("coordinates")
+        if not isinstance(coords, list) or len(coords) != 2:
+            raise AggregateError("$geoNear `near` Point needs [lng, lat]")
+        return True, (float(coords[0]), float(coords[1]))
+    if isinstance(near, list) and len(near) == 2:
+        spherical = bool(spherical_opt) if spherical_opt is not None else False
+        return spherical, (float(near[0]), float(near[1]))
+    raise AggregateError(
+        "$geoNear `near` must be a GeoJSON Point or a [x, y] pair"
+    )
+
+
 _STAGES = {
     "$match": _stage_match,
     "$count": _stage_count,
@@ -1069,4 +1156,5 @@ _STAGES = {
     "$graphLookup": _stage_graph_lookup,
     "$documents": _stage_documents,
     "$changeStream": _stage_change_stream,
+    "$geoNear": _stage_geo_near,
 }

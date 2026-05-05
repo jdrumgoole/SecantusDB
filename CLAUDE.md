@@ -70,7 +70,9 @@ Unique enforcement is a prefix probe on the entries table, not a full scan.
 
 Still missing: multi-field sort acceleration (a sort `{a:1, b:1}` matching a compound index `{a:1, b:1}` would skip post-sort entirely; today only single-field sort is index-accelerated), and `collation`.
 
-Out of scope regardless: text / geo / hashed / wildcard indexes, collation.
+Out of scope regardless: text / hashed / wildcard indexes, collation.
+
+**Geo support (Phase 1, no index acceleration)**: `$geoWithin`, `$geoIntersects`, `$near`, `$nearSphere` field operators and `$geoNear` aggregation stage land in `secantus.geo` + `secantus.query` + `secantus.aggregate`. Doc-side accepts GeoJSON (`{type:"Point|Polygon|...", coordinates: ...}`), legacy `[x, y]` pairs, and `{x, y}` / `{lng, lat}` maps. Query-side accepts `$geometry` (GeoJSON), `$box`, `$polygon`, `$center` (planar disk), `$centerSphere` (great-circle cap, radius in radians). Containment and intersection delegate to Shapely (planar — Shapely 2.x); spherical-circle containment uses haversine in `secantus.geo._great_circle_radians` directly. Distance returns meters when spherical (mean-radius `EARTH_RADIUS_METERS = 6_378_100.0` matching `mongod`'s constant) and planar units otherwise. `$geoNear` sorts ascending by distance and attaches the value under `distanceField` — `key` is required (Phase 1 has no index, so we can't infer the geo field). All operators run as full collection scans; index acceleration (2dsphere via S2 cells, 2d via geohash bits) is the Phase 2 work tracked in `tasks/backlog.md`.
 
 ### Oplog and change streams
 
