@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import secrets
 from dataclasses import dataclass, field
+from typing import Any
 
 SCRAM_SHA_256 = "SCRAM-SHA-256"
 DEFAULT_ITERATIONS = 15000  # MongoDB default for SCRAM-SHA-256
@@ -236,15 +237,25 @@ class ConnectionAuth:
 
     One instance per TCP connection, threaded through every
     ``CommandContext`` for that connection. Holds the in-flight SCRAM
-    conversation (if any) and the set of authenticated principals.
+    conversation (if any), the set of authenticated principals, and
+    the union of role bindings across those principals.
 
     ``authenticated_principals`` is a list of ``(db_name, username)``
     tuples. A connection can authenticate as multiple users (one per
     auth source) — pymongo does this when an ``authSource`` URI option
     is paired with admin-database commands.
+
+    ``effective_roles`` is the union of the role bindings of every
+    authenticated principal. Each entry is the
+    ``{"role": <name>, "db": <db>}`` shape stored on the user record.
+    The RBAC privilege check (:func:`secantus.rbac.check_privilege`)
+    walks this list. Re-population is the auth-completion handler's
+    responsibility (``_sasl_continue``); ``dropUser`` of the calling
+    principal also rebuilds it.
     """
 
     authenticated_principals: list[tuple[str, str]] = field(default_factory=list)
+    effective_roles: list[dict[str, Any]] = field(default_factory=list)
     scram: ScramState | None = None
     _next_conv_id: int = 1
 
@@ -256,3 +267,34 @@ class ConnectionAuth:
         cid = self._next_conv_id
         self._next_conv_id += 1
         return cid
+
+    def add_principal_roles(self, roles: list[dict[str, Any]]) -> None:
+        """Merge a freshly-authenticated principal's role bindings.
+
+        Bindings are deduplicated by ``(role, db)`` so a user that
+        appears with the same role on multiple connections doesn't
+        balloon the effective set.
+        """
+        seen = {(r.get("role"), r.get("db")) for r in self.effective_roles}
+        for role in roles:
+            if not isinstance(role, dict):
+                continue
+            key = (role.get("role"), role.get("db"))
+            if key in seen:
+                continue
+            seen.add(key)
+            self.effective_roles.append(dict(role))
+
+    def remove_principal_roles(self, principal_roles: list[dict[str, Any]]) -> None:
+        """Drop one principal's roles from the effective set.
+
+        Used when a connection's user is deleted via ``dropUser`` — we
+        clear that user's roles so subsequent commands on the same
+        connection see the reduced privilege set.
+        """
+        to_remove = {(r.get("role"), r.get("db")) for r in principal_roles if isinstance(r, dict)}
+        if not to_remove:
+            return
+        self.effective_roles = [
+            r for r in self.effective_roles if (r.get("role"), r.get("db")) not in to_remove
+        ]
