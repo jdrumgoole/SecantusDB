@@ -1,9 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 110" role="img" aria-label="SecantusDB">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 130" role="img" aria-label="SecantusDB">
   <defs>
     <style>
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@500&amp;display=swap');
       .name { font-family: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif; font-weight: 500; letter-spacing: -0.02em; }
     </style>
   </defs>
-  <text x="0" y="84" class="name" font-size="92" fill="#0f172a">Secantus<tspan fill="#06b6d4">DB</tspan></text>
+  <!-- viewBox sized for the Helvetica/Arial fallback that browsers use
+       when SVGs are loaded via <img> (no @import font load): the text
+       actually renders ~520 × 111 in those metrics, so 540 × 130 fits
+       with a small margin. The Inter cap height comes in narrower so
+       inline-loaded versions look identical. -->
+  <text x="0" y="95" class="name" font-size="92" fill="#0f172a">Secantus<tspan fill="#06b6d4">DB</tspan></text>
 </svg>
