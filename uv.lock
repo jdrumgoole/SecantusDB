@@ -1133,11 +1133,7 @@ wheels = [
 
 [[package]]
 name = "secantusdb"
-<<<<<<< HEAD
-version = "0.3.0a46"
-=======
 version = "0.3.0a47"
->>>>>>> lookup-index
 source = { editable = "." }
 dependencies = [
     { name = "pymongo" },
