@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 240" role="img" aria-label="SecantusDB">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@500&amp;display=swap');
+      .name { font-family: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif; font-weight: 500; letter-spacing: -0.02em; }
+    </style>
+  </defs>
+  <g transform="translate(-10.5, 10.5) scale(0.78)">
+    <path d="M52,36 Q160,14 268,36 L268,254 Q268,306 160,306 Q52,306 52,254 Z" fill="#334155"/>
+    <path d="M60,40 Q160,20 260,40 L260,250 Q260,300 160,300 Q60,300 60,250 Z" fill="#475569"/>
+    <path d="M60,40 Q160,20 260,40 L260,250 Q260,300 160,300 Q60,300 60,250 Z" fill="none" stroke="#020617" stroke-width="2" opacity="0.6"/>
+    <g transform="translate(160,165)">
+      <circle r="78" fill="#0e7490" stroke="#0f172a" stroke-width="2"/>
+      <g transform="translate(-44,-50)" stroke="#0f172a" stroke-width="2">
+        <path d="M0,70 V82 Q0,98 44,98 Q88,98 88,82 V70 Z" fill="#06b6d4"/>
+        <ellipse cx="44" cy="70" rx="44" ry="11" fill="#22d3ee"/>
+        <path d="M0,38 V58 Q0,74 44,74 Q88,74 88,58 V38 Z" fill="#06b6d4"/>
+        <ellipse cx="44" cy="38" rx="44" ry="11" fill="#22d3ee"/>
+        <path d="M0,6 V26 Q0,42 44,42 Q88,42 88,26 V6 Z" fill="#06b6d4"/>
+        <ellipse cx="44" cy="6" rx="44" ry="11" fill="#22d3ee"/>
+      </g>
+    </g>
+  </g>
+  <text x="240" y="148" class="name" font-size="76" fill="#0f172a">Secantus<tspan fill="#06b6d4">DB</tspan></text>
+</svg>

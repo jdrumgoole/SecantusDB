@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SecantusDB — Brand kit</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --slate-50:#f8fafc; --slate-100:#f1f5f9; --slate-200:#e2e8f0; --slate-300:#cbd5e1;
+    --slate-400:#94a3b8; --slate-500:#64748b; --slate-600:#475569; --slate-700:#334155;
+    --slate-800:#1e293b; --slate-900:#0f172a; --slate-950:#020617;
+    --cyan-300:#67e8f9; --cyan-400:#22d3ee; --cyan-500:#06b6d4; --cyan-600:#0891b2; --cyan-700:#0e7490;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    color: var(--slate-900);
+    background: var(--slate-50);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 64px 32px; }
+  header { padding: 96px 32px 48px; max-width: 1180px; margin: 0 auto; }
+  header img { max-width: 460px; width: 100%; height: auto; }
+  h1 { font-weight: 600; font-size: 14px; letter-spacing: 0.16em; color: var(--slate-500); margin: 32px 0 0; text-transform: uppercase; }
+  h2 { font-weight: 600; font-size: 28px; letter-spacing: -0.01em; margin: 0 0 8px; }
+  h3 { font-weight: 500; font-size: 14px; color: var(--slate-500); letter-spacing: 0.04em; text-transform: uppercase; margin: 0 0 16px; }
+  .lead { color: var(--slate-600); font-size: 18px; max-width: 60ch; margin: 16px 0 0; }
+  section { padding: 48px 0; border-top: 1px solid var(--slate-200); }
+  section:first-of-type { border-top: 0; }
+  .section-head { margin-bottom: 32px; }
+  .section-head .desc { color: var(--slate-600); margin: 0; max-width: 60ch; }
+  .grid {
+    display: grid;
+    gap: 24px;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  }
+  .grid.wide { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); }
+  .tile {
+    background: white;
+    border: 1px solid var(--slate-200);
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .tile.dark { background: var(--slate-900); border-color: var(--slate-800); }
+  .tile .preview {
+    aspect-ratio: 4 / 3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .tile.dark .preview { background: var(--slate-900); }
+  .tile .preview img { max-width: 80%; max-height: 80%; }
+  .tile .meta {
+    padding: 16px 20px;
+    border-top: 1px solid var(--slate-200);
+    background: var(--slate-50);
+  }
+  .tile.dark .meta { background: #0a1120; border-top-color: var(--slate-800); color: var(--slate-300); }
+  .tile.dark .meta .label { color: var(--slate-100); }
+  .label {
+    font-weight: 500;
+    font-size: 14px;
+    color: var(--slate-900);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  .label a {
+    font-weight: 400; font-size: 12px;
+    color: var(--cyan-600); text-decoration: none;
+    padding: 4px 8px; border-radius: 6px; background: var(--slate-100);
+  }
+  .label a:hover { background: var(--slate-200); }
+  .tile.dark .label a { background: var(--slate-800); color: var(--cyan-400); }
+  .tile.dark .label a:hover { background: #1a2333; }
+  .note { color: var(--slate-500); font-size: 13px; margin: 4px 0 0; }
+  .tile.dark .note { color: var(--slate-400); }
+
+  /* Color swatches */
+  .swatch-grid {
+    display: grid;
+    gap: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  }
+  .swatch {
+    border: 1px solid var(--slate-200);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .swatch .chip { aspect-ratio: 3 / 2; }
+  .swatch .info { padding: 12px 14px; background: white; }
+  .swatch .name { font-size: 13px; font-weight: 500; }
+  .swatch .hex { font-family: ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--slate-500); margin-top: 2px; }
+
+  /* Type spec */
+  .type-row {
+    display: grid; grid-template-columns: 200px 1fr; gap: 32px;
+    padding: 20px 0; border-top: 1px solid var(--slate-200);
+    align-items: baseline;
+  }
+  .type-row:first-child { border-top: 0; }
+  .type-row .meta-col { color: var(--slate-500); font-size: 13px; }
+  .type-row .meta-col strong { color: var(--slate-900); display: block; font-size: 15px; font-weight: 500; }
+  .type-row .sample-name { font-weight: 500; font-size: 56px; letter-spacing: -0.02em; }
+  .type-row .sample-name .db { color: var(--cyan-500); }
+  .type-row .sample-tag { font-weight: 400; font-size: 17px; letter-spacing: 0.16em; color: var(--slate-600); text-transform: uppercase; }
+
+  .meta-grid { display: grid; gap: 8px; grid-template-columns: 120px 1fr; font-size: 14px; }
+  .meta-grid dt { color: var(--slate-500); }
+  .meta-grid dd { margin: 0; color: var(--slate-900); }
+
+  footer {
+    padding: 48px 32px 96px;
+    max-width: 1180px;
+    margin: 0 auto;
+    color: var(--slate-500);
+    font-size: 13px;
+    border-top: 1px solid var(--slate-200);
+  }
+  footer code {
+    font-family: ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, monospace;
+    background: var(--slate-100); padding: 2px 6px; border-radius: 4px; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <img src="wordmark-horizontal.svg" alt="SecantusDB">
+  <h1>Brand kit</h1>
+  <p class="lead">Visual identity reference for SecantusDB. All assets are SVG — vector, scalable, transparent. Right-click any preview to save the file.</p>
+</header>
+
+<div class="wrap">
+
+<!-- ============== MARK ============== -->
+<section>
+  <div class="section-head">
+    <h2>Mark</h2>
+    <p class="desc">The shield is the icon. Use the full-colour mark whenever possible. Drop to mono variants when colour reproduction isn't an option.</p>
+  </div>
+  <div class="grid">
+    <div class="tile">
+      <div class="preview"><img src="mark.svg" alt="Primary mark"></div>
+      <div class="meta">
+        <div class="label">Primary <a href="mark.svg" download>SVG</a></div>
+        <p class="note">Default. Use on light backgrounds.</p>
+      </div>
+    </div>
+    <div class="tile dark">
+      <div class="preview"><img src="mark-on-dark.svg" alt="Mark on dark"></div>
+      <div class="meta">
+        <div class="label">On dark <a href="mark-on-dark.svg" download>SVG</a></div>
+        <p class="note">Brighter cyan, lighter rim. Use on slate/dark backgrounds.</p>
+      </div>
+    </div>
+    <div class="tile">
+      <div class="preview"><img src="mark-mono-dark.svg" alt="Monochrome dark"></div>
+      <div class="meta">
+        <div class="label">Mono dark <a href="mark-mono-dark.svg" download>SVG</a></div>
+        <p class="note">Single-ink. Stamps, embossing, fax-grade print.</p>
+      </div>
+    </div>
+    <div class="tile dark">
+      <div class="preview"><img src="mark-mono-light.svg" alt="Monochrome light"></div>
+      <div class="meta">
+        <div class="label">Mono light <a href="mark-mono-light.svg" download>SVG</a></div>
+        <p class="note">Reverse-out version. T-shirts, photographic backgrounds.</p>
+      </div>
+    </div>
+    <div class="tile">
+      <div class="preview" style="padding:48px"><img src="favicon.svg" alt="Favicon" style="max-width:100%;max-height:100%"></div>
+      <div class="meta">
+        <div class="label">Favicon <a href="favicon.svg" download>SVG</a></div>
+        <p class="note">Simplified for 16–64px. Three bars stand in for the database stack.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== HORIZONTAL LOCKUPS ============== -->
+<section>
+  <div class="section-head">
+    <h2>Horizontal lockup</h2>
+    <p class="desc">Primary wordmark. The version with the tagline is the marketing default; drop the tagline in product UI like nav bars.</p>
+  </div>
+  <div class="grid wide">
+    <div class="tile">
+      <div class="preview"><img src="wordmark-horizontal.svg" alt="Primary wordmark"></div>
+      <div class="meta">
+        <div class="label">With tagline <a href="wordmark-horizontal.svg" download>SVG</a></div>
+        <p class="note">Marketing site, README, presentation title slides.</p>
+      </div>
+    </div>
+    <div class="tile">
+      <div class="preview"><img src="wordmark-horizontal-no-tagline.svg" alt="Wordmark without tagline"></div>
+      <div class="meta">
+        <div class="label">No tagline <a href="wordmark-horizontal-no-tagline.svg" download>SVG</a></div>
+        <p class="note">Nav bars, product UI, anywhere vertical space is tight.</p>
+      </div>
+    </div>
+    <div class="tile dark">
+      <div class="preview"><img src="wordmark-horizontal-on-dark.svg" alt="Wordmark on dark"></div>
+      <div class="meta">
+        <div class="label">On dark <a href="wordmark-horizontal-on-dark.svg" download>SVG</a></div>
+        <p class="note">Dark-mode site headers, slide decks with dark theme.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== STACKED LOCKUPS ============== -->
+<section>
+  <div class="section-head">
+    <h2>Stacked lockup</h2>
+    <p class="desc">Vertical arrangement for square-ish contexts: app store listings, square ads, sponsorship slides.</p>
+  </div>
+  <div class="grid">
+    <div class="tile">
+      <div class="preview" style="aspect-ratio:1/1"><img src="wordmark-stacked.svg" alt="Stacked wordmark"></div>
+      <div class="meta">
+        <div class="label">Stacked <a href="wordmark-stacked.svg" download>SVG</a></div>
+        <p class="note">Square contexts, light background.</p>
+      </div>
+    </div>
+    <div class="tile dark">
+      <div class="preview" style="aspect-ratio:1/1"><img src="wordmark-stacked-on-dark.svg" alt="Stacked wordmark on dark"></div>
+      <div class="meta">
+        <div class="label">Stacked, on dark <a href="wordmark-stacked-on-dark.svg" download>SVG</a></div>
+        <p class="note">Square contexts, dark background.</p>
+      </div>
+    </div>
+    <div class="tile">
+      <div class="preview"><img src="wordmark-text-only.svg" alt="Text-only wordmark"></div>
+      <div class="meta">
+        <div class="label">Text only <a href="wordmark-text-only.svg" download>SVG</a></div>
+        <p class="note">When the shield can't be used (very long banners, body-copy mentions).</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== SOCIAL ============== -->
+<section>
+  <div class="section-head">
+    <h2>Social</h2>
+    <p class="desc">Pre-sized assets for the platforms that matter.</p>
+  </div>
+  <div class="grid wide">
+    <div class="tile dark">
+      <div class="preview" style="aspect-ratio:1/1"><img src="avatar.svg" alt="Social avatar" style="border-radius:24px"></div>
+      <div class="meta">
+        <div class="label">Avatar (1:1, 512×512) <a href="avatar.svg" download>SVG</a></div>
+        <p class="note">Profile pictures: X / Twitter, GitHub, LinkedIn, Discord.</p>
+      </div>
+    </div>
+    <div class="tile dark">
+      <div class="preview" style="aspect-ratio:1200/630"><img src="og-image.svg" alt="Open Graph image"></div>
+      <div class="meta">
+        <div class="label">Open Graph (1200×630) <a href="og-image.svg" download>SVG</a></div>
+        <p class="note">Link-preview card for X, LinkedIn, Slack, Discord. Reference via <code>&lt;meta property=&quot;og:image&quot;&gt;</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============== COLOUR ============== -->
+<section>
+  <div class="section-head">
+    <h2>Colour</h2>
+    <p class="desc">Slate for structure, cyan for the database accent. Tokens map directly to Tailwind's <code style="font-family:ui-monospace,monospace;font-size:13px">slate</code> and <code style="font-family:ui-monospace,monospace;font-size:13px">cyan</code> scales, which keeps theming portable.</p>
+  </div>
+
+  <h3>Primary</h3>
+  <div class="swatch-grid" style="margin-bottom: 32px">
+    <div class="swatch"><div class="chip" style="background:#475569"></div><div class="info"><div class="name">Shield face</div><div class="hex">#475569 · slate-600</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#334155"></div><div class="info"><div class="name">Shield rim</div><div class="hex">#334155 · slate-700</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#06b6d4"></div><div class="info"><div class="name">Accent</div><div class="hex">#06b6d4 · cyan-500</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#0e7490"></div><div class="info"><div class="name">Accent deep</div><div class="hex">#0e7490 · cyan-700</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#0f172a"></div><div class="info"><div class="name">Ink</div><div class="hex">#0f172a · slate-900</div></div></div>
+  </div>
+
+  <h3>Supporting</h3>
+  <div class="swatch-grid">
+    <div class="swatch"><div class="chip" style="background:#22d3ee"></div><div class="info"><div class="name">Accent bright</div><div class="hex">#22d3ee · cyan-400</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#67e8f9"></div><div class="info"><div class="name">Accent highlight</div><div class="hex">#67e8f9 · cyan-300</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#64748b"></div><div class="info"><div class="name">Muted</div><div class="hex">#64748b · slate-500</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#cbd5e1"></div><div class="info"><div class="name">Border</div><div class="hex">#cbd5e1 · slate-300</div></div></div>
+    <div class="swatch"><div class="chip" style="background:#f1f5f9"></div><div class="info"><div class="name">Surface</div><div class="hex">#f1f5f9 · slate-100</div></div></div>
+  </div>
+</section>
+
+<!-- ============== TYPOGRAPHY ============== -->
+<section>
+  <div class="section-head">
+    <h2>Typography</h2>
+    <p class="desc">Inter, two weights. The whole system runs on a single typeface — fewer decisions, more consistency.</p>
+  </div>
+
+  <div class="type-row">
+    <div class="meta-col">
+      <strong>Wordmark</strong>
+      Inter Medium · 500
+      <br>letter-spacing: −0.02em
+    </div>
+    <div>
+      <span class="sample-name">Secantus<span class="db">DB</span></span>
+    </div>
+  </div>
+  <div class="type-row">
+    <div class="meta-col">
+      <strong>Tagline</strong>
+      Inter Regular · 400
+      <br>letter-spacing: 0.16em
+      <br>tracking up, all caps
+    </div>
+    <div>
+      <span class="sample-tag">THE SQLITE OF DOCUMENT DATABASES</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============== USAGE ============== -->
+<section>
+  <div class="section-head">
+    <h2>Usage notes</h2>
+  </div>
+  <dl class="meta-grid" style="grid-template-columns: 200px 1fr; row-gap: 12px">
+    <dt>Clear space</dt>
+    <dd>Maintain padding equal to the height of the "S" in "Secantus" on all sides of any lockup.</dd>
+    <dt>Minimum size</dt>
+    <dd>Mark: 24px. Horizontal lockup with tagline: 220px wide. Below that, drop the tagline; below 160px, drop to the mark only.</dd>
+    <dt>Don't</dt>
+    <dd>Recolour the cyan to other hues. Skew or rotate. Place over busy photos without an overlay. Re-set the wordmark in a different typeface.</dd>
+    <dt>Do</dt>
+    <dd>Use the SVGs directly — no rasterisation needed for web. Inline the mark in your HTML for theme-aware <code>currentColor</code> tricks if you want.</dd>
+  </dl>
+</section>
+
+</div>
+
+<footer>
+  <p>SecantusDB brand kit · v1 · Generated <time>2026-05-05</time></p>
+  <p>All assets are SVG. To produce PNG fallbacks: <code>npx svgo &amp;&amp; npx sharp-cli -i mark.svg -o mark.png</code> (or any rasteriser).</p>
+</footer>
+
+</body>
+</html>

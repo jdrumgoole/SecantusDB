@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 180" role="img" aria-label="SecantusDB">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&amp;display=swap');
+      .name { font-family: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif; font-weight: 500; letter-spacing: -0.02em; }
+      .tag  { font-family: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif; font-weight: 400; letter-spacing: 0.16em; }
+    </style>
+  </defs>
+  <text x="20" y="100" class="name" font-size="76" fill="#0f172a">Secantus<tspan fill="#06b6d4">DB</tspan></text>
+  <line x1="24" y1="120" x2="280" y2="120" stroke="#06b6d4" stroke-width="1" opacity="0.55"/>
+  <text x="24" y="144" class="tag" font-size="17" fill="#475569">THE SQLITE OF DOCUMENT DATABASES</text>
+</svg>

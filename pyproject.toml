@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.3.0a30"
+version = "0.3.0a31"
 description = "A drop-in single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -79,6 +79,11 @@ sdist.exclude = [
     "vendor/mongo-java-driver/**",
     "java_validation/**",
     ".validation/**",
+    # brandkit/ is marketing content (logos, brand-guide HTML); not
+    # needed at install or run time. The docs that need it pull from
+    # docs/_static/ (a small subset checked in there too). Cloners
+    # and the GitHub release page are the right place for the full kit.
+    "brandkit/**",
 ]
 
 [tool.cibuildwheel]

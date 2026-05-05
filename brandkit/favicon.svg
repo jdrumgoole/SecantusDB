@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SecantusDB favicon">
+  <!-- Shield silhouette, simplified -->
+  <path d="M8,8 Q32,4 56,8 L56,48 Q56,58 32,60 Q8,58 8,48 Z" fill="#475569"/>
+  <!-- Three cyan bars representing database disks -->
+  <rect x="20" y="22" width="24" height="4" rx="1" fill="#22d3ee"/>
+  <rect x="20" y="30" width="24" height="4" rx="1" fill="#22d3ee"/>
+  <rect x="20" y="38" width="24" height="4" rx="1" fill="#22d3ee"/>
+</svg>
