@@ -163,6 +163,27 @@ Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_T
 
 Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases, and do **not** edit RTD's default_version through the dashboard — `release-finalize` owns that value. The only sanctioned path is `invoke release-prepare` + `invoke release-finalize` via sub-agent (or `invoke release` for a developer running it directly). The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation, RTD default left dangling).
 
+### Website-only commits skip the full test suite
+
+The marketing site under `website/` is excluded from sdist/wheel and never touches SecantusDB's runtime code. The global "always run the full test suite before committing" rule does **not** apply to website-only commits — running 700+ pytest tests just to ship a copy edit or a new blog post is wasted compute.
+
+Use the dedicated shortcut (defined in `website/tasks.py`):
+
+```bash
+cd website
+uv run python -m invoke publish --message "blog: post v0.3.0aN release notes"
+```
+
+`publish` runs in this order:
+
+1. **Refuses if any non-website change is staged or modified** (anything not under `website/` or the project `CLAUDE.md` aborts the task with a list of offending paths). Vendor submodule drift (` m vendor/...`) is tolerated.
+2. `git add` of the matched paths.
+3. `git commit -m "<message>" -m "Co-Authored-By: Claude ..."`.
+4. `git push origin <current-branch>`.
+5. `invoke deploy` — production Pelican build, `aws s3 sync`, CloudFront `/*` invalidation.
+
+No version bump and no pytest. If a real-code change has snuck into the working tree, the refusal forces a normal commit (with full test suite) for the mixed batch instead.
+
 ### Blog post per release
 
 Every GitHub Release **must** have a matching blog post on secantusdb.com. After `release-finalize` succeeds (specifically: after `gh release create` has run in step 6 and the auto-generated notes are visible on GitHub), create `website/content/blog/YYYY-MM-DD-release-X-Y-ZaN.md` with this shape:

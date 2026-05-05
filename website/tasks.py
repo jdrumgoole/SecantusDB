@@ -142,3 +142,83 @@ def deploy(c: Context) -> None:
         pty=True,
     )
     print(f"\nDone. https://{state.get('domain', 'secantusdb.com')}/")
+
+
+# Paths allowed in a `publish` commit. Anything else in `git status`
+# aborts the shortcut so we never sneak unrelated changes through the
+# website-only fast path (which skips the full pytest suite).
+_PUBLISH_ALLOWED_PREFIXES: tuple[str, ...] = ("website/", "CLAUDE.md")
+
+
+def _git(c: Context, args: str, **kw) -> str:
+    return c.run(f"git -C {REPO_ROOT} {args}", hide=True, **kw).stdout.rstrip()
+
+
+@task
+def publish(c: Context, message: str = "") -> None:
+    """Commit, push, and deploy website changes — no pytest, no version bump.
+
+    The shortcut for website-only updates: skips the global "run the full
+    test suite before committing" rule (the website tree never changes
+    SecantusDB's runtime code) and the "bump the version on every push"
+    rule (website tree is excluded from sdist/wheel). Only changes under
+    ``website/`` and the project ``CLAUDE.md`` are allowed; anything else
+    aborts the task so a misfire can't fast-path real code through it.
+
+    Usage::
+
+        cd website
+        uv run python -m invoke publish --message "blog: new release post"
+    """
+    if not message:
+        raise SystemExit(
+            "publish needs a commit message: "
+            'invoke publish --message "what changed"'
+        )
+
+    porcelain = _git(c, "status --porcelain=v1")
+    if not porcelain:
+        raise SystemExit("nothing to publish — working tree is clean")
+
+    bad: list[str] = []
+    paths_to_add: list[str] = []
+    for line in porcelain.splitlines():
+        # Skip vendor submodule drift markers (' m vendor/...') — the
+        # global rule tolerates those.
+        if line.startswith(" m vendor/") or line.startswith(" M vendor/"):
+            continue
+        # `git status --porcelain` rows are 'XY path'.
+        path = line[3:].strip()
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        if not path.startswith(_PUBLISH_ALLOWED_PREFIXES):
+            bad.append(path)
+        else:
+            paths_to_add.append(path)
+
+    if bad:
+        raise SystemExit(
+            "publish refuses: changes outside website/ + CLAUDE.md detected:\n  "
+            + "\n  ".join(bad)
+            + "\nUse a normal commit (with full pytest run) for these."
+        )
+
+    if not paths_to_add:
+        raise SystemExit("no website/ or CLAUDE.md changes to publish")
+
+    branch = _git(c, "rev-parse --abbrev-ref HEAD")
+    print(f"=== Committing {len(paths_to_add)} path(s) on '{branch}' ===")
+    add_cmd = "git -C " + str(REPO_ROOT) + " add -- " + " ".join(
+        f"'{p}'" for p in paths_to_add
+    )
+    c.run(add_cmd, pty=True)
+    c.run(
+        f"git -C {REPO_ROOT} commit -m {message!r} -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'",
+        pty=True,
+    )
+
+    print(f"=== Pushing {branch} ===")
+    c.run(f"git -C {REPO_ROOT} push origin {branch}", pty=True)
+
+    print(f"=== Deploying ===")
+    deploy(c)
