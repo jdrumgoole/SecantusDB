@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 380 110" role="img" aria-label="SecantusDB">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@500&amp;display=swap');
+      .name { font-family: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif; font-weight: 500; letter-spacing: -0.02em; }
+    </style>
+  </defs>
+  <text x="0" y="84" class="name" font-size="92" fill="#0f172a">Secantus<tspan fill="#06b6d4">DB</tspan></text>
+</svg>

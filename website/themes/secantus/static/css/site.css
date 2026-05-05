@@ -111,16 +111,23 @@ pre code { background: transparent; padding: 0; }
 .site-header .logo {
   display: flex;
   align-items: center;
+  gap: 14px;
+  flex-wrap: nowrap;
   text-decoration: none;
   flex-shrink: 0;
 }
-.site-header .logo-lockup {
-  height: 76px;
+.site-header .logo img {
   width: auto;
   display: block;
+  flex-shrink: 0;
 }
+/* Mark (shield) is the small "icon" half of the lockup; wordmark text
+   is the visually-dominant half — keep this asymmetry on purpose. */
+.site-header .logo-mark { height: 40px; }
+.site-header .logo-wordmark { height: 56px; }
 @media (max-width: 720px) {
-  .site-header .logo-lockup { height: 52px; }
+  .site-header .logo-mark { height: 28px; }
+  .site-header .logo-wordmark { height: 38px; }
 }
 .site-nav {
   display: flex;
