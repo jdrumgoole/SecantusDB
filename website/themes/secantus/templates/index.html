@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+
+{% block title %}Blog — {{ SITENAME }}{% endblock %}
+{% block description %}Updates, design notes, and deep dives from the SecantusDB project.{% endblock %}
+{% block canonical_path %}blog/{% endblock %}
+
+{% block content %}
+<section class="page-body">
+  <div class="wrap">
+    <h1>Blog</h1>
+    <p>Updates, design notes, and deep dives from the SecantusDB project.</p>
+
+    {% if articles %}
+    <ul class="article-list">
+      {% for article in articles_page.object_list %}
+      <li>
+        <h3><a href="{{ SITEURL }}/{{ article.url }}">{{ article.title }}</a></h3>
+        <p class="meta">{{ article.locale_date }}{% if article.author %} · {{ article.author }}{% endif %}</p>
+        {% if article.summary %}
+        <div class="summary">{{ article.summary | safe }}</div>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+
+    {% if articles_page.has_other_pages() %}
+    <nav class="pagination">
+      {% if articles_page.has_previous() %}
+      <a href="{{ SITEURL }}/{{ articles_previous_page.url }}">&larr; Newer</a>
+      {% endif %}
+      {% if articles_page.has_next() %}
+      <a href="{{ SITEURL }}/{{ articles_next_page.url }}">Older &rarr;</a>
+      {% endif %}
+    </nav>
+    {% endif %}
+
+    {% else %}
+    <p>No posts yet — check back soon.</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,26 @@
+<div class="benefits">
+  <div class="benefit">
+    <h3><span class="pip"></span>Drop-in wire protocol</h3>
+    <p>Speaks MongoDB OP_MSG / OP_QUERY on a real TCP socket. <code>pymongo</code>, the Go driver, <code>mongosh</code>, and <code>mongodump</code> all connect with no code changes.</p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Single-node by design</h3>
+    <p>No replica sets, no sharding, no cluster topology to model. Within single-node scope SecantusDB is a faithful surrogate &mdash; same handshake, same error codes.</p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Python-native &amp; embeddable</h3>
+    <p>Start a server in two lines from any test or app. No <code>mongod</code> to install, no port juggling, parallel-test friendly. Or run it as a standalone daemon (<code>secantusdb</code>).</p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Real WiredTiger storage</h3>
+    <p>The same C library MongoDB ships with, vendored and built into the wheel. B-trees, page eviction, write-ahead logging, durability &mdash; all real.</p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>CRUD, aggregation, change streams, indexes</h3>
+    <p>Not a mock. Full pipeline (<code>$match</code> through <code>$facet</code>), oplog-backed change streams with resume tokens, compound &amp; partial &amp; geo (<code>2d</code>/<code>2dsphere</code>) indexes.</p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Conformance-tested</h3>
+    <p>Validated against the unmodified pymongo, mongo-go-driver, mongo-node-driver, and mongo-java-driver test suites. The pass rates are the honest compatibility gauge.</p>
+  </div>
+</div>

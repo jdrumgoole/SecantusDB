@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="{{ DEFAULT_LANG }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ SITENAME }} — {{ SITESUBTITLE }}{% endblock %}</title>
+  <meta name="description" content="{% block description %}SecantusDB is a drop-in single-node MongoDB server in Python, backed by WiredTiger. Test embedding, dev environments, and single-node prototypes — no mongod to install.{% endblock %}">
+  <link rel="icon" type="image/svg+xml" href="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/favicon.svg">
+  <link rel="canonical" href="{{ SITEURL }}/{% block canonical_path %}{% endblock %}">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/css/site.css">
+  {% if FEED_ALL_ATOM %}
+  <link rel="alternate" type="application/atom+xml" title="{{ SITENAME }} Atom feed" href="{{ FEED_DOMAIN }}/{{ FEED_ALL_ATOM }}">
+  {% endif %}
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="{{ self.title() }}">
+  <meta property="og:description" content="{{ self.description() }}">
+  <meta property="og:url" content="{{ SITEURL }}/{{ self.canonical_path() }}">
+  <meta property="og:image" content="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/og-image.svg">
+  <meta property="og:site_name" content="{{ SITENAME }}">
+  <meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+
+{% include 'partials/alpha_banner.html' %}
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="logo" href="{{ SITEURL }}/" aria-label="SecantusDB home">
+      <img src="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/wordmark-horizontal-no-tagline.svg" alt="SecantusDB">
+    </a>
+    <nav class="site-nav">
+      <a href="{{ SITEURL }}/">Home</a>
+      <a href="{{ SITEURL }}/blog/">Blog</a>
+      <a class="external" href="{{ SECANTUS_DOCS_URL }}" rel="noopener">Docs</a>
+      <a class="external" href="{{ SECANTUS_GITHUB_URL }}" rel="noopener">GitHub</a>
+      <a class="external" href="{{ SECANTUS_PYPI_URL }}" rel="noopener">PyPI</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+{% block content %}{% endblock %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <span>SecantusDB v{{ SECANTUS_VERSION }} · alpha · GPL-2.0-only (code) + CC-BY-4.0 (content)</span>
+    <span>
+      <a href="{{ SECANTUS_DOCS_URL }}">Docs</a> ·
+      <a href="{{ SECANTUS_PYPI_URL }}">PyPI</a> ·
+      <a href="{{ SECANTUS_GITHUB_URL }}">GitHub</a> ·
+      <a href="{{ SITEURL }}/blog/">Blog</a>
+    </span>
+  </div>
+</footer>
+
+</body>
+</html>

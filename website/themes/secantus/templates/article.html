@@ -1,0 +1,23 @@
+{% extends 'base.html' %}
+
+{% block title %}{{ article.title }} — {{ SITENAME }} blog{% endblock %}
+{% block description %}{{ article.summary | striptags | default('SecantusDB — the SQLite of document databases.') }}{% endblock %}
+{% block canonical_path %}{{ article.url }}{% endblock %}
+
+{% block content %}
+<article class="post page-body">
+  <div class="wrap">
+    <header>
+      <h1>{{ article.title }}</h1>
+      <p class="meta">
+        {{ article.locale_date }}
+        {% if article.author %} · {{ article.author }}{% endif %}
+        {% if article.category %} · <a href="{{ SITEURL }}/blog/">{{ article.category }}</a>{% endif %}
+      </p>
+    </header>
+    <div class="body">
+      {{ article.content }}
+    </div>
+  </div>
+</article>
+{% endblock %}

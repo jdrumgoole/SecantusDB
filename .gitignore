@@ -35,3 +35,14 @@ docs/_build/
 # node_modules is local to the workdir and downloaded on first run.
 # package-lock.json IS committed for reproducibility.
 tests/cross_driver/node/node_modules/
+
+# Pelican site build artifacts and ephemeral runtime state. The build
+# output is regenerated each `invoke build`; theme/static/img/ is copied
+# from ../brandkit/ at build time; secantus-data/ is a stray WiredTiger
+# data dir that may be created if a SecantusDBServer is started with
+# website/ as cwd; aws-state.json contains account-specific resource IDs.
+website/output/
+website/themes/secantus/static/img/
+website/infra/aws-state.json
+website/secantus-data/
+website/__pycache__/
