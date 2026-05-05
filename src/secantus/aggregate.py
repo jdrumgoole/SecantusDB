@@ -1050,9 +1050,12 @@ def _stage_geo_near(
     distance from each doc's ``key`` field to ``near``, drops docs that
     fall outside [``minDistance``, ``maxDistance``], attaches the
     distance under ``distanceField`` (with dotted-path support), and
-    returns docs sorted ascending by distance. Real ``mongod`` requires
-    an index for ``$geoNear``; the surrogate works without one and will
-    use an index when Phase 2's ``_pick_geo_index`` lands.
+    returns docs sorted ascending by distance.
+
+    ``key`` is optional: when omitted, the stage picks the first geo
+    index on the collection (matching ``mongod``'s behaviour). Without
+    a geo index *and* without an explicit ``key`` the stage errors —
+    real ``mongod`` does the same.
     """
     from shapely.geometry import Point
 
@@ -1068,8 +1071,11 @@ def _stage_geo_near(
         raise AggregateError("$geoNear requires a string `distanceField`")
     key = spec.get("key")
     if not isinstance(key, str) or not key:
-        # Phase 1 requires explicit `key`; Phase 2 will infer from indexes.
-        raise AggregateError("$geoNear requires a `key` (Phase 1 limitation)")
+        key = _infer_geo_near_key(ctx)
+        if key is None:
+            raise AggregateError(
+                "$geoNear requires `key` when the collection has no geo index"
+            )
     pre_filter = spec.get("query")
     distance_multiplier = spec.get("distanceMultiplier", 1.0)
     if not isinstance(distance_multiplier, (int, float)) or isinstance(
@@ -1105,6 +1111,28 @@ def _stage_geo_near(
         results.append((d, out))
     results.sort(key=lambda pair: pair[0])
     return [doc for _d, doc in results]
+
+
+def _infer_geo_near_key(ctx: PipelineContext) -> str | None:
+    """Return the field name of the first geo index on the collection.
+
+    Real ``mongod`` allows ``$geoNear`` to omit ``key`` when there is
+    exactly one geo index and uses it implicitly. We pick the first
+    geo-typed key (``"2dsphere"`` or ``"2d"``) from
+    :meth:`storage.Storage.list_indexes` order, which is deterministic
+    (sorted by name). Returns ``None`` if no geo index exists or the
+    storage isn't available (e.g. the pipeline runs outside a server).
+    """
+    if ctx.storage is None or not ctx.db_name or not ctx.coll_name:
+        return None
+    for index in ctx.storage.list_indexes(ctx.db_name, ctx.coll_name):
+        key_spec = index.get("key", {})
+        if not isinstance(key_spec, Mapping):
+            continue
+        for field, value in key_spec.items():
+            if isinstance(value, str) and value in ("2dsphere", "2d"):
+                return field
+    return None
 
 
 def _parse_geo_near_origin(

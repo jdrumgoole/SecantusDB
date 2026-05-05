@@ -270,10 +270,13 @@ def test_unknown_geo_operator_errors(client: MongoClient) -> None:
         list(coll.find({"loc": {"$geoBogus": {"$box": [[-1, -1], [1, 1]]}}}))
 
 
-def test_geo_near_requires_explicit_key(client: MongoClient) -> None:
-    coll = client["geo"]["needs_key"]
+def test_geo_near_errors_without_key_and_without_geo_index(
+    client: MongoClient,
+) -> None:
+    coll = client["geo"]["no_index_no_key"]
     coll.insert_one({"_id": 1, "loc": _geo_point(0.0, 0.0)})
-    # Phase 1: `key` is required (no auto-pick from indexes yet).
+    # Real mongod also requires either `key` or a geo index — the auto-
+    # infer path can't produce a key out of thin air.
     with pytest.raises(OperationFailure):
         list(
             coll.aggregate(
@@ -287,3 +290,91 @@ def test_geo_near_requires_explicit_key(client: MongoClient) -> None:
                 ]
             )
         )
+
+
+def test_geo_near_infers_key_from_2dsphere_index(client: MongoClient) -> None:
+    coll = client["geo"]["infer_2dsphere"]
+    coll.insert_many(
+        [
+            {"_id": 1, "loc": _geo_point(0.0, 0.0)},
+            {"_id": 2, "loc": _geo_point(0.001, 0.0)},  # ~111 m
+            {"_id": 3, "loc": _geo_point(1.0, 0.0)},  # ~111 km
+        ]
+    )
+    coll.create_index([("loc", "2dsphere")])
+    docs = list(
+        coll.aggregate(
+            [
+                {
+                    "$geoNear": {
+                        "near": _geo_point(0.0, 0.0),
+                        "distanceField": "d",
+                        "maxDistance": 200,
+                        # `key` omitted — picker should infer "loc".
+                    }
+                }
+            ]
+        )
+    )
+    assert [d["_id"] for d in docs] == [1, 2]
+
+
+def test_geo_near_infers_key_from_2d_index(client: MongoClient) -> None:
+    coll = client["geo"]["infer_2d"]
+    coll.insert_many(
+        [
+            {"_id": 1, "pos": [0.0, 0.0]},
+            {"_id": 2, "pos": [3.0, 4.0]},  # planar distance 5
+            {"_id": 3, "pos": [50.0, 50.0]},
+        ]
+    )
+    coll.create_index([("pos", "2d")])
+    docs = list(
+        coll.aggregate(
+            [
+                {
+                    "$geoNear": {
+                        "near": [0.0, 0.0],
+                        "distanceField": "d",
+                        "maxDistance": 6.0,
+                        # `key` omitted — picker should infer "pos".
+                    }
+                }
+            ]
+        )
+    )
+    assert [d["_id"] for d in docs] == [1, 2]
+
+
+def test_geo_near_explicit_key_overrides_index_inference(
+    client: MongoClient,
+) -> None:
+    # Two geo fields with indexes — the explicit `key` wins over the
+    # picker's first-found choice. Verifies `key` isn't silently
+    # ignored when an index also exists.
+    coll = client["geo"]["override"]
+    coll.insert_many(
+        [
+            {
+                "_id": 1,
+                "home": _geo_point(0.0, 0.0),
+                "work": _geo_point(50.0, 50.0),
+            },
+        ]
+    )
+    coll.create_index([("home", "2dsphere")])
+    coll.create_index([("work", "2dsphere")])
+    docs = list(
+        coll.aggregate(
+            [
+                {
+                    "$geoNear": {
+                        "near": _geo_point(50.0, 50.0),
+                        "distanceField": "d",
+                        "key": "work",  # explicit
+                    }
+                }
+            ]
+        )
+    )
+    assert docs[0]["d"] == pytest.approx(0.0, abs=1e-6)

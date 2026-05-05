@@ -72,7 +72,7 @@ These are explicit non-goals. Don't add them without a reason.
 - **TLS / SSL** — same reason.
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told the server doesn't support compression; nothing to do.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes) — would need a full-text index implementation.
-- **Geo (operators + indexes)** — `$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere` operators, `$geoNear` aggregation stage, plus `2dsphere` (S2 cell coverings + ancestors) and `2d` (bit-interleaved geohash buckets) index acceleration. See `src/secantus/geo.py` + `src/secantus/geo_index.py`. Remaining nice-to-haves: `$geoNear` `key` auto-infer from the collection's first geo index (currently requires explicit `key`); fine-grained 2d range covering for big query polygons (currently a single coarse bbox range, accepts the verifier filter cost).
+- **Geo (operators + indexes)** — `$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere` operators, `$geoNear` aggregation stage (with `key` auto-infer from the first geo index when omitted), plus `2dsphere` (S2 cell coverings + ancestors) and `2d` (bit-interleaved geohash buckets) index acceleration. See `src/secantus/geo.py` + `src/secantus/geo_index.py`. Remaining nice-to-have: fine-grained 2d range covering for big query polygons (currently a single coarse bbox range, accepts the verifier filter cost).
 - **`$where`** — runs JavaScript. We don't ship a JS runtime.
 - **Capped collections** — fixed-size, FIFO collections. Implementable later if needed.
 - **Profiling** (`setProfilingLevel`, `system.profile` collection) — real `mongod` self-profiles; we don't.
