@@ -14,6 +14,8 @@ through each driver:
     accepted.
   * ``connectionStatus`` — authenticated user roles surfaced via
     ``authInfo.authenticatedUserRoles``.
+  * BSON type fidelity — ObjectId / int32 / int64 / double / Decimal128
+    / Date / Binary round-trip through SecantusDB without type collapse.
 
 Each test self-skips if its driver tooling isn't on PATH. Java is not
 covered here for the same reason as the geo smoke tests: a
@@ -481,5 +483,99 @@ def test_connstatus_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> N
     assert result.returncode == 0, (
         f"go connstatus smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# BSON type fidelity
+# ---------------------------------------------------------------------------
+
+
+# mongosh prints an extended-JSON representation per field; we parse it
+# Python-side and assert each field's type tag (`$oid`, `$numberInt`,
+# `$numberLong`, `$numberDouble`, `$numberDecimal`, `$date`, `$binary`).
+# Anything missing the expected tag means SecantusDB collapsed the type
+# at the wire — the exact bug class this smoke is built to catch.
+_TYPES_MONGOSH_SCRIPT = """
+const objID = new ObjectId();
+const dec = NumberDecimal("3.141592653589793238");
+const when = ISODate("2026-05-06T12:34:56.789Z");
+const bin = BinData(0, "aGVsbG8=");
+db.c.drop();
+db.c.insertOne({
+  _id: objID,
+  i32: NumberInt(2147483647),
+  i64: NumberLong("9223372036854775807"),
+  f64: 2.5,
+  dec: dec,
+  dt: when,
+  bin: bin,
+  b: true,
+  n: null,
+});
+const got = db.c.findOne({ _id: objID });
+print(EJSON.stringify(got, { relaxed: false }));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_types_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [_MONGOSH, "--quiet", f"{server.uri}types_xd", "--eval", _TYPES_MONGOSH_SCRIPT],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+
+    # Strict extJSON tags: collapsing at the server would drop these.
+    assert "$oid" in payload["_id"], f"_id: {payload['_id']}"
+    assert payload["i32"] == {"$numberInt": "2147483647"}
+    assert payload["i64"] == {"$numberLong": "9223372036854775807"}
+    assert payload["f64"] == {"$numberDouble": "2.5"}
+    assert payload["dec"] == {"$numberDecimal": "3.141592653589793238"}
+    assert payload["dt"] == {"$date": {"$numberLong": "1778070896789"}}
+    assert payload["bin"]["$binary"]["subType"] == "00"
+    assert payload["bin"]["$binary"]["base64"] == "aGVsbG8="
+    assert payload["b"] is True
+    assert payload["n"] is None
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_types_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "types_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node types smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_types_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./types"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go types smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
