@@ -23,6 +23,7 @@ Run from the ``website/`` directory.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -47,21 +48,13 @@ PELICAN_PROD_CMD = f"{PYTHON} -m pelican {HERE / 'content'} -o {OUTPUT} -s {HERE
 PELICAN_SERVE_CMD = f"{PYTHON} -m pelican --listen --autoreload --port 8000 -s pelicanconf.py -o output content"
 
 
-def _ensure_venv() -> None:
-    """In a worktree, make sure ``REPO_ROOT/.venv`` is a usable env.
+def _main_repo_root() -> Path | None:
+    """Return the main repo root if we're in a worktree, else None.
 
-    The website worktree (typically ``../SecantusDB-website``) symlinks
-    ``.venv`` to the main repo's ``.venv`` to reuse the already-built
-    pelican / boto3 / invoke install. ``uv run`` can clobber that
-    symlink with a fresh empty ``.venv`` directory; this self-heals it.
-
-    No-op when the worktree IS the main repo (its own ``.venv`` is
-    managed by ``uv sync``).
+    Uses ``git rev-parse --git-common-dir``: in the main repo this is
+    the relative ``.git``; in a worktree it's the main repo's
+    ``/path/to/main/.git`` (absolute).
     """
-    venv = REPO_ROOT / ".venv"
-    if venv.is_dir() and (venv / "bin" / "pelican").exists():
-        return  # working venv, nothing to do
-    # Find main repo path via git's shared common-dir.
     import subprocess
     try:
         common_dir = subprocess.check_output(
@@ -69,24 +62,59 @@ def _ensure_venv() -> None:
             text=True,
         ).strip()
     except subprocess.CalledProcessError:
-        return  # not in git, nothing to do
+        return None
     common_path = Path(common_dir) if Path(common_dir).is_absolute() else (REPO_ROOT / common_dir)
-    main_repo = common_path.parent
-    if main_repo == REPO_ROOT:
-        return  # we ARE the main repo; let uv sync handle it
-    main_venv = main_repo / ".venv"
-    if not (main_venv / "bin" / "pelican").exists():
-        raise SystemExit(
-            f"main repo venv at {main_venv} is missing pelican.\n"
-            f"Run `cd {main_repo} && uv sync --extra dev --extra website` first."
-        )
-    if venv.exists() or venv.is_symlink():
-        if venv.is_symlink():
-            venv.unlink()
-        else:
-            shutil.rmtree(venv)
-    venv.symlink_to(main_venv)
-    print(f"  symlinked {venv} → {main_venv}")
+    main = common_path.parent
+    return main if main != REPO_ROOT else None
+
+
+def _ensure_worktree_setup() -> None:
+    """In a worktree, mirror two things from the main repo:
+
+    1. ``.venv`` (symlink) so pelican / boto3 / invoke are available
+       without rebuilding the secantusdb wheel.
+    2. ``website/infra/aws-state.json`` (symlink) so ``deploy`` can
+       read the bucket / distribution / cert IDs without re-running
+       ``infra-up`` in every worktree.
+
+    No-op when the worktree IS the main repo (its own ``.venv`` is
+    managed by ``uv sync``; its ``aws-state.json`` is the source of
+    truth that the worktree symlinks to).
+    """
+    main_repo = _main_repo_root()
+    if main_repo is None:
+        return  # main repo or non-git, leave alone
+
+    # 1) .venv symlink
+    venv = REPO_ROOT / ".venv"
+    if not (venv.is_dir() and (venv / "bin" / "pelican").exists()):
+        main_venv = main_repo / ".venv"
+        if not (main_venv / "bin" / "pelican").exists():
+            raise SystemExit(
+                f"main repo venv at {main_venv} is missing pelican.\n"
+                f"Run `cd {main_repo} && uv sync --extra dev --extra website` first."
+            )
+        if venv.exists() or venv.is_symlink():
+            if venv.is_symlink():
+                venv.unlink()
+            else:
+                shutil.rmtree(venv)
+        venv.symlink_to(main_venv)
+        print(f"  symlinked {venv} → {main_venv}")
+
+    # 2) infra/aws-state.json symlink (only if the main repo has it)
+    main_state = main_repo / "website" / "infra" / "aws-state.json"
+    if main_state.exists() and not STATE_FILE.exists():
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if STATE_FILE.is_symlink():
+            STATE_FILE.unlink()
+        STATE_FILE.symlink_to(main_state)
+        print(f"  symlinked {STATE_FILE} → {main_state}")
+
+
+# Backwards-compatible alias kept so any external callers (or my own
+# in-flight branches) that still call _ensure_venv() keep working.
+_ensure_venv = _ensure_worktree_setup
 
 
 def _copy_brandkit_assets() -> None:
@@ -280,17 +308,24 @@ def publish(c: Context, message: str = "") -> None:
 
     branch = _git(c, "rev-parse --abbrev-ref HEAD")
     print(f"=== Committing {len(paths_to_add)} path(s) on '{branch}' ===")
-    add_cmd = "git -C " + str(REPO_ROOT) + " add -- " + " ".join(
-        f"'{p}'" for p in paths_to_add
+    add_cmd = "git -C " + shlex.quote(str(REPO_ROOT)) + " add -- " + " ".join(
+        shlex.quote(p) for p in paths_to_add
     )
     c.run(add_cmd, pty=True)
+    # `shlex.quote` for the messages — using ``{message!r}`` would
+    # escape embedded newlines as the literal two-character ``\n``,
+    # which the shell hands straight to git verbatim, so multi-line
+    # commit bodies came out as one line with literal ``\n`` in the
+    # log. shlex.quote preserves real newlines.
+    coauthor = "Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
     c.run(
-        f"git -C {REPO_ROOT} commit -m {message!r} -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'",
+        f"git -C {shlex.quote(str(REPO_ROOT))} commit "
+        f"-m {shlex.quote(message)} -m {shlex.quote(coauthor)}",
         pty=True,
     )
 
     print(f"=== Pushing {branch} ===")
-    c.run(f"git -C {REPO_ROOT} push origin {branch}", pty=True)
+    c.run(f"git -C {shlex.quote(str(REPO_ROOT))} push origin {branch}", pty=True)
 
     print(f"=== Deploying ===")
     deploy(c)
