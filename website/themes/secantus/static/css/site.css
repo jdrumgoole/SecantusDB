@@ -108,13 +108,21 @@ pre code { background: transparent; padding: 0; }
   padding-bottom: 22px;
   gap: 24px;
 }
+.site-header .logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  text-decoration: none;
+}
 .site-header .logo img {
-  height: 48px;
   width: auto;
   display: block;
 }
+.site-header .logo-mark { height: 32px; }
+.site-header .logo-wordmark { height: 40px; }
 @media (max-width: 720px) {
-  .site-header .logo img { height: 36px; }
+  .site-header .logo-mark { height: 26px; }
+  .site-header .logo-wordmark { height: 30px; }
 }
 .site-nav {
   display: flex;
