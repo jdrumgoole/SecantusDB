@@ -35,11 +35,66 @@ from bson import Decimal128
 from bson.timestamp import Timestamp
 
 from secantus.diff import compute_update_description
+from secantus.geo import parse_doc_geometry, parse_query_geometry
+from secantus.geo_index import (
+    encode_cell,
+    planar_2d_covering,
+    planar_2d_index_for_point,
+    s2_doc_covering,
+    s2_query_covering,
+)
 from secantus.paths import get_path, has_path
 from secantus.projection import apply_projection
 from secantus.query import matches
 from secantus.sortkey import COMPOUND_SEP, encode_value, encode_value_directed
 from secantus.update import apply_update, find_positional_matches
+
+_GEO_2DSPHERE = "2dsphere"
+_GEO_2D = "2d"
+_GEO_TYPES = frozenset({_GEO_2DSPHERE, _GEO_2D})
+
+
+def _geo_type_of(key_spec: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return ``(field, geo_type)`` if ``key_spec`` declares a geo index.
+
+    A geo index has exactly one field whose value is the string
+    ``"2dsphere"`` or ``"2d"`` (rather than ``1`` / ``-1``). Compound
+    geo indexes (geo field + scalar trailing fields) are out of scope
+    in Phase 2; we treat any spec containing a geo field as geo-only
+    and ignore the trailing fields. The picker still works because
+    `$geoWithin` etc. are answered by the cell scan + verifier.
+    """
+    for field, value in key_spec.items():
+        if isinstance(value, str) and value in _GEO_TYPES:
+            return field, value
+    return None
+
+
+def _doc_geo_cells(
+    doc: Mapping[str, Any],
+    field: str,
+    geo_type: str,
+    options: Mapping[str, Any],
+) -> list[bytes]:
+    """Encoded cell bytes for the doc's geo field — empty if no geometry.
+
+    For 2dsphere we get an S2-cell covering of the geometry (multi-entry
+    for non-Points). For 2d we always get a single bucket because the
+    legacy index only supports point-typed values.
+    """
+    value = get_path(dict(doc), field)
+    geom = parse_doc_geometry(value)
+    if geom is None:
+        return []
+    if geo_type == _GEO_2DSPHERE:
+        return [encode_cell(c) for c in s2_doc_covering(geom)]
+    # 2d: single point only. Non-points are silently skipped — matches
+    # mongod's "stored bad geometry doesn't match" rule.
+    from shapely.geometry import Point as _Point
+
+    if not isinstance(geom, _Point):
+        return []
+    return [encode_cell(planar_2d_index_for_point(geom.x, geom.y, options))]
 
 _COLL_TABLE = "table:secantus_collections"
 _DOC_TABLE = "table:secantus_documents"
@@ -1133,6 +1188,28 @@ class Storage:
                 return dict(key_spec)
         return None
 
+    def _pick_geo_index_for_filter(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Mirror :meth:`_try_geo_index_id_keys`'s index selection (no exec).
+
+        Returns ``(name, key_spec)`` if the filter has a geo operator on
+        a geo-indexed field; ``None`` otherwise. The picker is exact —
+        ``_try_geo_index_id_keys`` may still bail (e.g. ``$near`` with no
+        max distance), but ``explain`` reports IXSCAN whenever an index
+        *could* serve the query, matching mongod's planner explain.
+        """
+        for field, value in filter.items():
+            if not isinstance(value, dict):
+                continue
+            if not any(op in value for op in self._GEO_OPS):
+                continue
+            for name, key_spec, _opts in self._iter_indexes(db, coll):
+                geo = _geo_type_of(key_spec)
+                if geo is not None and geo[0] == field:
+                    return name, dict(key_spec)
+        return None
+
     def _pick_index_for_filter(
         self, db: str, coll: str, filter: dict[str, Any]
     ) -> tuple[str, dict[str, Any]] | None:
@@ -1141,6 +1218,10 @@ class Storage:
             return None
         if any(f.startswith("$") for f in filter):
             return None
+        # Mirror `_try_index_id_keys`: geo dispatch first.
+        geo_pick = self._pick_geo_index_for_filter(db, coll, filter)
+        if geo_pick is not None:
+            return geo_pick
         if all(not isinstance(v, dict) for v in filter.values()):
             picked = self._pick_compound_eq_index(db, coll, filter)
             if picked is not None:
@@ -1659,39 +1740,64 @@ class Storage:
             partial_filter = options.get("partialFilterExpression")
             if not isinstance(partial_filter, Mapping) or not partial_filter:
                 partial_filter = None
-            # Single doc-table walk: decode each blob once and fold all
-            # three checks (uniqueness, multikey detection, entry build)
-            # into one pass. Replaces three separate _all_docs() walks.
-            # Entries are buffered and only written after the uniqueness
-            # check has cleared, preserving the original "no partial
-            # writes on conflict" semantics.
             key_spec_dict = dict(key_spec)
-            seen: dict[bytes, Any] | None = {} if unique else None
-            multikey = False
-            entries: list[tuple[bytes, bytes]] = []
-            for id_k, blob in self._scan_docs(db, coll):
-                d = bson.decode(blob)
-                if partial_filter is not None and not matches(d, partial_filter):
-                    continue
-                if not multikey and _doc_makes_multikey(d, key_spec_dict):
-                    multikey = True
-                kb = _index_key(d, key_spec_dict, sparse=sparse)
-                if kb is None:
-                    continue
-                if seen is not None:
-                    if kb in seen:
-                        raise IndexConflict(name, d.get("_id"))
-                    seen[kb] = d.get("_id")
-                entries.append((kb, id_k))
-            if multikey:
+            geo = _geo_type_of(key_spec_dict)
+            # Geo indexes use the same entries table but write **multiple**
+            # entries per doc (one per S2 cell or 2d bucket). They're inherently
+            # multikey-style; uniqueness is meaningless for geo and is rejected
+            # by mongod, so we mirror.
+            if geo is not None:
+                if unique:
+                    raise IndexConflict(name, None)
+                geo_field, geo_type = geo
+                # Geo indexes are always multikey from the picker's perspective
+                # — each doc may produce many cell entries. Mark it so the
+                # regular pickers skip the index for non-geo queries.
                 options["multikey"] = True
-            payload = bson.encode({"key": dict(key_spec), "options": options})
-            c.reset()
-            c[db, coll, name] = payload
-            entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
-            for kb, id_k in entries:
-                entry_cur.reset()
-                entry_cur[db, coll, name, _pack_entry(kb, id_k)] = b""
+                entries: list[tuple[bytes, bytes]] = []
+                for id_k, blob in self._scan_docs(db, coll):
+                    d = bson.decode(blob)
+                    if partial_filter is not None and not matches(d, partial_filter):
+                        continue
+                    for cell_bytes in _doc_geo_cells(d, geo_field, geo_type, options):
+                        entries.append((cell_bytes, id_k))
+                payload = bson.encode({"key": dict(key_spec), "options": options})
+                c.reset()
+                c[db, coll, name] = payload
+                entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
+                for kb, id_k in entries:
+                    entry_cur.reset()
+                    entry_cur[db, coll, name, _pack_entry(kb, id_k)] = b""
+            else:
+                # Single doc-table walk: decode each blob once and fold all
+                # three checks (uniqueness, multikey detection, entry build)
+                # into one pass.
+                seen: dict[bytes, Any] | None = {} if unique else None
+                multikey = False
+                entries = []
+                for id_k, blob in self._scan_docs(db, coll):
+                    d = bson.decode(blob)
+                    if partial_filter is not None and not matches(d, partial_filter):
+                        continue
+                    if not multikey and _doc_makes_multikey(d, key_spec_dict):
+                        multikey = True
+                    kb = _index_key(d, key_spec_dict, sparse=sparse)
+                    if kb is None:
+                        continue
+                    if seen is not None:
+                        if kb in seen:
+                            raise IndexConflict(name, d.get("_id"))
+                        seen[kb] = d.get("_id")
+                    entries.append((kb, id_k))
+                if multikey:
+                    options["multikey"] = True
+                payload = bson.encode({"key": dict(key_spec), "options": options})
+                c.reset()
+                c[db, coll, name] = payload
+                entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
+                for kb, id_k in entries:
+                    entry_cur.reset()
+                    entry_cur[db, coll, name, _pack_entry(kb, id_k)] = b""
             ui = self._collection_uuid(db, coll)
             self._emit_oplog(
                 [
@@ -1879,9 +1985,18 @@ class Storage:
         id_k = _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         for name, key_spec, sparse, _unique in indexes:
             pf = partials.get(name)
             if pf is not None and not matches(doc, pf):
+                continue
+            geo = _geo_type_of(key_spec)
+            if geo is not None:
+                geo_field, geo_type = geo
+                opts = index_options.get(name, {})
+                for cell_bytes in _doc_geo_cells(doc, geo_field, geo_type, opts):
+                    c.reset()
+                    c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
                 continue
             kb = _index_key(doc, key_spec, sparse=sparse)
             if kb is None:
@@ -1903,9 +2018,20 @@ class Storage:
         id_k = _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         for name, key_spec, sparse, _unique in indexes:
             pf = partials.get(name)
             if pf is not None and not matches(doc, pf):
+                continue
+            geo = _geo_type_of(key_spec)
+            if geo is not None:
+                geo_field, geo_type = geo
+                opts = index_options.get(name, {})
+                for cell_bytes in _doc_geo_cells(doc, geo_field, geo_type, opts):
+                    c.reset()
+                    c.set_key(db, coll, name, _pack_entry(cell_bytes, id_k))
+                    if c.search() == 0:
+                        c.remove()
                 continue
             kb = _index_key(doc, key_spec, sparse=sparse)
             if kb is None:
@@ -1914,6 +2040,19 @@ class Storage:
             c.set_key(db, coll, name, _pack_entry(kb, id_k))
             if c.search() == 0:
                 c.remove()
+
+    def _index_options_map(self, db: str, coll: str) -> dict[str, dict[str, Any]]:
+        """Map of index name → its full options blob.
+
+        Used by the geo write/delete paths: 2d indexes carry per-index
+        ``bits`` / ``min`` / ``max`` settings that affect the cell encoder,
+        so we need the option blob to compute the right bucket. Cached
+        per call (the caller handles per-doc loops).
+        """
+        return {
+            name: dict(opts)
+            for name, _key_spec, opts in self._iter_indexes(db, coll)
+        }
 
     def _unique_conflict(
         self,
@@ -2011,6 +2150,201 @@ class Storage:
         return out
 
     _RANGE_OPS: tuple[str, ...] = ("$eq", "$gt", "$gte", "$lt", "$lte", "$in")
+    _GEO_OPS: tuple[str, ...] = ("$geoWithin", "$geoIntersects", "$near", "$nearSphere")
+
+    def _try_geo_index_id_keys(
+        self, db: str, coll: str, filter: dict[str, Any]
+    ) -> list[bytes] | None:
+        """If ``filter`` contains a geo operator on a geo-indexed field,
+        scan that index's covering cells and return candidate id_keys.
+
+        Returns ``None`` when no geo operator is present or no matching
+        geo index exists — caller falls through to regular pickers and
+        eventually a full scan. Returns a list (possibly empty) when a
+        geo index covers the query — caller short-circuits the regular
+        pickers.
+
+        The cell scan over-collects (cell-covering is a superset of the
+        true intersection); the caller's ``matches()`` step verifies via
+        :func:`secantus.geo.geo_within` / ``geo_intersects`` and removes
+        false positives.
+        """
+        # Find a single field with a geo operator on it.
+        geo_field: str | None = None
+        geo_op: str | None = None
+        geo_arg: Any = None
+        for field, value in filter.items():
+            if not isinstance(value, dict):
+                continue
+            for op in self._GEO_OPS:
+                if op in value:
+                    geo_field = field
+                    geo_op = op
+                    geo_arg = value[op]
+                    break
+            if geo_field is not None:
+                break
+        if geo_field is None:
+            return None
+        # Locate a geo index on that field.
+        chosen_name: str | None = None
+        chosen_type: str | None = None
+        chosen_opts: dict[str, Any] = {}
+        for name, key_spec, opts in self._iter_indexes(db, coll):
+            geo = _geo_type_of(key_spec)
+            if geo is None:
+                continue
+            if geo[0] == geo_field:
+                chosen_name = name
+                chosen_type = geo[1]
+                chosen_opts = dict(opts)
+                break
+        if chosen_name is None or chosen_type is None:
+            return None
+        # Build the query geometry from the operator arg.
+        cells = self._geo_query_cells(geo_op, geo_arg, chosen_type, chosen_opts)
+        if cells is None:
+            # Couldn't compute a covering — defer to full scan.
+            return None
+        return self._collect_geo_candidates(db, coll, chosen_name, cells)
+
+    def _geo_query_cells(
+        self, op: str, arg: Any, geo_type: str, options: Mapping[str, Any]
+    ) -> list[tuple[bytes, bytes]] | None:
+        """Byte ranges covering the query geometry, one per covering cell.
+
+        Both 2dsphere and 2d return ``list[tuple[bytes, bytes]]`` — for
+        2dsphere each entry is the (range_min, range_max) byte pair of
+        an S2 covering cell expanded to its leaf descendants; for 2d
+        it's the single (lo, hi) bbox range from `planar_2d_covering`.
+        Callers use :meth:`_scan_geo_range` for both.
+        """
+        from secantus.geo import GeoError
+
+        try:
+            if op in ("$geoWithin", "$geoIntersects"):
+                if not isinstance(arg, Mapping):
+                    return None
+                geom, _ = parse_query_geometry(arg)
+            elif op in ("$near", "$nearSphere"):
+                # `$near` without a max distance: caller falls through to
+                # full scan (signal None). With a max, expand into a cap
+                # (2dsphere) or planar disk (2d).
+                center, max_d, _min_d, _spherical = self._near_query_geom(arg)
+                if max_d is None:
+                    return None
+                from secantus.geo import _SphericalCircle
+
+                from shapely.geometry import Point as _Point
+
+                if geo_type == _GEO_2DSPHERE:
+                    from secantus.geo import EARTH_RADIUS_METERS
+
+                    radius_rad = max_d / EARTH_RADIUS_METERS
+                    geom = _SphericalCircle(center[0], center[1], radius_rad)
+                else:  # 2d planar — circular disk
+                    geom = _Point(*center).buffer(max_d, quad_segs=16)
+            else:
+                return None
+        except GeoError:
+            return None
+        if geo_type == _GEO_2DSPHERE:
+            # Each cell becomes a degenerate (cell, cell) range so the
+            # storage scanner does an exact point-lookup. Treating
+            # 2dsphere uniformly as a list-of-ranges keeps the storage
+            # path single-shaped.
+            return [
+                (encode_cell(c), encode_cell(c)) for c in s2_query_covering(geom)
+            ]
+        # 2d: shape must be planar; convert to a single (lo, hi) range.
+        from shapely.geometry.base import BaseGeometry as _BG
+
+        if not isinstance(geom, _BG):
+            return None
+        lo, hi = planar_2d_covering(geom, options)
+        return [(encode_cell(lo), encode_cell(hi))]
+
+    def _near_query_geom(
+        self, arg: Any
+    ) -> tuple[tuple[float, float], float | None, float | None, bool]:
+        """Reuse :mod:`secantus.query`'s ``$near`` parser for the picker.
+
+        Routing it through `_parse_near_spec` keeps the spec semantics in
+        one place — the operator handler and the picker agree on what
+        a ``$near`` arg means.
+        """
+        from secantus.query import _parse_near_spec  # type: ignore[attr-defined]
+
+        return _parse_near_spec(arg, default_spherical=False)
+
+    def _collect_geo_candidates(
+        self,
+        db: str,
+        coll: str,
+        index_name: str,
+        cells: list[tuple[bytes, bytes]],
+    ) -> list[bytes]:
+        """Walk index entries in each (lo, hi) range; return deduplicated id_keys.
+
+        A doc with N covering cells produces N index entries; we collect
+        just one ``_id`` per doc. The post-fetch verifier (in
+        ``find_matching``'s ``matches()`` step) discards docs whose
+        actual geometry doesn't match the query.
+        """
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        seen: set[bytes] = set()
+        out: list[bytes] = []
+        for lo_bytes, hi_bytes in cells:
+            self._scan_geo_range(c, db, coll, index_name, lo_bytes, hi_bytes, seen, out)
+        return out
+
+    def _scan_geo_range(
+        self,
+        c: Any,
+        db: str,
+        coll: str,
+        name: str,
+        lo_bytes: bytes,
+        hi_bytes: bytes,
+        seen: set[bytes],
+        out: list[bytes],
+    ) -> None:
+        """Walk every index entry whose escaped cell-id is in [lo_bytes, hi_bytes].
+
+        Lex byte order over `_escape_kb`-escaped fixed-width cell IDs is
+        the same as numeric cell-id order, so a forward WT cursor walk
+        between the two escaped boundary keys visits every entry inside
+        the range exactly once. Cell IDs are packed as fixed 8-byte
+        big-endian, so escaping never changes their relative order.
+        """
+        lo_prefix = _escape_kb(lo_bytes)
+        hi_prefix = _escape_kb(hi_bytes)
+        c.reset()
+        c.set_key(db, coll, name, lo_prefix)
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return
+        if rc < 0 and c.next() != 0:
+            return
+        while True:
+            k = c.get_key()
+            if k[0] != db or k[1] != coll or k[2] != name:
+                return
+            packed = bytes(k[3])
+            sep_pos = packed.find(_ENTRY_SEP)
+            if sep_pos < 0:
+                if c.next() != 0:
+                    return
+                continue
+            kb_part = packed[:sep_pos]
+            if kb_part > hi_prefix:
+                return
+            id_key = packed[sep_pos + len(_ENTRY_SEP):]
+            if id_key not in seen:
+                seen.add(id_key)
+                out.append(id_key)
+            if c.next() != 0:
+                return
 
     def _try_index_lookup(
         self, db: str, coll: str, filter: dict[str, Any]
@@ -2029,6 +2363,13 @@ class Storage:
             return None
         if any(f.startswith("$") for f in filter):
             return None
+        # Geo dispatch first — a $geoWithin / $geoIntersects / $near clause
+        # on a field with a 2dsphere or 2d index uses the cell-covering
+        # path. The picker returns None if no geo index covers the query,
+        # and we fall through to the regular pickers below.
+        geo_ids = self._try_geo_index_id_keys(db, coll, filter)
+        if geo_ids is not None:
+            return geo_ids
         # Bare-equality filters of any size can use a compound index whose
         # leading fields cover the filter set.
         if all(not isinstance(v, dict) for v in filter.values()):
