@@ -119,3 +119,22 @@ def test_killed_cursor_idempotent_after_expiry() -> None:
     # Already expired → reported as not-found, not killed.
     assert killed == []
     assert not_found == [cid]
+
+
+def test_snapshot_returns_metadata_for_live_cursors() -> None:
+    reg = CursorRegistry()
+    a = reg.register("db.c", [{"i": i} for i in range(5)])
+    b = reg.register("db.other", [{"i": 99}])
+    snap = reg.snapshot()
+    assert {s["cursor_id"] for s in snap} == {a, b}
+    a_entry = next(s for s in snap if s["cursor_id"] == a)
+    assert a_entry["namespace"] == "db.c"
+    assert a_entry["remaining"] == 5
+    assert a_entry["tailable"] is False
+
+
+def test_snapshot_drops_exhausted_cursors() -> None:
+    reg = CursorRegistry()
+    cid = reg.register("db.c", [{"x": 1}])
+    reg.next_batch(cid, 10)  # exhausts
+    assert reg.snapshot() == []

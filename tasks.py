@@ -72,6 +72,30 @@ def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(f"uv run python -m secantus --host {host} --port {port}", pty=True)
 
 
+@task(
+    help={
+        "uri": "MongoDB URI to administer.",
+        "port": "Local HTTP port (0 = pick a free one).",
+        "no_window": "Run headless (no pywebview window). Useful for CI.",
+        "token": "Override the auth token. Default: ~/.secantus/admin-token.",
+    }
+)
+def admin(
+    c: Context,
+    uri: str = "mongodb://127.0.0.1:27017",
+    port: int = 0,
+    no_window: bool = False,
+    token: str = "",
+) -> None:
+    """Launch the SecantusDB admin web UI."""
+    cmd = ["uv", "run", "secantusdb-admin", "--uri", uri, "--port", str(port)]
+    if no_window:
+        cmd.append("--no-window")
+    if token:
+        cmd.extend(["--token", token])
+    c.run(" ".join(cmd), pty=True)
+
+
 @task
 def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
     # --no-sync skips uv's project rebuild check: docs only need the Python

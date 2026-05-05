@@ -97,6 +97,8 @@ A_SERVER_STATUS = "serverStatus"
 A_HOST_INFO = "hostInfo"
 A_GET_CMD_LINE_OPTS = "getCmdLineOpts"
 A_GET_LOG = "getLog"
+A_INPROG = "inprog"
+A_FSYNC = "fsync"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +185,8 @@ _CLUSTER_ACTIONS: frozenset[str] = frozenset(
         A_HOST_INFO,
         A_GET_CMD_LINE_OPTS,
         A_GET_LOG,
+        A_INPROG,
+        A_FSYNC,
     }
 )
 

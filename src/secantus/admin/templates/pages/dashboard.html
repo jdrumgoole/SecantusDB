@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<section
+  class="tiles"
+  hx-get="/_partials/dashboard-tiles"
+  hx-trigger="load, every 2s"
+  hx-swap="innerHTML"
+>
+  <div class="loading">Loading…</div>
+</section>
+{% endblock %}
