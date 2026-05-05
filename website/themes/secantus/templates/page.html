@@ -11,23 +11,21 @@
   <section class="section alt">
     <div class="wrap">
       <h2>Why SecantusDB</h2>
-      <p class="section-lead">Built for tests, dev loops, and embedded single-node use &mdash; not as a stand-in for a production cluster. Within that scope, your driver can't tell us apart from <code>mongod</code>.</p>
+      <p class="section-lead">Build for full production use (eventually) right now use it as a cheap and easy clone for test and dev environments.</p>
       {% include 'partials/benefits_grid.html' %}
     </div>
   </section>
 
   <section class="section code-example">
     <div class="wrap">
-      <div class="copy">
-        <h2>Drop-in for <code>pymongo</code></h2>
-        <p class="section-lead">Same wire protocol, same handshake, same error codes. Point a <code>MongoClient</code> at SecantusDB and your application code doesn't know the difference.</p>
-        <div class="ctas">
-          <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}" rel="noopener">Read the docs</a>
-          <a class="btn btn-secondary" href="{{ SECANTUS_PYPI_URL }}" rel="noopener"><code>pip install SecantusDB</code></a>
-        </div>
-      </div>
-      <div class="code">
-{{ page.content | safe }}
+      <h2>Drop-in for <code>pymongo</code></h2>
+      <p class="section-lead">Same wire protocol, same handshake, same error codes. The application code is <strong>byte-identical</strong> &mdash; only the setup line changes.</p>
+
+      {% include 'partials/code_comparison.html' %}
+
+      <div class="ctas" style="margin-top: 28px;">
+        <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}" rel="noopener">Read the docs</a>
+        <a class="btn btn-secondary" href="{{ SECANTUS_PYPI_URL }}" rel="noopener"><code>pip install SecantusDB</code></a>
       </div>
     </div>
   </section>

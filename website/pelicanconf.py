@@ -82,4 +82,17 @@ JINJA_GLOBALS = {
     "SECANTUS_TAGLINE": SECANTUS_TAGLINE,
 }
 
+
+def _pyhighlight(code: str) -> str:
+    """Render Python source as HTML with the same Pygments classes that
+    markdown's codehilite extension produces, so the side-by-side
+    comparison on the home page reads as one consistent code block."""
+    from pygments import highlight
+    from pygments.formatters import HtmlFormatter
+    from pygments.lexers import PythonLexer
+    return highlight(code.strip("\n"), PythonLexer(), HtmlFormatter(cssclass="highlight"))
+
+
+JINJA_FILTERS = {"pyhighlight": _pyhighlight}
+
 RELATIVE_URLS = True

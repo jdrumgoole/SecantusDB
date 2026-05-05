@@ -1,0 +1,40 @@
+{# Side-by-side comparison: same application code, different setup.
+   The shared lines (5–8) are byte-identical between the two snippets —
+   that's the whole pitch. #}
+{% set normal_mongo %}
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://localhost:27017")
+db = client["mydb"]
+db["users"].insert_one({"_id": 1, "name": "Joe"})
+assert db["users"].find_one({"_id": 1})["name"] == "Joe"
+{% endset %}
+{% set embedded_secantus %}
+from pymongo import MongoClient
+from secantus import SecantusDBServer
+
+with SecantusDBServer(port=27017) as server:
+    client = MongoClient(server.uri)
+    db = client["mydb"]
+    db["users"].insert_one({"_id": 1, "name": "Joe"})
+    assert db["users"].find_one({"_id": 1})["name"] == "Joe"
+{% endset %}
+
+<div class="code-compare">
+  <figure>
+    <figcaption>
+      <span class="dot"></span>
+      Normal MongoDB
+      <span class="hint">requires <code>mongod</code> running on :27017</span>
+    </figcaption>
+    {{ normal_mongo | pyhighlight | safe }}
+  </figure>
+  <figure>
+    <figcaption>
+      <span class="dot accent"></span>
+      Embedded SecantusDB
+      <span class="hint">no external process &mdash; in your test or app</span>
+    </figcaption>
+    {{ embedded_secantus | pyhighlight | safe }}
+  </figure>
+</div>
