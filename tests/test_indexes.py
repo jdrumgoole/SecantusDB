@@ -1730,3 +1730,128 @@ def test_id_bool_distinct_from_int(storage: Storage) -> None:
     """True must not collide with 1 — different BSON types."""
     inserted, _ = storage.insert("db", "c", [{"_id": 1}, {"_id": True}])
     assert inserted == 2
+
+
+# ---------------------------------------------------------------------------
+# Multi-field sort acceleration
+# ---------------------------------------------------------------------------
+
+
+def test_multi_field_sort_uses_compound_index(storage: Storage) -> None:
+    """Sort {a:1, b:1} against an index {a:1, b:1} walks the index in
+    forward order and skips the Python post-sort. Result equivalence
+    with a $natural-hinted scan is the correctness check."""
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": i, "a": i % 3, "b": i % 5} for i in range(15)],
+    )
+    storage.create_index("db", "c", "a_b_1", {"a": 1, "b": 1}, {})
+
+    plan = storage.explain_plan("db", "c", sort={"a": 1, "b": 1})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "a_b_1"
+    assert plan["direction"] == "forward"
+
+    indexed = storage.find_matching("db", "c", {}, sort={"a": 1, "b": 1})
+    scanned = storage.find_matching("db", "c", {}, sort={"a": 1, "b": 1}, hint="$natural")
+    assert [(d["a"], d["b"]) for d in indexed] == [(d["a"], d["b"]) for d in scanned]
+
+
+def test_multi_field_sort_walks_backward_for_inverted_directions(
+    storage: Storage,
+) -> None:
+    """Sort {a:-1, b:-1} against index {a:1, b:1} walks backward —
+    the fully-inverted permutation matches without a Python sort."""
+    storage.insert("db", "c", [{"_id": i, "a": i % 3, "b": i % 5} for i in range(15)])
+    storage.create_index("db", "c", "a_b_1", {"a": 1, "b": 1}, {})
+
+    plan = storage.explain_plan("db", "c", sort={"a": -1, "b": -1})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["direction"] == "backward"
+
+    indexed = storage.find_matching("db", "c", {}, sort={"a": -1, "b": -1})
+    scanned = storage.find_matching("db", "c", {}, sort={"a": -1, "b": -1}, hint="$natural")
+    assert [(d["a"], d["b"]) for d in indexed] == [(d["a"], d["b"]) for d in scanned]
+
+
+def test_multi_field_sort_partial_inversion_falls_back(storage: Storage) -> None:
+    """Sort {a:1, b:-1} against index {a:1, b:1} doesn't match (neither
+    direction works), so the planner falls back to COLLSCAN +
+    Python sort. Result must still be correct.
+    """
+    storage.insert("db", "c", [{"_id": i, "a": i % 3, "b": i % 5} for i in range(15)])
+    storage.create_index("db", "c", "a_b_1", {"a": 1, "b": 1}, {})
+
+    plan = storage.explain_plan("db", "c", sort={"a": 1, "b": -1})
+    assert plan["kind"] == "COLLSCAN"
+
+    out = storage.find_matching("db", "c", {}, sort={"a": 1, "b": -1})
+    keys = [(d["a"], d["b"]) for d in out]
+    assert keys == sorted(keys, key=lambda p: (p[0], -p[1]))
+
+
+def test_multi_field_sort_mixed_direction_index_matches(storage: Storage) -> None:
+    """Sort {a:1, b:-1} against an index {a:1, b:-1} matches forward."""
+    storage.insert("db", "c", [{"_id": i, "a": i % 3, "b": i % 5} for i in range(15)])
+    storage.create_index("db", "c", "a_asc_b_desc", {"a": 1, "b": -1}, {})
+
+    plan = storage.explain_plan("db", "c", sort={"a": 1, "b": -1})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["direction"] == "forward"
+
+    indexed = storage.find_matching("db", "c", {}, sort={"a": 1, "b": -1})
+    scanned = storage.find_matching("db", "c", {}, sort={"a": 1, "b": -1}, hint="$natural")
+    assert [(d["a"], d["b"]) for d in indexed] == [(d["a"], d["b"]) for d in scanned]
+
+
+def test_multi_field_sort_no_matching_index_collscans(storage: Storage) -> None:
+    """Without a compound index covering the exact sort spec, the
+    planner stays on COLLSCAN. The Python sort still produces a
+    correctly ordered result."""
+    storage.insert("db", "c", [{"_id": i, "a": i % 3, "b": i % 5} for i in range(10)])
+    # Single-field index on `a` only — doesn't cover {a:1, b:1}.
+    storage.create_index("db", "c", "a_1", {"a": 1}, {})
+
+    plan = storage.explain_plan("db", "c", sort={"a": 1, "b": 1})
+    assert plan["kind"] == "COLLSCAN"
+    out = storage.find_matching("db", "c", {}, sort={"a": 1, "b": 1})
+    keys = [(d["a"], d["b"]) for d in out]
+    assert keys == sorted(keys)
+
+
+def test_multi_field_sort_partial_prefix_not_accelerated(storage: Storage) -> None:
+    """Sort {a:1, b:1, c:1} against an index {a:1, b:1} (prefix only)
+    is intentionally not accelerated — the savings on the leading
+    prefix don't outweigh the cost of materialising and Python-sorting
+    the trailing field. Result must still be correct via COLLSCAN."""
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": i, "a": i % 3, "b": i % 5, "c": i % 7} for i in range(20)],
+    )
+    storage.create_index("db", "c", "a_b_1", {"a": 1, "b": 1}, {})
+
+    plan = storage.explain_plan("db", "c", sort={"a": 1, "b": 1, "c": 1})
+    assert plan["kind"] == "COLLSCAN"
+    out = storage.find_matching("db", "c", {}, sort={"a": 1, "b": 1, "c": 1})
+    keys = [(d["a"], d["b"], d["c"]) for d in out]
+    assert keys == sorted(keys)
+
+
+def test_multi_field_sort_skips_multikey_index(storage: Storage) -> None:
+    """An index that gets flagged multikey (because some doc has an
+    array value on an indexed field) doesn't qualify for sort
+    acceleration — array values would shuffle row order in ways the
+    sort spec doesn't expect. Falls back to Python sort."""
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "a": 1, "b": [1, 2]},  # array value → multikey
+            {"_id": 2, "a": 2, "b": 5},
+        ],
+    )
+    storage.create_index("db", "c", "a_b_1", {"a": 1, "b": 1}, {})
+    plan = storage.explain_plan("db", "c", sort={"a": 1, "b": 1})
+    assert plan["kind"] == "COLLSCAN"
