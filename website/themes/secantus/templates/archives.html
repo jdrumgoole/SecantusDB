@@ -10,7 +10,7 @@
     <ul class="article-list">
       {% for article in dates %}
       <li>
-        <h3><a href="{{ SITEURL }}/{{ article.url }}">{{ article.title }}</a></h3>
+        <h3><a href="/{{ article.url }}">{{ article.title }}</a></h3>
         <p class="meta">{{ article.locale_date }}</p>
       </li>
       {% endfor %}

@@ -39,13 +39,28 @@ TIMEZONE = "Europe/Dublin"
 DEFAULT_LANG = "en"
 
 ARTICLE_PATHS = ["blog"]
-ARTICLE_URL = "blog/{slug}/"
-ARTICLE_SAVE_AS = "blog/{slug}/index.html"
+ARTICLE_URL = "blog/{slug}.html"
+ARTICLE_SAVE_AS = "blog/{slug}.html"
 PAGE_PATHS = ["pages"]
-PAGE_URL = "{slug}/"
-PAGE_SAVE_AS = "{slug}/index.html"
+PAGE_URL = "{slug}.html"
+PAGE_SAVE_AS = "{slug}.html"
 
-INDEX_SAVE_AS = "blog/index.html"
+# `.html` URLs end-to-end so S3 + CloudFront serve every page directly
+# from a real key — no CloudFront Function or Lambda@Edge needed for
+# directory-style index resolution.
+INDEX_SAVE_AS = "blog.html"
+INDEX_URL = "blog.html"
+ARCHIVES_SAVE_AS = "archives.html"
+ARCHIVES_URL = "archives.html"
+TAGS_SAVE_AS = "tags.html"
+TAG_URL = "tag/{slug}.html"
+TAG_SAVE_AS = "tag/{slug}.html"
+CATEGORIES_SAVE_AS = "categories.html"
+CATEGORY_URL = "category/{slug}.html"
+CATEGORY_SAVE_AS = "category/{slug}.html"
+AUTHORS_SAVE_AS = "authors.html"
+AUTHOR_URL = "author/{slug}.html"
+AUTHOR_SAVE_AS = "author/{slug}.html"
 DIRECT_TEMPLATES = ["index", "archives"]
 
 DEFAULT_PAGINATION = 10
