@@ -316,6 +316,64 @@ def _iter_coords(geom: BaseGeometry) -> list[tuple[float, float]]:
 
 
 # ---------------------------------------------------------------------------
+# Coordinate-bounds validation (used by index extraction)
+# ---------------------------------------------------------------------------
+
+
+# 2dsphere bounds are baked in (the unit sphere; mongod does the same).
+# 2d bounds are user-tunable via the index's `min` / `max` options.
+_2DSPHERE_LNG_BOUNDS: tuple[float, float] = (-180.0, 180.0)
+_2DSPHERE_LAT_BOUNDS: tuple[float, float] = (-90.0, 90.0)
+
+
+def validate_coordinates(
+    geom: BaseGeometry,
+    *,
+    geo_type: str,
+    options: Mapping[str, Any] | None = None,
+) -> None:
+    """Walk every coordinate in ``geom`` and raise :class:`GeoError` if
+    any falls outside the bounds dictated by ``geo_type``.
+
+    For ``2dsphere`` geometries we enforce the unit-sphere range
+    (``lng ∈ [-180, 180]``, ``lat ∈ [-90, 90]``) regardless of options.
+
+    For ``2d`` geometries we enforce the user-configurable
+    ``min`` / ``max`` (defaulting to ``[-180, 180]``) on both axes.
+
+    Index-time callers in :mod:`secantus.storage` raise the resulting
+    error to surface it as a wire-level "can't extract geo keys" write
+    error (code 16572), matching ``mongod``.
+    """
+    if geo_type == "2dsphere":
+        for x, y in _iter_coords(geom):
+            if not (_2DSPHERE_LNG_BOUNDS[0] <= x <= _2DSPHERE_LNG_BOUNDS[1]):
+                raise GeoError(
+                    f"longitude {x} out of 2dsphere range [-180, 180]"
+                )
+            if not (_2DSPHERE_LAT_BOUNDS[0] <= y <= _2DSPHERE_LAT_BOUNDS[1]):
+                raise GeoError(
+                    f"latitude {y} out of 2dsphere range [-90, 90]"
+                )
+        return
+    if geo_type == "2d":
+        opts = options or {}
+        lo = float(opts.get("min", -180.0))
+        hi = float(opts.get("max", 180.0))
+        for x, y in _iter_coords(geom):
+            if not (lo <= x <= hi):
+                raise GeoError(
+                    f"x coordinate {x} out of 2d range [{lo}, {hi}]"
+                )
+            if not (lo <= y <= hi):
+                raise GeoError(
+                    f"y coordinate {y} out of 2d range [{lo}, {hi}]"
+                )
+        return
+    raise GeoError(f"unknown geo index type: {geo_type!r}")
+
+
+# ---------------------------------------------------------------------------
 # Distance
 # ---------------------------------------------------------------------------
 

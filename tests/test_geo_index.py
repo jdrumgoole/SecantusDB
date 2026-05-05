@@ -286,3 +286,109 @@ def test_polygon_doc_writes_multi_cell_entries(client: MongoClient) -> None:
         )
     )
     assert [d["_id"] for d in found] == [1]
+
+
+# --- Input validation: bad geometry rejected at write time -----------------
+
+
+def test_2dsphere_rejects_out_of_range_longitude(client: MongoClient) -> None:
+    coll = client["geo_idx"]["bad_lng"]
+    coll.create_index([("loc", "2dsphere")])
+    with pytest.raises(OperationFailure) as exc:
+        coll.insert_one({"_id": 1, "loc": _pt(200.0, 0.0)})  # lng > 180
+    assert exc.value.code == 16572
+
+
+def test_2dsphere_rejects_out_of_range_latitude(client: MongoClient) -> None:
+    coll = client["geo_idx"]["bad_lat"]
+    coll.create_index([("loc", "2dsphere")])
+    with pytest.raises(OperationFailure) as exc:
+        coll.insert_one({"_id": 1, "loc": _pt(0.0, 95.0)})  # lat > 90
+    assert exc.value.code == 16572
+
+
+def test_2dsphere_rejects_unparseable_geometry(client: MongoClient) -> None:
+    coll = client["geo_idx"]["bad_shape"]
+    coll.create_index([("loc", "2dsphere")])
+    with pytest.raises(OperationFailure) as exc:
+        coll.insert_one({"_id": 1, "loc": "not a geometry"})
+    assert exc.value.code == 16572
+
+
+def test_2dsphere_missing_field_is_sparse(client: MongoClient) -> None:
+    """Missing or null indexed field must NOT error — geo indexes are
+    sparse-by-default (matches mongod). The doc just isn't indexed.
+    """
+    coll = client["geo_idx"]["sparse_missing"]
+    coll.create_index([("loc", "2dsphere")])
+    coll.insert_one({"_id": 1, "name": "no_loc"})  # field missing
+    coll.insert_one({"_id": 2, "loc": None})  # field explicitly null
+    coll.insert_one({"_id": 3, "loc": _pt(0.0, 0.0)})
+    # All three docs were stored.
+    assert coll.count_documents({}) == 3
+    # Only doc 3 is in the index — confirmed by a $geoWithin query.
+    hits = sorted(
+        d["_id"]
+        for d in coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 1.0]}}})
+    )
+    assert hits == [3]
+
+
+def test_2d_rejects_polygon_doc(client: MongoClient) -> None:
+    """The 2d index only supports point-typed values; a polygon must
+    be rejected (not silently skipped, which was the pre-validation
+    behavior)."""
+    coll = client["geo_idx"]["bad_2d_shape"]
+    coll.create_index([("loc", "2d")])
+    with pytest.raises(OperationFailure) as exc:
+        coll.insert_one(
+            {
+                "_id": 1,
+                "loc": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                },
+            }
+        )
+    assert exc.value.code == 16572
+
+
+def test_2d_respects_custom_min_max(client: MongoClient) -> None:
+    coll = client["geo_idx"]["custom_2d"]
+    # Tight 2d bounds: only [-10, 10] is valid.
+    coll.create_index([("loc", "2d")], min=-10, max=10)
+    coll.insert_one({"_id": 1, "loc": [5.0, 5.0]})  # in bounds
+    with pytest.raises(OperationFailure) as exc:
+        coll.insert_one({"_id": 2, "loc": [50.0, 50.0]})  # out of bounds
+    assert exc.value.code == 16572
+
+
+def test_create_index_fails_on_existing_bad_doc(client: MongoClient) -> None:
+    """Creating a geo index over a collection where a doc already has
+    out-of-range coordinates should fail — mongod errors on the same
+    'Can't extract geo keys' path during the initial scan.
+    """
+    coll = client["geo_idx"]["existing_bad"]
+    # Insert a doc with bad coords *before* the geo index exists, so
+    # validation only kicks in at create_index time.
+    coll.insert_one({"_id": 1, "loc": _pt(200.0, 0.0)})
+    with pytest.raises(OperationFailure) as exc:
+        coll.create_index([("loc", "2dsphere")])
+    assert exc.value.code == 16572
+    # The index must NOT have been created.
+    names = {ix["name"] for ix in coll.list_indexes()}
+    assert "loc_2dsphere" not in names
+
+
+def test_update_to_bad_geometry_rejected(client: MongoClient) -> None:
+    """An update that swaps a valid geometry for an out-of-range one
+    must fail; the doc stays at its pre-update value."""
+    coll = client["geo_idx"]["update_bad"]
+    coll.insert_one({"_id": 1, "loc": _pt(0.0, 0.0)})
+    coll.create_index([("loc", "2dsphere")])
+    with pytest.raises(OperationFailure) as exc:
+        coll.replace_one({"_id": 1}, {"_id": 1, "loc": _pt(200.0, 0.0)})
+    assert exc.value.code == 16572
+    # Original doc is untouched and still indexed.
+    found = coll.find_one({"_id": 1})
+    assert found["loc"] == _pt(0.0, 0.0)
