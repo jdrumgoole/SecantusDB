@@ -94,8 +94,10 @@ LDAP, Kerberos, and TLS are *not* implemented — an authenticated
 principal is currently treated as fully privileged.
 
 What's **out of scope:** real replica sets, sharding, RBAC, x509 /
-LDAP / Kerberos auth, TLS, text / geo / wildcard indexes, `$where`,
-real transaction rollback. If you need those, run a real `mongod`.
+LDAP / Kerberos auth, TLS, text / wildcard indexes, `$where`, real
+transaction rollback. If you need those, run a real `mongod`. Geo
+support (`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`,
+`$geoNear`, `2dsphere` and `2d` indexes) is in scope and shipped.
 
 ## Installation
 
