@@ -115,12 +115,12 @@ pre code { background: transparent; padding: 0; }
   flex-shrink: 0;
 }
 .site-header .logo-lockup {
-  height: 56px;
+  height: 76px;
   width: auto;
   display: block;
 }
 @media (max-width: 720px) {
-  .site-header .logo-lockup { height: 40px; }
+  .site-header .logo-lockup { height: 52px; }
 }
 .site-nav {
   display: flex;
