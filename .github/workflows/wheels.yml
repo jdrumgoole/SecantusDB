@@ -66,9 +66,15 @@ jobs:
         env:
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
           CIBW_BEFORE_ALL_LINUX: |
-            yum install -y ccache 2>/dev/null \
+            (yum install -y ccache 2>/dev/null \
               || dnf install -y ccache 2>/dev/null \
-              || apk add --no-cache ccache
+              || apk add --no-cache ccache 2>/dev/null \
+              || true)
+            if ! command -v ccache >/dev/null 2>&1; then
+              echo "ccache unavailable on this image; installing passthrough shim"
+              printf '#!/bin/sh\nexec "$@"\n' > /usr/bin/ccache
+              chmod +x /usr/bin/ccache
+            fi
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
           CIBW_ENVIRONMENT_LINUX: >-
             CCACHE_DIR=/host_ccache
