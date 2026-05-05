@@ -3,7 +3,7 @@ Slug: home
 Save_as: index.html
 URL:
 Status: hidden
-Summary: SecantusDB is a real MongoDB server written in Python, backed by WiredTiger. It speaks the wire protocol so any standard driver connects unchanged. Use it for tests, dev, embedded apps, and single-node prototypes.
+Summary: Embeddable Document Database compatible with MongoDB.
 
 ```python
 from pymongo import MongoClient

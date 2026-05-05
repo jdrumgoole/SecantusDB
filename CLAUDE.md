@@ -163,6 +163,29 @@ Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_T
 
 Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases, and do **not** edit RTD's default_version through the dashboard — `release-finalize` owns that value. The only sanctioned path is `invoke release-prepare` + `invoke release-finalize` via sub-agent (or `invoke release` for a developer running it directly). The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation, RTD default left dangling).
 
+### Blog post per release
+
+Every GitHub Release **must** have a matching blog post on secantusdb.com. After `release-finalize` succeeds (specifically: after `gh release create` has run in step 6 and the auto-generated notes are visible on GitHub), create `website/content/blog/YYYY-MM-DD-release-X-Y-ZaN.md` with this shape:
+
+```
+Title: SecantusDB vX.Y.ZaN
+Date: YYYY-MM-DD HH:MM:SS         # release publishedAt, local TZ ok
+Slug: release-X-Y-ZaN
+Author: Joe Drumgoole
+Category: Releases
+Tags: release
+Summary: Release notes for SecantusDB vX.Y.ZaN.
+
+[Install from PyPI](https://pypi.org/project/SecantusDB/X.Y.ZaN/) ·
+[GitHub Release](https://github.com/jdrumgoole/SecantusDB/releases/tag/vX.Y.ZaN) ·
+[Tag on GitHub](https://github.com/jdrumgoole/SecantusDB/tree/vX.Y.ZaN)
+
+<paste the GitHub auto-generated notes here — fetch with
+ `gh release view vX.Y.ZaN --json body --jq .body`>
+```
+
+Then deploy the site: `cd website && uv run python -m invoke deploy`. **No version bump needed for a release-blog-post deploy** — the website tree is excluded from sdist/wheel (per the global rule in `~/CLAUDE.md`). The release post is what makes the blog index a real changelog rather than a dev journal — keep it in sync.
+
 ## Backlog of stubs and stopgaps
 
 `tasks/backlog.md` is the canonical list of commands that are stubbed, features with simplified implementations, and work explicitly deferred from a slice. **Update it whenever you stub something, defer a slice, or discover a limitation. When you fix an item, delete its line.** Future sessions should treat that file as load-bearing — it's the only honest record of where SecantusDB's behaviour diverges from real MongoDB.

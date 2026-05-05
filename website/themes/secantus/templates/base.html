@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ SITENAME }} — {{ SITESUBTITLE }}{% endblock %}</title>
-  <meta name="description" content="{% block description %}SecantusDB is a drop-in single-node MongoDB server in Python, backed by WiredTiger. Test embedding, dev environments, and single-node prototypes — no mongod to install.{% endblock %}">
+  <meta name="description" content="{% block description %}Embeddable Document Database compatible with MongoDB.{% endblock %}">
   <link rel="icon" type="image/svg+xml" href="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/favicon.svg">
   <link rel="canonical" href="{{ SITEURL }}/{% block canonical_path %}{% endblock %}">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -14,12 +14,14 @@
   {% endif %}
 
   <meta property="og:type" content="website">
-  <meta property="og:title" content="{{ self.title() }}">
-  <meta property="og:description" content="{{ self.description() }}">
+  <meta property="og:title" content="Embeddable Document Database compatible with MongoDB.">
+  <meta property="og:description" content="Embeddable Document Database compatible with MongoDB.">
   <meta property="og:url" content="{{ SITEURL }}/{{ self.canonical_path() }}">
   <meta property="og:image" content="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/og-image.svg">
   <meta property="og:site_name" content="{{ SITENAME }}">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Embeddable Document Database compatible with MongoDB.">
+  <meta name="twitter:description" content="Embeddable Document Database compatible with MongoDB.">
 </head>
 <body>
 
