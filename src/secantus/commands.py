@@ -655,7 +655,38 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
 
 def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["create"]
+    capped = bool(doc.get("capped", False))
+    if capped:
+        size = doc.get("size")
+        if (
+            not isinstance(size, (int, float))
+            or isinstance(size, bool)
+            or size <= 0
+        ):
+            return {
+                "ok": 0.0,
+                "errmsg": "the 'size' field is required when 'capped' is true and must be a positive number",
+                "code": 72,
+                "codeName": "InvalidOptions",
+            }
+        max_docs = doc.get("max")
+        if max_docs is not None and (
+            not isinstance(max_docs, (int, float))
+            or isinstance(max_docs, bool)
+            or max_docs <= 0
+        ):
+            return {
+                "ok": 0.0,
+                "errmsg": "the 'max' field must be a positive integer when set",
+                "code": 72,
+                "codeName": "InvalidOptions",
+            }
     ctx.storage.create_collection(ctx.db_name, coll)
+    if capped:
+        opts: dict[str, Any] = {"capped": True, "size": int(doc["size"])}
+        if doc.get("max") is not None:
+            opts["max"] = int(doc["max"])
+        ctx.storage.set_collection_options(ctx.db_name, coll, **opts)
     pre_post = doc.get("changeStreamPreAndPostImages")
     if isinstance(pre_post, Mapping):
         ctx.storage.set_collection_options(
@@ -683,9 +714,19 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _list_collections(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     names = ctx.storage.list_collections(ctx.db_name)
-    batch = [
-        {"name": n, "type": "collection", "options": {}, "info": {"readOnly": False}} for n in names
-    ]
+    batch: list[dict[str, Any]] = []
+    for n in names:
+        raw = ctx.storage.get_collection_options(ctx.db_name, n)
+        opts: dict[str, Any] = {}
+        if raw.get("capped"):
+            opts["capped"] = True
+            if "size" in raw:
+                opts["size"] = raw["size"]
+            if "max" in raw:
+                opts["max"] = raw["max"]
+        batch.append(
+            {"name": n, "type": "collection", "options": opts, "info": {"readOnly": False}}
+        )
     return {
         "cursor": {
             "firstBatch": batch,

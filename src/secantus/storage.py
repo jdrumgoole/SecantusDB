@@ -936,6 +936,7 @@ class Storage:
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
+        fresh_id_keys: set[bytes] = set()
         oplog_on = self.enable_oplog
         with self._lock:
             self._ensure_collection(db, coll)
@@ -1006,9 +1007,76 @@ class Storage:
                             "o2": {"_id": doc["_id"]},
                         }
                     )
-            if oplog_entries:
-                self._emit_oplog(oplog_entries)
+                fresh_id_keys.add(key)
+            cap_entries, cap_pre_images = self._enforce_capped_bounds_locked(
+                db, coll, fresh_id_keys, indexes, partials, oplog_on, ns, ui
+            )
+            if oplog_entries or cap_entries:
+                pre_images = [None] * len(oplog_entries) + cap_pre_images
+                self._emit_oplog(oplog_entries + cap_entries, pre_images)
         return inserted, errors
+
+    def _enforce_capped_bounds_locked(
+        self,
+        db: str,
+        coll: str,
+        fresh_id_keys: set[bytes],
+        indexes: list[tuple[str, dict[str, Any], bool, bool]],
+        partials: dict[str, dict[str, Any]],
+        oplog_on: bool,
+        ns: str,
+        ui: _uuid.UUID | None,
+    ) -> tuple[list[dict[str, Any]], list[bytes | None]]:
+        """Evict oldest non-fresh docs from a capped collection until within bounds.
+
+        "Oldest" is the natural-order walk over the doc table, which matches
+        insertion order when ``_id`` is monotonic (e.g. the default
+        ObjectId). For non-monotonic ``_id`` values the eviction order
+        reflects ``_id`` byte order, not literal insertion order — capped
+        users with custom ``_id`` should not rely on FIFO semantics.
+        """
+        raw = self._coll_options(db, coll) or {}
+        if not raw.get("capped"):
+            return [], []
+        size_limit = raw.get("size")
+        max_limit = raw.get("max")
+        if size_limit is None and max_limit is None:
+            return [], []
+        scanned = list(self._scan_docs(db, coll))
+        total = sum(len(blob) for _id_k, blob in scanned)
+        count = len(scanned)
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
+        preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
+        for id_k, blob in scanned:
+            over_size = size_limit is not None and total > size_limit
+            over_max = max_limit is not None and count > max_limit
+            if not over_size and not over_max:
+                break
+            if id_k in fresh_id_keys:
+                # Don't evict docs we just inserted in this batch — they
+                # always sort to the tail with monotonic _ids, so reaching
+                # one means everything left is fresh too.
+                break
+            doc = bson.decode(blob)
+            self._delete_index_entries(db, coll, doc, indexes, partials)
+            doc_cur = self._cursor(_DOC_TABLE)
+            doc_cur.set_key(db, coll, id_k)
+            doc_cur.remove()
+            total -= len(blob)
+            count -= 1
+            if oplog_on:
+                entry: dict[str, Any] = {
+                    "op": "d",
+                    "ns": ns,
+                    "o": {"_id": doc["_id"]},
+                    "o2": {"_id": doc["_id"]},
+                }
+                if ui is not None:
+                    entry["ui"] = bson.Binary(ui.bytes, subtype=4)
+                oplog_entries.append(entry)
+                pre_images.append(bson.encode(doc) if preimages_on else None)
+        return oplog_entries, pre_images
 
     def find_matching(
         self,
@@ -1461,6 +1529,13 @@ class Storage:
                         }
                     )
                     pre_images.append(None)
+            cap_ns = ns if oplog_on else ""
+            cap_entries, cap_pre = self._enforce_capped_bounds_locked(
+                db, coll, set(), indexes, partials, oplog_on, cap_ns, ui
+            )
+            if cap_entries:
+                oplog_entries.extend(cap_entries)
+                pre_images.extend(cap_pre)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}

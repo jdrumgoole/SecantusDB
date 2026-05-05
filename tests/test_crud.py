@@ -1318,3 +1318,136 @@ def test_unacknowledged_writes_do_not_desync_connection(server: SecantusDBServer
         assert ack_coll.find_one({"_id": 99}) == {"_id": 99}
     finally:
         mc.close()
+
+
+# ---- capped collections ----------------------------------------------------
+
+
+def test_create_capped_surfaces_options_via_list_collections(client: MongoClient) -> None:
+    db = client["capped_opts_db"]
+    db.create_collection("logs", capped=True, size=4096, max=10)
+    info = next(c for c in db.list_collections() if c["name"] == "logs")
+    assert info["options"].get("capped") is True
+    assert info["options"].get("size") == 4096
+    assert info["options"].get("max") == 10
+
+
+def test_create_capped_without_size_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["capped_nosize_db"]
+    with pytest.raises(OperationFailure) as exc:
+        db.create_collection("logs", capped=True)
+    assert exc.value.code == 72
+
+
+def test_create_capped_negative_size_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["capped_negsize_db"]
+    with pytest.raises(OperationFailure) as exc:
+        db.create_collection("logs", capped=True, size=-1)
+    assert exc.value.code == 72
+
+
+def test_create_capped_zero_max_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["capped_zeromax_db"]
+    with pytest.raises(OperationFailure) as exc:
+        db.create_collection("logs", capped=True, size=4096, max=0)
+    assert exc.value.code == 72
+
+
+def test_create_uncapped_options_absent(client: MongoClient) -> None:
+    db = client["uncapped_db"]
+    db.create_collection("things")
+    info = next(c for c in db.list_collections() if c["name"] == "things")
+    assert "capped" not in info["options"]
+    assert "size" not in info["options"]
+    assert "max" not in info["options"]
+
+
+def test_capped_collection_evicts_by_max_count(client: MongoClient) -> None:
+    db = client["capped_evict_max_db"]
+    db.create_collection("logs", capped=True, size=1_000_000, max=3)
+    coll = db["logs"]
+    for i in range(10):
+        coll.insert_one({"i": i, "payload": "x"})
+    docs = list(coll.find().sort("_id"))
+    assert len(docs) == 3
+    assert [d["i"] for d in docs] == [7, 8, 9]
+
+
+def test_capped_collection_evicts_by_size_budget(client: MongoClient) -> None:
+    # Pick a size budget that fits about 3 docs of ~80 bytes each.
+    db = client["capped_evict_size_db"]
+    db.create_collection("logs", capped=True, size=300)
+    coll = db["logs"]
+    payload = "x" * 50
+    for i in range(20):
+        coll.insert_one({"i": i, "p": payload})
+    docs = list(coll.find().sort("_id"))
+    # The exact count depends on BSON encoding overhead, but it's bounded
+    # and far smaller than 20.
+    assert 0 < len(docs) <= 6
+    # Survivors must be the most recent inserts.
+    expected_tail = list(range(20 - len(docs), 20))
+    assert [d["i"] for d in docs] == expected_tail
+
+
+def test_capped_delete_is_allowed(client: MongoClient) -> None:
+    db = client["capped_delete_db"]
+    db.create_collection("logs", capped=True, size=1_000_000, max=10)
+    coll = db["logs"]
+    coll.insert_many([{"i": i} for i in range(5)])
+    result = coll.delete_one({"i": 2})
+    assert result.deleted_count == 1
+    remaining = sorted(d["i"] for d in coll.find())
+    assert remaining == [0, 1, 3, 4]
+
+
+def test_capped_update_growth_triggers_eviction(client: MongoClient) -> None:
+    # Tight size budget that fits the originals but not after growth.
+    db = client["capped_update_grow_db"]
+    db.create_collection("logs", capped=True, size=400)
+    coll = db["logs"]
+    for i in range(4):
+        coll.insert_one({"i": i, "p": "x" * 30})
+    before = list(coll.find().sort("_id"))
+    assert len(before) == 4
+    # Grow the youngest doc significantly: existing docs total ~size budget
+    # already, so the larger doc should evict at least one of the older ones.
+    coll.update_one({"i": 3}, {"$set": {"p": "y" * 200}})
+    after = list(coll.find().sort("_id"))
+    assert len(after) < len(before)
+    # The grown doc must survive.
+    grown = coll.find_one({"i": 3})
+    assert grown is not None
+    assert grown["p"] == "y" * 200
+
+
+def test_capped_collection_eviction_emits_change_stream_deletes(
+    client: MongoClient,
+) -> None:
+    db = client["capped_changestream_db"]
+    db.create_collection("logs", capped=True, size=1_000_000, max=2)
+    coll = db["logs"]
+    coll.insert_one({"i": 0})
+    coll.insert_one({"i": 1})
+    # Open a stream then trigger a third insert that should evict i=0.
+    with coll.watch() as stream:
+        coll.insert_one({"i": 2})
+        events = []
+        # Expect insert + delete (eviction) within a small window.
+        deadline = 5.0
+        import time as _t
+
+        start = _t.time()
+        while _t.time() - start < deadline and len(events) < 2:
+            event = stream.try_next()
+            if event is not None:
+                events.append(event)
+        ops = [e["operationType"] for e in events]
+        assert "insert" in ops
+        assert "delete" in ops
