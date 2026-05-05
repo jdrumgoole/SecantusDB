@@ -18,7 +18,9 @@ from secantus.auth import (
     continue_scram,
     derive_credentials,
 )
+from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorNotFound, CursorRegistry
+from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.projection import apply_projection
 from secantus.rbac import (
@@ -34,8 +36,10 @@ from secantus.rbac import (
     A_DROP_INDEX,
     A_DROP_USER,
     A_FIND,
+    A_FSYNC,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
+    A_INPROG,
     A_GRANT_ROLE,
     A_HOST_INFO,
     A_INSERT,
@@ -77,6 +81,8 @@ class CommandContext:
     connection_auth: ConnectionAuth | None = None
     require_auth: bool = False
     metrics: Metrics | None = None
+    connections: ConnectionRegistry | None = None
+    logs: LogBuffer | None = None
 
 
 def _split_into_cursor(
@@ -161,8 +167,16 @@ def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
 
 
 def _build_info(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    # `version` stays at the MongoDB-compatibility value so drivers enable
+    # the right feature flags (change streams, $changeStream pre-images,
+    # etc.). `secantusVersion` is the SecantusDB-specific marker admin
+    # tools and the ./about-page can read to know which actual build is
+    # running.
+    import secantus
+
     return {
         "version": SERVER_VERSION,
+        "secantusVersion": secantus.__version__,
         "gitVersion": "0" * 40,
         "versionArray": SERVER_VERSION_ARRAY,
         "bits": 64,
@@ -200,8 +214,88 @@ def _commit_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str,
     return {"ok": 1.0}
 
 
-def _get_log(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"totalLinesWritten": 0, "log": [], "ok": 1.0}
+def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # mongod's currentOp returns a heterogeneous array of "in-progress"
+    # records: per-connection ops + idle cursors. We don't track per-op
+    # state (no in-flight queue), so each connection collapses to a
+    # single "op" record carrying its last command + counters. Cursor
+    # entries are emitted as ``type: "idleCursor"`` to match mongod.
+    inprog: list[dict[str, Any]] = []
+    if ctx.connections is not None:
+        for conn in ctx.connections.snapshot():
+            host_port = f"{conn.peer_addr[0]}:{conn.peer_addr[1]}"
+            opened_iso = _dt.datetime.fromtimestamp(
+                conn.opened_at, tz=_dt.timezone.utc
+            ).isoformat()
+            inprog.append(
+                {
+                    "type": "op",
+                    "desc": f"conn{conn.conn_id}",
+                    "connectionId": bson.Int64(conn.conn_id),
+                    "client": host_port,
+                    "opid": bson.Int64(conn.conn_id),
+                    "active": conn.last_command_name is not None,
+                    "op": conn.last_command_name or "none",
+                    "ns": "",
+                    "currentOpTime": opened_iso,
+                    "secs_running": 0,
+                    "microsecs_running": 0,
+                    "effectiveUsers": (
+                        [{"user": conn.user.split("@", 1)[0], "db": conn.user.split("@", 1)[1]}]
+                        if conn.user and "@" in conn.user
+                        else []
+                    ),
+                }
+            )
+    if ctx.cursors is not None:
+        for snap in ctx.cursors.snapshot():
+            inprog.append(
+                {
+                    "type": "idleCursor",
+                    "ns": snap["namespace"],
+                    "cursorId": bson.Int64(snap["cursor_id"]),
+                    "tailable": snap["tailable"],
+                    "awaitData": snap["await_data"],
+                    "originatingCommand": {},
+                    "lsid": None,
+                }
+            )
+    return {"inprog": inprog, "ok": 1.0}
+
+
+def _fsync(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # mongod's `fsync` defaults to flushing all data to disk. With
+    # ``lock: true`` it also blocks subsequent writes until ``fsyncUnlock``
+    # — a feature that requires real cluster-style coordination we don't
+    # have. Reject the locked variant rather than silently skipping the
+    # lock, which would mislead backup tools that rely on it.
+    if doc.get("lock") is True:
+        return {
+            "ok": 0.0,
+            "errmsg": "fsync with lock:true is not supported by SecantusDB",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    ctx.storage.checkpoint()
+    return {"numFiles": 1, "ok": 1.0}
+
+
+def _get_log(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # mongod returns the in-memory log as a list of pre-formatted strings.
+    # Format mirrors mongod's: "<ts> <level> <component> <msg>" — close
+    # enough that tooling that grep-parses the response keeps working.
+    if ctx.logs is None:
+        return {"totalLinesWritten": 0, "log": [], "ok": 1.0}
+    entries = ctx.logs.tail()
+    formatted: list[str] = []
+    for e in entries:
+        ts = _dt.datetime.fromtimestamp(e.ts, tz=_dt.timezone.utc).isoformat()
+        formatted.append(f"{ts} {e.level} {e.component} {e.msg}")
+    return {
+        "totalLinesWritten": len(entries),
+        "log": formatted,
+        "ok": 1.0,
+    }
 
 
 def _whatsmyuri(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
@@ -1369,6 +1463,8 @@ def _sasl_continue(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         roles = record.get("roles") or []
         if isinstance(roles, list):
             conn.add_principal_roles(roles)
+    if ctx.connections is not None:
+        ctx.connections.authenticate(ctx.connection_id, f"{state.username}@{state.db_name}")
     conn.scram = None
     return {
         "conversationId": state.conversation_id,
@@ -1766,6 +1862,8 @@ _HANDLERS: dict[str, CommandHandler] = {
     "getLog": _get_log,
     "whatsmyuri": _whatsmyuri,
     "hostInfo": _hostinfo,
+    "currentOp": _current_op,
+    "fsync": _fsync,
     "explain": _explain,
     "serverStatus": _server_status,
     "connectionStatus": _connection_status,
@@ -1872,6 +1970,8 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "hostInfo": (A_HOST_INFO, SCOPE_CLUSTER),
     "getCmdLineOpts": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
     "getLog": (A_GET_LOG, SCOPE_CLUSTER),
+    "currentOp": (A_INPROG, SCOPE_CLUSTER),
+    "fsync": (A_FSYNC, SCOPE_CLUSTER),
 }
 
 
@@ -1948,6 +2048,8 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # the same.
     if ctx.metrics is not None:
         ctx.metrics.record_command(name)
+    if ctx.connections is not None:
+        ctx.connections.record_command(ctx.connection_id, name)
     handler = _HANDLERS.get(name)
     if handler is None:
         return {

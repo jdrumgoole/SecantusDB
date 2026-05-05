@@ -1,0 +1,182 @@
+/* SecantusDB admin UI — palette lifted from the website theme.
+ *
+ * The marketing site lives in slate + cyan; the admin app keeps the
+ * same palette so jumping between them feels coherent. The layout
+ * is admin-tool-shaped (sidebar + content), not landing-page shaped.
+ */
+
+:root {
+  --slate-50:  #f8fafc;
+  --slate-100: #f1f5f9;
+  --slate-200: #e2e8f0;
+  --slate-300: #cbd5e1;
+  --slate-400: #94a3b8;
+  --slate-500: #64748b;
+  --slate-600: #475569;
+  --slate-700: #334155;
+  --slate-800: #1e293b;
+  --slate-900: #0f172a;
+  --slate-950: #020617;
+  --cyan-400:  #22d3ee;
+  --cyan-500:  #06b6d4;
+  --cyan-600:  #0891b2;
+
+  --bg: var(--slate-50);
+  --fg: var(--slate-900);
+  --muted: var(--slate-500);
+  --accent: var(--cyan-600);
+  --surface: #ffffff;
+  --border: var(--slate-200);
+  --error: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--slate-950);
+    --fg: var(--slate-100);
+    --muted: var(--slate-400);
+    --accent: var(--cyan-400);
+    --surface: var(--slate-900);
+    --border: var(--slate-800);
+    --error: #fca5a5;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+body {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 1.25rem 0;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 1.25rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand-mark {
+  color: var(--accent);
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+.brand-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.sidebar nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0.75rem 0;
+}
+
+.sidebar nav li a {
+  display: block;
+  padding: 0.5rem 1.25rem;
+  color: var(--fg);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.sidebar nav li a:hover {
+  background: var(--slate-100);
+}
+
+@media (prefers-color-scheme: dark) {
+  .sidebar nav li a:hover {
+    background: var(--slate-800);
+  }
+}
+
+.sidebar nav li a.nav-current {
+  border-left: 3px solid var(--accent);
+  padding-left: calc(1.25rem - 3px);
+  font-weight: 600;
+}
+
+.sidebar nav li a.nav-disabled {
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.content {
+  padding: 1.5rem 2rem 3rem;
+  overflow-x: hidden;
+}
+
+.page-header h1 {
+  margin: 0 0 1.5rem;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+}
+
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+.tile-label {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.tile-value {
+  margin-top: 0.4rem;
+  font-size: 1.6rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-hint {
+  margin-top: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.loading {
+  color: var(--muted);
+}
+
+.error {
+  color: var(--error);
+  background: var(--surface);
+  border: 1px solid var(--error);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+}

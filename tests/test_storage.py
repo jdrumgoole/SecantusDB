@@ -282,3 +282,24 @@ def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
             assert names >= {"_id_", "x_1"}
         finally:
             mc.close()
+
+
+def test_checkpoint_persists_inserts(tmp_path) -> None:
+    """Forcing a checkpoint flushes pending writes; subsequent close+reopen sees them."""
+    storage = Storage(str(tmp_path))
+    storage.insert("db", "c", [{"_id": 1, "x": 1}])
+    storage.checkpoint()
+    storage.close()
+
+    reopened = Storage(str(tmp_path))
+    try:
+        results = reopened.find_matching("db", "c", {})
+        assert results == [{"_id": 1, "x": 1}]
+    finally:
+        reopened.close()
+
+
+def test_checkpoint_after_close_is_safe(tmp_path) -> None:
+    storage = Storage(str(tmp_path))
+    storage.close()
+    storage.checkpoint()  # no-op; must not raise.

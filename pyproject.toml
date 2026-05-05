@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.3.0a56"
+version = "0.3.0a57"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,6 +44,16 @@ website = [
     # ships in the runtime dependency closure.
     "boto3>=1.34",
 ]
+admin = [
+    # Local FastAPI app served behind a pywebview window. Loopback-only
+    # with a per-launch token; no external services. See docs/admin.md.
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "jinja2>=3.1",
+    "httpx>=0.27",
+    "pywebview>=5.0",
+    "python-multipart>=0.0.9",
+]
 
 [project.scripts]
 # `secantusdb` is the primary console script, matching the PyPI distribution
@@ -51,6 +61,7 @@ website = [
 # entry point and start a standalone single-node server.
 secantusdb = "secantus.cli:main"
 secantus = "secantus.cli:main"
+secantusdb-admin = "secantus.admin.cli:main"
 
 [build-system]
 # SWIG is required at build time but pulled from the host (Homebrew /

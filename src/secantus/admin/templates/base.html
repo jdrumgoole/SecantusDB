@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title }} — SecantusDB admin</title>
+    <link rel="stylesheet" href="/static/css/admin.css" />
+    <script src="/static/js/htmx.min.js" defer></script>
+    <script src="/static/js/alpine.min.js" defer></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">●</span>
+        <span class="brand-name">SecantusDB</span>
+      </div>
+      <nav>
+        <ul>
+          <li><a href="/" class="nav-current">Dashboard</a></li>
+          <li><a href="#" class="nav-disabled" title="Slice 2">Databases</a></li>
+          <li><a href="#" class="nav-disabled" title="Slice 5">Users</a></li>
+          <li><a href="#" class="nav-disabled" title="Slice 6">Oplog</a></li>
+          <li><a href="#" class="nav-disabled" title="Slice 7">Console</a></li>
+          <li><a href="#" class="nav-disabled" title="Slice 9">Profiler</a></li>
+        </ul>
+      </nav>
+    </aside>
+    <main class="content">
+      <header class="page-header">
+        <h1>{{ title }}</h1>
+      </header>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

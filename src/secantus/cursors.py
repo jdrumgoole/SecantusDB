@@ -171,6 +171,29 @@ class CursorRegistry:
             self._prune_locked()
             return len(self._cursors)
 
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return a list of plain dicts describing the live cursors.
+
+        Used by the ``currentOp`` command and the admin UI's cursors page.
+        Each entry has ``cursor_id``, ``namespace``, ``remaining``,
+        ``last_access``, ``tailable``, and ``await_data``. We don't return
+        ``_Entry`` instances so callers can't accidentally mutate registry
+        state.
+        """
+        with self._lock:
+            self._prune_locked()
+            return [
+                {
+                    "cursor_id": e.cursor_id,
+                    "namespace": e.namespace,
+                    "remaining": len(e.remaining),
+                    "last_access": e.last_access,
+                    "tailable": e.tailable,
+                    "await_data": e.await_data,
+                }
+                for e in sorted(self._cursors.values(), key=lambda x: x.cursor_id)
+            ]
+
 
 __all__ = [
     "CursorNotFound",

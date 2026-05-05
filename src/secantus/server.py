@@ -13,7 +13,9 @@ if TYPE_CHECKING:
 
 from secantus.auth import ConnectionAuth
 from secantus.commands import CommandContext, dispatch
+from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorRegistry
+from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.storage import Storage
 from secantus.wire import (
@@ -59,7 +61,6 @@ class SecantusDBServer:
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._connection_ids = itertools.count(1)
         # Oplog writes are only useful when change-stream clients can
         # connect, which requires replica-set advertisement in `hello`.
         # Skip them in pure-standalone mode to drop a per-write BSON
@@ -70,6 +71,12 @@ class SecantusDBServer:
         # eagerly so `start_monotonic` reflects construction time, not
         # the first command — uptime then matches what users expect.
         self.metrics = Metrics()
+        # Per-connection visibility (currentOp) and an in-memory log
+        # buffer (getLog). Both initialised eagerly so the registry /
+        # buffer survive the lifetime of the server, not just the first
+        # connection.
+        self.connections = ConnectionRegistry()
+        self.logs = LogBuffer()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -128,11 +135,14 @@ class SecantusDBServer:
             handler.start()
 
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
-        connection_id = next(self._connection_ids)
+        connection_id = self.connections.open((addr[0], addr[1]))
         reply_ids = itertools.count(1)
         connection_auth = ConnectionAuth()
         self.metrics.connection_opened()
         logger.debug("client %d connected from %s", connection_id, addr)
+        self.logs.append(
+            "I", "NETWORK", f"connection accepted", {"conn_id": connection_id, "from": addr}
+        )
         try:
             with conn:
                 while not self._stop_event.is_set():
@@ -161,6 +171,8 @@ class SecantusDBServer:
                             connection_auth=connection_auth,
                             require_auth=self.require_auth,
                             metrics=self.metrics,
+                            connections=self.connections,
+                            logs=self.logs,
                         )
                         response_doc = dispatch(body, ctx)
                         # `moreToCome` (bit 1) is the wire signal for
@@ -187,6 +199,8 @@ class SecantusDBServer:
                             connection_auth=connection_auth,
                             require_auth=self.require_auth,
                             metrics=self.metrics,
+                            connections=self.connections,
+                            logs=self.logs,
                         )
                         response_doc = dispatch(op.query, ctx)
                         reply = build_op_reply(
@@ -206,6 +220,7 @@ class SecantusDBServer:
             logger.exception("unhandled error on connection %d", connection_id)
         finally:
             self.metrics.connection_closed()
+            self.connections.close(connection_id)
             logger.debug("client %d disconnected", connection_id)
 
     def __enter__(self) -> Self:

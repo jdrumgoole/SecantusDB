@@ -837,6 +837,17 @@ class Storage:
                 shutil.rmtree(self._tempdir, ignore_errors=True)
                 self._tempdir = None
 
+    def checkpoint(self) -> None:
+        """Force a WiredTiger checkpoint to flush dirty pages to disk.
+
+        Backs the ``fsync`` command and the admin UI's maintenance
+        slice. Lock-protected so concurrent commands wait their turn.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._session().checkpoint()
+
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
         if s is None:
