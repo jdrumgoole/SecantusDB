@@ -77,7 +77,7 @@ def dashboard(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "pages/dashboard.html",
-        {"title": "Dashboard"},
+        {"title": "Dashboard", "active": "dashboard"},
     )
 
 
