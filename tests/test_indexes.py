@@ -6,8 +6,8 @@ from secantus.storage import IndexConflict, Storage
 
 
 @pytest.fixture
-def storage() -> Storage:
-    return Storage(":memory:")
+def storage(tmp_path) -> Storage:
+    return Storage(str(tmp_path))
 
 
 def test_create_and_list_simple_index(storage: Storage) -> None:

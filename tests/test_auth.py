@@ -228,8 +228,8 @@ def _user_record(db: str, user: str, password: str) -> dict:
     }
 
 
-def test_storage_add_get_drop_user() -> None:
-    s = Storage(":memory:")
+def test_storage_add_get_drop_user(tmp_path) -> None:
+    s = Storage(str(tmp_path))
     try:
         record = _user_record("admin", "alice", "pw")
         assert s.add_user("admin", "alice", record) is True
@@ -247,8 +247,8 @@ def test_storage_add_get_drop_user() -> None:
         s.close()
 
 
-def test_storage_list_users_paginates_and_filters_by_db() -> None:
-    s = Storage(":memory:")
+def test_storage_list_users_paginates_and_filters_by_db(tmp_path) -> None:
+    s = Storage(str(tmp_path))
     try:
         for db in ("admin", "app"):
             for i in range(3):
@@ -272,15 +272,15 @@ def test_storage_list_users_paginates_and_filters_by_db() -> None:
 
 
 @pytest.fixture
-def server_no_auth():
-    with SecantusDBServer(port=0, storage_path=":memory:") as srv:
+def server_no_auth(tmp_path):
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
         yield srv
 
 
 @pytest.fixture
-def server_with_auth():
+def server_with_auth(tmp_path):
     """Server with --auth on. Pre-seed an admin user before yielding."""
-    srv = SecantusDBServer(port=0, storage_path=":memory:", require_auth=True)
+    srv = SecantusDBServer(port=0, storage_path=str(tmp_path), require_auth=True)
     srv.start()
     # Bypass auth gating by injecting the user directly into storage.
     # pymongo enforces iterations>=4096 even though SCRAM-SHA-256 RFC allows

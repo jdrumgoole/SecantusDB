@@ -11,8 +11,10 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def server():
-    with SecantusDBServer(port=0, storage_path=":memory:") as srv:
+def server(tmp_path):
+    # Real on-disk WiredTiger storage. `tmp_path` is unique per test +
+    # parallel worker (xdist), and pytest cleans it up after teardown.
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
         yield srv
 
 

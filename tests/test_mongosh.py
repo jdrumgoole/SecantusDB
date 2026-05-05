@@ -57,8 +57,8 @@ def _run_mongosh(uri: str, eval_script: str) -> str:
     return result.stdout.strip()
 
 
-def test_mongosh_writes_pymongo_reads() -> None:
-    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+def test_mongosh_writes_pymongo_reads(tmp_path) -> None:
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as server:
         # mongosh inserts.
         out = _run_mongosh(
             f"{server.uri}wine_cellar",
@@ -77,8 +77,8 @@ def test_mongosh_writes_pymongo_reads() -> None:
             client.close()
 
 
-def test_pymongo_writes_mongosh_reads() -> None:
-    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+def test_pymongo_writes_mongosh_reads(tmp_path) -> None:
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as server:
         # pymongo inserts.
         client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
         try:
@@ -108,9 +108,9 @@ def test_pymongo_writes_mongosh_reads() -> None:
         ]
 
 
-def test_mongosh_index_round_trip() -> None:
+def test_mongosh_index_round_trip(tmp_path) -> None:
     """mongosh's createIndex + listIndexes round-trip through SecantusDB."""
-    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as server:
         # Split into two mongosh invocations: the first does the writes
         # (whose return values mongosh would otherwise auto-print and
         # complicate parsing); the second runs the single read whose

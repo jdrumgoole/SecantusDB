@@ -10,8 +10,8 @@ from secantus.storage import Storage
 
 
 @pytest.fixture
-def storage():
-    s = Storage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     try:
         yield s
     finally:
@@ -62,8 +62,8 @@ def test_find_seq_for_ts_returns_first_at_or_after(storage: Storage) -> None:
     assert storage.find_seq_for_ts(Timestamp(2_000_000, 0)) == storage.oplog_tail_seq() + 1
 
 
-def test_prune_oplog_respects_time_cap() -> None:
-    s = Storage(oplog_retention_seconds=10.0)
+def test_prune_oplog_respects_time_cap(tmp_path) -> None:
+    s = Storage(str(tmp_path), oplog_retention_seconds=10.0)
     fake_now = [1_000_000.0]
     s._time = lambda: fake_now[0]
     s._emit_oplog([{"op": "n", "ns": "a.b"}])  # ts secs = 1_000_000
@@ -79,8 +79,8 @@ def test_prune_oplog_respects_time_cap() -> None:
     s.close()
 
 
-def test_prune_oplog_respects_count_cap() -> None:
-    s = Storage(oplog_max_entries=2, oplog_retention_seconds=10_000.0)
+def test_prune_oplog_respects_count_cap(tmp_path) -> None:
+    s = Storage(str(tmp_path), oplog_max_entries=2, oplog_retention_seconds=10_000.0)
     for _ in range(5):
         s._emit_oplog([{"op": "n", "ns": "a.b"}])
     s.prune_oplog()
@@ -91,10 +91,10 @@ def test_prune_oplog_respects_count_cap() -> None:
     s.close()
 
 
-def test_prune_oplog_drops_paired_preimages() -> None:
+def test_prune_oplog_drops_paired_preimages(tmp_path) -> None:
     import bson
 
-    s = Storage(oplog_retention_seconds=0.0)  # immediate eligibility
+    s = Storage(str(tmp_path), oplog_retention_seconds=0.0)  # immediate eligibility
     pre_doc = {"_id": 1, "x": 5}
     s._emit_oplog(
         [{"op": "d", "ns": "a.b", "o": {"_id": 1}, "o2": {"_id": 1}}],

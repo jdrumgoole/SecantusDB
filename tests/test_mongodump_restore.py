@@ -40,7 +40,9 @@ def test_dump_restore_round_trip(tmp_path: Path) -> None:
         {"_id": 3, "name": "Barolo 2017", "year": 2017},
     ]
 
-    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+    wt_dir = tmp_path / "secantus-wt"
+    wt_dir.mkdir()
+    with SecantusDBServer(port=0, storage_path=str(wt_dir)) as server:
         uri = server.uri
         client = MongoClient(uri, serverSelectionTimeoutMS=2000)
         try:

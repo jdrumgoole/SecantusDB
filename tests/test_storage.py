@@ -7,8 +7,8 @@ from secantus.storage import Storage
 
 
 @pytest.fixture
-def storage() -> Storage:
-    return Storage(":memory:")
+def storage(tmp_path) -> Storage:
+    return Storage(str(tmp_path))
 
 
 def test_insert_assigns_object_id(storage: Storage) -> None:
@@ -193,3 +193,92 @@ def test_sort_cross_type_order(storage: Storage) -> None:
     assert pos[6] < pos[5]  # object < array
     assert pos[5] < pos[7]  # array < ObjectId
     assert pos[7] < pos[3]  # ObjectId < bool
+
+
+def test_storage_persists_across_reopen(tmp_path) -> None:
+    """Close the WT connection and reopen at the same path; data survives.
+
+    The whole point of on-disk storage is that data persists across
+    process restarts. This test exercises that end-to-end: write
+    documents, an index, and an oplog entry; close; reopen the same
+    directory; verify the data is exactly what we wrote.
+
+    Adding a new field, table, or option to a future SecantusDB release
+    should keep this test passing — that's the load-bearing format
+    compatibility we promise to users.
+    """
+    s1 = Storage(str(tmp_path))
+    try:
+        s1.insert(
+            "winelog",
+            "bottles",
+            [
+                {"_id": 1, "name": "Pommard 2018", "year": 2018},
+                {"_id": 2, "name": "Brunello 2015", "year": 2015},
+            ],
+        )
+        s1.create_index("winelog", "bottles", "year_1", {"year": 1}, {})
+    finally:
+        s1.close()
+
+    s2 = Storage(str(tmp_path))
+    try:
+        docs = sorted(
+            s2.find_matching("winelog", "bottles", {}),
+            key=lambda d: d["_id"],
+        )
+        assert [d["_id"] for d in docs] == [1, 2]
+        assert docs[0]["name"] == "Pommard 2018"
+        assert docs[1]["year"] == 2015
+
+        # The user-created index is back, alongside the implicit _id_.
+        names = {ix["name"] for ix in s2.list_indexes("winelog", "bottles")}
+        assert "year_1" in names
+        assert "_id_" in names
+
+        # The index actually serves a query (the entries table survived,
+        # not just the index metadata).
+        plan = s2.explain_plan("winelog", "bottles", {"year": 2018})
+        assert plan["kind"] == "IXSCAN"
+        assert plan["index_name"] == "year_1"
+    finally:
+        s2.close()
+
+
+def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
+    """End-to-end: server restart on the same on-disk path keeps data.
+
+    Mirrors the test_storage_persists_across_reopen check but goes
+    through the full wire stack — pymongo writes, server restart,
+    pymongo reads — which is the path real users exercise.
+    """
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    docs = [
+        {"_id": 1, "x": "first"},
+        {"_id": 2, "x": "second"},
+    ]
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+        mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
+        try:
+            mc["persist_db"]["c"].insert_many(docs)
+            mc["persist_db"]["c"].create_index([("x", 1)])
+        finally:
+            mc.close()
+
+    # Reopen the server on the same path (different bound port).
+    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+        mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
+        try:
+            stored = sorted(
+                mc["persist_db"]["c"].find(),
+                key=lambda d: d["_id"],
+            )
+            assert stored == docs
+            names = {ix["name"] for ix in mc["persist_db"]["c"].list_indexes()}
+            assert names >= {"_id_", "x_1"}
+        finally:
+            mc.close()
