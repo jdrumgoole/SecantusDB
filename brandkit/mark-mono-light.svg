@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="SecantusDB mark, monochrome light">
+  <path d="M52,36 Q160,14 268,36 L268,254 Q268,306 160,306 Q52,306 52,254 Z" fill="#f1f5f9"/>
+  <path d="M60,40 Q160,20 260,40 L260,250 Q260,300 160,300 Q60,300 60,250 Z" fill="none" stroke="#f1f5f9" stroke-width="2"/>
+  <g transform="translate(160,165)">
+    <circle r="78" fill="none" stroke="#f1f5f9" stroke-width="3"/>
+    <g transform="translate(-44,-50)" stroke="#f1f5f9" stroke-width="2.5" fill="none">
+      <path d="M0,70 V82 Q0,98 44,98 Q88,98 88,82 V70"/>
+      <ellipse cx="44" cy="70" rx="44" ry="11"/>
+      <path d="M0,38 V58 Q0,74 44,74 Q88,74 88,58 V38"/>
+      <ellipse cx="44" cy="38" rx="44" ry="11"/>
+      <path d="M0,6 V26 Q0,42 44,42 Q88,42 88,26 V6"/>
+      <ellipse cx="44" cy="6" rx="44" ry="11"/>
+    </g>
+  </g>
+</svg>

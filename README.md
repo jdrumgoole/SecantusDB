@@ -1,4 +1,9 @@
-# SecantusDB
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brandkit/wordmark-horizontal-on-dark.svg">
+    <img src="brandkit/wordmark-horizontal.svg" alt="SecantusDB — the SQLite of document databases" width="460">
+  </picture>
+</p>
 
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](#alpha-software)
 [![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)

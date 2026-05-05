@@ -39,6 +39,33 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 html_theme = "furo"
 html_static_path = ["_static"]
+# Brand assets — see brandkit/ at the repo root for the full kit and
+# brandkit/brand.html for the guided tour. The light/dark wordmark
+# pair gives furo a logo per colour scheme; the favicon is one inline
+# SVG.
+html_logo = "_static/wordmark-horizontal.svg"
+html_favicon = "_static/favicon.svg"
+html_theme_options = {
+    # Furo prefers `light_logo` / `dark_logo` when both are set;
+    # `html_logo` above stays as a fallback for alternate themes.
+    "light_logo": "wordmark-horizontal.svg",
+    "dark_logo": "wordmark-horizontal-on-dark.svg",
+    # Brand palette: slate (neutral) + cyan (accent), matching
+    # brandkit/README.md. Tokens map onto Tailwind's slate-* /
+    # cyan-* scales.
+    "light_css_variables": {
+        "color-brand-primary": "#0e7490",        # cyan-700, AA on white
+        "color-brand-content": "#0891b2",        # cyan-600
+        "color-foreground-primary": "#0f172a",   # slate-900
+        "color-foreground-secondary": "#475569", # slate-600
+    },
+    "dark_css_variables": {
+        "color-brand-primary": "#22d3ee",        # cyan-400, AA on slate-900
+        "color-brand-content": "#67e8f9",        # cyan-300
+        "color-background-primary": "#0f172a",   # slate-900
+        "color-background-secondary": "#1e293b", # slate-800
+    },
+}
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
