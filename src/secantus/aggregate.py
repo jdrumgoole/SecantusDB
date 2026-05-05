@@ -1082,6 +1082,11 @@ def _stage_geo_near(
         distance_multiplier, bool
     ):
         raise AggregateError("$geoNear distanceMultiplier must be a number")
+    include_locs_field = spec.get("includeLocs")
+    if include_locs_field is not None and (
+        not isinstance(include_locs_field, str) or not include_locs_field
+    ):
+        raise AggregateError("$geoNear includeLocs must be a non-empty string")
 
     spherical, center = _parse_geo_near_origin(near, spec.get("spherical"))
 
@@ -1108,6 +1113,12 @@ def _stage_geo_near(
             continue
         out = copy.deepcopy(doc)
         set_path(out, distance_field, d * float(distance_multiplier))
+        if include_locs_field is not None:
+            # Attach the *raw* doc geometry value, not a re-serialized
+            # Shapely point, so a doc stored as ``[x, y]`` round-trips
+            # as ``[x, y]`` and one stored as GeoJSON round-trips as
+            # GeoJSON. Matches mongod's "echo what was indexed" semantics.
+            set_path(out, include_locs_field, copy.deepcopy(value))
         results.append((d, out))
     results.sort(key=lambda pair: pair[0])
     return [doc for _d, doc in results]

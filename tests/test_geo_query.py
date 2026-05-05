@@ -227,6 +227,105 @@ def test_geo_near_with_query_prefilter(client: MongoClient) -> None:
     assert [d["_id"] for d in docs] == [1, 3]
 
 
+def test_geo_near_include_locs_attaches_raw_geojson(client: MongoClient) -> None:
+    """`includeLocs` echoes back the raw doc geometry under the named field.
+
+    Each output doc gets a copy of whatever was stored — GeoJSON shape
+    in, GeoJSON shape out — so the client can plot the matched points
+    without a second round-trip through the doc.
+    """
+    coll = client["geo"]["include_locs_geojson"]
+    docs = [
+        {"_id": 1, "loc": _geo_point(0.0, 0.0), "name": "origin"},
+        {"_id": 2, "loc": _geo_point(0.001, 0.0), "name": "east"},
+    ]
+    coll.insert_many(docs)
+    pipeline = [
+        {
+            "$geoNear": {
+                "near": _geo_point(0.0, 0.0),
+                "distanceField": "d",
+                "key": "loc",
+                "includeLocs": "matchedLoc",
+                "maxDistance": 500,
+            }
+        }
+    ]
+    out = list(coll.aggregate(pipeline))
+    assert [d["_id"] for d in out] == [1, 2]
+    # Each output doc carries an exact copy of the stored geometry.
+    assert out[0]["matchedLoc"] == _geo_point(0.0, 0.0)
+    assert out[1]["matchedLoc"] == _geo_point(0.001, 0.0)
+    # And the originals aren't disturbed.
+    assert out[0]["loc"] == _geo_point(0.0, 0.0)
+
+
+def test_geo_near_include_locs_with_legacy_pair(client: MongoClient) -> None:
+    """Legacy ``[x, y]`` pairs round-trip as pairs (not converted to GeoJSON)."""
+    coll = client["geo"]["include_locs_legacy"]
+    coll.insert_many(
+        [
+            {"_id": 1, "loc": [0.0, 0.0]},
+            {"_id": 2, "loc": [3.0, 4.0]},
+        ]
+    )
+    pipeline = [
+        {
+            "$geoNear": {
+                "near": [0.0, 0.0],
+                "distanceField": "d",
+                "key": "loc",
+                "includeLocs": "where",
+            }
+        }
+    ]
+    out = list(coll.aggregate(pipeline))
+    assert out[0]["where"] == [0.0, 0.0]
+    assert out[1]["where"] == [3.0, 4.0]
+
+
+def test_geo_near_include_locs_dotted_path(client: MongoClient) -> None:
+    """``includeLocs`` accepts dotted paths and creates the nested object."""
+    coll = client["geo"]["include_locs_dotted"]
+    coll.insert_one({"_id": 1, "loc": _geo_point(1.0, 2.0)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$geoNear": {
+                        "near": _geo_point(0.0, 0.0),
+                        "distanceField": "d",
+                        "key": "loc",
+                        "includeLocs": "match.loc",
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["match"] == {"loc": _geo_point(1.0, 2.0)}
+
+
+def test_geo_near_include_locs_must_be_string(client: MongoClient) -> None:
+    """Type check on ``includeLocs`` mirrors mongod (errors on non-string)."""
+    coll = client["geo"]["include_locs_bad"]
+    coll.insert_one({"_id": 1, "loc": _geo_point(0.0, 0.0)})
+    with pytest.raises(OperationFailure):
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$geoNear": {
+                            "near": _geo_point(0.0, 0.0),
+                            "distanceField": "d",
+                            "key": "loc",
+                            "includeLocs": 42,  # not a string
+                        }
+                    }
+                ]
+            )
+        )
+
+
 def test_geo_near_planar_distance(client: MongoClient) -> None:
     coll = client["geo"]["agg_near_planar"]
     coll.insert_many(
