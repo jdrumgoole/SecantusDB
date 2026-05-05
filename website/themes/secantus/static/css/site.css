@@ -104,13 +104,17 @@ pre code { background: transparent; padding: 0; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding-top: 18px;
-  padding-bottom: 18px;
+  padding-top: 22px;
+  padding-bottom: 22px;
   gap: 24px;
 }
 .site-header .logo img {
-  height: 32px;
+  height: 48px;
   width: auto;
+  display: block;
+}
+@media (max-width: 720px) {
+  .site-header .logo img { height: 36px; }
 }
 .site-nav {
   display: flex;
