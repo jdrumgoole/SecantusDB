@@ -570,3 +570,204 @@ def test_change_stream_stage_stashes_spec_and_returns_empty() -> None:
     assert out == []
     assert ctx.change_stream is not None
     assert ctx.change_stream.full_document_mode == "updateLookup"
+
+
+# --- $lookup index acceleration --------------------------------------------
+
+
+def test_lookup_uses_index_when_foreign_field_is_indexed(tmp_path) -> None:
+    """When the foreign collection has a single-field index on the
+    foreign field, the per-outer-doc lookup goes through Storage's
+    index path. Result-equivalence with the hash-join fallback is the
+    correctness check; the perf gain isn't asserted (would be flaky).
+    """
+    from secantus.aggregate import PipelineContext
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert("db", "users", [{"_id": i, "k": i, "name": f"u{i}"} for i in range(200)])
+        storage.create_index("db", "users", "k_1", {"k": 1}, {})
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 200} for i in range(50)])
+
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "as": "user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        assert len(joined) == 50
+        for o in joined:
+            assert len(o["user"]) == 1
+            assert o["user"][0]["k"] == o["user_k"]
+    finally:
+        storage.close()
+
+
+def test_lookup_falls_back_to_hash_join_without_index(tmp_path) -> None:
+    """No index → existing hash-join path. Result must match what the
+    index path produces."""
+    from secantus.aggregate import PipelineContext
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert("db", "users", [{"_id": i, "k": i} for i in range(20)])
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 20} for i in range(10)])
+
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "as": "user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        assert len(joined) == 10
+        for o in joined:
+            assert len(o["user"]) == 1
+            assert o["user"][0]["k"] == o["user_k"]
+    finally:
+        storage.close()
+
+
+def test_lookup_index_path_handles_array_local_value(tmp_path) -> None:
+    """Array local value → matches any element via the indexed $in path."""
+    from secantus.aggregate import PipelineContext
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert(
+            "db",
+            "users",
+            [
+                {"_id": 1, "k": 100},
+                {"_id": 2, "k": 200},
+                {"_id": 3, "k": 300},
+            ],
+        )
+        storage.create_index("db", "users", "k_1", {"k": 1}, {})
+        storage.insert("db", "orders", [{"_id": 1, "user_ks": [100, 300]}])
+
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_ks",
+                        "foreignField": "k",
+                        "as": "users",
+                    }
+                }
+            ],
+            ctx,
+        )
+        assert len(joined) == 1
+        assert sorted(u["k"] for u in joined[0]["users"]) == [100, 300]
+    finally:
+        storage.close()
+
+
+def test_lookup_compound_index_falls_back_to_hash_join(tmp_path) -> None:
+    """A compound index on the foreign field is *not* eligible for the
+    simple-shape index path; we fall back to hash-join. Result must
+    still be correct."""
+    from secantus.aggregate import PipelineContext
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert("db", "users", [{"_id": i, "k": i, "tag": "x"} for i in range(10)])
+        storage.create_index("db", "users", "k_tag_1", {"k": 1, "tag": 1}, {})
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 10} for i in range(5)])
+
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "as": "user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        assert len(joined) == 5
+        for o in joined:
+            assert len(o["user"]) == 1
+            assert o["user"][0]["k"] == o["user_k"]
+    finally:
+        storage.close()
+
+
+def test_lookup_pipeline_form_uses_index_when_available(tmp_path) -> None:
+    """Simple-form-plus-pipeline also picks up the index for the
+    pre-filter; the sub-pipeline still runs on the narrowed candidate
+    set. Verifies parity with the hash-join path."""
+    from secantus.aggregate import PipelineContext
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert(
+            "db",
+            "users",
+            [{"_id": i, "k": i, "active": i % 2 == 0} for i in range(20)],
+        )
+        storage.create_index("db", "users", "k_1", {"k": 1}, {})
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 20} for i in range(10)])
+
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "let": {"o_id": "$_id"},
+                        "pipeline": [{"$match": {"active": True}}],
+                        "as": "active_user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        assert len(joined) == 10
+        for o in joined:
+            if o["user_k"] % 2 == 0:
+                assert len(o["active_user"]) == 1
+                assert o["active_user"][0]["active"] is True
+            else:
+                assert o["active_user"] == []
+    finally:
+        storage.close()
