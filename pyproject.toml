@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.3.0a19"
+version = "0.3.0a20"
 description = "A drop-in single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,8 @@ dependencies = [
     "pymongo>=4.6",
     # `wiredtiger` is bundled in the binary wheel via vendor/wiredtiger;
     # no PyPI dependency on the standalone wiredtiger package.
+    "s2sphere>=0.2.5",
+    "shapely>=2.0",
 ]
 
 [project.optional-dependencies]
