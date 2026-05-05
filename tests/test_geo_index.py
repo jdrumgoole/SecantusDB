@@ -122,9 +122,7 @@ def test_2dsphere_geo_intersects_polygon(client: MongoClient) -> None:
                 "_id": 2,
                 "loc": {
                     "type": "Polygon",
-                    "coordinates": [
-                        [[10, 10], [11, 10], [11, 11], [10, 11], [10, 10]]
-                    ],
+                    "coordinates": [[[10, 10], [11, 10], [11, 11], [10, 11], [10, 10]]],
                 },
             },
         ]
@@ -135,8 +133,7 @@ def test_2dsphere_geo_intersects_polygon(client: MongoClient) -> None:
         "coordinates": [[[0.5, 0.5], [2, 0.5], [2, 2], [0.5, 2], [0.5, 0.5]]],
     }
     found = sorted(
-        d["_id"]
-        for d in coll.find({"loc": {"$geoIntersects": {"$geometry": query_geom}}})
+        d["_id"] for d in coll.find({"loc": {"$geoIntersects": {"$geometry": query_geom}}})
     )
     assert found == [1]
 
@@ -169,9 +166,7 @@ def test_explain_reports_ixscan_for_geo_within(client: MongoClient) -> None:
         {
             "explain": {
                 "find": "explain",
-                "filter": {
-                    "loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}
-                },
+                "filter": {"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}},
             }
         }
     )
@@ -191,9 +186,7 @@ def test_explain_reports_collscan_without_geo_index(client: MongoClient) -> None
         {
             "explain": {
                 "find": "no_idx",
-                "filter": {
-                    "loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}
-                },
+                "filter": {"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}},
             }
         }
     )
@@ -211,14 +204,12 @@ def test_update_moves_doc_in_geo_index(client: MongoClient) -> None:
     # Move the doc somewhere far via replacement-style update.
     coll.replace_one({"_id": 1}, {"_id": 1, "loc": _pt(50.0, 50.0)})
     # Should NOT be in the small disk anymore.
-    assert (
-        coll.find_one({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 0.001]}}})
-        is None
-    )
+    assert coll.find_one({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 0.001]}}}) is None
     # SHOULD be in a far disk.
-    assert coll.find_one(
-        {"loc": {"$geoWithin": {"$centerSphere": [[50, 50], 0.001]}}}
-    ) == {"_id": 1, "loc": _pt(50.0, 50.0)}
+    assert coll.find_one({"loc": {"$geoWithin": {"$centerSphere": [[50, 50], 0.001]}}}) == {
+        "_id": 1,
+        "loc": _pt(50.0, 50.0),
+    }
 
 
 def test_delete_removes_geo_entries(client: MongoClient) -> None:
@@ -232,8 +223,7 @@ def test_delete_removes_geo_entries(client: MongoClient) -> None:
     coll.create_index([("loc", "2dsphere")])
     coll.delete_one({"_id": 1})
     found = sorted(
-        d["_id"]
-        for d in coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 0.001]}}})
+        d["_id"] for d in coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 0.001]}}})
     )
     assert found == [2]
 
@@ -247,10 +237,7 @@ def test_drop_index_clears_entries(client: MongoClient) -> None:
     assert "loc_2dsphere" not in indexes
     # Query still works (full-scan).
     assert (
-        coll.find_one(
-            {"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}}
-        )
-        is not None
+        coll.find_one({"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}}) is not None
     )
 
 
@@ -274,17 +261,7 @@ def test_polygon_doc_writes_multi_cell_entries(client: MongoClient) -> None:
     )
     coll.create_index([("loc", "2dsphere")])
     # Query a 1-meter disk in the middle of the polygon.
-    found = list(
-        coll.find(
-            {
-                "loc": {
-                    "$geoIntersects": {
-                        "$geometry": _pt(5.0, 5.0)
-                    }
-                }
-            }
-        )
-    )
+    found = list(coll.find({"loc": {"$geoIntersects": {"$geometry": _pt(5.0, 5.0)}}}))
     assert [d["_id"] for d in found] == [1]
 
 
@@ -328,8 +305,7 @@ def test_2dsphere_missing_field_is_sparse(client: MongoClient) -> None:
     assert coll.count_documents({}) == 3
     # Only doc 3 is in the index — confirmed by a $geoWithin query.
     hits = sorted(
-        d["_id"]
-        for d in coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 1.0]}}})
+        d["_id"] for d in coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 1.0]}}})
     )
     assert hits == [3]
 

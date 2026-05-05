@@ -33,11 +33,14 @@ _HERE = Path(__file__).parent
 _CROSS_DRIVER = _HERE / "cross_driver"
 
 
-def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
-         timeout: float = 120.0) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout
-    )
+def _run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float = 120.0,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
 
 
 @pytest.fixture
@@ -99,8 +102,7 @@ def test_geo_smoke_via_mongosh(server: SecantusDBServer) -> None:
         timeout=60.0,
     )
     assert result.returncode == 0, (
-        f"mongosh exited {result.returncode}\nstdout: {result.stdout}\n"
-        f"stderr: {result.stderr}"
+        f"mongosh exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
     # mongosh prefixes connection-status lines before our JSON.stringify line;
@@ -157,8 +159,7 @@ def test_geo_smoke_via_node_driver(server: SecantusDBServer) -> None:
         timeout=60.0,
     )
     assert result.returncode == 0, (
-        f"node smoke exited {result.returncode}\nstdout: {result.stdout}\n"
-        f"stderr: {result.stderr}"
+        f"node smoke exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
 
@@ -184,7 +185,6 @@ def test_geo_smoke_via_go_driver(server: SecantusDBServer) -> None:
         timeout=180.0,  # first run pulls the driver
     )
     assert result.returncode == 0, (
-        f"go smoke exited {result.returncode}\nstdout: {result.stdout}\n"
-        f"stderr: {result.stderr}"
+        f"go smoke exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout

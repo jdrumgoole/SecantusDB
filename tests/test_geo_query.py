@@ -72,9 +72,7 @@ def test_geo_within_center_sphere(client: MongoClient) -> None:
         ]
     )
     # 0.001 rad ≈ 6.4 km
-    found = list(
-        coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}})
-    )
+    found = list(coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}}))
     assert {d["_id"] for d in found} == {1, 2}
 
 
@@ -93,9 +91,7 @@ def test_geo_intersects_polygon(client: MongoClient) -> None:
                 "_id": 2,
                 "loc": {
                     "type": "Polygon",
-                    "coordinates": [
-                        [[100, 100], [110, 100], [110, 110], [100, 110], [100, 100]]
-                    ],
+                    "coordinates": [[[100, 100], [110, 100], [110, 110], [100, 110], [100, 100]]],
                 },
             },
         ]

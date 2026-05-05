@@ -89,11 +89,7 @@ def parse_doc_geometry(value: Any) -> BaseGeometry | None:
                 except (TypeError, ValueError):
                     return None
         return None
-    if (
-        isinstance(value, Sequence)
-        and not isinstance(value, (str, bytes))
-        and len(value) == 2
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) == 2:
         try:
             return Point(float(value[0]), float(value[1]))
         except (TypeError, ValueError):
@@ -155,9 +151,7 @@ def parse_query_geometry(
         return _parse_center(spec["$center"]), False
     if "$centerSphere" in spec:
         return _parse_center_sphere(spec["$centerSphere"]), True
-    raise GeoError(
-        "geo query requires $geometry, $box, $polygon, $center, or $centerSphere"
-    )
+    raise GeoError("geo query requires $geometry, $box, $polygon, $center, or $centerSphere")
 
 
 def _parse_box(box: Any) -> Polygon:
@@ -166,9 +160,7 @@ def _parse_box(box: Any) -> Polygon:
     (x1, y1), (x2, y2) = (_pair(p, "$box corner") for p in box)
     lo_x, hi_x = sorted((x1, x2))
     lo_y, hi_y = sorted((y1, y2))
-    return Polygon(
-        [(lo_x, lo_y), (hi_x, lo_y), (hi_x, hi_y), (lo_x, hi_y), (lo_x, lo_y)]
-    )
+    return Polygon([(lo_x, lo_y), (hi_x, lo_y), (hi_x, hi_y), (lo_x, hi_y), (lo_x, lo_y)])
 
 
 def _parse_polygon(polygon: Any) -> Polygon:
@@ -240,9 +232,7 @@ class _SphericalCircle:
         self.radius_rad = radius_rad
 
     def contains_point(self, lng: float, lat: float) -> bool:
-        return _great_circle_radians(
-            self.center_lng, self.center_lat, lng, lat
-        ) <= self.radius_rad
+        return _great_circle_radians(self.center_lng, self.center_lat, lng, lat) <= self.radius_rad
 
 
 # ---------------------------------------------------------------------------
@@ -267,13 +257,9 @@ def geo_within(
         if isinstance(doc_geom, Point):
             return query_geom.contains_point(doc_geom.x, doc_geom.y)
         # For non-point doc geometry, require every vertex inside the cap.
-        return all(
-            query_geom.contains_point(x, y) for x, y in _iter_coords(doc_geom)
-        )
+        return all(query_geom.contains_point(x, y) for x, y in _iter_coords(doc_geom))
     try:
-        return bool(doc_geom.within(query_geom)) or bool(
-            doc_geom.equals(query_geom)
-        )
+        return bool(doc_geom.within(query_geom)) or bool(doc_geom.equals(query_geom))
     except GEOSException:
         return False
 
@@ -348,13 +334,9 @@ def validate_coordinates(
     if geo_type == "2dsphere":
         for x, y in _iter_coords(geom):
             if not (_2DSPHERE_LNG_BOUNDS[0] <= x <= _2DSPHERE_LNG_BOUNDS[1]):
-                raise GeoError(
-                    f"longitude {x} out of 2dsphere range [-180, 180]"
-                )
+                raise GeoError(f"longitude {x} out of 2dsphere range [-180, 180]")
             if not (_2DSPHERE_LAT_BOUNDS[0] <= y <= _2DSPHERE_LAT_BOUNDS[1]):
-                raise GeoError(
-                    f"latitude {y} out of 2dsphere range [-90, 90]"
-                )
+                raise GeoError(f"latitude {y} out of 2dsphere range [-90, 90]")
         return
     if geo_type == "2d":
         opts = options or {}
@@ -362,13 +344,9 @@ def validate_coordinates(
         hi = float(opts.get("max", 180.0))
         for x, y in _iter_coords(geom):
             if not (lo <= x <= hi):
-                raise GeoError(
-                    f"x coordinate {x} out of 2d range [{lo}, {hi}]"
-                )
+                raise GeoError(f"x coordinate {x} out of 2d range [{lo}, {hi}]")
             if not (lo <= y <= hi):
-                raise GeoError(
-                    f"y coordinate {y} out of 2d range [{lo}, {hi}]"
-                )
+                raise GeoError(f"y coordinate {y} out of 2d range [{lo}, {hi}]")
         return
     raise GeoError(f"unknown geo index type: {geo_type!r}")
 
@@ -378,9 +356,7 @@ def validate_coordinates(
 # ---------------------------------------------------------------------------
 
 
-def distance(
-    a: BaseGeometry, b: BaseGeometry, *, spherical: bool
-) -> float | None:
+def distance(a: BaseGeometry, b: BaseGeometry, *, spherical: bool) -> float | None:
     """Distance between two point-like geometries.
 
     Spherical mode returns **meters** (haversine on a sphere of radius
@@ -405,9 +381,7 @@ def _as_point(geom: BaseGeometry) -> tuple[float, float] | None:
     return None
 
 
-def _great_circle_radians(
-    lng_a: float, lat_a: float, lng_b: float, lat_b: float
-) -> float:
+def _great_circle_radians(lng_a: float, lat_a: float, lng_b: float, lat_b: float) -> float:
     """Haversine angle between two ``[lng, lat]`` points, in radians."""
     phi_a = math.radians(lat_a)
     phi_b = math.radians(lat_b)

@@ -1073,14 +1073,10 @@ def _stage_geo_near(
     if not isinstance(key, str) or not key:
         key = _infer_geo_near_key(ctx)
         if key is None:
-            raise AggregateError(
-                "$geoNear requires `key` when the collection has no geo index"
-            )
+            raise AggregateError("$geoNear requires `key` when the collection has no geo index")
     pre_filter = spec.get("query")
     distance_multiplier = spec.get("distanceMultiplier", 1.0)
-    if not isinstance(distance_multiplier, (int, float)) or isinstance(
-        distance_multiplier, bool
-    ):
+    if not isinstance(distance_multiplier, (int, float)) or isinstance(distance_multiplier, bool):
         raise AggregateError("$geoNear distanceMultiplier must be a number")
     include_locs_field = spec.get("includeLocs")
     if include_locs_field is not None and (
@@ -1146,9 +1142,7 @@ def _infer_geo_near_key(ctx: PipelineContext) -> str | None:
     return None
 
 
-def _parse_geo_near_origin(
-    near: Any, spherical_opt: Any
-) -> tuple[bool, tuple[float, float]]:
+def _parse_geo_near_origin(near: Any, spherical_opt: Any) -> tuple[bool, tuple[float, float]]:
     """Extract ``(spherical, (x, y))`` from ``$geoNear`` ``near`` value.
 
     A GeoJSON Point implies spherical; a legacy ``[x, y]`` is planar
@@ -1162,9 +1156,7 @@ def _parse_geo_near_origin(
     if isinstance(near, list) and len(near) == 2:
         spherical = bool(spherical_opt) if spherical_opt is not None else False
         return spherical, (float(near[0]), float(near[1]))
-    raise AggregateError(
-        "$geoNear `near` must be a GeoJSON Point or a [x, y] pair"
-    )
+    raise AggregateError("$geoNear `near` must be a GeoJSON Point or a [x, y] pair")
 
 
 _STAGES = {

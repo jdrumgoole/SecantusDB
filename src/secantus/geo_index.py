@@ -203,9 +203,7 @@ def _s2_circle_covering(circle: _SphericalCircle) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-def planar_2d_index_for_point(
-    x: float, y: float, options: Mapping[str, Any]
-) -> int:
+def planar_2d_index_for_point(x: float, y: float, options: Mapping[str, Any]) -> int:
     """Bucket a planar (x, y) into a 52-bit interleaved geohash.
 
     Unlike S2 cells, 2d index entries are point-only — `mongod` doesn't
@@ -220,9 +218,7 @@ def planar_2d_index_for_point(
     return _interleave(bx, by, bits)
 
 
-def planar_2d_covering(
-    geom: BaseGeometry, options: Mapping[str, Any]
-) -> tuple[int, int]:
+def planar_2d_covering(geom: BaseGeometry, options: Mapping[str, Any]) -> tuple[int, int]:
     """Return a coarse ``(lo, hi)`` cell-ID range that contains every
     bucket the geometry intersects.
 

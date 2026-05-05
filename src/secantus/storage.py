@@ -103,9 +103,7 @@ def _doc_geo_cells(
     try:
         validate_coordinates(geom, geo_type=geo_type, options=options)
     except GeoError as exc:
-        raise GeoExtractError(
-            index_name, field, doc.get("_id"), str(exc)
-        ) from exc
+        raise GeoExtractError(index_name, field, doc.get("_id"), str(exc)) from exc
     if geo_type == _GEO_2DSPHERE:
         return [encode_cell(c) for c in s2_doc_covering(geom)]
     # 2d: single point only.
@@ -119,6 +117,7 @@ def _doc_geo_cells(
             "2d index requires a point; got a non-point geometry",
         )
     return [encode_cell(planar_2d_index_for_point(geom.x, geom.y, options))]
+
 
 _COLL_TABLE = "table:secantus_collections"
 _DOC_TABLE = "table:secantus_documents"
@@ -973,9 +972,7 @@ class Storage:
                 try:
                     self._validate_geo_indexes(db, coll, doc, indexes, partials)
                 except GeoExtractError as exc:
-                    errors.append(
-                        {"index": index, "code": 16572, "errmsg": str(exc)}
-                    )
+                    errors.append({"index": index, "code": 16572, "errmsg": str(exc)})
                     if ordered:
                         break
                     continue
@@ -2059,9 +2056,7 @@ class Storage:
             if geo is not None:
                 geo_field, geo_type = geo
                 opts = index_options.get(name, {})
-                for cell_bytes in _doc_geo_cells(
-                    doc, geo_field, geo_type, opts, index_name=name
-                ):
+                for cell_bytes in _doc_geo_cells(doc, geo_field, geo_type, opts, index_name=name):
                     c.reset()
                     c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
                 continue
@@ -2101,9 +2096,7 @@ class Storage:
                 # can't match, but the next compact / drop_index cleans
                 # those up. Insert/update remain strict.
                 try:
-                    cells = _doc_geo_cells(
-                        doc, geo_field, geo_type, opts, index_name=name
-                    )
+                    cells = _doc_geo_cells(doc, geo_field, geo_type, opts, index_name=name)
                 except GeoExtractError:
                     continue
                 for cell_bytes in cells:
@@ -2163,10 +2156,7 @@ class Storage:
         so we need the option blob to compute the right bucket. Cached
         per call (the caller handles per-doc loops).
         """
-        return {
-            name: dict(opts)
-            for name, _key_spec, opts in self._iter_indexes(db, coll)
-        }
+        return {name: dict(opts) for name, _key_spec, opts in self._iter_indexes(db, coll)}
 
     def _unique_conflict(
         self,
@@ -2367,9 +2357,7 @@ class Storage:
             # storage scanner does an exact point-lookup. Treating
             # 2dsphere uniformly as a list-of-ranges keeps the storage
             # path single-shaped.
-            return [
-                (encode_cell(c), encode_cell(c)) for c in s2_query_covering(geom)
-            ]
+            return [(encode_cell(c), encode_cell(c)) for c in s2_query_covering(geom)]
         # 2d: shape must be planar; convert to a single (lo, hi) range.
         from shapely.geometry.base import BaseGeometry as _BG
 
@@ -2453,7 +2441,7 @@ class Storage:
             kb_part = packed[:sep_pos]
             if kb_part > hi_prefix:
                 return
-            id_key = packed[sep_pos + len(_ENTRY_SEP):]
+            id_key = packed[sep_pos + len(_ENTRY_SEP) :]
             if id_key not in seen:
                 seen.add(id_key)
                 out.append(id_key)

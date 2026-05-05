@@ -310,9 +310,7 @@ def _op_geo_intersects(values: list[Any], arg: Any) -> bool:
     return False
 
 
-def _op_geo_near(
-    values: list[Any], arg: Any, *, default_spherical: bool
-) -> bool:
+def _op_geo_near(values: list[Any], arg: Any, *, default_spherical: bool) -> bool:
     """Match (without ranking) for ``$near`` / ``$nearSphere``.
 
     ``$near`` is a hybrid operator: real ``mongod`` *also* sorts results
