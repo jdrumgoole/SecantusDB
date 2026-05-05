@@ -1053,6 +1053,21 @@ class Storage:
                         reverse = sort_dir != idx_dir
                         candidates = self._walk_index_in_order(db, coll, idx_name, reverse=reverse)
                         in_sort_order = True
+                # Multi-field sort acceleration: when sort has 2+ fields and
+                # filter is empty, try to find a compound index whose key
+                # spec exactly matches (or fully inverts) the sort. Walking
+                # that index in the right direction yields the requested
+                # order without a Python-side post-sort.
+                if candidates is None and not filter and sort_field is None and sort:
+                    multi_spec = self._multi_sort_spec(sort)
+                    if multi_spec is not None and len(multi_spec) > 1:
+                        match = self._compound_index_for_sort(db, coll, multi_spec)
+                        if match is not None:
+                            idx_name, reverse = match
+                            candidates = self._walk_index_in_order(
+                                db, coll, idx_name, reverse=reverse
+                            )
+                            in_sort_order = True
                 if candidates is None:
                     candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
         out = [d for d in candidates if matches(d, filter)]
@@ -1149,6 +1164,73 @@ class Storage:
             return None, 0
         return f, di
 
+    @staticmethod
+    def _multi_sort_spec(
+        sort: Mapping[str, Any] | None,
+    ) -> list[tuple[str, int]] | None:
+        """Return a list of ``(field, direction)`` pairs for a multi-field
+        sort spec, or ``None`` if any entry is operator-prefixed or has a
+        non-``±1`` direction.
+
+        Used for compound-index sort acceleration: an index whose key
+        spec exactly matches (or fully inverts) the returned list lets
+        ``find_matching`` walk WT in the requested order and skip the
+        Python-side post-sort entirely.
+        """
+        if not sort:
+            return None
+        out: list[tuple[str, int]] = []
+        for field, direction in sort.items():
+            if field.startswith("$"):
+                return None
+            try:
+                d = int(direction)
+            except (TypeError, ValueError):
+                return None
+            if d not in (-1, 1):
+                return None
+            out.append((field, d))
+        return out
+
+    def _compound_index_for_sort(
+        self, db: str, coll: str, sort_fields: list[tuple[str, int]]
+    ) -> tuple[str, bool] | None:
+        """Find a compound index that satisfies ``sort_fields`` end-to-end.
+
+        Returns ``(index_name, reverse_walk)`` where ``reverse_walk`` is
+        True when the matching index is the *fully-inverted* permutation
+        of the sort (walking backward yields the requested order).
+
+        Multikey indexes are excluded — array values in the index could
+        produce row order that doesn't match the BSON cross-type sort
+        the user expects from a sort spec, so we'd fall back to Python
+        sort anyway.
+
+        Strict match only: the index key spec must have the same fields
+        in the same order with directions either matching the sort spec
+        or being the full inverse. Partial-prefix matches (sort uses 3
+        fields, index has 2) aren't accelerated; the savings on the
+        leading prefix are usually less than the cost of the trailing
+        Python sort over the materialised set.
+        """
+        multikey = self._multikey_index_names(db, coll)
+        target = list(sort_fields)
+        inverted = [(f, -d) for f, d in target]
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if name in multikey:
+                continue
+            try:
+                idx_pairs = [(f, int(d)) for f, d in key_spec.items()]
+            except (TypeError, ValueError):
+                continue
+            if any(d not in (-1, 1) for _, d in idx_pairs):
+                continue
+            if idx_pairs == target:
+                return name, False
+            if idx_pairs == inverted:
+                return name, True
+        return None
+
     def _single_field_index_for(self, db: str, coll: str, field: str) -> tuple[str, int] | None:
         """Return ``(index_name, direction)`` for a single-field index on
         ``field``, or ``None`` if no such index exists. Direction is the
@@ -1235,6 +1317,23 @@ class Storage:
                     key_spec = self._key_spec_for(db, coll, name)
                     if key_spec is not None:
                         return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
+            # Multi-field sort acceleration mirrored in the planner: same
+            # rules as find_matching (compound key spec exactly matches
+            # or fully inverts the sort, filter empty).
+            if not filter and sort_field is None and sort:
+                multi_spec = self._multi_sort_spec(sort)
+                if multi_spec is not None and len(multi_spec) > 1:
+                    match = self._compound_index_for_sort(db, coll, multi_spec)
+                    if match is not None:
+                        name, reverse = match
+                        key_spec = self._key_spec_for(db, coll, name)
+                        if key_spec is not None:
+                            return {
+                                "kind": "IXSCAN",
+                                "index_name": name,
+                                "key_pattern": key_spec,
+                                "direction": "backward" if reverse else "forward",
+                            }
             return {"kind": "COLLSCAN"}
 
     def _key_spec_for(self, db: str, coll: str, name: str) -> dict[str, Any] | None:
