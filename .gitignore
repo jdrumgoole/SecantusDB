@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# `.venv` (no trailing slash) so a worktree's symlink-to-main-venv is
+# also ignored — `.venv/` only matches directories.
+.venv
 .venv/
 venv/
 .env

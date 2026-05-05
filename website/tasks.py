@@ -1,18 +1,30 @@
 """Invoke tasks for the SecantusDB marketing site under ``website/``.
 
-Run from the ``website/`` directory:
+Run from the ``website/`` directory.
 
-* ``uv run python -m invoke serve``      &mdash; local preview at http://localhost:8000
-* ``uv run python -m invoke build``      &mdash; production-ready build into ``output/``
-* ``uv run python -m invoke clean``      &mdash; wipe build output + copied assets
-* ``uv run python -m invoke deploy``     &mdash; build + sync to S3 + CloudFront invalidation
-* ``uv run python -m invoke infra-up``   &mdash; provision the AWS infrastructure (one-time)
+* On the **main repo** worktree::
+
+    uv run python -m invoke serve | build | deploy | publish | infra-up
+
+* On the dedicated ``website-dev`` worktree (the one CLAUDE.md tells
+  you to use to avoid parallel-release stash collisions on ``main``),
+  invoke the venv's python directly so ``uv``'s project-sync doesn't
+  try to rebuild the secantusdb wheel from a worktree that doesn't
+  have the WiredTiger submodule initialised::
+
+    ../SecantusDB/.venv/bin/python -m invoke serve | build | ...
+
+  All internal subprocess calls in this module run via the SAME
+  ``sys.executable`` that's currently running invoke, so once the
+  outer command finds a working venv, every step is consistent — no
+  more ``uv run`` recursion.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import sys
 from pathlib import Path
 
 from invoke.context import Context
@@ -25,9 +37,56 @@ BRANDKIT = REPO_ROOT / "brandkit"
 OUTPUT = HERE / "output"
 STATE_FILE = HERE / "infra" / "aws-state.json"
 
-PELICAN_DEV_CMD = f"uv run --extra website pelican {HERE / 'content'} -o {OUTPUT} -s {HERE / 'pelicanconf.py'}"
-PELICAN_PROD_CMD = f"uv run --extra website pelican {HERE / 'content'} -o {OUTPUT} -s {HERE / 'publishconf.py'}"
-PELICAN_SERVE_CMD = "uv run --extra website pelican --listen --autoreload --port 8000 -s pelicanconf.py -o output content"
+# Use the running interpreter for every subprocess so the task is
+# identical whether invoked under `uv run` (main repo) or via the
+# venv's python directly (website worktree, where uv-sync would fail).
+PYTHON = sys.executable
+
+PELICAN_DEV_CMD = f"{PYTHON} -m pelican {HERE / 'content'} -o {OUTPUT} -s {HERE / 'pelicanconf.py'}"
+PELICAN_PROD_CMD = f"{PYTHON} -m pelican {HERE / 'content'} -o {OUTPUT} -s {HERE / 'publishconf.py'}"
+PELICAN_SERVE_CMD = f"{PYTHON} -m pelican --listen --autoreload --port 8000 -s pelicanconf.py -o output content"
+
+
+def _ensure_venv() -> None:
+    """In a worktree, make sure ``REPO_ROOT/.venv`` is a usable env.
+
+    The website worktree (typically ``../SecantusDB-website``) symlinks
+    ``.venv`` to the main repo's ``.venv`` to reuse the already-built
+    pelican / boto3 / invoke install. ``uv run`` can clobber that
+    symlink with a fresh empty ``.venv`` directory; this self-heals it.
+
+    No-op when the worktree IS the main repo (its own ``.venv`` is
+    managed by ``uv sync``).
+    """
+    venv = REPO_ROOT / ".venv"
+    if venv.is_dir() and (venv / "bin" / "pelican").exists():
+        return  # working venv, nothing to do
+    # Find main repo path via git's shared common-dir.
+    import subprocess
+    try:
+        common_dir = subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return  # not in git, nothing to do
+    common_path = Path(common_dir) if Path(common_dir).is_absolute() else (REPO_ROOT / common_dir)
+    main_repo = common_path.parent
+    if main_repo == REPO_ROOT:
+        return  # we ARE the main repo; let uv sync handle it
+    main_venv = main_repo / ".venv"
+    if not (main_venv / "bin" / "pelican").exists():
+        raise SystemExit(
+            f"main repo venv at {main_venv} is missing pelican.\n"
+            f"Run `cd {main_repo} && uv sync --extra dev --extra website` first."
+        )
+    if venv.exists() or venv.is_symlink():
+        if venv.is_symlink():
+            venv.unlink()
+        else:
+            shutil.rmtree(venv)
+    venv.symlink_to(main_venv)
+    print(f"  symlinked {venv} → {main_venv}")
 
 
 def _copy_brandkit_assets() -> None:
@@ -55,6 +114,7 @@ def _load_state() -> dict[str, str]:
 @task
 def assets(c: Context) -> None:
     """Copy brandkit SVGs into the theme's static/img/."""
+    _ensure_venv()
     _copy_brandkit_assets()
 
 
@@ -96,9 +156,10 @@ def infra_up(c: Context, domain: str = "secantusdb.com") -> None:
     SSO / instance profile). The Route 53 hosted zone for the domain
     must already exist.
     """
+    _ensure_venv()
     aws_script = HERE / "infra" / "aws.py"
     c.run(
-        f"uv run --extra website python {aws_script} up --domain {domain} --state-file {STATE_FILE}",
+        f"{PYTHON} {aws_script} up --domain {domain} --state-file {STATE_FILE}",
         pty=True,
     )
 
@@ -106,9 +167,10 @@ def infra_up(c: Context, domain: str = "secantusdb.com") -> None:
 @task(name="infra-down")
 def infra_down(c: Context, domain: str = "secantusdb.com") -> None:
     """Tear-down stub (manual via console — see infra/aws.py)."""
+    _ensure_venv()
     aws_script = HERE / "infra" / "aws.py"
     c.run(
-        f"uv run --extra website python {aws_script} down --domain {domain} --state-file {STATE_FILE}",
+        f"{PYTHON} {aws_script} down --domain {domain} --state-file {STATE_FILE}",
         pty=True,
     )
 
@@ -129,7 +191,7 @@ def deploy(c: Context) -> None:
     deploy_script = HERE / "infra" / "aws.py"
     print(f"=== Syncing to s3://{bucket}/ ===")
     c.run(
-        f"uv run --extra website python {deploy_script} sync"
+        f"{PYTHON} {deploy_script} sync"
         f" --bucket {bucket}"
         f" --source {OUTPUT}",
         pty=True,
@@ -137,7 +199,7 @@ def deploy(c: Context) -> None:
 
     print(f"=== Invalidating CloudFront distribution {distribution_id} ===")
     c.run(
-        f"uv run --extra website python {deploy_script} invalidate"
+        f"{PYTHON} {deploy_script} invalidate"
         f" --distribution-id {distribution_id}",
         pty=True,
     )
@@ -147,7 +209,10 @@ def deploy(c: Context) -> None:
 # Paths allowed in a `publish` commit. Anything else in `git status`
 # aborts the shortcut so we never sneak unrelated changes through the
 # website-only fast path (which skips the full pytest suite).
-_PUBLISH_ALLOWED_PREFIXES: tuple[str, ...] = ("website/", "CLAUDE.md")
+# `.gitignore` is included because the worktree convention adds rules
+# for the .venv symlink, and CLAUDE.md is included because website
+# conventions get documented there alongside the marketing site.
+_PUBLISH_ALLOWED_PREFIXES: tuple[str, ...] = ("website/", "CLAUDE.md", ".gitignore")
 
 
 def _git(c: Context, args: str, **kw) -> str:
@@ -158,18 +223,25 @@ def _git(c: Context, args: str, **kw) -> str:
 def publish(c: Context, message: str = "") -> None:
     """Commit, push, and deploy website changes — no pytest, no version bump.
 
-    The shortcut for website-only updates: skips the global "run the full
-    test suite before committing" rule (the website tree never changes
-    SecantusDB's runtime code) and the "bump the version on every push"
-    rule (website tree is excluded from sdist/wheel). Only changes under
-    ``website/`` and the project ``CLAUDE.md`` are allowed; anything else
-    aborts the task so a misfire can't fast-path real code through it.
+    Designed to be run from the dedicated ``website-dev`` worktree
+    (``../SecantusDB-website``) so concurrent release activity on
+    ``main`` doesn't auto-stash these in-flight changes mid-edit.
 
-    Usage::
+    The shortcut skips the global "run the full test suite before
+    committing" rule (the website tree never changes SecantusDB's
+    runtime code) and the "bump the version on every push" rule
+    (website tree is excluded from sdist/wheel). Only changes under
+    ``website/`` and the project ``CLAUDE.md`` are allowed; anything
+    else aborts the task so a misfire can't fast-path real code
+    through it.
 
-        cd website
-        uv run python -m invoke publish --message "blog: new release post"
+    Usage (from the worktree)::
+
+        cd ../SecantusDB-website/website
+        ../../SecantusDB/.venv/bin/python -m invoke publish --message "..."
     """
+    _ensure_venv()
+
     if not message:
         raise SystemExit(
             "publish needs a commit message: "
