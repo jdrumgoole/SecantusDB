@@ -357,3 +357,71 @@ def test_cursor_id_is_int64_random(client: MongoClient) -> None:
     )
     cid = result["cursor"]["id"]
     assert int(cid) > 2**32
+
+
+def test_create_indexes_emits_change_event(client: MongoClient) -> None:
+    """A `createIndexes` on a watched collection produces an event with
+    operationType=createIndexes and the new index spec under
+    operationDescription.indexes[0]. Apps that watch index lifecycle for
+    schema-migration tooling now see them; previously the projection
+    dropped them entirely."""
+    db = client["csdb_create_idx"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.create_index([("x", 1)])
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    e = events[0]
+    assert e["operationType"] == "createIndexes"
+    assert e["ns"] == {"db": "csdb_create_idx", "coll": "c"}
+    indexes = e["operationDescription"]["indexes"]
+    assert len(indexes) == 1
+    assert indexes[0]["name"] == "x_1"
+    assert indexes[0]["key"] == {"x": 1}
+
+
+def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
+    """`dropIndexes` surfaces with operationType=dropIndexes and the
+    index name under operationDescription.indexes[0]."""
+    db = client["csdb_drop_idx"]
+    coll = db["c"]
+    db.create_collection("c")
+    coll.create_index([("x", 1)])  # one index to drop
+
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.drop_index("x_1")
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    e = events[0]
+    assert e["operationType"] == "dropIndexes"
+    assert e["ns"] == {"db": "csdb_drop_idx", "coll": "c"}
+    assert e["operationDescription"]["indexes"] == [{"name": "x_1"}]
+
+
+def test_index_lifecycle_at_database_scope(client: MongoClient) -> None:
+    """db.watch() picks up createIndexes/dropIndexes from any collection
+    in the database — same routing as the existing drop / dropDatabase
+    DDL events."""
+    db = client["csdb_idx_db_scope"]
+    db.create_collection("a")
+    db.create_collection("b")
+
+    cs = db.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    db["a"].create_index([("x", 1)])
+    db["b"].create_index([("y", 1)])
+
+    events = _drain(cs, target=2)
+    cs.close()
+    op_types = {e["operationType"] for e in events}
+    assert op_types == {"createIndexes"}
+    coll_names = {e["ns"]["coll"] for e in events}
+    assert coll_names == {"a", "b"}

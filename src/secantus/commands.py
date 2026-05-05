@@ -1358,6 +1358,67 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"ok": 1.0}
 
 
+def _update_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Rotate a password and/or replace a user's role bindings in place.
+
+    Real ``mongod``'s ``updateUser`` updates the existing record without
+    invalidating other connections — drop+recreate would force every
+    authenticated client off. We do the same: re-derive credentials when
+    ``pwd`` is supplied, replace ``roles`` when supplied, leave the rest
+    alone. The calling connection's effective_roles refresh live so a
+    role change takes effect on the next command.
+    """
+    username = doc.get("updateUser")
+    if not isinstance(username, str) or not username:
+        return {
+            "ok": 0.0,
+            "errmsg": "updateUser: username (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_user(db_name, username)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"User '{username}@{db_name}' not found",
+            "code": _USER_NOT_FOUND,
+            "codeName": "UserNotFound",
+        }
+    pwd = doc.get("pwd")
+    roles_arg = doc.get("roles")
+    if pwd is None and roles_arg is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "updateUser: nothing to update (supply pwd and/or roles)",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if pwd is not None:
+        if not isinstance(pwd, str) or not pwd:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateUser: pwd must be a non-empty string",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        record["credentials"] = derive_credentials(pwd).to_doc()
+    if roles_arg is not None:
+        normalised = _normalise_roles_arg(roles_arg, db_name)
+        if normalised is None:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateUser: roles must be a list of known roles",
+                "code": 31,
+                "codeName": "RoleNotFound",
+            }
+        record["roles"] = normalised
+    ctx.storage.add_user(db_name, username, record, replace=True)
+    if roles_arg is not None:
+        _refresh_effective_roles(ctx)
+    return {"ok": 1.0}
+
+
 def _drop_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     username = doc.get("dropUser")
     if not isinstance(username, str) or not username:
@@ -1667,6 +1728,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "saslStart": _sasl_start,
     "saslContinue": _sasl_continue,
     "createUser": _create_user,
+    "updateUser": _update_user,
     "dropUser": _drop_user,
     "usersInfo": _users_info,
     "grantRolesToUser": _grant_roles_to_user,
