@@ -93,17 +93,14 @@ sdist.exclude = [
     # docs/_static/ (a small subset checked in there too). Cloners
     # and the GitHub release page are the right place for the full kit.
     "brandkit/**",
-<<<<<<< HEAD
     # website/ is the marketing site (Pelican source + boto3 provisioner).
     # Dev-only; never shipped in the wheel or sdist.
     "website/**",
-=======
     # tests/cross_driver/ holds Go and Node smoke programs that exercise
     # SecantusDB through non-Python drivers. The Python orchestrator
     # (tests/test_geo_cross_driver.py) ships, but the JS/Go sources
     # don't need to live in the wheel — they're dev-only scaffolding.
     "tests/cross_driver/**",
->>>>>>> geo-cross-driver
 ]
 
 [tool.cibuildwheel]
