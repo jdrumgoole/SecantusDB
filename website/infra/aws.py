@@ -55,7 +55,13 @@ except ImportError:
 
 CLOUDFRONT_HOSTED_ZONE_ID = "Z2FDTNDATAQYW2"
 
-LONG_CACHE_EXTS = {".css", ".js", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".woff", ".woff2", ".ico"}
+# Only fonts are *truly* immutable — they're versioned in URL by the
+# Google Fonts service, never touched by us. CSS / SVG / PNG / JS all
+# change between deploys (template tweaks, brandkit refresh, copy edits)
+# so caching them with `immutable` would mean browsers refuse to
+# re-fetch even after a CloudFront invalidation. Short cache + must-
+# revalidate keeps deploys propagating the same day.
+LONG_CACHE_EXTS = {".woff", ".woff2"}
 LONG_CACHE_HEADER = "public, max-age=31536000, immutable"
 SHORT_CACHE_HEADER = "public, max-age=300, must-revalidate"
 

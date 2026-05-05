@@ -118,17 +118,23 @@ _ensure_venv = _ensure_worktree_setup
 
 
 def _copy_brandkit_assets() -> None:
-    """Mirror brandkit SVGs into the theme's static/img/ for serving."""
+    """Mirror brandkit images into the theme's static/img/ for serving.
+
+    SVGs are the source of truth; the PNG copies (only ``og-image.png``
+    today) exist because Bluesky / LinkedIn / Slack don't render SVG
+    Open Graph images, so a rasterised companion is required.
+    """
     THEME_IMG.mkdir(parents=True, exist_ok=True)
     if not BRANDKIT.exists():
         raise SystemExit(f"brandkit directory not found at {BRANDKIT}")
     copied = 0
-    for svg in BRANDKIT.glob("*.svg"):
-        shutil.copy2(svg, THEME_IMG / svg.name)
-        copied += 1
+    for pattern in ("*.svg", "*.png"):
+        for src in BRANDKIT.glob(pattern):
+            shutil.copy2(src, THEME_IMG / src.name)
+            copied += 1
     if copied == 0:
-        raise SystemExit(f"no SVGs found in {BRANDKIT}")
-    print(f"  copied {copied} SVG asset(s) → {THEME_IMG.relative_to(REPO_ROOT)}")
+        raise SystemExit(f"no SVG/PNG assets found in {BRANDKIT}")
+    print(f"  copied {copied} brandkit asset(s) → {THEME_IMG.relative_to(REPO_ROOT)}")
 
 
 def _load_state() -> dict[str, str]:
@@ -238,9 +244,14 @@ def deploy(c: Context) -> None:
 # aborts the shortcut so we never sneak unrelated changes through the
 # website-only fast path (which skips the full pytest suite).
 # `.gitignore` is included because the worktree convention adds rules
-# for the .venv symlink, and CLAUDE.md is included because website
-# conventions get documented there alongside the marketing site.
-_PUBLISH_ALLOWED_PREFIXES: tuple[str, ...] = ("website/", "CLAUDE.md", ".gitignore")
+# for the .venv symlink; CLAUDE.md is included because website
+# conventions get documented there alongside the marketing site;
+# `brandkit/` is included because brand assets (SVG sources + PNG
+# companions for OG / social embeds) are referenced by the site and
+# legitimately ride along with marketing changes.
+_PUBLISH_ALLOWED_PREFIXES: tuple[str, ...] = (
+    "website/", "CLAUDE.md", ".gitignore", "brandkit/",
+)
 
 
 def _git(c: Context, args: str, **kw) -> str:
