@@ -368,3 +368,83 @@ def test_update_to_bad_geometry_rejected(client: MongoClient) -> None:
     # Original doc is untouched and still indexed.
     found = coll.find_one({"_id": 1})
     assert found["loc"] == _pt(0.0, 0.0)
+
+
+# --- Compound geo + scalar indexes -----------------------------------------
+
+
+def test_compound_2dsphere_scalar_index_creates(client: MongoClient) -> None:
+    """``createIndex({loc: '2dsphere', cat: 1})`` accepts trailing scalar
+    fields. The index name embeds both fields, mongod-style."""
+    coll = client["geo_idx"]["compound_create"]
+    coll.insert_one({"_id": 1, "loc": _pt(0.0, 0.0), "cat": "park"})
+    name = coll.create_index([("loc", "2dsphere"), ("cat", 1)])
+    assert name == "loc_2dsphere_cat_1"
+    spec = next(ix for ix in coll.list_indexes() if ix["name"] == name)
+    assert spec["key"] == {"loc": "2dsphere", "cat": 1}
+
+
+def test_compound_geo_scalar_filters_by_trailing_field(client: MongoClient) -> None:
+    """Compound geo+scalar query results match the same filter run via
+    `$natural` scan — the geo index is consulted for the cell range,
+    the trailing scalar predicate is then applied at the verifier
+    step.
+
+    This is correct behaviour today because:
+      1. ``_pick_geo_index_for_filter`` recognises the geo operator on
+         the leading field and routes through the geo cell scan.
+      2. ``find_matching`` re-applies the full filter (including the
+         scalar) via ``matches()`` on the candidate set.
+
+    The trailing scalar is *not* used as an index pre-filter (real
+    mongod does that for cardinality wins); for typical small result
+    sets the verifier filter is cheap. Documented in
+    ``tasks/backlog.md``.
+    """
+    coll = client["geo_idx"]["compound_filter"]
+    coll.insert_many(
+        [
+            {"_id": 1, "loc": _pt(0.0001, 0.0), "cat": "restaurant"},
+            {"_id": 2, "loc": _pt(0.0001, 0.0), "cat": "park"},
+            {"_id": 3, "loc": _pt(0.0001, 0.0), "cat": "restaurant"},
+            {"_id": 4, "loc": _pt(50.0, 50.0), "cat": "restaurant"},
+        ]
+    )
+    coll.create_index([("loc", "2dsphere"), ("cat", 1)])
+    q = {
+        "cat": "restaurant",
+        "loc": {"$geoWithin": {"$centerSphere": [[0, 0], 0.001]}},
+    }
+    indexed = sorted(d["_id"] for d in coll.find(q))
+    scanned = sorted(d["_id"] for d in coll.find(q, hint="$natural"))
+    assert indexed == scanned == [1, 3]
+
+
+def test_geo_only_query_against_compound_index(client: MongoClient) -> None:
+    """A query on just the geo field still works against a compound
+    geo+scalar index — the trailing scalar is treated as "any value"."""
+    coll = client["geo_idx"]["compound_geo_only"]
+    coll.insert_many(
+        [
+            {"_id": 1, "loc": _pt(0.0001, 0.0), "cat": "park"},
+            {"_id": 2, "loc": _pt(0.0001, 0.0), "cat": "restaurant"},
+            {"_id": 3, "loc": _pt(50.0, 50.0), "cat": "park"},
+        ]
+    )
+    coll.create_index([("loc", "2dsphere"), ("cat", 1)])
+    found = sorted(
+        d["_id"] for d in coll.find({"loc": {"$geoWithin": {"$centerSphere": [[0, 0], 0.001]}}})
+    )
+    assert found == [1, 2]
+
+
+def test_compound_geo_scalar_input_validation_still_strict(
+    client: MongoClient,
+) -> None:
+    """Bad geo coords on a doc with a compound index still rejects on
+    the geo extractor — the trailing scalar doesn't bypass validation."""
+    coll = client["geo_idx"]["compound_bad_input"]
+    coll.create_index([("loc", "2dsphere"), ("cat", 1)])
+    with pytest.raises(OperationFailure) as exc:
+        coll.insert_one({"_id": 1, "loc": _pt(200.0, 0.0), "cat": "park"})
+    assert exc.value.code == 16572
