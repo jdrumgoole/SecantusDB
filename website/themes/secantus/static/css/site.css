@@ -112,17 +112,19 @@ pre code { background: transparent; padding: 0; }
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: nowrap;
   text-decoration: none;
 }
 .site-header .logo img {
   width: auto;
   display: block;
+  flex-shrink: 0;
 }
-.site-header .logo-mark { height: 32px; }
-.site-header .logo-wordmark { height: 40px; }
+.site-header .logo-mark { height: 24px; }
+.site-header .logo-wordmark { height: 52px; }
 @media (max-width: 720px) {
-  .site-header .logo-mark { height: 26px; }
-  .site-header .logo-wordmark { height: 30px; }
+  .site-header .logo-mark { height: 20px; }
+  .site-header .logo-wordmark { height: 36px; }
 }
 .site-nav {
   display: flex;
