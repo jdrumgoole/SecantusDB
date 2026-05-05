@@ -1,0 +1,10 @@
+{
+  "name": "secantusdb-cross-driver-geo-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Cross-driver geo smoke test for SecantusDB via mongo-node-driver. Run via `node geo_smoke.js` after `npm install`.",
+  "license": "GPL-2.0-only",
+  "dependencies": {
+    "mongodb": "^6.10.0"
+  }
+}
