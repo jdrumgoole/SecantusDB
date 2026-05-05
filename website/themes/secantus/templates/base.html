@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ SITENAME }} — {{ SITESUBTITLE }}{% endblock %}</title>
   <meta name="description" content="{% block description %}Embeddable Document Database compatible with MongoDB.{% endblock %}">
-  <link rel="icon" type="image/svg+xml" href="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/favicon.svg">
-  <link rel="canonical" href="{{ SITEURL }}/{% block canonical_path %}{% endblock %}">
+  <link rel="icon" type="image/svg+xml" href="/{{ THEME_STATIC_DIR }}/img/favicon.svg">
+  <link rel="canonical" href="{{ FEED_DOMAIN }}/{% block canonical_path %}{% endblock %}">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/css/site.css">
+  <link rel="stylesheet" href="/{{ THEME_STATIC_DIR }}/css/site.css">
   {% if FEED_ALL_ATOM %}
   <link rel="alternate" type="application/atom+xml" title="{{ SITENAME }} Atom feed" href="{{ FEED_DOMAIN }}/{{ FEED_ALL_ATOM }}">
   {% endif %}
@@ -16,8 +16,8 @@
   <meta property="og:type" content="website">
   <meta property="og:title" content="Embeddable Document Database compatible with MongoDB.">
   <meta property="og:description" content="Embeddable Document Database compatible with MongoDB.">
-  <meta property="og:url" content="{{ SITEURL }}/{{ self.canonical_path() }}">
-  <meta property="og:image" content="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/og-image.svg">
+  <meta property="og:url" content="{{ FEED_DOMAIN }}/{{ self.canonical_path() }}">
+  <meta property="og:image" content="/{{ THEME_STATIC_DIR }}/img/og-image.svg">
   <meta property="og:site_name" content="{{ SITENAME }}">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Embeddable Document Database compatible with MongoDB.">
@@ -29,12 +29,12 @@
 
 <header class="site-header">
   <div class="wrap">
-    <a class="logo" href="{{ SITEURL }}/" aria-label="SecantusDB home">
-      <img src="{{ SITEURL }}/{{ THEME_STATIC_DIR }}/img/wordmark-horizontal-no-tagline.svg" alt="SecantusDB">
+    <a class="logo" href="/" aria-label="SecantusDB home">
+      <img src="/{{ THEME_STATIC_DIR }}/img/wordmark-horizontal-no-tagline.svg" alt="SecantusDB">
     </a>
     <nav class="site-nav">
-      <a href="{{ SITEURL }}/">Home</a>
-      <a href="{{ SITEURL }}/blog/">Blog</a>
+      <a href="/">Home</a>
+      <a href="/blog.html">Blog</a>
       <a class="external" href="{{ SECANTUS_DOCS_URL }}" rel="noopener">Docs</a>
       <a class="external" href="{{ SECANTUS_GITHUB_URL }}" rel="noopener">GitHub</a>
       <a class="external" href="{{ SECANTUS_PYPI_URL }}" rel="noopener">PyPI</a>
@@ -53,7 +53,7 @@
       <a href="{{ SECANTUS_DOCS_URL }}">Docs</a> ·
       <a href="{{ SECANTUS_PYPI_URL }}">PyPI</a> ·
       <a href="{{ SECANTUS_GITHUB_URL }}">GitHub</a> ·
-      <a href="{{ SITEURL }}/blog/">Blog</a>
+      <a href="/blog.html">Blog</a>
     </span>
   </div>
 </footer>
