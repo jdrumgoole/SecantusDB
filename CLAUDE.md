@@ -219,26 +219,49 @@ No version bump and no pytest. If a real-code change has snuck into the working 
 
 ### Blog post per release
 
-Every GitHub Release **must** have a matching blog post on secantusdb.com. After `release-finalize` succeeds (specifically: after `gh release create` has run in step 6 and the auto-generated notes are visible on GitHub), create `website/content/blog/YYYY-MM-DD-release-X-Y-ZaN.md` with this shape:
+Every GitHub Release **must** have a matching blog post on secantusdb.com.
+
+**Posts must describe the changes, not link to them.** GitHub's auto-generated release notes are a list of PR links — useful as a reference, useless as a blog post. The blog is the user-facing changelog, so each post needs:
+
+1. A **descriptive title** that names the headline change. Not "SecantusDB vX.Y.ZaN" — something a reader would actually click on, e.g. "Change streams land — single-node, oplog-backed, pymongo-validated" or "Compound-index sort acceleration".
+2. A **prose body** of 1–3 short paragraphs explaining what shipped, why it matters, and any caveats. Reference real MongoDB behaviour and concrete operator names where it helps. If the release was small (a CLAUDE.md tweak, a CI fix), say that — short and honest beats inflated.
+3. A **trailing link bar** with three short links: GitHub release page, PyPI version page, git tag.
+
+To gather the actual changes for a post, run from inside the website worktree:
+
+```bash
+git -C ../SecantusDB log --oneline <prev-tag>..<this-tag>
+gh release view <this-tag> --repo jdrumgoole/SecantusDB --json body --jq .body
+```
+
+The commit log between consecutive tags is the source of truth — it's where the merge-commit titles tell you which feature branches landed.
+
+Post template (`website/content/blog/YYYY-MM-DD-release-X-Y-ZaN.md`):
 
 ```
-Title: SecantusDB vX.Y.ZaN
+Title: <headline change in plain English>
 Date: YYYY-MM-DD HH:MM:SS         # release publishedAt, local TZ ok
 Slug: release-X-Y-ZaN
 Author: Joe Drumgoole
 Category: Releases
 Tags: release
-Summary: Release notes for SecantusDB vX.Y.ZaN.
+Summary: <Title> (vX.Y.ZaN).
 
+<one to three short paragraphs describing what shipped and why>
+
+[Full release notes on GitHub](https://github.com/jdrumgoole/SecantusDB/releases/tag/vX.Y.ZaN) ·
 [Install from PyPI](https://pypi.org/project/SecantusDB/X.Y.ZaN/) ·
-[GitHub Release](https://github.com/jdrumgoole/SecantusDB/releases/tag/vX.Y.ZaN) ·
-[Tag on GitHub](https://github.com/jdrumgoole/SecantusDB/tree/vX.Y.ZaN)
-
-<paste the GitHub auto-generated notes here — fetch with
- `gh release view vX.Y.ZaN --json body --jq .body`>
+[Tag](https://github.com/jdrumgoole/SecantusDB/tree/vX.Y.ZaN)
 ```
 
-Then deploy the site: `cd website && uv run python -m invoke deploy`. **No version bump needed for a release-blog-post deploy** — the website tree is excluded from sdist/wheel (per the global rule in `~/CLAUDE.md`). The release post is what makes the blog index a real changelog rather than a dev journal — keep it in sync.
+Then publish from the website worktree (per the worktree convention above):
+
+```bash
+cd ../SecantusDB-website/website
+../../SecantusDB/.venv/bin/python -m invoke publish --message "blog: vX.Y.ZaN release notes"
+```
+
+**No version bump needed for a release-blog-post deploy** — the website tree is excluded from sdist/wheel (per the global rule in `~/CLAUDE.md`). The release post is what makes the blog index a real changelog rather than a dev journal — keep it in sync.
 
 ## Backlog of stubs and stopgaps
 
