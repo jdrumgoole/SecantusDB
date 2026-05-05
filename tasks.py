@@ -244,6 +244,29 @@ def validate_java(c: Context) -> None:
     print("\nWrote docs/validation-report-java.md")
 
 
+@task(name="validate-readme")
+def validate_readme(c: Context) -> None:
+    """HEAD-check every URL in the published PyPI README.
+
+    PyPI doesn't know our git repo, so any relative URL in `README.md`
+    renders as a broken link on the project page. This task fetches
+    the description PyPI is actually serving, extracts every link/img
+    URL, and reports each one's reachability — a thin wrapper over
+    `pytest -m online tests/test_pypi_readme_links.py` so failures
+    are easy to read in a terminal.
+
+    Run it after every release. Network-dependent and depends on the
+    package being published, so it's deliberately excluded from
+    `invoke test` (the `online` marker filters it out by default).
+    """
+    c.run(
+        "uv run --no-sync python -m pytest "
+        "-p no:xdist -o addopts= -m online -v "
+        "tests/test_pypi_readme_links.py",
+        pty=True,
+    )
+
+
 @task
 def clean(c: Context) -> None:
     c.run(

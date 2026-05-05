@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.3.0a32"
+version = "0.3.0a33"
 description = "A drop-in single-node MongoDB server in Python using the WiredTiger storage engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -126,12 +126,16 @@ before-build = "choco install -y swig"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# `-m 'not perf'`: keep the perf-regression suite out of the default run.
-# Perf benchmarks fight for CPU under xdist and would amplify variance;
-# they're run serially via `invoke perf` (or `pytest -p no:xdist -m perf`).
-addopts = "-n auto -m 'not perf'"
+# `-m 'not perf and not online'`: keep perf-regression and network-
+# dependent tests out of the default run. Perf benchmarks fight for
+# CPU under xdist and would amplify variance (run via `invoke perf`).
+# Online tests hit the public internet (PyPI, GitHub, RTD) and depend
+# on a published release, so they belong in `invoke validate-readme`
+# rather than every dev pytest run.
+addopts = "-n auto -m 'not perf and not online'"
 markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
+    "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",
 ]
 
 [tool.ruff]

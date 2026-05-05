@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="brandkit/wordmark-horizontal-on-dark.svg">
-    <img src="brandkit/wordmark-horizontal.svg" alt="SecantusDB — the SQLite of document databases" width="460">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/jdrumgoole/SecantusDB/main/brandkit/wordmark-horizontal-on-dark.svg">
+    <img src="https://raw.githubusercontent.com/jdrumgoole/SecantusDB/main/brandkit/wordmark-horizontal.svg" alt="SecantusDB — the SQLite of document databases" width="460">
   </picture>
 </p>
 
@@ -20,7 +20,7 @@
 > MongoDB uses — and the schema we layer on top (collection / index /
 > oplog tables) has been stable across releases; the test suite runs
 > against real on-disk WiredTiger storage and the
-> [persistence tests](tests/test_storage.py) explicitly verify
+> [persistence tests](https://github.com/jdrumgoole/SecantusDB/blob/main/tests/test_storage.py) explicitly verify
 > close-and-reopen round-trips. That said, we don't yet ship a migration
 > tool or a formal compatibility guarantee, so please don't put
 > production data here yet — production deployments that need durable
@@ -70,7 +70,7 @@ Python, and a like-for-like benchmark currently has SecantusDB
 ~8×–46× slower per operation than mongod. CRUD reads sit near the
 lower end of that; bulk update / delete and aggregation sit at the
 upper end where Python loop overhead dominates. See
-[`docs/benchmark.md`](docs/benchmark.md) for current numbers and
+[`docs/benchmark.md`](https://secantusdb.readthedocs.io/en/latest/benchmark.html) for current numbers and
 methodology. The right use is tests, dev, embedded apps, and
 single-node prototypes where conformance + WT durability matter
 more than per-op latency.
@@ -94,7 +94,7 @@ implemented end-to-end on the wire. Off by default; flip on with
 `secantusdb --auth` (or `SecantusDBServer(..., require_auth=True)`),
 provision users with `createUser`, then connect with the standard
 `MongoClient(uri, username=, password=)` shape. See
-[Authentication](docs/authentication.md). Authorization (RBAC), x509,
+[Authentication](https://secantusdb.readthedocs.io/en/latest/authentication.html). Authorization (RBAC), x509,
 LDAP, Kerberos, and TLS are *not* implemented — an authenticated
 principal is currently treated as fully privileged.
 
@@ -139,7 +139,7 @@ needs three native build tools on `PATH`:
 | Fedora/RHEL | `sudo dnf install -y cmake ninja-build swig` |
 | Alpine | `apk add --no-cache cmake ninja swig build-base` |
 
-See [Installation](docs/installation.md) for dev-install instructions.
+See [Installation](https://secantusdb.readthedocs.io/en/latest/installation.html) for dev-install instructions.
 
 ## Standalone daemon (drop-in `mongod` replacement)
 
@@ -167,8 +167,8 @@ client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 
 The conformance gauges back this up: pymongo's own test suite and
 mongo-go-driver's own test suite run **unmodified** against SecantusDB —
-see [pymongo validation report](docs/validation-report.md) and
-[Go-driver validation report](docs/validation-report-go.md).
+see [pymongo validation report](https://secantusdb.readthedocs.io/en/latest/validation-report.html) and
+[Go-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-go.html).
 
 ## Examples
 
@@ -232,34 +232,34 @@ with SecantusDBServer(port=0, storage_path=":memory:") as server:
 Full docs are in `docs/`; build them with `uv run python -m invoke docs`
 and open `docs/_build/html/index.html`. Highlights:
 
-- [Quickstart](docs/quickstart.md) — embedding in tests, running standalone.
-- [Architecture](docs/architecture.md) — the layered design.
-- [Indexes](docs/indexes.md) — what `find()` and `aggregate` accelerate,
+- [Quickstart](https://secantusdb.readthedocs.io/en/latest/quickstart.html) — embedding in tests, running standalone.
+- [Architecture](https://secantusdb.readthedocs.io/en/latest/architecture.html) — the layered design.
+- [Indexes](https://secantusdb.readthedocs.io/en/latest/indexes.html) — what `find()` and `aggregate` accelerate,
   `explain` semantics, hints, partial indexes, TTL.
-- [Aggregation](docs/aggregation.md) — supported pipeline stages and
+- [Aggregation](https://secantusdb.readthedocs.io/en/latest/aggregation.html) — supported pipeline stages and
   expression operators.
-- [Compatibility](docs/compatibility.md) — the divergences you should know
+- [Compatibility](https://secantusdb.readthedocs.io/en/latest/compatibility.html) — the divergences you should know
   about before you point an application at SecantusDB.
-- [pymongo validation report](docs/validation-report.md) — per-category
+- [pymongo validation report](https://secantusdb.readthedocs.io/en/latest/validation-report.html) — per-category
   pass / fail / skip rate from running **pymongo's own test suite,
   unmodified**, against SecantusDB. The submodule at
   `vendor/pymongo-tests/` is checked out at the pinned upstream tag with
   zero local edits; a pytest plugin starts an embedded server and points
   pymongo's `DB_IP`/`DB_PORT` at it.
-- [Go-driver validation report](docs/validation-report-go.md) —
+- [Go-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-go.html) —
   same shape against **mongo-go-driver's own test suite, unmodified**.
   Spawns a standalone SecantusDB daemon and runs `go test` with
   `MONGODB_URI` pointed at it. The Go driver underpins `mongodump` /
   `mongorestore` and most non-Python tooling, so this gauge catches
   type-strict wire bugs (int32 vs int64) that pymongo accepts silently.
-- [Node-driver validation report](docs/validation-report-node.md) —
+- [Node-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-node.html) —
   same shape against **mongo-node-driver's own test suite, unmodified**.
   Spawns a standalone SecantusDB daemon and runs mocha with
   `MONGODB_URI` pointed at it. Initial baseline is restricted to
   the import-clean subset of unit tests because of an unrelated
   ESM/TypeScript loader quirk in node-mongodb-native v7.2.0; see
   `node_validation/include_paths.py` for the rationale.
-- [Java-driver validation report](docs/validation-report-java.md) —
+- [Java-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-java.html) —
   same shape against **mongo-java-driver's own test suite, unmodified**.
   Spawns a standalone SecantusDB daemon and invokes the driver's
   bundled `./gradlew` with `-Dorg.mongodb.test.uri=mongodb://...`.
@@ -289,12 +289,12 @@ uv run python -m invoke docs   # build Sphinx docs (warnings as errors)
 
 SecantusDB is dual-licensed:
 
-- **Code** — GPL-2.0-only. See [`LICENSE`](LICENSE). SecantusDB bundles
+- **Code** — GPL-2.0-only. See [`LICENSE`](https://github.com/jdrumgoole/SecantusDB/blob/main/LICENSE). SecantusDB bundles
   the [WiredTiger](https://github.com/wiredtiger/wiredtiger) storage
   engine (itself GPL-2/GPL-3), so the combined work is GPL.
 - **Written content** — [Creative Commons Attribution 4.0
   International (CC-BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
-  See [`LICENSE-DOCS`](LICENSE-DOCS). Covers `README.md`, everything
+  See [`LICENSE-DOCS`](https://github.com/jdrumgoole/SecantusDB/blob/main/LICENSE-DOCS). Covers `README.md`, everything
   under `docs/`, the validation reports, and `pymongo_validation/README.md`.
   Operational instructions to AI assistants (`CLAUDE.md`) and vendored
   third-party content (under `vendor/`) are out of scope.
