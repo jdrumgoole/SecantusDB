@@ -163,14 +163,47 @@ Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_T
 
 Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases, and do **not** edit RTD's default_version through the dashboard — `release-finalize` owns that value. The only sanctioned path is `invoke release-prepare` + `invoke release-finalize` via sub-agent (or `invoke release` for a developer running it directly). The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation, RTD default left dangling).
 
+### Always work on the website from a dedicated worktree
+
+**Never edit `website/` files directly on `main`.** Concurrent `invoke release` runs (often from a parallel Claude session) gate on a clean working tree, and their first move is `git stash push -u -m "auto: parallel session..."` of any uncommitted changes — including all your in-flight website edits. The stash is **never popped back automatically** (the release session has no way to know which Claude was using those files), so any work-in-progress on `main` silently disappears between turns.
+
+Cure: do website work in a separate worktree:
+
+```bash
+git worktree add ../SecantusDB-website -b website-dev   # one-time
+cd ../SecantusDB-website                                # all website edits live here
+ln -sfn /Users/jdrumgoole/GIT/SecantusDB/.venv .venv    # reuse the main repo's venv;
+                                                        # avoids re-building secantusdb
+                                                        # (CMake + WiredTiger) just to
+                                                        # run pelican / boto3
+```
+
+From inside the worktree:
+
+```bash
+cd website
+uv run python -m invoke build --prod         # local build
+uv run python -m invoke publish --message "..."  # commit + push + deploy
+```
+
+When the `website-dev` branch is green, merge to `main` from the worktree (or from main itself):
+
+```bash
+cd /Users/jdrumgoole/GIT/SecantusDB
+git merge --no-ff website-dev -m "Merge website-dev: <what>"
+git push origin main
+```
+
+The worktree stays alive between releases — keep iterating on it. If you ever find website changes have vanished from `main`'s working tree (and you weren't expecting it), look at `git stash list` first: stashes named `auto: parallel session... set aside for X release` are the culprit, and `git stash show -p stash@{N}` will tell you exactly what got shelved. Apply (don't pop, per the global "don't tear down stashes you didn't create" rule) into the worktree to recover.
+
 ### Website-only commits skip the full test suite
 
 The marketing site under `website/` is excluded from sdist/wheel and never touches SecantusDB's runtime code. The global "always run the full test suite before committing" rule does **not** apply to website-only commits — running 700+ pytest tests just to ship a copy edit or a new blog post is wasted compute.
 
-Use the dedicated shortcut (defined in `website/tasks.py`):
+Use the dedicated shortcut (defined in `website/tasks.py`), **from inside the website worktree**:
 
 ```bash
-cd website
+cd ../SecantusDB-website/website
 uv run python -m invoke publish --message "blog: post v0.3.0aN release notes"
 ```
 
