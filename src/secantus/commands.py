@@ -20,6 +20,42 @@ from secantus.auth import (
 )
 from secantus.cursors import CursorNotFound, CursorRegistry
 from secantus.projection import apply_projection
+from secantus.rbac import (
+    A_CHANGE_PASSWORD,
+    A_COLL_MOD,
+    A_COLL_STATS,
+    A_CREATE_COLLECTION,
+    A_CREATE_INDEX,
+    A_CREATE_USER,
+    A_DB_STATS,
+    A_DROP_COLLECTION,
+    A_DROP_DATABASE,
+    A_DROP_INDEX,
+    A_DROP_USER,
+    A_FIND,
+    A_GET_CMD_LINE_OPTS,
+    A_GET_LOG,
+    A_GRANT_ROLE,
+    A_HOST_INFO,
+    A_INSERT,
+    A_KILL_CURSORS,
+    A_LIST_COLLECTIONS,
+    A_LIST_DATABASES,
+    A_LIST_INDEXES,
+    A_REMOVE,
+    A_RENAME_COLL_SAME_DB,
+    A_REVOKE_ROLE,
+    A_SERVER_STATUS,
+    A_UPDATE,
+    A_VIEW_ROLE,
+    A_VIEW_USER,
+    BUILT_IN_ROLES,
+    SCOPE_CLUSTER,
+    SCOPE_COLLECTION,
+    SCOPE_DATABASE,
+    check_privilege,
+    is_known_role,
+)
 from secantus.storage import Storage
 from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 
@@ -1254,12 +1290,18 @@ def _sasl_continue(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     except AuthError as exc:
         conn.scram = None
         return _auth_failure(str(exc))
-    # Successful proof. Mark the principal authenticated and clear the
-    # in-flight conversation. MongoDB returns done=True from the second
-    # server message (skipping the spec's optional 3rd round-trip).
+    # Successful proof. Mark the principal authenticated, capture their
+    # role bindings for RBAC, and clear the in-flight conversation.
+    # MongoDB returns done=True from the second server message
+    # (skipping the spec's optional 3rd round-trip).
     principal = (state.db_name, state.username)
     if principal not in conn.authenticated_principals:
         conn.authenticated_principals.append(principal)
+    record = ctx.storage.get_user(state.db_name, state.username)
+    if record is not None:
+        roles = record.get("roles") or []
+        if isinstance(roles, list):
+            conn.add_principal_roles(roles)
     conn.scram = None
     return {
         "conversationId": state.conversation_id,
@@ -1288,13 +1330,21 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     db_name = ctx.db_name or "admin"
     creds = derive_credentials(pwd)
-    roles = doc.get("roles", []) or []
+    roles_arg = doc.get("roles", []) or []
+    normalised = _normalise_roles_arg(roles_arg, db_name)
+    if normalised is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "createUser: roles must be a list of known roles",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
     record = {
         "_id": f"{db_name}.{username}",
         "user": username,
         "db": db_name,
         "credentials": creds.to_doc(),
-        "roles": list(roles),
+        "roles": normalised,
         "mechanisms": [SCRAM_SHA_256],
     }
     added = ctx.storage.add_user(db_name, username, record, replace=False)
@@ -1327,13 +1377,23 @@ def _drop_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "UserNotFound",
         }
     # Drop any active auth state for this principal on the calling
-    # connection. Other connections keep theirs until they reconnect —
-    # matches mongod's behaviour.
+    # connection — both the principal entry and the role bindings the
+    # connection inherited from this user. Other connections keep
+    # theirs until they reconnect, matching mongod.
     conn = ctx.connection_auth
     if conn is not None:
         conn.authenticated_principals = [
             p for p in conn.authenticated_principals if p != (db_name, username)
         ]
+        # Recompute effective roles by re-fetching the remaining
+        # principals' role bindings. Cheap (small list, infrequent op).
+        conn.effective_roles = []
+        for p_db, p_user in conn.authenticated_principals:
+            other = ctx.storage.get_user(p_db, p_user)
+            if other is not None:
+                roles = other.get("roles") or []
+                if isinstance(roles, list):
+                    conn.add_principal_roles(roles)
     return {"ok": 1.0}
 
 
@@ -1385,6 +1445,184 @@ def _users_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"users": users, "ok": 1.0}
 
 
+def _normalise_roles_arg(arg: Any, default_db: str) -> list[dict[str, str]] | None:
+    """Coerce a ``roles`` argument into the canonical ``[{role, db}]`` shape.
+
+    Accepts the list-of-strings shorthand (``["read", "readWrite"]`` —
+    each implicitly bound to ``default_db``) and the list-of-dicts form.
+    Validates role names against :data:`secantus.rbac.BUILT_IN_ROLES`.
+    Returns ``None`` if any entry is unrecognised — caller surfaces a
+    ``RoleNotFound`` error.
+    """
+    if not isinstance(arg, list):
+        return None
+    out: list[dict[str, str]] = []
+    for entry in arg:
+        if isinstance(entry, str):
+            if not is_known_role(entry):
+                return None
+            out.append({"role": entry, "db": default_db})
+            continue
+        if isinstance(entry, dict):
+            role = entry.get("role")
+            db = entry.get("db", default_db)
+            if not isinstance(role, str) or not isinstance(db, str):
+                return None
+            if not is_known_role(role):
+                return None
+            out.append({"role": role, "db": db})
+            continue
+        return None
+    return out
+
+
+def _grant_roles_to_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    username = doc.get("grantRolesToUser")
+    if not isinstance(username, str) or not username:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantRolesToUser: username (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    roles_arg = doc.get("roles")
+    new_roles = _normalise_roles_arg(roles_arg, db_name)
+    if new_roles is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantRolesToUser: roles must be a list of known roles",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    record = ctx.storage.get_user(db_name, username)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"User '{username}@{db_name}' not found",
+            "code": _USER_NOT_FOUND,
+            "codeName": "UserNotFound",
+        }
+    existing = record.get("roles") or []
+    seen = {(r.get("role"), r.get("db")) for r in existing if isinstance(r, dict)}
+    for r in new_roles:
+        key = (r["role"], r["db"])
+        if key not in seen:
+            existing.append(r)
+            seen.add(key)
+    record["roles"] = existing
+    ctx.storage.add_user(db_name, username, record, replace=True)
+    # Refresh effective roles on this connection if the calling user is
+    # the one that just got granted — the new privileges take effect
+    # immediately, not on the next connection.
+    _refresh_effective_roles(ctx)
+    return {"ok": 1.0}
+
+
+def _revoke_roles_from_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    username = doc.get("revokeRolesFromUser")
+    if not isinstance(username, str) or not username:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokeRolesFromUser: username (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    roles_arg = doc.get("roles")
+    to_revoke = _normalise_roles_arg(roles_arg, db_name)
+    if to_revoke is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokeRolesFromUser: roles must be a list of known roles",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    record = ctx.storage.get_user(db_name, username)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"User '{username}@{db_name}' not found",
+            "code": _USER_NOT_FOUND,
+            "codeName": "UserNotFound",
+        }
+    revoke_keys = {(r["role"], r["db"]) for r in to_revoke}
+    record["roles"] = [
+        r
+        for r in (record.get("roles") or [])
+        if isinstance(r, dict) and (r.get("role"), r.get("db")) not in revoke_keys
+    ]
+    ctx.storage.add_user(db_name, username, record, replace=True)
+    _refresh_effective_roles(ctx)
+    return {"ok": 1.0}
+
+
+def _refresh_effective_roles(ctx: CommandContext) -> None:
+    """Rebuild the connection's effective_roles from current user records.
+
+    Called after `grantRolesToUser` / `revokeRolesFromUser` so the
+    privilege check reflects the change immediately on this connection.
+    Other connections refresh on their next reconnect.
+    """
+    conn = ctx.connection_auth
+    if conn is None:
+        return
+    conn.effective_roles = []
+    for p_db, p_user in conn.authenticated_principals:
+        record = ctx.storage.get_user(p_db, p_user)
+        if record is None:
+            continue
+        roles = record.get("roles") or []
+        if isinstance(roles, list):
+            conn.add_principal_roles(roles)
+
+
+def _roles_info(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    """Return information about built-in roles.
+
+    Custom roles aren't supported (no `createRole` in this slice), so
+    this just enumerates the built-ins. Mongod returns more fields
+    (privileges, inherited roles); we surface name + db + isBuiltin
+    which is enough for tooling that wants to enumerate.
+    """
+    arg = doc.get("rolesInfo")
+    db_name = "admin"
+    show_builtin = bool(doc.get("showBuiltinRoles", False))
+
+    def _entry(role_name: str, role_db: str) -> dict[str, Any]:
+        return {
+            "role": role_name,
+            "db": role_db,
+            "isBuiltin": True,
+            "roles": [],
+            "inheritedRoles": [],
+        }
+
+    out: list[dict[str, Any]] = []
+    if arg == 1 or arg is True:
+        if show_builtin:
+            for name in BUILT_IN_ROLES:
+                out.append(_entry(name, db_name))
+    elif isinstance(arg, str):
+        if is_known_role(arg):
+            out.append(_entry(arg, db_name))
+    elif isinstance(arg, dict):
+        role = arg.get("role")
+        db = arg.get("db", db_name)
+        if isinstance(role, str) and is_known_role(role):
+            out.append(_entry(role, db if isinstance(db, str) else db_name))
+    elif isinstance(arg, list):
+        for entry in arg:
+            if isinstance(entry, str) and is_known_role(entry):
+                out.append(_entry(entry, db_name))
+            elif isinstance(entry, dict):
+                role = entry.get("role")
+                db = entry.get("db", db_name)
+                if isinstance(role, str) and is_known_role(role):
+                    out.append(_entry(role, db if isinstance(db, str) else db_name))
+    return {"roles": out, "ok": 1.0}
+
+
 _HANDLERS: dict[str, CommandHandler] = {
     "hello": _hello,
     "isMaster": _hello,
@@ -1431,6 +1669,9 @@ _HANDLERS: dict[str, CommandHandler] = {
     "createUser": _create_user,
     "dropUser": _drop_user,
     "usersInfo": _users_info,
+    "grantRolesToUser": _grant_roles_to_user,
+    "revokeRolesFromUser": _revoke_roles_from_user,
+    "rolesInfo": _roles_info,
 }
 
 # Commands a connection may invoke before authenticating, when
@@ -1451,6 +1692,119 @@ _PRE_AUTH_COMMANDS = frozenset(
         "hostInfo",
     }
 )
+
+
+# Per-command (action, scope) for the RBAC privilege check. The dispatcher
+# reads this; missing entries default to "no privilege required" so a
+# user with even minimal roles can still invoke them. Adding a new
+# command? Add it here (or to ``_NO_PRIVILEGE_COMMANDS`` for explicit
+# bypasses) — silent permissive defaults are how mongod's auth surface
+# tends to grow accidental privilege escalations, so be deliberate.
+_COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
+    # CRUD
+    "find": (A_FIND, SCOPE_COLLECTION),
+    "count": (A_FIND, SCOPE_COLLECTION),
+    "distinct": (A_FIND, SCOPE_COLLECTION),
+    # $out/$merge stages do their own write-action checks at stage time.
+    "aggregate": (A_FIND, SCOPE_COLLECTION),
+    "explain": (A_FIND, SCOPE_COLLECTION),
+    "insert": (A_INSERT, SCOPE_COLLECTION),
+    "update": (A_UPDATE, SCOPE_COLLECTION),
+    "delete": (A_REMOVE, SCOPE_COLLECTION),
+    "findAndModify": (A_UPDATE, SCOPE_COLLECTION),
+    "findandmodify": (A_UPDATE, SCOPE_COLLECTION),
+    # Cursor lifecycle
+    "killCursors": (A_KILL_CURSORS, SCOPE_COLLECTION),
+    # Index management
+    "listIndexes": (A_LIST_INDEXES, SCOPE_COLLECTION),
+    "createIndexes": (A_CREATE_INDEX, SCOPE_COLLECTION),
+    "dropIndexes": (A_DROP_INDEX, SCOPE_COLLECTION),
+    # DDL
+    "create": (A_CREATE_COLLECTION, SCOPE_DATABASE),
+    "drop": (A_DROP_COLLECTION, SCOPE_COLLECTION),
+    "dropDatabase": (A_DROP_DATABASE, SCOPE_DATABASE),
+    "renameCollection": (A_RENAME_COLL_SAME_DB, SCOPE_COLLECTION),
+    "collMod": (A_COLL_MOD, SCOPE_COLLECTION),
+    # Listings / stats
+    "listCollections": (A_LIST_COLLECTIONS, SCOPE_DATABASE),
+    "listDatabases": (A_LIST_DATABASES, SCOPE_CLUSTER),
+    "dbStats": (A_DB_STATS, SCOPE_DATABASE),
+    "collStats": (A_COLL_STATS, SCOPE_COLLECTION),
+    # User management
+    "createUser": (A_CREATE_USER, SCOPE_DATABASE),
+    "dropUser": (A_DROP_USER, SCOPE_DATABASE),
+    "usersInfo": (A_VIEW_USER, SCOPE_DATABASE),
+    "grantRolesToUser": (A_GRANT_ROLE, SCOPE_DATABASE),
+    "revokeRolesFromUser": (A_REVOKE_ROLE, SCOPE_DATABASE),
+    "rolesInfo": (A_VIEW_ROLE, SCOPE_DATABASE),
+    "updateUser": (A_CHANGE_PASSWORD, SCOPE_DATABASE),
+    # Cluster / introspection
+    "serverStatus": (A_SERVER_STATUS, SCOPE_CLUSTER),
+    "hostInfo": (A_HOST_INFO, SCOPE_CLUSTER),
+    "getCmdLineOpts": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
+    "getLog": (A_GET_LOG, SCOPE_CLUSTER),
+}
+
+
+# Commands that intentionally skip the RBAC check even when auth is on:
+# cursor continuation (the cursor was already authorized at find/aggregate
+# time), session-id administrivia (no real session state), and metadata
+# commands the driver depends on at every connection.
+_NO_PRIVILEGE_COMMANDS = frozenset(
+    {
+        "getMore",
+        "endSessions",
+        "startSession",
+        "refreshSessions",
+        "ping",
+        "ismaster",
+        "isMaster",
+        "hello",
+        "buildInfo",
+        "buildinfo",
+        "whatsmyuri",
+        "saslStart",
+        "saslContinue",
+        "logout",
+        "connectionStatus",
+        # Aborting/committing transactions are no-ops in our surrogate;
+        # gating them by a privilege would only confuse drivers that do
+        # protocol negotiation.
+        "abortTransaction",
+        "commitTransaction",
+    }
+)
+
+
+def _resource_for_command(
+    name: str, doc: dict[str, Any], default_db: str
+) -> tuple[str | None, bool]:
+    """Resolve the target (db, cluster_flag) the action operates on.
+
+    For collection-level commands, ``default_db`` is the connection's
+    current ``$db`` and that's the resource. For ``listCollections`` /
+    ``dropDatabase`` etc. the same applies. Cluster-level commands
+    (``serverStatus``, ``listDatabases``) return ``(None, True)``.
+
+    Some commands have their target db expressed in the request rather
+    than in the connection's ``$db`` — for instance ``renameCollection``
+    on the admin db with a ``renameCollection: "src.coll"`` namespace
+    string. We pull those out specifically to avoid mis-attributing
+    privileges to the admin db.
+    """
+    info = _COMMAND_ACTIONS.get(name)
+    if info is None:
+        return default_db, False
+    _action, scope = info
+    if scope == SCOPE_CLUSTER:
+        return None, True
+    # ``renameCollection: "src.coll"`` — the source db is the namespace
+    # prefix, not the connection's $db.
+    if name == "renameCollection":
+        ns = doc.get("renameCollection")
+        if isinstance(ns, str) and "." in ns:
+            return ns.split(".", 1)[0], False
+    return default_db, False
 
 
 def command_name(doc: dict[str, Any]) -> str:
@@ -1478,6 +1832,38 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 13,
             "codeName": "Unauthorized",
         }
+    # RBAC privilege check. Active only when ``--auth`` is on; without
+    # auth, any client can do anything (the legacy default-allow mode).
+    # Pre-auth commands (handshake, SCRAM round-trip) and explicitly
+    # exempt commands (cursor continuation, session admin) bypass the
+    # check. Everything else needs an action grant from the principal's
+    # role bindings.
+    if (
+        ctx.require_auth
+        and ctx.connection_auth is not None
+        and ctx.connection_auth.is_authenticated
+        and name not in _NO_PRIVILEGE_COMMANDS
+        and name not in _PRE_AUTH_COMMANDS
+    ):
+        info = _COMMAND_ACTIONS.get(name)
+        if info is not None:
+            action, scope = info
+            target_db, cluster = _resource_for_command(name, doc, ctx.db_name or "admin")
+            if not check_privilege(
+                ctx.connection_auth.effective_roles,
+                action,
+                target_db=target_db,
+                cluster=cluster,
+            ):
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"not authorized on {target_db or 'cluster'} to "
+                        f"execute command (action: {action})"
+                    ),
+                    "code": 13,
+                    "codeName": "Unauthorized",
+                }
     try:
         return handler(doc, ctx)
     except Exception as exc:

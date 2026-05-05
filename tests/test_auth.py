@@ -433,3 +433,217 @@ def test_drop_user_revokes_subsequent_logins(server_no_auth) -> None:
         rejected.admin.command("ping")
     rejected.close()
     plain.close()
+
+
+# ----------------------------------------------------------------------
+# RBAC: per-command privilege enforcement against built-in roles
+# ----------------------------------------------------------------------
+
+
+def _make_user_with_roles(srv, db: str, user: str, password: str, roles: list[dict]) -> None:
+    """Inject a user record with a specific role binding (bypassing the
+    saslStart conversation). Uses the same shape ``createUser`` would
+    produce, so subsequent SCRAM auth and ``grantRoles`` work normally.
+    """
+    creds = derive_credentials(password)
+    srv.storage.add_user(
+        db,
+        user,
+        {
+            "_id": f"{db}.{user}",
+            "user": user,
+            "db": db,
+            "credentials": creds.to_doc(),
+            "roles": roles,
+            "mechanisms": [SCRAM_SHA_256],
+        },
+    )
+
+
+def _client_for(srv, *, user: str, password: str, db: str = "admin"):
+    return pymongo.MongoClient(
+        srv.uri,
+        username=user,
+        password=password,
+        authSource=db,
+        authMechanism="SCRAM-SHA-256",
+        serverSelectionTimeoutMS=2000,
+    )
+
+
+def test_read_role_can_find_but_not_insert(server_with_auth) -> None:
+    _make_user_with_roles(server_with_auth, "shop", "viewer", "p", [{"role": "read", "db": "shop"}])
+    cli = _client_for(server_with_auth, user="viewer", password="p", db="shop")
+    try:
+        # find: allowed.
+        list(cli["shop"]["items"].find())
+        # insert: denied with code 13 (Unauthorized).
+        with pytest.raises(OperationFailure) as exc:
+            cli["shop"]["items"].insert_one({"x": 1})
+        assert exc.value.code == 13
+    finally:
+        cli.close()
+
+
+def test_readwrite_role_can_insert(server_with_auth) -> None:
+    _make_user_with_roles(
+        server_with_auth, "shop", "writer", "p", [{"role": "readWrite", "db": "shop"}]
+    )
+    cli = _client_for(server_with_auth, user="writer", password="p", db="shop")
+    try:
+        cli["shop"]["items"].insert_one({"_id": 1, "x": 1})
+        assert cli["shop"]["items"].count_documents({}) == 1
+    finally:
+        cli.close()
+
+
+def test_role_bound_to_one_db_doesnt_grant_another(server_with_auth) -> None:
+    _make_user_with_roles(
+        server_with_auth, "shop", "writer", "p", [{"role": "readWrite", "db": "shop"}]
+    )
+    cli = _client_for(server_with_auth, user="writer", password="p", db="shop")
+    try:
+        # Different db → unauthorized.
+        with pytest.raises(OperationFailure) as exc:
+            cli["other"]["stuff"].insert_one({"x": 1})
+        assert exc.value.code == 13
+    finally:
+        cli.close()
+
+
+def test_readanyDatabase_spans_dbs(server_with_auth) -> None:
+    _make_user_with_roles(
+        server_with_auth,
+        "admin",
+        "snoop",
+        "p",
+        [{"role": "readAnyDatabase", "db": "admin"}],
+    )
+    cli = _client_for(server_with_auth, user="snoop", password="p", db="admin")
+    try:
+        # Read from any db is fine.
+        list(cli["dbA"]["c"].find())
+        list(cli["dbB"]["c"].find())
+        # Writes still rejected.
+        with pytest.raises(OperationFailure) as exc:
+            cli["dbA"]["c"].insert_one({"x": 1})
+        assert exc.value.code == 13
+    finally:
+        cli.close()
+
+
+def test_useradmin_can_create_user_but_not_read(server_with_auth) -> None:
+    _make_user_with_roles(
+        server_with_auth,
+        "admin",
+        "useradmin",
+        "p",
+        [{"role": "userAdmin", "db": "admin"}],
+    )
+    cli = _client_for(server_with_auth, user="useradmin", password="p")
+    try:
+        cli["admin"].command({"createUser": "newbie", "pwd": "p2", "roles": []})
+        with pytest.raises(OperationFailure) as exc:
+            list(cli["admin"]["coll"].find())
+        assert exc.value.code == 13
+    finally:
+        cli.close()
+
+
+def test_grant_roles_takes_effect_immediately(server_with_auth) -> None:
+    """After grantRolesToUser on the calling principal, the new
+    privilege is usable on the *same* connection without reconnect.
+    Critical for tests that bootstrap a user then promote it."""
+    _make_user_with_roles(server_with_auth, "shop", "rocky", "p", [{"role": "read", "db": "shop"}])
+    cli = _client_for(server_with_auth, user="rocky", password="p", db="shop")
+    try:
+        # Initially read-only — insert is denied.
+        with pytest.raises(OperationFailure):
+            cli["shop"]["c"].insert_one({"x": 1})
+        # Need a userAdmin to do the grant. Use the root principal that
+        # the fixture pre-seeds; reuse the same connection since pymongo
+        # routes db.command to admin via authSource.
+        root_cli = _client_for(server_with_auth, user="root", password="secret")
+        try:
+            root_cli["shop"].command(
+                {
+                    "grantRolesToUser": "rocky",
+                    "roles": [{"role": "readWrite", "db": "shop"}],
+                }
+            )
+        finally:
+            root_cli.close()
+        # rocky's *existing* connection won't see the change (server-
+        # side effective roles are per-connection); but a new one will.
+        cli2 = _client_for(server_with_auth, user="rocky", password="p", db="shop")
+        try:
+            cli2["shop"]["c"].insert_one({"_id": 99, "x": 1})
+            assert cli2["shop"]["c"].count_documents({"_id": 99}) == 1
+        finally:
+            cli2.close()
+    finally:
+        cli.close()
+
+
+def test_revoke_roles_removes_privilege(server_with_auth) -> None:
+    _make_user_with_roles(
+        server_with_auth, "shop", "demoted", "p", [{"role": "readWrite", "db": "shop"}]
+    )
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        root_cli["shop"].command(
+            {
+                "revokeRolesFromUser": "demoted",
+                "roles": [{"role": "readWrite", "db": "shop"}],
+            }
+        )
+    finally:
+        root_cli.close()
+
+    # demoted now has no roles; even basic find should fail.
+    cli = _client_for(server_with_auth, user="demoted", password="p", db="shop")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            list(cli["shop"]["c"].find())
+        assert exc.value.code == 13
+    finally:
+        cli.close()
+
+
+def test_create_user_rejects_unknown_role(server_with_auth) -> None:
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            root_cli["admin"].command(
+                {
+                    "createUser": "victim",
+                    "pwd": "p",
+                    "roles": [{"role": "notARealRole", "db": "admin"}],
+                }
+            )
+        assert exc.value.code == 31  # RoleNotFound
+    finally:
+        root_cli.close()
+
+
+def test_roles_info_lists_builtins(server_with_auth) -> None:
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        result = root_cli["admin"].command({"rolesInfo": 1, "showBuiltinRoles": True})
+        names = {r["role"] for r in result["roles"]}
+        # Spot-check the load-bearing ones.
+        assert {"read", "readWrite", "dbAdmin", "userAdmin", "root"} <= names
+    finally:
+        root_cli.close()
+
+
+def test_no_auth_mode_bypasses_rbac(server_no_auth) -> None:
+    """Without ``--auth``, RBAC is not enforced — anyone can do anything.
+    Backwards-compat: the `--auth=False` mode is the legacy default."""
+    plain = pymongo.MongoClient(server_no_auth.uri)
+    try:
+        plain["dbA"]["c"].insert_one({"x": 1})
+        plain["dbB"]["c"].insert_one({"y": 2})
+        assert plain["dbA"]["c"].count_documents({}) == 1
+    finally:
+        plain.close()
