@@ -561,9 +561,29 @@ def _stage_lookup(
     foreign_field = spec.get("foreignField")
     if not (isinstance(local_field, str) and isinstance(foreign_field, str)):
         raise AggregateError("$lookup requires localField+foreignField, or pipeline form")
+
+    # Index-driven path: when the foreign collection has a non-multikey
+    # single-field index on the foreign field, do per-outer-doc lookups
+    # via Storage.find_matching. The query goes through the existing
+    # picker, so it lands as IXSCAN. This skips materialising the whole
+    # foreign collection in memory and turns the join from O(N+M) into
+    # O(M log N) with a much smaller constant for selective queries.
+    if _foreign_field_has_simple_index(ctx.storage, ctx.db_name, from_coll, foreign_field):
+        out: list[dict[str, Any]] = []
+        for doc in docs:
+            local_value = get_path(doc, local_field)
+            matches_list = _index_join_lookup(
+                ctx.storage, ctx.db_name, from_coll, foreign_field, local_value
+            )
+            new = copy.deepcopy(doc)
+            new[as_field] = matches_list
+            out.append(new)
+        return out
+
+    # Fallback: materialise the foreign collection and hash-join.
     foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
     join_index = _build_lookup_index(foreign_docs, foreign_field)
-    out: list[dict[str, Any]] = []
+    out = []
     for doc in docs:
         local_value = get_path(doc, local_field)
         matches_list = _hash_join_lookup(local_value, foreign_docs, foreign_field, join_index)
@@ -583,20 +603,44 @@ def _stage_lookup_pipeline(
     full_spec: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     assert ctx.storage is not None
-    foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
     local_field = full_spec.get("localField")
     foreign_field = full_spec.get("foreignField")
-    join_index = (
-        _build_lookup_index(foreign_docs, foreign_field) if isinstance(foreign_field, str) else None
+
+    # When localField + foreignField are also given (the simple-form-
+    # plus-pipeline mix), the simple-form join pre-filters the candidates
+    # fed into the sub-pipeline. Use the index when available; fall back
+    # to materialising the foreign collection for the hash-join.
+    use_index = isinstance(foreign_field, str) and _foreign_field_has_simple_index(
+        ctx.storage, ctx.db_name, from_coll, foreign_field
     )
+    foreign_docs: list[dict[str, Any]] | None = None
+    join_index: _LookupIndex | None = None
+    if not use_index:
+        foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
+        join_index = (
+            _build_lookup_index(foreign_docs, foreign_field)
+            if isinstance(foreign_field, str)
+            else None
+        )
+
     out: list[dict[str, Any]] = []
     for doc in docs:
         bound = {name: evaluate(expr, doc, ctx.vars) for name, expr in let_spec.items()}
         if isinstance(local_field, str) and isinstance(foreign_field, str):
             local_value = get_path(doc, local_field)
-            assert join_index is not None
-            candidates = _hash_join_lookup(local_value, foreign_docs, foreign_field, join_index)
+            if use_index:
+                assert ctx.storage is not None
+                candidates = _index_join_lookup(
+                    ctx.storage, ctx.db_name, from_coll, foreign_field, local_value
+                )
+            else:
+                assert foreign_docs is not None and join_index is not None
+                candidates = _hash_join_lookup(local_value, foreign_docs, foreign_field, join_index)
         else:
+            # No localField/foreignField: pure pipeline form. We have
+            # to feed the entire foreign collection in.
+            if foreign_docs is None:
+                foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
             candidates = list(foreign_docs)
         sub_ctx = ctx.with_vars(bound)
         joined = apply_pipeline(candidates, sub_pipeline, sub_ctx)
@@ -604,6 +648,61 @@ def _stage_lookup_pipeline(
         new[as_field] = joined
         out.append(new)
     return out
+
+
+def _foreign_field_has_simple_index(storage: Storage, db: str, coll: str, field: str) -> bool:
+    """Is there a single-field, non-multikey index on ``coll.field`` we
+    can drive `$lookup` through?
+
+    Multikey indexes are ineligible because Storage's pickers skip them
+    (find_matching falls back to a full scan), so a per-outer-doc loop
+    against a multikey-indexed foreign field is O(M*N) — strictly worse
+    than the existing hash-join. Compound indexes also disqualify; the
+    leading-field-only equality lookup is already part of Storage's
+    routing but the safe-perf rule here is "exact-shape match only".
+    """
+    try:
+        indexes = storage.list_indexes(db, coll)
+    except Exception:
+        return False
+    for ix in indexes:
+        key = ix.get("key", {})
+        if not isinstance(key, Mapping):
+            continue
+        if list(key.keys()) != [field]:
+            continue
+        # Direction (1 / -1) is fine — the storage range scan handles
+        # ASC and DESC. Multikey or geo flags disqualify.
+        value = key[field]
+        if not (isinstance(value, int) or value in (1, -1)):
+            continue
+        if ix.get("multikey"):
+            continue
+        return True
+    return False
+
+
+def _index_join_lookup(
+    storage: Storage,
+    db: str,
+    coll: str,
+    foreign_field: str,
+    local_value: Any,
+) -> list[dict[str, Any]]:
+    """Find the foreign docs whose ``foreign_field`` matches ``local_value``.
+
+    Equivalent to the hash-join's per-outer-doc step but routes through
+    Storage.find_matching so the existing index picker decides between
+    IXSCAN and COLLSCAN. For array local values we use ``$in`` so the
+    single index lookup covers all elements.
+    """
+    if isinstance(local_value, list):
+        # Empty list never matches anything (mirrors mongod's $in: []
+        # semantics) — short-circuit instead of a wasted query.
+        if not local_value:
+            return []
+        return storage.find_matching(db, coll, {foreign_field: {"$in": list(local_value)}})
+    return storage.find_matching(db, coll, {foreign_field: local_value})
 
 
 class _LookupIndex:
