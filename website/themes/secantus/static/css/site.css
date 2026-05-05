@@ -124,10 +124,10 @@ pre code { background: transparent; padding: 0; }
 /* Mark (shield) is the small "icon" half of the lockup; wordmark text
    is the visually-dominant half — keep this asymmetry on purpose. */
 .site-header .logo-mark { height: 40px; }
-.site-header .logo-wordmark { height: 56px; }
+.site-header .logo-wordmark { height: 39px; }   /* 56 × 0.70 ≈ 39 */
 @media (max-width: 720px) {
   .site-header .logo-mark { height: 28px; }
-  .site-header .logo-wordmark { height: 38px; }
+  .site-header .logo-wordmark { height: 27px; } /* 38 × 0.70 ≈ 27 */
 }
 .site-nav {
   display: flex;
