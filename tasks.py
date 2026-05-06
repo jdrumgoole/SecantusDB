@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
@@ -24,13 +25,16 @@ def test(c: Context, k: str = "", verbose: bool = False) -> None:
     if verbose:
         cmd += " -v"
     if k:
-        cmd += f" -k {k!r}"
+        # shlex.quote — `f"{k!r}"` uses Python repr() which wraps in
+        # single quotes but doesn't escape embedded single quotes,
+        # leaving a shell-injection hole on a CLI-supplied filter.
+        cmd += f" -k {shlex.quote(k)}"
     c.run(cmd, pty=True)
 
 
 @task(name="test-one")
 def test_one(c: Context, nodeid: str) -> None:
-    c.run(f"uv run python -m pytest -p no:xdist {nodeid!r}", pty=True)
+    c.run(f"uv run python -m pytest -p no:xdist {shlex.quote(nodeid)}", pty=True)
 
 
 @task
@@ -69,7 +73,10 @@ def fmt(c: Context) -> None:
 
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
-    c.run(f"uv run python -m secantus --host {host} --port {port}", pty=True)
+    c.run(
+        f"uv run python -m secantus --host {shlex.quote(host)} --port {int(port)}",
+        pty=True,
+    )
 
 
 @task(
@@ -105,8 +112,9 @@ def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
     # for a docs build.
     if clean:
         c.run("rm -rf docs/_build", pty=True)
+    qb = shlex.quote(builder)
     c.run(
-        f"uv run --no-sync sphinx-build -W --keep-going -b {builder} docs docs/_build/{builder}",
+        f"uv run --no-sync sphinx-build -W --keep-going -b {qb} docs docs/_build/{qb}",
         pty=True,
     )
 

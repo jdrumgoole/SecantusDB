@@ -85,6 +85,11 @@ class State:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
+        # 0600 — the file holds account-specific resource IDs (bucket
+        # name, distribution ID, hosted-zone ID, cert ARN). Not secrets
+        # in the credential sense, but reconnaissance value on a shared
+        # machine.
+        self.path.chmod(0o600)
 
     def set(self, key: str, value: str) -> None:
         self.data[key] = value

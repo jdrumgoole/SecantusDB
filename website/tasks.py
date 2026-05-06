@@ -23,6 +23,7 @@ Run from the ``website/`` directory.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import sys
@@ -193,7 +194,9 @@ def infra_up(c: Context, domain: str = "secantusdb.com") -> None:
     _ensure_venv()
     aws_script = HERE / "infra" / "aws.py"
     c.run(
-        f"{PYTHON} {aws_script} up --domain {domain} --state-file {STATE_FILE}",
+        f"{shlex.quote(PYTHON)} {shlex.quote(str(aws_script))} up"
+        f" --domain {shlex.quote(domain)}"
+        f" --state-file {shlex.quote(str(STATE_FILE))}",
         pty=True,
     )
 
@@ -204,7 +207,9 @@ def infra_down(c: Context, domain: str = "secantusdb.com") -> None:
     _ensure_venv()
     aws_script = HERE / "infra" / "aws.py"
     c.run(
-        f"{PYTHON} {aws_script} down --domain {domain} --state-file {STATE_FILE}",
+        f"{shlex.quote(PYTHON)} {shlex.quote(str(aws_script))} down"
+        f" --domain {shlex.quote(domain)}"
+        f" --state-file {shlex.quote(str(STATE_FILE))}",
         pty=True,
     )
 
@@ -224,17 +229,20 @@ def deploy(c: Context) -> None:
 
     deploy_script = HERE / "infra" / "aws.py"
     print(f"=== Syncing to s3://{bucket}/ ===")
+    # shlex.quote every interpolated value — bucket / distribution_id are
+    # read from aws-state.json, which is gitignored / on-disk only, but a
+    # poisoned state file should not become a code-execution path.
     c.run(
-        f"{PYTHON} {deploy_script} sync"
-        f" --bucket {bucket}"
-        f" --source {OUTPUT}",
+        f"{shlex.quote(PYTHON)} {shlex.quote(str(deploy_script))} sync"
+        f" --bucket {shlex.quote(bucket)}"
+        f" --source {shlex.quote(str(OUTPUT))}",
         pty=True,
     )
 
     print(f"=== Invalidating CloudFront distribution {distribution_id} ===")
     c.run(
-        f"{PYTHON} {deploy_script} invalidate"
-        f" --distribution-id {distribution_id}",
+        f"{shlex.quote(PYTHON)} {shlex.quote(str(deploy_script))} invalidate"
+        f" --distribution-id {shlex.quote(distribution_id)}",
         pty=True,
     )
     print(f"\nDone. https://{state.get('domain', 'secantusdb.com')}/")
@@ -287,22 +295,44 @@ def publish(c: Context, message: str = "") -> None:
             'invoke publish --message "what changed"'
         )
 
-    porcelain = _git(c, "status --porcelain=v1")
+    # `--porcelain=v1 -z` emits NUL-separated entries with no trailing
+    # newline. Plain `--porcelain=v1` is line-oriented, which makes a
+    # filename containing `\n` split into multiple "lines" and bypasses
+    # the path-prefix allowlist. -z is the POSIX-safe form.
+    porcelain = _git(c, "status --porcelain=v1 -z")
     if not porcelain:
         raise SystemExit("nothing to publish — working tree is clean")
 
     bad: list[str] = []
     paths_to_add: list[str] = []
-    for line in porcelain.splitlines():
+    entries = [e for e in porcelain.split("\0") if e]
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 3:
+            continue
+        status = entry[:2]
+        path = entry[3:]
+        # `R<score>` / `C<score>` (rename/copy) is followed by a second
+        # entry containing the OLD path — consume and skip it.
+        if status[0] in ("R", "C") and i < len(entries):
+            i += 1
         # Skip vendor submodule drift markers (' m vendor/...') — the
         # global rule tolerates those.
-        if line.startswith(" m vendor/") or line.startswith(" M vendor/"):
+        if status in (" m", " M") and path.startswith("vendor/"):
             continue
-        # `git status --porcelain` rows are 'XY path'.
-        path = line[3:].strip()
-        if path.startswith('"') and path.endswith('"'):
-            path = path[1:-1]
-        if not path.startswith(_PUBLISH_ALLOWED_PREFIXES):
+        # Normalize before the prefix check so `website/../src/...` (which
+        # lexically passes `startswith("website/")`) doesn't sneak through.
+        # `os.path.normpath` collapses `..` segments — `website/../src/x`
+        # normalizes to `src/x` which won't match the allowlist.
+        norm = os.path.normpath(path)
+        if norm.startswith("..") or os.path.isabs(norm):
+            # Defense-in-depth: a path that escapes the repo root is
+            # never something publish should ship.
+            bad.append(path)
+            continue
+        if not norm.startswith(_PUBLISH_ALLOWED_PREFIXES):
             bad.append(path)
         else:
             paths_to_add.append(path)
