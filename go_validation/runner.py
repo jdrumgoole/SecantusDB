@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-from .include_packages import INCLUDE
+from .include_packages import INCLUDE, SKIP_PATTERNS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-go-driver"
@@ -76,16 +76,20 @@ def main() -> int:
     host = "127.0.0.1"
     port = _find_free_port()
     daemon_cmd = [
-        sys.executable, "-m", "secantus",
-        "--host", host,
-        "--port", str(port),
-        "--storage-path", ":memory:",
-        "--log-level", "WARNING",
+        sys.executable,
+        "-m",
+        "secantus",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--storage-path",
+        ":memory:",
+        "--log-level",
+        "WARNING",
     ]
     print(f"go_validation: starting daemon on {host}:{port}", file=sys.stderr)
-    daemon = subprocess.Popen(
-        daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-    )
+    daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         _wait_for_listener(host, port)
 
@@ -93,16 +97,16 @@ def main() -> int:
         env["MONGODB_URI"] = f"mongodb://{host}:{port}"
         env.setdefault("REQUIRE_API_VERSION", "false")
 
-        cmd = ["go", "test", "-json", "-count=1", *INCLUDE]
+        cmd = ["go", "test", "-json", "-count=1"]
+        if SKIP_PATTERNS:
+            cmd.append(f"-skip={'|'.join(SKIP_PATTERNS)}")
+        cmd.extend(INCLUDE)
         print(
-            f"go_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(MONGODB_URI={env['MONGODB_URI']})",
+            f"go_validation: `{' '.join(cmd)}` in {VENDOR} (MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
         with RAW_OUT.open("w") as out:
-            proc = subprocess.run(
-                cmd, cwd=VENDOR, env=env, stdout=out, stderr=subprocess.PIPE
-            )
+            proc = subprocess.run(cmd, cwd=VENDOR, env=env, stdout=out, stderr=subprocess.PIPE)
         if proc.stderr:
             sys.stderr.buffer.write(proc.stderr)
 

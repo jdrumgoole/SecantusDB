@@ -23,6 +23,7 @@ from secantus.cursors import CursorNotFound, CursorRegistry
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.projection import apply_projection
+from secantus.query import matches
 from secantus.rbac import (
     A_CHANGE_PASSWORD,
     A_COLL_MOD,
@@ -985,10 +986,33 @@ def _list_collections(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
     }
 
 
-def _list_databases(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+def _list_databases(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """List databases honouring ``filter``, ``nameOnly``, ``authorizedDatabases``.
+
+    The ``filter`` document is a regular query predicate evaluated
+    against each per-database descriptor (``{name, sizeOnDisk,
+    empty}``). ``nameOnly: true`` strips the size/empty fields from
+    each entry — drivers use this when they only care about names.
+    ``authorizedDatabases`` is accepted for wire compatibility but
+    has no effect (we don't gate listing by per-db privileges in the
+    initial RBAC slice).
+    """
     names = ctx.storage.list_databases()
+    name_only = bool(doc.get("nameOnly", False))
+    filter_doc = doc.get("filter")
+
+    descriptors: list[dict[str, Any]] = [
+        {"name": n, "sizeOnDisk": 0, "empty": False} for n in names
+    ]
+
+    if isinstance(filter_doc, dict) and filter_doc:
+        descriptors = [d for d in descriptors if matches(d, filter_doc)]
+
+    if name_only:
+        descriptors = [{"name": d["name"]} for d in descriptors]
+
     return {
-        "databases": [{"name": n, "sizeOnDisk": 0, "empty": False} for n in names],
+        "databases": descriptors,
         "totalSize": 0,
         "ok": 1.0,
     }
