@@ -13,7 +13,6 @@ from secantus.admin.sampler import (
     compute_delta,
 )
 
-
 # ---- compute_delta ---------------------------------------------------------
 
 
@@ -54,10 +53,25 @@ def test_build_sample_projects_wire_shape() -> None:
     snap = {
         "uptime": 42,
         "connections": {"current": 3, "totalCreated": 7},
-        "opcounters": {"insert": 5, "query": 10, "update": 1, "delete": 0, "getmore": 2, "command": 8},
+        "opcounters": {
+            "insert": 5,
+            "query": 10,
+            "update": 1,
+            "delete": 0,
+            "getmore": 2,
+            "command": 8,
+        },
         "network": {"numRequests": 50},
     }
-    delta = {"insert": 1, "query": 2, "update": 0, "delete": 0, "getmore": 0, "command": 1, "requests": 4}
+    delta = {
+        "insert": 1,
+        "query": 2,
+        "update": 0,
+        "delete": 0,
+        "getmore": 0,
+        "command": 1,
+        "requests": 4,
+    }
     s = build_sample(123.45, snap, delta)
     assert s["ts"] == 123.45
     assert s["uptime"] == 42
@@ -119,13 +133,27 @@ async def test_sampler_tick_once_pushes_to_hub() -> None:
             {
                 "uptime": 1,
                 "connections": {"current": 1, "totalCreated": 1},
-                "opcounters": {"insert": 0, "query": 0, "update": 0, "delete": 0, "getmore": 0, "command": 0},
+                "opcounters": {
+                    "insert": 0,
+                    "query": 0,
+                    "update": 0,
+                    "delete": 0,
+                    "getmore": 0,
+                    "command": 0,
+                },
                 "network": {"numRequests": 0},
             },
             {
                 "uptime": 2,
                 "connections": {"current": 1, "totalCreated": 1},
-                "opcounters": {"insert": 3, "query": 5, "update": 0, "delete": 0, "getmore": 0, "command": 1},
+                "opcounters": {
+                    "insert": 3,
+                    "query": 5,
+                    "update": 0,
+                    "delete": 0,
+                    "getmore": 0,
+                    "command": 1,
+                },
                 "network": {"numRequests": 9},
             },
         ]
@@ -156,7 +184,14 @@ async def test_sampler_history_capped() -> None:
             {
                 "uptime": i,
                 "connections": {"current": 0, "totalCreated": 0},
-                "opcounters": {"insert": i, "query": 0, "update": 0, "delete": 0, "getmore": 0, "command": 0},
+                "opcounters": {
+                    "insert": i,
+                    "query": 0,
+                    "update": 0,
+                    "delete": 0,
+                    "getmore": 0,
+                    "command": 0,
+                },
                 "network": {"numRequests": 0},
             }
             for i in range(10)

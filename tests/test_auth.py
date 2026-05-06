@@ -17,6 +17,7 @@ import hmac
 
 import pymongo
 import pytest
+from pymongo import monitoring
 from pymongo.errors import OperationFailure
 
 from secantus import SecantusDBServer
@@ -752,3 +753,82 @@ def test_update_user_unknown_user_errors(server_with_auth) -> None:
         assert exc.value.code == 11
     finally:
         root_cli.close()
+
+
+# ----------------------------------------------------------------------
+# Speculative authentication
+# ----------------------------------------------------------------------
+
+
+class _SaslListener(monitoring.CommandListener):
+    """Captures the names of commands pymongo actually sends to the
+    server. With speculative auth working, an authenticated client
+    should produce a single ``saslContinue`` for the SCRAM proof —
+    no ``saslStart``, because the client folded that into ``hello``.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def started(self, event):  # type: ignore[override]
+        if event.command_name in ("saslStart", "saslContinue"):
+            self.events.append(event.command_name)
+
+    def succeeded(self, event):  # type: ignore[override]
+        pass
+
+    def failed(self, event):  # type: ignore[override]
+        pass
+
+
+def test_speculative_auth_skips_explicit_saslstart(server_with_auth) -> None:
+    """The client's first SCRAM round-trip rides inside ``hello``.
+
+    pymongo (4.x) sends ``hello`` with ``speculativeAuthenticate``
+    populated. If the server replies with a matching
+    ``speculativeAuthenticate`` body, pymongo skips its own
+    ``saslStart`` — only ``saslContinue`` should appear on the wire.
+    Mirrors pymongo's own ``test_scram_skip_empty_exchange``.
+    """
+    listener = _SaslListener()
+    cli = pymongo.MongoClient(
+        server_with_auth.uri,
+        username="root",
+        password="secret",
+        authSource="admin",
+        authMechanism=SCRAM_SHA_256,
+        event_listeners=[listener],
+    )
+    try:
+        # Force an authenticated round-trip so the SCRAM exchange
+        # actually fires; without this the connection is lazy.
+        cli.admin.command("ping")
+    finally:
+        cli.close()
+
+    assert listener.events == ["saslContinue"], (
+        f"expected only saslContinue (saslStart was speculatively folded into hello), "
+        f"got {listener.events!r}"
+    )
+
+
+def test_speculative_auth_wrong_password_falls_back_cleanly(server_with_auth) -> None:
+    """A wrong password in the speculative payload must not crash hello.
+
+    The server omits the ``speculativeAuthenticate`` field on a bad
+    payload, the client falls back to explicit saslStart, gets an
+    AuthenticationFailed back, and surfaces ``OperationFailure``.
+    """
+    cli = pymongo.MongoClient(
+        server_with_auth.uri,
+        username="root",
+        password="wrong",
+        authSource="admin",
+        authMechanism=SCRAM_SHA_256,
+        serverSelectionTimeoutMS=2000,
+    )
+    try:
+        with pytest.raises(OperationFailure):
+            cli.admin.command("ping")
+    finally:
+        cli.close()

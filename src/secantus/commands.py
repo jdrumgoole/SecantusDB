@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as _dt
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import bson
@@ -159,7 +159,49 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # Tell the client this server has access control on so it knows
         # to treat the connection as needing auth before commands flow.
         response["accessControlEnabled"] = True
+    # Speculative authentication: pymongo / mongo-go-driver fold the
+    # SCRAM client-first message into the `hello` body. We pull it
+    # back out, run it through the regular `saslStart` handler, and
+    # attach the reply under `speculativeAuthenticate`. The client
+    # then skips its own saslStart and goes straight to saslContinue
+    # — saving one wire round-trip on every connect.
+    spec = doc.get("speculativeAuthenticate")
+    if isinstance(spec, dict):
+        spec_reply = _speculative_auth(spec, ctx)
+        if spec_reply is not None:
+            response["speculativeAuthenticate"] = spec_reply
     return response
+
+
+def _speculative_auth(spec: dict[str, Any], ctx: CommandContext) -> dict[str, Any] | None:
+    """Run the SCRAM saslStart that's been folded into a `hello`.
+
+    The inner document carries `saslStart`, `mechanism`, `payload`,
+    `db`. We synthesize a regular saslStart command from it (with
+    `db_name` overridden to the spec's `db`) and run the existing
+    handler. On failure we return ``None`` rather than the error
+    envelope — the client treats a missing `speculativeAuthenticate`
+    field as "speculation rejected, fall back to explicit
+    saslStart", which is the right UX (a typo'd password shouldn't
+    abort the whole hello).
+    """
+    if "saslStart" not in spec:
+        return None
+    inner_doc = {
+        "saslStart": 1,
+        "mechanism": spec.get("mechanism"),
+        "payload": spec.get("payload"),
+    }
+    # `db` defaults to "admin" for spec auth. Run saslStart with a
+    # context cloned to that database so credential lookup hits the
+    # right user table.
+    spec_db = spec.get("db") if isinstance(spec.get("db"), str) else "admin"
+    spec_ctx = replace(ctx, db_name=spec_db)
+    reply = _sasl_start(inner_doc, spec_ctx)
+    if reply.get("ok") != 1.0:
+        # Speculation failed — let the client retry explicitly.
+        return None
+    return reply
 
 
 def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
