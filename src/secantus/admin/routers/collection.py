@@ -136,11 +136,11 @@ def _resolve_doc(request: Request, db: str, coll: str, id_token: str) -> tuple[A
     try:
         doc_id = decode_doc_id(id_token)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=f"bad document id token: {exc}")
+        raise HTTPException(status_code=404, detail=f"bad document id token: {exc}") from exc
     try:
         doc = request.app.state.mongo.get_doc(db, coll, doc_id)
     except MongoError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
     return doc_id, doc
@@ -150,9 +150,7 @@ def _resolve_doc(request: Request, db: str, coll: str, id_token: str) -> tuple[A
     "/db/{db}/{coll}/docs/{id_token}/edit",
     response_class=HTMLResponse,
 )
-def edit_doc_form(
-    request: Request, db: str, coll: str, id_token: str
-) -> HTMLResponse:
+def edit_doc_form(request: Request, db: str, coll: str, id_token: str) -> HTMLResponse:
     doc_id, doc = _resolve_doc(request, db, coll, id_token)
     templates = _templates(request)
     return templates.TemplateResponse(
@@ -183,7 +181,7 @@ def replace_doc(
     try:
         doc_id = decode_doc_id(id_token)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=f"bad document id token: {exc}")
+        raise HTTPException(status_code=404, detail=f"bad document id token: {exc}") from exc
 
     templates = _templates(request)
 
@@ -240,9 +238,7 @@ def replace_doc(
     "/db/{db}/{coll}/docs/{id_token}/delete-confirm",
     response_class=HTMLResponse,
 )
-def delete_doc_confirm(
-    request: Request, db: str, coll: str, id_token: str
-) -> HTMLResponse:
+def delete_doc_confirm(request: Request, db: str, coll: str, id_token: str) -> HTMLResponse:
     doc_id, doc = _resolve_doc(request, db, coll, id_token)
     templates = _templates(request)
     return templates.TemplateResponse(
@@ -271,10 +267,10 @@ def delete_doc(
     try:
         doc_id = decode_doc_id(id_token)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=f"bad document id token: {exc}")
+        raise HTTPException(status_code=404, detail=f"bad document id token: {exc}") from exc
     try:
         request.app.state.mongo.delete_doc(db, coll, doc_id)
     except MongoError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     # Empty body — HTMX with hx-swap="outerHTML" then removes the row.
     return HTMLResponse("", headers={"HX-Trigger": "doc-deleted"})

@@ -172,9 +172,7 @@ async def test_collections_page_for_empty_db_renders_empty_message(
 # ---- collection viewer (Slice 2.2) -----------------------------------------
 
 
-async def test_collection_viewer_renders_first_page(
-    server, http: AsyncClient
-) -> None:
+async def test_collection_viewer_renders_first_page(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -183,9 +181,7 @@ async def test_collection_viewer_renders_first_page(
     finally:
         mc.close()
 
-    r = await http.get(
-        "/db/viewer_db/c?page_size=5", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/db/viewer_db/c?page_size=5", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     # First five docs visible.
     assert "row-0" in r.text
@@ -196,9 +192,7 @@ async def test_collection_viewer_renders_first_page(
     assert "Next page" in r.text
 
 
-async def test_collection_viewer_paginates_to_completion(
-    server, http: AsyncClient
-) -> None:
+async def test_collection_viewer_paginates_to_completion(server, http: AsyncClient) -> None:
     from urllib.parse import parse_qs, urlparse
 
     from pymongo import MongoClient
@@ -209,7 +203,6 @@ async def test_collection_viewer_paginates_to_completion(
     finally:
         mc.close()
 
-    seen: list[int] = []
     url = "/db/page_db/c?page_size=5"
     for _ in range(10):  # safety bound
         r = await http.get(url, headers={HEADER_NAME: "testtoken"})
@@ -223,9 +216,7 @@ async def test_collection_viewer_paginates_to_completion(
         end = text.find('"', start + 6)
         href = text[start + 6 : end].replace("&amp;", "&")
         params = parse_qs(urlparse(href).query)
-        url = "/db/page_db/c?" + "&".join(
-            f"{k}={v[0]}" for k, v in params.items()
-        )
+        url = "/db/page_db/c?" + "&".join(f"{k}={v[0]}" for k, v in params.items())
     # The last page contains _id 10 and 11 (12 docs / page_size 5 = 3 pages).
     r = await http.get(url, headers={HEADER_NAME: "testtoken"})
     assert "Next page" not in r.text
@@ -234,16 +225,12 @@ async def test_collection_viewer_paginates_to_completion(
 async def test_collection_viewer_filter_invalid_json_shows_error(
     http: AsyncClient,
 ) -> None:
-    r = await http.get(
-        "/db/x/c?filter=not-json", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/db/x/c?filter=not-json", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "Filter is not valid JSON" in r.text
 
 
-async def test_collection_viewer_filter_with_id_rejected(
-    server, http: AsyncClient
-) -> None:
+async def test_collection_viewer_filter_with_id_rejected(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -260,9 +247,7 @@ async def test_collection_viewer_filter_with_id_rejected(
     assert "_id" in r.text and "skip-ID pagination" in r.text
 
 
-async def test_collection_viewer_descending_sort(
-    server, http: AsyncClient
-) -> None:
+async def test_collection_viewer_descending_sort(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -309,9 +294,7 @@ async def test_edit_modal_pre_populates_doc(server, http: AsyncClient) -> None:
     assert "Save" in r.text
 
 
-async def test_replace_doc_updates_and_returns_row(
-    server, http: AsyncClient
-) -> None:
+async def test_replace_doc_updates_and_returns_row(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -339,9 +322,7 @@ async def test_replace_doc_updates_and_returns_row(
         mc.close()
 
 
-async def test_replace_doc_invalid_json_returns_modal_error(
-    server, http: AsyncClient
-) -> None:
+async def test_replace_doc_invalid_json_returns_modal_error(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -387,9 +368,7 @@ async def test_edit_on_bogus_token_404s(http: AsyncClient) -> None:
     assert r.status_code == 404
 
 
-async def test_delete_confirm_modal_includes_typed_check(
-    server, http: AsyncClient
-) -> None:
+async def test_delete_confirm_modal_includes_typed_check(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -409,7 +388,7 @@ async def test_delete_confirm_modal_includes_typed_check(
     assert "things" in r.text  # collection name shown
     assert "Type the collection name" in r.text
     assert "hx-delete" in r.text
-    assert 'confirm !== \'things\'' in r.text  # Alpine guard wired up
+    assert "confirm !== 'things'" in r.text  # Alpine guard wired up
 
 
 async def _ensure_test_indexes(server, db_name: str, coll_name: str) -> None:

@@ -359,14 +359,23 @@ class Storage:
         self._lock = threading.RLock()
         self._closed = False
         self._tempdir: str | None = None
+        # session_max default is ~120; each client connection thread
+        # caches its own session in `threading.local()`, and cross-
+        # thread oplog readers open additional short-lived sessions on
+        # demand. With a few dozen concurrent client connections plus
+        # active change-stream tailers, the default ceiling is hit
+        # mid-handshake and surfaces as `out of sessions` /
+        # WT_ERROR. mongod itself runs with session_max=33000 — 1000
+        # is a generous floor for a single-node test surrogate while
+        # still well under the WT hard limit.
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
-            config = "create,in_memory=true"
+            config = "create,in_memory=true,session_max=1000"
         else:
             os.makedirs(path, exist_ok=True)
             home = path
-            config = "create"
+            config = "create,session_max=1000"
         self._conn = wt.wiredtiger_open(home, config)
         self._tls = threading.local()
         self._all_sessions: list[Any] = []
