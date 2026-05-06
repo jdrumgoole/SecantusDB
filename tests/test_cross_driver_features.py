@@ -16,6 +16,8 @@ through each driver:
     ``authInfo.authenticatedUserRoles``.
   * BSON type fidelity — ObjectId / int32 / int64 / double / Decimal128
     / Date / Binary round-trip through SecantusDB without type collapse.
+  * Bulk write — mixed insert / update / replace / upsert / delete in
+    one ``bulkWrite``; counts and final state match per-driver.
 
 Each test self-skips if its driver tooling isn't on PATH. Java is not
 covered here for the same reason as the geo smoke tests: a
@@ -577,5 +579,102 @@ def test_types_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go types smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Bulk write
+# ---------------------------------------------------------------------------
+
+
+# One mixed bulk: insert + updateOne + updateMany + replaceOne +
+# upsert + deleteOne. Each driver folds the heterogeneous slice into
+# one OP_MSG with a kind-1 documentSequence; this smoke proves the
+# server's command dispatcher reconstructs the shape and runs the
+# right per-op handler in each case. The mongosh script prints the
+# result counters + the final doc list for Python-side assertion.
+_BULK_MONGOSH_SCRIPT = """
+db.c.drop();
+db.c.insertMany([{ _id: 1, kind: "old" }, { _id: 2, kind: "old" }]);
+const res = db.c.bulkWrite([
+  { insertOne: { document: { _id: 3, kind: "fresh" } } },
+  { updateOne: { filter: { _id: 1 }, update: { $set: { kind: "new" } } } },
+  { updateMany: { filter: { kind: "old" }, update: { $set: { kind: "new" } } } },
+  { replaceOne: { filter: { _id: 3 }, replacement: { _id: 3, kind: "replaced" } } },
+  { updateOne: {
+      filter: { _id: 99 },
+      update: { $set: { kind: "upserted" } },
+      upsert: true,
+  } },
+  { deleteOne: { filter: { _id: 2 } } },
+]);
+const docs = db.c.find({}).sort({ _id: 1 }).toArray();
+print(JSON.stringify({
+  insertedCount: res.insertedCount,
+  matchedCount: res.matchedCount,
+  modifiedCount: res.modifiedCount,
+  upsertedCount: res.upsertedCount,
+  deletedCount: res.deletedCount,
+  docs: docs.map((d) => ({ _id: d._id, kind: d.kind })),
+}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_bulk_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [_MONGOSH, "--quiet", f"{server.uri}bulk_xd", "--eval", _BULK_MONGOSH_SCRIPT],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["insertedCount"] == 1
+    assert payload["matchedCount"] == 3
+    assert payload["modifiedCount"] == 3
+    assert payload["upsertedCount"] == 1
+    assert payload["deletedCount"] == 1
+    assert payload["docs"] == [
+        {"_id": 1, "kind": "new"},
+        {"_id": 3, "kind": "replaced"},
+        {"_id": 99, "kind": "upserted"},
+    ]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_bulk_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "bulk_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node bulk smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_bulk_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./bulk"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go bulk smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
