@@ -144,11 +144,9 @@ def create_index(
         except (ValueError, TypeError) as exc:
             raise HTTPException(
                 status_code=400, detail=f"Partial filter is not valid JSON: {exc}"
-            )
+            ) from exc
         if not isinstance(parsed_partial, dict):
-            raise HTTPException(
-                status_code=400, detail="Partial filter must be a JSON object."
-            )
+            raise HTTPException(status_code=400, detail="Partial filter must be a JSON object.")
         partial_doc = parsed_partial
 
     ttl_int: int | None = None
@@ -157,11 +155,11 @@ def create_index(
             ttl_int = int(ttl_seconds)
             if ttl_int < 0:
                 raise ValueError
-        except ValueError:
+        except ValueError as exc:
             raise HTTPException(
                 status_code=400,
                 detail="TTL must be a non-negative integer (seconds).",
-            )
+            ) from exc
 
     try:
         request.app.state.mongo.create_index(
@@ -175,7 +173,7 @@ def create_index(
             expire_after_seconds=ttl_int,
         )
     except MongoError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # HX-Redirect makes HTMX-aware browsers reload the page; for non-HTMX
     # form posts the next request still lands on the same URL.
     return HTMLResponse(
@@ -192,9 +190,7 @@ def create_index(
     "/db/{db}/{coll}/indexes/{name}/drop-confirm",
     response_class=HTMLResponse,
 )
-def drop_index_confirm(
-    request: Request, db: str, coll: str, name: str
-) -> HTMLResponse:
+def drop_index_confirm(request: Request, db: str, coll: str, name: str) -> HTMLResponse:
     if name == "_id_":
         raise HTTPException(status_code=400, detail="cannot drop _id_ index")
     templates = _templates(request)
@@ -209,14 +205,12 @@ def drop_index_confirm(
     )
 
 
-@router.delete(
-    "/db/{db}/{coll}/indexes/{name}", response_class=HTMLResponse
-)
+@router.delete("/db/{db}/{coll}/indexes/{name}", response_class=HTMLResponse)
 def drop_index(request: Request, db: str, coll: str, name: str) -> HTMLResponse:
     try:
         request.app.state.mongo.drop_index(db, coll, name)
     except MongoError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return HTMLResponse("", headers={"HX-Trigger": "index-dropped"})
 
 
@@ -284,10 +278,7 @@ def explain_page(request: Request, db: str, coll: str) -> HTMLResponse:
     filter_doc = _parse_optional_json("Filter", raw_filter) or {}
     sort_doc = _parse_optional_json("Sort", raw_sort)
     hint_value = _parse_optional_json("Hint", raw_hint)
-    if isinstance(hint_value, str):
-        hint = hint_value
-    else:
-        hint = hint_value
+    hint = hint_value
 
     plan_rows: list[dict[str, Any]] = []
     namespace = f"{db}.{coll}"

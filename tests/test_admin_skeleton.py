@@ -413,9 +413,7 @@ async def _ensure_test_indexes(server, db_name: str, coll_name: str) -> None:
 
 async def test_indexes_page_lists_with_badges(server, http: AsyncClient) -> None:
     await _ensure_test_indexes(server, "ix_db", "things")
-    r = await http.get(
-        "/db/ix_db/things/indexes", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/db/ix_db/things/indexes", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "_id_" in r.text
     assert "name_1" in r.text
@@ -431,16 +429,12 @@ async def test_indexes_page_lists_with_badges(server, http: AsyncClient) -> None
 # ---- create / drop index (Slice 3.2) ---------------------------------------
 
 
-async def test_create_index_then_appears_on_listing(
-    server, http: AsyncClient
-) -> None:
+async def test_create_index_then_appears_on_listing(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
     try:
-        mc["create_ix_db"]["things"].insert_many(
-            [{"_id": i, "name": f"r-{i}"} for i in range(3)]
-        )
+        mc["create_ix_db"]["things"].insert_many([{"_id": i, "name": f"r-{i}"} for i in range(3)])
     finally:
         mc.close()
 
@@ -451,9 +445,7 @@ async def test_create_index_then_appears_on_listing(
     )
     assert r.status_code in (200, 303)
 
-    r2 = await http.get(
-        "/db/create_ix_db/things/indexes", headers={HEADER_NAME: "testtoken"}
-    )
+    r2 = await http.get("/db/create_ix_db/things/indexes", headers={HEADER_NAME: "testtoken"})
     assert "name_1" in r2.text
     assert "unique" in r2.text
 
@@ -467,9 +459,7 @@ async def test_create_index_invalid_key_returns_400(http: AsyncClient) -> None:
     assert r.status_code == 400
 
 
-async def test_drop_confirm_modal_includes_typed_check(
-    server, http: AsyncClient
-) -> None:
+async def test_drop_confirm_modal_includes_typed_check(server, http: AsyncClient) -> None:
     await _ensure_test_indexes(server, "drop_ix_db", "things")
     r = await http.get(
         "/db/drop_ix_db/things/indexes/name_1/drop-confirm",
@@ -495,18 +485,14 @@ async def test_drop_index_endpoint_removes_it(server, http: AsyncClient) -> None
         headers={HEADER_NAME: "testtoken"},
     )
     assert r.status_code == 200
-    r2 = await http.get(
-        "/db/drop_ep_db/things/indexes", headers={HEADER_NAME: "testtoken"}
-    )
+    r2 = await http.get("/db/drop_ep_db/things/indexes", headers={HEADER_NAME: "testtoken"})
     assert "name_1" not in r2.text
 
 
 # ---- explain visualizer (Slice 3.3) ----------------------------------------
 
 
-async def test_explain_renders_collscan_for_unindexed_filter(
-    server, http: AsyncClient
-) -> None:
+async def test_explain_renders_collscan_for_unindexed_filter(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -524,9 +510,7 @@ async def test_explain_renders_collscan_for_unindexed_filter(
     assert "Winning plan" in r.text
 
 
-async def test_explain_renders_ixscan_when_index_covers_query(
-    server, http: AsyncClient
-) -> None:
+async def test_explain_renders_ixscan_when_index_covers_query(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -574,9 +558,7 @@ def test_ws_metrics_streams_backlog_and_tick(server, tmp_path) -> None:
         # before connecting so backlog has something in it.
         app.state.sampler.tick_once()
 
-        with client.websocket_connect(
-            "/ws/metrics?t=ws-token"
-        ) as ws:
+        with client.websocket_connect("/ws/metrics?t=ws-token") as ws:
             backlog = ws.receive_json()
             assert backlog["type"] == "backlog"
             assert isinstance(backlog["samples"], list)
@@ -595,10 +577,12 @@ def test_ws_metrics_rejects_missing_token(server) -> None:
     from starlette.websockets import WebSocketDisconnect
 
     app = create_app(mongo_uri=server.uri, token="ws-token")
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/ws/metrics") as ws:
-                ws.receive_json()
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/ws/metrics") as ws,
+    ):
+        ws.receive_json()
 
 
 def test_ws_metrics_rejects_bad_token(server) -> None:
@@ -606,15 +590,15 @@ def test_ws_metrics_rejects_bad_token(server) -> None:
     from starlette.websockets import WebSocketDisconnect
 
     app = create_app(mongo_uri=server.uri, token="ws-token")
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/ws/metrics?t=wrong") as ws:
-                ws.receive_json()
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/ws/metrics?t=wrong") as ws,
+    ):
+        ws.receive_json()
 
 
-async def test_delete_doc_removes_and_returns_empty(
-    server, http: AsyncClient
-) -> None:
+async def test_delete_doc_removes_and_returns_empty(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)

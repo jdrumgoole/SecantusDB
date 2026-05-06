@@ -19,6 +19,7 @@ event loop reference.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -41,9 +42,7 @@ DEFAULT_HISTORY_SIZE = 300
 _OPCOUNTER_FIELDS = ("insert", "query", "update", "delete", "getmore", "command")
 
 
-def compute_delta(
-    prev: dict[str, Any] | None, current: dict[str, Any]
-) -> dict[str, int]:
+def compute_delta(prev: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, int]:
     """Return per-bucket deltas between two ``serverStatus`` snapshots.
 
     Returns zeros when ``prev`` is ``None`` (the first tick has nothing
@@ -66,9 +65,7 @@ def compute_delta(
     return out
 
 
-def build_sample(
-    ts: float, snapshot: dict[str, Any], delta: dict[str, int]
-) -> dict[str, Any]:
+def build_sample(ts: float, snapshot: dict[str, Any], delta: dict[str, int]) -> dict[str, Any]:
     """Project a ``serverStatus`` snapshot + delta into the wire frame."""
     conns = snapshot.get("connections") or {}
     opc = snapshot.get("opcounters") or {}
@@ -125,15 +122,11 @@ class Hub:
             if sub.queue.full():
                 # Slow client. Drop the oldest queued sample to make room
                 # so we don't block the producer thread.
-                try:
+                with contextlib.suppress(asyncio.QueueEmpty):
                     sub.queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
+            # Should not happen because we just drained, but stay safe.
+            with contextlib.suppress(asyncio.QueueFull):
                 sub.queue.put_nowait(sample)
-            except asyncio.QueueFull:
-                # Should not happen because we just drained, but stay safe.
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -219,11 +212,9 @@ class Sampler:
             self._history.append(sample)
             wire_sample = {k: v for k, v in sample.items() if k != "_raw"}
         # Push to subscribers from the loop thread.
-        try:
+        # Loop is closing; drop silently.
+        with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(self._hub.broadcast, wire_sample)
-        except RuntimeError:
-            # Loop is closing; drop silently.
-            pass
         return wire_sample
 
     # ---- backlog for new subscribers ------------------------------------
