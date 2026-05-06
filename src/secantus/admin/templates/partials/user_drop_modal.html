@@ -1,0 +1,47 @@
+<div
+  class="modal-overlay"
+  x-data="{ confirm: '' }"
+  @click.self="document.getElementById('modal').innerHTML = ''"
+>
+  <div class="modal modal-narrow">
+    <header class="modal-header">
+      <h2>Drop user</h2>
+      <button
+        type="button"
+        class="modal-close"
+        @click="document.getElementById('modal').innerHTML = ''"
+      >×</button>
+    </header>
+    <div class="modal-body">
+      <p>
+        You are about to drop user <code>{{ username }}@{{ db_name }}</code>.
+        Existing connections authenticated as this user keep their session
+        until they reconnect.
+      </p>
+      <p>Type the username <code>{{ username }}</code> to confirm:</p>
+      <input
+        type="text"
+        class="confirm-input"
+        x-model="confirm"
+        autocomplete="off"
+        autofocus
+      />
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="document.getElementById('modal').innerHTML = ''"
+        >Cancel</button>
+        <button
+          type="button"
+          class="btn-danger"
+          x-bind:disabled="confirm !== '{{ username }}'"
+          hx-delete="/users/{{ db_name }}/{{ username }}"
+          hx-target="#user-{{ username }}"
+          hx-swap="outerHTML"
+          hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
+        >Drop</button>
+      </div>
+    </div>
+  </div>
+</div>

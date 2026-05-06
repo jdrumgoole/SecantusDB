@@ -32,6 +32,7 @@ from secantus.admin.routers import (
     health,
     indexes,
     metrics,
+    users,
 )
 from secantus.admin.sampler import Hub, Sampler
 
@@ -94,6 +95,7 @@ def create_app(*, mongo_uri: str, token: str) -> FastAPI:
     app.include_router(collection.router)
     app.include_router(indexes.router)
     app.include_router(metrics.router)
+    app.include_router(users.router)
 
     return app
 
