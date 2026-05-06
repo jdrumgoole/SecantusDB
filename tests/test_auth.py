@@ -22,6 +22,7 @@ from pymongo.errors import OperationFailure
 
 from secantus import SecantusDBServer
 from secantus.auth import (
+    SCRAM_SHA_1,
     SCRAM_SHA_256,
     AuthError,
     ConnectionAuth,
@@ -913,3 +914,132 @@ def test_drop_all_users_from_database_requires_dropuser_action(server_with_auth)
         assert exc.value.code == 13
     finally:
         viewer_cli.close()
+
+
+# ----------------------------------------------------------------------
+# SCRAM-SHA-1
+# ----------------------------------------------------------------------
+
+
+def test_derive_credentials_sha1_round_trips_through_doc() -> None:
+    """SHA-1 mechanism produces credentials with the right shape.
+
+    Salt is 16 bytes (RFC 5802 / mongod default); stored_key and
+    server_key are 20-byte SHA-1 digests; the doc layout uses
+    ``SCRAM-SHA-1`` as the top-level key.
+    """
+    creds = derive_credentials("hunter2", mechanism=SCRAM_SHA_1, username="alice")
+    assert creds.mechanism == SCRAM_SHA_1
+    assert len(creds.stored_key) == 20
+    assert len(creds.server_key) == 20
+    assert len(creds.salt) == 16
+
+    doc = creds.to_doc()
+    assert SCRAM_SHA_1 in doc
+    round_tripped = StoredCredentials.from_doc(doc, mechanism=SCRAM_SHA_1)
+    assert round_tripped.stored_key == creds.stored_key
+    assert round_tripped.server_key == creds.server_key
+    assert round_tripped.mechanism == SCRAM_SHA_1
+
+
+def test_derive_credentials_sha1_and_sha256_diverge() -> None:
+    """Same password produces different stored keys under each mechanism."""
+    sha1 = derive_credentials("p", salt=b"\x00" * 16, mechanism=SCRAM_SHA_1, username="u")
+    sha256 = derive_credentials("p", salt=b"\x00" * 28, mechanism=SCRAM_SHA_256)
+    assert sha1.stored_key != sha256.stored_key
+    assert len(sha1.stored_key) == 20
+    assert len(sha256.stored_key) == 32
+
+
+def test_derive_credentials_sha1_requires_username() -> None:
+    """SCRAM-SHA-1's legacy prepass mixes the username into the digest,
+    so the function must reject calls that omit it."""
+    with pytest.raises(ValueError, match="username is required"):
+        derive_credentials("p", mechanism=SCRAM_SHA_1)
+
+
+def test_create_user_with_sha1_then_authenticate_via_pymongo(server_no_auth) -> None:
+    """A user provisioned with mechanisms=['SCRAM-SHA-1'] authenticates
+    cleanly when pymongo is told to use that mechanism.
+    """
+    plain = pymongo.MongoClient(server_no_auth.uri)
+    plain.admin.command(
+        {
+            "createUser": "legacy",
+            "pwd": "hunter2",
+            "roles": [],
+            "mechanisms": [SCRAM_SHA_1],
+        }
+    )
+    plain.close()
+
+    authed = pymongo.MongoClient(
+        server_no_auth.uri,
+        username="legacy",
+        password="hunter2",
+        authSource="admin",
+        authMechanism=SCRAM_SHA_1,
+    )
+    info = authed.admin.command("connectionStatus")
+    users = info["authInfo"]["authenticatedUsers"]
+    assert {"user": "legacy", "db": "admin"} in users
+    authed.close()
+
+
+def test_create_user_with_both_mechanisms_authenticates_either_way(server_no_auth) -> None:
+    """A user with mechanisms=['SCRAM-SHA-256', 'SCRAM-SHA-1'] can be
+    reached via either mechanism with the same plaintext password.
+    Mirrors mongod's ability to keep both credential blobs side-by-side.
+    """
+    plain = pymongo.MongoClient(server_no_auth.uri)
+    plain.admin.command(
+        {
+            "createUser": "dual",
+            "pwd": "hunter2",
+            "roles": [],
+            "mechanisms": [SCRAM_SHA_256, SCRAM_SHA_1],
+        }
+    )
+    plain.close()
+
+    for mech in (SCRAM_SHA_256, SCRAM_SHA_1):
+        cli = pymongo.MongoClient(
+            server_no_auth.uri,
+            username="dual",
+            password="hunter2",
+            authSource="admin",
+            authMechanism=mech,
+        )
+        cli.admin.command("ping")
+        cli.close()
+
+
+def test_sasl_supported_mechs_reflects_user_record(server_no_auth) -> None:
+    """`hello.saslSupportedMechs` reports exactly the mechanisms the
+    named user has credentials for, in modern-first order. A SHA-1-only
+    user gets ``[SCRAM-SHA-1]``; a dual user gets both.
+    """
+    plain = pymongo.MongoClient(server_no_auth.uri)
+    plain.admin.command(
+        {"createUser": "sha1only", "pwd": "p", "roles": [], "mechanisms": [SCRAM_SHA_1]}
+    )
+    plain.admin.command(
+        {
+            "createUser": "dualmech",
+            "pwd": "p",
+            "roles": [],
+            "mechanisms": [SCRAM_SHA_256, SCRAM_SHA_1],
+        }
+    )
+
+    res1 = plain.admin.command({"hello": 1, "saslSupportedMechs": "admin.sha1only"})
+    assert res1["saslSupportedMechs"] == [SCRAM_SHA_1]
+
+    res2 = plain.admin.command({"hello": 1, "saslSupportedMechs": "admin.dualmech"})
+    assert res2["saslSupportedMechs"] == [SCRAM_SHA_256, SCRAM_SHA_1]
+
+    # Unknown principal: fall back to the modern default.
+    res3 = plain.admin.command({"hello": 1, "saslSupportedMechs": "admin.ghost"})
+    assert res3["saslSupportedMechs"] == [SCRAM_SHA_256]
+
+    plain.close()
