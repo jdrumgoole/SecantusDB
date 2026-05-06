@@ -412,6 +412,171 @@ async def test_delete_confirm_modal_includes_typed_check(
     assert 'confirm !== \'things\'' in r.text  # Alpine guard wired up
 
 
+async def _ensure_test_indexes(server, db_name: str, coll_name: str) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        coll = mc[db_name][coll_name]
+        coll.insert_many([{"_id": i, "name": f"r-{i}", "tags": ["a"]} for i in range(5)])
+        coll.create_index([("name", 1)], unique=True)
+        coll.create_index([("tags", 1)])  # multikey on insert
+        coll.create_index(
+            [("created", 1)],
+            partialFilterExpression={"name": "r-1"},
+        )
+    finally:
+        mc.close()
+
+
+# ---- indexes page (Slice 3.1) ----------------------------------------------
+
+
+async def test_indexes_page_lists_with_badges(server, http: AsyncClient) -> None:
+    await _ensure_test_indexes(server, "ix_db", "things")
+    r = await http.get(
+        "/db/ix_db/things/indexes", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    assert "_id_" in r.text
+    assert "name_1" in r.text
+    assert "tags_1" in r.text
+    assert "created_1" in r.text
+    assert "unique" in r.text
+    assert "multikey" in r.text
+    assert "partial" in r.text
+    # _id_ row has no Drop button.
+    assert "indexes/_id_/drop-confirm" not in r.text
+
+
+# ---- create / drop index (Slice 3.2) ---------------------------------------
+
+
+async def test_create_index_then_appears_on_listing(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["create_ix_db"]["things"].insert_many(
+            [{"_id": i, "name": f"r-{i}"} for i in range(3)]
+        )
+    finally:
+        mc.close()
+
+    r = await http.post(
+        "/db/create_ix_db/things/indexes",
+        data={"key": '{"name": 1}', "unique": "true"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code in (200, 303)
+
+    r2 = await http.get(
+        "/db/create_ix_db/things/indexes", headers={HEADER_NAME: "testtoken"}
+    )
+    assert "name_1" in r2.text
+    assert "unique" in r2.text
+
+
+async def test_create_index_invalid_key_returns_400(http: AsyncClient) -> None:
+    r = await http.post(
+        "/db/whatever/things/indexes",
+        data={"key": "not-json"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+
+
+async def test_drop_confirm_modal_includes_typed_check(
+    server, http: AsyncClient
+) -> None:
+    await _ensure_test_indexes(server, "drop_ix_db", "things")
+    r = await http.get(
+        "/db/drop_ix_db/things/indexes/name_1/drop-confirm",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "name_1" in r.text
+    assert "Type the index name" in r.text
+
+
+async def test_drop_id_index_refused(http: AsyncClient) -> None:
+    r = await http.get(
+        "/db/x/c/indexes/_id_/drop-confirm",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+
+
+async def test_drop_index_endpoint_removes_it(server, http: AsyncClient) -> None:
+    await _ensure_test_indexes(server, "drop_ep_db", "things")
+    r = await http.delete(
+        "/db/drop_ep_db/things/indexes/name_1",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    r2 = await http.get(
+        "/db/drop_ep_db/things/indexes", headers={HEADER_NAME: "testtoken"}
+    )
+    assert "name_1" not in r2.text
+
+
+# ---- explain visualizer (Slice 3.3) ----------------------------------------
+
+
+async def test_explain_renders_collscan_for_unindexed_filter(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["explain_db"]["c"].insert_many([{"_id": i, "x": i} for i in range(3)])
+    finally:
+        mc.close()
+
+    r = await http.get(
+        '/db/explain_db/c/explain?filter={"x": 1}',
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "COLLSCAN" in r.text
+    assert "Winning plan" in r.text
+
+
+async def test_explain_renders_ixscan_when_index_covers_query(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        coll = mc["explain_ix_db"]["c"]
+        coll.insert_many([{"_id": i, "x": i} for i in range(5)])
+        coll.create_index([("x", 1)])
+    finally:
+        mc.close()
+
+    r = await http.get(
+        '/db/explain_ix_db/c/explain?filter={"x": 3}',
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "IXSCAN" in r.text
+    assert "x_1" in r.text
+    assert "FETCH" in r.text
+
+
+async def test_explain_invalid_json_filter_shows_error(http: AsyncClient) -> None:
+    r = await http.get(
+        "/db/x/c/explain?filter=not-json",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "Filter is not valid JSON" in r.text
+
+
 async def test_delete_doc_removes_and_returns_empty(
     server, http: AsyncClient
 ) -> None:
