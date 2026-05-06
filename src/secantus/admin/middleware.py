@@ -74,4 +74,35 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         return response
 
 
-__all__ = ["TokenAuthMiddleware", "COOKIE_NAME", "HEADER_NAME", "QUERY_NAME"]
+def verify_websocket_token(
+    *,
+    expected: str,
+    query_params: object,
+    cookies: object,
+) -> bool:
+    """Verify the admin token for a WebSocket request.
+
+    ``BaseHTTPMiddleware`` doesn't see WebSocket scopes, so each
+    ``websocket`` handler must call this manually before
+    ``await websocket.accept()``.
+
+    Browsers can't send custom request headers on WebSocket handshakes,
+    so we accept either the URL query parameter (used by the dashboard
+    when bootstrapping the connection) or the persisted cookie set by
+    the HTTP middleware on first page load.
+    """
+    presented: str | None = None
+    if hasattr(query_params, "get"):
+        presented = query_params.get(QUERY_NAME)
+    if presented is None and hasattr(cookies, "get"):
+        presented = cookies.get(COOKIE_NAME)
+    return presented == expected
+
+
+__all__ = [
+    "TokenAuthMiddleware",
+    "COOKIE_NAME",
+    "HEADER_NAME",
+    "QUERY_NAME",
+    "verify_websocket_token",
+]
