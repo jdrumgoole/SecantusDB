@@ -612,6 +612,152 @@ def test_ws_metrics_rejects_bad_token(server) -> None:
                 ws.receive_json()
 
 
+# ---- /users + /roles (Slice 5) ----------------------------------------------
+
+
+async def test_roles_page_lists_built_in_roles(http: AsyncClient) -> None:
+    r = await http.get("/roles", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    for role in ("read", "readWrite", "dbAdmin", "userAdmin", "root"):
+        assert role in r.text
+    # readAnyDatabase carries the admin_only flag.
+    assert "admin_only" in r.text
+
+
+async def test_users_page_renders_empty_admin_db(http: AsyncClient) -> None:
+    r = await http.get("/users", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "No users on this database" in r.text
+
+
+async def test_create_user_then_lists_with_role_badge(
+    server, http: AsyncClient
+) -> None:
+    r = await http.post(
+        "/users?db=admin",
+        data={
+            "username": "alice",
+            "password": "s3cret",
+            "roles": ["readWrite@app", "read@admin"],
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code in (200, 303)
+    r2 = await http.get("/users?db=admin", headers={HEADER_NAME: "testtoken"})
+    assert "alice" in r2.text
+    assert "readWrite@app" in r2.text
+    assert "read@admin" in r2.text
+
+
+async def test_create_user_without_roles_rejected(http: AsyncClient) -> None:
+    r = await http.post(
+        "/users?db=admin",
+        data={"username": "bob", "password": "x"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+
+
+async def test_change_password_modal_renders(http: AsyncClient) -> None:
+    # Modal is purely UI; doesn't actually need the user to exist for the
+    # GET, since the form action is what fails on a non-existent user.
+    r = await http.get(
+        "/users/admin/missing/password",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "Change password" in r.text
+
+
+async def test_change_password_mismatch_returns_modal_error(
+    server, http: AsyncClient
+) -> None:
+    # Create a user first so updateUser has somewhere to land.
+    await http.post(
+        "/users?db=admin",
+        data={
+            "username": "carol",
+            "password": "p1",
+            "roles": ["read@admin"],
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    r = await http.post(
+        "/users/admin/carol/password",
+        data={"password": "p1", "confirm": "p2"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Passwords do not match" in r.text
+
+
+async def test_roles_modal_pre_checks_current_bindings(
+    server, http: AsyncClient
+) -> None:
+    await http.post(
+        "/users?db=admin",
+        data={
+            "username": "dan",
+            "password": "x",
+            "roles": ["read@admin"],
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    r = await http.get(
+        "/users/admin/dan/roles",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    # The current "read@admin" checkbox must come back checked.
+    assert 'value="read@admin"\n              checked' in r.text or 'value="read@admin" checked' in r.text
+
+
+async def test_update_roles_grants_and_revokes(server, http: AsyncClient) -> None:
+    # Start: read@admin only.
+    await http.post(
+        "/users?db=admin",
+        data={
+            "username": "eve",
+            "password": "x",
+            "roles": ["read@admin"],
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    # Replace: readWrite@app only.
+    r = await http.post(
+        "/users/admin/eve/roles",
+        data={"roles": ["readWrite@app"]},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    # Confirm via the listing.
+    r2 = await http.get("/users?db=admin", headers={HEADER_NAME: "testtoken"})
+    # eve now has readWrite@app, no more read@admin.
+    body = r2.text
+    eve_block = body.split("user-eve", 1)[-1].split("</tr>", 1)[0]
+    assert "readWrite@app" in eve_block
+    assert "read@admin" not in eve_block
+
+
+async def test_drop_user_endpoint_removes_user(server, http: AsyncClient) -> None:
+    await http.post(
+        "/users?db=admin",
+        data={
+            "username": "frank",
+            "password": "x",
+            "roles": ["read@admin"],
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    r = await http.delete(
+        "/users/admin/frank",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    r2 = await http.get("/users?db=admin", headers={HEADER_NAME: "testtoken"})
+    assert "frank" not in r2.text
+
+
 async def test_delete_doc_removes_and_returns_empty(
     server, http: AsyncClient
 ) -> None:

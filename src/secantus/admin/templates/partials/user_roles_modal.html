@@ -1,0 +1,40 @@
+<div class="modal-overlay" @click.self="document.getElementById('modal').innerHTML = ''">
+  <div class="modal">
+    <header class="modal-header">
+      <h2>Manage roles</h2>
+      <button
+        type="button"
+        class="modal-close"
+        @click="document.getElementById('modal').innerHTML = ''"
+      >×</button>
+    </header>
+    <form
+      class="modal-body"
+      hx-post="/users/{{ db_name }}/{{ username }}/roles"
+      hx-swap="none"
+    >
+      <p class="modal-meta">User: <code>{{ username }}@{{ db_name }}</code></p>
+      <div class="roles-grid">
+        {% for row in rows %}
+          <label class="checkbox-label">
+            <input
+              type="checkbox"
+              name="roles"
+              value="{{ row.value }}"
+              {% if row.checked %}checked{% endif %}
+            />
+            <code>{{ row.value }}</code>
+          </label>
+        {% endfor %}
+      </div>
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="document.getElementById('modal').innerHTML = ''"
+        >Cancel</button>
+        <button type="submit">Apply</button>
+      </div>
+    </form>
+  </div>
+</div>

@@ -303,6 +303,95 @@ class MongoFacade:
             raise MongoError(str(exc)) from exc
 
 
+    # ---- users ----------------------------------------------------------
+
+    def list_users(self, db: str) -> list[dict[str, Any]]:
+        """Return all users in ``db``. Each entry has ``user``, ``db``, ``roles``."""
+        try:
+            out = self._get_client()[db].command("usersInfo", 1)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+        return [dict(u) for u in out.get("users", []) or []]
+
+    def get_user(self, db: str, username: str) -> dict[str, Any] | None:
+        try:
+            out = self._get_client()[db].command("usersInfo", username)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+        users = out.get("users", []) or []
+        return dict(users[0]) if users else None
+
+    def create_user(
+        self,
+        db: str,
+        username: str,
+        password: str,
+        roles: list[dict[str, str] | str],
+    ) -> None:
+        try:
+            self._get_client()[db].command(
+                "createUser", username, pwd=password, roles=list(roles)
+            )
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def update_user_password(self, db: str, username: str, password: str) -> None:
+        try:
+            self._get_client()[db].command("updateUser", username, pwd=password)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def drop_user(self, db: str, username: str) -> None:
+        try:
+            self._get_client()[db].command("dropUser", username)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def grant_roles(
+        self,
+        db: str,
+        username: str,
+        roles: list[dict[str, str] | str],
+    ) -> None:
+        if not roles:
+            return
+        try:
+            self._get_client()[db].command(
+                "grantRolesToUser", username, roles=list(roles)
+            )
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def revoke_roles(
+        self,
+        db: str,
+        username: str,
+        roles: list[dict[str, str] | str],
+    ) -> None:
+        if not roles:
+            return
+        try:
+            self._get_client()[db].command(
+                "revokeRolesFromUser", username, roles=list(roles)
+            )
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+
 __all__ = [
     "MongoFacade",
     "MongoError",

@@ -743,3 +743,45 @@ body {
   color: var(--fg);
   font-weight: 500;
 }
+
+/* Users + roles screens */
+
+.inline-form {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.inline-db-input {
+  width: 14ch;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.85rem;
+}
+
+.inline-form button {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.roles-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.4rem 1rem;
+  margin-top: 0.4rem;
+}
+
+.action-pill {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  margin: 0.1rem 0.2rem 0.1rem 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 0.78rem;
+  color: var(--fg);
+}
