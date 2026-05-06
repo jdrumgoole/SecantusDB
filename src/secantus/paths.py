@@ -2,6 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+# Hard cap on numeric indices in dotted paths that would grow a list.
+# `{$set: {"arr.99999999": "x"}}` would otherwise allocate ~10**8 None
+# entries (~800 MB on CPython). Real BSON docs are 16 MB, so any path
+# index above this cap is by definition wrong.
+_MAX_LIST_GROW_INDEX = 100_000
+
+
+class PathError(ValueError):
+    """Raised when a dotted-path operation would exceed safety bounds."""
+
 
 def walk_to_parent(doc: dict[str, Any], path: str, *, create: bool) -> tuple[Any, str | None]:
     parts = path.split(".")
@@ -47,6 +57,11 @@ def set_path(doc: dict[str, Any], path: str, value: Any) -> None:
         parent[leaf] = value
     elif isinstance(parent, list) and leaf.isdigit():
         idx = int(leaf)
+        if idx > _MAX_LIST_GROW_INDEX:
+            raise PathError(
+                f"set_path index {idx} exceeds the {_MAX_LIST_GROW_INDEX}-element "
+                f"list-growth cap (path={path!r})"
+            )
         while len(parent) <= idx:
             parent.append(None)
         parent[idx] = value

@@ -231,6 +231,24 @@ def _stage_densify(
     bounds = range_spec.get("bounds")
     partition_fields = list(spec.get("partitionByFields") or [])
 
+    # Hard cap on filler-doc count per partition. Without this, an
+    # explicit `bounds: [0, 10**15]` with `step: 1` materialises 10**15
+    # filler docs and OOMs the process. mongod caps the densify result
+    # internally at ~250k; we use 1M to leave headroom for legitimate
+    # large-but-bounded ranges.
+    if isinstance(bounds, list) and len(bounds) == 2:
+        try:
+            span = float(bounds[1]) - float(bounds[0])
+            if span / float(step) > 1_000_000:
+                raise AggregateError(
+                    f"$densify range {bounds} with step {step} would emit "
+                    f"more than 1,000,000 fillers — refusing"
+                )
+        except (TypeError, ValueError):
+            # Non-numeric bounds reach the existing per-partition path
+            # which raises a more specific error there.
+            pass
+
     def partition_key(doc: Mapping[str, Any]) -> tuple[Any, ...]:
         return tuple(get_path(doc, f) for f in partition_fields)
 
@@ -1055,7 +1073,10 @@ def _stage_graph_lookup(
     connect_from = spec.get("connectFromField")
     connect_to = spec.get("connectToField")
     as_field = spec.get("as")
-    max_depth = spec.get("maxDepth")
+    # Default maxDepth=100 when caller doesn't specify, mirroring mongod.
+    # Without a default, a self-referencing collection blows up to O(N^2)
+    # memory in the BFS frontier.
+    max_depth = spec.get("maxDepth", 100)
     depth_field = spec.get("depthField")
     if not all(isinstance(x, str) for x in (from_coll, connect_from, connect_to, as_field)):
         raise AggregateError(
