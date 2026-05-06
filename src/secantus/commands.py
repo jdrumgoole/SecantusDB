@@ -39,9 +39,9 @@ from secantus.rbac import (
     A_FSYNC,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
-    A_INPROG,
     A_GRANT_ROLE,
     A_HOST_INFO,
+    A_INPROG,
     A_INSERT,
     A_KILL_CURSORS,
     A_LIST_COLLECTIONS,
@@ -224,9 +224,7 @@ def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if ctx.connections is not None:
         for conn in ctx.connections.snapshot():
             host_port = f"{conn.peer_addr[0]}:{conn.peer_addr[1]}"
-            opened_iso = _dt.datetime.fromtimestamp(
-                conn.opened_at, tz=_dt.timezone.utc
-            ).isoformat()
+            opened_iso = _dt.datetime.fromtimestamp(conn.opened_at, tz=_dt.timezone.utc).isoformat()
             inprog.append(
                 {
                     "type": "op",
@@ -356,6 +354,58 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         )
     return base
+
+
+def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    """Return server parameters.
+
+    Real `mongod` exposes hundreds of tunables. SecantusDB returns a
+    minimal set so admin tooling that probes one or two well-known
+    parameters (e.g. ``featureCompatibilityVersion`` for version
+    gating, ``enableTestCommands`` to detect a test mongod) gets a
+    sensible answer instead of a "no such command" error.
+
+    Caller forms accepted:
+      * ``{getParameter: 1, <name>: 1, ...}`` — return only the named
+        parameters.
+      * ``{getParameter: "*"}`` — return all known parameters.
+      * ``{getParameter: 1}`` — same as ``"*"`` (legacy form).
+    """
+    params: dict[str, Any] = {
+        "featureCompatibilityVersion": {"version": "7.0"},
+        "enableTestCommands": False,
+        "logLevel": 0,
+        "quiet": False,
+    }
+    arg = doc.get("getParameter")
+    if isinstance(arg, str) and arg == "*":
+        return {**params, "ok": 1.0}
+    if isinstance(arg, dict):
+        # ``{getParameter: {showDetails: true}, <name>: 1, ...}`` form.
+        keys = [k for k in doc if k != "getParameter" and not k.startswith("$")]
+        return {**{k: params[k] for k in keys if k in params}, "ok": 1.0}
+    # Default: name list passed alongside ``getParameter: 1``.
+    keys = [k for k in doc if k != "getParameter" and not k.startswith("$")]
+    if not keys:
+        return {**params, "ok": 1.0}
+    return {**{k: params[k] for k in keys if k in params}, "ok": 1.0}
+
+
+def _get_cmd_line_opts(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Return a parsed `mongod`-shaped command line.
+
+    pymongo's test bootstrap (and other admin tooling) reads this to
+    detect whether the server was started with `--auth`: it inspects
+    ``parsed.security.authorization`` and treats ``"enabled"`` as the
+    auth-on signal.
+    """
+    parsed: dict[str, Any] = {"net": {}, "storage": {}}
+    if ctx.require_auth:
+        parsed["security"] = {"authorization": "enabled"}
+    argv = ["secantus"]
+    if ctx.require_auth:
+        argv.append("--auth")
+    return {"argv": argv, "parsed": parsed, "ok": 1.0}
 
 
 def _connection_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -1866,8 +1916,11 @@ _HANDLERS: dict[str, CommandHandler] = {
     "fsync": _fsync,
     "explain": _explain,
     "serverStatus": _server_status,
+    "getCmdLineOpts": _get_cmd_line_opts,
+    "getParameter": _get_parameter,
     "connectionStatus": _connection_status,
     "dbStats": _db_stats,
+    "dbstats": _db_stats,
     "collStats": _coll_stats,
     "insert": _insert,
     "find": _find,

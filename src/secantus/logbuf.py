@@ -19,7 +19,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-
 _DEFAULT_CAPACITY = 5000
 
 

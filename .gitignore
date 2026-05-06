@@ -49,3 +49,4 @@ website/themes/secantus/static/img/
 website/infra/aws-state.json
 website/secantus-data/
 website/__pycache__/
+xunit-results/

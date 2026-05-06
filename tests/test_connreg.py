@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 
-from secantus.connreg import ConnInfo, ConnectionRegistry
+from secantus.connreg import ConnectionRegistry
 
 
 def test_open_assigns_monotonic_ids() -> None:
@@ -43,7 +43,7 @@ def test_close_removes_from_snapshot() -> None:
 
 def test_snapshot_is_isolated_copy() -> None:
     reg = ConnectionRegistry()
-    cid = reg.open(("127.0.0.1", 1001))
+    reg.open(("127.0.0.1", 1001))
     snap = reg.snapshot()
     snap[0].op_count = 999
     fresh = reg.snapshot()

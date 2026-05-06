@@ -8,11 +8,11 @@ used by tests and CI.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import secrets
 import sys
 from pathlib import Path
-
 
 _DEFAULT_TOKEN_PATH = Path.home() / ".secantus" / "admin-token"
 
@@ -29,12 +29,10 @@ def _resolve_token(*, override: str | None, token_path: Path) -> str:
     token = secrets.token_urlsafe(32)
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(token + "\n", encoding="utf-8")
-    try:
-        os.chmod(token_path, 0o600)
-    except OSError:
+    with contextlib.suppress(OSError):
         # Best-effort on systems without chmod (Windows). The file is
         # already in the user's home dir.
-        pass
+        os.chmod(token_path, 0o600)
     return token
 
 

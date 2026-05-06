@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -72,17 +71,13 @@ def render(raw: dict, out_path: Path) -> None:
         total = b["passed"] + b["failed"] + b["skipped"] + b["errored"]
         ran = b["passed"] + b["failed"] + b["errored"]
         rate = f"{(b['passed'] / ran * 100):.1f}%" if ran else "—"
-        rows.append(
-            (cat, b["passed"], b["failed"], b["errored"], b["skipped"], total, rate)
-        )
+        rows.append((cat, b["passed"], b["failed"], b["errored"], b["skipped"], total, rate))
         for k in totals:
             totals[k] += b[k]
 
     grand_total = sum(totals.values())
     grand_ran = totals["passed"] + totals["failed"] + totals["errored"]
-    grand_rate = (
-        f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
-    )
+    grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
 
     # Top failures for triage.
     fails = [t for t in raw.get("tests", []) if t.get("outcome") in ("failed", "error")]
