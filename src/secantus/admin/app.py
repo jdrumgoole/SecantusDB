@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 import secantus
 from secantus.admin.client import MongoFacade
 from secantus.admin.middleware import TokenAuthMiddleware
-from secantus.admin.routers import collection, dashboard, databases, health
+from secantus.admin.routers import collection, dashboard, databases, health, indexes
 
 _ADMIN_PKG = Path(__file__).resolve().parent
 _STATIC_DIR = _ADMIN_PKG / "static"
@@ -64,6 +64,7 @@ def create_app(*, mongo_uri: str, token: str) -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(databases.router)
     app.include_router(collection.router)
+    app.include_router(indexes.router)
 
     return app
 

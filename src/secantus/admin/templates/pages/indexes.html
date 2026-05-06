@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <a href="/db">Databases</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}">{{ db_name }}</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}/{{ coll_name }}">{{ coll_name }}</a>
+  <span class="sep">/</span>
+  <span>indexes</span>
+</nav>
+
+<div class="page-actions">
+  <a class="btn-secondary" href="/db/{{ db_name }}/{{ coll_name }}">← Documents</a>
+  <a class="btn-secondary" href="/db/{{ db_name }}/{{ coll_name }}/explain">Explain plan</a>
+</div>
+
+{% if error %}
+  <div class="error">{{ error }}</div>
+{% endif %}
+
+<details class="create-form-shell" open>
+  <summary>Create index</summary>
+  <form
+    class="filter-form"
+    method="post"
+    action="/db/{{ db_name }}/{{ coll_name }}/indexes"
+    hx-post="/db/{{ db_name }}/{{ coll_name }}/indexes"
+    hx-swap="none"
+    hx-on::after-request="if(event.detail.successful) window.location.reload()"
+  >
+    <label class="filter-label">
+      Key spec (Extended JSON)
+      <textarea name="key" rows="2" placeholder='e.g. {"name": 1} or {"loc": "2dsphere"}'></textarea>
+    </label>
+    <div class="filter-controls">
+      <label>
+        Name (optional)
+        <input type="text" name="name" />
+      </label>
+      <label>
+        TTL seconds (optional)
+        <input type="number" name="ttl_seconds" min="0" />
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" name="unique" value="true" /> unique
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" name="sparse" value="true" /> sparse
+      </label>
+    </div>
+    <label class="filter-label">
+      Partial filter expression (optional, JSON)
+      <textarea name="partial" rows="1" placeholder='e.g. {"status": "active"}'></textarea>
+    </label>
+    <div class="modal-actions">
+      <button type="submit">Create index</button>
+    </div>
+  </form>
+</details>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Key</th>
+      <th>Flags</th>
+      <th class="doc-actions-col">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+      <tr id="ix-{{ row.name }}">
+        <td><code>{{ row.name }}</code></td>
+        <td><code>{{ row.key_str }}</code></td>
+        <td>
+          {% for badge in row.badges %}
+            <span class="badge">{{ badge }}</span>
+          {% endfor %}
+        </td>
+        <td class="doc-actions">
+          {% if row.droppable %}
+            <button
+              type="button"
+              class="btn-danger"
+              hx-get="/db/{{ db_name }}/{{ coll_name }}/indexes/{{ row.name }}/drop-confirm"
+              hx-target="#modal"
+              hx-swap="innerHTML"
+            >Drop</button>
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="4" class="empty">No indexes (collection may not exist).</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div id="modal"></div>
+{% endblock %}

@@ -228,6 +228,84 @@ class MongoFacade:
             raise MongoError(str(exc)) from exc
         return int(res.deleted_count)
 
+    # ---- indexes ---------------------------------------------------------
+
+    def list_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
+        """Return the index list for ``db.coll`` as plain dicts.
+
+        Empty when the collection doesn't exist (so the page can render
+        an empty table cleanly instead of erroring).
+        """
+        try:
+            return [dict(ix) for ix in self._get_client()[db][coll].list_indexes()]
+        except OperationFailure as exc:
+            if exc.code in (26,):  # NamespaceNotFound
+                return []
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def create_index(
+        self,
+        db: str,
+        coll: str,
+        key: list[tuple[str, int | str]],
+        *,
+        name: str | None = None,
+        unique: bool = False,
+        sparse: bool = False,
+        partial_filter_expression: Mapping[str, Any] | None = None,
+        expire_after_seconds: int | None = None,
+    ) -> str:
+        """Create an index. Returns the resulting index name."""
+        kwargs: dict[str, Any] = {"unique": unique, "sparse": sparse}
+        if name:
+            kwargs["name"] = name
+        if partial_filter_expression is not None:
+            kwargs["partialFilterExpression"] = dict(partial_filter_expression)
+        if expire_after_seconds is not None:
+            kwargs["expireAfterSeconds"] = int(expire_after_seconds)
+        try:
+            return self._get_client()[db][coll].create_index(key, **kwargs)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def drop_index(self, db: str, coll: str, name: str) -> None:
+        if name == "_id_":
+            raise MongoError("cannot drop _id_ index")
+        try:
+            self._get_client()[db][coll].drop_index(name)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    # ---- explain ---------------------------------------------------------
+
+    def explain_find(
+        self,
+        db: str,
+        coll: str,
+        *,
+        filter_doc: Mapping[str, Any] | None = None,
+        sort: Mapping[str, Any] | None = None,
+        hint: Any = None,
+    ) -> dict[str, Any]:
+        """Run ``explain`` for a ``find`` and return the response."""
+        find_cmd: dict[str, Any] = {"find": coll, "filter": dict(filter_doc or {})}
+        if sort:
+            find_cmd["sort"] = dict(sort)
+        if hint is not None:
+            find_cmd["hint"] = hint
+        try:
+            return dict(self._get_client()[db].command("explain", find_cmd))
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
 
 __all__ = [
     "MongoFacade",

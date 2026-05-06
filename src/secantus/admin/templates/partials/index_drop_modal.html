@@ -1,0 +1,48 @@
+<div
+  class="modal-overlay"
+  x-data="{ confirm: '' }"
+  @click.self="document.getElementById('modal').innerHTML = ''"
+>
+  <div class="modal modal-narrow">
+    <header class="modal-header">
+      <h2>Drop index</h2>
+      <button
+        type="button"
+        class="modal-close"
+        @click="document.getElementById('modal').innerHTML = ''"
+      >×</button>
+    </header>
+    <div class="modal-body">
+      <p>
+        You are about to drop index
+        <code>{{ index_name }}</code> from
+        <code>{{ db_name }}.{{ coll_name }}</code>.
+        Existing queries that relied on it will fall back to a collection scan.
+      </p>
+      <p>Type the index name <code>{{ index_name }}</code> to confirm:</p>
+      <input
+        type="text"
+        class="confirm-input"
+        x-model="confirm"
+        autocomplete="off"
+        autofocus
+      />
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="document.getElementById('modal').innerHTML = ''"
+        >Cancel</button>
+        <button
+          type="button"
+          class="btn-danger"
+          x-bind:disabled="confirm !== '{{ index_name }}'"
+          hx-delete="/db/{{ db_name }}/{{ coll_name }}/indexes/{{ index_name }}"
+          hx-target="#ix-{{ index_name }}"
+          hx-swap="outerHTML"
+          hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
+        >Drop</button>
+      </div>
+    </div>
+  </div>
+</div>

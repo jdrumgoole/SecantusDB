@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <a href="/db">Databases</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}">{{ db_name }}</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}/{{ coll_name }}">{{ coll_name }}</a>
+  <span class="sep">/</span>
+  <span>explain</span>
+</nav>
+
+<div class="page-actions">
+  <a class="btn-secondary" href="/db/{{ db_name }}/{{ coll_name }}">← Documents</a>
+  <a class="btn-secondary" href="/db/{{ db_name }}/{{ coll_name }}/indexes">Indexes</a>
+</div>
+
+<form class="filter-form" method="get" action="/db/{{ db_name }}/{{ coll_name }}/explain">
+  <label class="filter-label">
+    Filter (Extended JSON)
+    <textarea name="filter" rows="2" placeholder='e.g. {"status": "active"}'>{{ raw_filter }}</textarea>
+  </label>
+  <label class="filter-label">
+    Sort (Extended JSON, optional)
+    <textarea name="sort" rows="1" placeholder='e.g. {"created_at": -1}'>{{ raw_sort }}</textarea>
+  </label>
+  <label class="filter-label">
+    Hint (Extended JSON or index name, optional)
+    <textarea name="hint" rows="1" placeholder='e.g. "name_1" or {"name": 1}'>{{ raw_hint }}</textarea>
+  </label>
+  <div class="modal-actions">
+    <button type="submit">Explain</button>
+  </div>
+</form>
+
+{% for msg in errors %}
+  <div class="error">{{ msg }}</div>
+{% endfor %}
+
+{% if plan_rows %}
+  <h2 class="section-title">Winning plan</h2>
+  <p class="modal-meta">Namespace: <code>{{ namespace }}</code></p>
+  <ol class="plan-tree">
+    {% for row in plan_rows %}
+      <li class="plan-row" style="--depth: {{ row.depth }}">
+        <span class="plan-stage plan-stage-{{ row.stage|lower }}">{{ row.stage }}</span>
+        {% if row.details.indexName %}
+          <span class="plan-detail">indexName=<code>{{ row.details.indexName }}</code></span>
+        {% endif %}
+        {% if row.details.keyPattern %}
+          <span class="plan-detail">keyPattern=<code>{{ row.details.keyPattern }}</code></span>
+        {% endif %}
+        {% if row.details.direction %}
+          <span class="plan-detail">direction=<code>{{ row.details.direction }}</code></span>
+        {% endif %}
+        {% if row.details.filter %}
+          <span class="plan-detail">filter=<code>{{ row.details.filter }}</code></span>
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ol>
+{% endif %}
+{% endblock %}
