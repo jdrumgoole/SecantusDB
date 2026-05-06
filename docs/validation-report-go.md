@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-05-03 — SecantusDB 0.2.0a12 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-05-06 — SecantusDB 0.3.0a63 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -9,20 +9,24 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `bson` | 5061 | 0 | 14 | 5075 | 100.0% |
-| `mongo` | 312 | 6 | 10 | 328 | 98.1% |
-| **Overall** | **5373** | **6** | **24** | **5403** | **99.9%** |
+| `internal/integration` | 207 | 8 | 22 | 237 | 96.3% |
+| `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
+| `mongo` | 303 | 0 | 10 | 313 | 100.0% |
+| **Overall** | **5613** | **8** | **46** | **5667** | **99.9%** |
 
-## Failures (6)
+## Failures (8)
 
 First 30 failed tests for triage:
 
 ```
-mongo :: TestConvenientTransactions/retry_timeout_enforced/unknown_transaction_commit_result
-mongo :: TestConvenientTransactions/retry_timeout_enforced/commit_transient_transaction_error
-mongo :: TestConvenientTransactions/retry_timeout_enforced
-mongo :: TestConvenientTransactions/context_error_before_commitTransaction_does_not_retry_and_aborts
-mongo :: TestConvenientTransactions/slow_operation_in_callback_retries
-mongo :: TestConvenientTransactions
+internal/integration :: TestCollection/find/invalid_identifier_error
+internal/integration :: TestCollection/find
+internal/integration :: TestCollection/insert_many/return_only_inserted_ids/ordered
+internal/integration :: TestCollection/insert_many/large_document_batches
+internal/integration :: TestCollection/insert_many/return_only_inserted_ids
+internal/integration :: TestCollection/insert_many/writeError_index
+internal/integration :: TestCollection/insert_many
+internal/integration :: TestCollection
 ```
 
 ## How this is generated
