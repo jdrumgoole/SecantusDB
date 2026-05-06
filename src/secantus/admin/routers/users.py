@@ -104,13 +104,11 @@ async def create_user(request: Request) -> HTMLResponse:
         raise HTTPException(status_code=400, detail="username and password are required")
     roles = _normalise_roles(list(raw_roles), default_db=db)
     if not roles:
-        raise HTTPException(
-            status_code=400, detail="at least one valid role is required"
-        )
+        raise HTTPException(status_code=400, detail="at least one valid role is required")
     try:
         request.app.state.mongo.create_user(db, username, password, roles)
     except MongoError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return HTMLResponse(
         "",
         status_code=303,
@@ -171,7 +169,7 @@ def roles_modal(request: Request, db: str, username: str) -> HTMLResponse:
     try:
         user = request.app.state.mongo.get_user(db, username)
     except MongoError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     if user is None:
         raise HTTPException(status_code=404, detail="user not found")
     current = _user_role_set(user)
@@ -206,7 +204,7 @@ async def update_roles(request: Request, db: str, username: str) -> HTMLResponse
     try:
         user = request.app.state.mongo.get_user(db, username)
     except MongoError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     if user is None:
         raise HTTPException(status_code=404, detail="user not found")
     current = _user_role_set(user)
@@ -224,7 +222,7 @@ async def update_roles(request: Request, db: str, username: str) -> HTMLResponse
         if to_revoke_pairs:
             request.app.state.mongo.revoke_roles(db, username, to_revoke_pairs)
     except MongoError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return HTMLResponse(
         "",
         headers={"HX-Trigger": "roles-updated", "HX-Redirect": f"/users?db={db}"},
@@ -246,7 +244,7 @@ def drop_user(request: Request, db: str, username: str) -> HTMLResponse:
     try:
         request.app.state.mongo.drop_user(db, username)
     except MongoError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return HTMLResponse("", headers={"HX-Trigger": "user-dropped"})
 
 

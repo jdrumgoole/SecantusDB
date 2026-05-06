@@ -832,3 +832,84 @@ def test_speculative_auth_wrong_password_falls_back_cleanly(server_with_auth) ->
             cli.admin.command("ping")
     finally:
         cli.close()
+
+
+# ----------------------------------------------------------------------
+# dropAllUsersFromDatabase
+# ----------------------------------------------------------------------
+
+
+def test_drop_all_users_from_database_removes_only_target_db(server_with_auth) -> None:
+    """A `dropAllUsersFromDatabase` on db `shop` removes shop users
+    but leaves users on other databases (including admin) intact.
+    Returns ``n`` = number of removed records.
+    """
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        root_cli["shop"].command(
+            "createUser",
+            "alice",
+            pwd="p",
+            roles=[{"role": "read", "db": "shop"}],
+        )
+        root_cli["shop"].command(
+            "createUser",
+            "bob",
+            pwd="p",
+            roles=[{"role": "readWrite", "db": "shop"}],
+        )
+        # User on a different db — must NOT be removed.
+        root_cli["other"].command(
+            "createUser",
+            "carol",
+            pwd="p",
+            roles=[{"role": "read", "db": "other"}],
+        )
+
+        result = root_cli["shop"].command("dropAllUsersFromDatabase")
+        assert result["ok"] == 1.0
+        assert result["n"] == 2
+
+        shop_users = root_cli["shop"].command("usersInfo")["users"]
+        assert shop_users == []
+        other_users = {u["user"] for u in root_cli["other"].command("usersInfo")["users"]}
+        assert other_users == {"carol"}
+        # root is still on admin and authenticatable.
+        admin_users = {u["user"] for u in root_cli["admin"].command("usersInfo")["users"]}
+        assert "root" in admin_users
+    finally:
+        root_cli.close()
+
+
+def test_drop_all_users_from_database_empty_db_returns_zero(server_with_auth) -> None:
+    """Empty database returns ``n: 0`` cleanly (not an error)."""
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        result = root_cli["empty_db"].command("dropAllUsersFromDatabase")
+        assert result["ok"] == 1.0
+        assert result["n"] == 0
+    finally:
+        root_cli.close()
+
+
+def test_drop_all_users_from_database_requires_dropuser_action(server_with_auth) -> None:
+    """A user without ``dropUser`` action gets code 13 / Unauthorized."""
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        # `read` role grants viewing but not user management.
+        root_cli["shop"].command(
+            "createUser",
+            "viewer",
+            pwd="p",
+            roles=[{"role": "read", "db": "shop"}],
+        )
+    finally:
+        root_cli.close()
+
+    viewer_cli = _client_for(server_with_auth, user="viewer", password="p", db="shop")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            viewer_cli["shop"].command("dropAllUsersFromDatabase")
+        assert exc.value.code == 13
+    finally:
+        viewer_cli.close()

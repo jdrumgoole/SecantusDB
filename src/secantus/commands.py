@@ -1713,6 +1713,45 @@ def _drop_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"ok": 1.0}
 
 
+def _drop_all_users_from_database(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop every user record bound to the calling database.
+
+    Mirrors ``mongod`` semantics: returns ``{ok: 1, n: <count>}`` with
+    ``n`` set to the number of records removed (0 is fine — empty db).
+    Active auth state on the calling connection is invalidated for any
+    principals scoped to this db; other connections keep theirs until
+    they reconnect.
+    """
+    db_name = ctx.db_name or "admin"
+    # Use a generous limit + paginate manually so we don't load every
+    # user across the whole connection at once on a megacorp deploy.
+    removed = 0
+    while True:
+        batch = ctx.storage.list_users(db_name, skip=0, limit=1000)
+        if not batch:
+            break
+        for record in batch:
+            username = record.get("user")
+            if isinstance(username, str) and ctx.storage.drop_user(db_name, username):
+                removed += 1
+        if len(batch) < 1000:
+            break
+
+    conn = ctx.connection_auth
+    if conn is not None:
+        conn.authenticated_principals = [
+            p for p in conn.authenticated_principals if p[0] != db_name
+        ]
+        conn.effective_roles = []
+        for p_db, p_user in conn.authenticated_principals:
+            other = ctx.storage.get_user(p_db, p_user)
+            if other is not None:
+                roles = other.get("roles") or []
+                if isinstance(roles, list):
+                    conn.add_principal_roles(roles)
+    return {"ok": 1.0, "n": removed}
+
+
 def _users_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     db_name = ctx.db_name or "admin"
     arg = doc.get("usersInfo")
@@ -1990,6 +2029,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "createUser": _create_user,
     "updateUser": _update_user,
     "dropUser": _drop_user,
+    "dropAllUsersFromDatabase": _drop_all_users_from_database,
     "usersInfo": _users_info,
     "grantRolesToUser": _grant_roles_to_user,
     "revokeRolesFromUser": _revoke_roles_from_user,
@@ -2055,6 +2095,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     # User management
     "createUser": (A_CREATE_USER, SCOPE_DATABASE),
     "dropUser": (A_DROP_USER, SCOPE_DATABASE),
+    "dropAllUsersFromDatabase": (A_DROP_USER, SCOPE_DATABASE),
     "usersInfo": (A_VIEW_USER, SCOPE_DATABASE),
     "grantRolesToUser": (A_GRANT_ROLE, SCOPE_DATABASE),
     "revokeRolesFromUser": (A_REVOKE_ROLE, SCOPE_DATABASE),

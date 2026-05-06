@@ -129,13 +129,14 @@ def validate(c: Context) -> None:
     """
     import pathlib
 
-    from pymongo_validation.include_paths import INCLUDE
+    from pymongo_validation.include_paths import DESELECT_TESTS, INCLUDE
 
     if not pathlib.Path("vendor/pymongo-tests/test").exists():
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
     paths = " ".join(INCLUDE)
+    deselect = " ".join(f"--deselect={t}" for t in DESELECT_TESTS)
     # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
     # `-p no:xdist -o addopts=`: pymongo's tests aren't xdist-safe (shared DBs);
     #   override the project-wide `addopts="-n auto"` from pyproject.toml.
@@ -155,7 +156,7 @@ def validate(c: Context) -> None:
         "-p no:cacheprovider -p no:xdist -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
         "--json-report --json-report-file=.validation/raw.json "
-        f"--no-header --tb=no -q {paths}",
+        f"--no-header --tb=no -q {deselect} {paths}",
         pty=True,
         warn=True,
     )

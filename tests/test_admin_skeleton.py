@@ -616,9 +616,7 @@ async def test_users_page_renders_empty_admin_db(http: AsyncClient) -> None:
     assert "No users on this database" in r.text
 
 
-async def test_create_user_then_lists_with_role_badge(
-    server, http: AsyncClient
-) -> None:
+async def test_create_user_then_lists_with_role_badge(server, http: AsyncClient) -> None:
     r = await http.post(
         "/users?db=admin",
         data={
@@ -655,9 +653,7 @@ async def test_change_password_modal_renders(http: AsyncClient) -> None:
     assert "Change password" in r.text
 
 
-async def test_change_password_mismatch_returns_modal_error(
-    server, http: AsyncClient
-) -> None:
+async def test_change_password_mismatch_returns_modal_error(server, http: AsyncClient) -> None:
     # Create a user first so updateUser has somewhere to land.
     await http.post(
         "/users?db=admin",
@@ -677,9 +673,7 @@ async def test_change_password_mismatch_returns_modal_error(
     assert "Passwords do not match" in r.text
 
 
-async def test_roles_modal_pre_checks_current_bindings(
-    server, http: AsyncClient
-) -> None:
+async def test_roles_modal_pre_checks_current_bindings(server, http: AsyncClient) -> None:
     await http.post(
         "/users?db=admin",
         data={
@@ -695,7 +689,10 @@ async def test_roles_modal_pre_checks_current_bindings(
     )
     assert r.status_code == 200
     # The current "read@admin" checkbox must come back checked.
-    assert 'value="read@admin"\n              checked' in r.text or 'value="read@admin" checked' in r.text
+    assert (
+        'value="read@admin"\n              checked' in r.text
+        or 'value="read@admin" checked' in r.text
+    )
 
 
 async def test_update_roles_grants_and_revokes(server, http: AsyncClient) -> None:
@@ -744,9 +741,7 @@ async def test_drop_user_endpoint_removes_user(server, http: AsyncClient) -> Non
     assert "frank" not in r2.text
 
 
-async def test_delete_doc_removes_and_returns_empty(
-    server, http: AsyncClient
-) -> None:
+async def test_delete_doc_removes_and_returns_empty(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
