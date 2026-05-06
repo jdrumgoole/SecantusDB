@@ -785,3 +785,44 @@ body {
   font-size: 0.78rem;
   color: var(--fg);
 }
+
+/* Change-stream tail */
+
+.changestream-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.cs-event {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+}
+
+.cs-event-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.4rem;
+}
+
+.cs-op {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  text-transform: lowercase;
+}
+
+.cs-ns {
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.85rem;
+  color: var(--muted);
+  flex: 1 1 auto;
+}

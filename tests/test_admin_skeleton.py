@@ -725,6 +725,79 @@ async def test_update_roles_grants_and_revokes(server, http: AsyncClient) -> Non
     assert "read@admin" not in eve_block
 
 
+async def test_changestream_page_renders(http: AsyncClient) -> None:
+    r = await http.get("/changestream", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Change stream" in r.text
+    # Scope picker is wired up.
+    assert 'name="scope"' in r.text
+
+
+def test_ws_changes_streams_collection_event(server) -> None:
+    """Open a coll-scope tail, write a doc, expect a single event frame."""
+    from fastapi.testclient import TestClient
+    from pymongo import MongoClient
+
+    app = create_app(mongo_uri=server.uri, token="cs-token")
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/changes/coll?t=cs-token&db=cs_db&coll=c"
+        ) as ws:
+            opened = ws.receive_json()
+            assert opened["type"] == "open"
+            assert opened["namespace"] == "cs_db.c"
+            # Insert a doc; expect an "insert" event to come through.
+            mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+            try:
+                mc["cs_db"]["c"].insert_one({"_id": 1, "x": 1})
+            finally:
+                mc.close()
+            evt = ws.receive_json()
+            assert evt["type"] == "event"
+            assert evt["event"]["operationType"] == "insert"
+            assert evt["event"]["ns"]["db"] == "cs_db"
+            assert evt["event"]["ns"]["coll"] == "c"
+
+
+def test_ws_changes_rejects_missing_token(server) -> None:
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    app = create_app(mongo_uri=server.uri, token="cs-token")
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                "/ws/changes/coll?db=x&coll=y"
+            ) as ws:
+                ws.receive_json()
+
+
+def test_ws_changes_rejects_bad_scope(server) -> None:
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    app = create_app(mongo_uri=server.uri, token="cs-token")
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                "/ws/changes/bogus?t=cs-token"
+            ) as ws:
+                ws.receive_json()
+
+
+def test_ws_changes_coll_scope_requires_db_and_coll(server) -> None:
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    app = create_app(mongo_uri=server.uri, token="cs-token")
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                "/ws/changes/coll?t=cs-token"
+            ) as ws:
+                ws.receive_json()
+
+
 async def test_drop_user_endpoint_removes_user(server, http: AsyncClient) -> None:
     await http.post(
         "/users?db=admin",

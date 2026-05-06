@@ -30,6 +30,7 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
+- [ ] **`local.oplog.rs` synthetic collection**: real mongod exposes the oplog as a queryable collection at `local.oplog.rs`; the admin UI's deferred `/oplog` page (window inspector + paged entries) wants this. Today, `Storage.read_oplog` / `oplog_floor_seq` / `oplog_tail_seq` exist as Python methods but no wire surface lets a pymongo client see them. Either synthesize the collection in `find_matching` / `count_matching` / `list_collections` for the `(local, oplog.rs)` pair, or add narrowly-scoped `secantusAdmin.oplogStats` + `secantusAdmin.oplogRead` commands. The synthetic-collection path is the more honest dogfooding choice. Slice 6 of the admin UI ships change-stream tail only; the oplog page is parked here.
 - [ ] **More aggregation expressions**: `$mergeAll`, `$function` (JS — also out of scope).
 - [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for numeric ranges (`bounds: "full"` / `[min, max]`, `partitionByFields`); date densify (`unit: "day" | "hour" | ...`) is deferred — needs date-arithmetic step iteration that isn't a one-line addition.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
