@@ -100,9 +100,7 @@ async def test_static_files_skip_token(http: AsyncClient) -> None:
 
 
 async def test_dashboard_tiles_render_serverstatus(http: AsyncClient) -> None:
-    r = await http.get(
-        "/_partials/dashboard-tiles", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/_partials/dashboard-tiles", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     # Expect labels for the KPI grid we render today.
     for label in ("Uptime", "Connections", "Inserts", "Queries", "Wire requests"):
@@ -118,9 +116,7 @@ async def test_dashboard_tiles_show_error_when_mongo_unreachable() -> None:
             transport=ASGITransport(app=app),
             base_url="http://testserver",
         ) as c:
-            r = await c.get(
-                "/_partials/dashboard-tiles", headers={HEADER_NAME: "testtoken"}
-            )
+            r = await c.get("/_partials/dashboard-tiles", headers={HEADER_NAME: "testtoken"})
             assert r.status_code == 200
             assert "Could not reach server" in r.text
     finally:

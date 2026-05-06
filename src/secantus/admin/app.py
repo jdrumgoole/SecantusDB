@@ -18,10 +18,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import secantus
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+import secantus
 from secantus.admin.client import MongoFacade
 from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import dashboard, health

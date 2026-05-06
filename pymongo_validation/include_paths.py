@@ -77,7 +77,16 @@ INCLUDE: list[str] = [
     #   test_csot                    — client-side timeouts (replica-set semantics)
     #   test_grid_file*, test_gridfs* — GridFS
     #   test_encryption, test_on_demand_csfle — CSFLE
-    #   test_auth*, test_ssl, test_ocsp* — auth / TLS
+    #   test_auth.py                 — SCRAM round-trip works (RBAC ships,
+    #     plugin runs the suite with auth=on), but pymongo's auth tests
+    #     also need: speculativeAuthenticate in hello, SCRAM-SHA-1
+    #     mechanism, $where (JS predicate), and
+    #     dropAllUsersFromDatabase. Each is its own slice. The plugin
+    #     and getCmdLineOpts / getParameter handlers added here
+    #     unblock that next slice.
+    #   test_auth_oidc, test_auth_aws — OIDC / AWS auth providers
+    #   test_auth_spec.py            — non-SCRAM cred mechanism specs
+    #   test_ssl, test_ocsp*         — TLS
     #   asynchronous/, atlas/, lambda/, performance/, mockupdb/
     #   index_management/, collection_management/, read_write_concern/
     #     (spec dirs containing JSON for features above)

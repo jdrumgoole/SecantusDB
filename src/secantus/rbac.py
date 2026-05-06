@@ -222,6 +222,10 @@ BUILT_IN_ROLES: dict[str, _RoleSpec] = {
     "readWrite": _RoleSpec(_READWRITE_ACTIONS),
     "dbAdmin": _RoleSpec(_DBADMIN_ACTIONS),
     "userAdmin": _RoleSpec(_USERADMIN_ACTIONS),
+    # `dbOwner` is the per-db union of readWrite + dbAdmin + userAdmin
+    # (mongod's documented composition). Tests targeting non-admin
+    # users typically grant this rather than enumerate the trio.
+    "dbOwner": _RoleSpec(_READWRITE_ACTIONS | _DBADMIN_ACTIONS | _USERADMIN_ACTIONS),
     # *AnyDatabase variants are admin-bound and span every db.
     "readAnyDatabase": _RoleSpec(_READ_ACTIONS, any_db=True, admin_only=True),
     "readWriteAnyDatabase": _RoleSpec(_READWRITE_ACTIONS, any_db=True, admin_only=True),

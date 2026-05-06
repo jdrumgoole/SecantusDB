@@ -8,8 +8,9 @@ HTTP server is up".
 
 from __future__ import annotations
 
-import secantus
 from fastapi import APIRouter, Request
+
+import secantus
 
 router = APIRouter()
 

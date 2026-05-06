@@ -141,7 +141,7 @@ class SecantusDBServer:
         self.metrics.connection_opened()
         logger.debug("client %d connected from %s", connection_id, addr)
         self.logs.append(
-            "I", "NETWORK", f"connection accepted", {"conn_id": connection_id, "from": addr}
+            "I", "NETWORK", "connection accepted", {"conn_id": connection_id, "from": addr}
         )
         try:
             with conn:

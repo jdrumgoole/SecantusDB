@@ -86,9 +86,7 @@ def test_current_op_lists_calling_connection(client: MongoClient) -> None:
     assert "inprog" in out
     # The pymongo connection making this very call is one of the entries.
     conn_entries = [e for e in out["inprog"] if e.get("type") == "op"]
-    assert any(
-        e.get("client", "").startswith("127.0.0.1:") for e in conn_entries
-    )
+    assert any(e.get("client", "").startswith("127.0.0.1:") for e in conn_entries)
 
 
 def test_current_op_lists_open_cursors(client: MongoClient) -> None:
