@@ -698,3 +698,48 @@ body {
 .muted {
   color: var(--muted);
 }
+
+/* Dashboard live-stream pieces */
+
+.connection-status {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0.6rem;
+}
+
+.tile-subvalue {
+  font-size: 0.95rem;
+  color: var(--muted);
+  font-weight: 500;
+  margin-left: 0.25rem;
+}
+
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.chart-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+
+.chart-label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.chart-label span {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  font-weight: 500;
+}

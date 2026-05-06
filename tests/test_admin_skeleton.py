@@ -577,6 +577,62 @@ async def test_explain_invalid_json_filter_shows_error(http: AsyncClient) -> Non
     assert "Filter is not valid JSON" in r.text
 
 
+# ---- /ws/metrics WebSocket (Slice 4) ---------------------------------------
+
+
+def test_ws_metrics_streams_backlog_and_tick(server, tmp_path) -> None:
+    """Sync test using starlette TestClient — websocket support is sync.
+
+    Drives the websocket through the FastAPI lifespan so the sampler
+    actually starts. We poke the sampler directly to deterministically
+    produce ticks rather than waiting on the 1Hz timer.
+    """
+    from fastapi.testclient import TestClient
+
+    app = create_app(mongo_uri=server.uri, token="ws-token")
+    with TestClient(app) as client:
+        # Lifespan just started the sampler; force one synchronous tick
+        # before connecting so backlog has something in it.
+        app.state.sampler.tick_once()
+
+        with client.websocket_connect(
+            "/ws/metrics?t=ws-token"
+        ) as ws:
+            backlog = ws.receive_json()
+            assert backlog["type"] == "backlog"
+            assert isinstance(backlog["samples"], list)
+            # Trigger another tick after subscribing, expect a streamed frame.
+            app.state.sampler.tick_once()
+            tick = ws.receive_json()
+            assert tick["type"] == "tick"
+            sample = tick["sample"]
+            assert "uptime" in sample
+            assert "delta" in sample
+            assert "opcounters" in sample
+
+
+def test_ws_metrics_rejects_missing_token(server) -> None:
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    app = create_app(mongo_uri=server.uri, token="ws-token")
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/metrics") as ws:
+                ws.receive_json()
+
+
+def test_ws_metrics_rejects_bad_token(server) -> None:
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    app = create_app(mongo_uri=server.uri, token="ws-token")
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/metrics?t=wrong") as ws:
+                ws.receive_json()
+
+
 async def test_delete_doc_removes_and_returns_empty(
     server, http: AsyncClient
 ) -> None:

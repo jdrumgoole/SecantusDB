@@ -14,6 +14,7 @@ and drive it via ``httpx.AsyncClient(transport=ASGITransport(app))``.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,7 +25,15 @@ from fastapi.staticfiles import StaticFiles
 import secantus
 from secantus.admin.client import MongoFacade
 from secantus.admin.middleware import TokenAuthMiddleware
-from secantus.admin.routers import collection, dashboard, databases, health, indexes
+from secantus.admin.routers import (
+    collection,
+    dashboard,
+    databases,
+    health,
+    indexes,
+    metrics,
+)
+from secantus.admin.sampler import Hub, Sampler
 
 _ADMIN_PKG = Path(__file__).resolve().parent
 _STATIC_DIR = _ADMIN_PKG / "static"
@@ -33,11 +42,21 @@ _TEMPLATES_DIR = _ADMIN_PKG / "templates"
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # MongoFacade is set up in ``create_app`` (so tests can construct
-    # the app without going through lifespan); we just close it here.
+    # Bind the asyncio loop the sampler will broadcast onto, then start
+    # the polling thread. The hub stays the same instance across the
+    # app's lifetime; it was constructed in ``create_app``.
+    loop = asyncio.get_running_loop()
+    sampler = Sampler(
+        snapshot_fn=app.state.mongo.server_status,
+        hub=app.state.hub,
+        loop=loop,
+    )
+    app.state.sampler = sampler
+    sampler.start()
     try:
         yield
     finally:
+        sampler.stop()
         app.state.mongo.close()
 
 
@@ -52,6 +71,15 @@ def create_app(*, mongo_uri: str, token: str) -> FastAPI:
     )
     app.state.mongo = MongoFacade(mongo_uri)
     app.state.templates_dir = _TEMPLATES_DIR
+    # Token is exposed on app.state so WS handlers can verify it (the
+    # HTTP middleware doesn't see WebSocket scopes, so per-route checks
+    # need the same token reference).
+    app.state.token = token
+    app.state.hub = Hub()
+    # Sampler is started inside lifespan so the asyncio loop is live;
+    # set to None here for the test path that constructs the app
+    # without going through lifespan.
+    app.state.sampler = None
 
     # Static files first so /static/* lookups don't pay the middleware
     # cost — middleware bypasses /static/ already, but mounting before
@@ -65,6 +93,7 @@ def create_app(*, mongo_uri: str, token: str) -> FastAPI:
     app.include_router(databases.router)
     app.include_router(collection.router)
     app.include_router(indexes.router)
+    app.include_router(metrics.router)
 
     return app
 

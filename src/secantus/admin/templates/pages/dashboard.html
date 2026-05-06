@@ -1,11 +1,156 @@
 {% extends "base.html" %}
 {% block content %}
-<section
-  class="tiles"
-  hx-get="/_partials/dashboard-tiles"
-  hx-trigger="load, every 2s"
-  hx-swap="innerHTML"
+<div
+  x-data="dashboard()"
+  x-init="init()"
+  class="dashboard"
 >
-  <div class="loading">Loading…</div>
-</section>
+  <div class="connection-status" x-text="status"></div>
+
+  <section class="tiles">
+    <div class="tile">
+      <div class="tile-label">Uptime</div>
+      <div class="tile-value" x-text="formatUptime(latest.uptime)"></div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">Connections</div>
+      <div class="tile-value">
+        <span x-text="latest.connections.current"></span>
+        <span class="tile-subvalue">/ <span x-text="latest.connections.totalCreated"></span></span>
+      </div>
+      <div class="tile-hint">current / total opened</div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">Wire requests</div>
+      <div class="tile-value" x-text="formatNumber(latest.requests)"></div>
+      <div class="tile-hint"><span x-text="latest.delta.requests"></span>/s</div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">Total commands</div>
+      <div class="tile-value" x-text="formatNumber(latest.opcounters.command)"></div>
+      <div class="tile-hint"><span x-text="latest.delta.command"></span>/s</div>
+    </div>
+  </section>
+
+  <h2 class="section-title">Operations per second</h2>
+  <section class="charts">
+    <div class="chart-tile">
+      <div class="chart-label">Inserts <span x-text="latest.delta.insert"></span>/s</div>
+      <canvas x-ref="ch_insert" height="60"></canvas>
+    </div>
+    <div class="chart-tile">
+      <div class="chart-label">Queries <span x-text="latest.delta.query"></span>/s</div>
+      <canvas x-ref="ch_query" height="60"></canvas>
+    </div>
+    <div class="chart-tile">
+      <div class="chart-label">Updates <span x-text="latest.delta.update"></span>/s</div>
+      <canvas x-ref="ch_update" height="60"></canvas>
+    </div>
+    <div class="chart-tile">
+      <div class="chart-label">Deletes <span x-text="latest.delta.delete"></span>/s</div>
+      <canvas x-ref="ch_delete" height="60"></canvas>
+    </div>
+  </section>
+</div>
+
+<script>
+function dashboard() {
+  const SPARK_LEN = 60;
+  return {
+    status: "connecting…",
+    latest: {
+      uptime: 0,
+      connections: {current: 0, totalCreated: 0},
+      opcounters: {insert: 0, query: 0, update: 0, delete: 0, getmore: 0, command: 0},
+      delta: {insert: 0, query: 0, update: 0, delete: 0, getmore: 0, command: 0, requests: 0},
+      requests: 0,
+    },
+    charts: {},
+    series: {insert: [], query: [], update: [], delete: []},
+    backoff: 1000,
+
+    init() {
+      this.charts.insert = this._mkChart(this.$refs.ch_insert);
+      this.charts.query = this._mkChart(this.$refs.ch_query);
+      this.charts.update = this._mkChart(this.$refs.ch_update);
+      this.charts.delete = this._mkChart(this.$refs.ch_delete);
+      this._connect();
+    },
+
+    _mkChart(canvas) {
+      return new Chart(canvas, {
+        type: "line",
+        data: {labels: [], datasets: [{
+          data: [],
+          borderColor: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(),
+          borderWidth: 1.5,
+          tension: 0.25,
+          pointRadius: 0,
+          fill: false,
+        }]},
+        options: {
+          responsive: true,
+          animation: false,
+          maintainAspectRatio: false,
+          plugins: {legend: {display: false}, tooltip: {enabled: false}},
+          scales: {
+            x: {display: false},
+            y: {display: false, beginAtZero: true},
+          },
+        },
+      });
+    },
+
+    _connect() {
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${window.location.host}/ws/metrics`;
+      const ws = new WebSocket(url);
+      ws.onopen = () => {
+        this.status = "live";
+        this.backoff = 1000;
+      };
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "backlog") {
+          for (const sample of msg.samples) this._handleSample(sample, true);
+          for (const k of Object.keys(this.charts)) this.charts[k].update("none");
+        } else if (msg.type === "tick") {
+          this._handleSample(msg.sample, false);
+        }
+      };
+      ws.onclose = () => {
+        this.status = `reconnecting in ${this.backoff}ms…`;
+        setTimeout(() => this._connect(), this.backoff);
+        this.backoff = Math.min(this.backoff * 2, 15000);
+      };
+      ws.onerror = () => ws.close();
+    },
+
+    _handleSample(sample, fromBacklog) {
+      this.latest = sample;
+      for (const k of ["insert", "query", "update", "delete"]) {
+        const arr = this.series[k];
+        arr.push(sample.delta[k] || 0);
+        while (arr.length > SPARK_LEN) arr.shift();
+        const chart = this.charts[k];
+        chart.data.labels = arr.map((_, i) => i);
+        chart.data.datasets[0].data = arr;
+        if (!fromBacklog) chart.update("none");
+      }
+    },
+
+    formatNumber(n) { return (n || 0).toLocaleString(); },
+    formatUptime(seconds) {
+      const s = parseInt(seconds || 0, 10);
+      if (s < 60) return `${s}s`;
+      const m = Math.floor(s / 60), rs = s % 60;
+      if (m < 60) return `${m}m ${rs}s`;
+      const h = Math.floor(m / 60), rm = m % 60;
+      if (h < 24) return `${h}h ${rm}m`;
+      const d = Math.floor(h / 24), rh = h % 24;
+      return `${d}d ${rh}h`;
+    },
+  };
+}
+</script>
 {% endblock %}
