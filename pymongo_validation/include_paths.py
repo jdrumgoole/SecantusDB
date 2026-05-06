@@ -61,6 +61,14 @@ INCLUDE: list[str] = [
     # Common helpers + errors.
     "vendor/pymongo-tests/test/test_common.py",
     "vendor/pymongo-tests/test/test_errors.py",
+    # Read/write concern + read preference. Mostly driver-side
+    # semantics (concern object construction, URI parsing, default
+    # propagation). Single-node SecantusDB accepts these on the wire
+    # and ignores them — what runs here is the surface that doesn't
+    # depend on multi-node consistency.
+    "vendor/pymongo-tests/test/test_read_concern.py",
+    "vendor/pymongo-tests/test/test_write_concern.py",
+    "vendor/pymongo-tests/test/test_read_preferences.py",
     # Change streams. test_change_stream.py also loads the JSON unified
     # specs from change_streams/unified/ via its own runner. Tests that
     # require multi-node oplog semantics (e.g. mongos cluster-wide
@@ -78,16 +86,29 @@ INCLUDE: list[str] = [
     #   test_grid_file*, test_gridfs* — GridFS
     #   test_encryption, test_on_demand_csfle — CSFLE
     #   test_auth.py                 — SCRAM round-trip works (RBAC ships,
-    #     plugin runs the suite with auth=on), but pymongo's auth tests
-    #     also need: speculativeAuthenticate in hello, SCRAM-SHA-1
-    #     mechanism, $where (JS predicate), and
-    #     dropAllUsersFromDatabase. Each is its own slice. The plugin
-    #     and getCmdLineOpts / getParameter handlers added here
-    #     unblock that next slice.
+    #     plugin runs the suite with auth=on), and speculativeAuthenticate
+    #     is now in. Remaining gaps before turning this on: SCRAM-SHA-1
+    #     mechanism, $where (JS predicate). Each is its own slice.
     #   test_auth_oidc, test_auth_aws — OIDC / AWS auth providers
     #   test_auth_spec.py            — non-SCRAM cred mechanism specs
     #   test_ssl, test_ocsp*         — TLS
     #   asynchronous/, atlas/, lambda/, performance/, mockupdb/
     #   index_management/, collection_management/, read_write_concern/
     #     (spec dirs containing JSON for features above)
+]
+
+
+# Specific test IDs to deselect from the gauge — passed to pytest's
+# ``--deselect`` flag by the ``validate`` task. Use for tests that
+# fail in our environment for reasons unrelated to SecantusDB
+# compatibility (pymongo-side test bugs, environment-specific warning
+# filters, etc.). Each entry carries a one-line reason so the next
+# pymongo upgrade can reassess.
+DESELECT_TESTS: list[str] = [
+    # pymongo's `assertRaises(DeprecationWarning)` here depends on a
+    # warning filter that's only set by pymongo's own conftest stack;
+    # under our plugin invocation the warning fires but isn't
+    # converted to an exception, so the assertion fails. The test
+    # verifies a pymongo-internal deprecation, not server behaviour.
+    "vendor/pymongo-tests/test/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated",
 ]

@@ -302,7 +302,6 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(str(exc)) from exc
 
-
     # ---- users ----------------------------------------------------------
 
     def list_users(self, db: str) -> list[dict[str, Any]]:
@@ -333,9 +332,7 @@ class MongoFacade:
         roles: list[dict[str, str] | str],
     ) -> None:
         try:
-            self._get_client()[db].command(
-                "createUser", username, pwd=password, roles=list(roles)
-            )
+            self._get_client()[db].command("createUser", username, pwd=password, roles=list(roles))
         except OperationFailure as exc:
             raise MongoError(str(exc), code=exc.code) from exc
         except PyMongoError as exc:
@@ -366,9 +363,7 @@ class MongoFacade:
         if not roles:
             return
         try:
-            self._get_client()[db].command(
-                "grantRolesToUser", username, roles=list(roles)
-            )
+            self._get_client()[db].command("grantRolesToUser", username, roles=list(roles))
         except OperationFailure as exc:
             raise MongoError(str(exc), code=exc.code) from exc
         except PyMongoError as exc:
@@ -383,9 +378,7 @@ class MongoFacade:
         if not roles:
             return
         try:
-            self._get_client()[db].command(
-                "revokeRolesFromUser", username, roles=list(roles)
-            )
+            self._get_client()[db].command("revokeRolesFromUser", username, roles=list(roles))
         except OperationFailure as exc:
             raise MongoError(str(exc), code=exc.code) from exc
         except PyMongoError as exc:
