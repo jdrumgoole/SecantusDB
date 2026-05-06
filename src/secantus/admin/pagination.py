@@ -121,9 +121,7 @@ def build_page_filter(
         raise ValueError("sort_dir must be 1 or -1")
     final: dict[str, Any] = dict(base_filter or {})
     if "_id" in final:
-        raise ValueError(
-            "filter must not include _id when using skip-ID pagination"
-        )
+        raise ValueError("filter must not include _id when using skip-ID pagination")
     if cursor is not None:
         op = "$gt" if sort_dir == 1 else "$lt"
         final["_id"] = {op: cursor.after}

@@ -14,7 +14,6 @@ from secantus.admin.pagination import (
     make_next_cursor,
 )
 
-
 # ---- detect_id_type --------------------------------------------------------
 
 
@@ -167,9 +166,7 @@ def test_paged_collection_walks_full_collection(server, facade) -> None:
     seen: list[int] = []
     cursor = None
     for _ in range(10):  # safety bound
-        rows, token = facade.paged_collection(
-            "paged_db", "c", cursor=cursor, page_size=10
-        )
+        rows, token = facade.paged_collection("paged_db", "c", cursor=cursor, page_size=10)
         seen.extend(d["_id"] for d in rows)
         if token is None:
             break
@@ -204,9 +201,7 @@ def test_paged_collection_with_filter(server, facade) -> None:
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
     try:
-        mc["filter_db"]["c"].insert_many(
-            [{"_id": i, "active": i % 2 == 0} for i in range(20)]
-        )
+        mc["filter_db"]["c"].insert_many([{"_id": i, "active": i % 2 == 0} for i in range(20)])
     finally:
         mc.close()
 

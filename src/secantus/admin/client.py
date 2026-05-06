@@ -172,11 +172,7 @@ class MongoFacade:
         find_filter = build_page_filter(filter_doc, cursor, sort_dir=sort_dir)
         try:
             coll_obj = self._get_client()[db][coll]
-            rows = list(
-                coll_obj.find(find_filter)
-                .sort("_id", sort_dir)
-                .limit(page_size + 1)
-            )
+            rows = list(coll_obj.find(find_filter).sort("_id", sort_dir).limit(page_size + 1))
         except OperationFailure as exc:
             raise MongoError(str(exc), code=exc.code) from exc
         except PyMongoError as exc:

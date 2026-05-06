@@ -18,6 +18,10 @@ through each driver:
     / Date / Binary round-trip through SecantusDB without type collapse.
   * Bulk write — mixed insert / update / replace / upsert / delete in
     one ``bulkWrite``; counts and final state match per-driver.
+  * Change-stream resume — ``resumeAfter`` and
+    ``startAtOperationTime`` round-trip; the resume token format is
+    opaque to drivers, but each driver must re-present it verbatim
+    and have the server replay the right next events.
 
 Each test self-skips if its driver tooling isn't on PATH. Java is not
 covered here for the same reason as the geo smoke tests: a
@@ -676,5 +680,123 @@ def test_bulk_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go bulk smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Change-stream resume
+# ---------------------------------------------------------------------------
+
+
+# Workload: open a watch, drive three inserts, capture the resume
+# token at event 1, close, reopen with `resumeAfter` → must replay
+# events 2 + 3 in order. Then reopen with `startAtOperationTime`
+# anchored to a pre-insert timestamp → must replay all three.
+#
+# Resume tokens are opaque to drivers; the server-side layout is
+# `{s, t, n, k}` BSON-encoded as a hex string (`secantus.changestreams`).
+# Any wire-shape divergence in token round-trip surfaces here as a
+# wrong starting position or a "resume token not found" error.
+_CS_RESUME_MONGOSH_SCRIPT = """
+db.c.drop();
+const startTs = db.runCommand({ hello: 1 }).lastWrite.opTime.ts;
+
+const cs1 = db.c.watch([], { maxAwaitTimeMS: 1000 });
+sleep(200);
+db.c.insertMany([{ _id: 1 }, { _id: 2 }, { _id: 3 }]);
+
+function nextEvent(cs, deadline) {
+  while (Date.now() < deadline) {
+    if (cs.hasNext()) return cs.next();
+    sleep(150);
+  }
+  return null;
+}
+
+const e1 = nextEvent(cs1, Date.now() + 8000);
+const resumeAfter = e1._id;
+cs1.close();
+
+const cs2 = db.c.watch([], { resumeAfter, maxAwaitTimeMS: 1000 });
+const e2 = nextEvent(cs2, Date.now() + 8000);
+const e3 = nextEvent(cs2, Date.now() + 8000);
+cs2.close();
+
+const cs3 = db.c.watch([], { startAtOperationTime: startTs, maxAwaitTimeMS: 1000 });
+const got = [];
+const deadline = Date.now() + 8000;
+while (got.length < 3 && Date.now() < deadline) {
+  if (cs3.hasNext()) got.push(cs3.next().documentKey._id);
+  else sleep(150);
+}
+cs3.close();
+
+print(JSON.stringify({
+  e1: e1.documentKey._id,
+  e2: e2.documentKey._id,
+  e3: e3.documentKey._id,
+  startAt: got,
+}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_cs_resume_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [
+            _MONGOSH,
+            "--quiet",
+            f"{server.uri}cs_resume_xd",
+            "--eval",
+            _CS_RESUME_MONGOSH_SCRIPT,
+        ],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["e1"] == 1
+    assert payload["e2"] == 2
+    assert payload["e3"] == 3
+    assert payload["startAt"] == [1, 2, 3]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_cs_resume_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "cs_resume_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node cs-resume smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_cs_resume_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./cs_resume"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go cs-resume smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
