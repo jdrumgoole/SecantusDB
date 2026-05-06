@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+{% if error %}
+  <div class="error">Could not list databases: {{ error }}</div>
+{% else %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th class="num">Size on disk</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for db in databases %}
+        <tr>
+          <td><a href="/db/{{ db.name }}">{{ db.name }}</a></td>
+          <td class="num">{{ db.sizeOnDisk | humanize_bytes }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="2" class="empty">No databases.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}
