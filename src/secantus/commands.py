@@ -10,6 +10,7 @@ import bson
 
 from secantus.aggregate import PipelineContext, apply_pipeline
 from secantus.auth import (
+    SCRAM_SHA_1,
     SCRAM_SHA_256,
     AuthError,
     ConnectionAuth,
@@ -150,12 +151,15 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         )
     # saslSupportedMechs: drivers pass `saslSupportedMechs: "<db>.<user>"`
-    # to discover which mechanisms they should attempt for that principal.
-    # We always advertise SCRAM-SHA-256 (the modern MongoDB default); older
-    # SCRAM-SHA-1 is intentionally not offered.
+    # to discover which mechanisms they should attempt for that
+    # principal. The reply lists exactly what the user record stores
+    # credentials for — SCRAM-SHA-256 (modern default) and/or
+    # SCRAM-SHA-1 (legacy). If we don't recognise the principal we
+    # advertise the modern default so the driver still picks
+    # something reasonable.
     sasl_mechs_for = doc.get("saslSupportedMechs")
     if isinstance(sasl_mechs_for, str):
-        response["saslSupportedMechs"] = [SCRAM_SHA_256]
+        response["saslSupportedMechs"] = _mechs_for_principal(ctx, sasl_mechs_for)
     if ctx.require_auth:
         # Tell the client this server has access control on so it knows
         # to treat the connection as needing auth before commands flow.
@@ -1495,32 +1499,57 @@ def _ensure_conn_auth(ctx: CommandContext) -> ConnectionAuth:
     return ctx.connection_auth
 
 
-def _lookup_creds(storage: Storage, db: str, username: str) -> StoredCredentials | None:
+def _mechs_for_principal(ctx: CommandContext, principal: str) -> list[str]:
+    """Resolve `saslSupportedMechs` for ``"<db>.<user>"``.
+
+    Looks up the user record and returns the mechanisms its
+    ``credentials`` doc carries entries for, falling back to
+    ``[SCRAM_SHA_256]`` when the principal is unknown so the driver
+    still tries a real mechanism.
+    """
+    db, _, username = principal.partition(".")
+    if not username:
+        return [SCRAM_SHA_256]
+    record = ctx.storage.get_user(db, username)
+    if record is None:
+        return [SCRAM_SHA_256]
+    creds_doc = record.get("credentials")
+    if not isinstance(creds_doc, dict):
+        return [SCRAM_SHA_256]
+    # Order: modern first when both are present.
+    mechs = [m for m in (SCRAM_SHA_256, SCRAM_SHA_1) if m in creds_doc]
+    return mechs or [SCRAM_SHA_256]
+
+
+def _lookup_creds(
+    storage: Storage, db: str, username: str, *, mechanism: str = SCRAM_SHA_256
+) -> StoredCredentials | None:
     record = storage.get_user(db, username)
     if record is None:
         return None
     creds_doc = record.get("credentials")
-    if not isinstance(creds_doc, dict) or SCRAM_SHA_256 not in creds_doc:
+    if not isinstance(creds_doc, dict) or mechanism not in creds_doc:
         return None
-    return StoredCredentials.from_doc(creds_doc)
+    return StoredCredentials.from_doc(creds_doc, mechanism=mechanism)
 
 
 def _sasl_start(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     conn = _ensure_conn_auth(ctx)
     mechanism = doc.get("mechanism", "")
-    if mechanism != SCRAM_SHA_256:
+    if mechanism not in (SCRAM_SHA_256, SCRAM_SHA_1):
         return _auth_failure(
-            f"Unsupported SASL mechanism: {mechanism!r} (only {SCRAM_SHA_256} is supported)"
+            f"Unsupported SASL mechanism: {mechanism!r} (supported: {SCRAM_SHA_256}, {SCRAM_SHA_1})"
         )
     payload = _payload_bytes(doc.get("payload"))
     db_name = ctx.db_name or "admin"
-    creds = _lookup_creds(ctx.storage, db_name, _peek_scram_username(payload))
+    creds = _lookup_creds(ctx.storage, db_name, _peek_scram_username(payload), mechanism=mechanism)
     try:
         server_first, state = begin_scram(
             conversation_id=conn.new_conversation_id(),
             db_name=db_name,
             payload=payload,
             creds=creds,
+            mechanism=mechanism,
         )
     except AuthError as exc:
         return _auth_failure(str(exc))
@@ -1608,7 +1637,6 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "BadValue",
         }
     db_name = ctx.db_name or "admin"
-    creds = derive_credentials(pwd)
     roles_arg = doc.get("roles", []) or []
     normalised = _normalise_roles_arg(roles_arg, db_name)
     if normalised is None:
@@ -1618,13 +1646,35 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 31,
             "codeName": "RoleNotFound",
         }
+    # `mechanisms` selects which SCRAM hashes to derive credentials
+    # for. Default to SCRAM-SHA-256 alone, matching mongod's modern
+    # default (post-3.6 the SHA-1 hashing isn't computed unless the
+    # request asks for it).
+    mechanisms_arg = doc.get("mechanisms")
+    if isinstance(mechanisms_arg, list) and mechanisms_arg:
+        requested = [m for m in mechanisms_arg if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
+    else:
+        requested = [SCRAM_SHA_256]
+    if not requested:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "createUser: mechanisms must contain at least one of "
+                f"{SCRAM_SHA_256!r}, {SCRAM_SHA_1!r}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    creds_doc: dict[str, object] = {}
+    for mech in requested:
+        creds_doc.update(derive_credentials(pwd, mechanism=mech, username=username).to_doc())
     record = {
         "_id": f"{db_name}.{username}",
         "user": username,
         "db": db_name,
-        "credentials": creds.to_doc(),
+        "credentials": creds_doc,
         "roles": normalised,
-        "mechanisms": [SCRAM_SHA_256],
+        "mechanisms": requested,
     }
     added = ctx.storage.add_user(db_name, username, record, replace=False)
     if not added:
@@ -1681,7 +1731,18 @@ def _update_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 2,
                 "codeName": "BadValue",
             }
-        record["credentials"] = derive_credentials(pwd).to_doc()
+        # Re-derive credentials for whichever mechanisms the existing
+        # record was provisioned with, so updateUser preserves a
+        # SHA-1+SHA-256 user as SHA-1+SHA-256.
+        existing_mechs = record.get("mechanisms")
+        if isinstance(existing_mechs, list) and existing_mechs:
+            mechs = [m for m in existing_mechs if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
+        else:
+            mechs = [SCRAM_SHA_256]
+        new_creds: dict[str, object] = {}
+        for mech in mechs:
+            new_creds.update(derive_credentials(pwd, mechanism=mech, username=username).to_doc())
+        record["credentials"] = new_creds
     if roles_arg is not None:
         normalised = _normalise_roles_arg(roles_arg, db_name)
         if normalised is None:
