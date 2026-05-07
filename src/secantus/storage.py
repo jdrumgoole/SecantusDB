@@ -368,14 +368,21 @@ class Storage:
         # WT_ERROR. mongod itself runs with session_max=33000 — 1000
         # is a generous floor for a single-node test surrogate while
         # still well under the WT hard limit.
+        # cache_size default is 100 MB. With ``in_memory=true`` every
+        # write also lives in cache, so a workload that inserts a
+        # handful of 16 MB documents (mongod's per-doc max) blows the
+        # cap as ``WT_CACHE_FULL: operation would overflow cache``.
+        # 1 GB gives generous headroom for tests + reasonable
+        # in-process workloads while staying well under the limits
+        # ``mongod`` itself runs with on a normal box.
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
-            config = "create,in_memory=true,session_max=1000"
+            config = "create,in_memory=true,session_max=1000,cache_size=1G"
         else:
             os.makedirs(path, exist_ok=True)
             home = path
-            config = "create,session_max=1000"
+            config = "create,session_max=1000,cache_size=1G"
         self._conn = wt.wiredtiger_open(home, config)
         self._tls = threading.local()
         self._all_sessions: list[Any] = []

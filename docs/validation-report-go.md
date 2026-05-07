@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-05-06 — SecantusDB 0.3.0a63 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-05-07 — SecantusDB 0.3.0a65 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -9,24 +9,36 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `bson` | 5061 | 0 | 14 | 5075 | 100.0% |
-| `internal/integration` | 207 | 8 | 22 | 237 | 96.3% |
+| `internal/integration` | 247 | 20 | 29 | 296 | 92.5% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
 | `mongo` | 303 | 0 | 10 | 313 | 100.0% |
-| **Overall** | **5613** | **8** | **46** | **5667** | **99.9%** |
+| **Overall** | **5653** | **20** | **53** | **5726** | **99.6%** |
 
-## Failures (8)
+## Failures (20)
 
 First 30 failed tests for triage:
 
 ```
-internal/integration :: TestCollection/find/invalid_identifier_error
-internal/integration :: TestCollection/find
-internal/integration :: TestCollection/insert_many/return_only_inserted_ids/ordered
-internal/integration :: TestCollection/insert_many/large_document_batches
-internal/integration :: TestCollection/insert_many/return_only_inserted_ids
-internal/integration :: TestCollection/insert_many/writeError_index
-internal/integration :: TestCollection/insert_many
-internal/integration :: TestCollection
+internal/integration :: TestCursor_All/getMore_error
+internal/integration :: TestCursor_All
+internal/integration :: TestCursor_Close/killCursors_error
+internal/integration :: TestCursor_Close
+internal/integration :: TestCursor_tailableAwaitData_applyRemainingTimeout/find_client-level_timeout
+internal/integration :: TestCursor_tailableAwaitData_applyRemainingTimeout/find_operation-level_timeout
+internal/integration :: TestCursor_tailableAwaitData_applyRemainingTimeout/aggregate_with_changeStream_client-level_timeout
+internal/integration :: TestCursor_tailableAwaitData_applyRemainingTimeout/aggregate_with_changeStream_operation-level_timeout
+internal/integration :: TestCursor_tailableAwaitData_applyRemainingTimeout/runCommandCursor_client-level_timeout
+internal/integration :: TestCursor_tailableAwaitData_applyRemainingTimeout/runCommandCursor_operation-level_timeout
+internal/integration :: TestCursor_tailableAwaitData_applyRemainingTimeout
+internal/integration :: TestDatabase/run_command/gets_result_and_error
+internal/integration :: TestDatabase/run_command
+internal/integration :: TestDatabase/list_collection_names/filter_not_found
+internal/integration :: TestDatabase/list_collection_names
+internal/integration :: TestDatabase/list_collections/verify_results/replica_set_filter
+internal/integration :: TestDatabase/list_collections/verify_results
+internal/integration :: TestDatabase/list_collections/getMore_commands_are_monitored
+internal/integration :: TestDatabase/list_collections
+internal/integration :: TestDatabase
 ```
 
 ## How this is generated

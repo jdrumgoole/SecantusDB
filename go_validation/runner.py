@@ -97,7 +97,17 @@ def main() -> int:
         env["MONGODB_URI"] = f"mongodb://{host}:{port}"
         env.setdefault("REQUIRE_API_VERSION", "false")
 
-        cmd = ["go", "test", "-json", "-count=1"]
+        # Default Go per-package timeout is 10 min. The mongo-go-driver
+        # integration package runs many CRUD tests in parallel against
+        # SecantusDB; total runtime under load can creep past 10 min,
+        # at which point Go's runtime kills the whole test binary
+        # with "test timed out", marking every still-running subtest
+        # as failed in cascade. Bumping to 30 min keeps the gauge
+        # interpretable: individual tests that really hang still
+        # surface, but the package-wide kill no longer corrupts the
+        # signal for unrelated work that just happened to be in
+        # flight when the killer fired.
+        cmd = ["go", "test", "-json", "-count=1", "-timeout=30m"]
         if SKIP_PATTERNS:
             cmd.append(f"-skip={'|'.join(SKIP_PATTERNS)}")
         cmd.extend(INCLUDE)
