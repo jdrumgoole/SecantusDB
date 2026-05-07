@@ -53,6 +53,7 @@ class SecantusDBServer:
         *,
         replica_set_name: str | None = "secantus",
         require_auth: bool = False,
+        ttl_sweep_seconds: float = 60.0,
     ) -> None:
         self.host = host
         self.port = port
@@ -65,7 +66,11 @@ class SecantusDBServer:
         # connect, which requires replica-set advertisement in `hello`.
         # Skip them in pure-standalone mode to drop a per-write BSON
         # encode + oplog-table cursor write per modified document.
-        self.storage = Storage(storage_path, enable_oplog=replica_set_name is not None)
+        self.storage = Storage(
+            storage_path,
+            enable_oplog=replica_set_name is not None,
+            ttl_sweep_seconds=ttl_sweep_seconds,
+        )
         self.cursors = CursorRegistry()
         # Per-server counters surfaced through `serverStatus`. Started
         # eagerly so `start_monotonic` reflects construction time, not
