@@ -349,6 +349,7 @@ class Storage:
         oplog_max_entries: int = 100_000,
         time_func: Callable[[], float] | None = None,
         enable_oplog: bool = True,
+        ttl_sweep_seconds: float = 60.0,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -407,6 +408,22 @@ class Storage:
         self._oplog_emit_count = 0
         with self._lock:
             self._next_seq, self._last_ts_secs, self._last_ts_ord = self._load_oplog_meta()
+
+        # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
+        # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
+        # the thread entirely (tests that drive expiry deterministically
+        # via ``prune_ttl(now=...)`` use that escape hatch). The
+        # sweeper walks every (db, coll) and calls ``prune_ttl`` on
+        # each — collections with no TTL index short-circuit cheaply
+        # at the index-scan step, so the steady-state cost is small.
+        self._ttl_sweep_seconds = float(ttl_sweep_seconds)
+        self._ttl_stop = threading.Event()
+        self._ttl_thread: threading.Thread | None = None
+        if self._ttl_sweep_seconds > 0:
+            self._ttl_thread = threading.Thread(
+                target=self._ttl_sweep_loop, name="secantus-ttl-sweeper", daemon=True
+            )
+            self._ttl_thread.start()
 
     def _load_oplog_meta(self) -> tuple[int, int, int]:
         c = self._cursor(_OPLOG_META_TABLE)
@@ -839,6 +856,13 @@ class Storage:
         return out
 
     def close(self) -> None:
+        # Stop the TTL sweeper before tearing down WT — the thread
+        # acquires ``self._lock`` to call prune_ttl, so racing it
+        # against close would deadlock or use-after-close.
+        self._ttl_stop.set()
+        if self._ttl_thread is not None and self._ttl_thread.is_alive():
+            self._ttl_thread.join(timeout=2.0)
+            self._ttl_thread = None
         with self._lock:
             if self._closed:
                 return
@@ -852,6 +876,81 @@ class Storage:
             if self._tempdir is not None:
                 shutil.rmtree(self._tempdir, ignore_errors=True)
                 self._tempdir = None
+
+    def prune_ttl_all_collections(self, *, now: _dt.datetime | None = None) -> int:
+        """Run :meth:`prune_ttl` against every collection, returning the
+        total docs pruned. Used by the background sweeper and exposed
+        publicly so callers (admin tooling, tests) can drive a
+        deterministic global pass.
+
+        Callers using the cached per-thread session must call
+        :meth:`_reset_thread_session` first — WiredTiger snapshots
+        are sticky per-session, so reads otherwise miss rows
+        committed by other threads. The sweeper does this on every
+        iteration; one-shot user calls happen on the writer's thread
+        and see their own writes.
+        """
+        with self._lock:
+            c = self._cursor(_COLL_TABLE)
+            namespaces: list[tuple[str, str]] = []
+            rc = c.next()
+            while rc == 0:
+                k = c.get_key()
+                namespaces.append((k[0], k[1]))
+                rc = c.next()
+        total = 0
+        for db, coll in namespaces:
+            with contextlib.suppress(Exception):
+                # Storage close races: drop_collection between snapshot
+                # and prune fails inside prune_ttl with a missing-coll
+                # error. The sweeper should never crash the daemon.
+                total += self.prune_ttl(db, coll, now=now)
+        return total
+
+    def _ttl_sweep_loop(self) -> None:
+        """Background sweeper: every ``ttl_sweep_seconds`` walk all
+        collections and prune expired docs. Stops when ``_ttl_stop``
+        is set or the storage is closed.
+
+        Drops the per-thread WT session before each iteration so the
+        next cursor call opens a fresh session. WiredTiger sessions
+        carry a sticky read snapshot — without the reset, reads on
+        this thread would never observe rows committed by other
+        writers, and TTL sweeps would always return 0 even when
+        expired docs existed. Same pattern as ``read_oplog``.
+        """
+        import logging
+
+        log = logging.getLogger("secantus.storage.ttl")
+        while not self._ttl_stop.wait(self._ttl_sweep_seconds):
+            if self._closed:
+                return
+            self._reset_thread_session()
+            try:
+                self.prune_ttl_all_collections()
+            except Exception:
+                # Sweeper failures must not propagate — they'd kill
+                # the daemon thread and silently disable expiry.
+                log.exception("ttl sweep failed")
+
+    def _reset_thread_session(self) -> None:
+        """Close the calling thread's cached WT session + cursors so
+        the next ``_session()`` call opens fresh ones. Needed when a
+        thread reads in a loop and must observe writes from other
+        threads (snapshot is otherwise sticky)."""
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            return
+        cursors = getattr(self._tls, "cursors", {}) or {}
+        for c in cursors.values():
+            with contextlib.suppress(Exception):
+                c.close()
+        with contextlib.suppress(Exception):
+            s.close()
+        with self._lock, contextlib.suppress(ValueError):
+            self._all_sessions.remove(s)
+        self._tls.session = None
+        self._tls.cursors = {}
 
     def checkpoint(self) -> None:
         """Force a WiredTiger checkpoint to flush dirty pages to disk.
