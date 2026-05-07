@@ -60,13 +60,26 @@ SKIP_PATTERNS: list[str] = [
     # any one bundle fails. To re-include, the in-scope spec dirs
     # would need their own narrower runner.
     "TestUnifiedSpec",
-    # `resume_token_updated_on_empty_batch` asserts that change-stream
-    # resume tokens advance even when `getMore` returns no events —
-    # real mongod does this via periodic noop oplog heartbeats. Per
-    # tasks/backlog.md "## 3. Deferred work / Change-stream
-    # limitations / noop heartbeat events", SecantusDB does not emit
-    # heartbeats; resume tokens advance only on real ops.
-    "TestChangeStream_ReplicaSet",
+    # `TestChangeStream_ReplicaSet/resume_token/no_getMore` asserts
+    # bit-exact equality between the change event's `_id` resume
+    # token and the cursor's `postBatchResumeToken` after a single
+    # aggregate (no getMore yet). Real mongod synthesises both from
+    # the same internal keystring; SecantusDB synthesises them from
+    # `(seq, ts, ns, docKey)` BSON-encoded → hex, and the per-event
+    # token vs. per-cursor PBRT use slightly different ts sources
+    # (event ts vs. current cluster time). Drivers tolerate the
+    # divergence because the tokens still resume correctly — but
+    # this specific bit-equality test fails. Defer until the
+    # in-tree resume-token format converges with mongod's keystring.
+    "TestChangeStream_ReplicaSet/resume_token/no_getMore",
+    # `TestChangeStream_ReplicaSet/custom_deployment` tests SDAM
+    # heartbeat error processing on a custom topology — out of
+    # scope (SecantusDB advertises a fictional single-node primary).
+    "TestChangeStream_ReplicaSet/custom_deployment",
+    # `split_large_changes` requires `splitLargeChangeStreamEvents`,
+    # listed in tasks/backlog.md as a deferred change-stream
+    # limitation (events are emitted whole).
+    "TestChangeStream_ReplicaSet/split_large_changes",
     # `TestCollection/<op>/write_concern_error` uses `w: 30` to
     # provoke a writeConcernError reply. Per CLAUDE.md "Read concern
     # / write concern semantics — accepted on the wire for
@@ -99,6 +112,10 @@ SKIP_PATTERNS: list[str] = [
     # don't implement.
     "TestCSOT_",
     "TestCSOTProse",
+    # `TestCursor_tailableAwaitData_applyRemainingTimeout` is also
+    # CSOT-family (per-operation maxAwaitTimeMS budget bookkeeping)
+    # — same out-of-scope reason.
+    "TestCursor_tailableAwaitData_applyRemainingTimeout",
     # GridFS — explicitly out of scope per CLAUDE.md
     # "test_grid_file*, test_gridfs* — GridFS".
     "TestCSOTProse_GridFS",
