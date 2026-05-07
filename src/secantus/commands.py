@@ -1272,13 +1272,20 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # The invalidate event has now been delivered.
         entry.final_event_pending = False
     cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
+    cursor_doc: dict[str, Any] = {
+        "nextBatch": batch,
+        # Cursor `id` MUST be int64 — Go driver hard-fails int32.
+        "id": bson.Int64(cursor_id if cursor_alive else 0),
+        "ns": ns,
+    }
+    if entry.last_token is not None:
+        # `postBatchResumeToken` lets change-stream consumers advance
+        # their resume position even when nextBatch is empty —
+        # MongoDB 4.2+ feature, mongo-go-driver and pymongo expect it
+        # on every change-stream getMore.
+        cursor_doc["postBatchResumeToken"] = entry.last_token
     return {
-        "cursor": {
-            "nextBatch": batch,
-            # Cursor `id` MUST be int64 — Go driver hard-fails int32.
-            "id": bson.Int64(cursor_id if cursor_alive else 0),
-            "ns": ns,
-        },
+        "cursor": cursor_doc,
         "ok": 1.0,
     }
 
@@ -1444,9 +1451,21 @@ def _aggregate_change_stream(
             return []
         rows = storage.read_oplog(start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter)
         if not rows:
+            # No new oplog entries since last poll. Still refresh
+            # ``last_token`` so the next ``postBatchResumeToken``
+            # carries the current cluster time — consumers on quiet
+            # collections can advance their resume position even
+            # when no events are visible. Token's ns / docKey stay
+            # at the last-seen value (drivers tolerate the placeholder).
+            ts = storage.current_cluster_time()
+            entry.last_token = changestreams.make_resume_token(
+                changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
+            )
             return []
         events: list[dict[str, Any]] = []
         last_seen = entry.position_seq
+        last_seen_ts = None
+        last_seen_ns = ns
         for seq, oplog_entry in rows:
             try:
                 ev, invalidates = changestreams.project(
@@ -1467,12 +1486,23 @@ def _aggregate_change_stream(
             if ev is not None:
                 events.append(ev)
             last_seen = seq
+            ts_field = oplog_entry.get("ts")
+            if ts_field is not None:
+                last_seen_ts = ts_field
+            ns_field = oplog_entry.get("ns")
+            if isinstance(ns_field, str) and ns_field:
+                last_seen_ns = ns_field
             if invalidates:
                 events.append(changestreams.invalidate_event(seq, oplog_entry))
                 entry.invalidated = True
                 entry.final_event_pending = True
                 break
         entry.position_seq = last_seen
+        if last_seen_ts is None:
+            last_seen_ts = storage.current_cluster_time()
+        entry.last_token = changestreams.make_resume_token(
+            changestreams.ResumeTokenData(last_seen, last_seen_ts, last_seen_ns, {})
+        )
         if pipeline_after_cs:
             events = apply_pipeline(events, pipeline_after_cs, pipeline_ctx)
         return events
@@ -1486,9 +1516,19 @@ def _aggregate_change_stream(
     )
     entry_ref["entry"] = ctx.cursors.get(cursor_id)
     _ = batch_size  # firstBatch is empty by design for change streams
+    initial_ts = ctx.storage.current_cluster_time()
+    initial_token = changestreams.make_resume_token(
+        changestreams.ResumeTokenData(start_seq - 1, initial_ts, ns, {})
+    )
+    entry_ref["entry"].last_token = initial_token
     return {
-        "cursor": {"firstBatch": [], "id": bson.Int64(cursor_id), "ns": ns},
-        "operationTime": ctx.storage.current_cluster_time(),
+        "cursor": {
+            "firstBatch": [],
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
+            "postBatchResumeToken": initial_token,
+        },
+        "operationTime": initial_ts,
         "ok": 1.0,
     }
 

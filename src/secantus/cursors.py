@@ -33,6 +33,12 @@ class _Entry:
     collection_uuid: _uuid.UUID | None = None
     invalidated: bool = False
     final_event_pending: bool = False
+    # Latest change-stream resume token observed by the producer.
+    # Returned to the client as ``cursor.postBatchResumeToken`` on
+    # every getMore so consumers on quiet collections can advance
+    # their resume position even when no events are visible. None
+    # for non-change-stream cursors.
+    last_token: dict[str, str] | None = None
 
 
 class CursorRegistry:
