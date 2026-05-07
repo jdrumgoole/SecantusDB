@@ -93,7 +93,11 @@ def _split_into_cursor(
     namespace: str,
     cursors: CursorRegistry,
 ) -> tuple[list[dict[str, Any]], int]:
-    if batch_size <= 0:
+    # ``batch_size == 0`` is a real value, not a "use default":
+    # MongoDB defines it as "open the cursor with an empty
+    # firstBatch and let the client pull via getMore". A cursor id
+    # is registered so the next getMore can find the docs.
+    if batch_size < 0:
         batch_size = DEFAULT_BATCH_SIZE
     first = docs[:batch_size]
     remaining = docs[batch_size:]
@@ -599,6 +603,17 @@ def _ns(db: str, coll: str) -> str:
 def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["insert"]
     documents = doc.get("documents", [])
+    if not isinstance(documents, list) or len(documents) == 0:
+        # mongod rejects an empty `documents` array with code 4
+        # (InvalidLength). Drivers (mongo-go-driver, mongo-java-driver)
+        # have command-error tests that check for this specific code
+        # / codeName combo, so it's load-bearing for the gauge.
+        return {
+            "ok": 0.0,
+            "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+            "code": 4,
+            "codeName": "InvalidLength",
+        }
     ordered = doc.get("ordered", True)
     inserted, errors = ctx.storage.insert(ctx.db_name, coll, documents, ordered=ordered)
     reply: dict[str, Any] = {"n": inserted, "ok": 1.0}
@@ -608,6 +623,7 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus.query import QueryError
     from secantus.storage import BadHint
 
     coll = doc["find"]
@@ -617,8 +633,27 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     sort = doc.get("sort") or None
     projection = doc.get("projection") or None
     hint = doc.get("hint")
-    batch_size = int(doc.get("batchSize", 0) or 0)
+    # ``batchSize`` is genuinely tri-state: absent (use default),
+    # 0 ("open the cursor but send no docs in firstBatch"), or
+    # explicit positive. The 0 case is load-bearing for drivers
+    # that want to set a streaming batch size via ``getMore`` — the
+    # mongo-go-driver test ``TestCursor/set_batchSize`` opens a
+    # cursor with batchSize 0, then calls SetBatchSize on the
+    # batch cursor and asserts the next getMore carries that size.
+    raw_batch_size = doc.get("batchSize")
+    batch_size = DEFAULT_BATCH_SIZE if raw_batch_size is None else int(raw_batch_size)
     single_batch = bool(doc.get("singleBatch", False))
+    # Validate filter syntax up-front. matches() raises QueryError for
+    # unknown top-level operators; running it against an empty doc is
+    # cheap and triggers the same validation paths the real query would
+    # hit. Without this, an empty collection with `{$foo: 1}` returns
+    # an empty cursor instead of an error — real mongod (and the
+    # mongo-go-driver test ``find/invalid_identifier_error``) rejects
+    # at the find command level.
+    try:
+        matches({}, filter_)
+    except QueryError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     try:
         docs = ctx.storage.find_matching(
             ctx.db_name,
@@ -632,13 +667,13 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         )
     except BadHint as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    except QueryError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     ns = _ns(ctx.db_name, coll)
     if single_batch:
         first_batch, cursor_id = docs, 0
     else:
-        first_batch, cursor_id = _split_into_cursor(
-            docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
-        )
+        first_batch, cursor_id = _split_into_cursor(docs, batch_size, ns, ctx.cursors)
     return {
         # Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
         "cursor": {"firstBatch": first_batch, "id": bson.Int64(cursor_id), "ns": ns},
@@ -1256,7 +1291,8 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     pipeline = doc.get("pipeline", [])
     hint = doc.get("hint")
     cursor_opts = doc.get("cursor") or {}
-    batch_size = int(cursor_opts.get("batchSize", 0) or 0)
+    raw_agg_batch = cursor_opts.get("batchSize")
+    batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else int(raw_agg_batch)
     coll_name = ""
 
     first_stage = pipeline[0] if pipeline else {}
@@ -1295,9 +1331,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         ns = f"{ctx.db_name}.$cmd.aggregate"
     pipeline_ctx = PipelineContext(storage=ctx.storage, db_name=ctx.db_name, coll_name=coll_name)
     docs = apply_pipeline(docs, pipeline, pipeline_ctx)
-    first_batch, cursor_id = _split_into_cursor(
-        docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
-    )
+    first_batch, cursor_id = _split_into_cursor(docs, batch_size, ns, ctx.cursors)
     # Silence unused import in this branch.
     _ = changestreams
     return {
