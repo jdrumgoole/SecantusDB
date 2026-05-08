@@ -31,11 +31,13 @@ from secantus.rbac import (
     A_COLL_STATS,
     A_CREATE_COLLECTION,
     A_CREATE_INDEX,
+    A_CREATE_ROLE,
     A_CREATE_USER,
     A_DB_STATS,
     A_DROP_COLLECTION,
     A_DROP_DATABASE,
     A_DROP_INDEX,
+    A_DROP_ROLE,
     A_DROP_USER,
     A_FIND,
     A_FSYNC,
@@ -1786,7 +1788,7 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     db_name = ctx.db_name or "admin"
     roles_arg = doc.get("roles", []) or []
-    normalised = _normalise_roles_arg(roles_arg, db_name)
+    normalised = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
     if normalised is None:
         return {
             "ok": 0.0,
@@ -1892,7 +1894,7 @@ def _update_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             new_creds.update(derive_credentials(pwd, mechanism=mech, username=username).to_doc())
         record["credentials"] = new_creds
     if roles_arg is not None:
-        normalised = _normalise_roles_arg(roles_arg, db_name)
+        normalised = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
         if normalised is None:
             return {
                 "ok": 0.0,
@@ -2033,21 +2035,36 @@ def _users_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"users": users, "ok": 1.0}
 
 
-def _normalise_roles_arg(arg: Any, default_db: str) -> list[dict[str, str]] | None:
+def _normalise_roles_arg(
+    arg: Any,
+    default_db: str,
+    *,
+    storage: Storage | None = None,
+) -> list[dict[str, str]] | None:
     """Coerce a ``roles`` argument into the canonical ``[{role, db}]`` shape.
 
     Accepts the list-of-strings shorthand (``["read", "readWrite"]`` —
     each implicitly bound to ``default_db``) and the list-of-dicts form.
-    Validates role names against :data:`secantus.rbac.BUILT_IN_ROLES`.
-    Returns ``None`` if any entry is unrecognised — caller surfaces a
-    ``RoleNotFound`` error.
+    Role names validate against :data:`secantus.rbac.BUILT_IN_ROLES`
+    first, then fall through to ``storage.get_role(db, name)`` so
+    custom roles are accepted alongside built-ins. Returns ``None``
+    if any entry is unrecognised — caller surfaces a ``RoleNotFound``
+    error.
     """
+
+    def _resolves(role: str, db: str) -> bool:
+        if is_known_role(role):
+            return True
+        if storage is None:
+            return False
+        return storage.get_role(db, role) is not None
+
     if not isinstance(arg, list):
         return None
     out: list[dict[str, str]] = []
     for entry in arg:
         if isinstance(entry, str):
-            if not is_known_role(entry):
+            if not _resolves(entry, default_db):
                 return None
             out.append({"role": entry, "db": default_db})
             continue
@@ -2056,7 +2073,7 @@ def _normalise_roles_arg(arg: Any, default_db: str) -> list[dict[str, str]] | No
             db = entry.get("db", default_db)
             if not isinstance(role, str) or not isinstance(db, str):
                 return None
-            if not is_known_role(role):
+            if not _resolves(role, db):
                 return None
             out.append({"role": role, "db": db})
             continue
@@ -2075,7 +2092,7 @@ def _grant_roles_to_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, 
         }
     db_name = ctx.db_name or "admin"
     roles_arg = doc.get("roles")
-    new_roles = _normalise_roles_arg(roles_arg, db_name)
+    new_roles = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
     if new_roles is None:
         return {
             "ok": 0.0,
@@ -2118,7 +2135,7 @@ def _revoke_roles_from_user(doc: dict[str, Any], ctx: CommandContext) -> dict[st
         }
     db_name = ctx.db_name or "admin"
     roles_arg = doc.get("roles")
-    to_revoke = _normalise_roles_arg(roles_arg, db_name)
+    to_revoke = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
     if to_revoke is None:
         return {
             "ok": 0.0,
@@ -2165,19 +2182,369 @@ def _refresh_effective_roles(ctx: CommandContext) -> None:
             conn.add_principal_roles(roles)
 
 
-def _roles_info(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    """Return information about built-in roles.
+def _normalise_privileges(arg: Any) -> list[dict[str, Any]] | None:
+    """Validate / normalise a ``privileges`` array. Returns the cleaned
+    list, or ``None`` if any entry is malformed (caller maps to
+    BadValue). An empty list is fine — a role can be a pure inheritor.
+    """
+    if not isinstance(arg, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for priv in arg:
+        if not isinstance(priv, Mapping):
+            return None
+        resource = priv.get("resource")
+        actions = priv.get("actions")
+        if not isinstance(resource, Mapping) or not isinstance(actions, list):
+            return None
+        if not all(isinstance(a, str) for a in actions):
+            return None
+        out.append({"resource": dict(resource), "actions": list(actions)})
+    return out
 
-    Custom roles aren't supported (no `createRole` in this slice), so
-    this just enumerates the built-ins. Mongod returns more fields
-    (privileges, inherited roles); we surface name + db + isBuiltin
-    which is enough for tooling that wants to enumerate.
+
+def _normalise_inherited_roles(arg: Any, default_db: str) -> list[dict[str, str]] | None:
+    """Validate / normalise an inherited ``roles`` array. Each entry is
+    ``"<name>"`` (uses default_db) or ``{"role": <name>, "db": <db>}``.
+    Returns ``None`` on malformed input.
+    """
+    if not isinstance(arg, list):
+        return None
+    out: list[dict[str, str]] = []
+    for entry in arg:
+        if isinstance(entry, str) and entry:
+            out.append({"role": entry, "db": default_db})
+        elif isinstance(entry, Mapping):
+            name = entry.get("role")
+            db = entry.get("db", default_db)
+            if not isinstance(name, str) or not name:
+                return None
+            if not isinstance(db, str) or not db:
+                return None
+            out.append({"role": name, "db": db})
+        else:
+            return None
+    return out
+
+
+def _create_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Define a custom role with privileges and (optionally) inherited
+    roles. Mongod-shaped: ``createRole`` ``privileges`` ``roles``.
+    Rejects names that collide with built-ins (matches mongod, which
+    refuses ``createRole: "read"`` etc.).
+    """
+    name = doc.get("createRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "createRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if name in BUILT_IN_ROLES:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Cannot create role with name {name!r}: name is reserved for a built-in",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    privileges = _normalise_privileges(doc.get("privileges"))
+    if privileges is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "createRole: privileges must be an array of {resource, actions}",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    inherited = _normalise_inherited_roles(doc.get("roles"), db_name)
+    if inherited is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "createRole: roles must be a list of names or {role, db} dicts",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    record = {
+        "_id": f"{db_name}.{name}",
+        "role": name,
+        "db": db_name,
+        "privileges": privileges,
+        "roles": inherited,
+    }
+    if not ctx.storage.add_role(db_name, name, record, replace=False):
+        return {
+            "ok": 0.0,
+            "errmsg": f'Role "{name}@{db_name}" already exists',
+            "code": 51002,
+            "codeName": "Location51002",
+        }
+    return {"ok": 1.0}
+
+
+def _update_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Replace a custom role's privileges / inherited roles in place.
+    Either ``privileges`` or ``roles`` (or both) may be supplied;
+    omitted fields stay as-is. Mongod-shaped.
+    """
+    name = doc.get("updateRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "updateRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    if "privileges" in doc:
+        privileges = _normalise_privileges(doc["privileges"])
+        if privileges is None:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateRole: privileges must be an array of {resource, actions}",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        record["privileges"] = privileges
+    if "roles" in doc:
+        inherited = _normalise_inherited_roles(doc["roles"], db_name)
+        if inherited is None:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateRole: roles must be a list of names or {role, db} dicts",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        record["roles"] = inherited
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _drop_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("dropRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "dropRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    if not ctx.storage.drop_role(db_name, name):
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    return {"ok": 1.0}
+
+
+def _drop_all_roles_from_database(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop every custom role bound to the calling db. Returns ``n`` =
+    removed count. Built-in roles are not affected (they're never
+    persisted)."""
+    db_name = ctx.db_name or "admin"
+    removed = 0
+    while True:
+        batch = ctx.storage.list_roles(db_name, skip=0, limit=1000)
+        if not batch:
+            break
+        for record in batch:
+            role = record.get("role")
+            if isinstance(role, str) and ctx.storage.drop_role(db_name, role):
+                removed += 1
+        if len(batch) < 1000:
+            break
+    return {"ok": 1.0, "n": removed}
+
+
+def _grant_privileges_to_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("grantPrivilegesToRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantPrivilegesToRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    additions = _normalise_privileges(doc.get("privileges"))
+    if additions is None:
+        return {
+            "ok": 0.0,
+            "errmsg": ("grantPrivilegesToRole: privileges must be an array of {resource, actions}"),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    privs = list(record.get("privileges") or [])
+    for add in additions:
+        merged = False
+        for existing in privs:
+            if existing.get("resource") == add["resource"]:
+                # Merge actions, dedupe.
+                existing_actions = list(existing.get("actions") or [])
+                for a in add["actions"]:
+                    if a not in existing_actions:
+                        existing_actions.append(a)
+                existing["actions"] = existing_actions
+                merged = True
+                break
+        if not merged:
+            privs.append(add)
+    record["privileges"] = privs
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _revoke_privileges_from_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("revokePrivilegesFromRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokePrivilegesFromRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    revocations = _normalise_privileges(doc.get("privileges"))
+    if revocations is None:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "revokePrivilegesFromRole: privileges must be an array of {resource, actions}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    privs = list(record.get("privileges") or [])
+    for rev in revocations:
+        for existing in privs:
+            if existing.get("resource") != rev["resource"]:
+                continue
+            actions = [a for a in (existing.get("actions") or []) if a not in rev["actions"]]
+            existing["actions"] = actions
+    # Drop privileges that have no actions left.
+    record["privileges"] = [p for p in privs if p.get("actions")]
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _grant_roles_to_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("grantRolesToRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantRolesToRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    additions = _normalise_inherited_roles(doc.get("roles"), db_name)
+    if additions is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantRolesToRole: roles must be a list of names or {role, db} dicts",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    seen = {(r["role"], r["db"]) for r in record.get("roles") or [] if isinstance(r, Mapping)}
+    inherited = list(record.get("roles") or [])
+    for add in additions:
+        if (add["role"], add["db"]) not in seen:
+            inherited.append(add)
+            seen.add((add["role"], add["db"]))
+    record["roles"] = inherited
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _revoke_roles_from_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("revokeRolesFromRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokeRolesFromRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    revocations = _normalise_inherited_roles(doc.get("roles"), db_name)
+    if revocations is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokeRolesFromRole: roles must be a list of names or {role, db} dicts",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    drop_set = {(r["role"], r["db"]) for r in revocations}
+    record["roles"] = [
+        r
+        for r in (record.get("roles") or [])
+        if isinstance(r, Mapping) and (r.get("role"), r.get("db")) not in drop_set
+    ]
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _roles_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Return information about built-in and custom roles.
+
+    Built-in roles surface as ``isBuiltin: true`` with empty
+    ``inheritedRoles``. Custom roles are looked up from storage and
+    their ``privileges`` / ``roles`` arrays surface as-is. The
+    ``rolesInfo`` argument matches mongod:
+
+    * ``1`` / ``true`` — every custom role on the calling db (plus
+      built-ins when ``showBuiltinRoles: true``).
+    * ``"<name>"`` or ``{role, db}`` — single role lookup.
+    * ``[ ... ]`` — multi-role lookup.
     """
     arg = doc.get("rolesInfo")
-    db_name = "admin"
+    db_name = ctx.db_name or "admin"
     show_builtin = bool(doc.get("showBuiltinRoles", False))
 
-    def _entry(role_name: str, role_db: str) -> dict[str, Any]:
+    def _builtin_entry(role_name: str, role_db: str) -> dict[str, Any]:
         return {
             "role": role_name,
             "db": role_db,
@@ -2186,28 +2553,49 @@ def _roles_info(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
             "inheritedRoles": [],
         }
 
+    def _custom_entry(record: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "role": record.get("role"),
+            "db": record.get("db"),
+            "isBuiltin": False,
+            "privileges": list(record.get("privileges") or []),
+            "roles": list(record.get("roles") or []),
+            "inheritedRoles": list(record.get("roles") or []),
+        }
+
     out: list[dict[str, Any]] = []
     if arg == 1 or arg is True:
+        # Custom roles in the calling db.
+        for record in ctx.storage.list_roles(db_name):
+            out.append(_custom_entry(record))
         if show_builtin:
             for name in BUILT_IN_ROLES:
-                out.append(_entry(name, db_name))
-    elif isinstance(arg, str):
-        if is_known_role(arg):
-            out.append(_entry(arg, db_name))
-    elif isinstance(arg, dict):
-        role = arg.get("role")
-        db = arg.get("db", db_name)
-        if isinstance(role, str) and is_known_role(role):
-            out.append(_entry(role, db if isinstance(db, str) else db_name))
-    elif isinstance(arg, list):
-        for entry in arg:
-            if isinstance(entry, str) and is_known_role(entry):
-                out.append(_entry(entry, db_name))
-            elif isinstance(entry, dict):
-                role = entry.get("role")
-                db = entry.get("db", db_name)
-                if isinstance(role, str) and is_known_role(role):
-                    out.append(_entry(role, db if isinstance(db, str) else db_name))
+                out.append(_builtin_entry(name, db_name))
+    else:
+        targets: list[tuple[str, str]] = []
+        if isinstance(arg, str):
+            targets.append((arg, db_name))
+        elif isinstance(arg, Mapping):
+            role = arg.get("role")
+            db = arg.get("db", db_name)
+            if isinstance(role, str) and isinstance(db, str):
+                targets.append((role, db))
+        elif isinstance(arg, list):
+            for entry in arg:
+                if isinstance(entry, str):
+                    targets.append((entry, db_name))
+                elif isinstance(entry, Mapping):
+                    role = entry.get("role")
+                    db = entry.get("db", db_name)
+                    if isinstance(role, str) and isinstance(db, str):
+                        targets.append((role, db))
+        for role_name, role_db in targets:
+            if role_name in BUILT_IN_ROLES:
+                out.append(_builtin_entry(role_name, role_db))
+                continue
+            record = ctx.storage.get_role(role_db, role_name)
+            if record is not None:
+                out.append(_custom_entry(record))
     return {"roles": out, "ok": 1.0}
 
 
@@ -2267,6 +2655,14 @@ _HANDLERS: dict[str, CommandHandler] = {
     "grantRolesToUser": _grant_roles_to_user,
     "revokeRolesFromUser": _revoke_roles_from_user,
     "rolesInfo": _roles_info,
+    "createRole": _create_role,
+    "updateRole": _update_role,
+    "dropRole": _drop_role,
+    "dropAllRolesFromDatabase": _drop_all_roles_from_database,
+    "grantPrivilegesToRole": _grant_privileges_to_role,
+    "revokePrivilegesFromRole": _revoke_privileges_from_role,
+    "grantRolesToRole": _grant_roles_to_role,
+    "revokeRolesFromRole": _revoke_roles_from_role,
 }
 
 # Commands a connection may invoke before authenticating, when
@@ -2334,6 +2730,15 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "revokeRolesFromUser": (A_REVOKE_ROLE, SCOPE_DATABASE),
     "rolesInfo": (A_VIEW_ROLE, SCOPE_DATABASE),
     "updateUser": (A_CHANGE_PASSWORD, SCOPE_DATABASE),
+    # Custom roles — same database scope as user mgmt.
+    "createRole": (A_CREATE_ROLE, SCOPE_DATABASE),
+    "updateRole": (A_GRANT_ROLE, SCOPE_DATABASE),
+    "dropRole": (A_DROP_ROLE, SCOPE_DATABASE),
+    "dropAllRolesFromDatabase": (A_DROP_ROLE, SCOPE_DATABASE),
+    "grantPrivilegesToRole": (A_GRANT_ROLE, SCOPE_DATABASE),
+    "revokePrivilegesFromRole": (A_REVOKE_ROLE, SCOPE_DATABASE),
+    "grantRolesToRole": (A_GRANT_ROLE, SCOPE_DATABASE),
+    "revokeRolesFromRole": (A_REVOKE_ROLE, SCOPE_DATABASE),
     # Cluster / introspection
     "serverStatus": (A_SERVER_STATUS, SCOPE_CLUSTER),
     "hostInfo": (A_HOST_INFO, SCOPE_CLUSTER),
@@ -2460,6 +2865,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 action,
                 target_db=target_db,
                 cluster=cluster,
+                role_resolver=ctx.storage.get_role,
             ):
                 return {
                     "ok": 0.0,
