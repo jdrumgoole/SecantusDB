@@ -127,6 +127,7 @@ _OPLOG_TABLE = "table:secantus_oplog"
 _PREIMAGE_TABLE = "table:secantus_preimages"
 _OPLOG_META_TABLE = "table:secantus_oplog_meta"
 _USERS_TABLE = "table:secantus_users"
+_ROLES_TABLE = "table:secantus_roles"
 
 _OPLOG_PRUNE_INTERVAL = 1000  # call prune_oplog every N emits
 
@@ -397,6 +398,7 @@ class Storage:
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
             boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
+            boot.create(_ROLES_TABLE, "key_format=SS,value_format=u")
         finally:
             boot.close()
 
@@ -839,6 +841,79 @@ class Storage:
         out: list[dict[str, Any]] = []
         with self._lock:
             c = self._cursor(_USERS_TABLE)
+            rc = c.next()
+            seen = 0
+            while rc == 0:
+                k = c.get_key()
+                row_db = k[0]
+                if db is None or row_db == db:
+                    if seen >= skip:
+                        blob = bytes(c.get_value())
+                        if blob:
+                            out.append(bson.decode(blob))
+                        if len(out) >= limit:
+                            break
+                    seen += 1
+                rc = c.next()
+        return out
+
+    # ------------------------------------------------------------------
+    # Custom roles. Storage layer is a thin BSON-blob CRUD; the commands
+    # layer owns the role-record shape (privileges + inherited roles)
+    # and ``secantus.rbac`` owns the privilege-check logic that walks
+    # the inheritance graph.
+    # ------------------------------------------------------------------
+
+    def add_role(
+        self,
+        db: str,
+        name: str,
+        record: Mapping[str, Any],
+        *,
+        replace: bool = False,
+    ) -> bool:
+        """Persist a custom role record. Returns True if added; False if
+        it already existed and ``replace=False``."""
+        with self._lock:
+            c = self._cursor(_ROLES_TABLE)
+            c.set_key(db, name)
+            if c.search() == 0 and not replace:
+                return False
+            c.reset()
+            c[db, name] = bson.encode(dict(record))
+            return True
+
+    def get_role(self, db: str, name: str) -> dict[str, Any] | None:
+        with self._lock:
+            c = self._cursor(_ROLES_TABLE)
+            c.set_key(db, name)
+            if c.search() != 0:
+                return None
+            blob = bytes(c.get_value())
+            return bson.decode(blob) if blob else None
+
+    def drop_role(self, db: str, name: str) -> bool:
+        with self._lock:
+            c = self._cursor(_ROLES_TABLE)
+            c.set_key(db, name)
+            if c.search() != 0:
+                return False
+            c.remove()
+            return True
+
+    def list_roles(
+        self,
+        db: str | None = None,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Paginated custom-role listing. ``db=None`` spans every db."""
+        if limit <= 0 or limit > 1000:
+            limit = 1000
+        out: list[dict[str, Any]] = []
+        with self._lock:
+            c = self._cursor(_ROLES_TABLE)
             rc = c.next()
             seen = 0
             while rc == 0:

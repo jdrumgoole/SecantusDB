@@ -51,7 +51,7 @@ on custom roles return ``Unauthorized`` errors that match real mongod.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -91,6 +91,8 @@ A_REVOKE_ROLE = "revokeRole"
 A_VIEW_USER = "viewUser"
 A_VIEW_ROLE = "viewRole"
 A_CHANGE_PASSWORD = "changeOwnPassword"
+A_CREATE_ROLE = "createRole"
+A_DROP_ROLE = "dropRole"
 
 # Cluster-wide
 A_SERVER_STATUS = "serverStatus"
@@ -174,6 +176,11 @@ _USERADMIN_ACTIONS: frozenset[str] = frozenset(
         A_VIEW_USER,
         A_VIEW_ROLE,
         A_CHANGE_PASSWORD,
+        # Custom-role management lives under userAdmin (mongod's
+        # documented mapping) — separate ``createRole`` /
+        # ``dropRole`` actions but the role grants both.
+        A_CREATE_ROLE,
+        A_DROP_ROLE,
     }
 )
 
@@ -283,20 +290,72 @@ def role_grants_action(
     return role_db == target_db
 
 
+def _custom_role_grants(
+    record: Mapping[str, Any],
+    action: str,
+    *,
+    target_db: str | None,
+    cluster: bool,
+) -> bool:
+    """Does a custom-role record's ``privileges`` array grant ``action``
+    on the resource? Pure shape match — no graph walking here.
+    """
+    privs = record.get("privileges")
+    if not isinstance(privs, list):
+        return False
+    for priv in privs:
+        if not isinstance(priv, Mapping):
+            continue
+        actions = priv.get("actions") or []
+        if action not in actions:
+            continue
+        resource = priv.get("resource") or {}
+        if not isinstance(resource, Mapping):
+            continue
+        # `{anyResource: true}` matches anything.
+        if resource.get("anyResource"):
+            return True
+        if cluster:
+            if resource.get("cluster"):
+                return True
+            continue
+        # Database-scoped resources. `{db: "<X>", collection: ""}`
+        # matches any collection in db X; `{db: "", collection: ""}`
+        # matches every database (mongod's "all dbs" sentinel).
+        res_db = resource.get("db")
+        if not isinstance(res_db, str):
+            continue
+        if res_db == "" or (target_db is not None and res_db == target_db):
+            return True
+    return False
+
+
 def check_privilege(
     roles: Iterable[Mapping[str, Any]],
     action: str,
     *,
     target_db: str | None = None,
     cluster: bool = False,
+    role_resolver: Callable[[str, str], Mapping[str, Any] | None] | None = None,
 ) -> bool:
     """True iff any role in ``roles`` grants ``action`` on the resource.
 
     ``roles`` is the user's role bindings as stored on the user record:
-    a list of ``{"role": <name>, "db": <db>}`` dicts. Unknown roles
-    silently grant nothing (matches mongod's "if you can't see the
-    role you can't use its privileges" model — it never elevates).
+    a list of ``{"role": <name>, "db": <db>}`` dicts. Built-in role
+    names short-circuit through :data:`BUILT_IN_ROLES`. If a role
+    isn't built-in and ``role_resolver`` is supplied, it's looked up
+    as a custom role: privileges are matched directly, and inherited
+    roles in the record's ``roles`` array are expanded recursively
+    with cycle detection. Unknown roles (no built-in, no resolver
+    hit) silently grant nothing — matches mongod's "if you can't see
+    the role you can't use its privileges" model.
+
+    ``role_resolver(db, name) -> record-or-None`` matches ``Storage.
+    get_role`` directly — production callers pass that as-is. The
+    parameter order mirrors mongod's docs (db before role name).
     """
+    visited: set[tuple[str, str]] = set()
+    pending: list[tuple[str, str]] = []
     for role_dict in roles:
         if not isinstance(role_dict, Mapping):
             continue
@@ -304,6 +363,33 @@ def check_privilege(
         role_db = role_dict.get("db")
         if not isinstance(role_name, str) or not isinstance(role_db, str):
             continue
-        if role_grants_action(role_name, role_db, action, target_db=target_db, cluster=cluster):
+        pending.append((role_name, role_db))
+
+    while pending:
+        role_name, role_db = pending.pop()
+        if (role_name, role_db) in visited:
+            continue
+        visited.add((role_name, role_db))
+        # Built-in roles win the lookup race — same name + db can't
+        # collide because mongod refuses to ``createRole`` for a
+        # built-in name (we mirror that in the command layer).
+        if role_name in BUILT_IN_ROLES:
+            if role_grants_action(role_name, role_db, action, target_db=target_db, cluster=cluster):
+                return True
+            continue
+        if role_resolver is None:
+            continue
+        record = role_resolver(role_db, role_name)
+        if record is None:
+            continue
+        if _custom_role_grants(record, action, target_db=target_db, cluster=cluster):
             return True
+        # Walk inherited roles. Each entry is `{role, db}`.
+        for inherited in record.get("roles") or []:
+            if not isinstance(inherited, Mapping):
+                continue
+            inh_name = inherited.get("role")
+            inh_db = inherited.get("db")
+            if isinstance(inh_name, str) and isinstance(inh_db, str):
+                pending.append((inh_name, inh_db))
     return False
