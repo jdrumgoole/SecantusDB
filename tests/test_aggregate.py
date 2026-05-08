@@ -690,19 +690,28 @@ def test_lookup_index_path_handles_array_local_value(tmp_path) -> None:
         storage.close()
 
 
-def test_lookup_compound_index_falls_back_to_hash_join(tmp_path) -> None:
-    """A compound index on the foreign field is *not* eligible for the
-    simple-shape index path; we fall back to hash-join. Result must
-    still be correct."""
-    from secantus.aggregate import PipelineContext
+def test_lookup_uses_compound_index_when_leading_field_matches(tmp_path) -> None:
+    """A compound index whose leading field is the foreign field is
+    eligible: each per-outer-doc lookup hits the storage picker as a
+    leading-prefix scan, not a hash-join over the materialised foreign
+    collection. The path is observable via the eligibility helper —
+    `find_matching` doesn't need to be intercepted to verify it."""
+    from secantus.aggregate import PipelineContext, _foreign_field_has_simple_index
     from secantus.storage import Storage
 
     storage = Storage(str(tmp_path))
     try:
         storage.insert("db", "users", [{"_id": i, "k": i, "tag": "x"} for i in range(10)])
         storage.create_index("db", "users", "k_tag_1", {"k": 1, "tag": 1}, {})
-        storage.insert("db", "orders", [{"_id": i, "user_k": i % 10} for i in range(5)])
 
+        # The eligibility helper sees the compound index as usable for
+        # the leading column.
+        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is True
+        # And only the leading column — a non-leading column is not
+        # equality-indexable on its own.
+        assert _foreign_field_has_simple_index(storage, "db", "users", "tag") is False
+
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 10} for i in range(5)])
         ctx = PipelineContext(storage=storage, db_name="db")
         outer = list(storage.find_matching("db", "orders", {}))
         joined = apply_pipeline(
@@ -723,6 +732,67 @@ def test_lookup_compound_index_falls_back_to_hash_join(tmp_path) -> None:
         for o in joined:
             assert len(o["user"]) == 1
             assert o["user"][0]["k"] == o["user_k"]
+    finally:
+        storage.close()
+
+
+def test_lookup_skips_compound_index_when_leading_field_does_not_match(tmp_path) -> None:
+    """Compound index whose leading field is *not* the foreign field
+    is ineligible — Storage's leading-prefix scan can't handle a
+    non-leading equality without a covering single-field index, so the
+    `$lookup` falls back to hash-join. Result must still be correct.
+    """
+    from secantus.aggregate import PipelineContext, _foreign_field_has_simple_index
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert("db", "users", [{"_id": i, "k": i, "tag": f"t{i}"} for i in range(10)])
+        # Leading field is `tag`, not `k` — so a `$lookup` on `k` can't
+        # use this index.
+        storage.create_index("db", "users", "tag_k_1", {"tag": 1, "k": 1}, {})
+
+        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is False
+        assert _foreign_field_has_simple_index(storage, "db", "users", "tag") is True
+
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 10} for i in range(5)])
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "as": "user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        assert len(joined) == 5
+        for o in joined:
+            assert len(o["user"]) == 1
+            assert o["user"][0]["k"] == o["user_k"]
+    finally:
+        storage.close()
+
+
+def test_lookup_skips_multikey_compound_index(tmp_path) -> None:
+    """Even when a compound index's leading field matches, multikey
+    flag disqualifies it (per-outer-doc scan would be O(M*N)).
+    """
+    from secantus.aggregate import _foreign_field_has_simple_index
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert("db", "users", [{"_id": 1, "k": [1, 2, 3], "tag": "x"}])
+        storage.create_index("db", "users", "k_tag_1", {"k": 1, "tag": 1}, {})
+        # The array value on the leading field flips multikey.
+        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is False
     finally:
         storage.close()
 

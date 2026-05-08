@@ -203,17 +203,28 @@ def _ensure_java_smokes_jar() -> bool:
 
     The jar is shared with ``tests/test_cross_driver_features.py`` —
     whichever test runs first incurs the build cost; the rest reuse it.
+    The flock guards against parallel xdist workers racing on the
+    Gradle build (see the matching helper in
+    ``test_cross_driver_features.py`` for the full rationale).
     """
     if _JAVA_SMOKES_JAR.is_file():
         return True
     if _GRADLE is None or _JAVA is None:
         return False
-    result = _run(
-        [_GRADLE, "smokesJar", "--no-daemon", "-q"],
-        cwd=_JAVA_SMOKE_DIR,
-        timeout=600.0,
-    )
-    return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
+    import fcntl
+
+    lock_path = _JAVA_SMOKE_DIR / ".smokesjar.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if _JAVA_SMOKES_JAR.is_file():
+            return True
+        result = _run(
+            [_GRADLE, "smokesJar", "--no-daemon", "-q"],
+            cwd=_JAVA_SMOKE_DIR,
+            timeout=600.0,
+        )
+        return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
 
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")

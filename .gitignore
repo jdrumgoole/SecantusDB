@@ -41,8 +41,10 @@ tests/cross_driver/node/node_modules/
 
 # Gradle wrapper / cache state for the Java cross-driver smokes is
 # rebuilt from build.gradle.kts on first run; the uber-jar in build/
-# is also excluded by the top-level `build/` rule above.
+# is also excluded by the top-level `build/` rule above. The flock
+# sentinel serialises parallel xdist workers around the build.
 tests/cross_driver/java/.gradle/
+tests/cross_driver/java/.smokesjar.lock
 
 # Pelican site build artifacts and ephemeral runtime state. The build
 # output is regenerated each `invoke build`; theme/static/img/ is copied
