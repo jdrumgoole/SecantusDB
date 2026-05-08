@@ -11,10 +11,9 @@ a small canonical workload run through each driver:
   * `$geoWithin` with `$centerSphere` — assert the close two come back
   * `$geoNear` aggregation — assert ordering + distances
 
-Each test self-skips if its driver tooling isn't on PATH. Java is not
-covered here because a single-file Java program can't pull in the
-driver jar without Maven/Gradle scaffolding; the gap is documented in
-``tasks/backlog.md``.
+Each test self-skips if its driver tooling isn't on PATH. Java
+coverage rides on the same uber-jar built by
+``tests/cross_driver/java/`` for the feature smoke matrix.
 """
 
 from __future__ import annotations
@@ -186,5 +185,52 @@ def test_geo_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go smoke exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# --- Java (mongo-java-driver) ---------------------------------------------
+
+
+_JAVA = shutil.which("java")
+_GRADLE = shutil.which("gradle")
+_JAVA_SMOKE_DIR = _CROSS_DRIVER / "java"
+_JAVA_SMOKES_JAR = _JAVA_SMOKE_DIR / "build" / "libs" / "secantus-java-smokes-all.jar"
+
+
+def _ensure_java_smokes_jar() -> bool:
+    """Build the Java smokes uber-jar if not present.
+
+    The jar is shared with ``tests/test_cross_driver_features.py`` —
+    whichever test runs first incurs the build cost; the rest reuse it.
+    """
+    if _JAVA_SMOKES_JAR.is_file():
+        return True
+    if _GRADLE is None or _JAVA is None:
+        return False
+    result = _run(
+        [_GRADLE, "smokesJar", "--no-daemon", "-q"],
+        cwd=_JAVA_SMOKE_DIR,
+        timeout=600.0,
+    )
+    return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_geo_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    import os as _os
+
+    env = {**_os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_JAVA, "-cp", str(_JAVA_SMOKES_JAR), "com.secantus.smokes.GeoSmoke"],
+        env=env,
+        timeout=120.0,
+    )
+    assert result.returncode == 0, (
+        f"java geo smoke exited {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout

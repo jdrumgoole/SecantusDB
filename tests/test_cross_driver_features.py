@@ -825,6 +825,19 @@ def test_bulk_smoke_via_go_driver(server: SecantusDBServer) -> None:
     assert "OK" in result.stdout
 
 
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_bulk_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.BulkSmoke", env)
+    assert result.returncode == 0, (
+        f"java bulk smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # Change-stream resume
 # ---------------------------------------------------------------------------
@@ -943,6 +956,20 @@ def test_cs_resume_smoke_via_go_driver(server: SecantusDBServer) -> None:
     assert "OK" in result.stdout
 
 
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_cs_resume_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.CsResumeSmoke", env)
+    assert result.returncode == 0, (
+        f"java cs-resume smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # listDatabases filter
 # ---------------------------------------------------------------------------
@@ -1012,6 +1039,20 @@ def test_listdb_filter_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go listdb-filter smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_listdb_filter_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.ListDbFilterSmoke", env)
+    assert result.returncode == 0, (
+        f"java listdb-filter smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
@@ -1087,6 +1128,20 @@ def test_batchsize_zero_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go batchsize-zero smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_batchsize_zero_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.BatchSizeZeroSmoke", env)
+    assert result.returncode == 0, (
+        f"java batchsize-zero smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
@@ -1381,6 +1436,19 @@ def test_pbrt_smoke_via_go_driver(server: SecantusDBServer) -> None:
     assert "OK" in result.stdout
 
 
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_pbrt_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.PbrtSmoke", env)
+    assert result.returncode == 0, (
+        f"java pbrt smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # Tailable cursor on capped collection
 # ---------------------------------------------------------------------------
@@ -1452,6 +1520,20 @@ def test_tailable_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go tailable smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_tailable_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.TailableSmoke", env)
+    assert result.returncode == 0, (
+        f"java tailable smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
