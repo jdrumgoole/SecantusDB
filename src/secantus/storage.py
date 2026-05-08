@@ -1056,6 +1056,32 @@ class Storage:
         with self._lock:
             return [(bson.decode(blob), id_k) for id_k, blob in self._scan_docs(db, coll)]
 
+    def scan_docs_after_id_key(
+        self, db: str, coll: str, after: bytes | None
+    ) -> list[tuple[bytes, dict[str, Any]]]:
+        """Scan the document table in natural (id_key) order, returning
+        only rows whose ``id_key`` is strictly greater than ``after``.
+        ``after`` of ``None`` returns the entire collection.
+
+        Used by the tailable-cursor producer to emit only the docs
+        inserted since the last poll. Returns ``[(id_key, doc), ...]``
+        — callers update their ``after`` checkpoint to the last
+        returned ``id_key`` for the next poll.
+        """
+        out: list[tuple[bytes, dict[str, Any]]] = []
+        with self._lock:
+            for id_k, blob in self._scan_docs(db, coll):
+                if after is not None and id_k <= after:
+                    continue
+                out.append((id_k, bson.decode(blob)))
+        return out
+
+    def collection_is_capped(self, db: str, coll: str) -> bool:
+        """Public predicate: does the collection have ``capped: true`` set?"""
+        with self._lock:
+            opts = self._coll_options(db, coll) or {}
+            return bool(opts.get("capped"))
+
     def insert(
         self, db: str, coll: str, docs: Iterable[dict[str, Any]], *, ordered: bool = True
     ) -> tuple[int, list[dict[str, Any]]]:

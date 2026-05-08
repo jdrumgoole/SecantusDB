@@ -148,12 +148,4 @@ SKIP_PATTERNS: list[str] = [
     # now that empty `insert.documents: []` returns the right
     # InvalidLength code.
     "TestErrorsCodeNamePropagated/write_concern_error",
-    # `TestCursor_TryNext/one_getMore_sent` exercises tailable
-    # cursors on a capped collection (not a change stream). Capped
-    # collections are implemented and change-stream tailable cursors
-    # are too, but tailable + awaitData on a *plain* capped
-    # collection (where ``find`` returns a non-zero cursor id even
-    # when the firstBatch is exhausted, so the client can keep
-    # polling for newly-inserted docs) is a separate slice.
-    "TestCursor_TryNext/one_getMore_sent",
 ]
