@@ -18,9 +18,6 @@ What's intentionally NOT here:
 
 - Authorization (RBAC): see ``secantus.rbac``; integrated into the
   command dispatcher as a separate concern.
-- SASLprep / RFC 4013 password normalisation: ASCII-only passwords work
-  byte-identically against real ``mongod``; non-ASCII passwords may
-  diverge from a SASLprepping client's expectation.
 """
 
 from __future__ import annotations
@@ -29,6 +26,8 @@ import base64
 import hashlib
 import hmac
 import secrets
+import stringprep
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -112,11 +111,93 @@ class StoredCredentials:
         )
 
 
+def saslprep(text: str) -> str:
+    """Apply RFC 4013 SASLprep to ``text``.
+
+    SASLprep is a profile of stringprep (RFC 3454) for SASL passwords.
+    The stages, in order:
+
+    1. **Map** characters per RFC 4013 §2.1: stringprep table B.1
+       (characters that map to nothing — soft hyphen, zero-width
+       joiners, etc.) maps to empty; non-ASCII whitespace (table
+       C.1.2) maps to ASCII space ``\\u0020``.
+    2. **Normalize** with NFKC (RFC 4013 §2.2).
+    3. **Prohibit** characters per RFC 4013 §2.3 (control codes,
+       private use, non-characters, surrogates, invalid Unicode,
+       inappropriate-for-plain-text and -for-canonical-representation
+       sets, change-display-and-deprecated, tagging characters).
+       Raises ``AuthError`` if any prohibited code point appears.
+    4. **Bidirectional check** (RFC 3454 §6): a string with R or AL
+       characters cannot also contain L characters; if it has any
+       R/AL it must start AND end with R or AL. Raises ``AuthError``
+       on violation.
+
+    For ASCII-only passwords this is the identity function (no
+    mapping, normalization is a no-op, no prohibited chars, no bidi
+    issues). The function is therefore safe to apply unconditionally
+    — non-conformant clients with ASCII passwords keep working.
+    """
+    # Stage 1: map.
+    out_chars: list[str] = []
+    for ch in text:
+        # Table B.1: Commonly mapped to nothing.
+        if stringprep.in_table_b1(ch):
+            continue
+        # Table C.1.2: Non-ASCII space → ASCII space.
+        if stringprep.in_table_c12(ch):
+            out_chars.append(" ")
+            continue
+        out_chars.append(ch)
+    mapped = "".join(out_chars)
+
+    # Stage 2: normalize (NFKC).
+    normalized = unicodedata.normalize("NFKC", mapped)
+
+    # Stage 3: prohibit.
+    prohibit_tables = (
+        stringprep.in_table_c12,  # non-ASCII space (post-mapping these should be ASCII)
+        stringprep.in_table_c21_c22,  # ASCII + non-ASCII control
+        stringprep.in_table_c3,  # private use
+        stringprep.in_table_c4,  # non-character code points
+        stringprep.in_table_c5,  # surrogates
+        stringprep.in_table_c6,  # inappropriate for plain text
+        stringprep.in_table_c7,  # inappropriate for canonical representation
+        stringprep.in_table_c8,  # change display + deprecated
+        stringprep.in_table_c9,  # tagging characters
+    )
+    for ch in normalized:
+        for predicate in prohibit_tables:
+            if predicate(ch):
+                raise AuthError(f"SASLprep: prohibited character {ch!r} (U+{ord(ch):04X})")
+
+    # Stage 4: bidirectional check (RFC 3454 §6).
+    has_r_al = any(stringprep.in_table_d1(ch) for ch in normalized)
+    has_l = any(stringprep.in_table_d2(ch) for ch in normalized)
+    if has_r_al and has_l:
+        raise AuthError(
+            "SASLprep: bidirectional check failed — string contains both R/AL and L characters"
+        )
+    if (
+        has_r_al
+        and normalized
+        and not (stringprep.in_table_d1(normalized[0]) and stringprep.in_table_d1(normalized[-1]))
+    ):
+        raise AuthError(
+            "SASLprep: bidirectional check failed — R/AL string must "
+            "start and end with R/AL characters"
+        )
+
+    return normalized
+
+
 def _scram_password_digest(username: str, password: str, mechanism: str) -> bytes:
     """Return the byte string PBKDF2 should hash for the given mechanism.
 
-    SCRAM-SHA-256 feeds the raw UTF-8 password directly (after SASLprep
-    in a fully-conformant client; we don't normalise here).
+    SCRAM-SHA-256 (RFC 7677) requires SASLprep on the password before
+    PBKDF2; ASCII passwords are pass-through, non-ASCII passwords get
+    Unicode-normalised. ``saslprep`` is applied here so the PBKDF2
+    input matches what a SASLprepping client (pymongo, mongo-go-driver
+    via auth/scram, Java driver) sends.
 
     SCRAM-SHA-1 in MongoDB applies a legacy *password prepass*:
     ``hex(MD5(username + ":mongo:" + password))``. The prepass exists
@@ -133,7 +214,8 @@ def _scram_password_digest(username: str, password: str, mechanism: str) -> byte
             f"{username}:mongo:{password}".encode()
         ).hexdigest()
         return digest.encode("utf-8")
-    return password.encode("utf-8")
+    # SCRAM-SHA-256 path: apply SASLprep.
+    return saslprep(password).encode("utf-8")
 
 
 def derive_credentials(
