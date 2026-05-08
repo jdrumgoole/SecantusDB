@@ -36,6 +36,10 @@ through each driver:
   * Tailable cursor on capped collection — open with
     ``tailable: true``, see seeded docs, then see follow-up
     inserts via the polling cursor.
+  * Custom roles — ``createRole`` + bind to user; verify granted
+    action succeeds and ungranted action gets ``Unauthorized``;
+    then ``grantPrivilegesToRole`` adds an action and a fresh
+    connection picks it up.
 
 Each test self-skips if its driver tooling isn't on PATH. Java is not
 covered here for the same reason as the geo smoke tests: a
@@ -1297,6 +1301,159 @@ def test_tailable_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go tailable smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Custom roles
+# ---------------------------------------------------------------------------
+
+
+_CUSTOM_ROLES_PROVISION_SCRIPT = """
+db.getSiblingDB('shop').runCommand({
+  createRole: 'shopAuditor',
+  privileges: [
+    {resource: {db: 'shop', collection: ''}, actions: ['find']},
+  ],
+  roles: [],
+});
+db.getSiblingDB('shop').runCommand({
+  createUser: 'auditor_msh',
+  pwd: 'p',
+  roles: [{role: 'shopAuditor', db: 'shop'}],
+});
+print('PROVISIONED');
+"""
+
+_CUSTOM_ROLES_AUDITOR_SCRIPT = """
+const items = db.getSiblingDB('shop').items;
+const findOk = items.find({}).toArray();
+let inserted = false;
+let errCode = null;
+try {
+  items.insertOne({x: 1});
+  inserted = true;
+} catch (e) {
+  errCode = e.code;
+}
+print(JSON.stringify({findCount: findOk.length, inserted, errCode}));
+"""
+
+_CUSTOM_ROLES_GRANT_SCRIPT = """
+db.getSiblingDB('shop').runCommand({
+  grantPrivilegesToRole: 'shopAuditor',
+  privileges: [
+    {resource: {db: 'shop', collection: ''}, actions: ['insert']},
+  ],
+});
+print('GRANTED');
+"""
+
+_CUSTOM_ROLES_AUDITOR_INSERT_SCRIPT = """
+const items = db.getSiblingDB('shop').items;
+let inserted = false;
+try {
+  items.insertOne({x: 2});
+  inserted = true;
+} catch (e) {}
+print(JSON.stringify({inserted}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_custom_roles_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
+    admin_uri = (
+        f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
+        "?authSource=admin&authMechanism=SCRAM-SHA-256"
+    )
+    r = _run(
+        [_MONGOSH, "--quiet", admin_uri, "--eval", _CUSTOM_ROLES_PROVISION_SCRIPT],
+        timeout=60.0,
+    )
+    assert r.returncode == 0 and "PROVISIONED" in r.stdout, (
+        f"provision: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
+
+    auditor_uri = (
+        f"mongodb://auditor_msh:p@127.0.0.1:{server_with_auth.port}/shop"
+        "?authSource=shop&authMechanism=SCRAM-SHA-256"
+    )
+    r = _run(
+        [_MONGOSH, "--quiet", auditor_uri, "--eval", _CUSTOM_ROLES_AUDITOR_SCRIPT],
+        timeout=60.0,
+    )
+    assert r.returncode == 0, f"auditor: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    out_line = next(
+        (ln for ln in reversed(r.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {r.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["inserted"] is False
+    assert payload["errCode"] == 13
+
+    # Grant insert; reconnect to pick up the new privilege.
+    r = _run(
+        [_MONGOSH, "--quiet", admin_uri, "--eval", _CUSTOM_ROLES_GRANT_SCRIPT],
+        timeout=60.0,
+    )
+    assert r.returncode == 0 and "GRANTED" in r.stdout, (
+        f"grant: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
+    r = _run(
+        [_MONGOSH, "--quiet", auditor_uri, "--eval", _CUSTOM_ROLES_AUDITOR_INSERT_SCRIPT],
+        timeout=60.0,
+    )
+    assert r.returncode == 0, (
+        f"auditor-insert: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(r.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    payload = json.loads(out_line)
+    assert payload["inserted"] is True
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_custom_roles_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "custom_roles_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node custom-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_custom_roles_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> None:
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run(
+        [_GO, "run", "./custom_roles"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go custom-roles smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
