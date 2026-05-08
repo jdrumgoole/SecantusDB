@@ -41,10 +41,11 @@ through each driver:
     then ``grantPrivilegesToRole`` adds an action and a fresh
     connection picks it up.
 
-Each test self-skips if its driver tooling isn't on PATH. Java is not
-covered here for the same reason as the geo smoke tests: a
-single-file Java program can't pull in the driver jar without
-Maven/Gradle scaffolding.
+Each test self-skips if its driver tooling isn't on PATH. Java
+coverage uses ``tests/cross_driver/java/`` — a single Gradle project
+that builds an uber-jar containing every smoke main class once at
+first-test time and reuses it across the run, so the per-smoke cost
+is just ``java -cp <jar> <FQN>`` (no Gradle re-invocation per test).
 """
 
 from __future__ import annotations
@@ -64,11 +65,15 @@ _HERE = Path(__file__).parent
 _CROSS_DRIVER = _HERE / "cross_driver"
 _NODE_SMOKE_DIR = _CROSS_DRIVER / "node"
 _GO_SMOKE_DIR = _CROSS_DRIVER / "go"
+_JAVA_SMOKE_DIR = _CROSS_DRIVER / "java"
+_JAVA_SMOKES_JAR = _JAVA_SMOKE_DIR / "build" / "libs" / "secantus-java-smokes-all.jar"
 
 _MONGOSH = shutil.which("mongosh")
 _NODE = shutil.which("node")
 _NPM = shutil.which("npm")
 _GO = shutil.which("go")
+_JAVA = shutil.which("java")
+_GRADLE = shutil.which("gradle")
 
 
 def _run(
@@ -90,6 +95,44 @@ def _ensure_node_modules() -> bool:
         return False
     result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
     return result.returncode == 0 and nm.is_dir()
+
+
+def _ensure_java_smokes_jar() -> bool:
+    """Build the Java smokes uber-jar once; cached in build/ for re-runs.
+
+    Skipping conditions: ``java`` or ``gradle`` not on PATH, or the
+    Gradle build itself fails. Returns True only when the jar is on
+    disk and runnable by ``java -cp <jar> <FQN>``.
+    """
+    if _JAVA_SMOKES_JAR.is_file():
+        return True
+    if _GRADLE is None or _JAVA is None:
+        return False
+    # Gradle 9.5 needs a JDK >= 17 toolchain; macOS dev boxes usually
+    # have multiple JDKs and Gradle's default scan picks the highest,
+    # so we rely on JAVA_HOME / sourceCompatibility=17 in build.gradle
+    # rather than mandating a toolchain block.
+    result = _run(
+        [_GRADLE, "smokesJar", "--no-daemon", "-q"],
+        cwd=_JAVA_SMOKE_DIR,
+        timeout=600.0,
+    )
+    return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
+
+
+def _run_java_smoke(
+    fqn: str, env: dict[str, str], *, timeout: float = 120.0
+) -> subprocess.CompletedProcess:
+    """Invoke a Java smoke main class via the prebuilt uber-jar.
+
+    Caller is responsible for the surrounding skipif gates and
+    ``_ensure_java_smokes_jar()`` call.
+    """
+    return _run(
+        [_JAVA, "-cp", str(_JAVA_SMOKES_JAR), fqn],
+        env=env,
+        timeout=timeout,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +281,23 @@ def test_rbac_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> None:
     assert "OK" in result.stdout
 
 
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_rbac_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run_java_smoke("com.secantus.smokes.RbacSmoke", env)
+    assert result.returncode == 0, (
+        f"java rbac smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # DDL change events
 # ---------------------------------------------------------------------------
@@ -315,6 +375,19 @@ def test_ddl_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go ddl smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_ddl_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.DdlSmoke", env)
+    assert result.returncode == 0, (
+        f"java ddl smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
 
@@ -431,6 +504,24 @@ def test_updateuser_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> N
     assert "OK" in result.stdout
 
 
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_updateuser_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run_java_smoke("com.secantus.smokes.UpdateUserSmoke", env)
+    assert result.returncode == 0, (
+        f"java updateuser smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # connectionStatus / authenticatedUserRoles
 # ---------------------------------------------------------------------------
@@ -506,6 +597,24 @@ def test_connstatus_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> N
     )
     assert result.returncode == 0, (
         f"go connstatus smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_connstatus_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run_java_smoke("com.secantus.smokes.ConnStatusSmoke", env)
+    assert result.returncode == 0, (
+        f"java connstatus smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
@@ -601,6 +710,20 @@ def test_types_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go types smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_types_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run_java_smoke("com.secantus.smokes.TypesSmoke", env)
+    assert result.returncode == 0, (
+        f"java types smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
 
@@ -1063,6 +1186,20 @@ def test_drop_all_users_smoke_via_go_driver(server_with_auth: SecantusDBServer) 
     assert "OK" in result.stdout
 
 
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_drop_all_users_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server_with_auth.uri, "ADMIN_PASSWORD": _ADMIN_PWD}
+    result = _run_java_smoke("com.secantus.smokes.DropAllUsersSmoke", env)
+    assert result.returncode == 0, (
+        f"java drop-all-users smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # SCRAM-SHA-1
 # ---------------------------------------------------------------------------
@@ -1145,6 +1282,20 @@ def test_scram_sha1_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> N
     )
     assert result.returncode == 0, (
         f"go scram-sha1 smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_scram_sha1_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server_with_auth.uri, "ADMIN_PASSWORD": _ADMIN_PWD}
+    result = _run_java_smoke("com.secantus.smokes.ScramSha1Smoke", env)
+    assert result.returncode == 0, (
+        f"java scram-sha1 smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
@@ -1454,6 +1605,28 @@ def test_custom_roles_smoke_via_go_driver(server_with_auth: SecantusDBServer) ->
     )
     assert result.returncode == 0, (
         f"go custom-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+def test_custom_roles_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run(
+        [_JAVA, "-cp", str(_JAVA_SMOKES_JAR), "com.secantus.smokes.CustomRolesSmoke"],
+        env=env,
+        timeout=120.0,
+    )
+    assert result.returncode == 0, (
+        f"java custom-roles smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
