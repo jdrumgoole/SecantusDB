@@ -22,6 +22,20 @@ through each driver:
     ``startAtOperationTime`` round-trip; the resume token format is
     opaque to drivers, but each driver must re-present it verbatim
     and have the server replay the right next events.
+  * ``listDatabases`` filter — ``{filter: {name: <x>}}`` returns
+    only the matching db; ``nameOnly: true`` strips size/empty.
+  * ``batchSize: 0`` — open a cursor with empty firstBatch, fetch
+    docs via the follow-up getMore.
+  * ``dropAllUsersFromDatabase`` — drops only target-db users,
+    returns ``n`` = removed count.
+  * SCRAM-SHA-1 — user with ``mechanisms: [SCRAM-SHA-1]`` round-
+    trips through the mongo-driver's legacy MD5-prepass + SHA-1
+    PBKDF2 path.
+  * ``postBatchResumeToken`` — change-stream cursor reply carries
+    a resume token that advances on empty getMores.
+  * Tailable cursor on capped collection — open with
+    ``tailable: true``, see seeded docs, then see follow-up
+    inserts via the polling cursor.
 
 Each test self-skips if its driver tooling isn't on PATH. Java is not
 covered here for the same reason as the geo smoke tests: a
@@ -797,6 +811,492 @@ def test_cs_resume_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go cs-resume smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# listDatabases filter
+# ---------------------------------------------------------------------------
+
+
+_LISTDB_MONGOSH_SCRIPT = """
+['alpha', 'beta', 'gamma'].forEach((d) => {
+  db.getSiblingDB(d).c.insertOne({_id: 1});
+});
+const filtered = db.adminCommand({listDatabases: 1, filter: {name: 'alpha'}});
+const nameOnly = db.adminCommand({listDatabases: 1, nameOnly: true});
+print(JSON.stringify({
+  filteredNames: filtered.databases.map((d) => d.name),
+  nameOnlyCount: nameOnly.databases.length,
+  nameOnlyHasSize: nameOnly.databases.some((d) => 'sizeOnDisk' in d),
+}));
+['alpha', 'beta', 'gamma'].forEach((d) => db.getSiblingDB(d).dropDatabase());
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_listdb_filter_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [_MONGOSH, "--quiet", f"{server.uri}admin", "--eval", _LISTDB_MONGOSH_SCRIPT],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["filteredNames"] == ["alpha"]
+    assert payload["nameOnlyCount"] >= 3
+    assert payload["nameOnlyHasSize"] is False
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_listdb_filter_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "listdb_filter_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node listdb-filter smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_listdb_filter_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./listdb_filter"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go listdb-filter smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# batchSize: 0
+# ---------------------------------------------------------------------------
+
+
+_BATCHSIZE_MONGOSH_SCRIPT = """
+db.c.drop();
+db.c.insertMany([0,1,2,3,4].map((i) => ({_id: i})));
+const cur = db.runCommand({find: 'c', filter: {}, batchSize: 0});
+const cursorId = cur.cursor.id;
+const firstBatch = cur.cursor.firstBatch;
+// Issue an explicit getMore so we can assert the docs flow through it.
+const more = db.runCommand({getMore: cursorId, collection: 'c', batchSize: 5});
+print(JSON.stringify({
+  firstBatchLen: firstBatch.length,
+  cursorIdNonZero: cursorId.toString() !== '0',
+  fromGetMore: more.cursor.nextBatch.map((d) => d._id),
+}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_batchsize_zero_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [_MONGOSH, "--quiet", f"{server.uri}batch_zero_xd", "--eval", _BATCHSIZE_MONGOSH_SCRIPT],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["firstBatchLen"] == 0
+    assert payload["cursorIdNonZero"] is True
+    assert payload["fromGetMore"] == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_batchsize_zero_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "batchsize_zero_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node batchsize-zero smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_batchsize_zero_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./batchsize_zero"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go batchsize-zero smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# dropAllUsersFromDatabase
+# ---------------------------------------------------------------------------
+
+
+_DROP_ALL_USERS_PROVISION_SCRIPT = """
+['alice', 'bob'].forEach((u) => {
+  db.getSiblingDB('shop').runCommand({
+    createUser: u, pwd: 'p',
+    roles: [{role: 'read', db: 'shop'}],
+  });
+});
+db.getSiblingDB('other').runCommand({
+  createUser: 'carol', pwd: 'p',
+  roles: [{role: 'read', db: 'other'}],
+});
+print('PROVISIONED');
+"""
+
+_DROP_ALL_USERS_OBSERVE_SCRIPT = """
+const r = db.getSiblingDB('shop').runCommand({dropAllUsersFromDatabase: 1});
+const shopUsers = db.getSiblingDB('shop').runCommand({usersInfo: 1}).users;
+const otherUsers = db.getSiblingDB('other').runCommand({usersInfo: 1}).users;
+print(JSON.stringify({
+  n: r.n,
+  shopUsers: shopUsers.map((u) => u.user),
+  otherUsers: otherUsers.map((u) => u.user),
+}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_drop_all_users_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
+    admin_uri = (
+        f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
+        "?authSource=admin&authMechanism=SCRAM-SHA-256"
+    )
+    r = _run(
+        [_MONGOSH, "--quiet", admin_uri, "--eval", _DROP_ALL_USERS_PROVISION_SCRIPT],
+        timeout=60.0,
+    )
+    assert r.returncode == 0 and "PROVISIONED" in r.stdout, (
+        f"provision: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
+    r = _run(
+        [_MONGOSH, "--quiet", admin_uri, "--eval", _DROP_ALL_USERS_OBSERVE_SCRIPT],
+        timeout=60.0,
+    )
+    assert r.returncode == 0, f"observe: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    out_line = next(
+        (ln for ln in reversed(r.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {r.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["n"] == 2
+    assert payload["shopUsers"] == []
+    assert payload["otherUsers"] == ["carol"]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_drop_all_users_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server_with_auth.uri, "ADMIN_PASSWORD": _ADMIN_PWD}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "drop_all_users_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node drop-all-users smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_drop_all_users_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server_with_auth.uri, "ADMIN_PASSWORD": _ADMIN_PWD}
+    result = _run(
+        [_GO, "run", "./drop_all_users"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go drop-all-users smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# SCRAM-SHA-1
+# ---------------------------------------------------------------------------
+
+
+_SCRAM_SHA1_PROVISION_SCRIPT = """
+db.getSiblingDB('admin').runCommand({
+  createUser: 'legacy_sh',
+  pwd: 'pass',
+  roles: [],
+  mechanisms: ['SCRAM-SHA-1'],
+});
+print('PROVISIONED');
+"""
+
+_SCRAM_SHA1_PING_SCRIPT = """
+print(JSON.stringify({
+  ok: db.getSiblingDB('admin').runCommand({ping: 1}).ok,
+  user: db.getSiblingDB('admin').runCommand({connectionStatus: 1})
+    .authInfo.authenticatedUsers[0].user,
+}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_scram_sha1_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
+    admin_uri = (
+        f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
+        "?authSource=admin&authMechanism=SCRAM-SHA-256"
+    )
+    r = _run(
+        [_MONGOSH, "--quiet", admin_uri, "--eval", _SCRAM_SHA1_PROVISION_SCRIPT],
+        timeout=60.0,
+    )
+    assert r.returncode == 0 and "PROVISIONED" in r.stdout, (
+        f"provision: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
+    legacy_uri = (
+        f"mongodb://legacy_sh:pass@127.0.0.1:{server_with_auth.port}/"
+        "?authSource=admin&authMechanism=SCRAM-SHA-1"
+    )
+    r = _run([_MONGOSH, "--quiet", legacy_uri, "--eval", _SCRAM_SHA1_PING_SCRIPT], timeout=60.0)
+    assert r.returncode == 0, f"ping: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    out_line = next(
+        (ln for ln in reversed(r.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {r.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["ok"] == 1
+    assert payload["user"] == "legacy_sh"
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_scram_sha1_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server_with_auth.uri, "ADMIN_PASSWORD": _ADMIN_PWD}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "scram_sha1_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node scram-sha1 smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_scram_sha1_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server_with_auth.uri, "ADMIN_PASSWORD": _ADMIN_PWD}
+    result = _run(
+        [_GO, "run", "./scram_sha1"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go scram-sha1 smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# postBatchResumeToken
+# ---------------------------------------------------------------------------
+
+
+_PBRT_MONGOSH_SCRIPT = """
+db.c.drop();
+const cs = db.c.watch([], {maxAwaitTimeMS: 500});
+const initial = cs.getResumeToken();
+sleep(200);
+cs.tryNext();
+sleep(200);
+cs.tryNext();
+sleep(200);
+const after = cs.getResumeToken();
+cs.close();
+print(JSON.stringify({
+  initialPresent: !!initial,
+  afterPresent: !!after,
+  // Resume tokens are {_data: <hex>}; advance check is on _data string.
+  initialData: initial ? initial._data : null,
+  afterData: after ? after._data : null,
+}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_pbrt_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [_MONGOSH, "--quiet", f"{server.uri}pbrt_xd", "--eval", _PBRT_MONGOSH_SCRIPT],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["afterPresent"] is True, "expected resume token after empty getMores"
+    if payload["initialData"]:
+        assert payload["initialData"] != payload["afterData"], (
+            "resume token did not advance across empty getMores"
+        )
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_pbrt_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "pbrt_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node pbrt smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_pbrt_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./pbrt"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go pbrt smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Tailable cursor on capped collection
+# ---------------------------------------------------------------------------
+
+
+_TAILABLE_MONGOSH_SCRIPT = """
+db.dropDatabase();
+db.createCollection('logs', {capped: true, size: 64 * 1024});
+db.logs.insertOne({_id: 1});
+const cur = db.logs.find({}).addOption(2);  // 2 = tailable cursor flag
+const first = cur.next();
+db.logs.insertOne({_id: 2});
+let got = null;
+const deadline = Date.now() + 5000;
+while (Date.now() < deadline && got === null) {
+  if (cur.hasNext()) got = cur.next();
+  else sleep(100);
+}
+cur.close();
+print(JSON.stringify({first: first._id, second: got ? got._id : null}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_tailable_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [_MONGOSH, "--quiet", f"{server.uri}tailable_xd", "--eval", _TAILABLE_MONGOSH_SCRIPT],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["first"] == 1
+    assert payload["second"] == 2
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+def test_tailable_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "tailable_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node tailable smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_tailable_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./tailable"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go tailable smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
