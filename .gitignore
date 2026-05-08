@@ -39,6 +39,11 @@ docs/_build/
 # package-lock.json IS committed for reproducibility.
 tests/cross_driver/node/node_modules/
 
+# Gradle wrapper / cache state for the Java cross-driver smokes is
+# rebuilt from build.gradle.kts on first run; the uber-jar in build/
+# is also excluded by the top-level `build/` rule above.
+tests/cross_driver/java/.gradle/
+
 # Pelican site build artifacts and ephemeral runtime state. The build
 # output is regenerated each `invoke build`; theme/static/img/ is copied
 # from ../brandkit/ at build time; secantus-data/ is a stray WiredTiger
