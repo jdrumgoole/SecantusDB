@@ -884,13 +884,28 @@ class Storage:
             return True
 
     def get_role(self, db: str, name: str) -> dict[str, Any] | None:
+        # Use a private short-lived session so cross-thread visibility
+        # is guaranteed: connection-thread A may have written a role
+        # while we're on connection-thread B, and B's cached session
+        # carries a sticky snapshot that won't observe A's commit.
+        # Same pattern as ``read_oplog``. The cost (one open_session +
+        # close per call) is negligible vs the correctness win.
         with self._lock:
-            c = self._cursor(_ROLES_TABLE)
-            c.set_key(db, name)
-            if c.search() != 0:
-                return None
-            blob = bytes(c.get_value())
-            return bson.decode(blob) if blob else None
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_ROLES_TABLE, None, None)
+                try:
+                    c.set_key(db, name)
+                    if c.search() != 0:
+                        return None
+                    blob = bytes(c.get_value())
+                    return bson.decode(blob) if blob else None
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
 
     def drop_role(self, db: str, name: str) -> bool:
         with self._lock:
