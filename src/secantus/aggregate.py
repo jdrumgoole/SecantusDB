@@ -651,32 +651,38 @@ def _stage_lookup_pipeline(
 
 
 def _foreign_field_has_simple_index(storage: Storage, db: str, coll: str, field: str) -> bool:
-    """Is there a single-field, non-multikey index on ``coll.field`` we
-    can drive `$lookup` through?
+    """Is there a non-multikey index whose leading column is ``field``?
 
-    Multikey indexes are ineligible because Storage's pickers skip them
-    (find_matching falls back to a full scan), so a per-outer-doc loop
-    against a multikey-indexed foreign field is O(M*N) — strictly worse
-    than the existing hash-join. Compound indexes also disqualify; the
-    leading-field-only equality lookup is already part of Storage's
-    routing but the safe-perf rule here is "exact-shape match only".
+    A single-field index keyed exactly on ``field`` is the canonical
+    fit, but a compound index whose leading field is ``field`` is also
+    eligible: Storage's picker turns ``{field: value}`` into a
+    leading-prefix scan over the compound index's entries (correctness
+    is identical to the single-field case for equality on the leading
+    column). Direction (1 / -1) is fine for either shape — the storage
+    range scan handles ASC and DESC.
+
+    Multikey indexes are ineligible because Storage's pickers skip
+    them (find_matching falls back to a full scan), so a per-outer-doc
+    loop against a multikey-indexed foreign field would be O(M*N) —
+    strictly worse than the in-memory hash-join. Geo / hashed / text
+    indexes are also out (the numeric-direction check below excludes
+    them).
     """
     try:
         indexes = storage.list_indexes(db, coll)
     except Exception:
         return False
     for ix in indexes:
+        if ix.get("multikey"):
+            continue
         key = ix.get("key", {})
         if not isinstance(key, Mapping):
             continue
-        if list(key.keys()) != [field]:
+        keys = list(key.keys())
+        if not keys or keys[0] != field:
             continue
-        # Direction (1 / -1) is fine — the storage range scan handles
-        # ASC and DESC. Multikey or geo flags disqualify.
-        value = key[field]
-        if not (isinstance(value, int) or value in (1, -1)):
-            continue
-        if ix.get("multikey"):
+        leading_value = key[field]
+        if leading_value not in (1, -1):
             continue
         return True
     return False

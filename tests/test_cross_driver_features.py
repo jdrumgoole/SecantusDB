@@ -100,6 +100,15 @@ def _ensure_node_modules() -> bool:
 def _ensure_java_smokes_jar() -> bool:
     """Build the Java smokes uber-jar once; cached in build/ for re-runs.
 
+    Under pytest-xdist parallel workers, multiple workers will hit
+    this helper simultaneously on a fresh checkout. We serialise the
+    build with ``fcntl.flock`` on a sentinel file so workers 2..N
+    wait for worker 1 to finish, then see the cached jar. Without the
+    lock, racing ``gradle smokesJar`` invocations clobber each other
+    and leave a partial jar missing some smoke classes — failing tests
+    with ``ClassNotFoundException`` on a class the source clearly
+    defines.
+
     Skipping conditions: ``java`` or ``gradle`` not on PATH, or the
     Gradle build itself fails. Returns True only when the jar is on
     disk and runnable by ``java -cp <jar> <FQN>``.
@@ -108,16 +117,26 @@ def _ensure_java_smokes_jar() -> bool:
         return True
     if _GRADLE is None or _JAVA is None:
         return False
-    # Gradle 9.5 needs a JDK >= 17 toolchain; macOS dev boxes usually
-    # have multiple JDKs and Gradle's default scan picks the highest,
-    # so we rely on JAVA_HOME / sourceCompatibility=17 in build.gradle
-    # rather than mandating a toolchain block.
-    result = _run(
-        [_GRADLE, "smokesJar", "--no-daemon", "-q"],
-        cwd=_JAVA_SMOKE_DIR,
-        timeout=600.0,
-    )
-    return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
+    import fcntl
+
+    lock_path = _JAVA_SMOKE_DIR / ".smokesjar.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        # Re-check after acquiring the lock — a sibling worker may
+        # have built it while we were blocked.
+        if _JAVA_SMOKES_JAR.is_file():
+            return True
+        # Gradle 9.5 needs a JDK >= 17 toolchain; macOS dev boxes
+        # usually have multiple JDKs and Gradle's default scan picks
+        # the highest, so we rely on JAVA_HOME / sourceCompatibility=17
+        # in build.gradle rather than mandating a toolchain block.
+        result = _run(
+            [_GRADLE, "smokesJar", "--no-daemon", "-q"],
+            cwd=_JAVA_SMOKE_DIR,
+            timeout=600.0,
+        )
+        return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
 
 
 def _run_java_smoke(
