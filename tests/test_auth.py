@@ -1043,3 +1043,97 @@ def test_sasl_supported_mechs_reflects_user_record(server_no_auth) -> None:
     assert res3["saslSupportedMechs"] == [SCRAM_SHA_256]
 
     plain.close()
+
+
+# ----------------------------------------------------------------------
+# SASLprep
+# ----------------------------------------------------------------------
+
+
+def test_saslprep_ascii_passes_through_unchanged() -> None:
+    """RFC 4013 §2.5: ASCII-only strings are pass-through."""
+    from secantus.auth import saslprep
+
+    assert saslprep("hunter2") == "hunter2"
+    assert saslprep("") == ""
+    # ASCII space is allowed (not in mapping table B.1).
+    assert saslprep("a b c") == "a b c"
+
+
+def test_saslprep_strips_table_b1() -> None:
+    """Table B.1 characters map to nothing — soft hyphen, ZWJ, etc."""
+    from secantus.auth import saslprep
+
+    # ­ SOFT HYPHEN (B.1) → removed.
+    assert saslprep("ab­cd") == "abcd"
+    # ‍ ZERO WIDTH JOINER (B.1) → removed.
+    assert saslprep("xy‍z") == "xyz"
+
+
+def test_saslprep_maps_non_ascii_space_to_ascii_space() -> None:
+    """Table C.1.2 — non-ASCII whitespace → U+0020.
+
+    Mapping happens in stage 1 before the prohibit check in stage 3,
+    so NBSP becomes ASCII space and the post-mapping string contains
+    ASCII space (C.1.1, not C.1.2) which is allowed.
+    """
+    from secantus.auth import saslprep
+
+    # NBSP (U+00A0) maps to ASCII space (U+0020).
+    assert saslprep("a b") == "a b"
+
+
+def test_saslprep_nfkc_normalisation() -> None:
+    """Stage 2: NFKC compatibility decomposition + canonical compose."""
+    from secantus.auth import saslprep
+
+    # ﬁ (ﬁ) is the LATIN SMALL LIGATURE FI; NFKC decomposes to
+    # ASCII "fi".
+    assert saslprep("aﬁb") == "afib"
+
+
+def test_saslprep_rejects_prohibited() -> None:
+    """C.2.1 (ASCII control), C.5 (surrogates), etc."""
+    from secantus.auth import AuthError, saslprep
+
+    #  NUL (C.2.1) — ASCII control.
+    with pytest.raises(AuthError, match="prohibited"):
+        saslprep("a\x00b")
+    # ‎ LEFT-TO-RIGHT MARK (C.8) — change-display.
+    with pytest.raises(AuthError, match="prohibited"):
+        saslprep("‎")
+
+
+def test_saslprep_bidi_check() -> None:
+    """A string with R/AL must not contain L."""
+    from secantus.auth import AuthError, saslprep
+
+    # Hebrew "shalom" prefixed by Latin → R/AL + L → reject.
+    with pytest.raises(AuthError, match="bidirectional"):
+        saslprep("aשלום")
+
+    # All-Hebrew passes.
+    saslprep("שלום")
+
+
+def test_derive_credentials_applies_saslprep_for_sha256() -> None:
+    """SCRAM-SHA-256 derivation runs the password through SASLprep
+    before PBKDF2. Two passwords that SASLprep maps to the same
+    canonical form must produce identical credentials (with the same
+    salt/iterations).
+    """
+    salt = b"\x00" * 28
+    # ­ (soft hyphen) maps to nothing. So "pa­ss" and "pass"
+    # produce identical SCRAM-SHA-256 stored credentials.
+    a = derive_credentials("pa­ss", salt=salt)
+    b = derive_credentials("pass", salt=salt)
+    assert a.stored_key == b.stored_key
+    assert a.server_key == b.server_key
+
+
+def test_derive_credentials_saslprep_rejects_prohibited_password() -> None:
+    """A password containing prohibited characters surfaces as AuthError."""
+    from secantus.auth import AuthError
+
+    with pytest.raises(AuthError, match="prohibited"):
+        derive_credentials("bad\x00pwd")
