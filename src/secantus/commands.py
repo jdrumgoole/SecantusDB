@@ -670,6 +670,29 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     ns = _ns(ctx.db_name, coll)
+    # Tailable cursor on a (capped) collection. Real mongod rejects
+    # ``tailable: true`` on a non-capped collection with code 2
+    # (BadValue). The driver-spec ``find`` command uses
+    # ``tailable: true`` + ``awaitData: true`` for the legacy
+    # newest-doc-poll workload (replicated by mongo-go-driver's
+    # ``TestCursor_TryNext/one_getMore_sent`` against a capped
+    # ``logs`` collection). Note the change-stream tailable path
+    # is separate — it goes through the ``aggregate``/``$changeStream``
+    # pipeline, not ``find``.
+    tailable = bool(doc.get("tailable", False))
+    if tailable:
+        if not ctx.storage.collection_is_capped(ctx.db_name, coll):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"error processing query: tailable cursor requested on non capped "
+                    f"collection {ns}"
+                ),
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        await_data = bool(doc.get("awaitData", False))
+        return _find_tailable(coll, docs, batch_size, ns, await_data, ctx)
     if single_batch:
         first_batch, cursor_id = docs, 0
     else:
@@ -677,6 +700,57 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {
         # Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
         "cursor": {"firstBatch": first_batch, "id": bson.Int64(cursor_id), "ns": ns},
+        "ok": 1.0,
+    }
+
+
+def _find_tailable(
+    coll: str,
+    initial_docs: list[dict[str, Any]],
+    batch_size: int,
+    ns: str,
+    await_data: bool,
+    ctx: CommandContext,
+) -> dict[str, Any]:
+    """Build a tailable cursor on a capped collection.
+
+    The producer scans the doc table for rows with ``id_key`` strictly
+    greater than the last one we've returned. ``id_key`` is the
+    byte-sortable ``_id`` encoding (see ``secantus.sortkey``); for
+    monotonic ``ObjectId``-style ``_id`` values that order matches
+    insertion order, which is exactly what tailable consumers expect.
+    Capped collections eviction-prune oldest rows in the same order,
+    so the producer naturally tracks the trailing edge.
+    """
+    db_name = ctx.db_name
+    storage = ctx.storage
+    # Track our current-watermark id_key on a mutable container so the
+    # producer closure can update it. Walk the collection once now to
+    # find the highest current id_key — that becomes the starting
+    # checkpoint after we hand back ``firstBatch``. Subsequent
+    # ``getMore`` polls re-scan from that checkpoint forward.
+    rows = storage.scan_docs_after_id_key(db_name, coll, after=None)
+    state = {"after_id_key": rows[-1][0] if rows else None}
+
+    def producer() -> list[dict[str, Any]]:
+        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=state["after_id_key"])
+        if not new_rows:
+            return []
+        state["after_id_key"] = new_rows[-1][0]
+        return [doc for _id_k, doc in new_rows]
+
+    first_batch = initial_docs[:batch_size]
+    cursor_id = ctx.cursors.register_tailable(
+        ns,
+        producer,
+        await_data=await_data,
+    )
+    return {
+        "cursor": {
+            "firstBatch": first_batch,
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
+        },
         "ok": 1.0,
     }
 
