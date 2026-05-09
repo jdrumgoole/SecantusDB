@@ -384,7 +384,6 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(str(exc)) from exc
 
-
     # ---- ad-hoc query console -------------------------------------------
 
     def run_find(

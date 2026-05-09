@@ -108,7 +108,14 @@ def run_find(
     projection: str = Form(""),
     limit: int = Form(50),
 ) -> HTMLResponse:
-    form = {"db": db, "coll": coll, "filter": filter, "sort": sort, "projection": projection, "limit": str(limit)}
+    form = {
+        "db": db,
+        "coll": coll,
+        "filter": filter,
+        "sort": sort,
+        "projection": projection,
+        "limit": str(limit),
+    }
     errors: list[str] = []
 
     filter_doc, err = _parse_json_field("Filter", filter, required_type=dict, default={})
@@ -117,7 +124,9 @@ def run_find(
     sort_doc, err = _parse_json_field("Sort", sort, required_type=dict, default=None)
     if err:
         errors.append(err)
-    projection_doc, err = _parse_json_field("Projection", projection, required_type=dict, default=None)
+    projection_doc, err = _parse_json_field(
+        "Projection", projection, required_type=dict, default=None
+    )
     if err:
         errors.append(err)
 
@@ -128,8 +137,12 @@ def run_find(
 
     try:
         rows = request.app.state.mongo.run_find(
-            db, coll,
-            filter_doc=filter_doc, sort=sort_doc, projection=projection_doc, limit=limit,
+            db,
+            coll,
+            filter_doc=filter_doc,
+            sort=sort_doc,
+            projection=projection_doc,
+            limit=limit,
         )
     except MongoError as exc:
         return _render_results(
@@ -137,7 +150,9 @@ def run_find(
         )
 
     request.app.state.history.record(
-        request.app.state.mongo_uri, "find", json.dumps(form),
+        request.app.state.mongo_uri,
+        "find",
+        json.dumps(form),
     )
     return _render_results(
         request,
@@ -161,20 +176,30 @@ def run_aggregate(
     parsed, err = _parse_json_field("Pipeline", pipeline, required_type=list, default=None)
     if err or parsed is None:
         return _render_results(
-            request, kind="aggregate", form=form, results=None,
-            errors=[err or "Pipeline is required."], stats=None,
+            request,
+            kind="aggregate",
+            form=form,
+            results=None,
+            errors=[err or "Pipeline is required."],
+            stats=None,
         )
 
     try:
         rows = request.app.state.mongo.run_aggregate(db, coll, parsed, limit=limit)
     except MongoError as exc:
         return _render_results(
-            request, kind="aggregate", form=form, results=None,
-            errors=[str(exc)], stats=None,
+            request,
+            kind="aggregate",
+            form=form,
+            results=None,
+            errors=[str(exc)],
+            stats=None,
         )
 
     request.app.state.history.record(
-        request.app.state.mongo_uri, "aggregate", json.dumps(form),
+        request.app.state.mongo_uri,
+        "aggregate",
+        json.dumps(form),
     )
     return _render_results(
         request,
@@ -196,20 +221,30 @@ def run_command(
     parsed, err = _parse_json_field("Command", command, required_type=dict, default=None)
     if err or parsed is None:
         return _render_results(
-            request, kind="runCommand", form=form, results=None,
-            errors=[err or "Command is required."], stats=None,
+            request,
+            kind="runCommand",
+            form=form,
+            results=None,
+            errors=[err or "Command is required."],
+            stats=None,
         )
 
     try:
         out = request.app.state.mongo.run_command(db, parsed)
     except MongoError as exc:
         return _render_results(
-            request, kind="runCommand", form=form, results=None,
-            errors=[str(exc)], stats=None,
+            request,
+            kind="runCommand",
+            form=form,
+            results=None,
+            errors=[str(exc)],
+            stats=None,
         )
 
     request.app.state.history.record(
-        request.app.state.mongo_uri, "runCommand", json.dumps(form),
+        request.app.state.mongo_uri,
+        "runCommand",
+        json.dumps(form),
     )
     return _render_results(
         request,
@@ -227,7 +262,5 @@ def history_entry(request: Request, entry_id: int) -> HTMLResponse:
     rows = request.app.state.history.recent(request.app.state.mongo_uri, limit=1000)
     for row in rows:
         if row.id == entry_id:
-            return HTMLResponse(
-                row.payload, headers={"Content-Type": "application/json"}
-            )
+            return HTMLResponse(row.payload, headers={"Content-Type": "application/json"})
     raise HTTPException(status_code=404, detail="history entry not found")

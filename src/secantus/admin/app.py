@@ -24,8 +24,8 @@ from fastapi.staticfiles import StaticFiles
 
 import secantus
 from secantus.admin.client import MongoFacade
-from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.history import HistoryStore
+from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
     changestream,
     collection,

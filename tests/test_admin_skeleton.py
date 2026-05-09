@@ -114,7 +114,11 @@ async def test_dashboard_tiles_render_serverstatus(http: AsyncClient) -> None:
 async def test_dashboard_tiles_show_error_when_mongo_unreachable(tmp_path) -> None:
     # Point at a port nothing's listening on; the facade's ServerSelectionTimeoutError
     # surfaces as a translated MongoError → "Could not reach server" in the HTML.
-    app = create_app(mongo_uri="mongodb://127.0.0.1:1", token="testtoken", history_path=tmp_path / "h.db")
+    app = create_app(
+        mongo_uri="mongodb://127.0.0.1:1",
+        token="testtoken",
+        history_path=tmp_path / "h.db",
+    )
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -857,9 +861,7 @@ async def test_console_find_returns_docs(server, http: AsyncClient) -> None:
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
     try:
-        mc["console_db"]["c"].insert_many(
-            [{"_id": i, "name": f"row-{i}"} for i in range(3)]
-        )
+        mc["console_db"]["c"].insert_many([{"_id": i, "name": f"row-{i}"} for i in range(3)])
     finally:
         mc.close()
 
@@ -954,9 +956,7 @@ async def test_console_history_endpoint_returns_payload(
     match = re.search(r"loadHistory\((\d+),\s*'(runCommand|find|aggregate)'\)", r.text)
     assert match is not None
     entry_id = int(match.group(1))
-    r2 = await http.get(
-        f"/console/history/{entry_id}", headers={HEADER_NAME: "testtoken"}
-    )
+    r2 = await http.get(f"/console/history/{entry_id}", headers={HEADER_NAME: "testtoken"})
     assert r2.status_code == 200
     payload = r2.json()
     assert payload["db"] == "admin"
