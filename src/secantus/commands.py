@@ -1560,6 +1560,8 @@ def _aggregate_change_stream(
                 last_seen = seq
                 continue
             if ev is not None:
+                if cs_spec.split_large_events:
+                    changestreams.stamp_split_event(ev)
                 events.append(ev)
             last_seen = seq
             ts_field = oplog_entry.get("ts")
@@ -1569,7 +1571,10 @@ def _aggregate_change_stream(
             if isinstance(ns_field, str) and ns_field:
                 last_seen_ns = ns_field
             if invalidates:
-                events.append(changestreams.invalidate_event(seq, oplog_entry))
+                inv = changestreams.invalidate_event(seq, oplog_entry)
+                if cs_spec.split_large_events:
+                    changestreams.stamp_split_event(inv)
+                events.append(inv)
                 entry.invalidated = True
                 entry.final_event_pending = True
                 break

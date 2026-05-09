@@ -392,6 +392,7 @@ class ChangeStreamSpec:
     resume_after: dict[str, Any] | None = None
     start_after: dict[str, Any] | None = None
     start_at_operation_time: Timestamp | None = None
+    split_large_events: bool = False
 
 
 def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
@@ -408,7 +409,26 @@ def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
         out.start_after = dict(spec["startAfter"])
     if isinstance(spec.get("startAtOperationTime"), Timestamp):
         out.start_at_operation_time = spec["startAtOperationTime"]
+    if bool(spec.get("splitLargeChangeStreamEvents")):
+        out.split_large_events = True
     return out
+
+
+def stamp_split_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Attach a ``splitEvent: {fragment: 1, of: 1}`` envelope.
+
+    Real ``mongod`` splits change-stream events larger than 16 MB into
+    multiple fragments when the user sets
+    ``splitLargeChangeStreamEvents: true``; each fragment carries its
+    position via ``splitEvent: {fragment: N, of: M}``. SecantusDB's
+    events are never that large in practice (oplog entries cap well
+    below 16 MB), so we always emit a single-fragment envelope —
+    correct from the driver's reassembly perspective. The user's
+    opt-in is honoured by the *presence* of the ``splitEvent`` field;
+    drivers don't get back a ``splitEvent`` when the option is off.
+    """
+    event["splitEvent"] = {"fragment": 1, "of": 1}
+    return event
 
 
 __all__ = [
@@ -426,4 +446,5 @@ __all__ = [
     "parse_resume_token",
     "parse_spec",
     "project",
+    "stamp_split_event",
 ]

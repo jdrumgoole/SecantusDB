@@ -425,3 +425,47 @@ def test_index_lifecycle_at_database_scope(client: MongoClient) -> None:
     assert op_types == {"createIndexes"}
     coll_names = {e["ns"]["coll"] for e in events}
     assert coll_names == {"a", "b"}
+
+
+def test_split_large_change_stream_events_attaches_envelope(client: MongoClient) -> None:
+    """When the user opts into ``splitLargeChangeStreamEvents: True``,
+    every event carries a ``splitEvent: {fragment, of}`` envelope.
+    SecantusDB's events are never large enough to actually split, so
+    every fragment is single (``{fragment: 1, of: 1}``) — drivers
+    reassemble identically.
+
+    The pymongo Collection.watch() API doesn't expose this option as a
+    top-level kwarg in 4.x, so we drive the aggregate command directly
+    with the ``$changeStream`` stage spec."""
+    db = client["csdb_split"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    pipeline = [{"$changeStream": {"splitLargeChangeStreamEvents": True}}]
+    cs = coll.aggregate(pipeline, batchSize=1, maxAwaitTimeMS=2000)
+    time.sleep(0.3)
+    coll.insert_one({"_id": 1, "x": 1})
+    coll.update_one({"_id": 1}, {"$set": {"x": 2}})
+    coll.delete_one({"_id": 1})
+
+    events = _drain(cs, target=3)
+    cs.close()
+    assert [e["operationType"] for e in events] == ["insert", "update", "delete"]
+    for e in events:
+        assert e["splitEvent"] == {"fragment": 1, "of": 1}
+
+
+def test_split_large_change_stream_events_omitted_by_default(client: MongoClient) -> None:
+    """Without the option, events do *not* carry a ``splitEvent`` field —
+    the envelope is only present when the user opts in."""
+    db = client["csdb_split_off"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.insert_one({"_id": 1})
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert "splitEvent" not in events[0]
