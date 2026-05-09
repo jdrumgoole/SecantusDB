@@ -18,9 +18,9 @@ from __future__ import annotations
 __all__ = ["create_app"]
 
 
-def create_app(*, mongo_uri: str, token: str):
+def create_app(*, mongo_uri: str, token: str, history_path=None):
     """Re-export ``app.create_app`` lazily to avoid pulling fastapi for tests
     that only import ``secantus.admin``."""
     from secantus.admin.app import create_app as _factory
 
-    return _factory(mongo_uri=mongo_uri, token=token)
+    return _factory(mongo_uri=mongo_uri, token=token, history_path=history_path)

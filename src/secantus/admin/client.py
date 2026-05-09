@@ -385,6 +385,70 @@ class MongoFacade:
             raise MongoError(str(exc)) from exc
 
 
+    # ---- ad-hoc query console -------------------------------------------
+
+    def run_find(
+        self,
+        db: str,
+        coll: str,
+        *,
+        filter_doc: Mapping[str, Any] | None = None,
+        sort: Mapping[str, Any] | None = None,
+        projection: Mapping[str, Any] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Run a console-driven ``find``. Returns up to ``limit`` docs.
+
+        ``limit`` is clamped to ``[1, 200]`` so a runaway query can't OOM
+        the admin process.
+        """
+        n = max(1, min(int(limit), 200))
+        try:
+            coll_obj = self._get_client()[db][coll]
+            cursor = coll_obj.find(
+                dict(filter_doc or {}), projection=dict(projection) if projection else None
+            ).limit(n)
+            if sort:
+                cursor = cursor.sort(list(dict(sort).items()))
+            return [dict(d) for d in cursor]
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def run_aggregate(
+        self,
+        db: str,
+        coll: str,
+        pipeline: list[Any],
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Run a console-driven aggregation. Returns up to ``limit`` docs."""
+        n = max(1, min(int(limit), 1000))
+        try:
+            coll_obj = self._get_client()[db][coll]
+            out: list[dict[str, Any]] = []
+            for d in coll_obj.aggregate(list(pipeline)):
+                out.append(dict(d))
+                if len(out) >= n:
+                    break
+            return out
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def run_command(self, db: str, command: Mapping[str, Any]) -> dict[str, Any]:
+        """Run an arbitrary command against ``db``. Returns the response doc."""
+        try:
+            return dict(self._get_client()[db].command(dict(command)))
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+
 __all__ = [
     "MongoFacade",
     "MongoError",

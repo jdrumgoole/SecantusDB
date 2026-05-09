@@ -31,8 +31,12 @@ def server(tmp_path):
 
 
 @pytest.fixture
-def app(server: SecantusDBServer):
-    app = create_app(mongo_uri=server.uri, token="testtoken")
+def app(server: SecantusDBServer, tmp_path):
+    app = create_app(
+        mongo_uri=server.uri,
+        token="testtoken",
+        history_path=tmp_path / "history.db",
+    )
     yield app
     app.state.mongo.close()
 
@@ -107,10 +111,10 @@ async def test_dashboard_tiles_render_serverstatus(http: AsyncClient) -> None:
         assert label in r.text
 
 
-async def test_dashboard_tiles_show_error_when_mongo_unreachable() -> None:
+async def test_dashboard_tiles_show_error_when_mongo_unreachable(tmp_path) -> None:
     # Point at a port nothing's listening on; the facade's ServerSelectionTimeoutError
     # surfaces as a translated MongoError → "Could not reach server" in the HTML.
-    app = create_app(mongo_uri="mongodb://127.0.0.1:1", token="testtoken")
+    app = create_app(mongo_uri="mongodb://127.0.0.1:1", token="testtoken", history_path=tmp_path / "h.db")
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -552,7 +556,7 @@ def test_ws_metrics_streams_backlog_and_tick(server, tmp_path) -> None:
     """
     from fastapi.testclient import TestClient
 
-    app = create_app(mongo_uri=server.uri, token="ws-token")
+    app = create_app(mongo_uri=server.uri, token="ws-token", history_path=tmp_path / "h.db")
     with TestClient(app) as client:
         # Lifespan just started the sampler; force one synchronous tick
         # before connecting so backlog has something in it.
@@ -572,11 +576,11 @@ def test_ws_metrics_streams_backlog_and_tick(server, tmp_path) -> None:
             assert "opcounters" in sample
 
 
-def test_ws_metrics_rejects_missing_token(server) -> None:
+def test_ws_metrics_rejects_missing_token(server, tmp_path) -> None:
     from fastapi.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
-    app = create_app(mongo_uri=server.uri, token="ws-token")
+    app = create_app(mongo_uri=server.uri, token="ws-token", history_path=tmp_path / "h.db")
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect),
@@ -585,11 +589,11 @@ def test_ws_metrics_rejects_missing_token(server) -> None:
         ws.receive_json()
 
 
-def test_ws_metrics_rejects_bad_token(server) -> None:
+def test_ws_metrics_rejects_bad_token(server, tmp_path) -> None:
     from fastapi.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
-    app = create_app(mongo_uri=server.uri, token="ws-token")
+    app = create_app(mongo_uri=server.uri, token="ws-token", history_path=tmp_path / "h.db")
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect),
@@ -730,12 +734,12 @@ async def test_changestream_page_renders(http: AsyncClient) -> None:
     assert 'name="scope"' in r.text
 
 
-def test_ws_changes_streams_collection_event(server) -> None:
+def test_ws_changes_streams_collection_event(server, tmp_path) -> None:
     """Open a coll-scope tail, write a doc, expect a single event frame."""
     from fastapi.testclient import TestClient
     from pymongo import MongoClient
 
-    app = create_app(mongo_uri=server.uri, token="cs-token")
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
     with (
         TestClient(app) as client,
         client.websocket_connect("/ws/changes/coll?t=cs-token&db=cs_db&coll=c") as ws,
@@ -756,11 +760,11 @@ def test_ws_changes_streams_collection_event(server) -> None:
         assert evt["event"]["ns"]["coll"] == "c"
 
 
-def test_ws_changes_rejects_missing_token(server) -> None:
+def test_ws_changes_rejects_missing_token(server, tmp_path) -> None:
     from fastapi.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
-    app = create_app(mongo_uri=server.uri, token="cs-token")
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect),
@@ -769,11 +773,11 @@ def test_ws_changes_rejects_missing_token(server) -> None:
         ws.receive_json()
 
 
-def test_ws_changes_rejects_bad_scope(server) -> None:
+def test_ws_changes_rejects_bad_scope(server, tmp_path) -> None:
     from fastapi.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
-    app = create_app(mongo_uri=server.uri, token="cs-token")
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect),
@@ -782,11 +786,11 @@ def test_ws_changes_rejects_bad_scope(server) -> None:
         ws.receive_json()
 
 
-def test_ws_changes_coll_scope_requires_db_and_coll(server) -> None:
+def test_ws_changes_coll_scope_requires_db_and_coll(server, tmp_path) -> None:
     from fastapi.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
-    app = create_app(mongo_uri=server.uri, token="cs-token")
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect),
@@ -836,3 +840,124 @@ async def test_delete_doc_removes_and_returns_empty(server, http: AsyncClient) -
         assert remaining == [2]
     finally:
         mc.close()
+
+
+# ---- /console (Slice 7) ----------------------------------------------------
+
+
+async def test_console_page_renders_with_tabs(http: AsyncClient) -> None:
+    r = await http.get("/console", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    for tab in ("find", "aggregate", "runCommand"):
+        assert tab in r.text
+
+
+async def test_console_find_returns_docs(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["console_db"]["c"].insert_many(
+            [{"_id": i, "name": f"row-{i}"} for i in range(3)]
+        )
+    finally:
+        mc.close()
+
+    r = await http.post(
+        "/console/find",
+        data={
+            "db": "console_db",
+            "coll": "c",
+            "filter": "{}",
+            "sort": "",
+            "projection": "",
+            "limit": "5",
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "row-0" in r.text
+    assert "row-2" in r.text
+    assert "Results" in r.text
+    # Recorded in the recent panel.
+    assert "find #" in r.text
+
+
+async def test_console_find_invalid_filter_renders_error(
+    http: AsyncClient,
+) -> None:
+    r = await http.post(
+        "/console/find",
+        data={
+            "db": "x",
+            "coll": "c",
+            "filter": "not-json",
+            "sort": "",
+            "projection": "",
+            "limit": "5",
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Filter is not valid" in r.text
+
+
+async def test_console_aggregate_returns_docs(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["agg_db"]["c"].insert_many([{"_id": i} for i in range(5)])
+    finally:
+        mc.close()
+
+    r = await http.post(
+        "/console/aggregate",
+        data={
+            "db": "agg_db",
+            "coll": "c",
+            "pipeline": '[{"$count": "n"}]',
+            "limit": "10",
+        },
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    # $count returns one doc {n: 5}; HTML escapes the quotes.
+    assert "n" in r.text and "5" in r.text
+
+
+async def test_console_run_command_returns_response(http: AsyncClient) -> None:
+    r = await http.post(
+        "/console/runCommand",
+        data={"db": "admin", "command": '{"ping": 1}'},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    # ping returns {ok: 1.0}; the HTML-escaped JSON spelling is &#34;ok&#34;.
+    assert "ok" in r.text and "1.0" in r.text
+
+
+async def test_console_history_endpoint_returns_payload(
+    http: AsyncClient,
+) -> None:
+    # Submit a runCommand so the history has at least one entry.
+    await http.post(
+        "/console/runCommand",
+        data={"db": "admin", "command": '{"ping": 1}'},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    # Pull the rendered page to find the most recent entry id.
+    r = await http.get("/console", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    import re
+
+    match = re.search(r"loadHistory\((\d+),\s*'(runCommand|find|aggregate)'\)", r.text)
+    assert match is not None
+    entry_id = int(match.group(1))
+    r2 = await http.get(
+        f"/console/history/{entry_id}", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r2.status_code == 200
+    payload = r2.json()
+    assert payload["db"] == "admin"
+    assert payload["command"] == '{"ping": 1}'
