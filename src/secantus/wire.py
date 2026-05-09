@@ -33,6 +33,22 @@ class WireProtocolError(Exception):
     pass
 
 
+class MalformedBodyError(WireProtocolError):
+    """Body bytes parse cleanly as a wire frame but fail BSON validation.
+
+    Raised after the message header has been read — the caller (the
+    server's connection loop) uses ``header.request_id`` to build a
+    targeted ``{ok: 0, errmsg, code: 2 BadValue}`` reply so the
+    connection survives. mongod returns the same shape for
+    e.g. ``BinData(4, ...)`` payloads whose advertised binary
+    length doesn't match the actual byte count.
+    """
+
+    def __init__(self, header: Header, message: str) -> None:
+        super().__init__(message)
+        self.header = header
+
+
 class ConnectionClosed(Exception):
     pass
 
@@ -97,10 +113,20 @@ def read_message(sock: socket.socket) -> Message:
             f"message length {header.message_length} exceeds max {MAX_MESSAGE_SIZE}"
         )
     body = _recv_exactly(sock, header.message_length - HEADER_SIZE)
-    if header.op_code == OP_MSG:
-        return Message(header=header, op=_parse_op_msg(body))
-    if header.op_code == OP_QUERY:
-        return Message(header=header, op=_parse_op_query(body))
+    try:
+        if header.op_code == OP_MSG:
+            return Message(header=header, op=_parse_op_msg(body))
+        if header.op_code == OP_QUERY:
+            return Message(header=header, op=_parse_op_query(body))
+    except bson.InvalidBSON as exc:
+        # Client sent a body whose framing is plausible but whose
+        # inner BSON document fails validation (e.g. a BinData with
+        # a mismatched length field, or an int32 declaring a doc size
+        # that overflows the buffer). Real mongod replies with a
+        # ``BadValue`` error and keeps the connection alive — surface
+        # the header here so the connection loop can do the same
+        # rather than dropping the socket on the next message.
+        raise MalformedBodyError(header, f"invalid BSON in body: {exc}") from exc
     raise WireProtocolError(f"unsupported op_code {header.op_code}")
 
 

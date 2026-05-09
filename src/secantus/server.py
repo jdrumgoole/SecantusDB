@@ -22,6 +22,7 @@ from secantus.storage import Storage
 from secantus.wire import (
     OP_MSG_FLAG_MORE_TO_COME,
     ConnectionClosed,
+    MalformedBodyError,
     OpMsg,
     OpQuery,
     WireProtocolError,
@@ -162,6 +163,31 @@ class SecantusDBServer:
                         message = read_message(conn)
                     except ConnectionClosed:
                         return
+                    except MalformedBodyError as exc:
+                        # Body bytes failed BSON validation. Build a
+                        # targeted error reply so the client gets a
+                        # ``BadValue`` and can keep using the connection
+                        # for subsequent commands. Mongod returns the
+                        # same shape — InvalidBSON in a command body is
+                        # not a protocol-level fault.
+                        logger.warning("malformed BSON from %s: %s", addr, exc)
+                        try:
+                            reply = build_op_msg_reply(
+                                response_to=exc.header.request_id,
+                                request_id=next(reply_ids),
+                                body={
+                                    "ok": 0.0,
+                                    "errmsg": str(exc),
+                                    "code": 2,
+                                    "codeName": "BadValue",
+                                },
+                            )
+                            conn.sendall(reply)
+                        except OSError:
+                            # Client may have hung up before we could
+                            # respond; fall through to the close path.
+                            return
+                        continue
                     except WireProtocolError as exc:
                         logger.warning("wire protocol error from %s: %s", addr, exc)
                         return
