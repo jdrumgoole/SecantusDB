@@ -1,0 +1,65 @@
+<div class="drivers">
+  <article class="driver">
+    <header>
+      <h3>pymongo</h3>
+      <span class="lang">Python</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>959</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The official MongoDB Python driver. The pymongo conformance suite is the primary gauge for SecantusDB &mdash; we run pymongo's own tests, unmodified, against an embedded SecantusDB.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-java-driver</h3>
+      <span class="lang">Java</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>8,023</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run the full <code>:bson:test</code> and unit-test subset of <code>:driver-core:test</code> through the driver's bundled gradle wrapper.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-node-driver</h3>
+      <span class="lang">Node.js</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>460</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. The import-clean unit-test subset runs cleanly against an embedded SecantusDB daemon.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-node.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-go-driver</h3>
+      <span class="lang">Go</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">99.7%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>5,676</strong> tests passed &middot; <strong>15</strong> failed</p>
+    <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here &mdash; an important second gauge.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+</div>
+
+<p class="drivers-foot">
+  Plus a <strong>cross-driver feature matrix</strong>: every shipped feature
+  (auth, change streams, custom roles, sessions, geo, bulk writes, type
+  fidelity&hellip;) is verified end-to-end through <em>all four</em> drivers
+  via dedicated smoke tests &mdash; so a wire-shape divergence that one driver
+  is permissive about gets caught by another.
+</p>

@@ -273,6 +273,103 @@ pre code { background: transparent; padding: 0; }
   line-height: 1.55;
 }
 
+/* ---- Drivers section ---- */
+
+.drivers-section { background: white; }
+
+.drivers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 24px;
+}
+.driver {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--slate-50, #f8fafc);
+  border: 1px solid var(--slate-200);
+  border-radius: 12px;
+  padding: 24px;
+  transition: border-color 0.12s, transform 0.12s;
+}
+.driver:hover {
+  border-color: var(--cyan-500);
+  transform: translateY(-2px);
+}
+.driver header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.driver h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--slate-900);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+.driver .lang {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--slate-500);
+  background: var(--slate-100, #f1f5f9);
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.driver .pass-rate {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.driver .rate {
+  font-size: 36px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--cyan-600, #0891b2);
+  line-height: 1;
+}
+.driver .rate-label {
+  font-size: 13px;
+  color: var(--slate-500);
+  letter-spacing: 0.02em;
+}
+.driver .counts {
+  margin: 0;
+  font-size: 14px;
+  color: var(--slate-700);
+}
+.driver .counts strong { color: var(--slate-900); }
+.driver .note {
+  margin: 0;
+  font-size: 14px;
+  color: var(--slate-600);
+  line-height: 1.55;
+  flex: 1;
+}
+.driver .report {
+  display: inline-block;
+  align-self: flex-start;
+  margin-top: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--cyan-600, #0891b2);
+  text-decoration: none;
+}
+.driver .report:hover { text-decoration: underline; }
+
+.drivers-foot {
+  margin: 36px auto 0;
+  max-width: 72ch;
+  text-align: center;
+  font-size: 15px;
+  color: var(--slate-600);
+  line-height: 1.6;
+}
+.drivers-foot strong { color: var(--slate-900); }
+
 /* ---- Code example block on home ---- */
 
 .code-example { background: white; }
