@@ -445,6 +445,7 @@ class Storage:
         time_func: Callable[[], float] | None = None,
         enable_oplog: bool = True,
         ttl_sweep_seconds: float = 60.0,
+        noop_heartbeat_seconds: float = 0.0,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -520,6 +521,25 @@ class Storage:
                 target=self._ttl_sweep_loop, name="secantus-ttl-sweeper", daemon=True
             )
             self._ttl_thread.start()
+
+        # Periodic noop heartbeat. Real mongod writes ``{op: "n"}``
+        # entries to the oplog every ~10s (configurable via
+        # ``periodicNoopIntervalSecs``) so cluster time advances and
+        # change-stream resume tokens minted from the oplog don't fall
+        # outside the retention window during quiet stretches. Default
+        # disabled (0) — embedded test users typically don't need it
+        # and the extra writes would noise up tight oplog assertions.
+        # Set ``noop_heartbeat_seconds=10`` (mongod default) for
+        # production-ish behaviour. ``enable_oplog=False`` short-
+        # circuits anyway, so the heartbeat is a no-op in that mode.
+        self._noop_heartbeat_seconds = float(noop_heartbeat_seconds)
+        self._noop_stop = threading.Event()
+        self._noop_thread: threading.Thread | None = None
+        if self._noop_heartbeat_seconds > 0 and self.enable_oplog:
+            self._noop_thread = threading.Thread(
+                target=self._noop_heartbeat_loop, name="secantus-noop-heartbeat", daemon=True
+            )
+            self._noop_thread.start()
 
     def _load_oplog_meta(self) -> tuple[int, int, int]:
         c = self._cursor(_OPLOG_META_TABLE)
@@ -1056,13 +1076,18 @@ class Storage:
         return out
 
     def close(self) -> None:
-        # Stop the TTL sweeper before tearing down WT — the thread
-        # acquires ``self._lock`` to call prune_ttl, so racing it
-        # against close would deadlock or use-after-close.
+        # Stop background threads before tearing down WT — both the
+        # TTL sweeper and the noop heartbeat acquire ``self._lock``,
+        # so racing them against close would deadlock or
+        # use-after-close.
         self._ttl_stop.set()
         if self._ttl_thread is not None and self._ttl_thread.is_alive():
             self._ttl_thread.join(timeout=2.0)
             self._ttl_thread = None
+        self._noop_stop.set()
+        if self._noop_thread is not None and self._noop_thread.is_alive():
+            self._noop_thread.join(timeout=2.0)
+            self._noop_thread = None
         with self._lock:
             if self._closed:
                 return
@@ -1152,6 +1177,47 @@ class Storage:
                 # Sweeper failures must not propagate — they'd kill
                 # the daemon thread and silently disable expiry.
                 log.exception("ttl sweep failed")
+
+    def emit_noop_heartbeat(self) -> int:
+        """Append one ``{op: "n"}`` heartbeat to the oplog and return its seq.
+
+        The entry shape mirrors mongod's periodic noop: ``op = "n"``,
+        an empty namespace, current cluster time, and a small
+        ``o = {msg: "periodic noop"}`` payload. Change-stream consumers
+        skip ``op: "n"`` rows in projection but still advance their
+        ``position_seq`` and ``last_token`` past them, so the resume
+        token of a quiet collection stays current.
+
+        Public so callers (admin tooling, tests that drive heartbeats
+        deterministically) can fire one explicitly.
+        """
+        with self._lock:
+            return self._emit_oplog(
+                [
+                    {
+                        "op": "n",
+                        "ns": "",
+                        "o": {"msg": "periodic noop"},
+                    }
+                ]
+            )
+
+    def _noop_heartbeat_loop(self) -> None:
+        """Background heartbeat: emit one ``{op: "n"}`` oplog entry every
+        ``noop_heartbeat_seconds``. Stops when ``_noop_stop`` is set
+        or the storage is closed. Failures are logged and swallowed —
+        a transient WT error must not kill the daemon thread.
+        """
+        import logging
+
+        log = logging.getLogger("secantus.storage.noop")
+        while not self._noop_stop.wait(self._noop_heartbeat_seconds):
+            if self._closed:
+                return
+            try:
+                self.emit_noop_heartbeat()
+            except Exception:
+                log.exception("noop heartbeat failed")
 
     def _reset_thread_session(self) -> None:
         """Close the calling thread's cached WT session + cursors so

@@ -205,6 +205,12 @@ def project(
     wall = oplog_entry.get("wall")
     if not isinstance(ts, Timestamp):
         return None, False
+    # Periodic noop heartbeats (``op: "n"``) advance cluster time
+    # without surfacing as user events. Skip the projection — the
+    # caller still bumps ``position_seq`` past them, so resume tokens
+    # on quiet collections track the heartbeat clock.
+    if op == "n":
+        return None, False
     if op in {"i", "u", "d"}:
         if not _scope_matches(ns, scope):
             return None, False
