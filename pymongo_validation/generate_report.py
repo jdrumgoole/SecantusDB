@@ -55,8 +55,16 @@ def render(raw: dict, out_path: Path) -> None:
     for test in raw.get("tests", []):
         cat = _category_for(test["nodeid"])
         outcome = test.get("outcome", "unknown")
+        # ``pytest-subtests`` reports the parent test with outcome
+        # ``"subtests passed"`` when its subtests all succeed (the
+        # individual subtests don't appear as separate rows in the
+        # JSON report). Treat that as a regular pass — historically
+        # we bucketed it as ``errored`` via the dict's default branch,
+        # which inflated the error count and made the gauge look
+        # worse than reality.
         bucket = {
             "passed": "passed",
+            "subtests passed": "passed",
             "failed": "failed",
             "skipped": "skipped",
             "error": "errored",
