@@ -44,6 +44,18 @@ def _db_from_namespace(ns: str) -> str:
     return db or "admin"
 
 
+# Default per-connection idle timeout. A client that connects and
+# sends nothing (or stalls mid-message) gets disconnected after this
+# many seconds. Without it, a hostile peer can pin a thread forever
+# by holding the socket open and not writing.
+DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
+
+# Default cap on simultaneous client connections. Each connection runs
+# its own dedicated thread; without a cap a TCP-flood DoS exhausts the
+# Python thread pool.
+DEFAULT_MAX_CONNECTIONS = 1000
+
+
 class SecantusDBServer:
     def __init__(
         self,
@@ -53,14 +65,23 @@ class SecantusDBServer:
         *,
         replica_set_name: str | None = "secantus",
         require_auth: bool = False,
+        client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
     ) -> None:
         self.host = host
         self.port = port
         self.replica_set_name = replica_set_name
         self.require_auth = require_auth
+        self.client_idle_timeout_s = client_idle_timeout_s
+        self.max_connections = max_connections
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Active connection counter — incremented in _handle_client,
+        # decremented on its way out. Read by _serve_forever to enforce
+        # max_connections.
+        self._active_conns = 0
+        self._active_conns_lock = threading.Lock()
         # Oplog writes are only useful when change-stream clients can
         # connect, which requires replica-set advertisement in `hello`.
         # Skip them in pure-standalone mode to drop a per-write BSON
@@ -127,6 +148,29 @@ class SecantusDBServer:
                 conn, addr = self._socket.accept()
             except OSError:
                 return
+            # Refuse new connections beyond the cap. A flood-DoS attacker
+            # would otherwise spawn a thread per accepted socket. We close
+            # the socket immediately rather than queuing — clients should
+            # see "connection refused" / EOF, not block.
+            with self._active_conns_lock:
+                if self._active_conns >= self.max_connections:
+                    overflowed = True
+                else:
+                    self._active_conns += 1
+                    overflowed = False
+            if overflowed:
+                logger.warning(
+                    "rejecting connection from %s: %d active >= %d cap",
+                    addr, self._active_conns, self.max_connections,
+                )
+                with contextlib.suppress(OSError):
+                    conn.close()
+                continue
+            # Set an idle timeout on the socket so a hostile or stuck
+            # peer can't pin a thread forever. Applies to all socket
+            # reads in _handle_client.
+            with contextlib.suppress(OSError):
+                conn.settimeout(self.client_idle_timeout_s)
             handler = threading.Thread(
                 target=self._handle_client,
                 args=(conn, addr),
@@ -149,6 +193,11 @@ class SecantusDBServer:
                     try:
                         message = read_message(conn)
                     except ConnectionClosed:
+                        return
+                    except TimeoutError:
+                        # Idle timeout fired — drop the connection so the
+                        # thread can be reaped instead of pinned forever.
+                        logger.debug("client %d idle timeout, closing", connection_id)
                         return
                     except WireProtocolError as exc:
                         logger.warning("wire protocol error from %s: %s", addr, exc)
@@ -221,6 +270,8 @@ class SecantusDBServer:
         finally:
             self.metrics.connection_closed()
             self.connections.close(connection_id)
+            with self._active_conns_lock:
+                self._active_conns -= 1
             logger.debug("client %d disconnected", connection_id)
 
     def __enter__(self) -> Self:

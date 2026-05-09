@@ -649,6 +649,22 @@ class Storage:
         with self._lock:
             return self._next_seq - 1
 
+    def oplog_tail_seq_nolock(self) -> int:
+        """Highest seq read without acquiring ``self._lock``.
+
+        Safe for use **only** as the wake predicate for a tailable
+        ``getMore`` waiting on ``self._oplog_cv``: lock order in the
+        write path is ``_lock`` -> ``_oplog_cv``, so a waiter that
+        already holds ``_oplog_cv`` (which is what ``cv.wait_for``
+        does) MUST NOT then take ``_lock`` -- that's an ABBA deadlock
+        with any concurrent writer. Reading ``_next_seq`` directly is
+        safe because (a) ``int`` reads are atomic under the GIL and
+        (b) the cv is also notified on every commit, so any momentary
+        stale read self-corrects on the next iteration of the
+        ``wait_for`` predicate.
+        """
+        return self._next_seq - 1
+
     def oplog_floor_seq(self) -> int:
         """Smallest seq currently present after pruning. 0 if empty.
 
@@ -843,7 +859,26 @@ class Storage:
             with contextlib.suppress(Exception):
                 self._conn.close()
             if self._tempdir is not None:
-                shutil.rmtree(self._tempdir, ignore_errors=True)
+                # Don't follow symlinks during cleanup. A local attacker
+                # racing the mkdtemp could replace `_tempdir` with a
+                # symlink to elsewhere on the filesystem before close()
+                # fires — `shutil.rmtree(symlink, ignore_errors=True)`
+                # would then delete the symlink target. The mkdtemp
+                # already creates with mode 0700 (owner-only), but the
+                # parent /tmp is world-writable, so this is the
+                # belt-and-braces guard. Failures during cleanup are
+                # logged but not raised — close() must remain idempotent.
+                try:
+                    if not os.path.islink(self._tempdir):
+                        shutil.rmtree(self._tempdir)
+                except OSError:
+                    # Best-effort: log via warnings rather than crash close().
+                    import warnings as _warn
+                    _warn.warn(
+                        f"failed to remove WiredTiger tempdir {self._tempdir!r}",
+                        ResourceWarning,
+                        stacklevel=2,
+                    )
                 self._tempdir = None
 
     def checkpoint(self) -> None:

@@ -5,12 +5,14 @@ import pytest
 from secantus.cursors import CursorNotFound, CursorRegistry
 
 
-def test_register_returns_unique_increasing_ids() -> None:
+def test_register_returns_unique_ids() -> None:
     reg = CursorRegistry()
+    # IDs are random 63-bit ints, not sequential — ordering is not
+    # guaranteed (and was previously a guessability hazard).
     a = reg.register("db.c", [{"x": 1}])
     b = reg.register("db.c", [{"x": 2}])
     assert a != b
-    assert b > a
+    assert a > 0 and b > 0
 
 
 def test_next_batch_returns_chunks_then_exhausts() -> None:
