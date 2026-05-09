@@ -38,6 +38,7 @@ docs/_build/
 # node_modules is local to the workdir and downloaded on first run.
 # package-lock.json IS committed for reproducibility.
 tests/cross_driver/node/node_modules/
+tests/cross_driver/node/.node_modules.lock
 
 # Gradle wrapper / cache state for the Java cross-driver smokes is
 # rebuilt from build.gradle.kts on first run; the uber-jar in build/
