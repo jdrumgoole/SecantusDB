@@ -11,8 +11,7 @@ Each item should have enough context for a future session to pick it up cold: wh
 These commands accept the request and return a wire-valid response, but the response is fabricated — they do no real work.
 
 - ~~`getLog`~~ — real now. Backed by `secantus.logbuf.LogBuffer` (5000-line ring buffer) on `SecantusDBServer.logs`. The accept loop logs connect events; expand to other log sites as needed.
-- [ ] **`startSession`** / **`endSessions`** / **`refreshSessions`** — `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced.
-- [ ] **`abortTransaction`** / **`commitTransaction`** — return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod`.
+- [ ] **`abortTransaction`** / **`commitTransaction`** — return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod`. (Logical sessions ARE tracked end-to-end via ``secantus.sessions.SessionRegistry``; transactions are the next layer up that doesn't yet correlate with session state.)
 
 ## 2. Stopgaps (functional but with significant limitations)
 
@@ -27,7 +26,7 @@ These work end-to-end but cut corners.
 Specific items that were left out of the slice that introduced their feature area.
 
 - [ ] **More aggregation expressions**: `$mergeAll`, `$function` (JS — also out of scope).
-- [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for numeric ranges (`bounds: "full"` / `[min, max]`, `partitionByFields`); date densify (`unit: "day" | "hour" | ...`) is deferred — needs date-arithmetic step iteration that isn't a one-line addition.
+- [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for both numeric ranges and date ranges with fixed-duration units (`week` / `day` / `hour` / `minute` / `second` / `millisecond`); the variable-length units (`month` / `quarter` / `year`) are rejected with a clear error — supporting them needs `relativedelta`-style arithmetic which isn't worth a new dependency yet.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
 
 ### Authentication

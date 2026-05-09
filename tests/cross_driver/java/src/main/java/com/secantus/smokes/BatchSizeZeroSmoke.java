@@ -45,7 +45,7 @@ public final class BatchSizeZeroSmoke {
 
         MongoClientSettings settings = MongoClientSettings.builder()
             .applyConnectionString(new ConnectionString(uri))
-            .applyToClusterSettings(b -> b.serverSelectionTimeout(5, TimeUnit.SECONDS))
+            .applyToClusterSettings(b -> b.serverSelectionTimeout(30, TimeUnit.SECONDS))
             .addCommandListener(listener)
             .build();
 

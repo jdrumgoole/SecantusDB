@@ -302,6 +302,7 @@ def test_rbac_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_rbac_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -400,6 +401,7 @@ def test_ddl_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_ddl_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -525,6 +527,7 @@ def test_updateuser_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> N
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_updateuser_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -623,6 +626,7 @@ def test_connstatus_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> N
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_connstatus_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -735,6 +739,7 @@ def test_types_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_types_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -846,6 +851,7 @@ def test_bulk_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_bulk_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -977,6 +983,7 @@ def test_cs_resume_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_cs_resume_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -1065,6 +1072,7 @@ def test_listdb_filter_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_listdb_filter_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -1154,6 +1162,7 @@ def test_batchsize_zero_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_batchsize_zero_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -1262,6 +1271,7 @@ def test_drop_all_users_smoke_via_go_driver(server_with_auth: SecantusDBServer) 
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_drop_all_users_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -1363,6 +1373,7 @@ def test_scram_sha1_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> N
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_scram_sha1_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -1457,6 +1468,7 @@ def test_pbrt_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_pbrt_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -1546,6 +1558,7 @@ def test_tailable_smoke_via_go_driver(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_tailable_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
@@ -1713,6 +1726,7 @@ def test_custom_roles_smoke_via_go_driver(server_with_auth: SecantusDBServer) ->
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_custom_roles_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")

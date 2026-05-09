@@ -229,6 +229,7 @@ def _ensure_java_smokes_jar() -> bool:
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
 def test_geo_smoke_via_java_driver(server: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")

@@ -68,7 +68,7 @@ public final class UpdateUserSmoke {
         MongoClientSettings settings = MongoClientSettings.builder()
             .applyConnectionString(new ConnectionString(uri))
             .credential(credential)
-            .applyToClusterSettings(b -> b.serverSelectionTimeout(3,
+            .applyToClusterSettings(b -> b.serverSelectionTimeout(30,
                 java.util.concurrent.TimeUnit.SECONDS))
             .build();
         return MongoClients.create(settings);
