@@ -118,8 +118,25 @@ def _ensure_node_modules() -> bool:
         return result.returncode == 0 and (nm / "mongodb").is_dir()
 
 
+def _java_smokes_jar_is_fresh() -> bool:
+    """True if the cached uber-jar exists AND is newer than every
+    ``.java`` source under ``tests/cross_driver/java/src/``.
+
+    A stale jar is the trap: existence alone isn't enough because
+    adding a new smoke source without rebuilding leaves the file in
+    place but missing the new class, so ``java -cp <jar> <FQN>``
+    fails with ``ClassNotFoundException`` on a class whose source
+    the developer just wrote.
+    """
+    if not _JAVA_SMOKES_JAR.is_file():
+        return False
+    jar_mtime = _JAVA_SMOKES_JAR.stat().st_mtime
+    src_root = _JAVA_SMOKE_DIR / "src"
+    return all(path.stat().st_mtime <= jar_mtime for path in src_root.rglob("*.java"))
+
+
 def _ensure_java_smokes_jar() -> bool:
-    """Build the Java smokes uber-jar once; cached in build/ for re-runs.
+    """Build the Java smokes uber-jar; cached in build/ for re-runs.
 
     Under pytest-xdist parallel workers, multiple workers will hit
     this helper simultaneously on a fresh checkout. We serialise the
@@ -130,11 +147,16 @@ def _ensure_java_smokes_jar() -> bool:
     with ``ClassNotFoundException`` on a class the source clearly
     defines.
 
+    Freshness check: the jar is also rebuilt when any ``.java`` source
+    under ``src/`` is newer than the jar. Without this, adding a new
+    smoke source in a slice would silently fail with
+    ``ClassNotFoundException`` on the not-yet-rebuilt class.
+
     Skipping conditions: ``java`` or ``gradle`` not on PATH, or the
     Gradle build itself fails. Returns True only when the jar is on
-    disk and runnable by ``java -cp <jar> <FQN>``.
+    disk, fresh, and runnable by ``java -cp <jar> <FQN>``.
     """
-    if _JAVA_SMOKES_JAR.is_file():
+    if _java_smokes_jar_is_fresh():
         return True
     if _GRADLE is None or _JAVA is None:
         return False
@@ -146,7 +168,7 @@ def _ensure_java_smokes_jar() -> bool:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
         # Re-check after acquiring the lock — a sibling worker may
         # have built it while we were blocked.
-        if _JAVA_SMOKES_JAR.is_file():
+        if _java_smokes_jar_is_fresh():
             return True
         # Gradle 9.5 needs a JDK >= 17 toolchain; macOS dev boxes
         # usually have multiple JDKs and Gradle's default scan picks

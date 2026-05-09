@@ -210,16 +210,31 @@ _JAVA_SMOKE_DIR = _CROSS_DRIVER / "java"
 _JAVA_SMOKES_JAR = _JAVA_SMOKE_DIR / "build" / "libs" / "secantus-java-smokes-all.jar"
 
 
+def _java_smokes_jar_is_fresh() -> bool:
+    """True if the cached uber-jar exists AND is newer than every
+    ``.java`` source under ``tests/cross_driver/java/src/``. Stale
+    detection — see the matching helper in
+    ``test_cross_driver_features.py`` for the full rationale.
+    """
+    if not _JAVA_SMOKES_JAR.is_file():
+        return False
+    jar_mtime = _JAVA_SMOKES_JAR.stat().st_mtime
+    src_root = _JAVA_SMOKE_DIR / "src"
+    return all(path.stat().st_mtime <= jar_mtime for path in src_root.rglob("*.java"))
+
+
 def _ensure_java_smokes_jar() -> bool:
-    """Build the Java smokes uber-jar if not present.
+    """Build the Java smokes uber-jar if not present or stale.
 
     The jar is shared with ``tests/test_cross_driver_features.py`` —
     whichever test runs first incurs the build cost; the rest reuse it.
     The flock guards against parallel xdist workers racing on the
-    Gradle build (see the matching helper in
-    ``test_cross_driver_features.py`` for the full rationale).
+    Gradle build, and the mtime check rebuilds when any ``.java``
+    source has been touched since the cached jar was written (see the
+    matching helper in ``test_cross_driver_features.py`` for the full
+    rationale).
     """
-    if _JAVA_SMOKES_JAR.is_file():
+    if _java_smokes_jar_is_fresh():
         return True
     if _GRADLE is None or _JAVA is None:
         return False
@@ -229,7 +244,7 @@ def _ensure_java_smokes_jar() -> bool:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock_fp:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
-        if _JAVA_SMOKES_JAR.is_file():
+        if _java_smokes_jar_is_fresh():
             return True
         result = _run(
             [_GRADLE, "smokesJar", "--no-daemon", "-q"],
