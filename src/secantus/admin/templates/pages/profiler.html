@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <span>Database</span>
+  <span class="sep">/</span>
+  <form method="get" action="/profiler" class="inline-form">
+    <input type="text" name="db" value="{{ db_name }}" class="confirm-input inline-db-input" autocomplete="off" />
+    <button type="submit">Switch</button>
+  </form>
+</nav>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<form
+  class="filter-form"
+  method="post"
+  action="/profiler?db={{ db_name }}"
+>
+  <div class="filter-controls">
+    <label>
+      Level
+      <select name="level">
+        <option value="0" {% if state.level == 0 %}selected{% endif %}>0 — off</option>
+        <option value="1" {% if state.level == 1 %}selected{% endif %}>1 — slow ops only</option>
+        <option value="2" {% if state.level == 2 %}selected{% endif %}>2 — every op</option>
+      </select>
+    </label>
+    <label>
+      slowms (ms)
+      <input type="number" name="slowms" min="0" value="{{ state.slowms }}" />
+    </label>
+    <label>
+      sampleRate
+      <input type="number" name="sample_rate" step="0.01" min="0" max="1" value="{{ state.sampleRate }}" />
+    </label>
+  </div>
+  <div class="modal-actions">
+    <button type="submit">Apply</button>
+  </div>
+</form>
+
+<h2 class="section-title">
+  Recent entries
+  <span class="modal-meta">— most recent 50 from <code>{{ db_name }}.system.profile</code></span>
+</h2>
+
+{% if rows %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>ts</th>
+        <th>op</th>
+        <th>ns</th>
+        <th class="num">millis</th>
+        <th>user</th>
+        <th>ok</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+        <tr>
+          <td><code>{{ r.ts }}</code></td>
+          <td><span class="badge">{{ r.op }}</span></td>
+          <td><code>{{ r.ns }}</code></td>
+          <td class="num">{{ r.millis }}</td>
+          <td>{% if r.user %}<code>{{ r.user }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+          <td>{% if r.ok == 1.0 %}<span class="badge">ok</span>{% else %}<span class="badge" style="border-color: var(--error); color: var(--error)">err</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <td colspan="6"><pre class="doc-body">{{ r.json }}</pre></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">
+    {% if state.level == 0 %}
+      Profiling is off; no entries to show. Set the level to 1 or 2 above to start recording.
+    {% else %}
+      No entries yet. Run an operation against this database to see one appear here.
+    {% endif %}
+  </p>
+{% endif %}
+{% endblock %}

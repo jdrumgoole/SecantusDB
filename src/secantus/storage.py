@@ -128,6 +128,7 @@ _PREIMAGE_TABLE = "table:secantus_preimages"
 _OPLOG_META_TABLE = "table:secantus_oplog_meta"
 _USERS_TABLE = "table:secantus_users"
 _ROLES_TABLE = "table:secantus_roles"
+_PROFILE_TABLE = "table:secantus_profile_settings"
 
 _OPLOG_PRUNE_INTERVAL = 1000  # call prune_oplog every N emits
 
@@ -494,6 +495,7 @@ class Storage:
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
             boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
             boot.create(_ROLES_TABLE, "key_format=SS,value_format=u")
+            boot.create(_PROFILE_TABLE, "key_format=S,value_format=u")
         finally:
             boot.close()
 
@@ -986,6 +988,69 @@ class Storage:
                     seen += 1
                 rc = c.next()
         return out
+
+    # ------------------------------------------------------------------
+    # Per-database profiling settings.
+    #
+    # Real mongod tracks (level, slowms, sampleRate) per database in
+    # memory + persists to the database's metadata. We persist in a
+    # dedicated WT table keyed by db name. The dispatch path reads
+    # these settings on every command — keep ``get_profile`` fast.
+    # ------------------------------------------------------------------
+
+    def get_profile(self, db: str) -> dict[str, Any]:
+        """Return the active profile settings for ``db``, defaults if unset.
+
+        Defaults match mongod: level 0 (off), slowms 100, sampleRate 1.0.
+        """
+        with self._lock:
+            c = self._cursor(_PROFILE_TABLE)
+            c.set_key(db)
+            if c.search() != 0:
+                return {"level": 0, "slowms": 100, "sampleRate": 1.0}
+            blob = bytes(c.get_value())
+            if not blob:
+                return {"level": 0, "slowms": 100, "sampleRate": 1.0}
+            doc = bson.decode(blob)
+            # ``or default`` is wrong here — slowms=0 / sampleRate=0.0 are
+            # legitimate values that must round-trip, not be replaced
+            # with defaults. Use direct ``.get`` with the default and
+            # coerce only when a value is actually present.
+            level_v = doc.get("level", 0)
+            slowms_v = doc.get("slowms", 100)
+            rate_v = doc.get("sampleRate", 1.0)
+            return {
+                "level": int(level_v) if level_v is not None else 0,
+                "slowms": int(slowms_v) if slowms_v is not None else 100,
+                "sampleRate": float(rate_v) if rate_v is not None else 1.0,
+            }
+
+    def set_profile(
+        self,
+        db: str,
+        *,
+        level: int,
+        slowms: int = 100,
+        sample_rate: float = 1.0,
+    ) -> None:
+        """Persist profile settings for ``db``."""
+        if level not in (0, 1, 2):
+            raise ValueError("level must be 0, 1, or 2")
+        if slowms < 0:
+            raise ValueError("slowms must be non-negative")
+        if not (0.0 <= sample_rate <= 1.0):
+            raise ValueError("sampleRate must be in [0, 1]")
+        doc = {"level": int(level), "slowms": int(slowms), "sampleRate": float(sample_rate)}
+        with self._lock:
+            c = self._cursor(_PROFILE_TABLE)
+            c[db] = bson.encode(doc)
+
+    def ensure_profile_collection(self, db: str, *, size_bytes: int = 10 * 1024 * 1024) -> None:
+        """Ensure ``<db>.system.profile`` exists as a 10 MB-default capped collection."""
+        if self.collection_exists(db, "system.profile"):
+            return
+        self.create_collection(db, "system.profile")
+        self.set_collection_options(db, "system.profile", capped=True, size=int(size_bytes))
 
     # ------------------------------------------------------------------
     # Custom roles. Storage layer is a thin BSON-blob CRUD; the commands

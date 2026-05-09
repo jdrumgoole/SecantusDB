@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import random as _random
+import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -43,6 +45,7 @@ from secantus.rbac import (
     A_DROP_ROLE,
     A_DROP_USER,
     A_FIND,
+    A_ENABLE_PROFILER,
     A_FSYNC,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
@@ -409,6 +412,56 @@ def _fsync(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     ctx.storage.checkpoint()
     return {"numFiles": 1, "ok": 1.0}
+
+
+def _profile(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Get / set per-database profiling level (mongod ``profile`` shape).
+
+    ``{profile: -1}`` reads the current state. ``{profile: 0|1|2,
+    slowms: N, sampleRate: F}`` updates it. Returns the previous values
+    under ``was`` / ``slowms`` / ``sampleRate`` so monitoring scripts
+    can confirm the change.
+    """
+    db = ctx.db_name or "admin"
+    arg = doc.get("profile")
+    prev = ctx.storage.get_profile(db)
+
+    if arg == -1:
+        return {
+            "was": prev["level"],
+            "slowms": prev["slowms"],
+            "sampleRate": prev["sampleRate"],
+            "ok": 1.0,
+        }
+    if not isinstance(arg, int) or arg not in (0, 1, 2):
+        return {
+            "ok": 0.0,
+            "errmsg": "profile must be -1, 0, 1, or 2",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    new_slowms = doc.get("slowms", prev["slowms"])
+    new_sample_rate = doc.get("sampleRate", prev["sampleRate"])
+    try:
+        ctx.storage.set_profile(
+            db,
+            level=int(arg),
+            slowms=int(new_slowms),
+            sample_rate=float(new_sample_rate),
+        )
+    except ValueError as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    return {
+        "was": prev["level"],
+        "slowms": prev["slowms"],
+        "sampleRate": prev["sampleRate"],
+        "ok": 1.0,
+    }
 
 
 def _get_log(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -2786,6 +2839,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "hostInfo": _hostinfo,
     "currentOp": _current_op,
     "fsync": _fsync,
+    "profile": _profile,
     "explain": _explain,
     "serverStatus": _server_status,
     "getCmdLineOpts": _get_cmd_line_opts,
@@ -2931,6 +2985,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "getLog": (A_GET_LOG, SCOPE_CLUSTER),
     "currentOp": (A_INPROG, SCOPE_CLUSTER),
     "fsync": (A_FSYNC, SCOPE_CLUSTER),
+    "profile": (A_ENABLE_PROFILER, SCOPE_DATABASE),
 }
 
 
@@ -2997,6 +3052,147 @@ def _resource_for_command(
 
 def command_name(doc: dict[str, Any]) -> str:
     return next(iter(doc), "")
+
+
+# Commands the profiler skips. Handshake / session admin / cursor
+# continuation / profile-itself produce noise out of proportion to their
+# value. ``getLog`` would otherwise be self-amplifying as the dashboard
+# polls it. Mongod skips a similar set.
+_PROFILE_SKIP_COMMANDS = frozenset(
+    {
+        "hello",
+        "isMaster",
+        "ismaster",
+        "ping",
+        "buildInfo",
+        "buildinfo",
+        "whatsmyuri",
+        "saslStart",
+        "saslContinue",
+        "logout",
+        "connectionStatus",
+        "startSession",
+        "endSessions",
+        "refreshSessions",
+        "getMore",
+        "killCursors",
+        "profile",
+    }
+)
+
+
+_PROFILE_OP_BUCKET: dict[str, str] = {
+    "find": "query",
+    "count": "query",
+    "distinct": "query",
+    "aggregate": "command",
+    "insert": "insert",
+    "update": "update",
+    "delete": "remove",
+    "findAndModify": "command",
+    "findandmodify": "command",
+}
+
+
+def _profile_eligible_command(name: str, doc: dict[str, Any]) -> bool:
+    """Return ``True`` if dispatch should time + maybe record this command."""
+    if name in _PROFILE_SKIP_COMMANDS:
+        return False
+    # Recursion guard: any op against ``system.profile`` (write or read)
+    # would itself produce a profile entry and recurse. Reads of the
+    # profile collection in particular would otherwise cause writes that
+    # show up on the next read, growing without bound until the user
+    # spots it.
+    coll = doc.get(name)
+    if isinstance(coll, str) and coll == "system.profile":
+        return False
+    return True
+
+
+def _profile_op_label(name: str) -> str:
+    return _PROFILE_OP_BUCKET.get(name, "command")
+
+
+def _profile_command_namespace(name: str, doc: dict[str, Any], db: str) -> str:
+    """Best-effort ``ns`` field for a profile entry. ``db.coll`` or just ``db``."""
+    coll_arg = doc.get(name)
+    if isinstance(coll_arg, str) and coll_arg:
+        return f"{db}.{coll_arg}"
+    return db
+
+
+def _profile_sanitize_command(doc: dict[str, Any]) -> dict[str, Any]:
+    """Drop framing fields that aren't useful in a profile entry."""
+    out = dict(doc)
+    for key in ("$db", "$clusterTime", "lsid", "$readPreference"):
+        out.pop(key, None)
+    return out
+
+
+def _maybe_record_profile(
+    ctx: CommandContext,
+    name: str,
+    doc: dict[str, Any],
+    result: dict[str, Any],
+    start_ns: int,
+) -> None:
+    """Persist a ``system.profile`` entry if the per-DB level requires it.
+
+    Errors during profile-write are swallowed: the user's command has
+    already produced its result, and a profile-write failure shouldn't
+    bleed into the response. Logged at WARNING for diagnosability.
+    """
+    db = ctx.db_name or "admin"
+    try:
+        settings = ctx.storage.get_profile(db)
+    except Exception:
+        return
+    level = int(settings.get("level") or 0)
+    if level == 0:
+        return
+    duration_ms = max(0, (_time.monotonic_ns() - start_ns) // 1_000_000)
+    # ``settings.get(...) or default`` would replace legitimate zero
+    # values with the default. Use the explicit-default form instead.
+    slowms_raw = settings.get("slowms", 100)
+    slowms = int(slowms_raw) if slowms_raw is not None else 100
+    if level == 1 and duration_ms < slowms:
+        return
+    rate_raw = settings.get("sampleRate", 1.0)
+    sample_rate = float(rate_raw) if rate_raw is not None else 1.0
+    if sample_rate < 1.0 and _random.random() > sample_rate:
+        return
+    try:
+        ctx.storage.ensure_profile_collection(db)
+        client_addr = ""
+        if ctx.connections is not None:
+            for info in ctx.connections.snapshot():
+                if info.conn_id == ctx.connection_id:
+                    client_addr = f"{info.peer_addr[0]}:{info.peer_addr[1]}"
+                    break
+        user = None
+        if ctx.connection_auth is not None and ctx.connection_auth.is_authenticated:
+            principals = ctx.connection_auth.authenticated_principals
+            if principals:
+                u, d = principals[0]
+                user = f"{u}@{d}"
+        entry = {
+            "ts": _dt.datetime.now(_dt.timezone.utc),
+            "op": _profile_op_label(name),
+            "ns": _profile_command_namespace(name, doc, db),
+            "command": _profile_sanitize_command(doc),
+            "millis": int(duration_ms),
+            "ok": 1.0 if result.get("ok") == 1.0 else 0.0,
+            "client": client_addr,
+        }
+        if user is not None:
+            entry["user"] = user
+        if result.get("ok") != 1.0 and "errmsg" in result:
+            entry["errMsg"] = str(result["errmsg"])
+            if "code" in result:
+                entry["errCode"] = int(result["code"])
+        ctx.storage.insert(db, "system.profile", [entry])
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("profile-write failed for %s: %s", db, exc)
 
 
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -3070,12 +3266,14 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     "code": 13,
                     "codeName": "Unauthorized",
                 }
+    profile_eligible = _profile_eligible_command(name, doc)
+    start_ns = _time.monotonic_ns() if profile_eligible else 0
     try:
-        return handler(doc, ctx)
+        result = handler(doc, ctx)
     except _USER_FACING_EXCEPTIONS as exc:
         # Validation-class errors: messages are deliberately shaped to
         # match mongod, drivers parse them. Surface verbatim.
-        return {
+        result = {
             "ok": 0.0,
             "errmsg": str(exc),
             "code": 14,
@@ -3093,9 +3291,12 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             ctx.connection_id,
             ctx.db_name,
         )
-        return {
+        result = {
             "ok": 0.0,
             "errmsg": "internal server error",
             "code": 1,
             "codeName": "InternalError",
         }
+    if profile_eligible:
+        _maybe_record_profile(ctx, name, doc, result, start_ns)
+    return result
