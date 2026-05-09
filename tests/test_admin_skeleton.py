@@ -1034,3 +1034,58 @@ async def test_kill_cursor_requires_ns(http: AsyncClient) -> None:
         headers={HEADER_NAME: "testtoken"},
     )
     assert r.status_code == 400
+
+
+# ---- /profiler (Slice 9) ---------------------------------------------------
+
+
+async def test_profiler_page_default_state(http: AsyncClient) -> None:
+    r = await http.get("/profiler", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    # Off by default.
+    assert "0 — off" in r.text
+    # Defaults pre-filled.
+    assert 'value="100"' in r.text
+
+
+async def test_profiler_post_changes_state(http: AsyncClient) -> None:
+    r = await http.post(
+        "/profiler?db=app",
+        data={"level": "2", "slowms": "75", "sample_rate": "0.5"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code in (200, 303)
+    r2 = await http.get("/profiler?db=app", headers={HEADER_NAME: "testtoken"})
+    assert r2.status_code == 200
+    # Level 2 selected.
+    assert 'value="2" selected' in r2.text
+    assert 'value="75"' in r2.text
+
+
+async def test_profiler_lists_entries_after_op(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        # Arm level 2 then do an op so system.profile has at least one entry.
+        mc["entries_db"].command("profile", 2)
+        mc["entries_db"]["c"].insert_one({"_id": 1, "x": 1})
+    finally:
+        mc.close()
+
+    r = await http.get(
+        "/profiler?db=entries_db", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    # The insert op shows up.
+    assert "insert" in r.text
+    assert "entries_db.c" in r.text
+
+
+async def test_profiler_post_invalid_level_400(http: AsyncClient) -> None:
+    r = await http.post(
+        "/profiler?db=app",
+        data={"level": "3", "slowms": "100", "sample_rate": "1.0"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400

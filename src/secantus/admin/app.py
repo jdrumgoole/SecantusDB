@@ -36,6 +36,7 @@ from secantus.admin.routers import (
     health,
     indexes,
     metrics,
+    profiler,
     users,
 )
 from secantus.admin.sampler import Hub, Sampler
@@ -115,6 +116,7 @@ def create_app(
     app.include_router(changestream.router)
     app.include_router(console.router)
     app.include_router(connections.router)
+    app.include_router(profiler.router)
 
     return app
 

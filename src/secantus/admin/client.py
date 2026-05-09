@@ -447,6 +447,40 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(str(exc)) from exc
 
+    # ---- profiler -------------------------------------------------------
+
+    def get_profile(self, db: str) -> dict[str, Any]:
+        """Return the current profile state for ``db``."""
+        try:
+            out = self._get_client()[db].command("profile", -1)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+        return {
+            "level": int(out.get("was", 0) or 0),
+            "slowms": int(out.get("slowms", 100) or 100),
+            "sampleRate": float(out.get("sampleRate", 1.0) or 1.0),
+        }
+
+    def set_profile(
+        self,
+        db: str,
+        *,
+        level: int,
+        slowms: int = 100,
+        sample_rate: float = 1.0,
+    ) -> None:
+        """Update profile state for ``db``."""
+        try:
+            self._get_client()[db].command(
+                "profile", int(level), slowms=int(slowms), sampleRate=float(sample_rate)
+            )
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
     # ---- currentOp + cursor management ----------------------------------
 
     def current_op(self) -> list[dict[str, Any]]:

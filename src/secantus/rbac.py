@@ -109,6 +109,7 @@ A_GET_CMD_LINE_OPTS = "getCmdLineOpts"
 A_GET_LOG = "getLog"
 A_INPROG = "inprog"
 A_FSYNC = "fsync"
+A_ENABLE_PROFILER = "enableProfiler"
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +173,10 @@ _DBADMIN_ACTIONS: frozenset[str] = frozenset(
         A_RENAME_COLL_SAME_DB,
         A_COLL_MOD,
         A_VIEW_ROLE,
+        # ``profile`` enables per-database profiling and reads
+        # ``system.profile``. Real mongod groups the privilege under
+        # dbAdmin.
+        A_ENABLE_PROFILER,
     }
 )
 
