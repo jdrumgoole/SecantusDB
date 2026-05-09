@@ -1089,3 +1089,103 @@ async def test_profiler_post_invalid_level_400(http: AsyncClient) -> None:
         headers={HEADER_NAME: "testtoken"},
     )
     assert r.status_code == 400
+
+
+# ---- /maintenance (Slice 10) ------------------------------------------------
+
+
+async def test_maintenance_page_renders(http: AsyncClient) -> None:
+    r = await http.get("/maintenance", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    for label in ("Force checkpoint", "Prune oplog", "Prune TTL", "Danger zone"):
+        assert label in r.text
+
+
+async def test_maintenance_fsync_runs_and_flashes(http: AsyncClient) -> None:
+    r = await http.post(
+        "/maintenance/fsync", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    assert "fsync ok" in r.text
+
+
+async def test_maintenance_prune_oplog_returns_count(http: AsyncClient) -> None:
+    r = await http.post(
+        "/maintenance/prune-oplog", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    assert "pruned" in r.text and "oplog row" in r.text
+
+
+async def test_maintenance_prune_ttl_returns_count(http: AsyncClient) -> None:
+    r = await http.post(
+        "/maintenance/prune-ttl", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    assert "TTL doc" in r.text
+
+
+async def test_maintenance_drop_db_modal_typed_check(http: AsyncClient) -> None:
+    r = await http.get(
+        "/maintenance/drop-database/myapp/confirm",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "Type the database name" in r.text
+    assert "myapp" in r.text
+
+
+async def test_maintenance_drop_db_actually_drops(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["killme"]["c"].insert_one({"_id": 1})
+        assert "killme" in mc.list_database_names()
+    finally:
+        mc.close()
+
+    r = await http.post(
+        "/maintenance/drop-database",
+        data={"db": "killme"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "dropped database killme" in r.text
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        assert "killme" not in mc.list_database_names()
+    finally:
+        mc.close()
+
+
+async def test_maintenance_drop_coll_actually_drops(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["dcdb"]["go"].insert_one({"_id": 1})
+        mc["dcdb"]["stay"].insert_one({"_id": 1})
+    finally:
+        mc.close()
+
+    r = await http.post(
+        "/maintenance/drop-collection",
+        data={"db": "dcdb", "coll": "go"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "dropped collection dcdb.go" in r.text
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        names = set(mc["dcdb"].list_collection_names())
+        assert "go" not in names
+        assert "stay" in names
+    finally:
+        mc.close()

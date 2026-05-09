@@ -888,3 +888,19 @@ body {
 .history-payload {
   display: none;  /* Server-rendered, used by JS in the future */
 }
+
+/* Flash banner shown after a maintenance action */
+
+.flash {
+  padding: 0.6rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.flash-ok {
+  border-color: var(--accent);
+  color: var(--accent);
+}
