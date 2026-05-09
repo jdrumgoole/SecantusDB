@@ -11,11 +11,17 @@ from __future__ import annotations
 import pytest
 
 from secantus.rbac import (
+    A_CREATE_COLLECTION,
+    A_CREATE_INDEX,
+    A_CREATE_ROLE,
     A_CREATE_USER,
     A_DROP_DATABASE,
     A_FIND,
+    A_FSYNC,
     A_GET_LOG,
     A_INSERT,
+    A_LIST_COLLECTIONS,
+    A_LIST_DATABASES,
     A_REMOVE,
     A_SERVER_STATUS,
     A_UPDATE,
@@ -167,3 +173,71 @@ class TestPrivilegeMatrix:
         assert actual is allowed, (
             f"{role} on {bound_db} → {action}: expected {allowed}, got {actual}"
         )
+
+
+class TestClusterRoleBundles:
+    """``clusterMonitor`` / ``clusterAdmin`` / ``backup`` / ``restore`` —
+    mongod's named cluster-wide bundles. All admin-bound, all span every
+    db. Spot checks each role's canonical actions land where they should
+    and cluster-write actions stay gated to ``clusterAdmin``/``restore``."""
+
+    def test_clusterMonitor_grants_listDatabases(self) -> None:
+        assert role_grants_action(
+            "clusterMonitor", "admin", A_LIST_DATABASES, target_db=None, cluster=True
+        )
+        assert role_grants_action(
+            "clusterMonitor", "admin", A_SERVER_STATUS, target_db=None, cluster=True
+        )
+
+    def test_clusterMonitor_does_not_grant_dropDatabase(self) -> None:
+        # Read-only monitoring; dropDatabase is a write that requires
+        # clusterAdmin / root / restore.
+        assert not role_grants_action("clusterMonitor", "admin", A_DROP_DATABASE, target_db="anyDb")
+
+    def test_clusterMonitor_must_be_admin_bound(self) -> None:
+        # Cluster bundles, like the *AnyDatabase variants, are admin-only.
+        assert not role_grants_action(
+            "clusterMonitor", "myapp", A_LIST_DATABASES, target_db=None, cluster=True
+        )
+
+    def test_clusterAdmin_grants_dropDatabase(self) -> None:
+        assert role_grants_action("clusterAdmin", "admin", A_DROP_DATABASE, target_db="anyDb")
+        assert role_grants_action("clusterAdmin", "admin", A_FSYNC, target_db=None, cluster=True)
+        # And inherits clusterMonitor's reads.
+        assert role_grants_action(
+            "clusterAdmin", "admin", A_SERVER_STATUS, target_db=None, cluster=True
+        )
+
+    def test_clusterAdmin_does_not_grant_collection_writes(self) -> None:
+        # Cluster admin manages cluster topology, not collection data.
+        assert not role_grants_action("clusterAdmin", "admin", A_INSERT, target_db="anyDb")
+        assert not role_grants_action("clusterAdmin", "admin", A_FIND, target_db="anyDb")
+
+    def test_backup_reads_every_database(self) -> None:
+        for db in ("dbA", "dbB", "admin"):
+            assert role_grants_action("backup", "admin", A_FIND, target_db=db)
+            assert role_grants_action("backup", "admin", A_LIST_COLLECTIONS, target_db=db)
+        # Backup needs to see what's there to dump it.
+        assert role_grants_action("backup", "admin", A_LIST_DATABASES, target_db=None, cluster=True)
+
+    def test_backup_does_not_grant_writes(self) -> None:
+        # A backup user shouldn't be able to mutate data or rotate creds.
+        assert not role_grants_action("backup", "admin", A_INSERT, target_db="dbA")
+        assert not role_grants_action("backup", "admin", A_DROP_DATABASE, target_db="dbA")
+        assert not role_grants_action("backup", "admin", A_CREATE_USER, target_db="admin")
+
+    def test_restore_writes_every_database(self) -> None:
+        for db in ("dbA", "dbB", "admin"):
+            assert role_grants_action("restore", "admin", A_INSERT, target_db=db)
+            assert role_grants_action("restore", "admin", A_CREATE_COLLECTION, target_db=db)
+            assert role_grants_action("restore", "admin", A_CREATE_INDEX, target_db=db)
+        # Restore recreates users/roles as part of bringing dumps back online.
+        assert role_grants_action("restore", "admin", A_CREATE_USER, target_db="admin")
+        assert role_grants_action("restore", "admin", A_CREATE_ROLE, target_db="admin")
+        # And dropDatabase to make room for the import.
+        assert role_grants_action("restore", "admin", A_DROP_DATABASE, target_db="dbA")
+
+    def test_cluster_bundles_in_known_roles(self) -> None:
+        for name in ("clusterMonitor", "clusterAdmin", "backup", "restore"):
+            assert is_known_role(name), name
+            assert name in BUILT_IN_ROLES

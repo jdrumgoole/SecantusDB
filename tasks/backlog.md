@@ -36,7 +36,6 @@ Specific items that were left out of the slice that introduced their feature are
 
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 
-- [ ] **More built-in role names**: `clusterAdmin` / `clusterMonitor` / `backup` / `restore`. Custom user-defined roles (with inheritance graphs + cycle detection) are implemented; the gap here is just the named built-ins that map to specific privilege bundles real `mongod` ships with.
 - [ ] **x509 / LDAP / Kerberos / GSSAPI / MONGODB-AWS / MONGODB-OIDC** — alternative mechanisms. Out of scope for the first auth slice.
 - [ ] **Internal cluster auth (keyfile / x509)** — only meaningful with replica sets / sharding, both out of scope.
 - [ ] **`system.users` collection visibility** — credentials live in a dedicated WT table (`secantus_users`), not surfaced via `find` / `aggregate` on `admin.system.users`. Tools that poke at the system collection won't see them; use `usersInfo` instead.
