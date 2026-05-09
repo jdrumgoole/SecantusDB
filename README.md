@@ -5,21 +5,21 @@
   </picture>
 </p>
 
-[![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](#alpha-software)
+[![Status: beta](https://img.shields.io/badge/status-beta-yellow)](#beta-software)
 [![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
 [![License: GPL-2.0-only (code) + CC-BY-4.0 (content)](https://img.shields.io/badge/license-GPL--2.0--only%20%2B%20CC--BY--4.0-blue)](#license)
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![Documentation Status](https://readthedocs.org/projects/secantusdb/badge/?version=latest)](https://secantusdb.readthedocs.io/en/latest/)
 
 > [!WARNING]
-> **Alpha software.** <a id="alpha-software"></a>
+> **Beta software.** <a id="beta-software"></a>
 >
-> SecantusDB is in early development. The Python API surface (CLI flags,
-> public class signatures) is still settling and may shift between point
-> releases. **The on-disk format is WiredTiger's** — the same engine
-> MongoDB uses — and the schema we layer on top (collection / index /
-> oplog tables) has been stable across releases; the test suite runs
-> against real on-disk WiredTiger storage and the
+> SecantusDB is past initial proving but the Python API surface (CLI
+> flags, public class signatures) may still shift before 1.0. **The
+> on-disk format is WiredTiger's** — the same engine MongoDB uses —
+> and the schema we layer on top (collection / index / oplog tables)
+> has been stable across releases; the test suite runs against real
+> on-disk WiredTiger storage and the
 > [persistence tests](https://github.com/jdrumgoole/SecantusDB/blob/main/tests/test_storage.py) explicitly verify
 > close-and-reopen round-trips. That said, we don't yet ship a migration
 > tool or a formal compatibility guarantee, so please don't put
