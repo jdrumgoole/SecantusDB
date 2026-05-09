@@ -1,0 +1,47 @@
+<div
+  class="modal-overlay"
+  x-data="{ confirm: '' }"
+  @click.self="document.getElementById('modal').innerHTML = ''"
+>
+  <div class="modal modal-narrow">
+    <header class="modal-header">
+      <h2>Kill cursor</h2>
+      <button
+        type="button"
+        class="modal-close"
+        @click="document.getElementById('modal').innerHTML = ''"
+      >×</button>
+    </header>
+    <div class="modal-body">
+      <p>
+        About to kill cursor <code>{{ cursor_id }}</code> on
+        <code>{{ ns }}</code>. Active tailable consumers will see the
+        stream end on their next <code>getMore</code>.
+      </p>
+      <p>Type the cursor id <code>{{ cursor_id }}</code> to confirm:</p>
+      <input
+        type="text"
+        class="confirm-input"
+        x-model="confirm"
+        autocomplete="off"
+        autofocus
+      />
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="document.getElementById('modal').innerHTML = ''"
+        >Cancel</button>
+        <button
+          type="button"
+          class="btn-danger"
+          x-bind:disabled="confirm !== '{{ cursor_id }}'"
+          hx-delete="/cursors/{{ cursor_id }}?ns={{ ns | urlencode }}"
+          hx-target="#cursor-{{ cursor_id }}"
+          hx-swap="outerHTML"
+          hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
+        >Kill</button>
+      </div>
+    </div>
+  </div>
+</div>

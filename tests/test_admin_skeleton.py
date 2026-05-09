@@ -961,3 +961,76 @@ async def test_console_history_endpoint_returns_payload(
     payload = r2.json()
     assert payload["db"] == "admin"
     assert payload["command"] == '{"ping": 1}'
+
+
+# ---- /connections + /cursors (Slice 8) -------------------------------------
+
+
+async def test_connections_page_lists_caller(http: AsyncClient) -> None:
+    r = await http.get("/connections", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    # The pymongo client backing the facade is itself a connection in
+    # currentOp, so its (host:port) renders in the table.
+    assert "127.0.0.1:" in r.text
+
+
+async def test_cursors_page_lists_open_cursor(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        coll = mc["cursors_db"]["c"]
+        coll.insert_many([{"_id": i} for i in range(20)])
+        # Open and partially drain a cursor so it stays open server-side.
+        cursor = coll.find().batch_size(2)
+        next(cursor)
+        try:
+            r = await http.get("/cursors", headers={HEADER_NAME: "testtoken"})
+            assert r.status_code == 200
+            assert "cursors_db.c" in r.text
+        finally:
+            cursor.close()
+    finally:
+        mc.close()
+
+
+async def test_kill_cursor_confirm_modal_renders(http: AsyncClient) -> None:
+    r = await http.get(
+        "/cursors/12345/kill-confirm?ns=db.coll",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "Type the cursor id" in r.text
+    assert "12345" in r.text
+
+
+async def test_kill_cursor_endpoint_kills(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        coll = mc["kill_curs_db"]["c"]
+        coll.insert_many([{"_id": i} for i in range(20)])
+        cursor = coll.find().batch_size(2)
+        next(cursor)
+        cursor_id = cursor.cursor_id
+        try:
+            r = await http.delete(
+                f"/cursors/{cursor_id}?ns=kill_curs_db.c",
+                headers={HEADER_NAME: "testtoken"},
+            )
+            assert r.status_code == 200
+        finally:
+            # The pymongo cursor was force-killed by our endpoint;
+            # cursor.close() is a no-op now.
+            cursor.close()
+    finally:
+        mc.close()
+
+
+async def test_kill_cursor_requires_ns(http: AsyncClient) -> None:
+    r = await http.delete(
+        "/cursors/12345",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400

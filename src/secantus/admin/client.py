@@ -448,6 +448,34 @@ class MongoFacade:
             raise MongoError(str(exc)) from exc
 
 
+    # ---- currentOp + cursor management ----------------------------------
+
+    def current_op(self) -> list[dict[str, Any]]:
+        """Return the ``inprog`` array from ``currentOp`` (connections + cursors)."""
+        out = self._run_admin("currentOp")
+        return [dict(e) for e in out.get("inprog", []) or []]
+
+    def kill_cursor(self, ns: str, cursor_id: int) -> dict[str, Any]:
+        """Issue ``killCursors`` for ``cursor_id`` against the namespace ``ns``.
+
+        ``ns`` is ``db.coll``. The wire command is per-collection — for
+        cursors that aren't naturally tied to a collection (cluster-wide
+        change streams, e.g. ``ns == ""``), the caller passes ``"admin.$cmd"``
+        and the command is rejected with a clear error.
+        """
+        db, _, coll = ns.partition(".")
+        if not db or not coll:
+            raise MongoError(f"cannot kill cursor in namespace {ns!r}")
+        try:
+            return dict(
+                self._get_client()[db].command("killCursors", coll, cursors=[int(cursor_id)])
+            )
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+
 __all__ = [
     "MongoFacade",
     "MongoError",

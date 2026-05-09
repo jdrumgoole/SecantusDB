@@ -29,6 +29,7 @@ from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
     changestream,
     collection,
+    connections,
     console,
     dashboard,
     databases,
@@ -113,6 +114,7 @@ def create_app(
     app.include_router(users.router)
     app.include_router(changestream.router)
     app.include_router(console.router)
+    app.include_router(connections.router)
 
     return app
 
