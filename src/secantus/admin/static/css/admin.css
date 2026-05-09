@@ -904,3 +904,13 @@ body {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* Geo viewer map */
+
+.geo-map {
+  height: 60vh;
+  min-height: 400px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}

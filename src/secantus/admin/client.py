@@ -543,6 +543,47 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(str(exc)) from exc
 
+    # ---- schema sampler / logs / geo ------------------------------------
+
+    def sample_collection(
+        self, db: str, coll: str, *, size: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return up to ``size`` random docs via ``$sample``.
+
+        ``$sample`` is the right primitive for schema inference: it gives
+        an unbiased look at the collection without paging through the
+        whole thing. ``size`` is clamped to ``[1, 1000]``.
+        """
+        n = max(1, min(int(size), 1000))
+        try:
+            cursor = self._get_client()[db][coll].aggregate([{"$sample": {"size": n}}])
+            return [dict(d) for d in cursor]
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def get_log(self, name: str = "global") -> dict[str, Any]:
+        """Return the response of ``getLog``: ``{log: [...], totalLinesWritten}``."""
+        try:
+            return dict(self._get_client().admin.command("getLog", name))
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def geo_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
+        """Return only indexes that look like ``2dsphere`` / ``2d``."""
+        ixs = self.list_indexes(db, coll)
+        out: list[dict[str, Any]] = []
+        for ix in ixs:
+            key = ix.get("key") or {}
+            for v in key.values():
+                if v in ("2dsphere", "2d"):
+                    out.append(ix)
+                    break
+        return out
+
 
 __all__ = [
     "MongoFacade",
