@@ -26,6 +26,7 @@ import secantus
 from secantus.admin.client import MongoFacade
 from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
+    changestream,
     collection,
     dashboard,
     databases,
@@ -96,6 +97,7 @@ def create_app(*, mongo_uri: str, token: str) -> FastAPI:
     app.include_router(indexes.router)
     app.include_router(metrics.router)
     app.include_router(users.router)
+    app.include_router(changestream.router)
 
     return app
 

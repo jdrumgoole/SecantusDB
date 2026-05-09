@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block content %}
+<div
+  x-data="changestreamPage({{ {'scope': scope, 'db': db_name, 'coll': coll_name} | tojson }})"
+  x-init="init()"
+>
+  <form class="filter-form" method="get" action="/changestream">
+    <div class="filter-controls">
+      <label>
+        Scope
+        <select name="scope" x-model="scope">
+          <option value="cluster">cluster</option>
+          <option value="db">db</option>
+          <option value="coll">coll</option>
+        </select>
+      </label>
+      <label x-show="scope !== 'cluster'">
+        Database
+        <input type="text" name="db" x-model="db" autocomplete="off" />
+      </label>
+      <label x-show="scope === 'coll'">
+        Collection
+        <input type="text" name="coll" x-model="coll" autocomplete="off" />
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" x-model="ddlOn" /> Show DDL events
+      </label>
+      <button type="button" @click="reconnect()">Watch</button>
+    </div>
+  </form>
+
+  <p class="modal-meta">
+    Status: <code x-text="status"></code>
+    <span x-show="namespace">· Namespace: <code x-text="namespace"></code></span>
+  </p>
+
+  <div class="changestream-log">
+    <template x-for="entry in events" :key="entry.id">
+      <div class="cs-event">
+        <div class="cs-event-head">
+          <span class="cs-op" x-text="entry.event.operationType"></span>
+          <span class="cs-ns" x-text="formatNs(entry.event)"></span>
+          <button
+            type="button"
+            class="btn-secondary"
+            @click="copyResume(entry.event._id)"
+          >Copy resume token</button>
+        </div>
+        <pre class="doc-body" x-text="formatJson(entry.event)"></pre>
+      </div>
+    </template>
+    <p x-show="events.length === 0" class="empty">
+      No events yet. Run a write against
+      <span x-show="namespace"><code x-text="namespace"></code></span>
+      <span x-show="!namespace">the watched scope</span>
+      to see one appear here.
+    </p>
+  </div>
+</div>
+
+<script>
+function changestreamPage(initial) {
+  return {
+    scope: initial.scope || "cluster",
+    db: initial.db || "",
+    coll: initial.coll || "",
+    ddlOn: true,
+    status: "idle",
+    namespace: "",
+    events: [],
+    nextId: 1,
+    ws: null,
+
+    init() {
+      // Auto-connect if URL has scope= already (the page link from nav
+      // hits /changestream with scope=cluster; only auto-connect if the
+      // user supplied scope explicitly).
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("scope")) this._connect();
+    },
+
+    reconnect() {
+      // Update the URL so a refresh keeps the same scope.
+      const params = new URLSearchParams();
+      params.set("scope", this.scope);
+      if (this.scope !== "cluster") params.set("db", this.db);
+      if (this.scope === "coll") params.set("coll", this.coll);
+      window.history.replaceState(null, "", `/changestream?${params.toString()}`);
+      this.events = [];
+      this._connect();
+    },
+
+    _connect() {
+      if (this.ws) {
+        try { this.ws.close(); } catch (_) {}
+        this.ws = null;
+      }
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const params = new URLSearchParams();
+      if (this.scope !== "cluster") params.set("db", this.db);
+      if (this.scope === "coll") params.set("coll", this.coll);
+      const qs = params.toString();
+      const url = `${proto}//${window.location.host}/ws/changes/${this.scope}${qs ? "?" + qs : ""}`;
+      this.status = "connecting…";
+      this.ws = new WebSocket(url);
+      this.ws.onopen = () => { this.status = "connected"; };
+      this.ws.onmessage = (evt) => {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === "open") {
+          this.namespace = msg.namespace;
+          this.status = "tailing";
+        } else if (msg.type === "event") {
+          if (!this.ddlOn && this._isDDL(msg.event)) return;
+          this.events.unshift({id: this.nextId++, event: msg.event});
+          if (this.events.length > 200) this.events.pop();
+        } else if (msg.type === "error") {
+          this.status = `error: ${msg.message}`;
+        }
+      };
+      this.ws.onclose = () => { this.status = "disconnected"; };
+      this.ws.onerror = () => { this.status = "websocket error"; };
+    },
+
+    _isDDL(event) {
+      const op = event.operationType;
+      return ["create", "drop", "createIndexes", "dropIndexes", "rename", "modify", "invalidate"].includes(op);
+    },
+
+    formatNs(event) {
+      if (event.ns) return `${event.ns.db}.${event.ns.coll}`;
+      return "";
+    },
+
+    formatJson(event) {
+      return JSON.stringify(event, null, 2);
+    },
+
+    copyResume(token) {
+      const text = JSON.stringify(token);
+      if (navigator.clipboard) navigator.clipboard.writeText(text);
+    },
+  };
+}
+</script>
+{% endblock %}
