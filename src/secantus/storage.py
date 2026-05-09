@@ -196,6 +196,12 @@ def _index_key(
     (descending) fields get bitwise-inverted bytes, making a forward
     B-tree walk yield values in descending order. Compound keys are
     joined with ``\\x00\\x00`` between components.
+
+    For docs whose indexed field is array-valued, this returns the
+    whole-array sortkey only — the single canonical "doc-shape" key
+    used by uniqueness probes. The full set of multikey entries
+    (per-element + whole-array) is produced by
+    :func:`_index_key_variants`.
     """
     if sparse:
         for field in key_spec:
@@ -207,6 +213,94 @@ def _index_key(
         return encode_value_directed(get_path(dict(doc), fields[0]), d)
     parts = [encode_value_directed(get_path(dict(doc), f), int(key_spec[f])) for f in fields]
     return COMPOUND_SEP.join(parts)
+
+
+def _index_key_variants(
+    doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
+) -> list[bytes]:
+    """All byte-keys this doc contributes to an index under ``key_spec``.
+
+    For scalar-valued fields, returns one key — same as ``_index_key``.
+    For array-valued fields, returns one key per array element *and*
+    the whole-array key, mirroring real ``mongod``'s multikey index
+    layout. This makes:
+
+    * ``{tags: "python"}`` against ``{tags: ["python", "go"]}`` light
+      up via the per-element entry for ``"python"``.
+    * ``{tags: ["python", "go"]}`` (whole-array equality) light up via
+      the whole-array entry — without this, the equality lookup would
+      false-negative.
+    * Range / ``$in`` queries on array fields hit at least all true
+      matches (the post-index ``matches()`` filter discards
+      false-positives).
+
+    For compound indexes whose multiple fields are array-valued, the
+    cartesian product is taken across each field's candidate values.
+    Real mongod restricts compound indexes to one multikey field per
+    doc; we don't enforce that — we just emit the cross-product, which
+    is correct (over-includes; the post-filter discards) but pays a
+    cardinality blow-up the user is then on the hook for.
+
+    Returns an empty list when ``sparse`` and any field is missing.
+    Per-element values are deduplicated against their encoded bytes,
+    so ``[1, 1, 2]`` writes two element entries (``1`` and ``2``) plus
+    the whole-array entry, not three.
+    """
+    fields = list(key_spec)
+    if sparse:
+        for field in fields:
+            if not has_path(dict(doc), field):
+                return []
+
+    # Per-field candidate values: scalars contribute [val]; arrays
+    # contribute [unique_elements..., whole_array].
+    per_field: list[list[Any]] = []
+    for field in fields:
+        v = get_path(dict(doc), field)
+        if isinstance(v, list):
+            seen: set[bytes] = set()
+            uniq: list[Any] = []
+            d = int(key_spec[field])
+            for elem in v:
+                eb = encode_value_directed(elem, d)
+                if eb in seen:
+                    continue
+                seen.add(eb)
+                uniq.append(elem)
+            # Whole-array sortkey may collide with an element when the
+            # array is a single scalar repeated; the dedup below at the
+            # entry level (set of bytes) catches that.
+            per_field.append([*uniq, v])
+        else:
+            per_field.append([v])
+
+    if len(fields) == 1:
+        d = int(key_spec[fields[0]])
+        keys: list[bytes] = []
+        seen_kb: set[bytes] = set()
+        for val in per_field[0]:
+            kb = encode_value_directed(val, d)
+            if kb in seen_kb:
+                continue
+            seen_kb.add(kb)
+            keys.append(kb)
+        return keys
+
+    # Compound: cartesian product across per-field candidate lists.
+    from itertools import product
+
+    keys = []
+    seen_kb = set()
+    for combo in product(*per_field):
+        parts = [
+            encode_value_directed(combo[i], int(key_spec[fields[i]])) for i in range(len(fields))
+        ]
+        kb = COMPOUND_SEP.join(parts)
+        if kb in seen_kb:
+            continue
+        seen_kb.add(kb)
+        keys.append(kb)
+    return keys
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -2249,7 +2343,10 @@ class Storage:
             else:
                 # Single doc-table walk: decode each blob once and fold all
                 # three checks (uniqueness, multikey detection, entry build)
-                # into one pass.
+                # into one pass. Uniqueness is probed against the canonical
+                # whole-doc key (``_index_key``); index entries are written
+                # for every key variant (``_index_key_variants``) so per-
+                # element multikey lookups land at IXSCAN.
                 seen: dict[bytes, Any] | None = {} if unique else None
                 multikey = False
                 entries = []
@@ -2259,14 +2356,14 @@ class Storage:
                         continue
                     if not multikey and _doc_makes_multikey(d, key_spec_dict):
                         multikey = True
-                    kb = _index_key(d, key_spec_dict, sparse=sparse)
-                    if kb is None:
-                        continue
                     if seen is not None:
-                        if kb in seen:
-                            raise IndexConflict(name, d.get("_id"))
-                        seen[kb] = d.get("_id")
-                    entries.append((kb, id_k))
+                        canonical = _index_key(d, key_spec_dict, sparse=sparse)
+                        if canonical is not None:
+                            if canonical in seen:
+                                raise IndexConflict(name, d.get("_id"))
+                            seen[canonical] = d.get("_id")
+                    for kb in _index_key_variants(d, key_spec_dict, sparse=sparse):
+                        entries.append((kb, id_k))
                 if multikey:
                     options["multikey"] = True
                 payload = bson.encode({"key": dict(key_spec), "options": options})
@@ -2476,11 +2573,9 @@ class Storage:
                     c.reset()
                     c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
                 continue
-            kb = _index_key(doc, key_spec, sparse=sparse)
-            if kb is None:
-                continue
-            c.reset()
-            c[db, coll, name, _pack_entry(kb, id_k)] = b""
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+                c.reset()
+                c[db, coll, name, _pack_entry(kb, id_k)] = b""
 
     def _delete_index_entries(
         self,
@@ -2521,13 +2616,11 @@ class Storage:
                     if c.search() == 0:
                         c.remove()
                 continue
-            kb = _index_key(doc, key_spec, sparse=sparse)
-            if kb is None:
-                continue
-            c.reset()
-            c.set_key(db, coll, name, _pack_entry(kb, id_k))
-            if c.search() == 0:
-                c.remove()
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+                c.reset()
+                c.set_key(db, coll, name, _pack_entry(kb, id_k))
+                if c.search() == 0:
+                    c.remove()
 
     def _validate_geo_indexes(
         self,
@@ -2662,7 +2755,10 @@ class Storage:
             return []
         c = self._cursor(_DOC_TABLE)
         out: list[dict[str, Any]] = []
-        for id_k in id_keys:
+        # Multikey indexes write per-element entries, so the same doc's
+        # id_key can appear more than once for queries that match
+        # multiple elements. Dedupe while preserving order.
+        for id_k in dict.fromkeys(id_keys):
             c.reset()
             c.set_key(db, coll, id_k)
             if c.search() == 0:
@@ -2923,7 +3019,9 @@ class Storage:
             if id_keys is not None:
                 c = self._cursor(_DOC_TABLE)
                 out: list[tuple[bytes, bytes]] = []
-                for id_k in id_keys:
+                # Same dedup contract as ``_docs_by_id_keys``: multikey
+                # indexes can yield duplicate id_keys for one doc.
+                for id_k in dict.fromkeys(id_keys):
                     c.reset()
                     c.set_key(db, coll, id_k)
                     if c.search() == 0:
@@ -2944,21 +3042,28 @@ class Storage:
         win over compound (tighter scan, no separator math). All fields
         must be ASC or DESC. Partial indexes are skipped unless ``query``
         implies their ``partialFilterExpression``.
+
+        Multikey indexes are not skipped — ``_index_key_variants`` writes
+        per-element entries, so equality / range / ``$in`` lookups on
+        the leading field hit at least all true matches. The geo
+        ``2dsphere`` / ``2d`` indexes have non-numeric direction values
+        and are excluded by the ASC/DESC check below.
         """
-        multikey = self._multikey_index_names(db, coll)
         partials = self._partial_filters(db, coll)
         query = query or {}
         compound_fallback: tuple[str, int, bool] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if name in multikey:
-                continue
             pf = partials.get(name)
             if pf is not None and not self._query_implies_partial(query, pf):
                 continue
             idx_fields = list(key_spec)
             if not idx_fields or idx_fields[0] != field:
                 continue
-            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
+            # Geo / hashed / text indexes carry string direction values
+            # ("2dsphere", "2d", "hashed", "text"); the bare equality
+            # picker can't drive them. Real numeric direction values are
+            # 1 / -1.
+            if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
             d = int(key_spec[field])
             if len(idx_fields) == 1:
@@ -3046,15 +3151,14 @@ class Storage:
 
         Returns ``(name, key_spec)`` of the chosen index, or ``None`` if no
         index covers the filter as a leading prefix. Pure picker — does
-        not scan.
+        not scan. Multikey indexes are eligible (per-element entries
+        cover equality lookups); the ASC/DESC direction check excludes
+        geo indexes.
         """
         filter_fields = set(filter)
-        multikey = self._multikey_index_names(db, coll)
         partials = self._partial_filters(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if name in multikey:
-                continue
             pf = partials.get(name)
             if pf is not None:
                 if not self._query_implies_partial(filter, pf):
@@ -3065,7 +3169,9 @@ class Storage:
             else:
                 eff_fields = filter_fields
             idx_fields = list(key_spec.keys())
-            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
+            # Geo / hashed / text indexes (string direction values) can't
+            # serve a bare-equality compound lookup.
+            if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
             if len(idx_fields) < len(eff_fields):
                 continue
@@ -3142,17 +3248,16 @@ class Storage:
         eq_fields, operator_field, _operator_ops = parts
         eq_set = set(eq_fields)
         target_eq_count = len(eq_set)
-        multikey = self._multikey_index_names(db, coll)
         partials = self._partial_filters(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if name in multikey:
-                continue
             pf = partials.get(name)
             if pf is not None and not self._query_implies_partial(filter, pf):
                 continue
             idx_fields = list(key_spec.keys())
-            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
+            # Geo / hashed / text indexes (string direction values) can't
+            # serve a compound prefix + trailing-operator lookup.
+            if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
             if len(idx_fields) <= target_eq_count:
                 continue

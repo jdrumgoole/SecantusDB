@@ -780,19 +780,50 @@ def test_lookup_skips_compound_index_when_leading_field_does_not_match(tmp_path)
         storage.close()
 
 
-def test_lookup_skips_multikey_compound_index(tmp_path) -> None:
-    """Even when a compound index's leading field matches, multikey
-    flag disqualifies it (per-outer-doc scan would be O(M*N)).
-    """
-    from secantus.aggregate import _foreign_field_has_simple_index
+def test_lookup_uses_multikey_compound_index(tmp_path) -> None:
+    """Multikey compound indexes whose leading field matches are now
+    eligible — Storage's per-element entries make per-outer-doc IXSCAN
+    correct (each foreign array element gets its own entry, so an
+    equality lookup still hits all true matches)."""
+    from secantus.aggregate import PipelineContext, _foreign_field_has_simple_index, apply_pipeline
     from secantus.storage import Storage
 
     storage = Storage(str(tmp_path))
     try:
-        storage.insert("db", "users", [{"_id": 1, "k": [1, 2, 3], "tag": "x"}])
+        storage.insert(
+            "db",
+            "users",
+            [
+                {"_id": 1, "k": [1, 2, 3], "tag": "x"},
+                {"_id": 2, "k": [3, 4], "tag": "y"},
+                {"_id": 3, "k": 5, "tag": "z"},
+            ],
+        )
         storage.create_index("db", "users", "k_tag_1", {"k": 1, "tag": 1}, {})
-        # The array value on the leading field flips multikey.
-        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is False
+        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is True
+
+        storage.insert("db", "orders", [{"_id": 10, "user_k": 3}, {"_id": 11, "user_k": 5}])
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "as": "user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        # Order 10 (user_k=3) matches users 1 and 2.
+        # Order 11 (user_k=5) matches user 3.
+        joined.sort(key=lambda d: d["_id"])
+        assert sorted(u["_id"] for u in joined[0]["user"]) == [1, 2]
+        assert [u["_id"] for u in joined[1]["user"]] == [3]
     finally:
         storage.close()
 
