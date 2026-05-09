@@ -826,3 +826,65 @@ body {
   color: var(--muted);
   flex: 1 1 auto;
 }
+
+/* Console tabs + history */
+
+.console-tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.console-tabs button {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.console-tabs button:hover {
+  color: var(--fg);
+}
+
+.console-tabs button.tab-active {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.history-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.history-summary {
+  flex: 1 1 auto;
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-payload {
+  display: none;  /* Server-rendered, used by JS in the future */
+}

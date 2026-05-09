@@ -25,9 +25,11 @@ from fastapi.staticfiles import StaticFiles
 import secantus
 from secantus.admin.client import MongoFacade
 from secantus.admin.middleware import TokenAuthMiddleware
+from secantus.admin.history import HistoryStore
 from secantus.admin.routers import (
     changestream,
     collection,
+    console,
     dashboard,
     databases,
     health,
@@ -62,7 +64,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.mongo.close()
 
 
-def create_app(*, mongo_uri: str, token: str) -> FastAPI:
+_DEFAULT_HISTORY_PATH = Path.home() / ".secantus" / "admin.db"
+
+
+def create_app(
+    *,
+    mongo_uri: str,
+    token: str,
+    history_path: Path | str | None = None,
+) -> FastAPI:
     app = FastAPI(
         title="SecantusDB admin",
         version=secantus.__version__,
@@ -72,12 +82,16 @@ def create_app(*, mongo_uri: str, token: str) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.mongo = MongoFacade(mongo_uri)
+    app.state.mongo_uri = mongo_uri
     app.state.templates_dir = _TEMPLATES_DIR
     # Token is exposed on app.state so WS handlers can verify it (the
     # HTTP middleware doesn't see WebSocket scopes, so per-route checks
     # need the same token reference).
     app.state.token = token
     app.state.hub = Hub()
+    # Persistent ad-hoc query history (sqlite). Tests pass a per-test
+    # path; production defaults to the same dir as the persisted token.
+    app.state.history = HistoryStore(history_path or _DEFAULT_HISTORY_PATH)
     # Sampler is started inside lifespan so the asyncio loop is live;
     # set to None here for the test path that constructs the app
     # without going through lifespan.
@@ -98,6 +112,7 @@ def create_app(*, mongo_uri: str, token: str) -> FastAPI:
     app.include_router(metrics.router)
     app.include_router(users.router)
     app.include_router(changestream.router)
+    app.include_router(console.router)
 
     return app
 
