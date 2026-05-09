@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="modal-meta">
+  Live snapshot from <code>currentOp</code>. Connections refresh on
+  page reload — kill-on-row is deferred until SecantusDB grows
+  <code>killOp</code>.
+</p>
+
+{% if error %}
+  <div class="error">{{ error }}</div>
+{% endif %}
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>conn_id</th>
+      <th>Client</th>
+      <th>User</th>
+      <th>Last op</th>
+      <th>Active</th>
+      <th>Connected at</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+      <tr>
+        <td><code>{{ r.conn_id }}</code></td>
+        <td><code>{{ r.client }}</code></td>
+        <td>
+          {% if r.user.user %}<code>{{ r.user.user }}@{{ r.user.db }}</code>{% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td><code>{{ r.op or '—' }}</code></td>
+        <td>{% if r.active %}<span class="badge">active</span>{% else %}<span class="muted">idle</span>{% endif %}</td>
+        <td><code>{{ r.opened_at }}</code></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="empty">No connections.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

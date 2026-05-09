@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="modal-meta">
+  Live cursors from <code>currentOp</code>. Killing a cursor frees
+  server-side state and ends any tailable consumer that depends on it.
+</p>
+
+{% if error %}
+  <div class="error">{{ error }}</div>
+{% endif %}
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>cursor_id</th>
+      <th>Namespace</th>
+      <th>Flags</th>
+      <th class="doc-actions-col">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+      <tr id="cursor-{{ r.cursor_id }}">
+        <td><code>{{ r.cursor_id }}</code></td>
+        <td><code>{{ r.ns or '—' }}</code></td>
+        <td>
+          {% if r.tailable %}<span class="badge">tailable</span>{% endif %}
+          {% if r.await_data %}<span class="badge">awaitData</span>{% endif %}
+        </td>
+        <td class="doc-actions">
+          {% if r.killable %}
+            <button
+              type="button"
+              class="btn-danger"
+              hx-get="/cursors/{{ r.cursor_id }}/kill-confirm?ns={{ r.ns | urlencode }}"
+              hx-target="#modal"
+              hx-swap="innerHTML"
+            >Kill</button>
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="4" class="empty">No cursors.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div id="modal"></div>
+{% endblock %}
