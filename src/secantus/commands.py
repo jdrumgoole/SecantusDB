@@ -22,10 +22,12 @@ from secantus.auth import (
 )
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorNotFound, CursorRegistry
+from secantus.expressions import ExpressionError
+from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
-from secantus.projection import apply_projection
-from secantus.query import matches
+from secantus.projection import ProjectionError, apply_projection
+from secantus.query import QueryError, matches
 from secantus.rbac import (
     A_CHANGE_PASSWORD,
     A_COLL_MOD,
@@ -66,10 +68,6 @@ from secantus.rbac import (
     check_privilege,
     is_known_role,
 )
-from secantus.expressions import ExpressionError
-from secantus.geo import GeoError
-from secantus.projection import ProjectionError
-from secantus.query import QueryError
 from secantus.sessions import SessionRegistry
 from secantus.storage import DuplicateKeyError, GeoExtractError, Storage
 from secantus.update import UpdateError
@@ -1484,8 +1482,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # update / delete. Use the lock-free tail peek; a stale
             # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
-                lambda: ctx.storage.oplog_tail_seq_nolock() > captured_tail
-                or entry.invalidated,
+                lambda: ctx.storage.oplog_tail_seq_nolock() > captured_tail or entry.invalidated,
                 timeout=wait_seconds,
             )
         if entry.producer is not None and not entry.remaining:
@@ -3092,7 +3089,9 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # peer.
         logger.exception(
             "internal error handling command %s (conn=%s, db=%s)",
-            name, ctx.connection_id, ctx.db_name,
+            name,
+            ctx.connection_id,
+            ctx.db_name,
         )
         return {
             "ok": 0.0,

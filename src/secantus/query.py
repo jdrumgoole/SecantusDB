@@ -96,10 +96,9 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
             return False
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             return False
-        if "pattern" in schema:
-            # Route through _compile_regex so the pattern-length cap fires.
-            if not _compile_regex(schema["pattern"], 0).search(value):
-                return False
+        # Route through _compile_regex so the pattern-length cap fires.
+        if "pattern" in schema and not _compile_regex(schema["pattern"], 0).search(value):
+            return False
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
             return False
@@ -505,8 +504,7 @@ _MAX_REGEX_PATTERN_LEN = 1000
 def _compile_regex(pattern: str | bytes, flags: int) -> re.Pattern:
     if hasattr(pattern, "__len__") and len(pattern) > _MAX_REGEX_PATTERN_LEN:
         raise QueryError(
-            f"regex pattern of {len(pattern)} chars exceeds the "
-            f"{_MAX_REGEX_PATTERN_LEN}-char cap"
+            f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
         )
     return re.compile(pattern, flags)
 

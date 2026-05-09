@@ -391,8 +391,7 @@ def _resolve_regex(arg: Any, ctx: _Ctx) -> tuple[str, int]:
         raise ExpressionError("regex must be a string or BSON Regex")
     if len(pattern) > _MAX_REGEX_PATTERN_LEN:
         raise ExpressionError(
-            f"regex pattern of {len(pattern)} chars exceeds the "
-            f"{_MAX_REGEX_PATTERN_LEN}-char cap"
+            f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
         )
     return pattern, flags
 

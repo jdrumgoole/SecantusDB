@@ -383,7 +383,16 @@ def release_prepare(c: Context, version: str) -> None:
 
     print(f"==> [4/6] Committing + tagging v{version}")
     c.run("git add pyproject.toml src/secantus/__init__.py uv.lock", pty=True)
-    c.run(f'git commit -m "Release v{version}"', pty=True)
+    # If the version is already at ``version`` on HEAD (e.g. because a
+    # parallel-session merge bumped it), the ``git add`` stages nothing
+    # and ``git commit`` would abort with "nothing to commit". Detect
+    # that case and skip the commit — the tag still goes on HEAD which
+    # already carries the right version.
+    staged = c.run("git diff --cached --quiet", warn=True, hide=True)
+    if staged.return_code == 0:
+        print(f"    version already at {version} on HEAD; skipping release commit")
+    else:
+        c.run(f'git commit -m "Release v{version}"', pty=True)
     c.run(f'git tag -a v{version} -m "Release v{version}"', pty=True)
     # Combine the branch and tag pushes into one network round-trip.
     # The publish workflow still fires on the tag ref; nothing else

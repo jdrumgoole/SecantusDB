@@ -188,8 +188,7 @@ def _check_doc_len(doc_len: int, offset: int, end: int, where: str) -> None:
     """
     if doc_len < _MIN_BSON_DOC_LEN:
         raise _BodyBoundsError(
-            f"{where}: declared BSON length {doc_len} below minimum "
-            f"{_MIN_BSON_DOC_LEN}"
+            f"{where}: declared BSON length {doc_len} below minimum {_MIN_BSON_DOC_LEN}"
         )
     if offset + doc_len > end:
         raise _BodyBoundsError(

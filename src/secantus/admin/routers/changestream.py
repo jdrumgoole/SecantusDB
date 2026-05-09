@@ -27,6 +27,7 @@ Frame protocol (JSON):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -105,33 +106,27 @@ async def ws_changes(
                 # tight-loop on a quiet stream.
                 await asyncio.sleep(0.5)
                 continue
-            await websocket.send_json(
-                {"type": "event", "event": _serialize_event(dict(event))}
-            )
+            await websocket.send_json({"type": "event", "event": _serialize_event(dict(event))})
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pragma: no cover — network/driver failure path
         logger.exception("change-stream tail terminated")
-        try:
+        with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(exc)})
-        except Exception:
-            pass
     finally:
         if stream is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.to_thread(stream.close)
-            except Exception:
-                pass
 
 
 # ---- /changestream page ----------------------------------------------------
 
 
+from fastapi import Request  # noqa: E402
 from fastapi.responses import HTMLResponse  # noqa: E402
 from fastapi.templating import Jinja2Templates  # noqa: E402
-from fastapi import Request  # noqa: E402
 
 
 @router.get("/changestream", response_class=HTMLResponse)

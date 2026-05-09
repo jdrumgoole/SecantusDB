@@ -174,7 +174,9 @@ class SecantusDBServer:
             if overflowed:
                 logger.warning(
                     "rejecting connection from %s: %d active >= %d cap",
-                    addr, self._active_conns, self.max_connections,
+                    addr,
+                    self._active_conns,
+                    self.max_connections,
                 )
                 with contextlib.suppress(OSError):
                     conn.close()

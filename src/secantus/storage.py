@@ -1089,6 +1089,7 @@ class Storage:
                 except OSError:
                     # Best-effort: log via warnings rather than crash close().
                     import warnings as _warn
+
                     _warn.warn(
                         f"failed to remove WiredTiger tempdir {self._tempdir!r}",
                         ResourceWarning,

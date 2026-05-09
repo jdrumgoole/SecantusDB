@@ -736,24 +736,24 @@ def test_ws_changes_streams_collection_event(server) -> None:
     from pymongo import MongoClient
 
     app = create_app(mongo_uri=server.uri, token="cs-token")
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            "/ws/changes/coll?t=cs-token&db=cs_db&coll=c"
-        ) as ws:
-            opened = ws.receive_json()
-            assert opened["type"] == "open"
-            assert opened["namespace"] == "cs_db.c"
-            # Insert a doc; expect an "insert" event to come through.
-            mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
-            try:
-                mc["cs_db"]["c"].insert_one({"_id": 1, "x": 1})
-            finally:
-                mc.close()
-            evt = ws.receive_json()
-            assert evt["type"] == "event"
-            assert evt["event"]["operationType"] == "insert"
-            assert evt["event"]["ns"]["db"] == "cs_db"
-            assert evt["event"]["ns"]["coll"] == "c"
+    with (
+        TestClient(app) as client,
+        client.websocket_connect("/ws/changes/coll?t=cs-token&db=cs_db&coll=c") as ws,
+    ):
+        opened = ws.receive_json()
+        assert opened["type"] == "open"
+        assert opened["namespace"] == "cs_db.c"
+        # Insert a doc; expect an "insert" event to come through.
+        mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            mc["cs_db"]["c"].insert_one({"_id": 1, "x": 1})
+        finally:
+            mc.close()
+        evt = ws.receive_json()
+        assert evt["type"] == "event"
+        assert evt["event"]["operationType"] == "insert"
+        assert evt["event"]["ns"]["db"] == "cs_db"
+        assert evt["event"]["ns"]["coll"] == "c"
 
 
 def test_ws_changes_rejects_missing_token(server) -> None:
@@ -761,12 +761,12 @@ def test_ws_changes_rejects_missing_token(server) -> None:
     from starlette.websockets import WebSocketDisconnect
 
     app = create_app(mongo_uri=server.uri, token="cs-token")
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect(
-                "/ws/changes/coll?db=x&coll=y"
-            ) as ws:
-                ws.receive_json()
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/ws/changes/coll?db=x&coll=y") as ws,
+    ):
+        ws.receive_json()
 
 
 def test_ws_changes_rejects_bad_scope(server) -> None:
@@ -774,12 +774,12 @@ def test_ws_changes_rejects_bad_scope(server) -> None:
     from starlette.websockets import WebSocketDisconnect
 
     app = create_app(mongo_uri=server.uri, token="cs-token")
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect(
-                "/ws/changes/bogus?t=cs-token"
-            ) as ws:
-                ws.receive_json()
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/ws/changes/bogus?t=cs-token") as ws,
+    ):
+        ws.receive_json()
 
 
 def test_ws_changes_coll_scope_requires_db_and_coll(server) -> None:
@@ -787,12 +787,12 @@ def test_ws_changes_coll_scope_requires_db_and_coll(server) -> None:
     from starlette.websockets import WebSocketDisconnect
 
     app = create_app(mongo_uri=server.uri, token="cs-token")
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect(
-                "/ws/changes/coll?t=cs-token"
-            ) as ws:
-                ws.receive_json()
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/ws/changes/coll?t=cs-token") as ws,
+    ):
+        ws.receive_json()
 
 
 async def test_drop_user_endpoint_removes_user(server, http: AsyncClient) -> None:
