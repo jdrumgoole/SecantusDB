@@ -65,6 +65,7 @@ from secantus.rbac import (
     check_privilege,
     is_known_role,
 )
+from secantus.sessions import SessionRegistry
 from secantus.storage import Storage
 from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 
@@ -87,6 +88,7 @@ class CommandContext:
     metrics: Metrics | None = None
     connections: ConnectionRegistry | None = None
     logs: LogBuffer | None = None
+    sessions: SessionRegistry | None = None
 
 
 def _split_into_cursor(
@@ -239,23 +241,77 @@ def _build_info(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     }
 
 
-def _end_sessions(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _lsid_bytes_from_arg(entry: Any) -> bytes | None:
+    """Extract the 16-byte UUID payload from a session-id document.
+
+    The wire shape is ``{id: BinData(4, <uuid>)}``; the BSON layer
+    surfaces the value as ``bson.Binary``. Returns ``None`` for any
+    shape we don't recognise so the handler can skip silently rather
+    than fail the whole command.
+    """
+    from bson import Binary
+
+    if not isinstance(entry, Mapping):
+        return None
+    inner = entry.get("id")
+    if isinstance(inner, Binary):
+        raw = bytes(inner)
+        if len(raw) == 16:
+            return raw
+    elif isinstance(inner, (bytes, bytearray)) and len(inner) == 16:
+        return bytes(inner)
+    return None
+
+
+def _end_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop the listed sessions from the registry.
+
+    Real ``mongod`` also kills any cursors associated with these
+    sessions; SecantusDB doesn't track cursor → session affinity
+    yet, so cursors live on under their own idle TTL.
+    """
+    if ctx.sessions is not None:
+        for entry in doc.get("endSessions") or []:
+            lsid = _lsid_bytes_from_arg(entry)
+            if lsid is not None:
+                ctx.sessions.unregister(lsid)
     return {"ok": 1.0}
 
 
-def _start_session(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _start_session(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Mint a fresh session id and register it.
+
+    The driver receives ``{id: BinData(4, <uuid>)}`` and threads it
+    onto every subsequent command via the top-level ``lsid`` field;
+    the dispatch layer refreshes the registry's last-access timestamp
+    on each such command.
+    """
     import uuid
 
     from bson import Binary
 
+    raw = uuid.uuid4().bytes
+    if ctx.sessions is not None:
+        ctx.sessions.register(raw)
     return {
-        "id": {"id": Binary(uuid.uuid4().bytes, 4)},
+        "id": {"id": Binary(raw, 4)},
         "timeoutMinutes": 30,
         "ok": 1.0,
     }
 
 
-def _refresh_sessions(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _refresh_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Bump the idle TTL on listed sessions.
+
+    Implicitly creates any session not already in the registry —
+    matching mongod's behaviour of treating ``refreshSessions`` as
+    "ensure this session is alive", not "fail if it isn't".
+    """
+    if ctx.sessions is not None:
+        for entry in doc.get("refreshSessions") or []:
+            lsid = _lsid_bytes_from_arg(entry)
+            if lsid is not None:
+                ctx.sessions.refresh(lsid)
     return {"ok": 1.0}
 
 
@@ -2873,6 +2929,15 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         ctx.metrics.record_command(name)
     if ctx.connections is not None:
         ctx.connections.record_command(ctx.connection_id, name)
+    # Implicit session registration: drivers that don't call
+    # ``startSession`` explicitly still attach an ``lsid`` to every
+    # command. Touching the registry on each lsid'd command keeps
+    # the idle-TTL clock aligned with actual activity, mirroring
+    # mongod's "session is alive while it's being used" rule.
+    if ctx.sessions is not None:
+        lsid = _lsid_bytes_from_arg(doc.get("lsid"))
+        if lsid is not None:
+            ctx.sessions.register(lsid)
     handler = _HANDLERS.get(name)
     if handler is None:
         return {

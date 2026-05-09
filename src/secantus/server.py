@@ -17,6 +17,7 @@ from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorRegistry
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
+from secantus.sessions import SessionRegistry
 from secantus.storage import Storage
 from secantus.wire import (
     OP_MSG_FLAG_MORE_TO_COME,
@@ -82,6 +83,12 @@ class SecantusDBServer:
         # connection.
         self.connections = ConnectionRegistry()
         self.logs = LogBuffer()
+        # Logical-session registry: drivers send an lsid on every
+        # command and bracket session lifetime via ``startSession`` /
+        # ``endSessions`` / ``refreshSessions``. Tracked here so the
+        # session-management commands actually have state to operate
+        # on instead of returning canned ``{ok: 1}``.
+        self.sessions = SessionRegistry()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -178,6 +185,7 @@ class SecantusDBServer:
                             metrics=self.metrics,
                             connections=self.connections,
                             logs=self.logs,
+                            sessions=self.sessions,
                         )
                         response_doc = dispatch(body, ctx)
                         # `moreToCome` (bit 1) is the wire signal for
@@ -206,6 +214,7 @@ class SecantusDBServer:
                             metrics=self.metrics,
                             connections=self.connections,
                             logs=self.logs,
+                            sessions=self.sessions,
                         )
                         response_doc = dispatch(op.query, ctx)
                         reply = build_op_reply(

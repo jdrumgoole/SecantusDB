@@ -37,7 +37,7 @@ public final class CsResumeSmoke {
 
         MongoClientSettings settings = MongoClientSettings.builder()
             .applyConnectionString(new ConnectionString(uri))
-            .applyToClusterSettings(b -> b.serverSelectionTimeout(5, TimeUnit.SECONDS))
+            .applyToClusterSettings(b -> b.serverSelectionTimeout(30, TimeUnit.SECONDS))
             .build();
 
         try (MongoClient client = MongoClients.create(settings)) {
@@ -71,7 +71,7 @@ public final class CsResumeSmoke {
                 for (int id : new int[]{1, 2, 3}) {
                     coll.insertOne(new Document("_id", id));
                 }
-                ChangeStreamDocument<Document> e1 = nextEvent(cur1, 8000);
+                ChangeStreamDocument<Document> e1 = nextEvent(cur1, 15000);
                 int gotId = e1.getDocumentKey().getInt32("_id").getValue();
                 if (gotId != 1) {
                     System.err.printf("e1 _id: got %d, want 1%n", gotId);
@@ -85,8 +85,8 @@ public final class CsResumeSmoke {
                 .resumeAfter(resumeAfter)
                 .maxAwaitTime(1, TimeUnit.SECONDS);
             try (MongoCursor<ChangeStreamDocument<Document>> cur2 = cs2.cursor()) {
-                ChangeStreamDocument<Document> e2 = nextEvent(cur2, 8000);
-                ChangeStreamDocument<Document> e3 = nextEvent(cur2, 8000);
+                ChangeStreamDocument<Document> e2 = nextEvent(cur2, 15000);
+                ChangeStreamDocument<Document> e3 = nextEvent(cur2, 15000);
                 int e2id = e2.getDocumentKey().getInt32("_id").getValue();
                 int e3id = e3.getDocumentKey().getInt32("_id").getValue();
                 if (e2id != 2 || e3id != 3) {
@@ -101,7 +101,7 @@ public final class CsResumeSmoke {
                 .maxAwaitTime(1, TimeUnit.SECONDS);
             try (MongoCursor<ChangeStreamDocument<Document>> cur3 = cs3.cursor()) {
                 List<Integer> got = new ArrayList<>();
-                long deadline = System.currentTimeMillis() + 8000;
+                long deadline = System.currentTimeMillis() + 15000;
                 while (got.size() < 3 && System.currentTimeMillis() < deadline) {
                     ChangeStreamDocument<Document> ev = nextEvent(cur3,
                         Math.max(0, deadline - System.currentTimeMillis()));

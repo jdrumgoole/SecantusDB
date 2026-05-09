@@ -557,6 +557,137 @@ def test_densify_invalid_step_raises() -> None:
         )
 
 
+def test_densify_date_unit_day_fills_gaps() -> None:
+    """Date densify with ``unit: "day"``: fillers carry the densify
+    field as a real ``datetime`` at every step between adjacent
+    inputs."""
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2026, 1, 1)},
+        {"ts": dt.datetime(2026, 1, 4)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [{"$densify": {"field": "ts", "range": {"bounds": "full", "step": 1, "unit": "day"}}}],
+    )
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 1),
+        dt.datetime(2026, 1, 2),
+        dt.datetime(2026, 1, 3),
+        dt.datetime(2026, 1, 4),
+    ]
+
+
+def test_densify_date_unit_hour_with_explicit_bounds() -> None:
+    """``unit: "hour"`` + explicit bounds extends below/above the
+    observed range, just like the numeric version."""
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2026, 1, 1, 10, 0)},
+        {"ts": dt.datetime(2026, 1, 1, 12, 0)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {
+                        "bounds": [dt.datetime(2026, 1, 1, 9, 0), dt.datetime(2026, 1, 1, 13, 0)],
+                        "step": 1,
+                        "unit": "hour",
+                    },
+                }
+            }
+        ],
+    )
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 1, 9, 0),
+        dt.datetime(2026, 1, 1, 10, 0),
+        dt.datetime(2026, 1, 1, 11, 0),
+        dt.datetime(2026, 1, 1, 12, 0),
+    ]
+
+
+def test_densify_date_partitions_independently() -> None:
+    """Date densify respects ``partitionByFields`` — each (partition,
+    range) pair fills its own gaps and carries the partition values
+    onto fillers."""
+    import datetime as dt
+
+    docs = [
+        {"region": "us", "ts": dt.datetime(2026, 1, 1)},
+        {"region": "us", "ts": dt.datetime(2026, 1, 3)},
+        {"region": "eu", "ts": dt.datetime(2026, 1, 2)},
+        {"region": "eu", "ts": dt.datetime(2026, 1, 4)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "partitionByFields": ["region"],
+                    "range": {"bounds": "full", "step": 1, "unit": "day"},
+                }
+            }
+        ],
+    )
+    by_region: dict[str, list[object]] = {"us": [], "eu": []}
+    for d in out:
+        by_region[d["region"]].append(d["ts"])
+    assert by_region["us"] == [
+        dt.datetime(2026, 1, 1),
+        dt.datetime(2026, 1, 2),
+        dt.datetime(2026, 1, 3),
+    ]
+    assert by_region["eu"] == [
+        dt.datetime(2026, 1, 2),
+        dt.datetime(2026, 1, 3),
+        dt.datetime(2026, 1, 4),
+    ]
+
+
+def test_densify_date_unit_month_rejected() -> None:
+    """``month`` / ``quarter`` / ``year`` are variable-length and
+    can't be expressed as a fixed timedelta — rejected with a clear
+    error pointing at the supported set."""
+    import datetime as dt
+
+    with pytest.raises(AggregateError, match="variable-length"):
+        apply_pipeline(
+            [{"ts": dt.datetime(2026, 1, 1)}],
+            [
+                {
+                    "$densify": {
+                        "field": "ts",
+                        "range": {"bounds": "full", "step": 1, "unit": "month"},
+                    }
+                }
+            ],
+        )
+
+
+def test_densify_date_unrecognised_unit_rejected() -> None:
+    """Unknown unit string surfaces as a plain ``$densify`` error."""
+    import datetime as dt
+
+    with pytest.raises(AggregateError, match="not recognised"):
+        apply_pipeline(
+            [{"ts": dt.datetime(2026, 1, 1)}],
+            [
+                {
+                    "$densify": {
+                        "field": "ts",
+                        "range": {"bounds": "full", "step": 1, "unit": "fortnight"},
+                    }
+                }
+            ],
+        )
+
+
 def test_change_stream_stage_stashes_spec_and_returns_empty() -> None:
     """`$changeStream` is a source stage: ignores input, stashes spec on ctx."""
     from secantus.aggregate import PipelineContext, apply_pipeline

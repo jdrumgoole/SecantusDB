@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
@@ -199,10 +200,21 @@ def _stage_unset(
     return out
 
 
+_DENSIFY_UNIT_TO_TIMEDELTA: dict[str, str] = {
+    # Units whose duration is fixed: trivially expressed as a timedelta.
+    "week": "weeks",
+    "day": "days",
+    "hour": "hours",
+    "minute": "minutes",
+    "second": "seconds",
+    "millisecond": "milliseconds",
+}
+
+
 def _stage_densify(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    """Numeric ``$densify``: fill gaps between consecutive values.
+    """``$densify``: fill gaps between consecutive values, numeric or date.
 
     Output is each input doc plus filler docs (containing only the
     densify field, plus any partitionByFields) at every multiple of
@@ -213,7 +225,12 @@ def _stage_densify(
     don't yet plumb a partition-wide range distinct from each
     partition's observed extremes.
 
-    Date densify (``unit``) is deferred — see ``tasks/backlog.md``.
+    Date densify is enabled by setting ``range.unit`` to one of
+    ``"week"`` / ``"day"`` / ``"hour"`` / ``"minute"`` / ``"second"`` /
+    ``"millisecond"`` — those are the units with a fixed duration so
+    a ``timedelta`` represents them exactly. ``"month"`` / ``"quarter"``
+    / ``"year"`` are rejected (variable-length, would need
+    ``relativedelta``-style arithmetic).
     """
     if not isinstance(spec, Mapping):
         raise AggregateError("$densify requires a document spec")
@@ -223,11 +240,24 @@ def _stage_densify(
     range_spec = spec.get("range")
     if not isinstance(range_spec, Mapping):
         raise AggregateError("$densify requires range")
-    if "unit" in range_spec:
-        raise AggregateError("$densify date ranges (unit) not yet supported")
-    step = range_spec.get("step")
-    if not isinstance(step, (int, float)) or step <= 0:
+    raw_step = range_spec.get("step")
+    if not isinstance(raw_step, (int, float)) or raw_step <= 0:
         raise AggregateError("$densify step must be a positive number")
+    unit = range_spec.get("unit")
+    if unit is not None:
+        if not isinstance(unit, str):
+            raise AggregateError("$densify range.unit must be a string")
+        if unit in {"month", "quarter", "year"}:
+            raise AggregateError(
+                f"$densify range.unit={unit!r} is variable-length; "
+                "supported units are week / day / hour / minute / second / millisecond"
+            )
+        td_kwarg = _DENSIFY_UNIT_TO_TIMEDELTA.get(unit)
+        if td_kwarg is None:
+            raise AggregateError(f"$densify range.unit={unit!r} is not recognised")
+        step: Any = _dt.timedelta(**{td_kwarg: raw_step})
+    else:
+        step = raw_step
     bounds = range_spec.get("bounds")
     partition_fields = list(spec.get("partitionByFields") or [])
 

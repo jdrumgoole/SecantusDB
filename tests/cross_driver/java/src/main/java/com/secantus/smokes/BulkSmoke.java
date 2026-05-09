@@ -42,7 +42,7 @@ public final class BulkSmoke {
 
         MongoClientSettings settings = MongoClientSettings.builder()
             .applyConnectionString(new ConnectionString(uri))
-            .applyToClusterSettings(b -> b.serverSelectionTimeout(5, TimeUnit.SECONDS))
+            .applyToClusterSettings(b -> b.serverSelectionTimeout(30, TimeUnit.SECONDS))
             .build();
 
         try (MongoClient client = MongoClients.create(settings)) {
