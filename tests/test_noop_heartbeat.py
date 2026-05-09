@@ -50,13 +50,19 @@ def test_emit_noop_heartbeat_writes_oplog_entry(tmp_path) -> None:
 
 def test_background_heartbeat_thread_fires(tmp_path) -> None:
     """A small heartbeat interval should produce multiple noop oplog
-    entries within a short observation window."""
-    storage = Storage(str(tmp_path / "wt"), noop_heartbeat_seconds=0.05)
+    entries within a short observation window. Generous bounds because
+    CI runners on slow Python builds (macos 3.10 in particular) can
+    take >100ms to schedule the daemon thread for the first tick;
+    the goal here is to prove it fires *repeatedly*, not to time it."""
+    storage = Storage(str(tmp_path / "wt"), noop_heartbeat_seconds=0.1)
     try:
-        time.sleep(0.4)  # ~6-8 heartbeats expected at 50ms cadence
+        time.sleep(1.5)  # ~12-15 heartbeats expected at 100ms cadence
         rows = list(storage.read_oplog(start_seq=1, limit=100))
         noop_rows = [entry for _seq, entry in rows if entry.get("op") == "n"]
-        assert len(noop_rows) >= 3, f"expected >=3 heartbeat rows in 0.4s, got {len(noop_rows)}"
+        # Repeated firing requires at least 3 entries (startup + at
+        # least two scheduled iterations); the slow-CI safety margin
+        # is the 1.5s window vs the 100ms cadence.
+        assert len(noop_rows) >= 3, f"expected >=3 heartbeat rows in 1.5s, got {len(noop_rows)}"
     finally:
         storage.close()
 
