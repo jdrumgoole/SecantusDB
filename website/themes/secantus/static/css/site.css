@@ -64,15 +64,15 @@ pre code { background: transparent; padding: 0; }
 
 .wrap { max-width: var(--max-width); margin: 0 auto; padding: 0 32px; }
 
-/* ---- Alpha banner ---- */
+/* ---- Beta banner ---- */
 
-.alpha-banner {
+.beta-banner {
   background: var(--slate-900);
   color: var(--slate-100);
   border-bottom: 2px solid var(--cyan-500);
   font-size: 14px;
 }
-.alpha-banner .wrap {
+.beta-banner .wrap {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -80,8 +80,8 @@ pre code { background: transparent; padding: 0; }
   padding-top: 12px;
   padding-bottom: 12px;
 }
-.alpha-banner strong { color: var(--cyan-400); letter-spacing: 0.04em; }
-.alpha-banner .badge {
+.beta-banner strong { color: var(--cyan-400); letter-spacing: 0.04em; }
+.beta-banner .badge {
   display: inline-block;
   background: var(--cyan-500);
   color: var(--slate-950);
@@ -92,7 +92,7 @@ pre code { background: transparent; padding: 0; }
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
-.alpha-banner a { color: var(--cyan-300); }
+.beta-banner a { color: var(--cyan-300); }
 
 /* ---- Site header / nav ---- */
 
