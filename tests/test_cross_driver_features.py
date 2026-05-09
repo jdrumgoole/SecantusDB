@@ -87,14 +87,35 @@ def _run(
 
 
 def _ensure_node_modules() -> bool:
-    """Install mongodb npm package once; cached in dir for re-runs."""
+    """Install mongodb npm package once; cached in dir for re-runs.
+
+    Same parallel-test race as the Java jar build: multiple xdist
+    workers see no ``node_modules`` on a cold checkout, all kick off
+    ``npm install`` simultaneously, and the directory ends up with
+    partial state (the top-level ``node_modules/`` exists from
+    whichever worker finished last, but the ``mongodb`` / ``bson``
+    package directories may be missing because npm clobbered them
+    mid-write). Tests then fail with ``Cannot find module 'mongodb'``.
+    Serialise via ``fcntl.flock`` so workers 2..N wait for the first
+    to finish, then see the populated directory.
+    """
     nm = _NODE_SMOKE_DIR / "node_modules"
-    if nm.is_dir():
+    if nm.is_dir() and (nm / "mongodb").is_dir():
         return True
     if _NPM is None:
         return False
-    result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
-    return result.returncode == 0 and nm.is_dir()
+    import fcntl
+
+    lock_path = _NODE_SMOKE_DIR / ".node_modules.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        # Re-check after acquiring the lock — a sibling worker may
+        # have populated it while we were blocked.
+        if (nm / "mongodb").is_dir():
+            return True
+        result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
+        return result.returncode == 0 and (nm / "mongodb").is_dir()
 
 
 def _ensure_java_smokes_jar() -> bool:
@@ -262,6 +283,7 @@ def test_rbac_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_rbac_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -369,6 +391,7 @@ def test_ddl_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_ddl_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -485,6 +508,7 @@ def test_updateuser_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_updateuser_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -584,6 +608,7 @@ def test_connstatus_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_connstatus_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -706,6 +731,7 @@ def test_types_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_types_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -819,6 +845,7 @@ def test_bulk_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_bulk_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -949,6 +976,7 @@ def test_cs_resume_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_cs_resume_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -1038,6 +1066,7 @@ def test_listdb_filter_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_listdb_filter_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -1128,6 +1157,7 @@ def test_batchsize_zero_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_batchsize_zero_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -1237,6 +1267,7 @@ def test_drop_all_users_smoke_via_mongosh(server_with_auth: SecantusDBServer) ->
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_drop_all_users_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -1339,6 +1370,7 @@ def test_scram_sha1_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_scram_sha1_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -1436,6 +1468,7 @@ def test_pbrt_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_pbrt_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -1524,6 +1557,7 @@ def test_tailable_smoke_via_mongosh(server: SecantusDBServer) -> None:
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_tailable_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -1684,6 +1718,7 @@ def test_custom_roles_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> N
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_custom_roles_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")

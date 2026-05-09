@@ -130,19 +130,31 @@ def _ensure_node_modules() -> bool:
     """Install mongodb npm package once; cached in the dir for re-runs.
 
     Returns False if `npm install` fails (e.g. offline). The pytest
-    skipif then passes the failure reason through.
+    skipif then passes the failure reason through. The flock + the
+    ``mongodb`` sub-directory existence check guard against parallel
+    xdist workers racing on the install (see the matching helper in
+    ``test_cross_driver_features.py`` for the full rationale).
     """
     nm = _NODE_SMOKE_DIR / "node_modules"
-    if nm.is_dir():
+    if nm.is_dir() and (nm / "mongodb").is_dir():
         return True
     if _NPM is None:
         return False
-    result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
-    return result.returncode == 0 and nm.is_dir()
+    import fcntl
+
+    lock_path = _NODE_SMOKE_DIR / ".node_modules.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if (nm / "mongodb").is_dir():
+            return True
+        result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
+        return result.returncode == 0 and (nm / "mongodb").is_dir()
 
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_geo_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
