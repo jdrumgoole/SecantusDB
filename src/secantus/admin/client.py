@@ -447,7 +447,6 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(str(exc)) from exc
 
-
     # ---- currentOp + cursor management ----------------------------------
 
     def current_op(self) -> list[dict[str, Any]]:
