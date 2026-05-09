@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -8,7 +9,7 @@ from typing import Any
 
 import bson
 
-from secantus.aggregate import PipelineContext, apply_pipeline
+from secantus.aggregate import AggregateError, PipelineContext, apply_pipeline
 from secantus.auth import (
     SCRAM_SHA_1,
     SCRAM_SHA_256,
@@ -65,9 +66,34 @@ from secantus.rbac import (
     check_privilege,
     is_known_role,
 )
+from secantus.expressions import ExpressionError
+from secantus.geo import GeoError
+from secantus.projection import ProjectionError
+from secantus.query import QueryError
 from secantus.sessions import SessionRegistry
-from secantus.storage import Storage
+from secantus.storage import DuplicateKeyError, GeoExtractError, Storage
+from secantus.update import UpdateError
 from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
+
+logger = logging.getLogger(__name__)
+
+# Exception classes whose ``str()`` is intentionally user-facing — they
+# carry mongod-shaped error messages (validation failures, malformed
+# operators, etc.) and must be surfaced verbatim so pymongo / mongo-go /
+# mongo-node / mongo-java tests see the same text real mongod produces.
+# Anything OUTSIDE this tuple is treated as an internal error and gets a
+# generic message + a server-side log line, never the raw exception text.
+_USER_FACING_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    AggregateError,
+    AuthError,
+    DuplicateKeyError,
+    ExpressionError,
+    GeoError,
+    GeoExtractError,
+    ProjectionError,
+    QueryError,
+    UpdateError,
+)
 
 WIRE_VERSION = 17
 SERVER_VERSION = "7.0.0"
@@ -1397,6 +1423,22 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 43,
             "codeName": "CursorNotFound",
         }
+    # Cursor ownership check. ``getMore`` is in ``_NO_PRIVILEGE_COMMANDS``
+    # (the original ``find`` / ``aggregate`` already authorised the
+    # namespace), so without this check a connection that learns or
+    # guesses someone else's cursor id can pull pages from a namespace
+    # it has no privilege on, just by claiming the right ``collection``
+    # in the request. Reject any getMore where the caller's claimed
+    # namespace doesn't match the cursor's stored namespace — same
+    # response mongod returns (CursorNotFound, code 43) so we don't
+    # confirm-or-deny which cursor IDs exist on other connections.
+    if entry.namespace and ns != entry.namespace:
+        return {
+            "ok": 0.0,
+            "errmsg": f"cursor id {cursor_id} not found",
+            "code": 43,
+            "codeName": "CursorNotFound",
+        }
     if not entry.tailable:
         try:
             batch, exhausted = ctx.cursors.next_batch(cursor_id, batch_size)
@@ -1434,8 +1476,16 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         wait_seconds = max_time_ms / 1000.0 if max_time_ms > 0 else 1.0
         captured_tail = ctx.storage.oplog_tail_seq()
         with ctx.storage._oplog_cv:
+            # Wake predicate must not acquire ``storage._lock`` — the
+            # write path holds ``_lock`` then notifies under
+            # ``_oplog_cv`` (lock order ``_lock -> _oplog_cv``), so a
+            # waiter holding ``_oplog_cv`` and reaching for ``_lock``
+            # would ABBA-deadlock against any concurrent insert /
+            # update / delete. Use the lock-free tail peek; a stale
+            # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
-                lambda: ctx.storage.oplog_tail_seq() > captured_tail or entry.invalidated,
+                lambda: ctx.storage.oplog_tail_seq_nolock() > captured_tail
+                or entry.invalidated,
                 timeout=wait_seconds,
             )
         if entry.producer is not None and not entry.remaining:
@@ -1575,6 +1625,24 @@ def _aggregate_change_stream(
                 "errmsg": f"invalid resume token: {exc}",
                 "code": 9,
                 "codeName": "FailedToParse",
+            }
+        # Scope-bind the resume token. Without this check, a client
+        # watching `db.collA` can craft a token with a different `ns`
+        # (e.g. `db.collB`, or `secrets.users`) and read the oplog of
+        # that other namespace from the embedded `seq`. mongod itself
+        # leaves tokens unsigned (they're opaque transports of position),
+        # but it gates the read at the resource ACL — SecantusDB doesn't
+        # have full per-resource ACL plumbing, so the watch scope is
+        # the boundary we must enforce here.
+        if not changestreams._scope_matches(data.ns, scope):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "Resume token namespace does not match the change-stream "
+                    "watch scope; refusing cross-namespace resume."
+                ),
+                "code": 13,  # Unauthorized
+                "codeName": "Unauthorized",
             }
         history_lost = False
         if floor > 0 and data.seq < floor:
@@ -2772,6 +2840,13 @@ _HANDLERS: dict[str, CommandHandler] = {
 
 # Commands a connection may invoke before authenticating, when
 # require_auth=True. The handshake plus the auth handshake itself.
+# getLog and hostInfo were previously listed here, which let an
+# unauthenticated peer dump the in-memory log buffer (which can contain
+# operation parameters, error messages, and other operational details)
+# and read the server host's OS/CPU info. Both leak server-internal
+# state and have no role in the driver handshake — pymongo / mongo-go /
+# mongo-node / mongo-java all complete connect+auth without calling
+# them. Require auth like every other command of their privilege class.
 _PRE_AUTH_COMMANDS = frozenset(
     {
         "hello",
@@ -2783,9 +2858,7 @@ _PRE_AUTH_COMMANDS = frozenset(
         "saslStart",
         "saslContinue",
         "endSessions",
-        "getLog",
         "whatsmyuri",
-        "hostInfo",
     }
 )
 
@@ -2825,6 +2898,11 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "listCollections": (A_LIST_COLLECTIONS, SCOPE_DATABASE),
     "listDatabases": (A_LIST_DATABASES, SCOPE_CLUSTER),
     "dbStats": (A_DB_STATS, SCOPE_DATABASE),
+    # MongoDB clients accept either case; the handler table aliases them
+    # but the RBAC table previously only listed ``dbStats``, so a
+    # lowercase request slipped past the privilege check (the dispatcher
+    # silently exempts commands missing from this table).
+    "dbstats": (A_DB_STATS, SCOPE_DATABASE),
     "collStats": (A_COLL_STATS, SCOPE_COLLECTION),
     # User management
     "createUser": (A_CREATE_USER, SCOPE_DATABASE),
@@ -2848,6 +2926,11 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "serverStatus": (A_SERVER_STATUS, SCOPE_CLUSTER),
     "hostInfo": (A_HOST_INFO, SCOPE_CLUSTER),
     "getCmdLineOpts": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
+    # ``getParameter`` exposes server-internal config (featureFlag state,
+    # tunables) and was missing from this table — a cluster-info command
+    # an unprivileged authenticated user could call. Reuse the same
+    # cluster-monitor action as the other introspection commands.
+    "getParameter": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
     "getLog": (A_GET_LOG, SCOPE_CLUSTER),
     "currentOp": (A_INPROG, SCOPE_CLUSTER),
     "fsync": (A_FSYNC, SCOPE_CLUSTER),
@@ -2992,10 +3075,28 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 }
     try:
         return handler(doc, ctx)
-    except Exception as exc:
+    except _USER_FACING_EXCEPTIONS as exc:
+        # Validation-class errors: messages are deliberately shaped to
+        # match mongod, drivers parse them. Surface verbatim.
         return {
             "ok": 0.0,
             "errmsg": str(exc),
             "code": 14,
             "codeName": "TypeMismatch",
+        }
+    except Exception:
+        # Anything else is an internal bug. Logging the full traceback
+        # server-side preserves debuggability; returning a generic
+        # message avoids leaking field paths, file paths, document
+        # contents, or stack frames over the wire to an unauthenticated
+        # peer.
+        logger.exception(
+            "internal error handling command %s (conn=%s, db=%s)",
+            name, ctx.connection_id, ctx.db_name,
+        )
+        return {
+            "ok": 0.0,
+            "errmsg": "internal server error",
+            "code": 1,
+            "codeName": "InternalError",
         }
