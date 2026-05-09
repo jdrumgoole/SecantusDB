@@ -87,6 +87,27 @@ class ConnectionRegistry:
                 return
             info.user = user
 
+    def get(self, conn_id: int) -> ConnInfo | None:
+        """Return a fresh copy of the ``ConnInfo`` for ``conn_id`` or ``None``.
+
+        Single-connection lookup that avoids walking the full snapshot.
+        Used by handlers like ``whatsmyuri`` that only need the current
+        connection's peer address.
+        """
+        with self._lock:
+            info = self._conns.get(conn_id)
+            if info is None:
+                return None
+            return ConnInfo(
+                conn_id=info.conn_id,
+                peer_addr=info.peer_addr,
+                opened_at=info.opened_at,
+                last_cmd_at=info.last_cmd_at,
+                op_count=info.op_count,
+                user=info.user,
+                last_command_name=info.last_command_name,
+            )
+
     def snapshot(self) -> list[ConnInfo]:
         """Return a fresh list of ``ConnInfo`` copies, sorted by ``conn_id``."""
         with self._lock:

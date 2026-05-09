@@ -10,7 +10,6 @@ Each item should have enough context for a future session to pick it up cold: wh
 
 These commands accept the request and return a wire-valid response, but the response is fabricated — they do no real work.
 
-- [ ] **`hostInfo`** / **`whatsmyuri`** — hardcoded values. (`buildInfo` is now real: `version` stays at the MongoDB-compatibility marker `"7.0.0"` for driver feature gating, and a new `secantusVersion` field surfaces the actual `secantus.__version__`.)
 - ~~`getLog`~~ — real now. Backed by `secantus.logbuf.LogBuffer` (5000-line ring buffer) on `SecantusDBServer.logs`. The accept loop logs connect events; expand to other log sites as needed.
 - [ ] **`startSession`** / **`endSessions`** / **`refreshSessions`** — `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced.
 - [ ] **`abortTransaction`** / **`commitTransaction`** — return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod`.
@@ -20,7 +19,6 @@ These commands accept the request and return a wire-valid response, but the resp
 These work end-to-end but cut corners.
 
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
-- [ ] **`$dateFromString` / `$dateToString`** — format strings use Python's `strptime`/`strftime` codes plus the `%L` extension for milliseconds; `timezone` argument supports IANA names ("Europe/Dublin"), UTC offsets ("+05:30"), and "GMT"/"UTC". Still missing: full MongoDB format spec (`%G`/`%V` ISO-week, `%j` day-of-year edge cases) and the `format` option's MongoDB-specific tokens.
 - [ ] **`renameCollection`** — atomic per the storage `RLock`, but no protection against concurrent writers across worktrees. Tests are single-process so this is fine.
 - [ ] **`createIndexes` options that are accepted but not enforced**: `collation` (Python compares with default locale).
 

@@ -978,8 +978,23 @@ def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
         d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
         d = d_aware.astimezone(tz)
     out = fmt
+    # Pre-process tokens whose mongod semantics differ from Python's
+    # strftime, then hand the rest off to strftime untouched.
+    # ``%L`` — 3-digit milliseconds (mongod-only token).
     if "%L" in out:
         out = out.replace("%L", f"{d.microsecond // 1000:03d}")
+    # ``%w`` — mongod numbers days 1-Sunday through 7-Saturday;
+    # Python's strftime numbers them 0-Sunday through 6-Saturday.
+    # Substitute the resolved digit directly so strftime never sees
+    # the token. Formula: ((weekday() + 1) % 7) + 1 maps
+    # Mon..Sun (0..6) → 2..7,1 i.e. mongod's Sunday=1 numbering.
+    if "%w" in out:
+        out = out.replace("%w", str(((d.weekday() + 1) % 7) + 1))
+    # ``%G`` (ISO year), ``%V`` (ISO week 1-53), ``%j`` (day of year
+    # 001-366), ``%U`` (Sunday-start week 00-53), ``%u`` (ISO weekday
+    # 1-Mon … 7-Sun), ``%Y``, ``%m``, ``%d``, ``%H``, ``%M``, ``%S``,
+    # ``%z``, ``%Z``, ``%%`` — all match mongod's tokens and pass
+    # straight through to Python's strftime.
     return d.strftime(out)
 
 

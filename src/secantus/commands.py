@@ -349,22 +349,66 @@ def _get_log(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
-def _whatsmyuri(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"you": "127.0.0.1:0", "ok": 1.0}
+def _whatsmyuri(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Return the requesting client's connection peer (``host:port``).
+
+    Drivers and ``mongosh`` use this to disambiguate which client they
+    are. Serving the actual peer (looked up from the connection
+    registry) instead of a hardcoded placeholder makes the helpers
+    work end-to-end.
+    """
+    peer_str = "unknown"
+    if ctx.connections is not None:
+        info = ctx.connections.get(ctx.connection_id)
+        if info is not None:
+            peer_str = f"{info.peer_addr[0]}:{info.peer_addr[1]}"
+    return {"you": peer_str, "ok": 1.0}
 
 
 def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    """Real ``hostInfo``: hostname, OS, CPU arch, core count, RAM size.
+
+    Hostname comes from ``socket.gethostname()``; CPU architecture
+    from ``platform.machine()``; OS type / name / version from
+    ``platform.system()`` / ``platform.release()``. Memory size in MB
+    is read via ``sysconf(SC_PHYS_PAGES) * sysconf(SC_PAGE_SIZE)`` on
+    POSIX (Linux / macOS); falls back to 0 on platforms where sysconf
+    doesn't expose those keys (Windows, some BSDs).
+    """
+    import platform
+    import socket
+
+    mem_mb = 0
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and phys_pages > 0:
+            mem_mb = (page_size * phys_pages) // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        # ``os.sysconf`` doesn't exist on Windows (AttributeError) and
+        # the specific keys may be missing on some Unix variants.
+        pass
+
+    os_type = platform.system() or "Unknown"  # "Darwin", "Linux", "Windows"
+    os_release = platform.release() or ""
+    os_version = platform.version() or os_release
+
     return {
         "system": {
             "currentTime": _dt.datetime.now(_dt.timezone.utc),
-            "hostname": "secantus",
+            "hostname": socket.gethostname() or "localhost",
             "cpuAddrSize": 64,
-            "memSizeMB": 0,
+            "memSizeMB": mem_mb,
             "numCores": os.cpu_count() or 1,
-            "cpuArch": "x86_64",
+            "cpuArch": platform.machine() or "unknown",
             "numaEnabled": False,
         },
-        "os": {"type": "secantus", "name": "secantus", "version": SERVER_VERSION},
+        "os": {
+            "type": os_type,
+            "name": os_type,
+            "version": os_release,
+        },
+        "extra": {"versionString": os_version},
         "ok": 1.0,
     }
 
