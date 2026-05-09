@@ -86,6 +86,8 @@ Three more WT tables, in the same connection:
 
 Retention: `prune_oplog(*, now=None)` drops entries older than `oplog_retention_seconds` (default 1h) and trims to `oplog_max_entries` (default 100k), deleting paired pre-images. Called opportunistically (every 1000 emits) and exposed publicly. No background sweeper — same pattern as `prune_ttl`.
 
+Periodic noop heartbeats: `Storage.emit_noop_heartbeat()` writes one `{op: "n", ns: "", o: {msg: "periodic noop"}}` row to the oplog. A background thread fires it every `noop_heartbeat_seconds` (default 0 = disabled; mongod's default is 10s and tests can opt in with smaller intervals). Change-stream projection treats `op: "n"` as "skip the event but advance position", so a quiet collection's `postBatchResumeToken` keeps tracking cluster time and stays inside the oplog retention window. Disabled when `enable_oplog=False`.
+
 Cross-thread reads (`read_oplog`, `read_preimage`, `oplog_floor_seq`, `find_seq_for_ts`) open a **fresh WT session per call** rather than reusing the per-thread cached session. WiredTiger's MVCC keeps a session's read snapshot until the session commits / resets; reusing the cached session for tailable getMore polls would never observe rows committed by writer threads on other connections. The fresh session is cheap and uniformly correct.
 
 Cluster time: `Storage.current_cluster_time()` returns the next monotonic `Timestamp(secs, ord)` and persists it. Used in `hello`'s `lastWrite.opTime` and the `aggregate` reply's `operationTime`.
