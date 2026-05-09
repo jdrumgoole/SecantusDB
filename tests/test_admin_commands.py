@@ -104,3 +104,77 @@ def test_current_op_lists_open_cursors(client: MongoClient) -> None:
         assert c["cursorId"] != 0
     finally:
         cursor.close()
+
+
+# ---- whatsmyuri -------------------------------------------------------------
+
+
+def test_whatsmyuri_returns_real_peer(client: MongoClient) -> None:
+    """``whatsmyuri`` returns the real connection peer (host:port),
+    not a placeholder. Drivers and ``mongosh`` use this to identify
+    which client they are."""
+    out = client.admin.command("whatsmyuri")
+    assert out["ok"] == 1.0
+    you = out["you"]
+    assert isinstance(you, str)
+    # ``host:port`` shape; loopback in test fixtures.
+    assert ":" in you
+    host, port = you.rsplit(":", 1)
+    assert host in ("127.0.0.1", "::1", "localhost")
+    assert port.isdigit() and int(port) > 0
+
+
+# ---- hostInfo ---------------------------------------------------------------
+
+
+def test_host_info_returns_real_system_info(client: MongoClient) -> None:
+    """``hostInfo`` reports real values from the running process —
+    hostname, CPU arch, OS type/version, core count. Used to match
+    against ``mongod``'s shape for monitoring tools."""
+    import platform
+    import socket
+
+    out = client.admin.command("hostInfo")
+    assert out["ok"] == 1.0
+
+    system = out["system"]
+    assert system["hostname"] == socket.gethostname()
+    assert system["cpuArch"] == platform.machine()
+    # Core count is at least 1; matches the number reported by os.cpu_count().
+    import os
+
+    assert system["numCores"] == (os.cpu_count() or 1)
+    assert system["cpuAddrSize"] == 64
+
+    os_block = out["os"]
+    # platform.system() returns "Darwin" / "Linux" / "Windows"; the stub
+    # always returned literal "secantus" — verify we no longer do.
+    assert os_block["type"] == platform.system()
+    assert os_block["type"] != "secantus"
+    assert os_block["name"] == platform.system()
+
+
+def test_host_info_memory_size_nonzero_on_posix() -> None:
+    """On POSIX systems, ``memSizeMB`` reports the real physical RAM
+    via sysconf, not 0. (Skipped when sysconf doesn't expose
+    SC_PHYS_PAGES — e.g. on Windows runners — though SecantusDB
+    isn't built there yet.)"""
+    import os
+
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        pytest.skip("sysconf SC_PHYS_PAGES not available on this platform")
+
+    if page_size <= 0 or phys_pages <= 0:
+        pytest.skip("sysconf returned no usable memory size")
+
+    # Pull through the server fixture for a realistic round-trip.
+    with SecantusDBServer(port=0, storage_path=":memory:") as srv:
+        mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
+        try:
+            out = mc.admin.command("hostInfo")
+            assert out["system"]["memSizeMB"] > 0
+        finally:
+            mc.close()
