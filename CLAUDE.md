@@ -269,6 +269,36 @@ cd ../SecantusDB-website/website
 
 `tasks/backlog.md` is the canonical list of commands that are stubbed, features with simplified implementations, and work explicitly deferred from a slice. **Update it whenever you stub something, defer a slice, or discover a limitation. When you fix an item, delete its line.** Future sessions should treat that file as load-bearing — it's the only honest record of where SecantusDB's behaviour diverges from real MongoDB.
 
+## CI is load-bearing — failures are serious bugs, not flakes
+
+After every push to `main` (and after every push to a feature branch that has CI configured), check the corresponding GitHub Actions run and resolve any failures *before* moving on to the next slice. CI is the source of truth, not the local test result — CI catches a class of bugs that local-only testing misses:
+
+- **Cold caches**: locally, `node_modules/`, the Java smokes uber-jar, the Go module cache, and `.pytest_cache` are all populated from prior runs. CI starts fresh every time, exposing race conditions in test bootstrap (e.g. multiple xdist workers calling `_ensure_node_modules()` simultaneously and clobbering `npm install`).
+- **Cross-platform**: macOS and Linux differ in subtle ways (sysconf keys, default locale, file system case-sensitivity, default temp dir, line endings).
+- **Cross-Python**: 3.10–3.13 see different stdlib behaviours (`datetime.UTC`, removed `imp`, dataclass slots semantics, walrus precedence in match statements, etc).
+- **Missing extras**: the CI workflow installs a specific subset of `pyproject.toml` extras (currently `--extra dev --extra admin`). Adding new tests that depend on a different extra silently passes locally (`uv sync --all-extras` is the dev default) and fails only on CI. When you add a test file that imports something new, check whether the import chain is covered by `--extra dev --extra admin` — if not, either move the dep into `dev`/`admin` or update the workflow.
+
+**Procedure** after pushing:
+
+```
+gh run list --repo jdrumgoole/SecantusDB --branch main --limit 3 \
+  --json databaseId,name,status,conclusion
+# pick the most recent Tests run, then either watch:
+gh run watch <id> --repo jdrumgoole/SecantusDB --exit-status
+# or, if you've moved on to other work, check status later:
+gh run view <id> --repo jdrumgoole/SecantusDB --json conclusion,jobs
+# on failure:
+gh run view <id> --repo jdrumgoole/SecantusDB --log-failed
+```
+
+If CI fails, treat it like a failing local test: stop, diagnose root cause, fix. Do not push more commits on top of a broken `main` — they pile up, and the eventual fix has to bisect through all of them.
+
+**Recurring patterns to recognise**:
+
+- **xdist parallel-worker races on shared install state** — the `--extra admin` miss, the Java-jar build race, the Node `npm install` race were all variants. Fix: `fcntl.flock` around the install + `xdist_group(name="<group>")` markers + `--dist=loadgroup` so the test serialise onto one worker.
+- **Per-platform `os.sysconf` keys** — `SC_PHYS_PAGES` exists on Linux/macOS but not Windows; wrap with `try/except (ValueError, OSError, AttributeError)`.
+- **`pytest-subtests` outcome accounting** — its parent-test outcome is `"subtests passed"`, not `"passed"`. Anywhere we bucket pytest outcomes (e.g. `pymongo_validation/generate_report.py`) needs an explicit handler or it falls into the default branch silently.
+
 ## Conventions for changes here
 
 - **Major features and non-trivial updates go in a git worktree on a feature branch — never directly on `main`.** New CRUD operators, aggregation stages, storage-layer changes, wire-protocol additions, indexing work, and similar multi-file changes all qualify. Trivial one-file tweaks (typo fixes, single-line config edits) can stay on `main`. Create a worktree alongside the repo: `git worktree add ../SecantusDB-<branch> -b <branch>`. Develop and run the full test suite there; merge into `main` only when green, then `git worktree remove ../SecantusDB-<branch> && git branch -d <branch>`. This keeps `main` releasable and lets parallel sessions work without colliding.
