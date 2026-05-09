@@ -17,10 +17,12 @@ import hmac
 
 import pymongo
 import pytest
+from pymongo import monitoring
 from pymongo.errors import OperationFailure
 
 from secantus import SecantusDBServer
 from secantus.auth import (
+    SCRAM_SHA_1,
     SCRAM_SHA_256,
     AuthError,
     ConnectionAuth,
@@ -647,3 +649,491 @@ def test_no_auth_mode_bypasses_rbac(server_no_auth) -> None:
         assert plain["dbA"]["c"].count_documents({}) == 1
     finally:
         plain.close()
+
+
+# ----------------------------------------------------------------------
+# updateUser: rotate password / replace roles in place
+# ----------------------------------------------------------------------
+
+
+def test_update_user_rotates_password(server_with_auth) -> None:
+    """`updateUser` with a new `pwd` re-derives credentials. The calling
+    connection (already authed under the old password) keeps working;
+    new connections must use the new password."""
+    _make_user_with_roles(
+        server_with_auth, "admin", "alice", "orig", [{"role": "root", "db": "admin"}]
+    )
+
+    cli = _client_for(server_with_auth, user="alice", password="orig")
+    try:
+        cli["admin"].command("ping")
+        cli["admin"].command({"updateUser": "alice", "pwd": "rotated"})
+        # Same connection still works — rotation doesn't kick the caller.
+        cli["admin"].command("ping")
+    finally:
+        cli.close()
+
+    # Old password no longer accepted.
+    cli_old = _client_for(server_with_auth, user="alice", password="orig")
+    try:
+        with pytest.raises(OperationFailure):
+            cli_old["admin"].command("ping")
+    finally:
+        cli_old.close()
+
+    # New password accepted.
+    cli_new = _client_for(server_with_auth, user="alice", password="rotated")
+    try:
+        cli_new["admin"].command("ping")
+    finally:
+        cli_new.close()
+
+
+def test_update_user_replaces_roles(server_with_auth) -> None:
+    """`updateUser` with a `roles` argument REPLACES (not appends) the
+    user's role bindings — matches mongod."""
+    _make_user_with_roles(server_with_auth, "shop", "rocky", "p", [{"role": "read", "db": "shop"}])
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        root_cli["shop"].command(
+            {
+                "updateUser": "rocky",
+                "roles": [{"role": "readWrite", "db": "shop"}],
+            }
+        )
+    finally:
+        root_cli.close()
+
+    # rocky now has readWrite, not read — insert should succeed.
+    cli = _client_for(server_with_auth, user="rocky", password="p", db="shop")
+    try:
+        cli["shop"]["c"].insert_one({"x": 1})
+    finally:
+        cli.close()
+
+
+def test_update_user_rejects_unknown_role(server_with_auth) -> None:
+    _make_user_with_roles(
+        server_with_auth, "admin", "alice", "p", [{"role": "read", "db": "admin"}]
+    )
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            root_cli["admin"].command(
+                {
+                    "updateUser": "alice",
+                    "roles": [{"role": "fakeRole", "db": "admin"}],
+                }
+            )
+        assert exc.value.code == 31  # RoleNotFound
+    finally:
+        root_cli.close()
+
+
+def test_update_user_requires_at_least_one_field(server_with_auth) -> None:
+    """`updateUser` with no `pwd` and no `roles` is a client error
+    (BadValue) — there's nothing to update."""
+    _make_user_with_roles(
+        server_with_auth, "admin", "alice", "p", [{"role": "read", "db": "admin"}]
+    )
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            root_cli["admin"].command({"updateUser": "alice"})
+        assert exc.value.code == 2
+    finally:
+        root_cli.close()
+
+
+def test_update_user_unknown_user_errors(server_with_auth) -> None:
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            root_cli["admin"].command({"updateUser": "ghost", "pwd": "p"})
+        # mongod's UserNotFound code is 11.
+        assert exc.value.code == 11
+    finally:
+        root_cli.close()
+
+
+# ----------------------------------------------------------------------
+# Speculative authentication
+# ----------------------------------------------------------------------
+
+
+class _SaslListener(monitoring.CommandListener):
+    """Captures the names of commands pymongo actually sends to the
+    server. With speculative auth working, an authenticated client
+    should produce a single ``saslContinue`` for the SCRAM proof —
+    no ``saslStart``, because the client folded that into ``hello``.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def started(self, event):  # type: ignore[override]
+        if event.command_name in ("saslStart", "saslContinue"):
+            self.events.append(event.command_name)
+
+    def succeeded(self, event):  # type: ignore[override]
+        pass
+
+    def failed(self, event):  # type: ignore[override]
+        pass
+
+
+def test_speculative_auth_skips_explicit_saslstart(server_with_auth) -> None:
+    """The client's first SCRAM round-trip rides inside ``hello``.
+
+    pymongo (4.x) sends ``hello`` with ``speculativeAuthenticate``
+    populated. If the server replies with a matching
+    ``speculativeAuthenticate`` body, pymongo skips its own
+    ``saslStart`` — only ``saslContinue`` should appear on the wire.
+    Mirrors pymongo's own ``test_scram_skip_empty_exchange``.
+    """
+    listener = _SaslListener()
+    cli = pymongo.MongoClient(
+        server_with_auth.uri,
+        username="root",
+        password="secret",
+        authSource="admin",
+        authMechanism=SCRAM_SHA_256,
+        event_listeners=[listener],
+    )
+    try:
+        # Force an authenticated round-trip so the SCRAM exchange
+        # actually fires; without this the connection is lazy.
+        cli.admin.command("ping")
+    finally:
+        cli.close()
+
+    assert listener.events == ["saslContinue"], (
+        f"expected only saslContinue (saslStart was speculatively folded into hello), "
+        f"got {listener.events!r}"
+    )
+
+
+def test_speculative_auth_wrong_password_falls_back_cleanly(server_with_auth) -> None:
+    """A wrong password in the speculative payload must not crash hello.
+
+    The server omits the ``speculativeAuthenticate`` field on a bad
+    payload, the client falls back to explicit saslStart, gets an
+    AuthenticationFailed back, and surfaces ``OperationFailure``.
+    """
+    cli = pymongo.MongoClient(
+        server_with_auth.uri,
+        username="root",
+        password="wrong",
+        authSource="admin",
+        authMechanism=SCRAM_SHA_256,
+        serverSelectionTimeoutMS=2000,
+    )
+    try:
+        with pytest.raises(OperationFailure):
+            cli.admin.command("ping")
+    finally:
+        cli.close()
+
+
+# ----------------------------------------------------------------------
+# dropAllUsersFromDatabase
+# ----------------------------------------------------------------------
+
+
+def test_drop_all_users_from_database_removes_only_target_db(server_with_auth) -> None:
+    """A `dropAllUsersFromDatabase` on db `shop` removes shop users
+    but leaves users on other databases (including admin) intact.
+    Returns ``n`` = number of removed records.
+    """
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        root_cli["shop"].command(
+            "createUser",
+            "alice",
+            pwd="p",
+            roles=[{"role": "read", "db": "shop"}],
+        )
+        root_cli["shop"].command(
+            "createUser",
+            "bob",
+            pwd="p",
+            roles=[{"role": "readWrite", "db": "shop"}],
+        )
+        # User on a different db — must NOT be removed.
+        root_cli["other"].command(
+            "createUser",
+            "carol",
+            pwd="p",
+            roles=[{"role": "read", "db": "other"}],
+        )
+
+        result = root_cli["shop"].command("dropAllUsersFromDatabase")
+        assert result["ok"] == 1.0
+        assert result["n"] == 2
+
+        shop_users = root_cli["shop"].command("usersInfo")["users"]
+        assert shop_users == []
+        other_users = {u["user"] for u in root_cli["other"].command("usersInfo")["users"]}
+        assert other_users == {"carol"}
+        # root is still on admin and authenticatable.
+        admin_users = {u["user"] for u in root_cli["admin"].command("usersInfo")["users"]}
+        assert "root" in admin_users
+    finally:
+        root_cli.close()
+
+
+def test_drop_all_users_from_database_empty_db_returns_zero(server_with_auth) -> None:
+    """Empty database returns ``n: 0`` cleanly (not an error)."""
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        result = root_cli["empty_db"].command("dropAllUsersFromDatabase")
+        assert result["ok"] == 1.0
+        assert result["n"] == 0
+    finally:
+        root_cli.close()
+
+
+def test_drop_all_users_from_database_requires_dropuser_action(server_with_auth) -> None:
+    """A user without ``dropUser`` action gets code 13 / Unauthorized."""
+    root_cli = _client_for(server_with_auth, user="root", password="secret")
+    try:
+        # `read` role grants viewing but not user management.
+        root_cli["shop"].command(
+            "createUser",
+            "viewer",
+            pwd="p",
+            roles=[{"role": "read", "db": "shop"}],
+        )
+    finally:
+        root_cli.close()
+
+    viewer_cli = _client_for(server_with_auth, user="viewer", password="p", db="shop")
+    try:
+        with pytest.raises(OperationFailure) as exc:
+            viewer_cli["shop"].command("dropAllUsersFromDatabase")
+        assert exc.value.code == 13
+    finally:
+        viewer_cli.close()
+
+
+# ----------------------------------------------------------------------
+# SCRAM-SHA-1
+# ----------------------------------------------------------------------
+
+
+def test_derive_credentials_sha1_round_trips_through_doc() -> None:
+    """SHA-1 mechanism produces credentials with the right shape.
+
+    Salt is 16 bytes (RFC 5802 / mongod default); stored_key and
+    server_key are 20-byte SHA-1 digests; the doc layout uses
+    ``SCRAM-SHA-1`` as the top-level key.
+    """
+    creds = derive_credentials("hunter2", mechanism=SCRAM_SHA_1, username="alice")
+    assert creds.mechanism == SCRAM_SHA_1
+    assert len(creds.stored_key) == 20
+    assert len(creds.server_key) == 20
+    assert len(creds.salt) == 16
+
+    doc = creds.to_doc()
+    assert SCRAM_SHA_1 in doc
+    round_tripped = StoredCredentials.from_doc(doc, mechanism=SCRAM_SHA_1)
+    assert round_tripped.stored_key == creds.stored_key
+    assert round_tripped.server_key == creds.server_key
+    assert round_tripped.mechanism == SCRAM_SHA_1
+
+
+def test_derive_credentials_sha1_and_sha256_diverge() -> None:
+    """Same password produces different stored keys under each mechanism."""
+    sha1 = derive_credentials("p", salt=b"\x00" * 16, mechanism=SCRAM_SHA_1, username="u")
+    sha256 = derive_credentials("p", salt=b"\x00" * 28, mechanism=SCRAM_SHA_256)
+    assert sha1.stored_key != sha256.stored_key
+    assert len(sha1.stored_key) == 20
+    assert len(sha256.stored_key) == 32
+
+
+def test_derive_credentials_sha1_requires_username() -> None:
+    """SCRAM-SHA-1's legacy prepass mixes the username into the digest,
+    so the function must reject calls that omit it."""
+    with pytest.raises(ValueError, match="username is required"):
+        derive_credentials("p", mechanism=SCRAM_SHA_1)
+
+
+def test_create_user_with_sha1_then_authenticate_via_pymongo(server_no_auth) -> None:
+    """A user provisioned with mechanisms=['SCRAM-SHA-1'] authenticates
+    cleanly when pymongo is told to use that mechanism.
+    """
+    plain = pymongo.MongoClient(server_no_auth.uri)
+    plain.admin.command(
+        {
+            "createUser": "legacy",
+            "pwd": "hunter2",
+            "roles": [],
+            "mechanisms": [SCRAM_SHA_1],
+        }
+    )
+    plain.close()
+
+    authed = pymongo.MongoClient(
+        server_no_auth.uri,
+        username="legacy",
+        password="hunter2",
+        authSource="admin",
+        authMechanism=SCRAM_SHA_1,
+    )
+    info = authed.admin.command("connectionStatus")
+    users = info["authInfo"]["authenticatedUsers"]
+    assert {"user": "legacy", "db": "admin"} in users
+    authed.close()
+
+
+def test_create_user_with_both_mechanisms_authenticates_either_way(server_no_auth) -> None:
+    """A user with mechanisms=['SCRAM-SHA-256', 'SCRAM-SHA-1'] can be
+    reached via either mechanism with the same plaintext password.
+    Mirrors mongod's ability to keep both credential blobs side-by-side.
+    """
+    plain = pymongo.MongoClient(server_no_auth.uri)
+    plain.admin.command(
+        {
+            "createUser": "dual",
+            "pwd": "hunter2",
+            "roles": [],
+            "mechanisms": [SCRAM_SHA_256, SCRAM_SHA_1],
+        }
+    )
+    plain.close()
+
+    for mech in (SCRAM_SHA_256, SCRAM_SHA_1):
+        cli = pymongo.MongoClient(
+            server_no_auth.uri,
+            username="dual",
+            password="hunter2",
+            authSource="admin",
+            authMechanism=mech,
+        )
+        cli.admin.command("ping")
+        cli.close()
+
+
+def test_sasl_supported_mechs_reflects_user_record(server_no_auth) -> None:
+    """`hello.saslSupportedMechs` reports exactly the mechanisms the
+    named user has credentials for, in modern-first order. A SHA-1-only
+    user gets ``[SCRAM-SHA-1]``; a dual user gets both.
+    """
+    plain = pymongo.MongoClient(server_no_auth.uri)
+    plain.admin.command(
+        {"createUser": "sha1only", "pwd": "p", "roles": [], "mechanisms": [SCRAM_SHA_1]}
+    )
+    plain.admin.command(
+        {
+            "createUser": "dualmech",
+            "pwd": "p",
+            "roles": [],
+            "mechanisms": [SCRAM_SHA_256, SCRAM_SHA_1],
+        }
+    )
+
+    res1 = plain.admin.command({"hello": 1, "saslSupportedMechs": "admin.sha1only"})
+    assert res1["saslSupportedMechs"] == [SCRAM_SHA_1]
+
+    res2 = plain.admin.command({"hello": 1, "saslSupportedMechs": "admin.dualmech"})
+    assert res2["saslSupportedMechs"] == [SCRAM_SHA_256, SCRAM_SHA_1]
+
+    # Unknown principal: fall back to the modern default.
+    res3 = plain.admin.command({"hello": 1, "saslSupportedMechs": "admin.ghost"})
+    assert res3["saslSupportedMechs"] == [SCRAM_SHA_256]
+
+    plain.close()
+
+
+# ----------------------------------------------------------------------
+# SASLprep
+# ----------------------------------------------------------------------
+
+
+def test_saslprep_ascii_passes_through_unchanged() -> None:
+    """RFC 4013 §2.5: ASCII-only strings are pass-through."""
+    from secantus.auth import saslprep
+
+    assert saslprep("hunter2") == "hunter2"
+    assert saslprep("") == ""
+    # ASCII space is allowed (not in mapping table B.1).
+    assert saslprep("a b c") == "a b c"
+
+
+def test_saslprep_strips_table_b1() -> None:
+    """Table B.1 characters map to nothing — soft hyphen, ZWJ, etc."""
+    from secantus.auth import saslprep
+
+    # ­ SOFT HYPHEN (B.1) → removed.
+    assert saslprep("ab­cd") == "abcd"
+    # ‍ ZERO WIDTH JOINER (B.1) → removed.
+    assert saslprep("xy‍z") == "xyz"
+
+
+def test_saslprep_maps_non_ascii_space_to_ascii_space() -> None:
+    """Table C.1.2 — non-ASCII whitespace → U+0020.
+
+    Mapping happens in stage 1 before the prohibit check in stage 3,
+    so NBSP becomes ASCII space and the post-mapping string contains
+    ASCII space (C.1.1, not C.1.2) which is allowed.
+    """
+    from secantus.auth import saslprep
+
+    # NBSP (U+00A0) maps to ASCII space (U+0020).
+    assert saslprep("a b") == "a b"
+
+
+def test_saslprep_nfkc_normalisation() -> None:
+    """Stage 2: NFKC compatibility decomposition + canonical compose."""
+    from secantus.auth import saslprep
+
+    # ﬁ (ﬁ) is the LATIN SMALL LIGATURE FI; NFKC decomposes to
+    # ASCII "fi".
+    assert saslprep("aﬁb") == "afib"
+
+
+def test_saslprep_rejects_prohibited() -> None:
+    """C.2.1 (ASCII control), C.5 (surrogates), etc."""
+    from secantus.auth import AuthError, saslprep
+
+    #  NUL (C.2.1) — ASCII control.
+    with pytest.raises(AuthError, match="prohibited"):
+        saslprep("a\x00b")
+    # ‎ LEFT-TO-RIGHT MARK (C.8) — change-display.
+    with pytest.raises(AuthError, match="prohibited"):
+        saslprep("‎")
+
+
+def test_saslprep_bidi_check() -> None:
+    """A string with R/AL must not contain L."""
+    from secantus.auth import AuthError, saslprep
+
+    # Hebrew "shalom" prefixed by Latin → R/AL + L → reject.
+    with pytest.raises(AuthError, match="bidirectional"):
+        saslprep("aשלום")
+
+    # All-Hebrew passes.
+    saslprep("שלום")
+
+
+def test_derive_credentials_applies_saslprep_for_sha256() -> None:
+    """SCRAM-SHA-256 derivation runs the password through SASLprep
+    before PBKDF2. Two passwords that SASLprep maps to the same
+    canonical form must produce identical credentials (with the same
+    salt/iterations).
+    """
+    salt = b"\x00" * 28
+    # ­ (soft hyphen) maps to nothing. So "pa­ss" and "pass"
+    # produce identical SCRAM-SHA-256 stored credentials.
+    a = derive_credentials("pa­ss", salt=salt)
+    b = derive_credentials("pass", salt=salt)
+    assert a.stored_key == b.stored_key
+    assert a.server_key == b.server_key
+
+
+def test_derive_credentials_saslprep_rejects_prohibited_password() -> None:
+    """A password containing prohibited characters surfaces as AuthError."""
+    from secantus.auth import AuthError
+
+    with pytest.raises(AuthError, match="prohibited"):
+        derive_credentials("bad\x00pwd")

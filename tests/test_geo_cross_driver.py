@@ -11,10 +11,9 @@ a small canonical workload run through each driver:
   * `$geoWithin` with `$centerSphere` — assert the close two come back
   * `$geoNear` aggregation — assert ordering + distances
 
-Each test self-skips if its driver tooling isn't on PATH. Java is not
-covered here because a single-file Java program can't pull in the
-driver jar without Maven/Gradle scaffolding; the gap is documented in
-``tasks/backlog.md``.
+Each test self-skips if its driver tooling isn't on PATH. Java
+coverage rides on the same uber-jar built by
+``tests/cross_driver/java/`` for the feature smoke matrix.
 """
 
 from __future__ import annotations
@@ -131,19 +130,31 @@ def _ensure_node_modules() -> bool:
     """Install mongodb npm package once; cached in the dir for re-runs.
 
     Returns False if `npm install` fails (e.g. offline). The pytest
-    skipif then passes the failure reason through.
+    skipif then passes the failure reason through. The flock + the
+    ``mongodb`` sub-directory existence check guard against parallel
+    xdist workers racing on the install (see the matching helper in
+    ``test_cross_driver_features.py`` for the full rationale).
     """
     nm = _NODE_SMOKE_DIR / "node_modules"
-    if nm.is_dir():
+    if nm.is_dir() and (nm / "mongodb").is_dir():
         return True
     if _NPM is None:
         return False
-    result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
-    return result.returncode == 0 and nm.is_dir()
+    import fcntl
+
+    lock_path = _NODE_SMOKE_DIR / ".node_modules.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if (nm / "mongodb").is_dir():
+            return True
+        result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
+        return result.returncode == 0 and (nm / "mongodb").is_dir()
 
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
 def test_geo_smoke_via_node_driver(server: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
@@ -186,5 +197,79 @@ def test_geo_smoke_via_go_driver(server: SecantusDBServer) -> None:
     )
     assert result.returncode == 0, (
         f"go smoke exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# --- Java (mongo-java-driver) ---------------------------------------------
+
+
+_JAVA = shutil.which("java")
+_GRADLE = shutil.which("gradle")
+_JAVA_SMOKE_DIR = _CROSS_DRIVER / "java"
+_JAVA_SMOKES_JAR = _JAVA_SMOKE_DIR / "build" / "libs" / "secantus-java-smokes-all.jar"
+
+
+def _java_smokes_jar_is_fresh() -> bool:
+    """True if the cached uber-jar exists AND is newer than every
+    ``.java`` source under ``tests/cross_driver/java/src/``. Stale
+    detection — see the matching helper in
+    ``test_cross_driver_features.py`` for the full rationale.
+    """
+    if not _JAVA_SMOKES_JAR.is_file():
+        return False
+    jar_mtime = _JAVA_SMOKES_JAR.stat().st_mtime
+    src_root = _JAVA_SMOKE_DIR / "src"
+    return all(path.stat().st_mtime <= jar_mtime for path in src_root.rglob("*.java"))
+
+
+def _ensure_java_smokes_jar() -> bool:
+    """Build the Java smokes uber-jar if not present or stale.
+
+    The jar is shared with ``tests/test_cross_driver_features.py`` —
+    whichever test runs first incurs the build cost; the rest reuse it.
+    The flock guards against parallel xdist workers racing on the
+    Gradle build, and the mtime check rebuilds when any ``.java``
+    source has been touched since the cached jar was written (see the
+    matching helper in ``test_cross_driver_features.py`` for the full
+    rationale).
+    """
+    if _java_smokes_jar_is_fresh():
+        return True
+    if _GRADLE is None or _JAVA is None:
+        return False
+    import fcntl
+
+    lock_path = _JAVA_SMOKE_DIR / ".smokesjar.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if _java_smokes_jar_is_fresh():
+            return True
+        result = _run(
+            [_GRADLE, "smokesJar", "--no-daemon", "-q"],
+            cwd=_JAVA_SMOKE_DIR,
+            timeout=600.0,
+        )
+        return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
+def test_geo_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    import os as _os
+
+    env = {**_os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_JAVA, "-cp", str(_JAVA_SMOKES_JAR), "com.secantus.smokes.GeoSmoke"],
+        env=env,
+        timeout=120.0,
+    )
+    assert result.returncode == 0, (
+        f"java geo smoke exited {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout

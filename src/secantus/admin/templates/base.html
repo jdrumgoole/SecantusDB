@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title }} — SecantusDB admin</title>
+    <link rel="stylesheet" href="/static/css/admin.css" />
+    <script src="/static/js/htmx.min.js" defer></script>
+    <script src="/static/js/alpine.min.js" defer></script>
+    <script src="/static/js/chart.umd.min.js" defer></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">●</span>
+        <span class="brand-name">SecantusDB</span>
+      </div>
+      <nav>
+        <ul>
+          <li><a href="/" class="{% if active == 'dashboard' %}nav-current{% endif %}">Dashboard</a></li>
+          <li><a href="/db" class="{% if active == 'databases' %}nav-current{% endif %}">Databases</a></li>
+          <li><a href="/users" class="{% if active == 'users' %}nav-current{% endif %}">Users</a></li>
+          <li><a href="/changestream" class="{% if active == 'changestream' %}nav-current{% endif %}">Change stream</a></li>
+          <li><a href="/console" class="{% if active == 'console' %}nav-current{% endif %}">Console</a></li>
+          <li><a href="/connections" class="{% if active == 'connections' %}nav-current{% endif %}">Connections</a></li>
+          <li><a href="/cursors" class="{% if active == 'cursors' %}nav-current{% endif %}">Cursors</a></li>
+          <li><a href="/profiler" class="{% if active == 'profiler' %}nav-current{% endif %}">Profiler</a></li>
+        </ul>
+      </nav>
+    </aside>
+    <main class="content">
+      <header class="page-header">
+        <h1>{{ title }}</h1>
+      </header>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

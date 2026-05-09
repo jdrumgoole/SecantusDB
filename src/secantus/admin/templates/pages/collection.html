@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <a href="/db">Databases</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}">{{ db_name }}</a>
+  <span class="sep">/</span>
+  <span>{{ coll_name }}</span>
+</nav>
+
+<div class="page-actions">
+  <a class="btn-secondary" href="/db/{{ db_name }}/{{ coll_name }}/indexes">Indexes</a>
+  <a class="btn-secondary" href="/db/{{ db_name }}/{{ coll_name }}/explain">Explain plan</a>
+</div>
+
+<form class="filter-form" method="get" action="/db/{{ db_name }}/{{ coll_name }}">
+  <label class="filter-label">
+    Filter (Extended JSON)
+    <textarea name="filter" rows="2" placeholder='e.g. {"status": "active"}'>{{ raw_filter }}</textarea>
+  </label>
+  <div class="filter-controls">
+    <label>
+      Sort _id
+      <select name="sort">
+        <option value="asc" {% if sort == 'asc' %}selected{% endif %}>ascending</option>
+        <option value="desc" {% if sort == 'desc' %}selected{% endif %}>descending</option>
+      </select>
+    </label>
+    <label>
+      Page size
+      <input type="number" name="page_size" value="{{ page_size }}" min="1" max="200" />
+    </label>
+    <button type="submit">Apply</button>
+  </div>
+</form>
+
+{% for msg in errors %}
+  <div class="error">{{ msg }}</div>
+{% endfor %}
+
+{% if rows %}
+  <table class="data-table docs-table">
+    <thead>
+      <tr>
+        <th>_id</th>
+        <th>Document</th>
+        <th class="doc-actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+        {% include "partials/doc_row.html" %}
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if next_cursor %}
+    <div class="pager">
+      <a href="/db/{{ db_name }}/{{ coll_name }}?filter={{ raw_filter | urlencode }}&sort={{ sort }}&page_size={{ page_size }}&cursor={{ next_cursor | urlencode }}">
+        Next page →
+      </a>
+    </div>
+  {% endif %}
+{% elif not errors %}
+  <p class="empty">No documents match.</p>
+{% endif %}
+
+<div id="modal"></div>
+{% endblock %}

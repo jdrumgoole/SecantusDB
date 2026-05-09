@@ -1,0 +1,33 @@
+<div class="modal-overlay" @click.self="document.getElementById('modal').innerHTML = ''">
+  <div class="modal">
+    <header class="modal-header">
+      <h2>Edit document</h2>
+      <button
+        type="button"
+        class="modal-close"
+        @click="document.getElementById('modal').innerHTML = ''"
+        aria-label="Close"
+      >×</button>
+    </header>
+    <form
+      hx-post="/db/{{ db_name }}/{{ coll_name }}/docs/{{ id_token }}"
+      hx-target="#row-{{ id_token }}"
+      hx-swap="outerHTML"
+      hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
+    >
+      <p class="modal-meta">_id: <code>{{ doc_id }}</code> (immutable)</p>
+      {% if error %}
+        <div class="error">{{ error }}</div>
+      {% endif %}
+      <textarea name="body" rows="20" spellcheck="false">{{ doc_json }}</textarea>
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="document.getElementById('modal').innerHTML = ''"
+        >Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </div>
+</div>

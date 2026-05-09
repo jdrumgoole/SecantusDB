@@ -96,7 +96,8 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
             return False
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             return False
-        if "pattern" in schema and not re.search(schema["pattern"], value):
+        # Route through _compile_regex so the pattern-length cap fires.
+        if "pattern" in schema and not _compile_regex(schema["pattern"], 0).search(value):
             return False
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
@@ -490,8 +491,21 @@ def _re_flags(flags_input: Any) -> int:
     return flags
 
 
+# Hard cap on user-supplied regex pattern length. Python's `re` has no
+# match timeout, so a catastrophic-backtracking pattern like `(a+)+$`
+# applied to a long string hangs the worker thread permanently. Capping
+# the pattern length is a coarse but effective mitigation — real-world
+# legitimate patterns are well under this — and it sidesteps the worst
+# ReDoS family without pulling in the `regex` package.
+_MAX_REGEX_PATTERN_LEN = 1000
+
+
 @lru_cache(maxsize=1024)
 def _compile_regex(pattern: str | bytes, flags: int) -> re.Pattern:
+    if hasattr(pattern, "__len__") and len(pattern) > _MAX_REGEX_PATTERN_LEN:
+        raise QueryError(
+            f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
+        )
     return re.compile(pattern, flags)
 
 

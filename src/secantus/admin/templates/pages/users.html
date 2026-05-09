@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <span>Home database</span>
+  <span class="sep">/</span>
+  <form method="get" action="/users" class="inline-form">
+    <input
+      type="text"
+      name="db"
+      value="{{ db_name }}"
+      class="confirm-input inline-db-input"
+      autocomplete="off"
+    />
+    <button type="submit">Switch</button>
+  </form>
+  <span class="sep">/</span>
+  <a href="/roles">Built-in roles</a>
+</nav>
+
+{% if error %}
+  <div class="error">{{ error }}</div>
+{% endif %}
+
+<details class="create-form-shell" open>
+  <summary>Create user</summary>
+  <form
+    class="filter-form"
+    method="post"
+    action="/users?db={{ db_name }}"
+    hx-post="/users?db={{ db_name }}"
+    hx-swap="none"
+    hx-on::after-request="if(event.detail.successful) window.location.reload()"
+  >
+    <div class="filter-controls">
+      <label>
+        Username
+        <input type="text" name="username" required autocomplete="off" />
+      </label>
+      <label>
+        Password
+        <input type="password" name="password" required autocomplete="new-password" />
+      </label>
+    </div>
+    <label class="filter-label">
+      Roles (bound to this home database)
+      <span class="roles-grid">
+        {% for role in all_roles %}
+          <label class="checkbox-label">
+            <input type="checkbox" name="roles" value="{{ role }}@{{ db_name }}" />
+            {{ role }}
+          </label>
+        {% endfor %}
+      </span>
+    </label>
+    <div class="modal-actions">
+      <button type="submit">Create user</button>
+    </div>
+  </form>
+</details>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>User</th>
+      <th>Roles</th>
+      <th class="doc-actions-col">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for u in users %}
+      <tr id="user-{{ u.user }}">
+        <td><code>{{ u.user }}</code></td>
+        <td>
+          {% for r in u.roles %}
+            <span class="badge">{{ r.role }}@{{ r.db }}</span>
+          {% endfor %}
+        </td>
+        <td class="doc-actions">
+          <button
+            type="button"
+            class="btn-secondary"
+            hx-get="/users/{{ db_name }}/{{ u.user }}/password"
+            hx-target="#modal"
+            hx-swap="innerHTML"
+          >Password</button>
+          <button
+            type="button"
+            class="btn-secondary"
+            hx-get="/users/{{ db_name }}/{{ u.user }}/roles"
+            hx-target="#modal"
+            hx-swap="innerHTML"
+          >Roles</button>
+          <button
+            type="button"
+            class="btn-danger"
+            hx-get="/users/{{ db_name }}/{{ u.user }}/drop-confirm"
+            hx-target="#modal"
+            hx-swap="innerHTML"
+          >Drop</button>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3" class="empty">No users on this database.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div id="modal"></div>
+{% endblock %}

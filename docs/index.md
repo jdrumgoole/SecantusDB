@@ -1,18 +1,18 @@
 # SecantusDB
 
 :::{warning}
-**Alpha software.**
+**Beta software.**
 
-SecantusDB is in early development. The Python API surface (CLI flags,
-public class signatures) is still settling and may shift between point
-releases. **The on-disk format is WiredTiger's** — the same engine
-MongoDB uses — and the schema we layer on top (collection / index /
-oplog tables) has been stable across releases; the test suite runs
-against real on-disk WiredTiger storage and the persistence tests
-explicitly verify close-and-reopen round-trips. That said, we don't
-yet ship a migration tool or a formal compatibility guarantee, so
-please don't put production data here yet — production deployments
-that need durable data across upgrades should still run a real `mongod`.
+SecantusDB is past initial proving but the Python API surface (CLI
+flags, public class signatures) may still shift before 1.0. **The
+on-disk format is WiredTiger's** — the same engine MongoDB uses —
+and the schema we layer on top (collection / index / oplog tables)
+has been stable across releases; the test suite runs against real
+on-disk WiredTiger storage and the persistence tests explicitly
+verify close-and-reopen round-trips. That said, we don't yet ship a
+migration tool or a formal compatibility guarantee, so please don't
+put production data here yet — production deployments that need
+durable data across upgrades should still run a real `mongod`.
 :::
 
 **Drop-in MongoDB for single-node applications.** SecantusDB is a real
@@ -33,7 +33,7 @@ There are two ways to use it:
 - **Standalone daemon** — `pip install` puts a `secantusdb` script on
   `PATH` that runs the server like a `mongod`. Drop-in replacement for a
   single-node `mongod` in dev / CI / small production-shaped workloads
-  where the alpha caveats are acceptable.
+  where the beta caveats are acceptable.
 
 Single-node only by design. Replica sets, sharding, and anything that
 depends on real cluster topology are out of scope — but within the

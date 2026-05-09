@@ -1,0 +1,20 @@
+<tr id="row-{{ row.id_token }}">
+  <td class="doc-id">{{ row.id }}</td>
+  <td><pre class="doc-body">{{ row.json }}</pre></td>
+  <td class="doc-actions">
+    <button
+      type="button"
+      class="btn-secondary"
+      hx-get="/db/{{ db_name }}/{{ coll_name }}/docs/{{ row.id_token }}/edit"
+      hx-target="#modal"
+      hx-swap="innerHTML"
+    >Edit</button>
+    <button
+      type="button"
+      class="btn-danger"
+      hx-get="/db/{{ db_name }}/{{ coll_name }}/docs/{{ row.id_token }}/delete-confirm"
+      hx-target="#modal"
+      hx-swap="innerHTML"
+    >Delete</button>
+  </td>
+</tr>

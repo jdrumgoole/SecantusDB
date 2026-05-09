@@ -1,23 +1,23 @@
-"""SCRAM-SHA-256 authentication.
+"""SCRAM authentication (SHA-256 + SHA-1).
 
-Implements MongoDB's default authentication mechanism end-to-end on the
-wire: PBKDF2-HMAC-SHA-256 password derivation per RFC 7677, the SCRAM
-challenge / response state machine per RFC 5802, and the per-connection
-state pymongo / mongo-go-driver expect across saslStart / saslContinue.
+Implements MongoDB's authentication mechanisms end-to-end on the
+wire: PBKDF2 password derivation per RFC 7677 (SCRAM-SHA-256) and
+RFC 5802 (SCRAM-SHA-1), the challenge/response state machine, and
+per-connection state pymongo / mongo-go-driver expect across
+saslStart / saslContinue.
+
+Both mechanisms share the same wire flow (n, GS2 header, auth message
+construction, proof verification) — the only differences are the hash
+algorithm (SHA-256 vs SHA-1), the salt length (28 vs 16 bytes), and the
+default iteration count (15000 vs 10000). A user record can carry
+credentials for both mechanisms simultaneously (as real mongod does)
+so legacy clients pinned to SHA-1 and modern clients defaulting to
+SHA-256 can authenticate the same user.
 
 What's intentionally NOT here:
 
-- Authorization (RBAC): an authenticated user is treated as fully
-  privileged; ``createUser`` accepts a ``roles`` array but never
-  consults it on subsequent commands. Role enforcement is a separate
-  slice — see ``tasks/backlog.md``.
-- SASLprep / RFC 4013 password normalisation: ASCII-only passwords work
-  byte-identically against real ``mongod``; non-ASCII passwords may
-  diverge from a SASLprepping client's expectation.
-- SCRAM-SHA-1: the legacy mechanism. Modern drivers default to
-  SCRAM-SHA-256; we only advertise that one.
-- Speculative authentication (auth folded into ``hello`` reply) — we
-  honour the explicit ``saslStart`` round-trip instead.
+- Authorization (RBAC): see ``secantus.rbac``; integrated into the
+  command dispatcher as a separate concern.
 """
 
 from __future__ import annotations
@@ -26,13 +26,42 @@ import base64
 import hashlib
 import hmac
 import secrets
+import stringprep
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
 SCRAM_SHA_256 = "SCRAM-SHA-256"
+SCRAM_SHA_1 = "SCRAM-SHA-1"
+SUPPORTED_MECHS = (SCRAM_SHA_256, SCRAM_SHA_1)
+
 DEFAULT_ITERATIONS = 15000  # MongoDB default for SCRAM-SHA-256
 NONCE_BYTES = 24
 SALT_BYTES = 28
+
+
+# Per-mechanism parameters. ``hash_name`` is the OpenSSL hash identifier
+# passed to PBKDF2 + HMAC; ``dklen`` is the digest size in bytes;
+# ``default_iterations`` matches mongod's per-mechanism default; salt
+# length follows RFC 5802 / 7677 (16 bytes for SHA-1, 28 for SHA-256).
+_MECH_PARAMS: dict[str, dict[str, Any]] = {
+    SCRAM_SHA_256: {
+        "hash_name": "sha256",
+        "dklen": 32,
+        "default_iterations": 15000,
+        "salt_bytes": 28,
+    },
+    SCRAM_SHA_1: {
+        "hash_name": "sha1",
+        "dklen": 20,
+        "default_iterations": 10000,
+        "salt_bytes": 16,
+    },
+}
+
+
+def _hash_for(mechanism: str) -> Any:
+    return getattr(hashlib, _MECH_PARAMS[mechanism]["hash_name"])
 
 
 class AuthError(Exception):
@@ -41,21 +70,23 @@ class AuthError(Exception):
 
 @dataclass
 class StoredCredentials:
-    """SCRAM-SHA-256 credentials persisted per user.
+    """SCRAM credentials for a single mechanism, persisted per user.
 
     These are exactly the fields a real ``mongod`` keeps in
-    ``admin.system.users[].credentials["SCRAM-SHA-256"]``. The plaintext
-    password is never stored.
+    ``admin.system.users[].credentials[<mechanism>]``. The plaintext
+    password is never stored. ``mechanism`` is one of
+    ``SCRAM_SHA_256`` / ``SCRAM_SHA_1``.
     """
 
     iteration_count: int
     salt: bytes
     stored_key: bytes
     server_key: bytes
+    mechanism: str = SCRAM_SHA_256
 
     def to_doc(self) -> dict[str, object]:
         return {
-            SCRAM_SHA_256: {
+            self.mechanism: {
                 "iterationCount": self.iteration_count,
                 "salt": base64.b64encode(self.salt).decode("ascii"),
                 "storedKey": base64.b64encode(self.stored_key).decode("ascii"),
@@ -64,46 +95,182 @@ class StoredCredentials:
         }
 
     @classmethod
-    def from_doc(cls, doc: dict[str, object]) -> StoredCredentials:
-        sub = doc[SCRAM_SHA_256]  # type: ignore[index]
+    def from_doc(
+        cls, doc: dict[str, object], *, mechanism: str = SCRAM_SHA_256
+    ) -> StoredCredentials:
+        if mechanism not in doc:
+            raise KeyError(f"credentials doc has no entry for {mechanism!r}")
+        sub = doc[mechanism]
         assert isinstance(sub, dict)
         return cls(
             iteration_count=int(sub["iterationCount"]),
             salt=base64.b64decode(sub["salt"]),
             stored_key=base64.b64decode(sub["storedKey"]),
             server_key=base64.b64decode(sub["serverKey"]),
+            mechanism=mechanism,
         )
+
+
+def saslprep(text: str) -> str:
+    """Apply RFC 4013 SASLprep to ``text``.
+
+    SASLprep is a profile of stringprep (RFC 3454) for SASL passwords.
+    The stages, in order:
+
+    1. **Map** characters per RFC 4013 §2.1: stringprep table B.1
+       (characters that map to nothing — soft hyphen, zero-width
+       joiners, etc.) maps to empty; non-ASCII whitespace (table
+       C.1.2) maps to ASCII space ``\\u0020``.
+    2. **Normalize** with NFKC (RFC 4013 §2.2).
+    3. **Prohibit** characters per RFC 4013 §2.3 (control codes,
+       private use, non-characters, surrogates, invalid Unicode,
+       inappropriate-for-plain-text and -for-canonical-representation
+       sets, change-display-and-deprecated, tagging characters).
+       Raises ``AuthError`` if any prohibited code point appears.
+    4. **Bidirectional check** (RFC 3454 §6): a string with R or AL
+       characters cannot also contain L characters; if it has any
+       R/AL it must start AND end with R or AL. Raises ``AuthError``
+       on violation.
+
+    For ASCII-only passwords this is the identity function (no
+    mapping, normalization is a no-op, no prohibited chars, no bidi
+    issues). The function is therefore safe to apply unconditionally
+    — non-conformant clients with ASCII passwords keep working.
+    """
+    # Stage 1: map.
+    out_chars: list[str] = []
+    for ch in text:
+        # Table B.1: Commonly mapped to nothing.
+        if stringprep.in_table_b1(ch):
+            continue
+        # Table C.1.2: Non-ASCII space → ASCII space.
+        if stringprep.in_table_c12(ch):
+            out_chars.append(" ")
+            continue
+        out_chars.append(ch)
+    mapped = "".join(out_chars)
+
+    # Stage 2: normalize (NFKC).
+    normalized = unicodedata.normalize("NFKC", mapped)
+
+    # Stage 3: prohibit.
+    prohibit_tables = (
+        stringprep.in_table_c12,  # non-ASCII space (post-mapping these should be ASCII)
+        stringprep.in_table_c21_c22,  # ASCII + non-ASCII control
+        stringprep.in_table_c3,  # private use
+        stringprep.in_table_c4,  # non-character code points
+        stringprep.in_table_c5,  # surrogates
+        stringprep.in_table_c6,  # inappropriate for plain text
+        stringprep.in_table_c7,  # inappropriate for canonical representation
+        stringprep.in_table_c8,  # change display + deprecated
+        stringprep.in_table_c9,  # tagging characters
+    )
+    for ch in normalized:
+        for predicate in prohibit_tables:
+            if predicate(ch):
+                raise AuthError(f"SASLprep: prohibited character {ch!r} (U+{ord(ch):04X})")
+
+    # Stage 4: bidirectional check (RFC 3454 §6).
+    has_r_al = any(stringprep.in_table_d1(ch) for ch in normalized)
+    has_l = any(stringprep.in_table_d2(ch) for ch in normalized)
+    if has_r_al and has_l:
+        raise AuthError(
+            "SASLprep: bidirectional check failed — string contains both R/AL and L characters"
+        )
+    if (
+        has_r_al
+        and normalized
+        and not (stringprep.in_table_d1(normalized[0]) and stringprep.in_table_d1(normalized[-1]))
+    ):
+        raise AuthError(
+            "SASLprep: bidirectional check failed — R/AL string must "
+            "start and end with R/AL characters"
+        )
+
+    return normalized
+
+
+def _scram_password_digest(username: str, password: str, mechanism: str) -> bytes:
+    """Return the byte string PBKDF2 should hash for the given mechanism.
+
+    SCRAM-SHA-256 (RFC 7677) requires SASLprep on the password before
+    PBKDF2; ASCII passwords are pass-through, non-ASCII passwords get
+    Unicode-normalised. ``saslprep`` is applied here so the PBKDF2
+    input matches what a SASLprepping client (pymongo, mongo-go-driver
+    via auth/scram, Java driver) sends.
+
+    SCRAM-SHA-1 in MongoDB applies a legacy *password prepass*:
+    ``hex(MD5(username + ":mongo:" + password))``. The prepass exists
+    so MongoDB 3.x could honour passwords originally stored under the
+    pre-SCRAM ``MONGODB-CR`` scheme, which used exactly this digest as
+    its "password" input. Every modern driver (pymongo, mongo-go-driver,
+    Java, Node) applies the same prepass in its SCRAM-SHA-1 path, so to
+    accept those clients we have to apply it server-side too. Without
+    this the PBKDF2 input bytes would diverge and authentication would
+    fail at the proof step.
+    """
+    if mechanism == SCRAM_SHA_1:
+        digest = hashlib.md5(  # noqa: S324 - legacy MongoDB prepass, not security-sensitive
+            f"{username}:mongo:{password}".encode()
+        ).hexdigest()
+        return digest.encode("utf-8")
+    # SCRAM-SHA-256 path: apply SASLprep.
+    return saslprep(password).encode("utf-8")
 
 
 def derive_credentials(
     password: str,
     *,
-    iterations: int = DEFAULT_ITERATIONS,
+    iterations: int | None = None,
     salt: bytes | None = None,
+    mechanism: str = SCRAM_SHA_256,
+    username: str = "",
 ) -> StoredCredentials:
-    """Derive SCRAM-SHA-256 stored credentials from a plaintext password.
+    """Derive SCRAM stored credentials from a plaintext password.
 
     Layout matches RFC 5802 §3:
 
-        SaltedPassword = PBKDF2(HMAC-SHA-256, password, salt, iterations)
+        SaltedPassword = PBKDF2(HMAC-<hash>, prepassed-password, salt, iterations)
         ClientKey      = HMAC(SaltedPassword, "Client Key")
-        StoredKey      = SHA-256(ClientKey)
+        StoredKey      = <hash>(ClientKey)
         ServerKey      = HMAC(SaltedPassword, "Server Key")
 
-    The plaintext password is dropped on return; only StoredKey,
-    ServerKey, salt, and iteration count are kept.
+    where ``<hash>`` is SHA-256 for ``SCRAM-SHA-256`` and SHA-1 for
+    ``SCRAM-SHA-1``. ``prepassed-password`` is the raw UTF-8 password
+    for SCRAM-SHA-256 and ``hex(MD5(username + ":mongo:" + password))``
+    for SCRAM-SHA-1 (see ``_scram_password_digest``). The plaintext is
+    dropped on return.
+
+    ``username`` is required when ``mechanism`` is SCRAM-SHA-1 because
+    the legacy prepass mixes it into the digest. For SCRAM-SHA-256 it
+    is ignored.
     """
+    if mechanism not in _MECH_PARAMS:
+        raise ValueError(f"unsupported SCRAM mechanism: {mechanism!r}")
+    if mechanism == SCRAM_SHA_1 and not username:
+        raise ValueError(
+            "username is required to derive SCRAM-SHA-1 credentials "
+            "(MongoDB's legacy prepass mixes it into the digest)"
+        )
+    params = _MECH_PARAMS[mechanism]
+    if iterations is None:
+        iterations = int(params["default_iterations"])
     if salt is None:
-        salt = secrets.token_bytes(SALT_BYTES)
-    salted = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
-    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
-    stored_key = hashlib.sha256(client_key).digest()
-    server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+        salt = secrets.token_bytes(int(params["salt_bytes"]))
+    hash_obj = _hash_for(mechanism)
+    pbkdf2_input = _scram_password_digest(username, password, mechanism)
+    salted = hashlib.pbkdf2_hmac(
+        params["hash_name"], pbkdf2_input, salt, iterations, dklen=params["dklen"]
+    )
+    client_key = hmac.new(salted, b"Client Key", hash_obj).digest()
+    stored_key = hash_obj(client_key).digest()
+    server_key = hmac.new(salted, b"Server Key", hash_obj).digest()
     return StoredCredentials(
         iteration_count=iterations,
         salt=salt,
         stored_key=stored_key,
         server_key=server_key,
+        mechanism=mechanism,
     )
 
 
@@ -139,15 +306,16 @@ def begin_scram(
     db_name: str,
     payload: bytes,
     creds: StoredCredentials | None,
+    mechanism: str = SCRAM_SHA_256,
 ) -> tuple[bytes, ScramState]:
     """Process a SCRAM client-first message and return (server-first payload, state).
 
     ``creds`` is the looked-up StoredCredentials for ``(db_name, user)``,
     or None if no such user exists. Either way we generate a server-first
     reply: when the user is missing we substitute fabricated credentials
-    so the caller can finish the SCRAM round-trip and surface
-    ``AuthenticationFailed`` only after the client proof step. This
-    matches real ``mongod``'s timing behaviour.
+    (under the requested ``mechanism``) so the caller can finish the
+    SCRAM round-trip and surface ``AuthenticationFailed`` only after
+    the client proof step. This matches real ``mongod``'s timing.
     """
     if not payload.startswith(b"n,"):
         raise AuthError("invalid SCRAM client-first: expected GS2 header 'n,,'")
@@ -165,7 +333,13 @@ def begin_scram(
     if creds is None:
         # Fabricate credentials with the right shape so we can run through
         # the rest of the protocol; the proof check will fail at step 2.
-        creds = derive_credentials(secrets.token_urlsafe(16))
+        # SCRAM-SHA-1 needs a username for its legacy prepass; the value
+        # itself is fine since the proof will fail anyway.
+        creds = derive_credentials(
+            secrets.token_urlsafe(16),
+            mechanism=mechanism,
+            username=username,
+        )
         user_exists = False
     else:
         user_exists = True
@@ -211,7 +385,8 @@ def continue_scram(state: ScramState, payload: bytes) -> bytes:
     auth_message = (
         state.client_first_bare + b"," + state.server_first + b"," + client_final_without_proof
     )
-    client_signature = hmac.new(state.creds.stored_key, auth_message, hashlib.sha256).digest()
+    hash_obj = _hash_for(state.creds.mechanism)
+    client_signature = hmac.new(state.creds.stored_key, auth_message, hash_obj).digest()
     try:
         client_proof = base64.b64decode(client_proof_b64, validate=False)
     except Exception as exc:  # noqa: BLE001
@@ -219,14 +394,14 @@ def continue_scram(state: ScramState, payload: bytes) -> bytes:
     if len(client_proof) != len(client_signature):
         raise AuthError("authentication failed")
     received_client_key = bytes(a ^ b for a, b in zip(client_proof, client_signature, strict=True))
-    expected_stored = hashlib.sha256(received_client_key).digest()
+    expected_stored = hash_obj(received_client_key).digest()
     # Constant-time compare guards against timing oracles even when
     # user_exists is False.
     if not hmac.compare_digest(expected_stored, state.creds.stored_key):
         raise AuthError("authentication failed")
     if not state.user_exists:
         raise AuthError("authentication failed")
-    server_signature = hmac.new(state.creds.server_key, auth_message, hashlib.sha256).digest()
+    server_signature = hmac.new(state.creds.server_key, auth_message, hash_obj).digest()
     state.step = 2
     return b"v=" + base64.b64encode(server_signature)
 

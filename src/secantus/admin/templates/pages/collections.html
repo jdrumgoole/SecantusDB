@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <a href="/db">Databases</a> <span class="sep">/</span> <span>{{ db_name }}</span>
+</nav>
+{% if error %}
+  <div class="error">Could not list collections: {{ error }}</div>
+{% else %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th class="num">Documents</th>
+        <th class="num">Data size</th>
+        <th class="num">Index size</th>
+        <th>Options</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in collections %}
+        <tr>
+          <td><a href="/db/{{ db_name }}/{{ c.name }}">{{ c.name }}</a></td>
+          <td class="num">{{ "{:,}".format(c.count) }}</td>
+          <td class="num">{{ c.dataSize | humanize_bytes }}</td>
+          <td class="num">{{ c.indexSize | humanize_bytes }}</td>
+          <td>
+            {% if c.options.capped %}
+              <span class="badge">capped</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">No collections.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
@@ -24,13 +25,16 @@ def test(c: Context, k: str = "", verbose: bool = False) -> None:
     if verbose:
         cmd += " -v"
     if k:
-        cmd += f" -k {k!r}"
+        # shlex.quote — `f"{k!r}"` uses Python repr() which wraps in
+        # single quotes but doesn't escape embedded single quotes,
+        # leaving a shell-injection hole on a CLI-supplied filter.
+        cmd += f" -k {shlex.quote(k)}"
     c.run(cmd, pty=True)
 
 
 @task(name="test-one")
 def test_one(c: Context, nodeid: str) -> None:
-    c.run(f"uv run python -m pytest -p no:xdist {nodeid!r}", pty=True)
+    c.run(f"uv run python -m pytest -p no:xdist {shlex.quote(nodeid)}", pty=True)
 
 
 @task
@@ -69,7 +73,34 @@ def fmt(c: Context) -> None:
 
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
-    c.run(f"uv run python -m secantus --host {host} --port {port}", pty=True)
+    c.run(
+        f"uv run python -m secantus --host {shlex.quote(host)} --port {int(port)}",
+        pty=True,
+    )
+
+
+@task(
+    help={
+        "uri": "MongoDB URI to administer.",
+        "port": "Local HTTP port (0 = pick a free one).",
+        "no_window": "Run headless (no pywebview window). Useful for CI.",
+        "token": "Override the auth token. Default: ~/.secantus/admin-token.",
+    }
+)
+def admin(
+    c: Context,
+    uri: str = "mongodb://127.0.0.1:27017",
+    port: int = 0,
+    no_window: bool = False,
+    token: str = "",
+) -> None:
+    """Launch the SecantusDB admin web UI."""
+    cmd = ["uv", "run", "secantusdb-admin", "--uri", uri, "--port", str(port)]
+    if no_window:
+        cmd.append("--no-window")
+    if token:
+        cmd.extend(["--token", token])
+    c.run(" ".join(cmd), pty=True)
 
 
 @task
@@ -81,8 +112,9 @@ def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
     # for a docs build.
     if clean:
         c.run("rm -rf docs/_build", pty=True)
+    qb = shlex.quote(builder)
     c.run(
-        f"uv run --no-sync sphinx-build -W --keep-going -b {builder} docs docs/_build/{builder}",
+        f"uv run --no-sync sphinx-build -W --keep-going -b {qb} docs docs/_build/{qb}",
         pty=True,
     )
 
@@ -105,13 +137,14 @@ def validate(c: Context) -> None:
     """
     import pathlib
 
-    from pymongo_validation.include_paths import INCLUDE
+    from pymongo_validation.include_paths import DESELECT_TESTS, INCLUDE
 
     if not pathlib.Path("vendor/pymongo-tests/test").exists():
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
     paths = " ".join(INCLUDE)
+    deselect = " ".join(f"--deselect={t}" for t in DESELECT_TESTS)
     # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
     # `-p no:xdist -o addopts=`: pymongo's tests aren't xdist-safe (shared DBs);
     #   override the project-wide `addopts="-n auto"` from pyproject.toml.
@@ -131,7 +164,7 @@ def validate(c: Context) -> None:
         "-p no:cacheprovider -p no:xdist -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
         "--json-report --json-report-file=.validation/raw.json "
-        f"--no-header --tb=no -q {paths}",
+        f"--no-header --tb=no -q {deselect} {paths}",
         pty=True,
         warn=True,
     )
@@ -350,7 +383,16 @@ def release_prepare(c: Context, version: str) -> None:
 
     print(f"==> [4/6] Committing + tagging v{version}")
     c.run("git add pyproject.toml src/secantus/__init__.py uv.lock", pty=True)
-    c.run(f'git commit -m "Release v{version}"', pty=True)
+    # If the version is already at ``version`` on HEAD (e.g. because a
+    # parallel-session merge bumped it), the ``git add`` stages nothing
+    # and ``git commit`` would abort with "nothing to commit". Detect
+    # that case and skip the commit — the tag still goes on HEAD which
+    # already carries the right version.
+    staged = c.run("git diff --cached --quiet", warn=True, hide=True)
+    if staged.return_code == 0:
+        print(f"    version already at {version} on HEAD; skipping release commit")
+    else:
+        c.run(f'git commit -m "Release v{version}"', pty=True)
     c.run(f'git tag -a v{version} -m "Release v{version}"', pty=True)
     # Combine the branch and tag pushes into one network round-trip.
     # The publish workflow still fires on the tag ref; nothing else

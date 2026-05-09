@@ -13,11 +13,16 @@ if TYPE_CHECKING:
 
 from secantus.auth import ConnectionAuth
 from secantus.commands import CommandContext, dispatch
+from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorRegistry
+from secantus.logbuf import LogBuffer
+from secantus.metrics import Metrics
+from secantus.sessions import SessionRegistry
 from secantus.storage import Storage
 from secantus.wire import (
     OP_MSG_FLAG_MORE_TO_COME,
     ConnectionClosed,
+    MalformedBodyError,
     OpMsg,
     OpQuery,
     WireProtocolError,
@@ -41,6 +46,18 @@ def _db_from_namespace(ns: str) -> str:
     return db or "admin"
 
 
+# Default per-connection idle timeout. A client that connects and
+# sends nothing (or stalls mid-message) gets disconnected after this
+# many seconds. Without it, a hostile peer can pin a thread forever
+# by holding the socket open and not writing.
+DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
+
+# Default cap on simultaneous client connections. Each connection runs
+# its own dedicated thread; without a cap a TCP-flood DoS exhausts the
+# Python thread pool.
+DEFAULT_MAX_CONNECTIONS = 1000
+
+
 class SecantusDBServer:
     def __init__(
         self,
@@ -50,21 +67,50 @@ class SecantusDBServer:
         *,
         replica_set_name: str | None = "secantus",
         require_auth: bool = False,
+        ttl_sweep_seconds: float = 60.0,
+        client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
     ) -> None:
         self.host = host
         self.port = port
         self.replica_set_name = replica_set_name
         self.require_auth = require_auth
+        self.client_idle_timeout_s = client_idle_timeout_s
+        self.max_connections = max_connections
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._connection_ids = itertools.count(1)
+        # Active connection counter — incremented in _handle_client,
+        # decremented on its way out. Read by _serve_forever to enforce
+        # max_connections.
+        self._active_conns = 0
+        self._active_conns_lock = threading.Lock()
         # Oplog writes are only useful when change-stream clients can
         # connect, which requires replica-set advertisement in `hello`.
         # Skip them in pure-standalone mode to drop a per-write BSON
         # encode + oplog-table cursor write per modified document.
-        self.storage = Storage(storage_path, enable_oplog=replica_set_name is not None)
+        self.storage = Storage(
+            storage_path,
+            enable_oplog=replica_set_name is not None,
+            ttl_sweep_seconds=ttl_sweep_seconds,
+        )
         self.cursors = CursorRegistry()
+        # Per-server counters surfaced through `serverStatus`. Started
+        # eagerly so `start_monotonic` reflects construction time, not
+        # the first command — uptime then matches what users expect.
+        self.metrics = Metrics()
+        # Per-connection visibility (currentOp) and an in-memory log
+        # buffer (getLog). Both initialised eagerly so the registry /
+        # buffer survive the lifetime of the server, not just the first
+        # connection.
+        self.connections = ConnectionRegistry()
+        self.logs = LogBuffer()
+        # Logical-session registry: drivers send an lsid on every
+        # command and bracket session lifetime via ``startSession`` /
+        # ``endSessions`` / ``refreshSessions``. Tracked here so the
+        # session-management commands actually have state to operate
+        # on instead of returning canned ``{ok: 1}``.
+        self.sessions = SessionRegistry()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -115,6 +161,31 @@ class SecantusDBServer:
                 conn, addr = self._socket.accept()
             except OSError:
                 return
+            # Refuse new connections beyond the cap. A flood-DoS attacker
+            # would otherwise spawn a thread per accepted socket. We close
+            # the socket immediately rather than queuing — clients should
+            # see "connection refused" / EOF, not block.
+            with self._active_conns_lock:
+                if self._active_conns >= self.max_connections:
+                    overflowed = True
+                else:
+                    self._active_conns += 1
+                    overflowed = False
+            if overflowed:
+                logger.warning(
+                    "rejecting connection from %s: %d active >= %d cap",
+                    addr,
+                    self._active_conns,
+                    self.max_connections,
+                )
+                with contextlib.suppress(OSError):
+                    conn.close()
+                continue
+            # Set an idle timeout on the socket so a hostile or stuck
+            # peer can't pin a thread forever. Applies to all socket
+            # reads in _handle_client.
+            with contextlib.suppress(OSError):
+                conn.settimeout(self.client_idle_timeout_s)
             handler = threading.Thread(
                 target=self._handle_client,
                 args=(conn, addr),
@@ -123,10 +194,14 @@ class SecantusDBServer:
             handler.start()
 
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
-        connection_id = next(self._connection_ids)
+        connection_id = self.connections.open((addr[0], addr[1]))
         reply_ids = itertools.count(1)
         connection_auth = ConnectionAuth()
+        self.metrics.connection_opened()
         logger.debug("client %d connected from %s", connection_id, addr)
+        self.logs.append(
+            "I", "NETWORK", "connection accepted", {"conn_id": connection_id, "from": addr}
+        )
         try:
             with conn:
                 while not self._stop_event.is_set():
@@ -134,6 +209,36 @@ class SecantusDBServer:
                         message = read_message(conn)
                     except ConnectionClosed:
                         return
+                    except TimeoutError:
+                        # Idle timeout fired — drop the connection so the
+                        # thread can be reaped instead of pinned forever.
+                        logger.debug("client %d idle timeout, closing", connection_id)
+                        return
+                    except MalformedBodyError as exc:
+                        # Body bytes failed BSON validation. Build a
+                        # targeted error reply so the client gets a
+                        # ``BadValue`` and can keep using the connection
+                        # for subsequent commands. Mongod returns the
+                        # same shape — InvalidBSON in a command body is
+                        # not a protocol-level fault.
+                        logger.warning("malformed BSON from %s: %s", addr, exc)
+                        try:
+                            reply = build_op_msg_reply(
+                                response_to=exc.header.request_id,
+                                request_id=next(reply_ids),
+                                body={
+                                    "ok": 0.0,
+                                    "errmsg": str(exc),
+                                    "code": 2,
+                                    "codeName": "BadValue",
+                                },
+                            )
+                            conn.sendall(reply)
+                        except OSError:
+                            # Client may have hung up before we could
+                            # respond; fall through to the close path.
+                            return
+                        continue
                     except WireProtocolError as exc:
                         logger.warning("wire protocol error from %s: %s", addr, exc)
                         return
@@ -154,6 +259,10 @@ class SecantusDBServer:
                             replica_set_name=self.replica_set_name,
                             connection_auth=connection_auth,
                             require_auth=self.require_auth,
+                            metrics=self.metrics,
+                            connections=self.connections,
+                            logs=self.logs,
+                            sessions=self.sessions,
                         )
                         response_doc = dispatch(body, ctx)
                         # `moreToCome` (bit 1) is the wire signal for
@@ -179,6 +288,10 @@ class SecantusDBServer:
                             replica_set_name=self.replica_set_name,
                             connection_auth=connection_auth,
                             require_auth=self.require_auth,
+                            metrics=self.metrics,
+                            connections=self.connections,
+                            logs=self.logs,
+                            sessions=self.sessions,
                         )
                         response_doc = dispatch(op.query, ctx)
                         reply = build_op_reply(
@@ -197,6 +310,10 @@ class SecantusDBServer:
         except Exception:
             logger.exception("unhandled error on connection %d", connection_id)
         finally:
+            self.metrics.connection_closed()
+            self.connections.close(connection_id)
+            with self._active_conns_lock:
+                self._active_conns -= 1
             logger.debug("client %d disconnected", connection_id)
 
     def __enter__(self) -> Self:

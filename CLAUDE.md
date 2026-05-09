@@ -8,7 +8,7 @@ SecantusDB is a **surrogate single-node MongoDB server** written in Python. It s
 
 The name was chosen to dodge brand-clash risk: an early prototype was called "fongo", a follow-on was called "fongodb", and the current name avoids both the existing "Fongo" brand and any confusion with MongoDB itself. Internal references to `fongo` or `fongodb` are stale — flag and rename to `secantus` (or `SecantusDB` for the brand form).
 
-**In scope:** the subset of the MongoDB wire protocol that `pymongo` actually emits — connection handshake, CRUD, cursors, aggregation, findAndModify, and **change streams** (single-node, oplog-backed; collection / db / cluster scope; resume tokens; `fullDocument: "updateLookup"`; `fullDocumentBeforeChange` pre-images; `awaitData` blocking).
+**In scope:** the subset of the MongoDB wire protocol that `pymongo` actually emits — connection handshake, CRUD, cursors, aggregation, findAndModify, and **change streams** (single-node, oplog-backed; collection / db / cluster scope; resume tokens; `fullDocument: "updateLookup"`; `fullDocumentBeforeChange` pre-images; `awaitData` blocking; `splitLargeChangeStreamEvents` envelope — events are never large enough to actually split, so every fragment is `{fragment: 1, of: 1}`, but the field is present when the user opts in).
 
 **Explicitly out of scope:** real replica sets, sharding, multi-node consistency. SecantusDB advertises itself as a single-node `secantus` replica-set primary in the `hello` reply (so `pymongo`'s topology machinery accepts change streams), but the topology is fictional — there are no other members, no elections, no cross-node oplog. If a feature only makes sense in a multi-node deployment, SecantusDB does not implement it.
 
@@ -31,7 +31,7 @@ Layers, roughly outermost-in:
 - `src/secantus/projection.py` — `apply_projection(doc, spec)` for `find()`'s `projection` argument. Inclusion/exclusion modes, `_id` defaults, dotted paths, plus the `$elemMatch` projection operator that returns the first array element matching a sub-filter.
 - `src/secantus/update.py` — pure `apply_update(doc, update)`. Operators: `$set`/`$unset`/`$inc`/`$mul`/`$min`/`$max`/`$push`/`$pull`/`$addToSet`/`$pop`/`$rename`. Replacement-style updates preserve `_id`. Mixing operators with replacement fields is rejected.
 - `src/secantus/expressions.py` — pure `evaluate(expr, doc, vars=None)`. The aggregation expression language: field paths (`"$x.y"`), `$$varname` user vars + `$$ROOT`/`$$CURRENT`, `$literal`, arithmetic, comparison, logical, `$cond`/`$ifNull`, `$size`, dates (`$year`/`$month`/`$dayOfMonth`/`$dayOfWeek`/`$hour`/`$minute`/`$second`/`$dateToString`), strings (`$concat`/`$split`/`$trim`/`$ltrim`/`$rtrim`/`$substrCP`/`$strLenCP`/`$indexOfCP`/`$toLower`/`$toUpper`/`$toString`), arrays (`$arrayElemAt`/`$first`/`$last`/`$slice`/`$concatArrays`/`$reverseArray`/`$in`/`$filter`/`$map`/`$reduce`), conversions (`$toInt`/`$toDouble`/`$toBool`/`$toDecimal`). Used by the aggregation pipeline and by `$expr` in queries.
-- `src/secantus/aggregate.py` — `apply_pipeline(docs, pipeline, ctx)`. Stages: `$match`, `$count`, `$limit`, `$skip`, `$sort`, `$project` (with computed fields), `$addFields`/`$set`, `$unset`, `$unwind`, `$densify` (numeric ranges only — `bounds: "full"` / `[min, max]`, `partitionByFields`, positive `step`; date `unit` deferred), `$replaceRoot`/`$replaceWith`, `$group`, `$lookup` (both simple and `let`/`pipeline` forms; uses an O(N+M) hash-join — `_build_lookup_index` keys foreign docs by their `foreignField` value, with array values expanded element-wise, and `_hash_join_lookup` does dict lookups per outer doc), `$sample`, `$sortByCount`, `$facet`, `$bucket`. `$group` accumulators: `$sum`, `$count`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`. `PipelineContext` carries the `Storage`, current `db_name`, and a `vars` map (for `$lookup` `let` bindings, threaded through every stage that calls the expression evaluator).
+- `src/secantus/aggregate.py` — `apply_pipeline(docs, pipeline, ctx)`. Stages: `$match`, `$count`, `$limit`, `$skip`, `$sort`, `$project` (with computed fields), `$addFields`/`$set`, `$unset`, `$unwind`, `$densify` (`bounds: "full"` / `[min, max]`, `partitionByFields`, positive `step`; date densify with `unit: "week"|"day"|"hour"|"minute"|"second"|"millisecond"` walks by fixed-duration `timedelta`. Variable-length units `month`/`quarter`/`year` rejected — would need `relativedelta`), `$replaceRoot`/`$replaceWith`, `$group`, `$lookup` (both simple and `let`/`pipeline` forms; per-outer-doc lookups go through `Storage.find_matching` whenever the foreign collection has any index whose leading field is `foreignField` — single-field, compound (leading-prefix scan), and multikey (per-element entries) all light up at IXSCAN. No matching index: falls back to an O(N+M) hash-join via `_build_lookup_index` / `_hash_join_lookup`), `$sample`, `$sortByCount`, `$facet`, `$bucket`. `$group` accumulators: `$sum`, `$count`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`. `PipelineContext` carries the `Storage`, current `db_name`, and a `vars` map (for `$lookup` `let` bindings, threaded through every stage that calls the expression evaluator).
 - `src/secantus/cursors.py` — `CursorRegistry`. Per-server, thread-safe map of int64 cursor id → remaining docs. Used by `find` and `aggregate` to support pagination via `getMore`/`killCursors`. Cursors carry a `last_access` timestamp; entries idle longer than `idle_ttl_seconds` (default 600s, matching MongoDB's 10-minute cursor TTL) are pruned opportunistically on every `register` / `next_batch` / `kill` / `len`. The clock is injectable (`time_func`) so tests can drive expiry deterministically.
 - `src/secantus/paths.py` — shared dotted-path helpers (`get_path`/`set_path`/`unset_path`/`has_path`/`walk_to_parent`). Used by `update`, `projection`, `aggregate`, and storage's sort.
 - `src/secantus/sortkey.py` — pure `encode_value(v)` and `encode_compound([v1, v2, ...])` that produce **byte-sortable** bytes whose lex order matches MongoDB's BSON cross-type sort order. Layout: `<rank_byte><payload>`. Numbers go through a "lexical decimal" form (sign byte + bias-shifted exponent + paired BCD digits + terminator) so int / long / double / Decimal128 collide on equal value and order correctly across the unified numeric type. NaN / ±Infinity get dedicated bracketing markers. Strings, binary, regex are null-escaped (`\x00 → \x00\xff`) so `\x00\x00` is a safe compound separator. `encode_value_directed(v, direction)` bitwise-inverts the bytes when `direction == -1` so the same encoder drives descending indexes.
@@ -54,7 +54,7 @@ Sort-by-indexed-field rides the same B-tree. The walk direction is chosen so the
 
 Unique enforcement is a prefix probe on the entries table, not a full scan.
 
-**Multikey fallback**: indexes don't yet support per-element entries for array values, so an index where any doc has a list value on an indexed field is flagged `multikey: True` (sticky — never cleared) at insert / update / `create_index` time. Pickers skip multikey indexes, and `find_matching` falls back to a full scan + `matches()` so array-element queries (e.g. `{tags: "python"}` against `{tags: ["python", "go"]}`) return the correct rows. The flag is persisted in the index options blob and surfaced through `list_indexes`.
+**Multikey indexes**: when a doc has an array-valued field that an index covers, `_index_key_variants` writes one entry per array element *plus* a whole-array entry. The whole-array entry handles equality queries against the full array (`{tags: ["py", "go"]}`); per-element entries handle scalar element queries (`{tags: "py"}`), `$in`, and range. Compound indexes with multiple multikey columns take the cartesian product (real `mongod` rejects this; we accept it but the cardinality blow-up is on the user). Storage flags the index `multikey: True` at insert / update / `create_index` time (sticky — never cleared); the flag still drives sort-acceleration decisions (`_compound_index_for_sort` skips multikey because one doc → many index entries breaks natural-order walks), but query planning treats multikey indexes as first-class — equality / range / `$in` lookups all light up at IXSCAN. `_docs_by_id_keys` and `_candidates_iter` dedup id_keys returned from index walks because the same doc can appear via more than one element entry. Uniqueness probes still use the canonical whole-doc `_index_key` (one canonical key per doc, regardless of array shape).
 
 `hint` is honored on both `find` and `aggregate`: pass an index name string, a key-spec dict, `"$natural"` (forces a collection scan even when an index would match), or `"_id_"` / `{_id: 1}` (walks doc-table order). An unknown hint surfaces as a `BadValue` (code 2) error to the client. The hint can also align with the sort spec to skip the post-sort step when the leading field matches.
 
@@ -68,7 +68,9 @@ Unique enforcement is a prefix probe on the entries table, not a full scan.
 
 **TTL indexes**: `expireAfterSeconds` is honoured by `Storage.prune_ttl(db, coll, *, now=None)` which walks the collection, deletes docs whose indexed `datetime` field is older than `now - expireAfterSeconds`, and removes their index entries. The clock is injectable so tests can drive expiry deterministically. There is **no background sweeper** — real MongoDB prunes every 60s; SecantusDB requires the caller to invoke `prune_ttl` explicitly. Docs without the TTL field, with non-date values, or with values inside the window are left untouched.
 
-Still missing: multi-field sort acceleration (a sort `{a:1, b:1}` matching a compound index `{a:1, b:1}` would skip post-sort entirely; today only single-field sort is index-accelerated), and `collation`.
+Multi-field sort acceleration: a sort spec whose `(field, direction)` tuple list exactly matches — or fully inverts — a compound index's key spec walks the index in forward / backward order and skips the Python post-sort entirely. Picker is strict-shape only (partial-prefix sorts, mixed-direction mismatches, and multikey indexes fall back to COLLSCAN + Python sort). `_compound_index_for_sort` lives in `storage.py` next to `_single_field_index_for`; the planner mirrors the same rules in `explain_plan`.
+
+Still missing: `collation`.
 
 Out of scope regardless: text / hashed / wildcard indexes, collation.
 
@@ -83,6 +85,8 @@ Three more WT tables, in the same connection:
 - `table:secantus_oplog_meta` (key_format=`S`, value=BSON) — single key `"state"` storing `{next_seq, last_ts_secs, last_ts_ord}`. Persisted at the end of every `_emit_oplog`, recovered on startup so `Timestamp` minting and seq numbering are strictly greater than any previously-emitted value.
 
 Retention: `prune_oplog(*, now=None)` drops entries older than `oplog_retention_seconds` (default 1h) and trims to `oplog_max_entries` (default 100k), deleting paired pre-images. Called opportunistically (every 1000 emits) and exposed publicly. No background sweeper — same pattern as `prune_ttl`.
+
+Periodic noop heartbeats: `Storage.emit_noop_heartbeat()` writes one `{op: "n", ns: "", o: {msg: "periodic noop"}}` row to the oplog. A background thread fires it every `noop_heartbeat_seconds` (default 0 = disabled; mongod's default is 10s and tests can opt in with smaller intervals). Change-stream projection treats `op: "n"` as "skip the event but advance position", so a quiet collection's `postBatchResumeToken` keeps tracking cluster time and stays inside the oplog retention window. Disabled when `enable_oplog=False`.
 
 Cross-thread reads (`read_oplog`, `read_preimage`, `oplog_floor_seq`, `find_seq_for_ts`) open a **fresh WT session per call** rather than reusing the per-thread cached session. WiredTiger's MVCC keeps a session's read snapshot until the session commits / resets; reusing the cached session for tailable getMore polls would never observe rows committed by writer threads on other connections. The fresh session is cheap and uniformly correct.
 
@@ -266,6 +270,36 @@ cd ../SecantusDB-website/website
 ## Backlog of stubs and stopgaps
 
 `tasks/backlog.md` is the canonical list of commands that are stubbed, features with simplified implementations, and work explicitly deferred from a slice. **Update it whenever you stub something, defer a slice, or discover a limitation. When you fix an item, delete its line.** Future sessions should treat that file as load-bearing — it's the only honest record of where SecantusDB's behaviour diverges from real MongoDB.
+
+## CI is load-bearing — failures are serious bugs, not flakes
+
+After every push to `main` (and after every push to a feature branch that has CI configured), check the corresponding GitHub Actions run and resolve any failures *before* moving on to the next slice. CI is the source of truth, not the local test result — CI catches a class of bugs that local-only testing misses:
+
+- **Cold caches**: locally, `node_modules/`, the Java smokes uber-jar, the Go module cache, and `.pytest_cache` are all populated from prior runs. CI starts fresh every time, exposing race conditions in test bootstrap (e.g. multiple xdist workers calling `_ensure_node_modules()` simultaneously and clobbering `npm install`).
+- **Cross-platform**: macOS and Linux differ in subtle ways (sysconf keys, default locale, file system case-sensitivity, default temp dir, line endings).
+- **Cross-Python**: 3.10–3.13 see different stdlib behaviours (`datetime.UTC`, removed `imp`, dataclass slots semantics, walrus precedence in match statements, etc).
+- **Missing extras**: the CI workflow installs a specific subset of `pyproject.toml` extras (currently `--extra dev --extra admin`). Adding new tests that depend on a different extra silently passes locally (`uv sync --all-extras` is the dev default) and fails only on CI. When you add a test file that imports something new, check whether the import chain is covered by `--extra dev --extra admin` — if not, either move the dep into `dev`/`admin` or update the workflow.
+
+**Procedure** after pushing:
+
+```
+gh run list --repo jdrumgoole/SecantusDB --branch main --limit 3 \
+  --json databaseId,name,status,conclusion
+# pick the most recent Tests run, then either watch:
+gh run watch <id> --repo jdrumgoole/SecantusDB --exit-status
+# or, if you've moved on to other work, check status later:
+gh run view <id> --repo jdrumgoole/SecantusDB --json conclusion,jobs
+# on failure:
+gh run view <id> --repo jdrumgoole/SecantusDB --log-failed
+```
+
+If CI fails, treat it like a failing local test: stop, diagnose root cause, fix. Do not push more commits on top of a broken `main` — they pile up, and the eventual fix has to bisect through all of them.
+
+**Recurring patterns to recognise**:
+
+- **xdist parallel-worker races on shared install state** — the `--extra admin` miss, the Java-jar build race, the Node `npm install` race were all variants. Fix: `fcntl.flock` around the install + `xdist_group(name="<group>")` markers + `--dist=loadgroup` so the test serialise onto one worker.
+- **Per-platform `os.sysconf` keys** — `SC_PHYS_PAGES` exists on Linux/macOS but not Windows; wrap with `try/except (ValueError, OSError, AttributeError)`.
+- **`pytest-subtests` outcome accounting** — its parent-test outcome is `"subtests passed"`, not `"passed"`. Anywhere we bucket pytest outcomes (e.g. `pymongo_validation/generate_report.py`) needs an explicit handler or it falls into the default branch silently.
 
 ## Conventions for changes here
 

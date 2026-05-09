@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
@@ -199,10 +200,21 @@ def _stage_unset(
     return out
 
 
+_DENSIFY_UNIT_TO_TIMEDELTA: dict[str, str] = {
+    # Units whose duration is fixed: trivially expressed as a timedelta.
+    "week": "weeks",
+    "day": "days",
+    "hour": "hours",
+    "minute": "minutes",
+    "second": "seconds",
+    "millisecond": "milliseconds",
+}
+
+
 def _stage_densify(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    """Numeric ``$densify``: fill gaps between consecutive values.
+    """``$densify``: fill gaps between consecutive values, numeric or date.
 
     Output is each input doc plus filler docs (containing only the
     densify field, plus any partitionByFields) at every multiple of
@@ -213,7 +225,12 @@ def _stage_densify(
     don't yet plumb a partition-wide range distinct from each
     partition's observed extremes.
 
-    Date densify (``unit``) is deferred — see ``tasks/backlog.md``.
+    Date densify is enabled by setting ``range.unit`` to one of
+    ``"week"`` / ``"day"`` / ``"hour"`` / ``"minute"`` / ``"second"`` /
+    ``"millisecond"`` — those are the units with a fixed duration so
+    a ``timedelta`` represents them exactly. ``"month"`` / ``"quarter"``
+    / ``"year"`` are rejected (variable-length, would need
+    ``relativedelta``-style arithmetic).
     """
     if not isinstance(spec, Mapping):
         raise AggregateError("$densify requires a document spec")
@@ -223,13 +240,44 @@ def _stage_densify(
     range_spec = spec.get("range")
     if not isinstance(range_spec, Mapping):
         raise AggregateError("$densify requires range")
-    if "unit" in range_spec:
-        raise AggregateError("$densify date ranges (unit) not yet supported")
-    step = range_spec.get("step")
-    if not isinstance(step, (int, float)) or step <= 0:
+    raw_step = range_spec.get("step")
+    if not isinstance(raw_step, (int, float)) or raw_step <= 0:
         raise AggregateError("$densify step must be a positive number")
+    unit = range_spec.get("unit")
+    if unit is not None:
+        if not isinstance(unit, str):
+            raise AggregateError("$densify range.unit must be a string")
+        if unit in {"month", "quarter", "year"}:
+            raise AggregateError(
+                f"$densify range.unit={unit!r} is variable-length; "
+                "supported units are week / day / hour / minute / second / millisecond"
+            )
+        td_kwarg = _DENSIFY_UNIT_TO_TIMEDELTA.get(unit)
+        if td_kwarg is None:
+            raise AggregateError(f"$densify range.unit={unit!r} is not recognised")
+        step: Any = _dt.timedelta(**{td_kwarg: raw_step})
+    else:
+        step = raw_step
     bounds = range_spec.get("bounds")
     partition_fields = list(spec.get("partitionByFields") or [])
+
+    # Hard cap on filler-doc count per partition. Without this, an
+    # explicit `bounds: [0, 10**15]` with `step: 1` materialises 10**15
+    # filler docs and OOMs the process. mongod caps the densify result
+    # internally at ~250k; we use 1M to leave headroom for legitimate
+    # large-but-bounded ranges.
+    if isinstance(bounds, list) and len(bounds) == 2:
+        try:
+            span = float(bounds[1]) - float(bounds[0])
+            if span / float(step) > 1_000_000:
+                raise AggregateError(
+                    f"$densify range {bounds} with step {step} would emit "
+                    f"more than 1,000,000 fillers — refusing"
+                )
+        except (TypeError, ValueError):
+            # Non-numeric bounds reach the existing per-partition path
+            # which raises a more specific error there.
+            pass
 
     def partition_key(doc: Mapping[str, Any]) -> tuple[Any, ...]:
         return tuple(get_path(doc, f) for f in partition_fields)
@@ -651,15 +699,23 @@ def _stage_lookup_pipeline(
 
 
 def _foreign_field_has_simple_index(storage: Storage, db: str, coll: str, field: str) -> bool:
-    """Is there a single-field, non-multikey index on ``coll.field`` we
-    can drive `$lookup` through?
+    """Is there an index whose leading column is ``field`` we can drive
+    `$lookup` through?
 
-    Multikey indexes are ineligible because Storage's pickers skip them
-    (find_matching falls back to a full scan), so a per-outer-doc loop
-    against a multikey-indexed foreign field is O(M*N) — strictly worse
-    than the existing hash-join. Compound indexes also disqualify; the
-    leading-field-only equality lookup is already part of Storage's
-    routing but the safe-perf rule here is "exact-shape match only".
+    A single-field index keyed exactly on ``field`` is the canonical
+    fit, but a compound index whose leading field is ``field`` is also
+    eligible: Storage's picker turns ``{field: value}`` into a
+    leading-prefix scan over the compound index's entries (correctness
+    is identical to the single-field case for equality on the leading
+    column). Multikey is fine too — Storage's
+    ``_index_key_variants`` writes per-element entries, so equality
+    lookups against array-valued foreign fields hit at least all true
+    matches. Direction (1 / -1) is fine for either shape — the storage
+    range scan handles ASC and DESC.
+
+    Geo / hashed / text indexes are excluded by the all-numeric
+    direction check below (their direction values are strings like
+    ``"2dsphere"`` or ``"hashed"``).
     """
     try:
         indexes = storage.list_indexes(db, coll)
@@ -669,14 +725,12 @@ def _foreign_field_has_simple_index(storage: Storage, db: str, coll: str, field:
         key = ix.get("key", {})
         if not isinstance(key, Mapping):
             continue
-        if list(key.keys()) != [field]:
+        keys = list(key.keys())
+        if not keys or keys[0] != field:
             continue
-        # Direction (1 / -1) is fine — the storage range scan handles
-        # ASC and DESC. Multikey or geo flags disqualify.
-        value = key[field]
-        if not (isinstance(value, int) or value in (1, -1)):
-            continue
-        if ix.get("multikey"):
+        # Every column must be ASC/DESC numeric — excludes geo / hashed /
+        # text whose direction values are strings.
+        if any(v not in (1, -1) for v in key.values()):
             continue
         return True
     return False
@@ -1055,7 +1109,10 @@ def _stage_graph_lookup(
     connect_from = spec.get("connectFromField")
     connect_to = spec.get("connectToField")
     as_field = spec.get("as")
-    max_depth = spec.get("maxDepth")
+    # Default maxDepth=100 when caller doesn't specify, mirroring mongod.
+    # Without a default, a self-referencing collection blows up to O(N^2)
+    # memory in the BFS frontier.
+    max_depth = spec.get("maxDepth", 100)
     depth_field = spec.get("depthField")
     if not all(isinstance(x, str) for x in (from_coll, connect_from, connect_to, as_field)):
         raise AggregateError(

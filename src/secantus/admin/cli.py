@@ -1,0 +1,91 @@
+"""Command-line entry point for ``secantusdb-admin``.
+
+Resolves the token, configures uvicorn, optionally opens a pywebview
+window, and runs until shutdown. ``--no-window`` is the headless mode
+used by tests and CI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import secrets
+import sys
+from pathlib import Path
+
+_DEFAULT_TOKEN_PATH = Path.home() / ".secantus" / "admin-token"
+
+
+def _resolve_token(*, override: str | None, token_path: Path) -> str:
+    """Pick the token to use, in order: ``--token`` flag, persisted file,
+    freshly generated (and persisted)."""
+    if override:
+        return override
+    if token_path.exists():
+        contents = token_path.read_text(encoding="utf-8").strip()
+        if contents:
+            return contents
+    token = secrets.token_urlsafe(32)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(token + "\n", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        # Best-effort on systems without chmod (Windows). The file is
+        # already in the user's home dir.
+        os.chmod(token_path, 0o600)
+    return token
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="secantusdb-admin",
+        description="Local admin UI for a SecantusDB (or any MongoDB) server.",
+    )
+    parser.add_argument(
+        "--uri",
+        default="mongodb://127.0.0.1:27017",
+        help="MongoDB URI to administer (default: mongodb://127.0.0.1:27017).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Local HTTP port (0 = pick a free one).",
+    )
+    parser.add_argument(
+        "--no-window",
+        action="store_true",
+        help="Run the FastAPI app without opening a pywebview window. Used in CI.",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="Override the auth token. Default: read/generate ~/.secantus/admin-token.",
+    )
+    parser.add_argument(
+        "--token-path",
+        default=str(_DEFAULT_TOKEN_PATH),
+        help="Where to read/persist the default token (ignored if --token is set).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    token = _resolve_token(override=args.token, token_path=Path(args.token_path))
+
+    # Lazy imports — the launcher pulls in fastapi / uvicorn / pywebview,
+    # all heavyweight. Importing them inside ``main`` keeps ``--help``
+    # fast and avoids cost when tests construct ``create_app`` directly.
+    from secantus.admin.launcher import run
+
+    return run(
+        mongo_uri=args.uri,
+        port=args.port,
+        token=token,
+        no_window=args.no_window,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

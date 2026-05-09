@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import os
+import random as _random
+import time as _time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import bson
 
-from secantus.aggregate import PipelineContext, apply_pipeline
+from secantus.aggregate import AggregateError, PipelineContext, apply_pipeline
 from secantus.auth import (
+    SCRAM_SHA_1,
     SCRAM_SHA_256,
     AuthError,
     ConnectionAuth,
@@ -18,25 +22,36 @@ from secantus.auth import (
     continue_scram,
     derive_credentials,
 )
+from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorNotFound, CursorRegistry
-from secantus.projection import apply_projection
+from secantus.expressions import ExpressionError
+from secantus.geo import GeoError
+from secantus.logbuf import LogBuffer
+from secantus.metrics import Metrics
+from secantus.projection import ProjectionError, apply_projection
+from secantus.query import QueryError, matches
 from secantus.rbac import (
     A_CHANGE_PASSWORD,
     A_COLL_MOD,
     A_COLL_STATS,
     A_CREATE_COLLECTION,
     A_CREATE_INDEX,
+    A_CREATE_ROLE,
     A_CREATE_USER,
     A_DB_STATS,
     A_DROP_COLLECTION,
     A_DROP_DATABASE,
     A_DROP_INDEX,
+    A_DROP_ROLE,
     A_DROP_USER,
     A_FIND,
+    A_ENABLE_PROFILER,
+    A_FSYNC,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
     A_GRANT_ROLE,
     A_HOST_INFO,
+    A_INPROG,
     A_INSERT,
     A_KILL_CURSORS,
     A_LIST_COLLECTIONS,
@@ -56,8 +71,30 @@ from secantus.rbac import (
     check_privilege,
     is_known_role,
 )
-from secantus.storage import Storage
+from secantus.sessions import SessionRegistry
+from secantus.storage import DuplicateKeyError, GeoExtractError, Storage
+from secantus.update import UpdateError
 from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
+
+logger = logging.getLogger(__name__)
+
+# Exception classes whose ``str()`` is intentionally user-facing — they
+# carry mongod-shaped error messages (validation failures, malformed
+# operators, etc.) and must be surfaced verbatim so pymongo / mongo-go /
+# mongo-node / mongo-java tests see the same text real mongod produces.
+# Anything OUTSIDE this tuple is treated as an internal error and gets a
+# generic message + a server-side log line, never the raw exception text.
+_USER_FACING_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    AggregateError,
+    AuthError,
+    DuplicateKeyError,
+    ExpressionError,
+    GeoError,
+    GeoExtractError,
+    ProjectionError,
+    QueryError,
+    UpdateError,
+)
 
 WIRE_VERSION = 17
 SERVER_VERSION = "7.0.0"
@@ -75,6 +112,10 @@ class CommandContext:
     replica_set_name: str | None = None
     connection_auth: ConnectionAuth | None = None
     require_auth: bool = False
+    metrics: Metrics | None = None
+    connections: ConnectionRegistry | None = None
+    logs: LogBuffer | None = None
+    sessions: SessionRegistry | None = None
 
 
 def _split_into_cursor(
@@ -83,7 +124,11 @@ def _split_into_cursor(
     namespace: str,
     cursors: CursorRegistry,
 ) -> tuple[list[dict[str, Any]], int]:
-    if batch_size <= 0:
+    # ``batch_size == 0`` is a real value, not a "use default":
+    # MongoDB defines it as "open the cursor with an empty
+    # firstBatch and let the client pull via getMore". A cursor id
+    # is registered so the next getMore can find the docs.
+    if batch_size < 0:
         batch_size = DEFAULT_BATCH_SIZE
     first = docs[:batch_size]
     remaining = docs[batch_size:]
@@ -141,17 +186,62 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         )
     # saslSupportedMechs: drivers pass `saslSupportedMechs: "<db>.<user>"`
-    # to discover which mechanisms they should attempt for that principal.
-    # We always advertise SCRAM-SHA-256 (the modern MongoDB default); older
-    # SCRAM-SHA-1 is intentionally not offered.
+    # to discover which mechanisms they should attempt for that
+    # principal. The reply lists exactly what the user record stores
+    # credentials for — SCRAM-SHA-256 (modern default) and/or
+    # SCRAM-SHA-1 (legacy). If we don't recognise the principal we
+    # advertise the modern default so the driver still picks
+    # something reasonable.
     sasl_mechs_for = doc.get("saslSupportedMechs")
     if isinstance(sasl_mechs_for, str):
-        response["saslSupportedMechs"] = [SCRAM_SHA_256]
+        response["saslSupportedMechs"] = _mechs_for_principal(ctx, sasl_mechs_for)
     if ctx.require_auth:
         # Tell the client this server has access control on so it knows
         # to treat the connection as needing auth before commands flow.
         response["accessControlEnabled"] = True
+    # Speculative authentication: pymongo / mongo-go-driver fold the
+    # SCRAM client-first message into the `hello` body. We pull it
+    # back out, run it through the regular `saslStart` handler, and
+    # attach the reply under `speculativeAuthenticate`. The client
+    # then skips its own saslStart and goes straight to saslContinue
+    # — saving one wire round-trip on every connect.
+    spec = doc.get("speculativeAuthenticate")
+    if isinstance(spec, dict):
+        spec_reply = _speculative_auth(spec, ctx)
+        if spec_reply is not None:
+            response["speculativeAuthenticate"] = spec_reply
     return response
+
+
+def _speculative_auth(spec: dict[str, Any], ctx: CommandContext) -> dict[str, Any] | None:
+    """Run the SCRAM saslStart that's been folded into a `hello`.
+
+    The inner document carries `saslStart`, `mechanism`, `payload`,
+    `db`. We synthesize a regular saslStart command from it (with
+    `db_name` overridden to the spec's `db`) and run the existing
+    handler. On failure we return ``None`` rather than the error
+    envelope — the client treats a missing `speculativeAuthenticate`
+    field as "speculation rejected, fall back to explicit
+    saslStart", which is the right UX (a typo'd password shouldn't
+    abort the whole hello).
+    """
+    if "saslStart" not in spec:
+        return None
+    inner_doc = {
+        "saslStart": 1,
+        "mechanism": spec.get("mechanism"),
+        "payload": spec.get("payload"),
+    }
+    # `db` defaults to "admin" for spec auth. Run saslStart with a
+    # context cloned to that database so credential lookup hits the
+    # right user table.
+    spec_db = spec.get("db") if isinstance(spec.get("db"), str) else "admin"
+    spec_ctx = replace(ctx, db_name=spec_db)
+    reply = _sasl_start(inner_doc, spec_ctx)
+    if reply.get("ok") != 1.0:
+        # Speculation failed — let the client retry explicitly.
+        return None
+    return reply
 
 
 def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
@@ -159,8 +249,16 @@ def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
 
 
 def _build_info(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    # `version` stays at the MongoDB-compatibility value so drivers enable
+    # the right feature flags (change streams, $changeStream pre-images,
+    # etc.). `secantusVersion` is the SecantusDB-specific marker admin
+    # tools and the ./about-page can read to know which actual build is
+    # running.
+    import secantus
+
     return {
         "version": SERVER_VERSION,
+        "secantusVersion": secantus.__version__,
         "gitVersion": "0" * 40,
         "versionArray": SERVER_VERSION_ARRAY,
         "bits": 64,
@@ -170,23 +268,77 @@ def _build_info(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     }
 
 
-def _end_sessions(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _lsid_bytes_from_arg(entry: Any) -> bytes | None:
+    """Extract the 16-byte UUID payload from a session-id document.
+
+    The wire shape is ``{id: BinData(4, <uuid>)}``; the BSON layer
+    surfaces the value as ``bson.Binary``. Returns ``None`` for any
+    shape we don't recognise so the handler can skip silently rather
+    than fail the whole command.
+    """
+    from bson import Binary
+
+    if not isinstance(entry, Mapping):
+        return None
+    inner = entry.get("id")
+    if isinstance(inner, Binary):
+        raw = bytes(inner)
+        if len(raw) == 16:
+            return raw
+    elif isinstance(inner, (bytes, bytearray)) and len(inner) == 16:
+        return bytes(inner)
+    return None
+
+
+def _end_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop the listed sessions from the registry.
+
+    Real ``mongod`` also kills any cursors associated with these
+    sessions; SecantusDB doesn't track cursor → session affinity
+    yet, so cursors live on under their own idle TTL.
+    """
+    if ctx.sessions is not None:
+        for entry in doc.get("endSessions") or []:
+            lsid = _lsid_bytes_from_arg(entry)
+            if lsid is not None:
+                ctx.sessions.unregister(lsid)
     return {"ok": 1.0}
 
 
-def _start_session(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _start_session(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Mint a fresh session id and register it.
+
+    The driver receives ``{id: BinData(4, <uuid>)}`` and threads it
+    onto every subsequent command via the top-level ``lsid`` field;
+    the dispatch layer refreshes the registry's last-access timestamp
+    on each such command.
+    """
     import uuid
 
     from bson import Binary
 
+    raw = uuid.uuid4().bytes
+    if ctx.sessions is not None:
+        ctx.sessions.register(raw)
     return {
-        "id": {"id": Binary(uuid.uuid4().bytes, 4)},
+        "id": {"id": Binary(raw, 4)},
         "timeoutMinutes": 30,
         "ok": 1.0,
     }
 
 
-def _refresh_sessions(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _refresh_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Bump the idle TTL on listed sessions.
+
+    Implicitly creates any session not already in the registry —
+    matching mongod's behaviour of treating ``refreshSessions`` as
+    "ensure this session is alive", not "fail if it isn't".
+    """
+    if ctx.sessions is not None:
+        for entry in doc.get("refreshSessions") or []:
+            lsid = _lsid_bytes_from_arg(entry)
+            if lsid is not None:
+                ctx.sessions.refresh(lsid)
     return {"ok": 1.0}
 
 
@@ -198,53 +350,304 @@ def _commit_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str,
     return {"ok": 1.0}
 
 
-def _get_log(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"totalLinesWritten": 0, "log": [], "ok": 1.0}
+def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # mongod's currentOp returns a heterogeneous array of "in-progress"
+    # records: per-connection ops + idle cursors. We don't track per-op
+    # state (no in-flight queue), so each connection collapses to a
+    # single "op" record carrying its last command + counters. Cursor
+    # entries are emitted as ``type: "idleCursor"`` to match mongod.
+    inprog: list[dict[str, Any]] = []
+    if ctx.connections is not None:
+        for conn in ctx.connections.snapshot():
+            host_port = f"{conn.peer_addr[0]}:{conn.peer_addr[1]}"
+            opened_iso = _dt.datetime.fromtimestamp(conn.opened_at, tz=_dt.timezone.utc).isoformat()
+            inprog.append(
+                {
+                    "type": "op",
+                    "desc": f"conn{conn.conn_id}",
+                    "connectionId": bson.Int64(conn.conn_id),
+                    "client": host_port,
+                    "opid": bson.Int64(conn.conn_id),
+                    "active": conn.last_command_name is not None,
+                    "op": conn.last_command_name or "none",
+                    "ns": "",
+                    "currentOpTime": opened_iso,
+                    "secs_running": 0,
+                    "microsecs_running": 0,
+                    "effectiveUsers": (
+                        [{"user": conn.user.split("@", 1)[0], "db": conn.user.split("@", 1)[1]}]
+                        if conn.user and "@" in conn.user
+                        else []
+                    ),
+                }
+            )
+    if ctx.cursors is not None:
+        for snap in ctx.cursors.snapshot():
+            inprog.append(
+                {
+                    "type": "idleCursor",
+                    "ns": snap["namespace"],
+                    "cursorId": bson.Int64(snap["cursor_id"]),
+                    "tailable": snap["tailable"],
+                    "awaitData": snap["await_data"],
+                    "originatingCommand": {},
+                    "lsid": None,
+                }
+            )
+    return {"inprog": inprog, "ok": 1.0}
 
 
-def _whatsmyuri(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"you": "127.0.0.1:0", "ok": 1.0}
+def _fsync(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # mongod's `fsync` defaults to flushing all data to disk. With
+    # ``lock: true`` it also blocks subsequent writes until ``fsyncUnlock``
+    # — a feature that requires real cluster-style coordination we don't
+    # have. Reject the locked variant rather than silently skipping the
+    # lock, which would mislead backup tools that rely on it.
+    if doc.get("lock") is True:
+        return {
+            "ok": 0.0,
+            "errmsg": "fsync with lock:true is not supported by SecantusDB",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    ctx.storage.checkpoint()
+    return {"numFiles": 1, "ok": 1.0}
 
 
-def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _profile(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Get / set per-database profiling level (mongod ``profile`` shape).
+
+    ``{profile: -1}`` reads the current state. ``{profile: 0|1|2,
+    slowms: N, sampleRate: F}`` updates it. Returns the previous values
+    under ``was`` / ``slowms`` / ``sampleRate`` so monitoring scripts
+    can confirm the change.
+    """
+    db = ctx.db_name or "admin"
+    arg = doc.get("profile")
+    prev = ctx.storage.get_profile(db)
+
+    if arg == -1:
+        return {
+            "was": prev["level"],
+            "slowms": prev["slowms"],
+            "sampleRate": prev["sampleRate"],
+            "ok": 1.0,
+        }
+    if not isinstance(arg, int) or arg not in (0, 1, 2):
+        return {
+            "ok": 0.0,
+            "errmsg": "profile must be -1, 0, 1, or 2",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    new_slowms = doc.get("slowms", prev["slowms"])
+    new_sample_rate = doc.get("sampleRate", prev["sampleRate"])
+    try:
+        ctx.storage.set_profile(
+            db,
+            level=int(arg),
+            slowms=int(new_slowms),
+            sample_rate=float(new_sample_rate),
+        )
+    except ValueError as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
     return {
-        "system": {
-            "currentTime": _dt.datetime.now(_dt.timezone.utc),
-            "hostname": "secantus",
-            "cpuAddrSize": 64,
-            "memSizeMB": 0,
-            "numCores": os.cpu_count() or 1,
-            "cpuArch": "x86_64",
-            "numaEnabled": False,
-        },
-        "os": {"type": "secantus", "name": "secantus", "version": SERVER_VERSION},
+        "was": prev["level"],
+        "slowms": prev["slowms"],
+        "sampleRate": prev["sampleRate"],
         "ok": 1.0,
     }
 
 
-def _server_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _get_log(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # mongod returns the in-memory log as a list of pre-formatted strings.
+    # Format mirrors mongod's: "<ts> <level> <component> <msg>" — close
+    # enough that tooling that grep-parses the response keeps working.
+    if ctx.logs is None:
+        return {"totalLinesWritten": 0, "log": [], "ok": 1.0}
+    entries = ctx.logs.tail()
+    formatted: list[str] = []
+    for e in entries:
+        ts = _dt.datetime.fromtimestamp(e.ts, tz=_dt.timezone.utc).isoformat()
+        formatted.append(f"{ts} {e.level} {e.component} {e.msg}")
     return {
+        "totalLinesWritten": len(entries),
+        "log": formatted,
+        "ok": 1.0,
+    }
+
+
+def _whatsmyuri(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Return the requesting client's connection peer (``host:port``).
+
+    Drivers and ``mongosh`` use this to disambiguate which client they
+    are. Serving the actual peer (looked up from the connection
+    registry) instead of a hardcoded placeholder makes the helpers
+    work end-to-end.
+    """
+    peer_str = "unknown"
+    if ctx.connections is not None:
+        info = ctx.connections.get(ctx.connection_id)
+        if info is not None:
+            peer_str = f"{info.peer_addr[0]}:{info.peer_addr[1]}"
+    return {"you": peer_str, "ok": 1.0}
+
+
+def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    """Real ``hostInfo``: hostname, OS, CPU arch, core count, RAM size.
+
+    Hostname comes from ``socket.gethostname()``; CPU architecture
+    from ``platform.machine()``; OS type / name / version from
+    ``platform.system()`` / ``platform.release()``. Memory size in MB
+    is read via ``sysconf(SC_PHYS_PAGES) * sysconf(SC_PAGE_SIZE)`` on
+    POSIX (Linux / macOS); falls back to 0 on platforms where sysconf
+    doesn't expose those keys (Windows, some BSDs).
+    """
+    import platform
+    import socket
+
+    mem_mb = 0
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and phys_pages > 0:
+            mem_mb = (page_size * phys_pages) // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        # ``os.sysconf`` doesn't exist on Windows (AttributeError) and
+        # the specific keys may be missing on some Unix variants.
+        pass
+
+    os_type = platform.system() or "Unknown"  # "Darwin", "Linux", "Windows"
+    os_release = platform.release() or ""
+    os_version = platform.version() or os_release
+
+    return {
+        "system": {
+            "currentTime": _dt.datetime.now(_dt.timezone.utc),
+            "hostname": socket.gethostname() or "localhost",
+            "cpuAddrSize": 64,
+            "memSizeMB": mem_mb,
+            "numCores": os.cpu_count() or 1,
+            "cpuArch": platform.machine() or "unknown",
+            "numaEnabled": False,
+        },
+        "os": {
+            "type": os_type,
+            "name": os_type,
+            "version": os_release,
+        },
+        "extra": {"versionString": os_version},
+        "ok": 1.0,
+    }
+
+
+def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Real metrics from :class:`secantus.metrics.Metrics` if the server
+    constructed one (production path); falls back to zeroed values for
+    embedded callers that didn't thread a metrics instance through (e.g.
+    ad-hoc test harnesses that use ``CommandContext`` directly)."""
+    base: dict[str, Any] = {
         "host": "secantus",
         "version": SERVER_VERSION,
         "process": "secantus",
         "pid": os.getpid(),
-        "uptime": 0,
-        "uptimeMillis": 0,
-        "uptimeEstimate": 0,
         "localTime": _dt.datetime.now(_dt.timezone.utc),
         "ok": 1.0,
     }
+    if ctx.metrics is not None:
+        base.update(ctx.metrics.snapshot())
+    else:
+        base.update(
+            {
+                "uptime": 0,
+                "uptimeMillis": 0,
+                "uptimeEstimate": 0,
+                "connections": {
+                    "current": 0,
+                    "available": 0,
+                    "totalCreated": 0,
+                },
+                "opcounters": {
+                    "insert": 0,
+                    "query": 0,
+                    "update": 0,
+                    "delete": 0,
+                    "getmore": 0,
+                    "command": 0,
+                },
+                "network": {"numRequests": 0, "bytesIn": 0, "bytesOut": 0},
+            }
+        )
+    return base
+
+
+def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    """Return server parameters.
+
+    Real `mongod` exposes hundreds of tunables. SecantusDB returns a
+    minimal set so admin tooling that probes one or two well-known
+    parameters (e.g. ``featureCompatibilityVersion`` for version
+    gating, ``enableTestCommands`` to detect a test mongod) gets a
+    sensible answer instead of a "no such command" error.
+
+    Caller forms accepted:
+      * ``{getParameter: 1, <name>: 1, ...}`` — return only the named
+        parameters.
+      * ``{getParameter: "*"}`` — return all known parameters.
+      * ``{getParameter: 1}`` — same as ``"*"`` (legacy form).
+    """
+    params: dict[str, Any] = {
+        "featureCompatibilityVersion": {"version": "7.0"},
+        "enableTestCommands": False,
+        "logLevel": 0,
+        "quiet": False,
+    }
+    arg = doc.get("getParameter")
+    if isinstance(arg, str) and arg == "*":
+        return {**params, "ok": 1.0}
+    if isinstance(arg, dict):
+        # ``{getParameter: {showDetails: true}, <name>: 1, ...}`` form.
+        keys = [k for k in doc if k != "getParameter" and not k.startswith("$")]
+        return {**{k: params[k] for k in keys if k in params}, "ok": 1.0}
+    # Default: name list passed alongside ``getParameter: 1``.
+    keys = [k for k in doc if k != "getParameter" and not k.startswith("$")]
+    if not keys:
+        return {**params, "ok": 1.0}
+    return {**{k: params[k] for k in keys if k in params}, "ok": 1.0}
+
+
+def _get_cmd_line_opts(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Return a parsed `mongod`-shaped command line.
+
+    pymongo's test bootstrap (and other admin tooling) reads this to
+    detect whether the server was started with `--auth`: it inspects
+    ``parsed.security.authorization`` and treats ``"enabled"`` as the
+    auth-on signal.
+    """
+    parsed: dict[str, Any] = {"net": {}, "storage": {}}
+    if ctx.require_auth:
+        parsed["security"] = {"authorization": "enabled"}
+    argv = ["secantus"]
+    if ctx.require_auth:
+        argv.append("--auth")
+    return {"argv": argv, "parsed": parsed, "ok": 1.0}
 
 
 def _connection_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     principals = ctx.connection_auth.authenticated_principals if ctx.connection_auth else []
+    roles = list(ctx.connection_auth.effective_roles) if ctx.connection_auth else []
     return {
         "authInfo": {
             "authenticatedUsers": [{"user": user, "db": db} for db, user in principals],
-            # RBAC isn't implemented; an authenticated user is treated as
-            # fully privileged. Surface an empty role/privilege list — most
-            # clients only check authenticatedUsers.
-            "authenticatedUserRoles": [],
+            "authenticatedUserRoles": roles,
+            # Per-action expansion is heavy and clients rarely check;
+            # leave empty for now (mongod also surfaces this with a
+            # `showPrivileges` toggle which we don't honour).
             "authenticatedUserPrivileges": [],
         },
         "ok": 1.0,
@@ -379,6 +782,17 @@ def _ns(db: str, coll: str) -> str:
 def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["insert"]
     documents = doc.get("documents", [])
+    if not isinstance(documents, list) or len(documents) == 0:
+        # mongod rejects an empty `documents` array with code 4
+        # (InvalidLength). Drivers (mongo-go-driver, mongo-java-driver)
+        # have command-error tests that check for this specific code
+        # / codeName combo, so it's load-bearing for the gauge.
+        return {
+            "ok": 0.0,
+            "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+            "code": 4,
+            "codeName": "InvalidLength",
+        }
     ordered = doc.get("ordered", True)
     inserted, errors = ctx.storage.insert(ctx.db_name, coll, documents, ordered=ordered)
     reply: dict[str, Any] = {"n": inserted, "ok": 1.0}
@@ -388,6 +802,7 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus.query import QueryError
     from secantus.storage import BadHint
 
     coll = doc["find"]
@@ -397,8 +812,27 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     sort = doc.get("sort") or None
     projection = doc.get("projection") or None
     hint = doc.get("hint")
-    batch_size = int(doc.get("batchSize", 0) or 0)
+    # ``batchSize`` is genuinely tri-state: absent (use default),
+    # 0 ("open the cursor but send no docs in firstBatch"), or
+    # explicit positive. The 0 case is load-bearing for drivers
+    # that want to set a streaming batch size via ``getMore`` — the
+    # mongo-go-driver test ``TestCursor/set_batchSize`` opens a
+    # cursor with batchSize 0, then calls SetBatchSize on the
+    # batch cursor and asserts the next getMore carries that size.
+    raw_batch_size = doc.get("batchSize")
+    batch_size = DEFAULT_BATCH_SIZE if raw_batch_size is None else int(raw_batch_size)
     single_batch = bool(doc.get("singleBatch", False))
+    # Validate filter syntax up-front. matches() raises QueryError for
+    # unknown top-level operators; running it against an empty doc is
+    # cheap and triggers the same validation paths the real query would
+    # hit. Without this, an empty collection with `{$foo: 1}` returns
+    # an empty cursor instead of an error — real mongod (and the
+    # mongo-go-driver test ``find/invalid_identifier_error``) rejects
+    # at the find command level.
+    try:
+        matches({}, filter_)
+    except QueryError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     try:
         docs = ctx.storage.find_matching(
             ctx.db_name,
@@ -412,16 +846,90 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         )
     except BadHint as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    except QueryError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     ns = _ns(ctx.db_name, coll)
+    # Tailable cursor on a (capped) collection. Real mongod rejects
+    # ``tailable: true`` on a non-capped collection with code 2
+    # (BadValue). The driver-spec ``find`` command uses
+    # ``tailable: true`` + ``awaitData: true`` for the legacy
+    # newest-doc-poll workload (replicated by mongo-go-driver's
+    # ``TestCursor_TryNext/one_getMore_sent`` against a capped
+    # ``logs`` collection). Note the change-stream tailable path
+    # is separate — it goes through the ``aggregate``/``$changeStream``
+    # pipeline, not ``find``.
+    tailable = bool(doc.get("tailable", False))
+    if tailable:
+        if not ctx.storage.collection_is_capped(ctx.db_name, coll):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"error processing query: tailable cursor requested on non capped "
+                    f"collection {ns}"
+                ),
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        await_data = bool(doc.get("awaitData", False))
+        return _find_tailable(coll, docs, batch_size, ns, await_data, ctx)
     if single_batch:
         first_batch, cursor_id = docs, 0
     else:
-        first_batch, cursor_id = _split_into_cursor(
-            docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
-        )
+        first_batch, cursor_id = _split_into_cursor(docs, batch_size, ns, ctx.cursors)
     return {
         # Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
         "cursor": {"firstBatch": first_batch, "id": bson.Int64(cursor_id), "ns": ns},
+        "ok": 1.0,
+    }
+
+
+def _find_tailable(
+    coll: str,
+    initial_docs: list[dict[str, Any]],
+    batch_size: int,
+    ns: str,
+    await_data: bool,
+    ctx: CommandContext,
+) -> dict[str, Any]:
+    """Build a tailable cursor on a capped collection.
+
+    The producer scans the doc table for rows with ``id_key`` strictly
+    greater than the last one we've returned. ``id_key`` is the
+    byte-sortable ``_id`` encoding (see ``secantus.sortkey``); for
+    monotonic ``ObjectId``-style ``_id`` values that order matches
+    insertion order, which is exactly what tailable consumers expect.
+    Capped collections eviction-prune oldest rows in the same order,
+    so the producer naturally tracks the trailing edge.
+    """
+    db_name = ctx.db_name
+    storage = ctx.storage
+    # Track our current-watermark id_key on a mutable container so the
+    # producer closure can update it. Walk the collection once now to
+    # find the highest current id_key — that becomes the starting
+    # checkpoint after we hand back ``firstBatch``. Subsequent
+    # ``getMore`` polls re-scan from that checkpoint forward.
+    rows = storage.scan_docs_after_id_key(db_name, coll, after=None)
+    state = {"after_id_key": rows[-1][0] if rows else None}
+
+    def producer() -> list[dict[str, Any]]:
+        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=state["after_id_key"])
+        if not new_rows:
+            return []
+        state["after_id_key"] = new_rows[-1][0]
+        return [doc for _id_k, doc in new_rows]
+
+    first_batch = initial_docs[:batch_size]
+    cursor_id = ctx.cursors.register_tailable(
+        ns,
+        producer,
+        await_data=await_data,
+    )
+    return {
+        "cursor": {
+            "firstBatch": first_batch,
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
+        },
         "ok": 1.0,
     }
 
@@ -691,7 +1199,35 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
 
 def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["create"]
+    capped = bool(doc.get("capped", False))
+    if capped:
+        size = doc.get("size")
+        if not isinstance(size, (int, float)) or isinstance(size, bool) or size <= 0:
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "the 'size' field is required when 'capped' is true "
+                    "and must be a positive number"
+                ),
+                "code": 72,
+                "codeName": "InvalidOptions",
+            }
+        max_docs = doc.get("max")
+        if max_docs is not None and (
+            not isinstance(max_docs, (int, float)) or isinstance(max_docs, bool) or max_docs <= 0
+        ):
+            return {
+                "ok": 0.0,
+                "errmsg": "the 'max' field must be a positive integer when set",
+                "code": 72,
+                "codeName": "InvalidOptions",
+            }
     ctx.storage.create_collection(ctx.db_name, coll)
+    if capped:
+        opts: dict[str, Any] = {"capped": True, "size": int(doc["size"])}
+        if doc.get("max") is not None:
+            opts["max"] = int(doc["max"])
+        ctx.storage.set_collection_options(ctx.db_name, coll, **opts)
     pre_post = doc.get("changeStreamPreAndPostImages")
     if isinstance(pre_post, Mapping):
         ctx.storage.set_collection_options(
@@ -719,9 +1255,19 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _list_collections(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     names = ctx.storage.list_collections(ctx.db_name)
-    batch = [
-        {"name": n, "type": "collection", "options": {}, "info": {"readOnly": False}} for n in names
-    ]
+    batch: list[dict[str, Any]] = []
+    for n in names:
+        raw = ctx.storage.get_collection_options(ctx.db_name, n)
+        opts: dict[str, Any] = {}
+        if raw.get("capped"):
+            opts["capped"] = True
+            if "size" in raw:
+                opts["size"] = raw["size"]
+            if "max" in raw:
+                opts["max"] = raw["max"]
+        batch.append(
+            {"name": n, "type": "collection", "options": opts, "info": {"readOnly": False}}
+        )
     return {
         "cursor": {
             "firstBatch": batch,
@@ -732,10 +1278,33 @@ def _list_collections(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
     }
 
 
-def _list_databases(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+def _list_databases(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """List databases honouring ``filter``, ``nameOnly``, ``authorizedDatabases``.
+
+    The ``filter`` document is a regular query predicate evaluated
+    against each per-database descriptor (``{name, sizeOnDisk,
+    empty}``). ``nameOnly: true`` strips the size/empty fields from
+    each entry — drivers use this when they only care about names.
+    ``authorizedDatabases`` is accepted for wire compatibility but
+    has no effect (we don't gate listing by per-db privileges in the
+    initial RBAC slice).
+    """
     names = ctx.storage.list_databases()
+    name_only = bool(doc.get("nameOnly", False))
+    filter_doc = doc.get("filter")
+
+    descriptors: list[dict[str, Any]] = [
+        {"name": n, "sizeOnDisk": 0, "empty": False} for n in names
+    ]
+
+    if isinstance(filter_doc, dict) and filter_doc:
+        descriptors = [d for d in descriptors if matches(d, filter_doc)]
+
+    if name_only:
+        descriptors = [{"name": d["name"]} for d in descriptors]
+
     return {
-        "databases": [{"name": n, "sizeOnDisk": 0, "empty": False} for n in names],
+        "databases": descriptors,
         "totalSize": 0,
         "ok": 1.0,
     }
@@ -905,6 +1474,22 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 43,
             "codeName": "CursorNotFound",
         }
+    # Cursor ownership check. ``getMore`` is in ``_NO_PRIVILEGE_COMMANDS``
+    # (the original ``find`` / ``aggregate`` already authorised the
+    # namespace), so without this check a connection that learns or
+    # guesses someone else's cursor id can pull pages from a namespace
+    # it has no privilege on, just by claiming the right ``collection``
+    # in the request. Reject any getMore where the caller's claimed
+    # namespace doesn't match the cursor's stored namespace — same
+    # response mongod returns (CursorNotFound, code 43) so we don't
+    # confirm-or-deny which cursor IDs exist on other connections.
+    if entry.namespace and ns != entry.namespace:
+        return {
+            "ok": 0.0,
+            "errmsg": f"cursor id {cursor_id} not found",
+            "code": 43,
+            "codeName": "CursorNotFound",
+        }
     if not entry.tailable:
         try:
             batch, exhausted = ctx.cursors.next_batch(cursor_id, batch_size)
@@ -942,8 +1527,15 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         wait_seconds = max_time_ms / 1000.0 if max_time_ms > 0 else 1.0
         captured_tail = ctx.storage.oplog_tail_seq()
         with ctx.storage._oplog_cv:
+            # Wake predicate must not acquire ``storage._lock`` — the
+            # write path holds ``_lock`` then notifies under
+            # ``_oplog_cv`` (lock order ``_lock -> _oplog_cv``), so a
+            # waiter holding ``_oplog_cv`` and reaching for ``_lock``
+            # would ABBA-deadlock against any concurrent insert /
+            # update / delete. Use the lock-free tail peek; a stale
+            # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
-                lambda: ctx.storage.oplog_tail_seq() > captured_tail or entry.invalidated,
+                lambda: ctx.storage.oplog_tail_seq_nolock() > captured_tail or entry.invalidated,
                 timeout=wait_seconds,
             )
         if entry.producer is not None and not entry.remaining:
@@ -956,13 +1548,20 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # The invalidate event has now been delivered.
         entry.final_event_pending = False
     cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
+    cursor_doc: dict[str, Any] = {
+        "nextBatch": batch,
+        # Cursor `id` MUST be int64 — Go driver hard-fails int32.
+        "id": bson.Int64(cursor_id if cursor_alive else 0),
+        "ns": ns,
+    }
+    if entry.last_token is not None:
+        # `postBatchResumeToken` lets change-stream consumers advance
+        # their resume position even when nextBatch is empty —
+        # MongoDB 4.2+ feature, mongo-go-driver and pymongo expect it
+        # on every change-stream getMore.
+        cursor_doc["postBatchResumeToken"] = entry.last_token
     return {
-        "cursor": {
-            "nextBatch": batch,
-            # Cursor `id` MUST be int64 — Go driver hard-fails int32.
-            "id": bson.Int64(cursor_id if cursor_alive else 0),
-            "ns": ns,
-        },
+        "cursor": cursor_doc,
         "ok": 1.0,
     }
 
@@ -975,7 +1574,8 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     pipeline = doc.get("pipeline", [])
     hint = doc.get("hint")
     cursor_opts = doc.get("cursor") or {}
-    batch_size = int(cursor_opts.get("batchSize", 0) or 0)
+    raw_agg_batch = cursor_opts.get("batchSize")
+    batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else int(raw_agg_batch)
     coll_name = ""
 
     first_stage = pipeline[0] if pipeline else {}
@@ -1014,9 +1614,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         ns = f"{ctx.db_name}.$cmd.aggregate"
     pipeline_ctx = PipelineContext(storage=ctx.storage, db_name=ctx.db_name, coll_name=coll_name)
     docs = apply_pipeline(docs, pipeline, pipeline_ctx)
-    first_batch, cursor_id = _split_into_cursor(
-        docs, batch_size or DEFAULT_BATCH_SIZE, ns, ctx.cursors
-    )
+    first_batch, cursor_id = _split_into_cursor(docs, batch_size, ns, ctx.cursors)
     # Silence unused import in this branch.
     _ = changestreams
     return {
@@ -1078,6 +1676,24 @@ def _aggregate_change_stream(
                 "code": 9,
                 "codeName": "FailedToParse",
             }
+        # Scope-bind the resume token. Without this check, a client
+        # watching `db.collA` can craft a token with a different `ns`
+        # (e.g. `db.collB`, or `secrets.users`) and read the oplog of
+        # that other namespace from the embedded `seq`. mongod itself
+        # leaves tokens unsigned (they're opaque transports of position),
+        # but it gates the read at the resource ACL — SecantusDB doesn't
+        # have full per-resource ACL plumbing, so the watch scope is
+        # the boundary we must enforce here.
+        if not changestreams._scope_matches(data.ns, scope):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "Resume token namespace does not match the change-stream "
+                    "watch scope; refusing cross-namespace resume."
+                ),
+                "code": 13,  # Unauthorized
+                "codeName": "Unauthorized",
+            }
         history_lost = False
         if floor > 0 and data.seq < floor:
             history_lost = True
@@ -1129,9 +1745,21 @@ def _aggregate_change_stream(
             return []
         rows = storage.read_oplog(start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter)
         if not rows:
+            # No new oplog entries since last poll. Still refresh
+            # ``last_token`` so the next ``postBatchResumeToken``
+            # carries the current cluster time — consumers on quiet
+            # collections can advance their resume position even
+            # when no events are visible. Token's ns / docKey stay
+            # at the last-seen value (drivers tolerate the placeholder).
+            ts = storage.current_cluster_time()
+            entry.last_token = changestreams.make_resume_token(
+                changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
+            )
             return []
         events: list[dict[str, Any]] = []
         last_seen = entry.position_seq
+        last_seen_ts = None
+        last_seen_ns = ns
         for seq, oplog_entry in rows:
             try:
                 ev, invalidates = changestreams.project(
@@ -1150,14 +1778,30 @@ def _aggregate_change_stream(
                 last_seen = seq
                 continue
             if ev is not None:
+                if cs_spec.split_large_events:
+                    changestreams.stamp_split_event(ev)
                 events.append(ev)
             last_seen = seq
+            ts_field = oplog_entry.get("ts")
+            if ts_field is not None:
+                last_seen_ts = ts_field
+            ns_field = oplog_entry.get("ns")
+            if isinstance(ns_field, str) and ns_field:
+                last_seen_ns = ns_field
             if invalidates:
-                events.append(changestreams.invalidate_event(seq, oplog_entry))
+                inv = changestreams.invalidate_event(seq, oplog_entry)
+                if cs_spec.split_large_events:
+                    changestreams.stamp_split_event(inv)
+                events.append(inv)
                 entry.invalidated = True
                 entry.final_event_pending = True
                 break
         entry.position_seq = last_seen
+        if last_seen_ts is None:
+            last_seen_ts = storage.current_cluster_time()
+        entry.last_token = changestreams.make_resume_token(
+            changestreams.ResumeTokenData(last_seen, last_seen_ts, last_seen_ns, {})
+        )
         if pipeline_after_cs:
             events = apply_pipeline(events, pipeline_after_cs, pipeline_ctx)
         return events
@@ -1171,9 +1815,19 @@ def _aggregate_change_stream(
     )
     entry_ref["entry"] = ctx.cursors.get(cursor_id)
     _ = batch_size  # firstBatch is empty by design for change streams
+    initial_ts = ctx.storage.current_cluster_time()
+    initial_token = changestreams.make_resume_token(
+        changestreams.ResumeTokenData(start_seq - 1, initial_ts, ns, {})
+    )
+    entry_ref["entry"].last_token = initial_token
     return {
-        "cursor": {"firstBatch": [], "id": bson.Int64(cursor_id), "ns": ns},
-        "operationTime": ctx.storage.current_cluster_time(),
+        "cursor": {
+            "firstBatch": [],
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
+            "postBatchResumeToken": initial_token,
+        },
+        "operationTime": initial_ts,
         "ok": 1.0,
     }
 
@@ -1218,32 +1872,57 @@ def _ensure_conn_auth(ctx: CommandContext) -> ConnectionAuth:
     return ctx.connection_auth
 
 
-def _lookup_creds(storage: Storage, db: str, username: str) -> StoredCredentials | None:
+def _mechs_for_principal(ctx: CommandContext, principal: str) -> list[str]:
+    """Resolve `saslSupportedMechs` for ``"<db>.<user>"``.
+
+    Looks up the user record and returns the mechanisms its
+    ``credentials`` doc carries entries for, falling back to
+    ``[SCRAM_SHA_256]`` when the principal is unknown so the driver
+    still tries a real mechanism.
+    """
+    db, _, username = principal.partition(".")
+    if not username:
+        return [SCRAM_SHA_256]
+    record = ctx.storage.get_user(db, username)
+    if record is None:
+        return [SCRAM_SHA_256]
+    creds_doc = record.get("credentials")
+    if not isinstance(creds_doc, dict):
+        return [SCRAM_SHA_256]
+    # Order: modern first when both are present.
+    mechs = [m for m in (SCRAM_SHA_256, SCRAM_SHA_1) if m in creds_doc]
+    return mechs or [SCRAM_SHA_256]
+
+
+def _lookup_creds(
+    storage: Storage, db: str, username: str, *, mechanism: str = SCRAM_SHA_256
+) -> StoredCredentials | None:
     record = storage.get_user(db, username)
     if record is None:
         return None
     creds_doc = record.get("credentials")
-    if not isinstance(creds_doc, dict) or SCRAM_SHA_256 not in creds_doc:
+    if not isinstance(creds_doc, dict) or mechanism not in creds_doc:
         return None
-    return StoredCredentials.from_doc(creds_doc)
+    return StoredCredentials.from_doc(creds_doc, mechanism=mechanism)
 
 
 def _sasl_start(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     conn = _ensure_conn_auth(ctx)
     mechanism = doc.get("mechanism", "")
-    if mechanism != SCRAM_SHA_256:
+    if mechanism not in (SCRAM_SHA_256, SCRAM_SHA_1):
         return _auth_failure(
-            f"Unsupported SASL mechanism: {mechanism!r} (only {SCRAM_SHA_256} is supported)"
+            f"Unsupported SASL mechanism: {mechanism!r} (supported: {SCRAM_SHA_256}, {SCRAM_SHA_1})"
         )
     payload = _payload_bytes(doc.get("payload"))
     db_name = ctx.db_name or "admin"
-    creds = _lookup_creds(ctx.storage, db_name, _peek_scram_username(payload))
+    creds = _lookup_creds(ctx.storage, db_name, _peek_scram_username(payload), mechanism=mechanism)
     try:
         server_first, state = begin_scram(
             conversation_id=conn.new_conversation_id(),
             db_name=db_name,
             payload=payload,
             creds=creds,
+            mechanism=mechanism,
         )
     except AuthError as exc:
         return _auth_failure(str(exc))
@@ -1302,6 +1981,8 @@ def _sasl_continue(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         roles = record.get("roles") or []
         if isinstance(roles, list):
             conn.add_principal_roles(roles)
+    if ctx.connections is not None:
+        ctx.connections.authenticate(ctx.connection_id, f"{state.username}@{state.db_name}")
     conn.scram = None
     return {
         "conversationId": state.conversation_id,
@@ -1329,9 +2010,8 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "BadValue",
         }
     db_name = ctx.db_name or "admin"
-    creds = derive_credentials(pwd)
     roles_arg = doc.get("roles", []) or []
-    normalised = _normalise_roles_arg(roles_arg, db_name)
+    normalised = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
     if normalised is None:
         return {
             "ok": 0.0,
@@ -1339,13 +2019,35 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 31,
             "codeName": "RoleNotFound",
         }
+    # `mechanisms` selects which SCRAM hashes to derive credentials
+    # for. Default to SCRAM-SHA-256 alone, matching mongod's modern
+    # default (post-3.6 the SHA-1 hashing isn't computed unless the
+    # request asks for it).
+    mechanisms_arg = doc.get("mechanisms")
+    if isinstance(mechanisms_arg, list) and mechanisms_arg:
+        requested = [m for m in mechanisms_arg if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
+    else:
+        requested = [SCRAM_SHA_256]
+    if not requested:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "createUser: mechanisms must contain at least one of "
+                f"{SCRAM_SHA_256!r}, {SCRAM_SHA_1!r}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    creds_doc: dict[str, object] = {}
+    for mech in requested:
+        creds_doc.update(derive_credentials(pwd, mechanism=mech, username=username).to_doc())
     record = {
         "_id": f"{db_name}.{username}",
         "user": username,
         "db": db_name,
-        "credentials": creds.to_doc(),
+        "credentials": creds_doc,
         "roles": normalised,
-        "mechanisms": [SCRAM_SHA_256],
+        "mechanisms": requested,
     }
     added = ctx.storage.add_user(db_name, username, record, replace=False)
     if not added:
@@ -1355,6 +2057,78 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": _USER_ALREADY_EXISTS,
             "codeName": "Location51003",
         }
+    return {"ok": 1.0}
+
+
+def _update_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Rotate a password and/or replace a user's role bindings in place.
+
+    Real ``mongod``'s ``updateUser`` updates the existing record without
+    invalidating other connections — drop+recreate would force every
+    authenticated client off. We do the same: re-derive credentials when
+    ``pwd`` is supplied, replace ``roles`` when supplied, leave the rest
+    alone. The calling connection's effective_roles refresh live so a
+    role change takes effect on the next command.
+    """
+    username = doc.get("updateUser")
+    if not isinstance(username, str) or not username:
+        return {
+            "ok": 0.0,
+            "errmsg": "updateUser: username (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_user(db_name, username)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"User '{username}@{db_name}' not found",
+            "code": _USER_NOT_FOUND,
+            "codeName": "UserNotFound",
+        }
+    pwd = doc.get("pwd")
+    roles_arg = doc.get("roles")
+    if pwd is None and roles_arg is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "updateUser: nothing to update (supply pwd and/or roles)",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if pwd is not None:
+        if not isinstance(pwd, str) or not pwd:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateUser: pwd must be a non-empty string",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        # Re-derive credentials for whichever mechanisms the existing
+        # record was provisioned with, so updateUser preserves a
+        # SHA-1+SHA-256 user as SHA-1+SHA-256.
+        existing_mechs = record.get("mechanisms")
+        if isinstance(existing_mechs, list) and existing_mechs:
+            mechs = [m for m in existing_mechs if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
+        else:
+            mechs = [SCRAM_SHA_256]
+        new_creds: dict[str, object] = {}
+        for mech in mechs:
+            new_creds.update(derive_credentials(pwd, mechanism=mech, username=username).to_doc())
+        record["credentials"] = new_creds
+    if roles_arg is not None:
+        normalised = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
+        if normalised is None:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateUser: roles must be a list of known roles",
+                "code": 31,
+                "codeName": "RoleNotFound",
+            }
+        record["roles"] = normalised
+    ctx.storage.add_user(db_name, username, record, replace=True)
+    if roles_arg is not None:
+        _refresh_effective_roles(ctx)
     return {"ok": 1.0}
 
 
@@ -1395,6 +2169,45 @@ def _drop_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 if isinstance(roles, list):
                     conn.add_principal_roles(roles)
     return {"ok": 1.0}
+
+
+def _drop_all_users_from_database(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop every user record bound to the calling database.
+
+    Mirrors ``mongod`` semantics: returns ``{ok: 1, n: <count>}`` with
+    ``n`` set to the number of records removed (0 is fine — empty db).
+    Active auth state on the calling connection is invalidated for any
+    principals scoped to this db; other connections keep theirs until
+    they reconnect.
+    """
+    db_name = ctx.db_name or "admin"
+    # Use a generous limit + paginate manually so we don't load every
+    # user across the whole connection at once on a megacorp deploy.
+    removed = 0
+    while True:
+        batch = ctx.storage.list_users(db_name, skip=0, limit=1000)
+        if not batch:
+            break
+        for record in batch:
+            username = record.get("user")
+            if isinstance(username, str) and ctx.storage.drop_user(db_name, username):
+                removed += 1
+        if len(batch) < 1000:
+            break
+
+    conn = ctx.connection_auth
+    if conn is not None:
+        conn.authenticated_principals = [
+            p for p in conn.authenticated_principals if p[0] != db_name
+        ]
+        conn.effective_roles = []
+        for p_db, p_user in conn.authenticated_principals:
+            other = ctx.storage.get_user(p_db, p_user)
+            if other is not None:
+                roles = other.get("roles") or []
+                if isinstance(roles, list):
+                    conn.add_principal_roles(roles)
+    return {"ok": 1.0, "n": removed}
 
 
 def _users_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -1445,21 +2258,36 @@ def _users_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"users": users, "ok": 1.0}
 
 
-def _normalise_roles_arg(arg: Any, default_db: str) -> list[dict[str, str]] | None:
+def _normalise_roles_arg(
+    arg: Any,
+    default_db: str,
+    *,
+    storage: Storage | None = None,
+) -> list[dict[str, str]] | None:
     """Coerce a ``roles`` argument into the canonical ``[{role, db}]`` shape.
 
     Accepts the list-of-strings shorthand (``["read", "readWrite"]`` —
     each implicitly bound to ``default_db``) and the list-of-dicts form.
-    Validates role names against :data:`secantus.rbac.BUILT_IN_ROLES`.
-    Returns ``None`` if any entry is unrecognised — caller surfaces a
-    ``RoleNotFound`` error.
+    Role names validate against :data:`secantus.rbac.BUILT_IN_ROLES`
+    first, then fall through to ``storage.get_role(db, name)`` so
+    custom roles are accepted alongside built-ins. Returns ``None``
+    if any entry is unrecognised — caller surfaces a ``RoleNotFound``
+    error.
     """
+
+    def _resolves(role: str, db: str) -> bool:
+        if is_known_role(role):
+            return True
+        if storage is None:
+            return False
+        return storage.get_role(db, role) is not None
+
     if not isinstance(arg, list):
         return None
     out: list[dict[str, str]] = []
     for entry in arg:
         if isinstance(entry, str):
-            if not is_known_role(entry):
+            if not _resolves(entry, default_db):
                 return None
             out.append({"role": entry, "db": default_db})
             continue
@@ -1468,7 +2296,7 @@ def _normalise_roles_arg(arg: Any, default_db: str) -> list[dict[str, str]] | No
             db = entry.get("db", default_db)
             if not isinstance(role, str) or not isinstance(db, str):
                 return None
-            if not is_known_role(role):
+            if not _resolves(role, db):
                 return None
             out.append({"role": role, "db": db})
             continue
@@ -1487,7 +2315,7 @@ def _grant_roles_to_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, 
         }
     db_name = ctx.db_name or "admin"
     roles_arg = doc.get("roles")
-    new_roles = _normalise_roles_arg(roles_arg, db_name)
+    new_roles = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
     if new_roles is None:
         return {
             "ok": 0.0,
@@ -1530,7 +2358,7 @@ def _revoke_roles_from_user(doc: dict[str, Any], ctx: CommandContext) -> dict[st
         }
     db_name = ctx.db_name or "admin"
     roles_arg = doc.get("roles")
-    to_revoke = _normalise_roles_arg(roles_arg, db_name)
+    to_revoke = _normalise_roles_arg(roles_arg, db_name, storage=ctx.storage)
     if to_revoke is None:
         return {
             "ok": 0.0,
@@ -1577,19 +2405,369 @@ def _refresh_effective_roles(ctx: CommandContext) -> None:
             conn.add_principal_roles(roles)
 
 
-def _roles_info(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    """Return information about built-in roles.
+def _normalise_privileges(arg: Any) -> list[dict[str, Any]] | None:
+    """Validate / normalise a ``privileges`` array. Returns the cleaned
+    list, or ``None`` if any entry is malformed (caller maps to
+    BadValue). An empty list is fine — a role can be a pure inheritor.
+    """
+    if not isinstance(arg, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for priv in arg:
+        if not isinstance(priv, Mapping):
+            return None
+        resource = priv.get("resource")
+        actions = priv.get("actions")
+        if not isinstance(resource, Mapping) or not isinstance(actions, list):
+            return None
+        if not all(isinstance(a, str) for a in actions):
+            return None
+        out.append({"resource": dict(resource), "actions": list(actions)})
+    return out
 
-    Custom roles aren't supported (no `createRole` in this slice), so
-    this just enumerates the built-ins. Mongod returns more fields
-    (privileges, inherited roles); we surface name + db + isBuiltin
-    which is enough for tooling that wants to enumerate.
+
+def _normalise_inherited_roles(arg: Any, default_db: str) -> list[dict[str, str]] | None:
+    """Validate / normalise an inherited ``roles`` array. Each entry is
+    ``"<name>"`` (uses default_db) or ``{"role": <name>, "db": <db>}``.
+    Returns ``None`` on malformed input.
+    """
+    if not isinstance(arg, list):
+        return None
+    out: list[dict[str, str]] = []
+    for entry in arg:
+        if isinstance(entry, str) and entry:
+            out.append({"role": entry, "db": default_db})
+        elif isinstance(entry, Mapping):
+            name = entry.get("role")
+            db = entry.get("db", default_db)
+            if not isinstance(name, str) or not name:
+                return None
+            if not isinstance(db, str) or not db:
+                return None
+            out.append({"role": name, "db": db})
+        else:
+            return None
+    return out
+
+
+def _create_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Define a custom role with privileges and (optionally) inherited
+    roles. Mongod-shaped: ``createRole`` ``privileges`` ``roles``.
+    Rejects names that collide with built-ins (matches mongod, which
+    refuses ``createRole: "read"`` etc.).
+    """
+    name = doc.get("createRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "createRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if name in BUILT_IN_ROLES:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Cannot create role with name {name!r}: name is reserved for a built-in",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    privileges = _normalise_privileges(doc.get("privileges"))
+    if privileges is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "createRole: privileges must be an array of {resource, actions}",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    inherited = _normalise_inherited_roles(doc.get("roles"), db_name)
+    if inherited is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "createRole: roles must be a list of names or {role, db} dicts",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    record = {
+        "_id": f"{db_name}.{name}",
+        "role": name,
+        "db": db_name,
+        "privileges": privileges,
+        "roles": inherited,
+    }
+    if not ctx.storage.add_role(db_name, name, record, replace=False):
+        return {
+            "ok": 0.0,
+            "errmsg": f'Role "{name}@{db_name}" already exists',
+            "code": 51002,
+            "codeName": "Location51002",
+        }
+    return {"ok": 1.0}
+
+
+def _update_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Replace a custom role's privileges / inherited roles in place.
+    Either ``privileges`` or ``roles`` (or both) may be supplied;
+    omitted fields stay as-is. Mongod-shaped.
+    """
+    name = doc.get("updateRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "updateRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    if "privileges" in doc:
+        privileges = _normalise_privileges(doc["privileges"])
+        if privileges is None:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateRole: privileges must be an array of {resource, actions}",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        record["privileges"] = privileges
+    if "roles" in doc:
+        inherited = _normalise_inherited_roles(doc["roles"], db_name)
+        if inherited is None:
+            return {
+                "ok": 0.0,
+                "errmsg": "updateRole: roles must be a list of names or {role, db} dicts",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        record["roles"] = inherited
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _drop_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("dropRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "dropRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    if not ctx.storage.drop_role(db_name, name):
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    return {"ok": 1.0}
+
+
+def _drop_all_roles_from_database(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop every custom role bound to the calling db. Returns ``n`` =
+    removed count. Built-in roles are not affected (they're never
+    persisted)."""
+    db_name = ctx.db_name or "admin"
+    removed = 0
+    while True:
+        batch = ctx.storage.list_roles(db_name, skip=0, limit=1000)
+        if not batch:
+            break
+        for record in batch:
+            role = record.get("role")
+            if isinstance(role, str) and ctx.storage.drop_role(db_name, role):
+                removed += 1
+        if len(batch) < 1000:
+            break
+    return {"ok": 1.0, "n": removed}
+
+
+def _grant_privileges_to_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("grantPrivilegesToRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantPrivilegesToRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    additions = _normalise_privileges(doc.get("privileges"))
+    if additions is None:
+        return {
+            "ok": 0.0,
+            "errmsg": ("grantPrivilegesToRole: privileges must be an array of {resource, actions}"),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    privs = list(record.get("privileges") or [])
+    for add in additions:
+        merged = False
+        for existing in privs:
+            if existing.get("resource") == add["resource"]:
+                # Merge actions, dedupe.
+                existing_actions = list(existing.get("actions") or [])
+                for a in add["actions"]:
+                    if a not in existing_actions:
+                        existing_actions.append(a)
+                existing["actions"] = existing_actions
+                merged = True
+                break
+        if not merged:
+            privs.append(add)
+    record["privileges"] = privs
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _revoke_privileges_from_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("revokePrivilegesFromRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokePrivilegesFromRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    revocations = _normalise_privileges(doc.get("privileges"))
+    if revocations is None:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "revokePrivilegesFromRole: privileges must be an array of {resource, actions}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    privs = list(record.get("privileges") or [])
+    for rev in revocations:
+        for existing in privs:
+            if existing.get("resource") != rev["resource"]:
+                continue
+            actions = [a for a in (existing.get("actions") or []) if a not in rev["actions"]]
+            existing["actions"] = actions
+    # Drop privileges that have no actions left.
+    record["privileges"] = [p for p in privs if p.get("actions")]
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _grant_roles_to_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("grantRolesToRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantRolesToRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    additions = _normalise_inherited_roles(doc.get("roles"), db_name)
+    if additions is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "grantRolesToRole: roles must be a list of names or {role, db} dicts",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    seen = {(r["role"], r["db"]) for r in record.get("roles") or [] if isinstance(r, Mapping)}
+    inherited = list(record.get("roles") or [])
+    for add in additions:
+        if (add["role"], add["db"]) not in seen:
+            inherited.append(add)
+            seen.add((add["role"], add["db"]))
+    record["roles"] = inherited
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _revoke_roles_from_role(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    name = doc.get("revokeRolesFromRole")
+    if not isinstance(name, str) or not name:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokeRolesFromRole: role name (string) required",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    db_name = ctx.db_name or "admin"
+    record = ctx.storage.get_role(db_name, name)
+    if record is None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Role {name!r} not found on database {db_name!r}",
+            "code": 31,
+            "codeName": "RoleNotFound",
+        }
+    revocations = _normalise_inherited_roles(doc.get("roles"), db_name)
+    if revocations is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "revokeRolesFromRole: roles must be a list of names or {role, db} dicts",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    drop_set = {(r["role"], r["db"]) for r in revocations}
+    record["roles"] = [
+        r
+        for r in (record.get("roles") or [])
+        if isinstance(r, Mapping) and (r.get("role"), r.get("db")) not in drop_set
+    ]
+    ctx.storage.add_role(db_name, name, record, replace=True)
+    return {"ok": 1.0}
+
+
+def _roles_info(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Return information about built-in and custom roles.
+
+    Built-in roles surface as ``isBuiltin: true`` with empty
+    ``inheritedRoles``. Custom roles are looked up from storage and
+    their ``privileges`` / ``roles`` arrays surface as-is. The
+    ``rolesInfo`` argument matches mongod:
+
+    * ``1`` / ``true`` — every custom role on the calling db (plus
+      built-ins when ``showBuiltinRoles: true``).
+    * ``"<name>"`` or ``{role, db}`` — single role lookup.
+    * ``[ ... ]`` — multi-role lookup.
     """
     arg = doc.get("rolesInfo")
-    db_name = "admin"
+    db_name = ctx.db_name or "admin"
     show_builtin = bool(doc.get("showBuiltinRoles", False))
 
-    def _entry(role_name: str, role_db: str) -> dict[str, Any]:
+    def _builtin_entry(role_name: str, role_db: str) -> dict[str, Any]:
         return {
             "role": role_name,
             "db": role_db,
@@ -1598,28 +2776,49 @@ def _roles_info(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
             "inheritedRoles": [],
         }
 
+    def _custom_entry(record: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "role": record.get("role"),
+            "db": record.get("db"),
+            "isBuiltin": False,
+            "privileges": list(record.get("privileges") or []),
+            "roles": list(record.get("roles") or []),
+            "inheritedRoles": list(record.get("roles") or []),
+        }
+
     out: list[dict[str, Any]] = []
     if arg == 1 or arg is True:
+        # Custom roles in the calling db.
+        for record in ctx.storage.list_roles(db_name):
+            out.append(_custom_entry(record))
         if show_builtin:
             for name in BUILT_IN_ROLES:
-                out.append(_entry(name, db_name))
-    elif isinstance(arg, str):
-        if is_known_role(arg):
-            out.append(_entry(arg, db_name))
-    elif isinstance(arg, dict):
-        role = arg.get("role")
-        db = arg.get("db", db_name)
-        if isinstance(role, str) and is_known_role(role):
-            out.append(_entry(role, db if isinstance(db, str) else db_name))
-    elif isinstance(arg, list):
-        for entry in arg:
-            if isinstance(entry, str) and is_known_role(entry):
-                out.append(_entry(entry, db_name))
-            elif isinstance(entry, dict):
-                role = entry.get("role")
-                db = entry.get("db", db_name)
-                if isinstance(role, str) and is_known_role(role):
-                    out.append(_entry(role, db if isinstance(db, str) else db_name))
+                out.append(_builtin_entry(name, db_name))
+    else:
+        targets: list[tuple[str, str]] = []
+        if isinstance(arg, str):
+            targets.append((arg, db_name))
+        elif isinstance(arg, Mapping):
+            role = arg.get("role")
+            db = arg.get("db", db_name)
+            if isinstance(role, str) and isinstance(db, str):
+                targets.append((role, db))
+        elif isinstance(arg, list):
+            for entry in arg:
+                if isinstance(entry, str):
+                    targets.append((entry, db_name))
+                elif isinstance(entry, Mapping):
+                    role = entry.get("role")
+                    db = entry.get("db", db_name)
+                    if isinstance(role, str) and isinstance(db, str):
+                        targets.append((role, db))
+        for role_name, role_db in targets:
+            if role_name in BUILT_IN_ROLES:
+                out.append(_builtin_entry(role_name, role_db))
+                continue
+            record = ctx.storage.get_role(role_db, role_name)
+            if record is not None:
+                out.append(_custom_entry(record))
     return {"roles": out, "ok": 1.0}
 
 
@@ -1638,10 +2837,16 @@ _HANDLERS: dict[str, CommandHandler] = {
     "getLog": _get_log,
     "whatsmyuri": _whatsmyuri,
     "hostInfo": _hostinfo,
+    "currentOp": _current_op,
+    "fsync": _fsync,
+    "profile": _profile,
     "explain": _explain,
     "serverStatus": _server_status,
+    "getCmdLineOpts": _get_cmd_line_opts,
+    "getParameter": _get_parameter,
     "connectionStatus": _connection_status,
     "dbStats": _db_stats,
+    "dbstats": _db_stats,
     "collStats": _coll_stats,
     "insert": _insert,
     "find": _find,
@@ -1667,15 +2872,32 @@ _HANDLERS: dict[str, CommandHandler] = {
     "saslStart": _sasl_start,
     "saslContinue": _sasl_continue,
     "createUser": _create_user,
+    "updateUser": _update_user,
     "dropUser": _drop_user,
+    "dropAllUsersFromDatabase": _drop_all_users_from_database,
     "usersInfo": _users_info,
     "grantRolesToUser": _grant_roles_to_user,
     "revokeRolesFromUser": _revoke_roles_from_user,
     "rolesInfo": _roles_info,
+    "createRole": _create_role,
+    "updateRole": _update_role,
+    "dropRole": _drop_role,
+    "dropAllRolesFromDatabase": _drop_all_roles_from_database,
+    "grantPrivilegesToRole": _grant_privileges_to_role,
+    "revokePrivilegesFromRole": _revoke_privileges_from_role,
+    "grantRolesToRole": _grant_roles_to_role,
+    "revokeRolesFromRole": _revoke_roles_from_role,
 }
 
 # Commands a connection may invoke before authenticating, when
 # require_auth=True. The handshake plus the auth handshake itself.
+# getLog and hostInfo were previously listed here, which let an
+# unauthenticated peer dump the in-memory log buffer (which can contain
+# operation parameters, error messages, and other operational details)
+# and read the server host's OS/CPU info. Both leak server-internal
+# state and have no role in the driver handshake — pymongo / mongo-go /
+# mongo-node / mongo-java all complete connect+auth without calling
+# them. Require auth like every other command of their privilege class.
 _PRE_AUTH_COMMANDS = frozenset(
     {
         "hello",
@@ -1687,9 +2909,7 @@ _PRE_AUTH_COMMANDS = frozenset(
         "saslStart",
         "saslContinue",
         "endSessions",
-        "getLog",
         "whatsmyuri",
-        "hostInfo",
     }
 )
 
@@ -1729,20 +2949,43 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "listCollections": (A_LIST_COLLECTIONS, SCOPE_DATABASE),
     "listDatabases": (A_LIST_DATABASES, SCOPE_CLUSTER),
     "dbStats": (A_DB_STATS, SCOPE_DATABASE),
+    # MongoDB clients accept either case; the handler table aliases them
+    # but the RBAC table previously only listed ``dbStats``, so a
+    # lowercase request slipped past the privilege check (the dispatcher
+    # silently exempts commands missing from this table).
+    "dbstats": (A_DB_STATS, SCOPE_DATABASE),
     "collStats": (A_COLL_STATS, SCOPE_COLLECTION),
     # User management
     "createUser": (A_CREATE_USER, SCOPE_DATABASE),
     "dropUser": (A_DROP_USER, SCOPE_DATABASE),
+    "dropAllUsersFromDatabase": (A_DROP_USER, SCOPE_DATABASE),
     "usersInfo": (A_VIEW_USER, SCOPE_DATABASE),
     "grantRolesToUser": (A_GRANT_ROLE, SCOPE_DATABASE),
     "revokeRolesFromUser": (A_REVOKE_ROLE, SCOPE_DATABASE),
     "rolesInfo": (A_VIEW_ROLE, SCOPE_DATABASE),
     "updateUser": (A_CHANGE_PASSWORD, SCOPE_DATABASE),
+    # Custom roles — same database scope as user mgmt.
+    "createRole": (A_CREATE_ROLE, SCOPE_DATABASE),
+    "updateRole": (A_GRANT_ROLE, SCOPE_DATABASE),
+    "dropRole": (A_DROP_ROLE, SCOPE_DATABASE),
+    "dropAllRolesFromDatabase": (A_DROP_ROLE, SCOPE_DATABASE),
+    "grantPrivilegesToRole": (A_GRANT_ROLE, SCOPE_DATABASE),
+    "revokePrivilegesFromRole": (A_REVOKE_ROLE, SCOPE_DATABASE),
+    "grantRolesToRole": (A_GRANT_ROLE, SCOPE_DATABASE),
+    "revokeRolesFromRole": (A_REVOKE_ROLE, SCOPE_DATABASE),
     # Cluster / introspection
     "serverStatus": (A_SERVER_STATUS, SCOPE_CLUSTER),
     "hostInfo": (A_HOST_INFO, SCOPE_CLUSTER),
     "getCmdLineOpts": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
+    # ``getParameter`` exposes server-internal config (featureFlag state,
+    # tunables) and was missing from this table — a cluster-info command
+    # an unprivileged authenticated user could call. Reuse the same
+    # cluster-monitor action as the other introspection commands.
+    "getParameter": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
     "getLog": (A_GET_LOG, SCOPE_CLUSTER),
+    "currentOp": (A_INPROG, SCOPE_CLUSTER),
+    "fsync": (A_FSYNC, SCOPE_CLUSTER),
+    "profile": (A_ENABLE_PROFILER, SCOPE_DATABASE),
 }
 
 
@@ -1811,8 +3054,166 @@ def command_name(doc: dict[str, Any]) -> str:
     return next(iter(doc), "")
 
 
+# Commands the profiler skips. Handshake / session admin / cursor
+# continuation / profile-itself produce noise out of proportion to their
+# value. ``getLog`` would otherwise be self-amplifying as the dashboard
+# polls it. Mongod skips a similar set.
+_PROFILE_SKIP_COMMANDS = frozenset(
+    {
+        "hello",
+        "isMaster",
+        "ismaster",
+        "ping",
+        "buildInfo",
+        "buildinfo",
+        "whatsmyuri",
+        "saslStart",
+        "saslContinue",
+        "logout",
+        "connectionStatus",
+        "startSession",
+        "endSessions",
+        "refreshSessions",
+        "getMore",
+        "killCursors",
+        "profile",
+    }
+)
+
+
+_PROFILE_OP_BUCKET: dict[str, str] = {
+    "find": "query",
+    "count": "query",
+    "distinct": "query",
+    "aggregate": "command",
+    "insert": "insert",
+    "update": "update",
+    "delete": "remove",
+    "findAndModify": "command",
+    "findandmodify": "command",
+}
+
+
+def _profile_eligible_command(name: str, doc: dict[str, Any]) -> bool:
+    """Return ``True`` if dispatch should time + maybe record this command."""
+    if name in _PROFILE_SKIP_COMMANDS:
+        return False
+    # Recursion guard: any op against ``system.profile`` (write or read)
+    # would itself produce a profile entry and recurse. Reads of the
+    # profile collection in particular would otherwise cause writes that
+    # show up on the next read, growing without bound until the user
+    # spots it.
+    coll = doc.get(name)
+    if isinstance(coll, str) and coll == "system.profile":
+        return False
+    return True
+
+
+def _profile_op_label(name: str) -> str:
+    return _PROFILE_OP_BUCKET.get(name, "command")
+
+
+def _profile_command_namespace(name: str, doc: dict[str, Any], db: str) -> str:
+    """Best-effort ``ns`` field for a profile entry. ``db.coll`` or just ``db``."""
+    coll_arg = doc.get(name)
+    if isinstance(coll_arg, str) and coll_arg:
+        return f"{db}.{coll_arg}"
+    return db
+
+
+def _profile_sanitize_command(doc: dict[str, Any]) -> dict[str, Any]:
+    """Drop framing fields that aren't useful in a profile entry."""
+    out = dict(doc)
+    for key in ("$db", "$clusterTime", "lsid", "$readPreference"):
+        out.pop(key, None)
+    return out
+
+
+def _maybe_record_profile(
+    ctx: CommandContext,
+    name: str,
+    doc: dict[str, Any],
+    result: dict[str, Any],
+    start_ns: int,
+) -> None:
+    """Persist a ``system.profile`` entry if the per-DB level requires it.
+
+    Errors during profile-write are swallowed: the user's command has
+    already produced its result, and a profile-write failure shouldn't
+    bleed into the response. Logged at WARNING for diagnosability.
+    """
+    db = ctx.db_name or "admin"
+    try:
+        settings = ctx.storage.get_profile(db)
+    except Exception:
+        return
+    level = int(settings.get("level") or 0)
+    if level == 0:
+        return
+    duration_ms = max(0, (_time.monotonic_ns() - start_ns) // 1_000_000)
+    # ``settings.get(...) or default`` would replace legitimate zero
+    # values with the default. Use the explicit-default form instead.
+    slowms_raw = settings.get("slowms", 100)
+    slowms = int(slowms_raw) if slowms_raw is not None else 100
+    if level == 1 and duration_ms < slowms:
+        return
+    rate_raw = settings.get("sampleRate", 1.0)
+    sample_rate = float(rate_raw) if rate_raw is not None else 1.0
+    if sample_rate < 1.0 and _random.random() > sample_rate:
+        return
+    try:
+        ctx.storage.ensure_profile_collection(db)
+        client_addr = ""
+        if ctx.connections is not None:
+            for info in ctx.connections.snapshot():
+                if info.conn_id == ctx.connection_id:
+                    client_addr = f"{info.peer_addr[0]}:{info.peer_addr[1]}"
+                    break
+        user = None
+        if ctx.connection_auth is not None and ctx.connection_auth.is_authenticated:
+            principals = ctx.connection_auth.authenticated_principals
+            if principals:
+                u, d = principals[0]
+                user = f"{u}@{d}"
+        entry = {
+            "ts": _dt.datetime.now(_dt.timezone.utc),
+            "op": _profile_op_label(name),
+            "ns": _profile_command_namespace(name, doc, db),
+            "command": _profile_sanitize_command(doc),
+            "millis": int(duration_ms),
+            "ok": 1.0 if result.get("ok") == 1.0 else 0.0,
+            "client": client_addr,
+        }
+        if user is not None:
+            entry["user"] = user
+        if result.get("ok") != 1.0 and "errmsg" in result:
+            entry["errMsg"] = str(result["errmsg"])
+            if "code" in result:
+                entry["errCode"] = int(result["code"])
+        ctx.storage.insert(db, "system.profile", [entry])
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("profile-write failed for %s: %s", db, exc)
+
+
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
+    # Count every dispatched command — even unknown / unauth-rejected
+    # ones — so serverStatus.network.numRequests reflects raw wire
+    # traffic, not just the successful subset. Mongod's accounting is
+    # the same.
+    if ctx.metrics is not None:
+        ctx.metrics.record_command(name)
+    if ctx.connections is not None:
+        ctx.connections.record_command(ctx.connection_id, name)
+    # Implicit session registration: drivers that don't call
+    # ``startSession`` explicitly still attach an ``lsid`` to every
+    # command. Touching the registry on each lsid'd command keeps
+    # the idle-TTL clock aligned with actual activity, mirroring
+    # mongod's "session is alive while it's being used" rule.
+    if ctx.sessions is not None:
+        lsid = _lsid_bytes_from_arg(doc.get("lsid"))
+        if lsid is not None:
+            ctx.sessions.register(lsid)
     handler = _HANDLERS.get(name)
     if handler is None:
         return {
@@ -1854,6 +3255,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 action,
                 target_db=target_db,
                 cluster=cluster,
+                role_resolver=ctx.storage.get_role,
             ):
                 return {
                     "ok": 0.0,
@@ -1864,12 +3266,37 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     "code": 13,
                     "codeName": "Unauthorized",
                 }
+    profile_eligible = _profile_eligible_command(name, doc)
+    start_ns = _time.monotonic_ns() if profile_eligible else 0
     try:
-        return handler(doc, ctx)
-    except Exception as exc:
-        return {
+        result = handler(doc, ctx)
+    except _USER_FACING_EXCEPTIONS as exc:
+        # Validation-class errors: messages are deliberately shaped to
+        # match mongod, drivers parse them. Surface verbatim.
+        result = {
             "ok": 0.0,
             "errmsg": str(exc),
             "code": 14,
             "codeName": "TypeMismatch",
         }
+    except Exception:
+        # Anything else is an internal bug. Logging the full traceback
+        # server-side preserves debuggability; returning a generic
+        # message avoids leaking field paths, file paths, document
+        # contents, or stack frames over the wire to an unauthenticated
+        # peer.
+        logger.exception(
+            "internal error handling command %s (conn=%s, db=%s)",
+            name,
+            ctx.connection_id,
+            ctx.db_name,
+        )
+        result = {
+            "ok": 0.0,
+            "errmsg": "internal server error",
+            "code": 1,
+            "codeName": "InternalError",
+        }
+    if profile_eligible:
+        _maybe_record_profile(ctx, name, doc, result, start_ns)
+    return result

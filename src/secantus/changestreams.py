@@ -205,6 +205,12 @@ def project(
     wall = oplog_entry.get("wall")
     if not isinstance(ts, Timestamp):
         return None, False
+    # Periodic noop heartbeats (``op: "n"``) advance cluster time
+    # without surfacing as user events. Skip the projection — the
+    # caller still bumps ``position_seq`` past them, so resume tokens
+    # on quiet collections track the heartbeat clock.
+    if op == "n":
+        return None, False
     if op in {"i", "u", "d"}:
         if not _scope_matches(ns, scope):
             return None, False
@@ -304,7 +310,55 @@ def project(
                 event["wallTime"] = wall
             invalidates = scope.get("kind") == "coll"
             return event, invalidates
-        # createIndexes / dropIndexes: deferred (filtered out per backlog).
+        if "createIndexes" in cmd:
+            affected_ns = f"{cmd_db}.{cmd['createIndexes']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            indexes = cmd.get("indexes") or []
+            # mongod emits one event per index in a multi-index createIndexes
+            # call. We mirror that: surface the *first* index's spec on this
+            # event and rely on the oplog entry split (real mongod writes one
+            # oplog entry per index too, so when SecantusDB emits multi-
+            # index createIndexes, future iterations should split it).
+            # Today our storage layer only ever creates one index per
+            # createIndexes call, so the loop below collapses to one event.
+            spec = indexes[0] if isinstance(indexes, list) and indexes else {}
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            event = {
+                "_id": token,
+                "operationType": "createIndexes",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": {
+                    "indexes": [
+                        {
+                            "v": spec.get("v", 2),
+                            "key": dict(spec.get("key", {})),
+                            "name": spec.get("name", ""),
+                        }
+                    ]
+                    if spec
+                    else []
+                },
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
+        if "dropIndexes" in cmd:
+            affected_ns = f"{cmd_db}.{cmd['dropIndexes']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            event = {
+                "_id": token,
+                "operationType": "dropIndexes",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": {"indexes": [{"name": cmd.get("index", "")}]},
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
         return None, False
     return None, False
 
@@ -344,6 +398,7 @@ class ChangeStreamSpec:
     resume_after: dict[str, Any] | None = None
     start_after: dict[str, Any] | None = None
     start_at_operation_time: Timestamp | None = None
+    split_large_events: bool = False
 
 
 def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
@@ -360,7 +415,26 @@ def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
         out.start_after = dict(spec["startAfter"])
     if isinstance(spec.get("startAtOperationTime"), Timestamp):
         out.start_at_operation_time = spec["startAtOperationTime"]
+    if bool(spec.get("splitLargeChangeStreamEvents")):
+        out.split_large_events = True
     return out
+
+
+def stamp_split_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Attach a ``splitEvent: {fragment: 1, of: 1}`` envelope.
+
+    Real ``mongod`` splits change-stream events larger than 16 MB into
+    multiple fragments when the user sets
+    ``splitLargeChangeStreamEvents: true``; each fragment carries its
+    position via ``splitEvent: {fragment: N, of: M}``. SecantusDB's
+    events are never that large in practice (oplog entries cap well
+    below 16 MB), so we always emit a single-fragment envelope —
+    correct from the driver's reassembly perspective. The user's
+    opt-in is honoured by the *presence* of the ``splitEvent`` field;
+    drivers don't get back a ``splitEvent`` when the option is off.
+    """
+    event["splitEvent"] = {"fragment": 1, "of": 1}
+    return event
 
 
 __all__ = [
@@ -378,4 +452,5 @@ __all__ = [
     "parse_resume_token",
     "parse_spec",
     "project",
+    "stamp_split_event",
 ]

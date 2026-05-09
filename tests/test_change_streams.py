@@ -357,3 +357,115 @@ def test_cursor_id_is_int64_random(client: MongoClient) -> None:
     )
     cid = result["cursor"]["id"]
     assert int(cid) > 2**32
+
+
+def test_create_indexes_emits_change_event(client: MongoClient) -> None:
+    """A `createIndexes` on a watched collection produces an event with
+    operationType=createIndexes and the new index spec under
+    operationDescription.indexes[0]. Apps that watch index lifecycle for
+    schema-migration tooling now see them; previously the projection
+    dropped them entirely."""
+    db = client["csdb_create_idx"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.create_index([("x", 1)])
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    e = events[0]
+    assert e["operationType"] == "createIndexes"
+    assert e["ns"] == {"db": "csdb_create_idx", "coll": "c"}
+    indexes = e["operationDescription"]["indexes"]
+    assert len(indexes) == 1
+    assert indexes[0]["name"] == "x_1"
+    assert indexes[0]["key"] == {"x": 1}
+
+
+def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
+    """`dropIndexes` surfaces with operationType=dropIndexes and the
+    index name under operationDescription.indexes[0]."""
+    db = client["csdb_drop_idx"]
+    coll = db["c"]
+    db.create_collection("c")
+    coll.create_index([("x", 1)])  # one index to drop
+
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.drop_index("x_1")
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    e = events[0]
+    assert e["operationType"] == "dropIndexes"
+    assert e["ns"] == {"db": "csdb_drop_idx", "coll": "c"}
+    assert e["operationDescription"]["indexes"] == [{"name": "x_1"}]
+
+
+def test_index_lifecycle_at_database_scope(client: MongoClient) -> None:
+    """db.watch() picks up createIndexes/dropIndexes from any collection
+    in the database — same routing as the existing drop / dropDatabase
+    DDL events."""
+    db = client["csdb_idx_db_scope"]
+    db.create_collection("a")
+    db.create_collection("b")
+
+    cs = db.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    db["a"].create_index([("x", 1)])
+    db["b"].create_index([("y", 1)])
+
+    events = _drain(cs, target=2)
+    cs.close()
+    op_types = {e["operationType"] for e in events}
+    assert op_types == {"createIndexes"}
+    coll_names = {e["ns"]["coll"] for e in events}
+    assert coll_names == {"a", "b"}
+
+
+def test_split_large_change_stream_events_attaches_envelope(client: MongoClient) -> None:
+    """When the user opts into ``splitLargeChangeStreamEvents: True``,
+    every event carries a ``splitEvent: {fragment, of}`` envelope.
+    SecantusDB's events are never large enough to actually split, so
+    every fragment is single (``{fragment: 1, of: 1}``) — drivers
+    reassemble identically.
+
+    The pymongo Collection.watch() API doesn't expose this option as a
+    top-level kwarg in 4.x, so we drive the aggregate command directly
+    with the ``$changeStream`` stage spec."""
+    db = client["csdb_split"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    pipeline = [{"$changeStream": {"splitLargeChangeStreamEvents": True}}]
+    cs = coll.aggregate(pipeline, batchSize=1, maxAwaitTimeMS=2000)
+    time.sleep(0.3)
+    coll.insert_one({"_id": 1, "x": 1})
+    coll.update_one({"_id": 1}, {"$set": {"x": 2}})
+    coll.delete_one({"_id": 1})
+
+    events = _drain(cs, target=3)
+    cs.close()
+    assert [e["operationType"] for e in events] == ["insert", "update", "delete"]
+    for e in events:
+        assert e["splitEvent"] == {"fragment": 1, "of": 1}
+
+
+def test_split_large_change_stream_events_omitted_by_default(client: MongoClient) -> None:
+    """Without the option, events do *not* carry a ``splitEvent`` field —
+    the envelope is only present when the user opts in."""
+    db = client["csdb_split_off"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.insert_one({"_id": 1})
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert "splitEvent" not in events[0]

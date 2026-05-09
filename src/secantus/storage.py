@@ -127,6 +127,8 @@ _OPLOG_TABLE = "table:secantus_oplog"
 _PREIMAGE_TABLE = "table:secantus_preimages"
 _OPLOG_META_TABLE = "table:secantus_oplog_meta"
 _USERS_TABLE = "table:secantus_users"
+_ROLES_TABLE = "table:secantus_roles"
+_PROFILE_TABLE = "table:secantus_profile_settings"
 
 _OPLOG_PRUNE_INTERVAL = 1000  # call prune_oplog every N emits
 
@@ -195,6 +197,12 @@ def _index_key(
     (descending) fields get bitwise-inverted bytes, making a forward
     B-tree walk yield values in descending order. Compound keys are
     joined with ``\\x00\\x00`` between components.
+
+    For docs whose indexed field is array-valued, this returns the
+    whole-array sortkey only — the single canonical "doc-shape" key
+    used by uniqueness probes. The full set of multikey entries
+    (per-element + whole-array) is produced by
+    :func:`_index_key_variants`.
     """
     if sparse:
         for field in key_spec:
@@ -206,6 +214,94 @@ def _index_key(
         return encode_value_directed(get_path(dict(doc), fields[0]), d)
     parts = [encode_value_directed(get_path(dict(doc), f), int(key_spec[f])) for f in fields]
     return COMPOUND_SEP.join(parts)
+
+
+def _index_key_variants(
+    doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
+) -> list[bytes]:
+    """All byte-keys this doc contributes to an index under ``key_spec``.
+
+    For scalar-valued fields, returns one key — same as ``_index_key``.
+    For array-valued fields, returns one key per array element *and*
+    the whole-array key, mirroring real ``mongod``'s multikey index
+    layout. This makes:
+
+    * ``{tags: "python"}`` against ``{tags: ["python", "go"]}`` light
+      up via the per-element entry for ``"python"``.
+    * ``{tags: ["python", "go"]}`` (whole-array equality) light up via
+      the whole-array entry — without this, the equality lookup would
+      false-negative.
+    * Range / ``$in`` queries on array fields hit at least all true
+      matches (the post-index ``matches()`` filter discards
+      false-positives).
+
+    For compound indexes whose multiple fields are array-valued, the
+    cartesian product is taken across each field's candidate values.
+    Real mongod restricts compound indexes to one multikey field per
+    doc; we don't enforce that — we just emit the cross-product, which
+    is correct (over-includes; the post-filter discards) but pays a
+    cardinality blow-up the user is then on the hook for.
+
+    Returns an empty list when ``sparse`` and any field is missing.
+    Per-element values are deduplicated against their encoded bytes,
+    so ``[1, 1, 2]`` writes two element entries (``1`` and ``2``) plus
+    the whole-array entry, not three.
+    """
+    fields = list(key_spec)
+    if sparse:
+        for field in fields:
+            if not has_path(dict(doc), field):
+                return []
+
+    # Per-field candidate values: scalars contribute [val]; arrays
+    # contribute [unique_elements..., whole_array].
+    per_field: list[list[Any]] = []
+    for field in fields:
+        v = get_path(dict(doc), field)
+        if isinstance(v, list):
+            seen: set[bytes] = set()
+            uniq: list[Any] = []
+            d = int(key_spec[field])
+            for elem in v:
+                eb = encode_value_directed(elem, d)
+                if eb in seen:
+                    continue
+                seen.add(eb)
+                uniq.append(elem)
+            # Whole-array sortkey may collide with an element when the
+            # array is a single scalar repeated; the dedup below at the
+            # entry level (set of bytes) catches that.
+            per_field.append([*uniq, v])
+        else:
+            per_field.append([v])
+
+    if len(fields) == 1:
+        d = int(key_spec[fields[0]])
+        keys: list[bytes] = []
+        seen_kb: set[bytes] = set()
+        for val in per_field[0]:
+            kb = encode_value_directed(val, d)
+            if kb in seen_kb:
+                continue
+            seen_kb.add(kb)
+            keys.append(kb)
+        return keys
+
+    # Compound: cartesian product across per-field candidate lists.
+    from itertools import product
+
+    keys = []
+    seen_kb = set()
+    for combo in product(*per_field):
+        parts = [
+            encode_value_directed(combo[i], int(key_spec[fields[i]])) for i in range(len(fields))
+        ]
+        kb = COMPOUND_SEP.join(parts)
+        if kb in seen_kb:
+            continue
+        seen_kb.add(kb)
+        keys.append(kb)
+    return keys
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -349,6 +445,8 @@ class Storage:
         oplog_max_entries: int = 100_000,
         time_func: Callable[[], float] | None = None,
         enable_oplog: bool = True,
+        ttl_sweep_seconds: float = 60.0,
+        noop_heartbeat_seconds: float = 0.0,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -359,14 +457,30 @@ class Storage:
         self._lock = threading.RLock()
         self._closed = False
         self._tempdir: str | None = None
+        # session_max default is ~120; each client connection thread
+        # caches its own session in `threading.local()`, and cross-
+        # thread oplog readers open additional short-lived sessions on
+        # demand. With a few dozen concurrent client connections plus
+        # active change-stream tailers, the default ceiling is hit
+        # mid-handshake and surfaces as `out of sessions` /
+        # WT_ERROR. mongod itself runs with session_max=33000 — 1000
+        # is a generous floor for a single-node test surrogate while
+        # still well under the WT hard limit.
+        # cache_size default is 100 MB. With ``in_memory=true`` every
+        # write also lives in cache, so a workload that inserts a
+        # handful of 16 MB documents (mongod's per-doc max) blows the
+        # cap as ``WT_CACHE_FULL: operation would overflow cache``.
+        # 1 GB gives generous headroom for tests + reasonable
+        # in-process workloads while staying well under the limits
+        # ``mongod`` itself runs with on a normal box.
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
-            config = "create,in_memory=true"
+            config = "create,in_memory=true,session_max=1000,cache_size=1G"
         else:
             os.makedirs(path, exist_ok=True)
             home = path
-            config = "create"
+            config = "create,session_max=1000,cache_size=1G"
         self._conn = wt.wiredtiger_open(home, config)
         self._tls = threading.local()
         self._all_sessions: list[Any] = []
@@ -380,6 +494,8 @@ class Storage:
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
             boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
+            boot.create(_ROLES_TABLE, "key_format=SS,value_format=u")
+            boot.create(_PROFILE_TABLE, "key_format=S,value_format=u")
         finally:
             boot.close()
 
@@ -391,6 +507,41 @@ class Storage:
         self._oplog_emit_count = 0
         with self._lock:
             self._next_seq, self._last_ts_secs, self._last_ts_ord = self._load_oplog_meta()
+
+        # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
+        # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
+        # the thread entirely (tests that drive expiry deterministically
+        # via ``prune_ttl(now=...)`` use that escape hatch). The
+        # sweeper walks every (db, coll) and calls ``prune_ttl`` on
+        # each — collections with no TTL index short-circuit cheaply
+        # at the index-scan step, so the steady-state cost is small.
+        self._ttl_sweep_seconds = float(ttl_sweep_seconds)
+        self._ttl_stop = threading.Event()
+        self._ttl_thread: threading.Thread | None = None
+        if self._ttl_sweep_seconds > 0:
+            self._ttl_thread = threading.Thread(
+                target=self._ttl_sweep_loop, name="secantus-ttl-sweeper", daemon=True
+            )
+            self._ttl_thread.start()
+
+        # Periodic noop heartbeat. Real mongod writes ``{op: "n"}``
+        # entries to the oplog every ~10s (configurable via
+        # ``periodicNoopIntervalSecs``) so cluster time advances and
+        # change-stream resume tokens minted from the oplog don't fall
+        # outside the retention window during quiet stretches. Default
+        # disabled (0) — embedded test users typically don't need it
+        # and the extra writes would noise up tight oplog assertions.
+        # Set ``noop_heartbeat_seconds=10`` (mongod default) for
+        # production-ish behaviour. ``enable_oplog=False`` short-
+        # circuits anyway, so the heartbeat is a no-op in that mode.
+        self._noop_heartbeat_seconds = float(noop_heartbeat_seconds)
+        self._noop_stop = threading.Event()
+        self._noop_thread: threading.Thread | None = None
+        if self._noop_heartbeat_seconds > 0 and self.enable_oplog:
+            self._noop_thread = threading.Thread(
+                target=self._noop_heartbeat_loop, name="secantus-noop-heartbeat", daemon=True
+            )
+            self._noop_thread.start()
 
     def _load_oplog_meta(self) -> tuple[int, int, int]:
         c = self._cursor(_OPLOG_META_TABLE)
@@ -640,6 +791,22 @@ class Storage:
         with self._lock:
             return self._next_seq - 1
 
+    def oplog_tail_seq_nolock(self) -> int:
+        """Highest seq read without acquiring ``self._lock``.
+
+        Safe for use **only** as the wake predicate for a tailable
+        ``getMore`` waiting on ``self._oplog_cv``: lock order in the
+        write path is ``_lock`` -> ``_oplog_cv``, so a waiter that
+        already holds ``_oplog_cv`` (which is what ``cv.wait_for``
+        does) MUST NOT then take ``_lock`` -- that's an ABBA deadlock
+        with any concurrent writer. Reading ``_next_seq`` directly is
+        safe because (a) ``int`` reads are atomic under the GIL and
+        (b) the cv is also notified on every commit, so any momentary
+        stale read self-corrects on the next iteration of the
+        ``wait_for`` predicate.
+        """
+        return self._next_seq - 1
+
     def oplog_floor_seq(self) -> int:
         """Smallest seq currently present after pruning. 0 if empty.
 
@@ -822,7 +989,170 @@ class Storage:
                 rc = c.next()
         return out
 
+    # ------------------------------------------------------------------
+    # Per-database profiling settings.
+    #
+    # Real mongod tracks (level, slowms, sampleRate) per database in
+    # memory + persists to the database's metadata. We persist in a
+    # dedicated WT table keyed by db name. The dispatch path reads
+    # these settings on every command — keep ``get_profile`` fast.
+    # ------------------------------------------------------------------
+
+    def get_profile(self, db: str) -> dict[str, Any]:
+        """Return the active profile settings for ``db``, defaults if unset.
+
+        Defaults match mongod: level 0 (off), slowms 100, sampleRate 1.0.
+        """
+        with self._lock:
+            c = self._cursor(_PROFILE_TABLE)
+            c.set_key(db)
+            if c.search() != 0:
+                return {"level": 0, "slowms": 100, "sampleRate": 1.0}
+            blob = bytes(c.get_value())
+            if not blob:
+                return {"level": 0, "slowms": 100, "sampleRate": 1.0}
+            doc = bson.decode(blob)
+            # ``or default`` is wrong here — slowms=0 / sampleRate=0.0 are
+            # legitimate values that must round-trip, not be replaced
+            # with defaults. Use direct ``.get`` with the default and
+            # coerce only when a value is actually present.
+            level_v = doc.get("level", 0)
+            slowms_v = doc.get("slowms", 100)
+            rate_v = doc.get("sampleRate", 1.0)
+            return {
+                "level": int(level_v) if level_v is not None else 0,
+                "slowms": int(slowms_v) if slowms_v is not None else 100,
+                "sampleRate": float(rate_v) if rate_v is not None else 1.0,
+            }
+
+    def set_profile(
+        self,
+        db: str,
+        *,
+        level: int,
+        slowms: int = 100,
+        sample_rate: float = 1.0,
+    ) -> None:
+        """Persist profile settings for ``db``."""
+        if level not in (0, 1, 2):
+            raise ValueError("level must be 0, 1, or 2")
+        if slowms < 0:
+            raise ValueError("slowms must be non-negative")
+        if not (0.0 <= sample_rate <= 1.0):
+            raise ValueError("sampleRate must be in [0, 1]")
+        doc = {"level": int(level), "slowms": int(slowms), "sampleRate": float(sample_rate)}
+        with self._lock:
+            c = self._cursor(_PROFILE_TABLE)
+            c[db] = bson.encode(doc)
+
+    def ensure_profile_collection(self, db: str, *, size_bytes: int = 10 * 1024 * 1024) -> None:
+        """Ensure ``<db>.system.profile`` exists as a 10 MB-default capped collection."""
+        if self.collection_exists(db, "system.profile"):
+            return
+        self.create_collection(db, "system.profile")
+        self.set_collection_options(db, "system.profile", capped=True, size=int(size_bytes))
+
+    # ------------------------------------------------------------------
+    # Custom roles. Storage layer is a thin BSON-blob CRUD; the commands
+    # layer owns the role-record shape (privileges + inherited roles)
+    # and ``secantus.rbac`` owns the privilege-check logic that walks
+    # the inheritance graph.
+    # ------------------------------------------------------------------
+
+    def add_role(
+        self,
+        db: str,
+        name: str,
+        record: Mapping[str, Any],
+        *,
+        replace: bool = False,
+    ) -> bool:
+        """Persist a custom role record. Returns True if added; False if
+        it already existed and ``replace=False``."""
+        with self._lock:
+            c = self._cursor(_ROLES_TABLE)
+            c.set_key(db, name)
+            if c.search() == 0 and not replace:
+                return False
+            c.reset()
+            c[db, name] = bson.encode(dict(record))
+            return True
+
+    def get_role(self, db: str, name: str) -> dict[str, Any] | None:
+        # Use a private short-lived session so cross-thread visibility
+        # is guaranteed: connection-thread A may have written a role
+        # while we're on connection-thread B, and B's cached session
+        # carries a sticky snapshot that won't observe A's commit.
+        # Same pattern as ``read_oplog``. The cost (one open_session +
+        # close per call) is negligible vs the correctness win.
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_ROLES_TABLE, None, None)
+                try:
+                    c.set_key(db, name)
+                    if c.search() != 0:
+                        return None
+                    blob = bytes(c.get_value())
+                    return bson.decode(blob) if blob else None
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+
+    def drop_role(self, db: str, name: str) -> bool:
+        with self._lock:
+            c = self._cursor(_ROLES_TABLE)
+            c.set_key(db, name)
+            if c.search() != 0:
+                return False
+            c.remove()
+            return True
+
+    def list_roles(
+        self,
+        db: str | None = None,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Paginated custom-role listing. ``db=None`` spans every db."""
+        if limit <= 0 or limit > 1000:
+            limit = 1000
+        out: list[dict[str, Any]] = []
+        with self._lock:
+            c = self._cursor(_ROLES_TABLE)
+            rc = c.next()
+            seen = 0
+            while rc == 0:
+                k = c.get_key()
+                row_db = k[0]
+                if db is None or row_db == db:
+                    if seen >= skip:
+                        blob = bytes(c.get_value())
+                        if blob:
+                            out.append(bson.decode(blob))
+                        if len(out) >= limit:
+                            break
+                    seen += 1
+                rc = c.next()
+        return out
+
     def close(self) -> None:
+        # Stop background threads before tearing down WT — both the
+        # TTL sweeper and the noop heartbeat acquire ``self._lock``,
+        # so racing them against close would deadlock or
+        # use-after-close.
+        self._ttl_stop.set()
+        if self._ttl_thread is not None and self._ttl_thread.is_alive():
+            self._ttl_thread.join(timeout=2.0)
+            self._ttl_thread = None
+        self._noop_stop.set()
+        if self._noop_thread is not None and self._noop_thread.is_alive():
+            self._noop_thread.join(timeout=2.0)
+            self._noop_thread = None
         with self._lock:
             if self._closed:
                 return
@@ -834,8 +1164,155 @@ class Storage:
             with contextlib.suppress(Exception):
                 self._conn.close()
             if self._tempdir is not None:
-                shutil.rmtree(self._tempdir, ignore_errors=True)
+                # Don't follow symlinks during cleanup. A local attacker
+                # racing the mkdtemp could replace `_tempdir` with a
+                # symlink to elsewhere on the filesystem before close()
+                # fires — `shutil.rmtree(symlink, ignore_errors=True)`
+                # would then delete the symlink target. The mkdtemp
+                # already creates with mode 0700 (owner-only), but the
+                # parent /tmp is world-writable, so this is the
+                # belt-and-braces guard. Failures during cleanup are
+                # logged but not raised — close() must remain idempotent.
+                try:
+                    if not os.path.islink(self._tempdir):
+                        shutil.rmtree(self._tempdir)
+                except OSError:
+                    # Best-effort: log via warnings rather than crash close().
+                    import warnings as _warn
+
+                    _warn.warn(
+                        f"failed to remove WiredTiger tempdir {self._tempdir!r}",
+                        ResourceWarning,
+                        stacklevel=2,
+                    )
                 self._tempdir = None
+
+    def prune_ttl_all_collections(self, *, now: _dt.datetime | None = None) -> int:
+        """Run :meth:`prune_ttl` against every collection, returning the
+        total docs pruned. Used by the background sweeper and exposed
+        publicly so callers (admin tooling, tests) can drive a
+        deterministic global pass.
+
+        Callers using the cached per-thread session must call
+        :meth:`_reset_thread_session` first — WiredTiger snapshots
+        are sticky per-session, so reads otherwise miss rows
+        committed by other threads. The sweeper does this on every
+        iteration; one-shot user calls happen on the writer's thread
+        and see their own writes.
+        """
+        with self._lock:
+            c = self._cursor(_COLL_TABLE)
+            namespaces: list[tuple[str, str]] = []
+            rc = c.next()
+            while rc == 0:
+                k = c.get_key()
+                namespaces.append((k[0], k[1]))
+                rc = c.next()
+        total = 0
+        for db, coll in namespaces:
+            with contextlib.suppress(Exception):
+                # Storage close races: drop_collection between snapshot
+                # and prune fails inside prune_ttl with a missing-coll
+                # error. The sweeper should never crash the daemon.
+                total += self.prune_ttl(db, coll, now=now)
+        return total
+
+    def _ttl_sweep_loop(self) -> None:
+        """Background sweeper: every ``ttl_sweep_seconds`` walk all
+        collections and prune expired docs. Stops when ``_ttl_stop``
+        is set or the storage is closed.
+
+        Drops the per-thread WT session before each iteration so the
+        next cursor call opens a fresh session. WiredTiger sessions
+        carry a sticky read snapshot — without the reset, reads on
+        this thread would never observe rows committed by other
+        writers, and TTL sweeps would always return 0 even when
+        expired docs existed. Same pattern as ``read_oplog``.
+        """
+        import logging
+
+        log = logging.getLogger("secantus.storage.ttl")
+        while not self._ttl_stop.wait(self._ttl_sweep_seconds):
+            if self._closed:
+                return
+            self._reset_thread_session()
+            try:
+                self.prune_ttl_all_collections()
+            except Exception:
+                # Sweeper failures must not propagate — they'd kill
+                # the daemon thread and silently disable expiry.
+                log.exception("ttl sweep failed")
+
+    def emit_noop_heartbeat(self) -> int:
+        """Append one ``{op: "n"}`` heartbeat to the oplog and return its seq.
+
+        The entry shape mirrors mongod's periodic noop: ``op = "n"``,
+        an empty namespace, current cluster time, and a small
+        ``o = {msg: "periodic noop"}`` payload. Change-stream consumers
+        skip ``op: "n"`` rows in projection but still advance their
+        ``position_seq`` and ``last_token`` past them, so the resume
+        token of a quiet collection stays current.
+
+        Public so callers (admin tooling, tests that drive heartbeats
+        deterministically) can fire one explicitly.
+        """
+        with self._lock:
+            return self._emit_oplog(
+                [
+                    {
+                        "op": "n",
+                        "ns": "",
+                        "o": {"msg": "periodic noop"},
+                    }
+                ]
+            )
+
+    def _noop_heartbeat_loop(self) -> None:
+        """Background heartbeat: emit one ``{op: "n"}`` oplog entry every
+        ``noop_heartbeat_seconds``. Stops when ``_noop_stop`` is set
+        or the storage is closed. Failures are logged and swallowed —
+        a transient WT error must not kill the daemon thread.
+        """
+        import logging
+
+        log = logging.getLogger("secantus.storage.noop")
+        while not self._noop_stop.wait(self._noop_heartbeat_seconds):
+            if self._closed:
+                return
+            try:
+                self.emit_noop_heartbeat()
+            except Exception:
+                log.exception("noop heartbeat failed")
+
+    def _reset_thread_session(self) -> None:
+        """Close the calling thread's cached WT session + cursors so
+        the next ``_session()`` call opens fresh ones. Needed when a
+        thread reads in a loop and must observe writes from other
+        threads (snapshot is otherwise sticky)."""
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            return
+        cursors = getattr(self._tls, "cursors", {}) or {}
+        for c in cursors.values():
+            with contextlib.suppress(Exception):
+                c.close()
+        with contextlib.suppress(Exception):
+            s.close()
+        with self._lock, contextlib.suppress(ValueError):
+            self._all_sessions.remove(s)
+        self._tls.session = None
+        self._tls.cursors = {}
+
+    def checkpoint(self) -> None:
+        """Force a WiredTiger checkpoint to flush dirty pages to disk.
+
+        Backs the ``fsync`` command and the admin UI's maintenance
+        slice. Lock-protected so concurrent commands wait their turn.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._session().checkpoint()
 
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
@@ -930,12 +1407,39 @@ class Storage:
         with self._lock:
             return [(bson.decode(blob), id_k) for id_k, blob in self._scan_docs(db, coll)]
 
+    def scan_docs_after_id_key(
+        self, db: str, coll: str, after: bytes | None
+    ) -> list[tuple[bytes, dict[str, Any]]]:
+        """Scan the document table in natural (id_key) order, returning
+        only rows whose ``id_key`` is strictly greater than ``after``.
+        ``after`` of ``None`` returns the entire collection.
+
+        Used by the tailable-cursor producer to emit only the docs
+        inserted since the last poll. Returns ``[(id_key, doc), ...]``
+        — callers update their ``after`` checkpoint to the last
+        returned ``id_key`` for the next poll.
+        """
+        out: list[tuple[bytes, dict[str, Any]]] = []
+        with self._lock:
+            for id_k, blob in self._scan_docs(db, coll):
+                if after is not None and id_k <= after:
+                    continue
+                out.append((id_k, bson.decode(blob)))
+        return out
+
+    def collection_is_capped(self, db: str, coll: str) -> bool:
+        """Public predicate: does the collection have ``capped: true`` set?"""
+        with self._lock:
+            opts = self._coll_options(db, coll) or {}
+            return bool(opts.get("capped"))
+
     def insert(
         self, db: str, coll: str, docs: Iterable[dict[str, Any]], *, ordered: bool = True
     ) -> tuple[int, list[dict[str, Any]]]:
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
+        fresh_id_keys: set[bytes] = set()
         oplog_on = self.enable_oplog
         with self._lock:
             self._ensure_collection(db, coll)
@@ -1006,9 +1510,76 @@ class Storage:
                             "o2": {"_id": doc["_id"]},
                         }
                     )
-            if oplog_entries:
-                self._emit_oplog(oplog_entries)
+                fresh_id_keys.add(key)
+            cap_entries, cap_pre_images = self._enforce_capped_bounds_locked(
+                db, coll, fresh_id_keys, indexes, partials, oplog_on, ns, ui
+            )
+            if oplog_entries or cap_entries:
+                pre_images = [None] * len(oplog_entries) + cap_pre_images
+                self._emit_oplog(oplog_entries + cap_entries, pre_images)
         return inserted, errors
+
+    def _enforce_capped_bounds_locked(
+        self,
+        db: str,
+        coll: str,
+        fresh_id_keys: set[bytes],
+        indexes: list[tuple[str, dict[str, Any], bool, bool]],
+        partials: dict[str, dict[str, Any]],
+        oplog_on: bool,
+        ns: str,
+        ui: _uuid.UUID | None,
+    ) -> tuple[list[dict[str, Any]], list[bytes | None]]:
+        """Evict oldest non-fresh docs from a capped collection until within bounds.
+
+        "Oldest" is the natural-order walk over the doc table, which matches
+        insertion order when ``_id`` is monotonic (e.g. the default
+        ObjectId). For non-monotonic ``_id`` values the eviction order
+        reflects ``_id`` byte order, not literal insertion order — capped
+        users with custom ``_id`` should not rely on FIFO semantics.
+        """
+        raw = self._coll_options(db, coll) or {}
+        if not raw.get("capped"):
+            return [], []
+        size_limit = raw.get("size")
+        max_limit = raw.get("max")
+        if size_limit is None and max_limit is None:
+            return [], []
+        scanned = list(self._scan_docs(db, coll))
+        total = sum(len(blob) for _id_k, blob in scanned)
+        count = len(scanned)
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
+        preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
+        for id_k, blob in scanned:
+            over_size = size_limit is not None and total > size_limit
+            over_max = max_limit is not None and count > max_limit
+            if not over_size and not over_max:
+                break
+            if id_k in fresh_id_keys:
+                # Don't evict docs we just inserted in this batch — they
+                # always sort to the tail with monotonic _ids, so reaching
+                # one means everything left is fresh too.
+                break
+            doc = bson.decode(blob)
+            self._delete_index_entries(db, coll, doc, indexes, partials)
+            doc_cur = self._cursor(_DOC_TABLE)
+            doc_cur.set_key(db, coll, id_k)
+            doc_cur.remove()
+            total -= len(blob)
+            count -= 1
+            if oplog_on:
+                entry: dict[str, Any] = {
+                    "op": "d",
+                    "ns": ns,
+                    "o": {"_id": doc["_id"]},
+                    "o2": {"_id": doc["_id"]},
+                }
+                if ui is not None:
+                    entry["ui"] = bson.Binary(ui.bytes, subtype=4)
+                oplog_entries.append(entry)
+                pre_images.append(bson.encode(doc) if preimages_on else None)
+        return oplog_entries, pre_images
 
     def find_matching(
         self,
@@ -1053,6 +1624,21 @@ class Storage:
                         reverse = sort_dir != idx_dir
                         candidates = self._walk_index_in_order(db, coll, idx_name, reverse=reverse)
                         in_sort_order = True
+                # Multi-field sort acceleration: when sort has 2+ fields and
+                # filter is empty, try to find a compound index whose key
+                # spec exactly matches (or fully inverts) the sort. Walking
+                # that index in the right direction yields the requested
+                # order without a Python-side post-sort.
+                if candidates is None and not filter and sort_field is None and sort:
+                    multi_spec = self._multi_sort_spec(sort)
+                    if multi_spec is not None and len(multi_spec) > 1:
+                        match = self._compound_index_for_sort(db, coll, multi_spec)
+                        if match is not None:
+                            idx_name, reverse = match
+                            candidates = self._walk_index_in_order(
+                                db, coll, idx_name, reverse=reverse
+                            )
+                            in_sort_order = True
                 if candidates is None:
                     candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
         out = [d for d in candidates if matches(d, filter)]
@@ -1149,6 +1735,73 @@ class Storage:
             return None, 0
         return f, di
 
+    @staticmethod
+    def _multi_sort_spec(
+        sort: Mapping[str, Any] | None,
+    ) -> list[tuple[str, int]] | None:
+        """Return a list of ``(field, direction)`` pairs for a multi-field
+        sort spec, or ``None`` if any entry is operator-prefixed or has a
+        non-``±1`` direction.
+
+        Used for compound-index sort acceleration: an index whose key
+        spec exactly matches (or fully inverts) the returned list lets
+        ``find_matching`` walk WT in the requested order and skip the
+        Python-side post-sort entirely.
+        """
+        if not sort:
+            return None
+        out: list[tuple[str, int]] = []
+        for field, direction in sort.items():
+            if field.startswith("$"):
+                return None
+            try:
+                d = int(direction)
+            except (TypeError, ValueError):
+                return None
+            if d not in (-1, 1):
+                return None
+            out.append((field, d))
+        return out
+
+    def _compound_index_for_sort(
+        self, db: str, coll: str, sort_fields: list[tuple[str, int]]
+    ) -> tuple[str, bool] | None:
+        """Find a compound index that satisfies ``sort_fields`` end-to-end.
+
+        Returns ``(index_name, reverse_walk)`` where ``reverse_walk`` is
+        True when the matching index is the *fully-inverted* permutation
+        of the sort (walking backward yields the requested order).
+
+        Multikey indexes are excluded — array values in the index could
+        produce row order that doesn't match the BSON cross-type sort
+        the user expects from a sort spec, so we'd fall back to Python
+        sort anyway.
+
+        Strict match only: the index key spec must have the same fields
+        in the same order with directions either matching the sort spec
+        or being the full inverse. Partial-prefix matches (sort uses 3
+        fields, index has 2) aren't accelerated; the savings on the
+        leading prefix are usually less than the cost of the trailing
+        Python sort over the materialised set.
+        """
+        multikey = self._multikey_index_names(db, coll)
+        target = list(sort_fields)
+        inverted = [(f, -d) for f, d in target]
+        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+            if name in multikey:
+                continue
+            try:
+                idx_pairs = [(f, int(d)) for f, d in key_spec.items()]
+            except (TypeError, ValueError):
+                continue
+            if any(d not in (-1, 1) for _, d in idx_pairs):
+                continue
+            if idx_pairs == target:
+                return name, False
+            if idx_pairs == inverted:
+                return name, True
+        return None
+
     def _single_field_index_for(self, db: str, coll: str, field: str) -> tuple[str, int] | None:
         """Return ``(index_name, direction)`` for a single-field index on
         ``field``, or ``None`` if no such index exists. Direction is the
@@ -1235,6 +1888,23 @@ class Storage:
                     key_spec = self._key_spec_for(db, coll, name)
                     if key_spec is not None:
                         return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
+            # Multi-field sort acceleration mirrored in the planner: same
+            # rules as find_matching (compound key spec exactly matches
+            # or fully inverts the sort, filter empty).
+            if not filter and sort_field is None and sort:
+                multi_spec = self._multi_sort_spec(sort)
+                if multi_spec is not None and len(multi_spec) > 1:
+                    match = self._compound_index_for_sort(db, coll, multi_spec)
+                    if match is not None:
+                        name, reverse = match
+                        key_spec = self._key_spec_for(db, coll, name)
+                        if key_spec is not None:
+                            return {
+                                "kind": "IXSCAN",
+                                "index_name": name,
+                                "key_pattern": key_spec,
+                                "direction": "backward" if reverse else "forward",
+                            }
             return {"kind": "COLLSCAN"}
 
     def _key_spec_for(self, db: str, coll: str, name: str) -> dict[str, Any] | None:
@@ -1461,6 +2131,13 @@ class Storage:
                         }
                     )
                     pre_images.append(None)
+            cap_ns = ns if oplog_on else ""
+            cap_entries, cap_pre = self._enforce_capped_bounds_locked(
+                db, coll, set(), indexes, partials, oplog_on, cap_ns, ui
+            )
+            if cap_entries:
+                oplog_entries.extend(cap_entries)
+                pre_images.extend(cap_pre)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
@@ -1833,7 +2510,10 @@ class Storage:
             else:
                 # Single doc-table walk: decode each blob once and fold all
                 # three checks (uniqueness, multikey detection, entry build)
-                # into one pass.
+                # into one pass. Uniqueness is probed against the canonical
+                # whole-doc key (``_index_key``); index entries are written
+                # for every key variant (``_index_key_variants``) so per-
+                # element multikey lookups land at IXSCAN.
                 seen: dict[bytes, Any] | None = {} if unique else None
                 multikey = False
                 entries = []
@@ -1843,14 +2523,14 @@ class Storage:
                         continue
                     if not multikey and _doc_makes_multikey(d, key_spec_dict):
                         multikey = True
-                    kb = _index_key(d, key_spec_dict, sparse=sparse)
-                    if kb is None:
-                        continue
                     if seen is not None:
-                        if kb in seen:
-                            raise IndexConflict(name, d.get("_id"))
-                        seen[kb] = d.get("_id")
-                    entries.append((kb, id_k))
+                        canonical = _index_key(d, key_spec_dict, sparse=sparse)
+                        if canonical is not None:
+                            if canonical in seen:
+                                raise IndexConflict(name, d.get("_id"))
+                            seen[canonical] = d.get("_id")
+                    for kb in _index_key_variants(d, key_spec_dict, sparse=sparse):
+                        entries.append((kb, id_k))
                 if multikey:
                     options["multikey"] = True
                 payload = bson.encode({"key": dict(key_spec), "options": options})
@@ -2060,11 +2740,9 @@ class Storage:
                     c.reset()
                     c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
                 continue
-            kb = _index_key(doc, key_spec, sparse=sparse)
-            if kb is None:
-                continue
-            c.reset()
-            c[db, coll, name, _pack_entry(kb, id_k)] = b""
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+                c.reset()
+                c[db, coll, name, _pack_entry(kb, id_k)] = b""
 
     def _delete_index_entries(
         self,
@@ -2105,13 +2783,11 @@ class Storage:
                     if c.search() == 0:
                         c.remove()
                 continue
-            kb = _index_key(doc, key_spec, sparse=sparse)
-            if kb is None:
-                continue
-            c.reset()
-            c.set_key(db, coll, name, _pack_entry(kb, id_k))
-            if c.search() == 0:
-                c.remove()
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+                c.reset()
+                c.set_key(db, coll, name, _pack_entry(kb, id_k))
+                if c.search() == 0:
+                    c.remove()
 
     def _validate_geo_indexes(
         self,
@@ -2246,7 +2922,10 @@ class Storage:
             return []
         c = self._cursor(_DOC_TABLE)
         out: list[dict[str, Any]] = []
-        for id_k in id_keys:
+        # Multikey indexes write per-element entries, so the same doc's
+        # id_key can appear more than once for queries that match
+        # multiple elements. Dedupe while preserving order.
+        for id_k in dict.fromkeys(id_keys):
             c.reset()
             c.set_key(db, coll, id_k)
             if c.search() == 0:
@@ -2507,7 +3186,9 @@ class Storage:
             if id_keys is not None:
                 c = self._cursor(_DOC_TABLE)
                 out: list[tuple[bytes, bytes]] = []
-                for id_k in id_keys:
+                # Same dedup contract as ``_docs_by_id_keys``: multikey
+                # indexes can yield duplicate id_keys for one doc.
+                for id_k in dict.fromkeys(id_keys):
                     c.reset()
                     c.set_key(db, coll, id_k)
                     if c.search() == 0:
@@ -2528,21 +3209,28 @@ class Storage:
         win over compound (tighter scan, no separator math). All fields
         must be ASC or DESC. Partial indexes are skipped unless ``query``
         implies their ``partialFilterExpression``.
+
+        Multikey indexes are not skipped — ``_index_key_variants`` writes
+        per-element entries, so equality / range / ``$in`` lookups on
+        the leading field hit at least all true matches. The geo
+        ``2dsphere`` / ``2d`` indexes have non-numeric direction values
+        and are excluded by the ASC/DESC check below.
         """
-        multikey = self._multikey_index_names(db, coll)
         partials = self._partial_filters(db, coll)
         query = query or {}
         compound_fallback: tuple[str, int, bool] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if name in multikey:
-                continue
             pf = partials.get(name)
             if pf is not None and not self._query_implies_partial(query, pf):
                 continue
             idx_fields = list(key_spec)
             if not idx_fields or idx_fields[0] != field:
                 continue
-            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
+            # Geo / hashed / text indexes carry string direction values
+            # ("2dsphere", "2d", "hashed", "text"); the bare equality
+            # picker can't drive them. Real numeric direction values are
+            # 1 / -1.
+            if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
             d = int(key_spec[field])
             if len(idx_fields) == 1:
@@ -2630,15 +3318,14 @@ class Storage:
 
         Returns ``(name, key_spec)`` of the chosen index, or ``None`` if no
         index covers the filter as a leading prefix. Pure picker — does
-        not scan.
+        not scan. Multikey indexes are eligible (per-element entries
+        cover equality lookups); the ASC/DESC direction check excludes
+        geo indexes.
         """
         filter_fields = set(filter)
-        multikey = self._multikey_index_names(db, coll)
         partials = self._partial_filters(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if name in multikey:
-                continue
             pf = partials.get(name)
             if pf is not None:
                 if not self._query_implies_partial(filter, pf):
@@ -2649,7 +3336,9 @@ class Storage:
             else:
                 eff_fields = filter_fields
             idx_fields = list(key_spec.keys())
-            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
+            # Geo / hashed / text indexes (string direction values) can't
+            # serve a bare-equality compound lookup.
+            if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
             if len(idx_fields) < len(eff_fields):
                 continue
@@ -2726,17 +3415,16 @@ class Storage:
         eq_fields, operator_field, _operator_ops = parts
         eq_set = set(eq_fields)
         target_eq_count = len(eq_set)
-        multikey = self._multikey_index_names(db, coll)
         partials = self._partial_filters(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
-            if name in multikey:
-                continue
             pf = partials.get(name)
             if pf is not None and not self._query_implies_partial(filter, pf):
                 continue
             idx_fields = list(key_spec.keys())
-            if any(int(key_spec[f]) not in (1, -1) for f in idx_fields):
+            # Geo / hashed / text indexes (string direction values) can't
+            # serve a compound prefix + trailing-operator lookup.
+            if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
             if len(idx_fields) <= target_eq_count:
                 continue

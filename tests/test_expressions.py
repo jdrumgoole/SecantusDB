@@ -122,6 +122,96 @@ def test_date_to_string_custom_format() -> None:
     assert out == "2026/04/27"
 
 
+def test_date_to_string_iso_year_and_week() -> None:
+    """``%G`` returns the ISO 8601 year, ``%V`` the ISO week 01-53.
+
+    These differ from ``%Y`` / ``%U`` near the year boundary: a
+    January date that belongs to the prior ISO year shows the prior
+    year under ``%G``."""
+    import datetime as dt
+
+    # 2026-01-01 is a Thursday — ISO week 1 of 2026.
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%G-W%V"}},
+        {"ts": dt.datetime(2026, 1, 1)},
+    )
+    assert out == "2026-W01"
+
+    # 2027-01-01 is a Friday — that's still ISO week 53 of 2026, not 2027's week 1.
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%G-W%V"}},
+        {"ts": dt.datetime(2027, 1, 1)},
+    )
+    assert out == "2026-W53"
+
+
+def test_date_to_string_day_of_year() -> None:
+    """``%j`` returns the 3-digit day of year (001-366)."""
+    import datetime as dt
+
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%j"}},
+        {"ts": dt.datetime(2026, 1, 1)},
+    )
+    assert out == "001"
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%j"}},
+        {"ts": dt.datetime(2026, 12, 31)},
+    )
+    assert out == "365"  # 2026 is a non-leap year
+
+
+def test_date_to_string_weekday_mongod_numbering() -> None:
+    """``%w`` uses mongod's 1-Sunday … 7-Saturday numbering, not
+    Python's 0-Sunday … 6-Saturday. The handler does the conversion
+    so format strings written against mongod's docs work as-is."""
+    import datetime as dt
+
+    cases = [
+        (dt.datetime(2026, 1, 4), "1"),  # Sunday
+        (dt.datetime(2026, 1, 5), "2"),  # Monday
+        (dt.datetime(2026, 1, 6), "3"),  # Tuesday
+        (dt.datetime(2026, 1, 7), "4"),  # Wednesday
+        (dt.datetime(2026, 1, 8), "5"),  # Thursday
+        (dt.datetime(2026, 1, 9), "6"),  # Friday
+        (dt.datetime(2026, 1, 10), "7"),  # Saturday
+    ]
+    for when, expected in cases:
+        out = evaluate({"$dateToString": {"date": "$ts", "format": "%w"}}, {"ts": when})
+        assert out == expected, f"{when.strftime('%A')}: got {out!r}, want {expected!r}"
+
+
+def test_date_to_string_iso_weekday_passthrough() -> None:
+    """``%u`` (ISO weekday 1-Mon … 7-Sun) is identical between mongod
+    and Python's strftime — passes straight through."""
+    import datetime as dt
+
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%u"}},
+        {"ts": dt.datetime(2026, 1, 5)},  # Monday
+    )
+    assert out == "1"
+    out = evaluate(
+        {"$dateToString": {"date": "$ts", "format": "%u"}},
+        {"ts": dt.datetime(2026, 1, 11)},  # Sunday
+    )
+    assert out == "7"
+
+
+def test_date_from_string_iso_year_and_week() -> None:
+    """``$dateFromString`` accepts ``%G``/``%V`` (with ``%u`` to
+    disambiguate the day) round-tripping with ``$dateToString``."""
+    out = evaluate(
+        {"$dateFromString": {"dateString": "2026-W01-1", "format": "%G-W%V-%u"}},
+        {},
+    )
+    import datetime as dt
+
+    assert isinstance(out, dt.datetime)
+    # 2026-W01-1 = Monday Dec 29, 2025 (ISO week 1 of 2026 starts Mon Dec 29).
+    assert out == dt.datetime(2025, 12, 29)
+
+
 def test_array_elem_at() -> None:
     doc = {"a": [10, 20, 30]}
     assert evaluate({"$arrayElemAt": ["$a", 0]}, doc) == 10

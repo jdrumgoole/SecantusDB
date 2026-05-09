@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import secrets
 import threading
 import time
@@ -11,6 +10,23 @@ from typing import Any
 
 DEFAULT_IDLE_TTL_SECONDS = 600.0  # matches MongoDB's 10-minute cursor TTL.
 TAILABLE_IDLE_TTL_SECONDS = 1800.0  # 30 min — change-stream clients legitimately idle.
+
+# Hard cap on simultaneous live cursors. Without this, a malicious or
+# buggy client can open cursors with `no_cursor_timeout=True` (or a low
+# request rate that stays under the prune cadence) and accumulate
+# unbounded `remaining` doc lists, OOMing the server.
+DEFAULT_MAX_CURSORS = 10_000
+
+
+class CursorLimitExceeded(Exception):
+    """Raised when register() would push the registry over its cap."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(
+            f"cursor registry full ({limit} cursors live); kill an existing "
+            f"cursor or increase max_cursors before opening a new one"
+        )
+        self.limit = limit
 
 
 class CursorNotFound(Exception):
@@ -33,6 +49,12 @@ class _Entry:
     collection_uuid: _uuid.UUID | None = None
     invalidated: bool = False
     final_event_pending: bool = False
+    # Latest change-stream resume token observed by the producer.
+    # Returned to the client as ``cursor.postBatchResumeToken`` on
+    # every getMore so consumers on quiet collections can advance
+    # their resume position even when no events are visible. None
+    # for non-change-stream cursors.
+    last_token: dict[str, str] | None = None
 
 
 class CursorRegistry:
@@ -41,12 +63,13 @@ class CursorRegistry:
         idle_ttl_seconds: float = DEFAULT_IDLE_TTL_SECONDS,
         time_func: Callable[[], float] | None = None,
         tailable_idle_ttl_seconds: float = TAILABLE_IDLE_TTL_SECONDS,
+        max_cursors: int = DEFAULT_MAX_CURSORS,
     ) -> None:
         self._cursors: dict[int, _Entry] = {}
         self._lock = threading.Lock()
-        self._next_id = itertools.count(1)
         self.idle_ttl_seconds = idle_ttl_seconds
         self.tailable_idle_ttl_seconds = tailable_idle_ttl_seconds
+        self.max_cursors = max_cursors
         self._time = time_func or time.monotonic
         # Last successful prune timestamp; -inf means never. Used to amortise
         # the O(N) prune walk across operations rather than running it on
@@ -81,7 +104,20 @@ class CursorRegistry:
     def register(self, namespace: str, remaining: list[dict[str, Any]]) -> int:
         with self._lock:
             self._prune_locked()
-            cursor_id = next(self._next_id)
+            if len(self._cursors) >= self.max_cursors:
+                raise CursorLimitExceeded(self.max_cursors)
+            # Cursor IDs were `itertools.count(1)` — sequential, predictable,
+            # and trivially enumerable by another connection issuing
+            # `getMore` against guessed IDs. Mint with `secrets.randbits`
+            # like the tailable path so cross-session cursor hijacking
+            # requires brute-forcing a 63-bit space.
+            for _attempt in range(8):
+                candidate = secrets.randbits(63) | 1  # avoid 0
+                if candidate not in self._cursors:
+                    cursor_id = candidate
+                    break
+            else:
+                raise RuntimeError("could not mint unique cursor id")
             self._cursors[cursor_id] = _Entry(cursor_id, namespace, list(remaining), self._time())
             return cursor_id
 
@@ -103,6 +139,8 @@ class CursorRegistry:
         """
         with self._lock:
             self._prune_locked()
+            if len(self._cursors) >= self.max_cursors:
+                raise CursorLimitExceeded(self.max_cursors)
             for _attempt in range(8):
                 candidate = secrets.randbits(63) | (1 << 32)  # ensure > 2**32
                 if candidate not in self._cursors:
@@ -171,11 +209,36 @@ class CursorRegistry:
             self._prune_locked()
             return len(self._cursors)
 
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return a list of plain dicts describing the live cursors.
+
+        Used by the ``currentOp`` command and the admin UI's cursors page.
+        Each entry has ``cursor_id``, ``namespace``, ``remaining``,
+        ``last_access``, ``tailable``, and ``await_data``. We don't return
+        ``_Entry`` instances so callers can't accidentally mutate registry
+        state.
+        """
+        with self._lock:
+            self._prune_locked()
+            return [
+                {
+                    "cursor_id": e.cursor_id,
+                    "namespace": e.namespace,
+                    "remaining": len(e.remaining),
+                    "last_access": e.last_access,
+                    "tailable": e.tailable,
+                    "await_data": e.await_data,
+                }
+                for e in sorted(self._cursors.values(), key=lambda x: x.cursor_id)
+            ]
+
 
 __all__ = [
+    "CursorLimitExceeded",
     "CursorNotFound",
     "CursorRegistry",
     "_Entry",
     "DEFAULT_IDLE_TTL_SECONDS",
+    "DEFAULT_MAX_CURSORS",
     "TAILABLE_IDLE_TTL_SECONDS",
 ]

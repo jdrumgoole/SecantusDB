@@ -52,7 +52,11 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        run: uv sync --extra dev  # also builds vendored WT via scikit-build-core
+        # ``--extra admin`` brings in httpx / fastapi / uvicorn used by
+        # tests/test_admin_*.py; without it those tests error at import
+        # time. ``website`` is intentionally excluded — pelican / boto3
+        # aren't exercised by pytest and would just slow CI down.
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       - name: Lint
         run: uv run ruff check src tests

@@ -33,6 +33,33 @@ class WireProtocolError(Exception):
     pass
 
 
+class MalformedBodyError(WireProtocolError):
+    """Body bytes parse cleanly as a wire frame but fail BSON validation.
+
+    Raised after the message header has been read — the caller (the
+    server's connection loop) uses ``header.request_id`` to build a
+    targeted ``{ok: 0, errmsg, code: 2 BadValue}`` reply so the
+    connection survives. mongod returns the same shape for
+    e.g. ``BinData(4, ...)`` payloads whose advertised binary
+    length doesn't match the actual byte count.
+    """
+
+    def __init__(self, header: Header, message: str) -> None:
+        super().__init__(message)
+        self.header = header
+
+
+class _BodyBoundsError(Exception):
+    """Internal: a BSON length field in an OP_MSG body is out-of-range.
+
+    Raised by the pre-decode bounds checks in ``_parse_op_msg``. Caught
+    by ``read_message`` and re-raised as ``MalformedBodyError`` so the
+    connection loop treats it as a recoverable BadValue (same shape as
+    a downstream ``bson.InvalidBSON``) rather than a fatal protocol
+    error that drops the connection.
+    """
+
+
 class ConnectionClosed(Exception):
     pass
 
@@ -97,10 +124,20 @@ def read_message(sock: socket.socket) -> Message:
             f"message length {header.message_length} exceeds max {MAX_MESSAGE_SIZE}"
         )
     body = _recv_exactly(sock, header.message_length - HEADER_SIZE)
-    if header.op_code == OP_MSG:
-        return Message(header=header, op=_parse_op_msg(body))
-    if header.op_code == OP_QUERY:
-        return Message(header=header, op=_parse_op_query(body))
+    try:
+        if header.op_code == OP_MSG:
+            return Message(header=header, op=_parse_op_msg(body))
+        if header.op_code == OP_QUERY:
+            return Message(header=header, op=_parse_op_query(body))
+    except (bson.InvalidBSON, _BodyBoundsError) as exc:
+        # Client sent a body whose framing is plausible but whose
+        # inner BSON document fails validation (e.g. a BinData with
+        # a mismatched length field, or an int32 declaring a doc size
+        # that overflows the buffer). Real mongod replies with a
+        # ``BadValue`` error and keeps the connection alive — surface
+        # the header here so the connection loop can do the same
+        # rather than dropping the socket on the next message.
+        raise MalformedBodyError(header, f"invalid BSON in body: {exc}") from exc
     raise WireProtocolError(f"unsupported op_code {header.op_code}")
 
 
@@ -133,6 +170,33 @@ def _parse_op_query(buf: bytes) -> OpQuery:
     )
 
 
+# Minimum BSON document length (an empty doc is 5 bytes: 4-byte length
+# + 1-byte zero terminator). Anything smaller is malformed.
+_MIN_BSON_DOC_LEN = 5
+
+
+def _check_doc_len(doc_len: int, offset: int, end: int, where: str) -> None:
+    """Validate a BSON length field before slicing into ``buf``.
+
+    Without this check, an attacker-supplied negative `doc_len` produces
+    an empty-or-garbage slice that `bson.decode` raises on uncaught,
+    crashing the connection thread. An oversized `doc_len` either
+    short-reads (decode fails partway) or attempts to allocate the
+    declared size. Raises ``_BodyBoundsError`` (translated to
+    ``MalformedBodyError`` by ``read_message``) so the connection loop
+    treats it as a recoverable BadValue, matching mongod.
+    """
+    if doc_len < _MIN_BSON_DOC_LEN:
+        raise _BodyBoundsError(
+            f"{where}: declared BSON length {doc_len} below minimum {_MIN_BSON_DOC_LEN}"
+        )
+    if offset + doc_len > end:
+        raise _BodyBoundsError(
+            f"{where}: declared BSON length {doc_len} would read "
+            f"past message end (offset={offset}, end={end})"
+        )
+
+
 def _parse_op_msg(buf: bytes) -> OpMsg:
     if len(buf) < 4:
         raise WireProtocolError("OP_MSG body too short for flags")
@@ -148,22 +212,35 @@ def _parse_op_msg(buf: bytes) -> OpMsg:
         (kind,) = _UINT8.unpack_from(buf, offset)
         offset += 1
         if kind == 0:
+            if offset + 4 > end:
+                raise _BodyBoundsError("OP_MSG kind-0 truncated before length")
             (doc_len,) = _INT32.unpack_from(buf, offset)
+            _check_doc_len(doc_len, offset, end, "OP_MSG kind-0")
             doc_bytes = buf[offset : offset + doc_len]
             if body is not None:
-                raise WireProtocolError("OP_MSG has more than one kind-0 section")
+                raise _BodyBoundsError("OP_MSG has more than one kind-0 section")
             body = bson.decode(doc_bytes)
             offset += doc_len
         elif kind == 1:
+            if offset + 4 > end:
+                raise _BodyBoundsError("OP_MSG kind-1 truncated before length")
             (section_len,) = _INT32.unpack_from(buf, offset)
+            # section_len includes the 4 length bytes themselves.
+            if section_len < 4 or offset + section_len > end:
+                raise _BodyBoundsError(
+                    f"OP_MSG kind-1: declared section length {section_len} invalid"
+                )
             section_end = offset + section_len
             offset += 4
-            ident_end = buf.index(b"\x00", offset)
+            ident_end = buf.index(b"\x00", offset, section_end)
             identifier = buf[offset:ident_end].decode("utf-8")
             offset = ident_end + 1
             docs: list[dict[str, Any]] = []
             while offset < section_end:
+                if offset + 4 > section_end:
+                    raise _BodyBoundsError("OP_MSG kind-1: truncated inner doc length")
                 (doc_len,) = _INT32.unpack_from(buf, offset)
+                _check_doc_len(doc_len, offset, section_end, "OP_MSG kind-1 inner")
                 docs.append(bson.decode(buf[offset : offset + doc_len]))
                 offset += doc_len
             sequences.append((identifier, docs))

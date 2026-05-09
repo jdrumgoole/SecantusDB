@@ -302,6 +302,14 @@ def _apply_op(
                     "the same number of concrete paths"
                 )
             for op_path, np_path in zip(old_paths, new_paths, strict=True):
+                # `_id` is immutable in mongod (error code 66
+                # ImmutableField). $rename targeting (or sourcing from)
+                # _id would silently overwrite it without this guard.
+                if np_path == "_id" or op_path == "_id":
+                    raise UpdateError(
+                        "Performing an update on the path '_id' would modify "
+                        "the immutable field '_id' (mongod code 66 ImmutableField)"
+                    )
                 if has_path(doc, op_path):
                     value = get_path(doc, op_path)
                     unset_path(doc, op_path)

@@ -557,6 +557,137 @@ def test_densify_invalid_step_raises() -> None:
         )
 
 
+def test_densify_date_unit_day_fills_gaps() -> None:
+    """Date densify with ``unit: "day"``: fillers carry the densify
+    field as a real ``datetime`` at every step between adjacent
+    inputs."""
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2026, 1, 1)},
+        {"ts": dt.datetime(2026, 1, 4)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [{"$densify": {"field": "ts", "range": {"bounds": "full", "step": 1, "unit": "day"}}}],
+    )
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 1),
+        dt.datetime(2026, 1, 2),
+        dt.datetime(2026, 1, 3),
+        dt.datetime(2026, 1, 4),
+    ]
+
+
+def test_densify_date_unit_hour_with_explicit_bounds() -> None:
+    """``unit: "hour"`` + explicit bounds extends below/above the
+    observed range, just like the numeric version."""
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2026, 1, 1, 10, 0)},
+        {"ts": dt.datetime(2026, 1, 1, 12, 0)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {
+                        "bounds": [dt.datetime(2026, 1, 1, 9, 0), dt.datetime(2026, 1, 1, 13, 0)],
+                        "step": 1,
+                        "unit": "hour",
+                    },
+                }
+            }
+        ],
+    )
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 1, 9, 0),
+        dt.datetime(2026, 1, 1, 10, 0),
+        dt.datetime(2026, 1, 1, 11, 0),
+        dt.datetime(2026, 1, 1, 12, 0),
+    ]
+
+
+def test_densify_date_partitions_independently() -> None:
+    """Date densify respects ``partitionByFields`` — each (partition,
+    range) pair fills its own gaps and carries the partition values
+    onto fillers."""
+    import datetime as dt
+
+    docs = [
+        {"region": "us", "ts": dt.datetime(2026, 1, 1)},
+        {"region": "us", "ts": dt.datetime(2026, 1, 3)},
+        {"region": "eu", "ts": dt.datetime(2026, 1, 2)},
+        {"region": "eu", "ts": dt.datetime(2026, 1, 4)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "partitionByFields": ["region"],
+                    "range": {"bounds": "full", "step": 1, "unit": "day"},
+                }
+            }
+        ],
+    )
+    by_region: dict[str, list[object]] = {"us": [], "eu": []}
+    for d in out:
+        by_region[d["region"]].append(d["ts"])
+    assert by_region["us"] == [
+        dt.datetime(2026, 1, 1),
+        dt.datetime(2026, 1, 2),
+        dt.datetime(2026, 1, 3),
+    ]
+    assert by_region["eu"] == [
+        dt.datetime(2026, 1, 2),
+        dt.datetime(2026, 1, 3),
+        dt.datetime(2026, 1, 4),
+    ]
+
+
+def test_densify_date_unit_month_rejected() -> None:
+    """``month`` / ``quarter`` / ``year`` are variable-length and
+    can't be expressed as a fixed timedelta — rejected with a clear
+    error pointing at the supported set."""
+    import datetime as dt
+
+    with pytest.raises(AggregateError, match="variable-length"):
+        apply_pipeline(
+            [{"ts": dt.datetime(2026, 1, 1)}],
+            [
+                {
+                    "$densify": {
+                        "field": "ts",
+                        "range": {"bounds": "full", "step": 1, "unit": "month"},
+                    }
+                }
+            ],
+        )
+
+
+def test_densify_date_unrecognised_unit_rejected() -> None:
+    """Unknown unit string surfaces as a plain ``$densify`` error."""
+    import datetime as dt
+
+    with pytest.raises(AggregateError, match="not recognised"):
+        apply_pipeline(
+            [{"ts": dt.datetime(2026, 1, 1)}],
+            [
+                {
+                    "$densify": {
+                        "field": "ts",
+                        "range": {"bounds": "full", "step": 1, "unit": "fortnight"},
+                    }
+                }
+            ],
+        )
+
+
 def test_change_stream_stage_stashes_spec_and_returns_empty() -> None:
     """`$changeStream` is a source stage: ignores input, stashes spec on ctx."""
     from secantus.aggregate import PipelineContext, apply_pipeline
@@ -690,19 +821,28 @@ def test_lookup_index_path_handles_array_local_value(tmp_path) -> None:
         storage.close()
 
 
-def test_lookup_compound_index_falls_back_to_hash_join(tmp_path) -> None:
-    """A compound index on the foreign field is *not* eligible for the
-    simple-shape index path; we fall back to hash-join. Result must
-    still be correct."""
-    from secantus.aggregate import PipelineContext
+def test_lookup_uses_compound_index_when_leading_field_matches(tmp_path) -> None:
+    """A compound index whose leading field is the foreign field is
+    eligible: each per-outer-doc lookup hits the storage picker as a
+    leading-prefix scan, not a hash-join over the materialised foreign
+    collection. The path is observable via the eligibility helper —
+    `find_matching` doesn't need to be intercepted to verify it."""
+    from secantus.aggregate import PipelineContext, _foreign_field_has_simple_index
     from secantus.storage import Storage
 
     storage = Storage(str(tmp_path))
     try:
         storage.insert("db", "users", [{"_id": i, "k": i, "tag": "x"} for i in range(10)])
         storage.create_index("db", "users", "k_tag_1", {"k": 1, "tag": 1}, {})
-        storage.insert("db", "orders", [{"_id": i, "user_k": i % 10} for i in range(5)])
 
+        # The eligibility helper sees the compound index as usable for
+        # the leading column.
+        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is True
+        # And only the leading column — a non-leading column is not
+        # equality-indexable on its own.
+        assert _foreign_field_has_simple_index(storage, "db", "users", "tag") is False
+
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 10} for i in range(5)])
         ctx = PipelineContext(storage=storage, db_name="db")
         outer = list(storage.find_matching("db", "orders", {}))
         joined = apply_pipeline(
@@ -723,6 +863,98 @@ def test_lookup_compound_index_falls_back_to_hash_join(tmp_path) -> None:
         for o in joined:
             assert len(o["user"]) == 1
             assert o["user"][0]["k"] == o["user_k"]
+    finally:
+        storage.close()
+
+
+def test_lookup_skips_compound_index_when_leading_field_does_not_match(tmp_path) -> None:
+    """Compound index whose leading field is *not* the foreign field
+    is ineligible — Storage's leading-prefix scan can't handle a
+    non-leading equality without a covering single-field index, so the
+    `$lookup` falls back to hash-join. Result must still be correct.
+    """
+    from secantus.aggregate import PipelineContext, _foreign_field_has_simple_index
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert("db", "users", [{"_id": i, "k": i, "tag": f"t{i}"} for i in range(10)])
+        # Leading field is `tag`, not `k` — so a `$lookup` on `k` can't
+        # use this index.
+        storage.create_index("db", "users", "tag_k_1", {"tag": 1, "k": 1}, {})
+
+        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is False
+        assert _foreign_field_has_simple_index(storage, "db", "users", "tag") is True
+
+        storage.insert("db", "orders", [{"_id": i, "user_k": i % 10} for i in range(5)])
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "as": "user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        assert len(joined) == 5
+        for o in joined:
+            assert len(o["user"]) == 1
+            assert o["user"][0]["k"] == o["user_k"]
+    finally:
+        storage.close()
+
+
+def test_lookup_uses_multikey_compound_index(tmp_path) -> None:
+    """Multikey compound indexes whose leading field matches are now
+    eligible — Storage's per-element entries make per-outer-doc IXSCAN
+    correct (each foreign array element gets its own entry, so an
+    equality lookup still hits all true matches)."""
+    from secantus.aggregate import PipelineContext, _foreign_field_has_simple_index, apply_pipeline
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    try:
+        storage.insert(
+            "db",
+            "users",
+            [
+                {"_id": 1, "k": [1, 2, 3], "tag": "x"},
+                {"_id": 2, "k": [3, 4], "tag": "y"},
+                {"_id": 3, "k": 5, "tag": "z"},
+            ],
+        )
+        storage.create_index("db", "users", "k_tag_1", {"k": 1, "tag": 1}, {})
+        assert _foreign_field_has_simple_index(storage, "db", "users", "k") is True
+
+        storage.insert("db", "orders", [{"_id": 10, "user_k": 3}, {"_id": 11, "user_k": 5}])
+        ctx = PipelineContext(storage=storage, db_name="db")
+        outer = list(storage.find_matching("db", "orders", {}))
+        joined = apply_pipeline(
+            outer,
+            [
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_k",
+                        "foreignField": "k",
+                        "as": "user",
+                    }
+                }
+            ],
+            ctx,
+        )
+        # Order 10 (user_k=3) matches users 1 and 2.
+        # Order 11 (user_k=5) matches user 3.
+        joined.sort(key=lambda d: d["_id"])
+        assert sorted(u["_id"] for u in joined[0]["user"]) == [1, 2]
+        assert [u["_id"] for u in joined[1]["user"]] == [3]
     finally:
         storage.close()
 

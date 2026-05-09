@@ -282,3 +282,72 @@ def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
             assert names >= {"_id_", "x_1"}
         finally:
             mc.close()
+
+
+def test_checkpoint_persists_inserts(tmp_path) -> None:
+    """Forcing a checkpoint flushes pending writes; subsequent close+reopen sees them."""
+    storage = Storage(str(tmp_path))
+    storage.insert("db", "c", [{"_id": 1, "x": 1}])
+    storage.checkpoint()
+    storage.close()
+
+    reopened = Storage(str(tmp_path))
+    try:
+        results = reopened.find_matching("db", "c", {})
+        assert results == [{"_id": 1, "x": 1}]
+    finally:
+        reopened.close()
+
+
+def test_checkpoint_after_close_is_safe(tmp_path) -> None:
+    storage = Storage(str(tmp_path))
+    storage.close()
+    storage.checkpoint()  # no-op; must not raise.
+
+
+def test_profile_defaults_are_off(tmp_path) -> None:
+    s = Storage(str(tmp_path))
+    try:
+        out = s.get_profile("admin")
+        assert out == {"level": 0, "slowms": 100, "sampleRate": 1.0}
+    finally:
+        s.close()
+
+
+def test_profile_set_then_get_round_trips(tmp_path) -> None:
+    s = Storage(str(tmp_path))
+    try:
+        s.set_profile("admin", level=2, slowms=50, sample_rate=0.5)
+        out = s.get_profile("admin")
+        assert out == {"level": 2, "slowms": 50, "sampleRate": 0.5}
+        # Other dbs untouched.
+        assert s.get_profile("other") == {"level": 0, "slowms": 100, "sampleRate": 1.0}
+    finally:
+        s.close()
+
+
+def test_profile_set_validates(tmp_path) -> None:
+    s = Storage(str(tmp_path))
+    try:
+        with pytest.raises(ValueError):
+            s.set_profile("admin", level=3)
+        with pytest.raises(ValueError):
+            s.set_profile("admin", level=1, slowms=-1)
+        with pytest.raises(ValueError):
+            s.set_profile("admin", level=1, sample_rate=2.0)
+    finally:
+        s.close()
+
+
+def test_ensure_profile_collection_is_capped(tmp_path) -> None:
+    s = Storage(str(tmp_path))
+    try:
+        s.ensure_profile_collection("appdb")
+        opts = s.get_collection_options("appdb", "system.profile")
+        assert opts.get("capped") is True
+        assert opts.get("size") == 10 * 1024 * 1024
+        # Idempotent.
+        s.ensure_profile_collection("appdb")
+        assert s.get_collection_options("appdb", "system.profile").get("capped") is True
+    finally:
+        s.close()

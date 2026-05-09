@@ -10,41 +10,31 @@ Each item should have enough context for a future session to pick it up cold: wh
 
 These commands accept the request and return a wire-valid response, but the response is fabricated — they do no real work.
 
-- [ ] **`serverStatus`** — returns version + zeroed metrics (uptime, connections). No real metrics tracking.
-- [ ] **`connectionStatus`** — empty `authInfo` (no auth implemented).
-- [ ] **`hostInfo`** / **`whatsmyuri`** / **`buildInfo`** — hardcoded values. `buildInfo.version` is literally `"7.0.0"`.
-- [ ] **`getLog`** — empty log array.
-- [ ] **`startSession`** / **`endSessions`** / **`refreshSessions`** — `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced.
-- [ ] **`abortTransaction`** / **`commitTransaction`** — return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod`.
+- ~~`getLog`~~ — real now. Backed by `secantus.logbuf.LogBuffer` (5000-line ring buffer) on `SecantusDBServer.logs`. The accept loop logs connect events; expand to other log sites as needed.
+- [ ] **`abortTransaction`** / **`commitTransaction`** — return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod`. (Logical sessions ARE tracked end-to-end via ``secantus.sessions.SessionRegistry``; transactions are the next layer up that doesn't yet correlate with session state.)
 
 ## 2. Stopgaps (functional but with significant limitations)
 
 These work end-to-end but cut corners.
 
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
-- [ ] **`$lookup` index acceleration: compound and multikey foreign indexes still hash-join.** The simple-form / pipeline-with-prefilter paths now drive the per-outer-doc lookup through `Storage.find_matching` when there's a non-multikey single-field index on `foreignField` (each request lands as IXSCAN, the foreign collection is never materialised). When the foreign field is array-valued (multikey index) or only covered by a compound index, the lookup falls back to the original O(N+M) in-memory hash-join — multikey would force a per-outer-doc scan and end up O(M*N), and the compound-leading-field equality probe is correct but the safe-perf rule today is "exact-shape match only". A future slice could opt into the compound-leading-field index when the exact-shape rule could be loosened safely.
-- [ ] **`$dateFromString` / `$dateToString`** — format strings use Python's `strptime`/`strftime` codes plus the `%L` extension for milliseconds; `timezone` argument supports IANA names ("Europe/Dublin"), UTC offsets ("+05:30"), and "GMT"/"UTC". Still missing: full MongoDB format spec (`%G`/`%V` ISO-week, `%j` day-of-year edge cases) and the `format` option's MongoDB-specific tokens.
 - [ ] **`renameCollection`** — atomic per the storage `RLock`, but no protection against concurrent writers across worktrees. Tests are single-process so this is fine.
 - [ ] **`createIndexes` options that are accepted but not enforced**: `collation` (Python compares with default locale).
-- [ ] **TTL is opt-in, not automatic** — `expireAfterSeconds` is honoured by `Storage.prune_ttl(db, coll, *, now=None)` which deletes expired docs and their index entries. Real MongoDB runs this on a 60s background sweeper; SecantusDB does not, so tests that depend on TTL behaviour must call `prune_ttl` explicitly.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
 Specific items that were left out of the slice that introduced their feature area.
 
+- [ ] **`local.oplog.rs` synthetic collection**: real mongod exposes the oplog as a queryable collection at `local.oplog.rs`; the admin UI's deferred `/oplog` page (window inspector + paged entries) wants this. Today, `Storage.read_oplog` / `oplog_floor_seq` / `oplog_tail_seq` exist as Python methods but no wire surface lets a pymongo client see them. Either synthesize the collection in `find_matching` / `count_matching` / `list_collections` for the `(local, oplog.rs)` pair, or add narrowly-scoped `secantusAdmin.oplogStats` + `secantusAdmin.oplogRead` commands. The synthetic-collection path is the more honest dogfooding choice. Slice 6 of the admin UI ships change-stream tail only; the oplog page is parked here.
+- [ ] **`killOp` / connection-close command**: real mongod exposes `db.killOp(opid)` to abort an in-flight op (which also reaps the connection's TCP socket). SecantusDB has no equivalent — the admin UI's `/connections` page (Slice 8) is read-only as a result. Implementation needs interruptible commands at the dispatch layer (a per-op cancel flag the long-running paths poll) plus a wire command that takes `opid` and either signals the flag or closes the per-connection socket directly. Until then, "kill this connection" is a TODO on the connections page.
 - [ ] **More aggregation expressions**: `$mergeAll`, `$function` (JS — also out of scope).
-- [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for numeric ranges (`bounds: "full"` / `[min, max]`, `partitionByFields`); date densify (`unit: "day" | "hour" | ...`) is deferred — needs date-arithmetic step iteration that isn't a one-line addition.
+- [ ] **More aggregation stages**: `$fill`. `$densify` is implemented for both numeric ranges and date ranges with fixed-duration units (`week` / `day` / `hour` / `minute` / `second` / `millisecond`); the variable-length units (`month` / `quarter` / `year`) are rejected with a clear error — supporting them needs `relativedelta`-style arithmetic which isn't worth a new dependency yet.
 - [ ] **`mapReduce`** — deprecated by MongoDB but still used by some legacy code. Not implemented.
 
 ### Authentication
 
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 
-- [ ] **Authorization (RBAC)** — `createUser` accepts a `roles` array and persists it, but no command enforces roles or privileges. An authenticated principal is treated as fully privileged. Real role enforcement needs a per-handler privilege-set check + builtin role definitions (`root`, `readWrite`, `read`, `dbAdmin`, `userAdmin`, ...) + `grantRolesToUser` / `revokeRolesFromUser` / `rolesInfo` / custom `createRole`.
-- [ ] **`updateUser`** — not implemented. Today: drop + recreate. Real `updateUser` rotates passwords without invalidating other connections.
-- [ ] **SCRAM-SHA-1** — legacy mechanism. Modern drivers default to SCRAM-SHA-256 since pymongo 3.7 / driver-spec 2018; we only advertise the modern one. Add if a downstream tool insists on SHA-1.
-- [ ] **SASLprep (RFC 4013)** password normalisation — passwords go to PBKDF2 as raw UTF-8 with no normalisation. ASCII passwords work byte-identically against real `mongod`; non-ASCII (combining marks, full-width digits, etc.) may diverge from a SASLprepping client's expectation.
-- [ ] **Speculative authentication** — pymongo / mongo-go-driver can fold the first SCRAM round-trip into the `hello` reply via `speculativeAuthenticate`. Not implemented; the explicit two-round-trip path works fine but adds one RTT to connection setup.
 - [ ] **x509 / LDAP / Kerberos / GSSAPI / MONGODB-AWS / MONGODB-OIDC** — alternative mechanisms. Out of scope for the first auth slice.
 - [ ] **Internal cluster auth (keyfile / x509)** — only meaningful with replica sets / sharding, both out of scope.
 - [ ] **`system.users` collection visibility** — credentials live in a dedicated WT table (`secantus_users`), not surfaced via `find` / `aggregate` on `admin.system.users`. Tools that poke at the system collection won't see them; use `usersInfo` instead.
@@ -55,9 +45,6 @@ SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/sasl
 Single-node change streams are implemented and conformant for typical pymongo `watch()` flows, but the following are deferred or intentionally diverge from real `mongod`:
 
 - [ ] **Multi-document transactions in change events** — `txnNumber` and `lsid` are never present on change events; SecantusDB has no real transaction state.
-- [ ] **`splitLargeChangeStreamEvents`** — not implemented. Events are emitted whole.
-- [ ] **`noop` heartbeat events** — real `mongod` writes periodic no-ops to advance cluster time even when no real ops happen; SecantusDB does not. Resume tokens advance only on real ops.
-- [ ] **DDL `createIndexes`/`dropIndexes` change events** — oplog has the entries but the projection drops them. Apps that watch for index lifecycle events won't see them.
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **`showExpandedEvents`** — accepted, ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
@@ -74,8 +61,8 @@ These are explicit non-goals. Don't add them without a reason.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes) — would need a full-text index implementation.
 - **Geo — complete and shipped.** Operators (`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`) + `$geoNear` aggregation stage (auto-infer `key`, `includeLocs`), `2dsphere` (S2 cell coverings + ancestors) and `2d` (bit-interleaved geohash) index acceleration, compound geo+scalar indexes (geo cell scan + verifier-step filter on trailing scalars), and write-time input validation (out-of-range coordinates / unparseable shapes reject with mongod's documented code 16572 across insert / update / upsert / createIndex). See `src/secantus/geo.py` + `src/secantus/geo_index.py`. **Validation surface**: 60+ in-tree pymongo tests in `tests/test_geo*.py`; 3 cross-driver smoke tests through mongosh, mongo-node-driver, and mongo-go-driver in `tests/test_geo_cross_driver.py` (all pass — wire-protocol geo path is clean across drivers); the pymongo conformance gauge keeps `test_collection.py`'s built-in geo tests at 100% pass. **Known optimisation deferred**: fine-grained 2d range covering for large query polygons (the single-coarse-bbox range over-scans Z-order space because bit-interleaved geohashes don't preserve row contiguity; tighter covering needs Tropf-Herzog LITMAX/BIGMIN-style range decomposition, ~100+ LOC). The verifier filters all false positives, so this is a perf optimisation not a correctness gap; defer until a workload actually hits it. **Out of scope**: Java cross-driver smoke (single-file equivalent doesn't exist; BSON-level GeoJSON serialization is exercised by the `:bson:test` Java gauge already), exact mongod error string matching (chase work without a clear payoff unless a driver test pins exact wording).
 - **`$where`** — runs JavaScript. We don't ship a JS runtime.
-- **Capped collections** — fixed-size, FIFO collections. Implementable later if needed.
-- **Profiling** (`setProfilingLevel`, `system.profile` collection) — real `mongod` self-profiles; we don't.
+- ~~Capped collections~~ — implemented. `create capped: true, size, max` accepted; `Storage.insert` and `Storage.update_matching` enforce FIFO eviction by walking the doc table in natural order and evicting oldest non-fresh docs while bounds are exceeded. `listCollections` surfaces `options.{capped,size,max}`. Eviction emits oplog `op:"d"` entries (and pre-images when enabled) so change streams observe the deletes. **Known limitation**: eviction order is `_id_key` natural order, which equals insertion order only when `_id` is monotonic (the default `ObjectId`). With user-supplied non-monotonic `_id` values, eviction does not match strict insertion order — capped users with custom `_id` should not rely on FIFO semantics.
+- ~~Profiling~~ — implemented. `profile` command (-1 / 0 / 1 / 2 with `slowms` + `sampleRate`) sets per-database state in `secantus_profile_settings`. Dispatch wraps each non-skip command in `time.monotonic_ns` timing; if the per-DB level matches, an entry is inserted into `<db>.system.profile` (auto-created capped 10 MB). Recursion guard skips ops against `system.profile` itself + handshake / cursor-continuation / profile-itself commands. Entry shape mirrors mongod (`ts`, `op`, `ns`, `command`, `millis`, `ok`, `client`, optional `user`, `errMsg` / `errCode` on failure). Out of scope today: `planSummary` / `keysExamined` / `docsExamined` / `nreturned` (would need post-handler stats plumbing).
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`). Outside change streams (e.g. capped-collection tailables) still depend on capped-collection support, which remains out of scope.
 
 ## 5. Known bugs and edge cases to watch

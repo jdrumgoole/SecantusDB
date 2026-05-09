@@ -38,6 +38,14 @@ docs/_build/
 # node_modules is local to the workdir and downloaded on first run.
 # package-lock.json IS committed for reproducibility.
 tests/cross_driver/node/node_modules/
+tests/cross_driver/node/.node_modules.lock
+
+# Gradle wrapper / cache state for the Java cross-driver smokes is
+# rebuilt from build.gradle.kts on first run; the uber-jar in build/
+# is also excluded by the top-level `build/` rule above. The flock
+# sentinel serialises parallel xdist workers around the build.
+tests/cross_driver/java/.gradle/
+tests/cross_driver/java/.smokesjar.lock
 
 # Pelican site build artifacts and ephemeral runtime state. The build
 # output is regenerated each `invoke build`; theme/static/img/ is copied
@@ -49,3 +57,4 @@ website/themes/secantus/static/img/
 website/infra/aws-state.json
 website/secantus-data/
 website/__pycache__/
+xunit-results/

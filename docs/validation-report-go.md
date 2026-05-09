@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-05-03 — SecantusDB 0.2.0a12 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-05-07 — SecantusDB 0.3.0a66 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -9,20 +9,31 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `bson` | 5061 | 0 | 14 | 5075 | 100.0% |
-| `mongo` | 312 | 6 | 10 | 328 | 98.1% |
-| **Overall** | **5373** | **6** | **24** | **5403** | **99.9%** |
+| `internal/integration` | 270 | 15 | 30 | 315 | 94.7% |
+| `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
+| `mongo` | 303 | 0 | 10 | 313 | 100.0% |
+| **Overall** | **5676** | **15** | **54** | **5745** | **99.7%** |
 
-## Failures (6)
+## Failures (15)
 
 First 30 failed tests for triage:
 
 ```
-mongo :: TestConvenientTransactions/retry_timeout_enforced/unknown_transaction_commit_result
-mongo :: TestConvenientTransactions/retry_timeout_enforced/commit_transient_transaction_error
-mongo :: TestConvenientTransactions/retry_timeout_enforced
-mongo :: TestConvenientTransactions/context_error_before_commitTransaction_does_not_retry_and_aborts
-mongo :: TestConvenientTransactions/slow_operation_in_callback_retries
-mongo :: TestConvenientTransactions
+internal/integration :: TestChangeStream_ReplicaSet/resume_token_updated_on_empty_batch
+internal/integration :: TestChangeStream_ReplicaSet
+internal/integration :: TestCursor_All/getMore_error
+internal/integration :: TestCursor_All
+internal/integration :: TestCursor_Close/killCursors_error
+internal/integration :: TestCursor_Close
+internal/integration :: TestDatabase/run_command/gets_result_and_error
+internal/integration :: TestDatabase/run_command
+internal/integration :: TestDatabase/list_collection_names/filter_not_found
+internal/integration :: TestDatabase/list_collection_names
+internal/integration :: TestDatabase/list_collections/verify_results/replica_set_filter
+internal/integration :: TestDatabase/list_collections/verify_results
+internal/integration :: TestDatabase/list_collections/getMore_commands_are_monitored
+internal/integration :: TestDatabase/list_collections
+internal/integration :: TestDatabase
 ```
 
 ## How this is generated

@@ -5,12 +5,14 @@ import pytest
 from secantus.cursors import CursorNotFound, CursorRegistry
 
 
-def test_register_returns_unique_increasing_ids() -> None:
+def test_register_returns_unique_ids() -> None:
     reg = CursorRegistry()
+    # IDs are random 63-bit ints, not sequential — ordering is not
+    # guaranteed (and was previously a guessability hazard).
     a = reg.register("db.c", [{"x": 1}])
     b = reg.register("db.c", [{"x": 2}])
     assert a != b
-    assert b > a
+    assert a > 0 and b > 0
 
 
 def test_next_batch_returns_chunks_then_exhausts() -> None:
@@ -119,3 +121,22 @@ def test_killed_cursor_idempotent_after_expiry() -> None:
     # Already expired → reported as not-found, not killed.
     assert killed == []
     assert not_found == [cid]
+
+
+def test_snapshot_returns_metadata_for_live_cursors() -> None:
+    reg = CursorRegistry()
+    a = reg.register("db.c", [{"i": i} for i in range(5)])
+    b = reg.register("db.other", [{"i": 99}])
+    snap = reg.snapshot()
+    assert {s["cursor_id"] for s in snap} == {a, b}
+    a_entry = next(s for s in snap if s["cursor_id"] == a)
+    assert a_entry["namespace"] == "db.c"
+    assert a_entry["remaining"] == 5
+    assert a_entry["tailable"] is False
+
+
+def test_snapshot_drops_exhausted_cursors() -> None:
+    reg = CursorRegistry()
+    cid = reg.register("db.c", [{"x": 1}])
+    reg.next_batch(cid, 10)  # exhausts
+    assert reg.snapshot() == []

@@ -1,0 +1,890 @@
+/* SecantusDB admin UI — palette lifted from the website theme.
+ *
+ * The marketing site lives in slate + cyan; the admin app keeps the
+ * same palette so jumping between them feels coherent. The layout
+ * is admin-tool-shaped (sidebar + content), not landing-page shaped.
+ */
+
+:root {
+  --slate-50:  #f8fafc;
+  --slate-100: #f1f5f9;
+  --slate-200: #e2e8f0;
+  --slate-300: #cbd5e1;
+  --slate-400: #94a3b8;
+  --slate-500: #64748b;
+  --slate-600: #475569;
+  --slate-700: #334155;
+  --slate-800: #1e293b;
+  --slate-900: #0f172a;
+  --slate-950: #020617;
+  --cyan-400:  #22d3ee;
+  --cyan-500:  #06b6d4;
+  --cyan-600:  #0891b2;
+
+  --bg: var(--slate-50);
+  --fg: var(--slate-900);
+  --muted: var(--slate-500);
+  --accent: var(--cyan-600);
+  --surface: #ffffff;
+  --border: var(--slate-200);
+  --error: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--slate-950);
+    --fg: var(--slate-100);
+    --muted: var(--slate-400);
+    --accent: var(--cyan-400);
+    --surface: var(--slate-900);
+    --border: var(--slate-800);
+    --error: #fca5a5;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+body {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 1.25rem 0;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 1.25rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand-mark {
+  color: var(--accent);
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+.brand-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.sidebar nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0.75rem 0;
+}
+
+.sidebar nav li a {
+  display: block;
+  padding: 0.5rem 1.25rem;
+  color: var(--fg);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.sidebar nav li a:hover {
+  background: var(--slate-100);
+}
+
+@media (prefers-color-scheme: dark) {
+  .sidebar nav li a:hover {
+    background: var(--slate-800);
+  }
+}
+
+.sidebar nav li a.nav-current {
+  border-left: 3px solid var(--accent);
+  padding-left: calc(1.25rem - 3px);
+  font-weight: 600;
+}
+
+.sidebar nav li a.nav-disabled {
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.content {
+  padding: 1.5rem 2rem 3rem;
+  overflow-x: hidden;
+}
+
+.page-header h1 {
+  margin: 0 0 1.5rem;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+}
+
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+.tile-label {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.tile-value {
+  margin-top: 0.4rem;
+  font-size: 1.6rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-hint {
+  margin-top: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.loading {
+  color: var(--muted);
+}
+
+.error {
+  color: var(--error);
+  background: var(--surface);
+  border: 1px solid var(--error);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+}
+
+/* Tables — used by databases / collections / docs viewer */
+
+.data-table {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-table th,
+.data-table td {
+  padding: 0.55rem 0.9rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.data-table thead th {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 500;
+  background: var(--bg);
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.data-table .num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.data-table .empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 1.25rem 0;
+}
+
+.data-table a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.data-table a:hover {
+  text-decoration: underline;
+}
+
+.data-table a.nav-disabled {
+  color: var(--muted);
+  pointer-events: none;
+}
+
+/* Breadcrumb above tables */
+
+.breadcrumb {
+  margin: -0.5rem 0 1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.breadcrumb a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.breadcrumb a:hover {
+  color: var(--fg);
+}
+
+.breadcrumb .sep {
+  margin: 0 0.5rem;
+  color: var(--border);
+}
+
+/* Inline badges */
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+}
+
+/* Collection viewer — filter form, docs table, pager */
+
+.filter-form {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.filter-form label {
+  display: block;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.filter-form textarea,
+.filter-form input,
+.filter-form select {
+  display: block;
+  margin-top: 0.3rem;
+  width: 100%;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.85rem;
+}
+
+.filter-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: end;
+}
+
+.filter-controls label {
+  flex: 0 0 auto;
+}
+
+.filter-controls input,
+.filter-controls select {
+  width: auto;
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+
+.filter-form button {
+  padding: 0.45rem 1rem;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: white;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.filter-form button:hover {
+  filter: brightness(1.1);
+}
+
+.docs-table .doc-id {
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  vertical-align: top;
+  padding-top: 0.85rem;
+}
+
+.docs-table .doc-body {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.pager {
+  margin-top: 1rem;
+  text-align: center;
+}
+
+.pager a {
+  display: inline-block;
+  padding: 0.45rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.pager a:hover {
+  border-color: var(--accent);
+}
+
+.empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 2rem 0;
+}
+
+/* Document row actions + modal */
+
+.doc-actions-col {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.doc-actions {
+  vertical-align: top;
+  padding-top: 0.6rem;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.btn-secondary,
+.btn-danger {
+  padding: 0.35rem 0.8rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+}
+
+.btn-secondary:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-danger {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.btn-danger:hover {
+  background: var(--error);
+  color: white;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4rem 1rem;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 100%;
+  max-width: 800px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.85rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.modal-close {
+  background: transparent;
+  border: none;
+  font-size: 1.4rem;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.modal form {
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.25rem;
+  gap: 0.75rem;
+  overflow: auto;
+}
+
+.modal-meta {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.modal-meta code {
+  background: var(--bg);
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.78rem;
+}
+
+.modal textarea {
+  width: 100%;
+  min-height: 240px;
+  padding: 0.6rem 0.8rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.modal-actions button[type="submit"] {
+  padding: 0.45rem 1.2rem;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: white;
+  border-radius: 4px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.modal-narrow {
+  max-width: 540px;
+}
+
+.modal-body {
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow: auto;
+}
+
+.modal-body code {
+  background: var(--bg);
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.85rem;
+}
+
+.confirm-input {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.9rem;
+}
+
+.btn-danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--surface);
+  color: var(--error);
+}
+
+.btn-danger:disabled:hover {
+  background: var(--surface);
+  color: var(--error);
+}
+
+/* Page action row (the strip of buttons under the breadcrumb) */
+
+.page-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.page-actions .btn-secondary {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Index create form (uses .filter-form scaffolding) */
+
+.create-form-shell {
+  margin-bottom: 1rem;
+}
+
+.create-form-shell summary {
+  cursor: pointer;
+  padding: 0.5rem 0.75rem;
+  font-weight: 500;
+  color: var(--accent);
+}
+
+.checkbox-label {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 0.4rem;
+  padding-bottom: 0.35rem;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  font-size: 0.85rem !important;
+  color: var(--fg) !important;
+}
+
+.checkbox-label input {
+  margin: 0;
+  width: auto !important;
+}
+
+/* Explain visualizer plan tree */
+
+.section-title {
+  margin-top: 1.5rem;
+  margin-bottom: 0.4rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.plan-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.plan-row {
+  padding: 0.4rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-left: calc(var(--depth, 0) * 1.5rem);
+  position: relative;
+}
+
+.plan-row::before {
+  content: "";
+  display: inline-block;
+  width: 1ch;
+  color: var(--muted);
+}
+
+.plan-row[style*="--depth: 0"]::before {
+  content: "";
+}
+
+.plan-row:not([style*="--depth: 0"])::before {
+  content: "└";
+  color: var(--muted);
+}
+
+.plan-stage {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+}
+
+.plan-stage-ixscan {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.plan-stage-collscan {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.plan-detail {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.plan-detail code {
+  background: var(--bg);
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* Dashboard live-stream pieces */
+
+.connection-status {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0.6rem;
+}
+
+.tile-subvalue {
+  font-size: 0.95rem;
+  color: var(--muted);
+  font-weight: 500;
+  margin-left: 0.25rem;
+}
+
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.chart-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+
+.chart-label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.chart-label span {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  font-weight: 500;
+}
+
+/* Users + roles screens */
+
+.inline-form {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.inline-db-input {
+  width: 14ch;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.85rem;
+}
+
+.inline-form button {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.roles-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.4rem 1rem;
+  margin-top: 0.4rem;
+}
+
+.action-pill {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  margin: 0.1rem 0.2rem 0.1rem 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 0.78rem;
+  color: var(--fg);
+}
+
+/* Change-stream tail */
+
+.changestream-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.cs-event {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+}
+
+.cs-event-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.4rem;
+}
+
+.cs-op {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  text-transform: lowercase;
+}
+
+.cs-ns {
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.85rem;
+  color: var(--muted);
+  flex: 1 1 auto;
+}
+
+/* Console tabs + history */
+
+.console-tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.console-tabs button {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.console-tabs button:hover {
+  color: var(--fg);
+}
+
+.console-tabs button.tab-active {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.history-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.history-summary {
+  flex: 1 1 auto;
+  font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-payload {
+  display: none;  /* Server-rendered, used by JS in the future */
+}

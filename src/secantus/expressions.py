@@ -366,6 +366,12 @@ def _op_switch(arg: Any, ctx: _Ctx) -> Any:
     raise ExpressionError("$switch found no matching branch and no default")
 
 
+# Mirror of query.py's pattern-length cap. Python `re` has no match
+# timeout; capping pattern length sidesteps catastrophic-backtracking
+# patterns reachable via $regexMatch / $regexFind / $regexFindAll.
+_MAX_REGEX_PATTERN_LEN = 1000
+
+
 def _resolve_regex(arg: Any, ctx: _Ctx) -> tuple[str, int]:
 
     from bson import Regex
@@ -383,6 +389,10 @@ def _resolve_regex(arg: Any, ctx: _Ctx) -> tuple[str, int]:
         flags |= _re_flags(raw_options)
     if not isinstance(pattern, str):
         raise ExpressionError("regex must be a string or BSON Regex")
+    if len(pattern) > _MAX_REGEX_PATTERN_LEN:
+        raise ExpressionError(
+            f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
+        )
     return pattern, flags
 
 
@@ -792,6 +802,13 @@ def _op_let(arg: Any, ctx: _Ctx) -> Any:
     return _eval(arg["in"], inner)
 
 
+# Hard cap on the size of a `$range` result. Without this, a single
+# document like `{$project: {r: {$range: [0, 1_000_000_000]}}}` is an
+# OOM bomb (allocates ~8 GB in CPython). MongoDB caps at 64 MB BSON
+# but doesn't materialise into Python — we have to cap explicitly.
+_MAX_RANGE_SIZE = 100_000
+
+
 def _op_range(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or not 2 <= len(arg) <= 3:
         raise ExpressionError("$range requires [start, end, step?]")
@@ -802,6 +819,15 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError("$range requires integer arguments")
     if step == 0:
         raise ExpressionError("$range step cannot be zero")
+    # Compute the size symbolically so we never call list(range(...)) on
+    # a billion-element range.
+    delta = end - start
+    if (delta > 0) == (step > 0):
+        size = (abs(delta) + abs(step) - 1) // abs(step)
+        if size > _MAX_RANGE_SIZE:
+            raise ExpressionError(
+                f"$range result of {size} elements exceeds the {_MAX_RANGE_SIZE}-element cap"
+            )
     return list(range(start, end, step))
 
 
@@ -978,8 +1004,23 @@ def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
         d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
         d = d_aware.astimezone(tz)
     out = fmt
+    # Pre-process tokens whose mongod semantics differ from Python's
+    # strftime, then hand the rest off to strftime untouched.
+    # ``%L`` — 3-digit milliseconds (mongod-only token).
     if "%L" in out:
         out = out.replace("%L", f"{d.microsecond // 1000:03d}")
+    # ``%w`` — mongod numbers days 1-Sunday through 7-Saturday;
+    # Python's strftime numbers them 0-Sunday through 6-Saturday.
+    # Substitute the resolved digit directly so strftime never sees
+    # the token. Formula: ((weekday() + 1) % 7) + 1 maps
+    # Mon..Sun (0..6) → 2..7,1 i.e. mongod's Sunday=1 numbering.
+    if "%w" in out:
+        out = out.replace("%w", str(((d.weekday() + 1) % 7) + 1))
+    # ``%G`` (ISO year), ``%V`` (ISO week 1-53), ``%j`` (day of year
+    # 001-366), ``%U`` (Sunday-start week 00-53), ``%u`` (ISO weekday
+    # 1-Mon … 7-Sun), ``%Y``, ``%m``, ``%d``, ``%H``, ``%M``, ``%S``,
+    # ``%z``, ``%Z``, ``%%`` — all match mongod's tokens and pass
+    # straight through to Python's strftime.
     return d.strftime(out)
 
 
@@ -1044,6 +1085,26 @@ def _op_in(arg: Any, ctx: _Ctx) -> bool:
     return needle in haystack
 
 
+# `int(very_long_string)` is O(n^2) in CPython. Python 3.11+ enforces a
+# default 4300-digit max via `sys.set_int_max_str_digits` (PEP 750), but
+# (a) it can be disabled at runtime, (b) the threshold above which it
+# bites is not consistent across versions, and (c) we'd rather raise a
+# clear ExpressionError than the underlying ValueError. Hard-cap here.
+_MAX_INT_STR_DIGITS = 4300
+
+
+def _safe_int_from_str(value: str, op_name: str) -> int:
+    if len(value) > _MAX_INT_STR_DIGITS:
+        raise ExpressionError(
+            f"{op_name} input string of {len(value)} chars exceeds the "
+            f"{_MAX_INT_STR_DIGITS}-char int-conversion cap"
+        )
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ExpressionError(f"{op_name} cannot convert {value!r}") from exc
+
+
 def _op_to_int(arg: Any, ctx: _Ctx) -> Any:
     value = _eval(arg, ctx)
     if value is None:
@@ -1057,10 +1118,7 @@ def _op_to_int(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(value, Decimal128):
         return int(value.to_decimal())
     if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError as exc:
-            raise ExpressionError(f"$toInt cannot convert {value!r}") from exc
+        return _safe_int_from_str(value, "$toInt")
     raise ExpressionError(f"$toInt cannot convert {type(value).__name__}")
 
 
@@ -1170,7 +1228,7 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, Decimal128):
             return int(value.to_decimal())
         if isinstance(value, str):
-            return int(value)
+            return _safe_int_from_str(value, "$convert (int/long)")
     elif code == 19:
         if isinstance(value, Decimal128):
             return value
@@ -1181,6 +1239,11 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, float):
             return Decimal128(Decimal(repr(value)))
         if isinstance(value, str):
+            if len(value) > _MAX_INT_STR_DIGITS:
+                raise ExpressionError(
+                    f"$convert (decimal) input string of {len(value)} chars "
+                    f"exceeds the {_MAX_INT_STR_DIGITS}-char cap"
+                )
             return Decimal128(value)
     raise ExpressionError(f"$convert cannot convert {type(value).__name__} to {target!r}")
 

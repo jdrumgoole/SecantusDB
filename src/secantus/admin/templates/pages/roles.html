@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <a href="/users">Users</a>
+  <span class="sep">/</span>
+  <span>built-in roles</span>
+</nav>
+
+<p class="modal-meta">
+  Built-in roles map to action sets enforced server-side by
+  <code>secantus.rbac</code>. Custom roles aren't implemented yet.
+</p>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Role</th>
+      <th>Flags</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+      <tr>
+        <td><code>{{ row.name }}</code></td>
+        <td>
+          {% for flag in row.flags %}
+            <span class="badge">{{ flag }}</span>
+          {% endfor %}
+        </td>
+        <td>
+          {% for action in row.actions %}
+            <code class="action-pill">{{ action }}</code>
+          {% endfor %}
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
