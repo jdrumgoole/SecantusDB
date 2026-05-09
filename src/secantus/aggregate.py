@@ -651,38 +651,38 @@ def _stage_lookup_pipeline(
 
 
 def _foreign_field_has_simple_index(storage: Storage, db: str, coll: str, field: str) -> bool:
-    """Is there a non-multikey index whose leading column is ``field``?
+    """Is there an index whose leading column is ``field`` we can drive
+    `$lookup` through?
 
     A single-field index keyed exactly on ``field`` is the canonical
     fit, but a compound index whose leading field is ``field`` is also
     eligible: Storage's picker turns ``{field: value}`` into a
     leading-prefix scan over the compound index's entries (correctness
     is identical to the single-field case for equality on the leading
-    column). Direction (1 / -1) is fine for either shape — the storage
+    column). Multikey is fine too — Storage's
+    ``_index_key_variants`` writes per-element entries, so equality
+    lookups against array-valued foreign fields hit at least all true
+    matches. Direction (1 / -1) is fine for either shape — the storage
     range scan handles ASC and DESC.
 
-    Multikey indexes are ineligible because Storage's pickers skip
-    them (find_matching falls back to a full scan), so a per-outer-doc
-    loop against a multikey-indexed foreign field would be O(M*N) —
-    strictly worse than the in-memory hash-join. Geo / hashed / text
-    indexes are also out (the numeric-direction check below excludes
-    them).
+    Geo / hashed / text indexes are excluded by the all-numeric
+    direction check below (their direction values are strings like
+    ``"2dsphere"`` or ``"hashed"``).
     """
     try:
         indexes = storage.list_indexes(db, coll)
     except Exception:
         return False
     for ix in indexes:
-        if ix.get("multikey"):
-            continue
         key = ix.get("key", {})
         if not isinstance(key, Mapping):
             continue
         keys = list(key.keys())
         if not keys or keys[0] != field:
             continue
-        leading_value = key[field]
-        if leading_value not in (1, -1):
+        # Every column must be ASC/DESC numeric — excludes geo / hashed /
+        # text whose direction values are strings.
+        if any(v not in (1, -1) for v in key.values()):
             continue
         return True
     return False
