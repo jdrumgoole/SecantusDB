@@ -1780,3 +1780,176 @@ def test_custom_roles_smoke_via_java_driver(server_with_auth: SecantusDBServer) 
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Logical sessions (startSession / endSessions / refreshSessions)
+# ---------------------------------------------------------------------------
+
+
+_SESSIONS_MONGOSH_SCRIPT = """
+const started = db.getSiblingDB("admin").runCommand({ startSession: 1 });
+// `BinData(4, ...)` second argument is base64-decoded by mongosh and
+// must produce exactly 16 bytes for subtype 4 (UUID). 24 base64 chars
+// → 16 raw bytes; passing 16 ASCII chars literally gives 12 bytes
+// after base64 decode and produces malformed BSON on the wire.
+const refreshRes = db.getSiblingDB("admin").runCommand({
+  refreshSessions: [{ id: BinData(4, "AAAAAAAAAAAAAAAAAAAAAA==") }],
+});
+const endRes = db.getSiblingDB("admin").runCommand({ endSessions: [started.id] });
+print(JSON.stringify({
+  startedOk: started.ok,
+  hasId: !!started.id && !!started.id.id,
+  timeoutMinutes: started.timeoutMinutes,
+  refreshOk: refreshRes.ok,
+  endOk: endRes.ok,
+}));
+"""
+
+
+@pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+def test_sessions_smoke_via_mongosh(server: SecantusDBServer) -> None:
+    result = _run(
+        [_MONGOSH, "--quiet", server.uri, "--eval", _SESSIONS_MONGOSH_SCRIPT],
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"mongosh sessions: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out_line = next(
+        (ln for ln in reversed(result.stdout.splitlines()) if ln.startswith("{")),
+        None,
+    )
+    assert out_line is not None, f"no JSON line: {result.stdout!r}"
+    payload = json.loads(out_line)
+    assert payload["startedOk"] == 1
+    assert payload["hasId"] is True
+    assert payload["timeoutMinutes"] == 30
+    assert payload["refreshOk"] == 1
+    assert payload["endOk"] == 1
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
+def test_sessions_smoke_via_node_driver(server: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "sessions_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node sessions smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_sessions_smoke_via_go_driver(server: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_GO, "run", "./sessions"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go sessions smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
+def test_sessions_smoke_via_java_driver(server: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_JAVA, "-cp", str(_JAVA_SMOKES_JAR), "com.secantus.smokes.SessionsSmoke"],
+        env=env,
+        timeout=120.0,
+    )
+    assert result.returncode == 0, (
+        f"java sessions smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Cluster role bundles (clusterMonitor / backup)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+@pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
+@pytest.mark.xdist_group(name="node_smokes")
+def test_cluster_roles_smoke_via_node_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_node_modules():
+        pytest.skip("could not install mongodb npm package")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run(
+        [_NODE, str(_NODE_SMOKE_DIR / "cluster_roles_smoke.js")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"node cluster-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_GO is None, reason="go not on PATH")
+def test_cluster_roles_smoke_via_go_driver(server_with_auth: SecantusDBServer) -> None:
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run(
+        [_GO, "run", "./cluster_roles"],
+        cwd=_GO_SMOKE_DIR,
+        env=env,
+        timeout=180.0,
+    )
+    assert result.returncode == 0, (
+        f"go cluster-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
+@pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
+@pytest.mark.xdist_group(name="java_smokes")
+def test_cluster_roles_smoke_via_java_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_java_smokes_jar():
+        pytest.skip("could not build secantus-java-smokes-all.jar")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_with_auth.uri,
+        "ADMIN_PASSWORD": _ADMIN_PWD,
+    }
+    result = _run(
+        [_JAVA, "-cp", str(_JAVA_SMOKES_JAR), "com.secantus.smokes.ClusterRolesSmoke"],
+        env=env,
+        timeout=120.0,
+    )
+    assert result.returncode == 0, (
+        f"java cluster-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
