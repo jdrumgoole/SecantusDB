@@ -509,6 +509,41 @@ class MongoFacade:
             raise MongoError(str(exc)) from exc
 
 
+    # ---- maintenance ---------------------------------------------------
+
+    def fsync(self) -> dict[str, Any]:
+        """Force a WiredTiger checkpoint via the ``fsync`` command."""
+        return self._run_admin("fsync")
+
+    def prune_oplog(self) -> int:
+        """Drop oplog rows past the retention window. Returns docs pruned."""
+        out = self._run_admin("secantusAdmin.pruneOplog")
+        return int(out.get("pruned", 0) or 0)
+
+    def prune_ttl(self) -> int:
+        """Run TTL pruning against every collection. Returns docs pruned."""
+        out = self._run_admin("secantusAdmin.pruneTtl")
+        return int(out.get("pruned", 0) or 0)
+
+    def drop_database(self, db: str) -> None:
+        """Drop ``db`` entirely. Mongod-shape ``dropDatabase`` command."""
+        try:
+            self._get_client()[db].command("dropDatabase")
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def drop_collection(self, db: str, coll: str) -> None:
+        """Drop a single collection."""
+        try:
+            self._get_client()[db].drop_collection(coll)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+
 __all__ = [
     "MongoFacade",
     "MongoError",

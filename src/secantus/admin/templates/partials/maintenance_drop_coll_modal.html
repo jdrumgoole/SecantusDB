@@ -1,0 +1,48 @@
+<div
+  class="modal-overlay"
+  x-data="{ confirm: '' }"
+  @click.self="document.getElementById('modal').innerHTML = ''"
+>
+  <div class="modal modal-narrow">
+    <header class="modal-header">
+      <h2>Drop collection</h2>
+      <button
+        type="button"
+        class="modal-close"
+        @click="document.getElementById('modal').innerHTML = ''"
+      >×</button>
+    </header>
+    <form
+      class="modal-body"
+      method="post"
+      action="/maintenance/drop-collection"
+    >
+      <input type="hidden" name="db" value="{{ db_name }}" />
+      <input type="hidden" name="coll" value="{{ coll_name }}" />
+      <p>
+        About to drop collection <code>{{ db_name }}.{{ coll_name }}</code>.
+        This cannot be undone.
+      </p>
+      <p>Type the collection name <code>{{ coll_name }}</code> to confirm:</p>
+      <input
+        type="text"
+        class="confirm-input"
+        x-model="confirm"
+        autocomplete="off"
+        autofocus
+      />
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="document.getElementById('modal').innerHTML = ''"
+        >Cancel</button>
+        <button
+          type="submit"
+          class="btn-danger"
+          x-bind:disabled="confirm !== '{{ coll_name }}'"
+        >Drop collection</button>
+      </div>
+    </form>
+  </div>
+</div>

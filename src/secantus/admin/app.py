@@ -35,6 +35,7 @@ from secantus.admin.routers import (
     databases,
     health,
     indexes,
+    maintenance,
     metrics,
     profiler,
     users,
@@ -117,6 +118,7 @@ def create_app(
     app.include_router(console.router)
     app.include_router(connections.router)
     app.include_router(profiler.router)
+    app.include_router(maintenance.router)
 
     return app
 
