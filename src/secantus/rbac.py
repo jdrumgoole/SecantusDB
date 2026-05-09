@@ -26,27 +26,35 @@ in-scope surface we collapse that to one of three shapes:
 * **database-level** action on ``target_db`` (e.g. ``listCollections``,
   ``createCollection``, ``dropDatabase``).
 * **cluster** action — ``serverStatus``, ``hostInfo``,
-  ``listDatabases``, etc. Only ``root`` (and the explicit
-  ``clusterAdmin`` / ``clusterMonitor`` roles, not implemented yet)
-  grants cluster-wide actions.
+  ``listDatabases``, etc. Granted by ``clusterMonitor`` (read-only
+  monitoring), ``clusterAdmin`` (monitoring + ``fsync`` /
+  ``dropDatabase`` across any db), ``backup`` / ``restore`` (their
+  cluster-wide reach), and ``root``.
 
 Built-in role coverage
 ======================
 
-The MVP set covers what real-world deployments use:
-
-* ``read`` / ``readWrite`` / ``dbAdmin`` / ``userAdmin`` — single-db.
+* ``read`` / ``readWrite`` / ``dbAdmin`` / ``userAdmin`` /
+  ``dbOwner`` — single-db.
 * ``readAnyDatabase`` / ``readWriteAnyDatabase`` /
   ``dbAdminAnyDatabase`` / ``userAdminAnyDatabase`` — admin-bound,
   cross-db.
+* ``clusterMonitor`` / ``clusterAdmin`` / ``backup`` / ``restore``
+  — admin-bound, cluster-wide bundles. ``clusterMonitor`` is read-only
+  monitoring; ``clusterAdmin`` adds ``fsync`` and ``dropDatabase``
+  across any db (mongod also bundles ``shutdown`` /
+  ``flushRouterConfig`` here, but those aren't in scope for SecantusDB
+  so they collapse into the same role). ``backup`` is read-everything
+  + monitoring (so the dump tool can ``listDatabases`` and read each
+  one); ``restore`` is write-everything + DDL + role/user management,
+  matching what restoring from a dump needs.
 * ``root`` — admin-bound, every action on every resource (including
   cluster-level actions).
 
-``clusterAdmin`` / ``clusterMonitor`` / ``backup`` / ``restore`` and
-custom roles are out of scope for the first slice; mongod recognises
-them but our handlers don't enforce cluster-monitor-only actions
-distinctly from root yet. ``createRole`` / ``dropRole`` / ``rolesInfo``
-on custom roles return ``Unauthorized`` errors that match real mongod.
+Custom user-defined roles (with inheritance graphs + cycle detection)
+are also implemented end-to-end: ``createRole`` / ``dropRole`` /
+``updateRole`` / ``grantPrivilegesToRole`` / ``revokePrivilegesFromRole``
+/ ``rolesInfo`` thread through ``check_privilege``'s resolver.
 """
 
 from __future__ import annotations
@@ -184,8 +192,9 @@ _USERADMIN_ACTIONS: frozenset[str] = frozenset(
     }
 )
 
-# Cluster actions only ``root`` grants in this slice.
-_CLUSTER_ACTIONS: frozenset[str] = frozenset(
+# Cluster-monitoring actions: reading server-wide state. Granted by
+# ``clusterMonitor``, ``clusterAdmin``, ``backup``, ``restore``, ``root``.
+_CLUSTER_MONITOR_ACTIONS: frozenset[str] = frozenset(
     {
         A_LIST_DATABASES,
         A_SERVER_STATUS,
@@ -193,9 +202,22 @@ _CLUSTER_ACTIONS: frozenset[str] = frozenset(
         A_GET_CMD_LINE_OPTS,
         A_GET_LOG,
         A_INPROG,
-        A_FSYNC,
     }
 )
+
+# Cluster-admin actions: cluster-wide writes / shutdown-class operations.
+# Granted by ``clusterAdmin`` and ``root``.
+_CLUSTER_ADMIN_EXTRA_ACTIONS: frozenset[str] = frozenset(
+    {
+        A_FSYNC,
+        A_DROP_DATABASE,
+    }
+)
+
+# Back-compat alias: pre-bundle code referenced ``_CLUSTER_ACTIONS`` as
+# the union granted only by ``root``. Keep the name for the ``root``
+# spec definition below.
+_CLUSTER_ACTIONS: frozenset[str] = _CLUSTER_MONITOR_ACTIONS | frozenset({A_FSYNC})
 
 
 class _RoleSpec:
@@ -238,13 +260,59 @@ BUILT_IN_ROLES: dict[str, _RoleSpec] = {
     "readWriteAnyDatabase": _RoleSpec(_READWRITE_ACTIONS, any_db=True, admin_only=True),
     "dbAdminAnyDatabase": _RoleSpec(_DBADMIN_ACTIONS, any_db=True, admin_only=True),
     "userAdminAnyDatabase": _RoleSpec(_USERADMIN_ACTIONS, any_db=True, admin_only=True),
+    # Cluster-monitoring read access only. Mongod's documented bundle
+    # also includes per-collection read on `system.profile`; we don't
+    # surface that, but the listDatabases / serverStatus / hostInfo /
+    # getLog / currentOp set is the part drivers actually exercise.
+    "clusterMonitor": _RoleSpec(
+        _CLUSTER_MONITOR_ACTIONS,
+        any_db=True,
+        cluster=True,
+        admin_only=True,
+    ),
+    # Cluster admin: clusterMonitor + cluster-write actions (fsync,
+    # dropDatabase across any db). Mongod also bundles ``clusterManager``
+    # and ``hostManager``; we collapse those into one bundle since the
+    # individual actions they enable (e.g. ``shutdown``, ``flushRouterConfig``)
+    # aren't in scope for SecantusDB.
+    "clusterAdmin": _RoleSpec(
+        _CLUSTER_MONITOR_ACTIONS | _CLUSTER_ADMIN_EXTRA_ACTIONS,
+        any_db=True,
+        cluster=True,
+        admin_only=True,
+    ),
+    # Backup: read on every database + cluster-monitoring (so ``listDatabases``
+    # works for the backup tool to discover what to dump). Mongod's bundle
+    # also covers reading system.profile / system.users; userAdmin actions
+    # are not granted (a backup user shouldn't be able to rotate creds).
+    "backup": _RoleSpec(
+        _READ_ACTIONS | _CLUSTER_MONITOR_ACTIONS,
+        any_db=True,
+        cluster=True,
+        admin_only=True,
+    ),
+    # Restore: write on every database + DDL + role/user management +
+    # cluster-monitoring. The restore tool needs to recreate users and
+    # roles as part of bringing the dump back online; mongod's documented
+    # bundle is essentially readWrite+dbAdmin+userAdmin everywhere plus
+    # cluster monitoring.
+    "restore": _RoleSpec(
+        _READWRITE_ACTIONS
+        | _DBADMIN_ACTIONS
+        | _USERADMIN_ACTIONS
+        | _CLUSTER_MONITOR_ACTIONS
+        | frozenset({A_DROP_DATABASE}),
+        any_db=True,
+        cluster=True,
+        admin_only=True,
+    ),
     # ``root`` covers everything: every action on every db, plus cluster.
     "root": _RoleSpec(
         _READWRITE_ACTIONS
         | _DBADMIN_ACTIONS
         | _USERADMIN_ACTIONS
         | _CLUSTER_ACTIONS
-        | frozenset({A_DROP_DATABASE}),
+        | _CLUSTER_ADMIN_EXTRA_ACTIONS,
         any_db=True,
         cluster=True,
         admin_only=True,
