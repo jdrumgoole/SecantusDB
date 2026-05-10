@@ -33,9 +33,7 @@ class EmbeddedServer:
     """Wraps an optional in-process ``SecantusDBServer`` for the dashboard."""
 
     def __init__(self, default_storage_path: Path | str | None = None) -> None:
-        self.default_storage_path = Path(
-            default_storage_path or DEFAULT_EMBEDDED_STORAGE
-        )
+        self.default_storage_path = Path(default_storage_path or DEFAULT_EMBEDDED_STORAGE)
         self._server: SecantusDBServer | None = None
         self._storage_path: Path | None = None
         self._lock = threading.Lock()

@@ -370,9 +370,7 @@ def _kill_all_sessions(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, A
     return {"ok": 1.0}
 
 
-def _kill_all_sessions_by_pattern(
-    _doc: dict[str, Any], ctx: CommandContext
-) -> dict[str, Any]:
+def _kill_all_sessions_by_pattern(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Pattern-filtered variant of ``killAllSessions``.
 
     Same effective semantics as ``killAllSessions`` — drop every
@@ -3419,9 +3417,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         if not isinstance(level, str) or level not in _VALID_READ_CONCERN_LEVELS:
             return {
                 "ok": 0.0,
-                "errmsg": (
-                    f"Specified readConcern level {level!r} is not valid"
-                ),
+                "errmsg": (f"Specified readConcern level {level!r} is not valid"),
                 "code": 9,
                 "codeName": "FailedToParse",
             }

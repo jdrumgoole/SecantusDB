@@ -18,7 +18,9 @@ def test_strips_topology_description() -> None:
 
 
 def test_strips_full_error_dict() -> None:
-    raw = "E11000 duplicate key error in index name_1: _id=1, full error: {'ok': 0.0, 'code': 11000}"
+    raw = (
+        "E11000 duplicate key error in index name_1: _id=1, full error: {'ok': 0.0, 'code': 11000}"
+    )
     out = friendly_error(Exception(raw))
     assert out == "E11000 duplicate key error in index name_1: _id=1"
 

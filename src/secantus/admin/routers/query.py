@@ -80,9 +80,7 @@ def _list_database_names(request: Request) -> list[str]:
     """Best-effort list of database names; empty list when unreachable."""
     try:
         return sorted(
-            d.get("name", "")
-            for d in request.app.state.mongo.list_databases()
-            if d.get("name")
+            d.get("name", "") for d in request.app.state.mongo.list_databases() if d.get("name")
         )
     except MongoError:
         return []

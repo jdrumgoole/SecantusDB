@@ -25,7 +25,7 @@ See ``docs/concurrency.md`` for the full architectural ceiling story.
 
 from __future__ import annotations
 
-import os
+import contextlib
 import shutil
 import signal
 import socket
@@ -36,9 +36,7 @@ import time
 from pathlib import Path
 
 import pytest
-
 from bench.concurrency import _parse_writer_log, _wait_listen
-
 
 # Single-writer floor we expect per-writer when scaling is healthy.
 # A writer that gets shut out completely by lock contention will
@@ -60,11 +58,17 @@ def _free_port() -> int:
 def _spawn_server(port: int, storage: Path) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [
-            sys.executable, "-m", "secantus",
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--storage-path", str(storage),
-            "--log-level", "WARNING",
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--storage-path",
+            str(storage),
+            "--log-level",
+            "WARNING",
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -78,12 +82,19 @@ def _spawn_writers(uri: str, n: int, batch: int) -> list[tuple[subprocess.Popen[
         log_path = Path(tempfile.mkstemp(prefix=f"writer-{i}-", suffix=".log")[1])
         log_f = log_path.open("w")
         argv = [
-            sys.executable, "-m", "bench.load_writer",
-            "--uri", uri,
-            "--db", "concurrency_test",
-            "--collection", f"w{i}",
-            "--batch-size", str(batch),
-            "--progress-every", "0",
+            sys.executable,
+            "-m",
+            "bench.load_writer",
+            "--uri",
+            uri,
+            "--db",
+            "concurrency_test",
+            "--collection",
+            f"w{i}",
+            "--batch-size",
+            str(batch),
+            "--progress-every",
+            "0",
         ]
         if i == 0:
             argv.append("--drop")
@@ -101,10 +112,8 @@ def _drain_writers(
     procs: list[tuple[subprocess.Popen[bytes], Path]],
 ) -> list[tuple[int, int] | None]:
     for p, _ in procs:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             p.send_signal(signal.SIGTERM)
-        except ProcessLookupError:
-            pass
     stats: list[tuple[int, int] | None] = []
     for p, log_path in procs:
         try:
@@ -136,7 +145,7 @@ def _measure(uri: str, n: int) -> float:
 @pytest.mark.slow
 @pytest.mark.xfail(
     reason="WT-level concurrency ceiling: pure-C pthread writes also cap "
-           "at ~1.3x at N=2. See bench/wt_poc/ + docs/concurrency.md.",
+    "at ~1.3x at N=2. See bench/wt_poc/ + docs/concurrency.md.",
     strict=False,
 )
 def test_two_writers_scale_above_single_writer(tmp_path) -> None:

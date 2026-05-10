@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -42,8 +42,10 @@ from secantus.admin.routers import (
     metrics,
     profiler,
     query,
-    server as server_router,
     users,
+)
+from secantus.admin.routers import (
+    server as server_router,
 )
 from secantus.admin.sampler import Hub, Sampler
 from secantus.admin.targets import TargetStore
@@ -73,10 +75,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.mongo.close()
         # Tear down any embedded SecantusDBServer the user spun up
         # from the dashboard. Safe when nothing is running.
-        try:
+        with suppress(Exception):
             app.state.embedded.stop()
-        except Exception:
-            pass
 
 
 _DEFAULT_HISTORY_PATH = Path.home() / ".secantus" / "admin.db"

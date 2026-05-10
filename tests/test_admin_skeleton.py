@@ -142,7 +142,6 @@ async def test_connection_switch_rebinds_facade(server, tmp_path) -> None:
                 assert "Switched to" in r.text
                 assert app.state.mongo_uri == srv2.uri
                 # The new facade can see the second server's collection.
-                colls = sorted(app.state.mongo.list_collections_with_stats("mark"))
                 names = [c["name"] for c in app.state.mongo.list_collections_with_stats("mark")]
                 assert names == ["b"]
         finally:
@@ -194,9 +193,7 @@ async def test_connection_recent_lists_after_switch(server, tmp_path) -> None:
                     data={"uri": srv2.uri},
                     headers={HEADER_NAME: "testtoken"},
                 )
-                r = await c.get(
-                    "/server", headers={HEADER_NAME: "testtoken"}
-                )
+                r = await c.get("/server", headers={HEADER_NAME: "testtoken"})
                 assert r.status_code == 200
                 # The newly-current URI shows up flagged "current".
                 assert "current" in r.text
@@ -209,7 +206,7 @@ async def test_connection_recent_lists_after_switch(server, tmp_path) -> None:
 async def test_connection_forget_removes_saved_uri(server, tmp_path) -> None:
     other_path = tmp_path / "other"
     other_path.mkdir()
-    with SecantusDBServer(port=0, storage_path=str(other_path)) as srv2:
+    with SecantusDBServer(port=0, storage_path=str(other_path)):
         app = create_app(
             mongo_uri=server.uri,
             token="testtoken",
@@ -230,9 +227,7 @@ async def test_connection_forget_removes_saved_uri(server, tmp_path) -> None:
                 )
                 assert r.status_code == 200
                 assert "Forgot" in r.text
-                assert all(
-                    e.uri != saved for e in app.state.targets.recent()
-                )
+                assert all(e.uri != saved for e in app.state.targets.recent())
         finally:
             app.state.mongo.close()
 
@@ -259,9 +254,7 @@ async def test_page_header_strips_password(server, tmp_path) -> None:
             transport=ASGITransport(app=app),
             base_url="http://testserver",
         ) as c:
-            r = await c.get(
-                "/", headers={HEADER_NAME: "testtoken"}
-            )
+            r = await c.get("/", headers={HEADER_NAME: "testtoken"})
             assert r.status_code == 200
             assert "alice@127.0.0.1" in r.text
             assert "s3cret" not in r.text
@@ -1533,9 +1526,7 @@ async def test_maintenance_drop_coll_actually_drops(server, http: AsyncClient) -
 # ---- /query datalists + collections endpoint --------------------------------
 
 
-async def test_query_page_lists_databases_in_datalist(
-    server, http: AsyncClient
-) -> None:
+async def test_query_page_lists_databases_in_datalist(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -1552,9 +1543,7 @@ async def test_query_page_lists_databases_in_datalist(
     assert 'value="beta"' in r.text
 
 
-async def test_query_collections_endpoint_returns_names(
-    server, http: AsyncClient
-) -> None:
+async def test_query_collections_endpoint_returns_names(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -1564,9 +1553,7 @@ async def test_query_collections_endpoint_returns_names(
     finally:
         mc.close()
 
-    r = await http.get(
-        "/query/_collections?db=zoo", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/query/_collections?db=zoo", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     payload = r.json()
     assert sorted(payload["collections"]) == ["lions", "tigers"]
@@ -1575,9 +1562,7 @@ async def test_query_collections_endpoint_returns_names(
 async def test_query_collections_endpoint_unknown_db_empty(
     http: AsyncClient,
 ) -> None:
-    r = await http.get(
-        "/query/_collections?db=", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/query/_collections?db=", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert r.json()["collections"] == []
 
@@ -1622,9 +1607,7 @@ async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:
             assert app.state.mongo_uri == embedded_uri
 
             # Stop again — page reflects "stopped".
-            r2 = await c.post(
-                "/embedded/stop", headers={HEADER_NAME: "testtoken"}
-            )
+            r2 = await c.post("/embedded/stop", headers={HEADER_NAME: "testtoken"})
             assert r2.status_code == 200
             assert "Stopped embedded server" in r2.text
             assert app.state.embedded.status()["running"] is False
@@ -1639,7 +1622,6 @@ async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:
 def test_cli_missing_admin_extra_shows_helpful_message(monkeypatch, capsys) -> None:
     """When fastapi/uvicorn aren't installed the CLI must point the user
     at the right install command — not raise ``ModuleNotFoundError``."""
-    import sys
 
     from secantus.admin import cli as admin_cli
 
@@ -1647,9 +1629,7 @@ def test_cli_missing_admin_extra_shows_helpful_message(monkeypatch, capsys) -> N
 
     def faux_import(name, *args, **kwargs):
         if name == "secantus.admin.launcher":
-            raise ModuleNotFoundError(
-                "No module named 'uvicorn'", name="uvicorn"
-            )
+            raise ModuleNotFoundError("No module named 'uvicorn'", name="uvicorn")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr("builtins.__import__", faux_import)

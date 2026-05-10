@@ -88,9 +88,7 @@ def _render_dashboard(
             "title": "Dashboard",
             "active": "dashboard",
             "embedded": embedded_status,
-            "embedded_default_path": str(
-                request.app.state.embedded.default_storage_path
-            ),
+            "embedded_default_path": str(request.app.state.embedded.default_storage_path),
             "pending_storage": pending_storage,
             "flash": flash,
             "error": error,
@@ -127,8 +125,7 @@ def post_embedded_start(
         flash = {
             "kind": "err",
             "msg": (
-                f"Started embedded server at {uri}, but couldn't switch the "
-                f"admin app to it: {exc}"
+                f"Started embedded server at {uri}, but couldn't switch the admin app to it: {exc}"
             ),
         }
     return _render_dashboard(request, flash=flash)
@@ -137,9 +134,7 @@ def post_embedded_start(
 @router.post("/embedded/stop", response_class=HTMLResponse)
 def post_embedded_stop(request: Request) -> HTMLResponse:
     request.app.state.embedded.stop()
-    return _render_dashboard(
-        request, flash={"kind": "ok", "msg": "Stopped embedded server."}
-    )
+    return _render_dashboard(request, flash={"kind": "ok", "msg": "Stopped embedded server."})
 
 
 @router.get("/_partials/dashboard-tiles", response_class=HTMLResponse)
