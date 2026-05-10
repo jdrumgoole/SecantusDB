@@ -89,6 +89,90 @@ Each phase is independently mergeable — full test suite must stay green betwee
 
 **Exit criterion:** annotated lock-call-site table in this doc; concurrency benchmark improves; full test suite passes.
 
+#### Phase 1.1 catalogue (2026-05-10)
+
+51 `with self._lock:` sites in `src/secantus/storage.py`, grouped by what they're protecting.
+
+**A. Read-only data scans — Phase 1 SHRINK candidates** (lock held during BSON decode of every doc):
+
+| Line | Method | Comment |
+|---|---|---|
+| 1481 | `_all_docs` | `[bson.decode(blob) for _id_k, blob in self._scan_docs(...)]` — decodes whole collection under lock |
+| 1485 | `_all_docs_with_id_key` | Same shape as above |
+| 1501 | `scan_docs_after_id_key` | Decodes every doc past `after` under lock |
+| 1682 | `find_matching` | COLLSCAN fallback at line 1727 decodes under lock; index-walk paths (`_walk_index_in_order`, `_docs_by_id_keys`) also decode under lock |
+| 2080 | `count_matching` | Filter-set branch calls `_all_docs(...)` (which decodes everything under lock) just to count matches |
+| 2090 | `collection_data_size` | Walks `_scan_docs` for byte counts; no decode but holds lock during O(N) iteration |
+| 2100 | `index_sizes` | Two scans (doc table for `_id_` size, index entries for the rest) under lock |
+
+**B. Read-only metadata** (small constant-cost reads — leave alone for Phase 1):
+
+| Line | Method | Notes |
+|---|---|---|
+| 640 | `_collection_uuid` | Single lookup |
+| 660 | `current_cluster_time` | Mints + persists one timestamp |
+| 686 | `get_collection_options` | Single lookup |
+| 765 | `read_oplog` | Bounded by `limit`; oplog scan |
+| 800 | `read_preimage` | Single lookup |
+| 821 | `oplog_tail_seq` | Trivial counter read (already bypassed via `oplog_tail_seq_nolock` for the cv path) |
+| 845 | `oplog_floor_seq` | Single cursor seek |
+| 866 | `find_seq_for_ts` | Bounded oplog scan |
+| 976 | `get_user` | Single lookup |
+| 1004 | `list_users` | Per-db user table walk |
+| 1036 | `get_profile` | Single lookup |
+| 1118 | `get_role` | Single lookup |
+| 1155 | `list_roles` | Per-db role table walk |
+| 1436 | `collection_exists` | Single lookup |
+| 1510 | `collection_is_capped` | Single options read |
+| 2520 | `list_collections` | Collection registry walk |
+| 2539 | `list_databases` | Same |
+| 2651 | `list_indexes` | Index registry walk |
+
+**C. Writes** (must hold the lock under today's architecture; Phase 2 redoes these):
+
+| Line | Method |
+|---|---|
+| 678 | `set_collection_options` |
+| 894 | `prune_oplog` |
+| 966 | `add_user` |
+| 985 | `drop_user` |
+| 1074 | `set_profile` |
+| 1102 | `add_role` |
+| 1136 | `drop_role` |
+| 1242 | `prune_ttl_all_collections` |
+| 1298 | `emit_noop_heartbeat` |
+| 1522 | `insert` (also takes `_batch_transaction()`) |
+| 2129 | `update_matching` (also takes `_batch_transaction()`) |
+| 2238 | `delete_matching` (also takes `_batch_transaction()`) |
+| 2315 | `prune_ttl` |
+| 2404 | `drop_collection` |
+| 2428 | `drop_database` |
+| 2458 | `rename_collection` |
+| 2560 | `create_index` |
+| 2685 | `drop_index` |
+| 2707 | `drop_all_indexes` |
+
+**D. Lifecycle** (rare, fine to keep under the lock):
+
+| Line | Method | Notes |
+|---|---|---|
+| 538 | `__init__` | One-shot during construction |
+| 1186 | `close` | Set `_closed`, drain sessions, checkpoint |
+| 1340 | `_reset_thread_session` | Per-thread cleanup |
+| 1351 | `checkpoint` | Acquired briefly to call `session.checkpoint()` |
+| 1401 | `_session` | Acquired briefly to register a freshly-opened session |
+| 1440 | `create_collection` | DDL — write |
+
+**Holds across user-supplied callable?** Spot check: `find_matching` calls the user's filter via `matches()` and `apply_projection()` — both are CALLED OUTSIDE the lock (lines 1728+). `update_matching` and `delete_matching` call `matches()` inside the lock; that's acceptable for now because they're write paths that need the schema-stable view. No `$where` JS execution exists in this codebase. No callback registration (no event hooks / change-stream callbacks) takes the lock. **Conclusion: no user-callable-under-lock hazard for read paths; write paths re-evaluate under Phase 2's MVCC model.**
+
+#### Phase 1.2 plan
+
+Refactor the seven Group A methods so:
+1. The lock is held only during the WT cursor walk (collecting raw `(id_key, blob)` tuples).
+2. BSON decode + `matches()` / `apply_projection()` / sort / limit run AFTER the lock releases.
+
+This unlocks concurrent reads — multiple `find` / `count` callers can decode in parallel even while a writer holds the lock for inserts.
+
 ### Phase 2 — Decompose the lock (1 week)
 
 **Architectural.** This is the hot phase. `_lock` is replaced by a small set of purpose-built primitives.

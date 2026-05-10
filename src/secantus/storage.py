@@ -1478,12 +1478,18 @@ class Storage:
                 return
 
     def _all_docs(self, db: str, coll: str) -> list[dict[str, Any]]:
+        # Two-stage to keep ``bson.decode`` out of ``self._lock`` —
+        # otherwise an N-doc scan blocks every other thread for the
+        # whole decode loop. Lock owns the WT cursor walk; decode
+        # happens after release.
         with self._lock:
-            return [bson.decode(blob) for _id_k, blob in self._scan_docs(db, coll)]
+            blobs = [blob for _id_k, blob in self._scan_docs(db, coll)]
+        return [bson.decode(blob) for blob in blobs]
 
     def _all_docs_with_id_key(self, db: str, coll: str) -> list[tuple[dict[str, Any], bytes]]:
         with self._lock:
-            return [(bson.decode(blob), id_k) for id_k, blob in self._scan_docs(db, coll)]
+            raw = [(id_k, blob) for id_k, blob in self._scan_docs(db, coll)]
+        return [(bson.decode(blob), id_k) for id_k, blob in raw]
 
     def scan_docs_after_id_key(
         self, db: str, coll: str, after: bytes | None
@@ -1497,13 +1503,14 @@ class Storage:
         — callers update their ``after`` checkpoint to the last
         returned ``id_key`` for the next poll.
         """
-        out: list[tuple[bytes, dict[str, Any]]] = []
+        # Two-stage: collect raw bytes under the lock, decode after.
         with self._lock:
-            for id_k, blob in self._scan_docs(db, coll):
-                if after is not None and id_k <= after:
-                    continue
-                out.append((id_k, bson.decode(blob)))
-        return out
+            raw: list[tuple[bytes, bytes]] = [
+                (id_k, blob)
+                for id_k, blob in self._scan_docs(db, coll)
+                if after is None or id_k > after
+            ]
+        return [(id_k, bson.decode(blob)) for id_k, blob in raw]
 
     def collection_is_capped(self, db: str, coll: str) -> bool:
         """Public predicate: does the collection have ``capped: true`` set?"""
@@ -1679,6 +1686,16 @@ class Storage:
     ) -> list[dict[str, Any]]:
         filter = filter or {}
         in_sort_order = False
+        # Two-stage decode discipline: the lock is held only for the
+        # WT cursor walk and any index routing; the COLLSCAN fallback
+        # collects raw blobs while the lock is held and defers
+        # ``bson.decode`` (and the ``matches()`` predicate, sorting,
+        # projection) to *after* the lock releases. Concurrent readers
+        # then decode in parallel even while a writer holds the lock
+        # for inserts. Index-path candidates still come back already
+        # decoded — that's a deeper refactor (Phase 2 territory).
+        candidates: list[dict[str, Any]] | None = None
+        raw_blobs: list[bytes] | None = None
         with self._lock:
             sort_field, sort_dir = self._single_sort_spec(sort)
             if hint is not None:
@@ -1724,7 +1741,10 @@ class Storage:
                             )
                             in_sort_order = True
                 if candidates is None:
-                    candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
+                    raw_blobs = [b for _, b in self._scan_docs(db, coll)]
+        if candidates is None:
+            assert raw_blobs is not None
+            candidates = [bson.decode(b) for b in raw_blobs]
         out = [d for d in candidates if matches(d, filter)]
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
@@ -3012,16 +3032,19 @@ class Storage:
         if not id_keys:
             return []
         c = self._cursor(_DOC_TABLE)
-        out: list[dict[str, Any]] = []
+        # Two-stage: WT cursor walk first (raw bytes), then ``bson.decode``
+        # outside that loop. The cursor work is what needs lock scope;
+        # decode is pure CPU and benefits from running unsynchronised.
         # Multikey indexes write per-element entries, so the same doc's
         # id_key can appear more than once for queries that match
         # multiple elements. Dedupe while preserving order.
+        raw: list[bytes] = []
         for id_k in dict.fromkeys(id_keys):
             c.reset()
             c.set_key(db, coll, id_k)
             if c.search() == 0:
-                out.append(bson.decode(bytes(c.get_value())))
-        return out
+                raw.append(bytes(c.get_value()))
+        return [bson.decode(b) for b in raw]
 
     _RANGE_OPS: tuple[str, ...] = ("$eq", "$gt", "$gte", "$lt", "$lte", "$in")
     _GEO_OPS: tuple[str, ...] = ("$geoWithin", "$geoIntersects", "$near", "$nearSphere")
