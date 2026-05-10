@@ -1,6 +1,6 @@
 # mongo-ruby-driver Validation Report
 
-Generated 2026-05-10 — SecantusDB 0.4.0b12 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
+Generated 2026-05-10 — SecantusDB 0.5.0b9 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
 
 Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver gauges for the official Ruby driver — the same gem Rails + Sinatra applications and the Ruby ecosystem build on.
 
@@ -8,15 +8,51 @@ Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the ana
 
 | Category | Passed | Failed | Pending | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `spec/mongo` | 71 | 0 | 7 | 78 | 100.0% |
-| `spec/support` | 26 | 0 | 8 | 34 | 100.0% |
-| **Overall** | **97** | **0** | **15** | **112** | **100.0%** |
+| `spec/mongo` | 182 | 23 | 16 | 221 | 88.8% |
+| `spec/support` | 83 | 6 | 8 | 97 | 93.3% |
+| **Overall** | **265** | **29** | **24** | **318** | **90.1%** |
 
-Run time: 2.60s.
+Run time: 13.48s.
+
+## Failures (29)
+
+First 30 failed examples for triage:
+
+```
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection is capped when instantiating a collection directly behaves like a validated collection command sets the collection with validators
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection is capped when instantiating a collection through the database behaves like a validated collection command sets the collection with validators
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection is capped when instantiating a collection using create applies the options
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a write concern when the server supports write concern on the create command applies the write concern
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a collation when instantiating a collection directly behaves like a collection command with a collation option sets the collection with a collation
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a collation when instantiating a collection through the database behaves like a collection command with a collation option sets the collection with a collation
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a collation when passing the options through create sets the collection with a collation
+spec/support :: Mongo::Collection#create when the collection has options when a session is provided behaves like a failed operation using a session raises an error
+spec/mongo :: Mongo::Collection#create when collation has a strength finds Capitalize from UPPER CASE
+spec/support :: Mongo::Collection#drop when the collection exists when a session is provided can set write concern behaves like a failed operation using a session raises an error
+spec/mongo :: Mongo::Collection#drop when the collection exists when the collection has a write concern when the server supports write concern on the drop command applies the write concern
+spec/support :: Mongo::Collection#indexes when a session is provided behaves like a failed operation using a session raises an error
+spec/mongo :: Mongo::Index::View#drop_one when the collection has a write concern when the server accepts writeConcern for the dropIndexes operation applies the write concern
+spec/mongo :: Mongo::Index::View#drop_all when indexes exists when the collection has a write concern when the server accepts writeConcern for the dropIndexes operation applies the write concern
+spec/support :: Mongo::Index::View#create_many when the indexes are created when passing multi-args when the index creation is successful when provided a session behaves like a failed operation using a session raises an error
+spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing multi-args when commit quorum options are specified on server versions >= 4.4 when commit_quorum value is not supported raises an exception
+spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing multi-args when hidden is specified on server versions >= 4.4 when hidden is false does not apply the hidden option to the index
+spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing multi-args when the collection has a write concern when the server accepts writeConcern for the createIndexes operation applies the write concern
+spec/support :: Mongo::Index::View#create_many when the indexes are created when passing an array when the index creation is successful when provided a session behaves like a failed operation using a session raises an error
+spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing an array when the collection has a write concern when the server accepts writeConcern for the createIndexes operation applies the write concern
+spec/mongo :: Mongo::Index::View#create_many when the indexes are created when index creation fails raises an exception
+spec/support :: Mongo::Index::View#create_one when the index is created when provided a session behaves like a failed operation using a session raises an error
+spec/mongo :: Mongo::Index::View#create_one when the index is created when the collection has a write concern when the server accepts writeConcern for the createIndexes operation applies the write concern
+spec/mongo :: Mongo::Index::View#create_one when index creation fails raises an exception
+spec/mongo :: Mongo::Index::View#create_one when providing an invalid partial index filter raises an exception
+spec/mongo :: Mongo::Index::View#create_one when providing an invalid wildcard projection expression raises an exception
+spec/mongo :: Mongo::Index::View#create_one when providing a wildcard projection to an invalid base index raises an exception
+spec/mongo :: Mongo::Index::View#create_one when providing hidden option on server versions >= 4.4 when hidden is false does not apply the hidden option to the index
+spec/mongo :: Mongo::Index::View#create_one when providing commit_quorum option on server versions >= 4.4 when commit_quorum value is not supported raises an exception
+```
 
 ## How this is generated
 
-**mongo-ruby-driver's tests are run unmodified, against a standalone SecantusDB daemon.** The submodule at `vendor/mongo-ruby-driver/` is checked out at the pinned upstream tag with zero local edits. `ruby_validation/runner.py` runs `bundle install` (one-time per checkout), then does a two-phase spawn: phase 1 boots `python -m secantus --port 20718 --storage-path <tempdir>` without `--auth` and uses pymongo to createUser `root-user` (root role) and `ruby-test-user` (readWriteAnyDatabase + dbAdminAnyDatabase); phase 2 stops that daemon and restarts on the same tempdir **with `--auth`**, so the user records persist and the server now enforces auth. rspec runs against phase 2 with `MONGODB_URI=mongodb://root-user:password@127.0.0.1:20718/?authSource=admin`. On-disk tempdir is rmtree'd after the run.
+**mongo-ruby-driver's tests are run unmodified, against a standalone SecantusDB daemon.** The submodule at `vendor/mongo-ruby-driver/` is checked out at the pinned upstream tag with zero local edits. `ruby_validation/runner.py` runs `bundle install` (one-time per checkout), then does a two-phase spawn: phase 1 boots `python -m secantus --port 27018 --storage-path <tempdir>` without `--auth` and uses pymongo to createUser `root-user` (root role) and `ruby-test-user` (readWriteAnyDatabase + dbAdminAnyDatabase); phase 2 stops that daemon and restarts on the same tempdir **with `--auth`**, so the user records persist and the server now enforces auth. rspec runs against phase 2 with `MONGODB_URI=mongodb://root-user:password@127.0.0.1:27018/?authSource=admin`. On-disk tempdir is rmtree'd after the run.
 
 These are **integration specs** — every test opens a real TCP connection to the SecantusDB daemon, SCRAM-authenticates, and exchanges wire commands end-to-end. The pass rate is therefore a true measure of SecantusDB's compatibility with the Ruby driver, not of the driver's own pure-code logic.
 
