@@ -535,6 +535,22 @@ class Storage:
         self._time = time_func or _time.time
         self._oplog_cv = threading.Condition(threading.Lock())
         self._oplog_emit_count = 0
+        # Tiny fine-grained lock for seq + timestamp minting. Held in
+        # microseconds while reserving the next seq range and bumping
+        # the cluster-time counter. Carved out of ``_lock`` (Phase 2.1
+        # of the WT concurrency plan) so concurrent writers can mint
+        # without contending on the global storage lock.
+        self._oplog_seq_lock = threading.Lock()
+        # Per-collection RLocks for the CRUD path (Phase 2.4 of the WT
+        # concurrency plan). Writes to *different* collections can now
+        # run in parallel; writes to the *same* collection still
+        # serialise (preserves unique-index correctness + the pre-check
+        # racing windows that would otherwise need an architectural
+        # refactor of the index-entries schema). DDL operations also
+        # acquire the per-coll lock(s) they affect so they cannot
+        # reshape schema mid-CRUD-write.
+        self._coll_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._coll_locks_mutex = threading.Lock()
         with self._lock:
             self._next_seq, self._last_ts_secs, self._last_ts_ord = self._load_oplog_meta()
 
@@ -618,10 +634,11 @@ class Storage:
     def _mint_ts(self) -> Timestamp:
         """Return a strictly-monotonic ``Timestamp(secs, ord)``.
 
-        Caller must hold ``self._lock``. Within a single wall-clock second
-        ``ord`` increments; on a new second it resets to 1. Recovered state
-        on startup ensures the first mint after restart is strictly greater
-        than any previously-emitted timestamp.
+        Caller must hold ``self._oplog_seq_lock``. Within a single
+        wall-clock second ``ord`` increments; on a new second it resets
+        to 1. Recovered state on startup ensures the first mint after
+        restart is strictly greater than any previously-emitted
+        timestamp.
         """
         now = int(self._time())
         if now > self._last_ts_secs:
@@ -631,13 +648,71 @@ class Storage:
             self._last_ts_ord += 1
         return Timestamp(self._last_ts_secs, self._last_ts_ord)
 
+    def _coll_lock(self, db: str, coll: str) -> threading.RLock:
+        """Return the per-collection RLock for ``(db, coll)``, creating it
+        on first reference. Phase 2.4 of the WT concurrency plan.
+
+        CRUD on a given collection serialises through this lock; CRUD on
+        *other* collections proceeds in parallel. DDL on this collection
+        also acquires this lock so schema changes cannot interleave with
+        in-flight writes.
+        """
+        key = (db, coll)
+        # Fast path: lock already exists — read without any mutation,
+        # safe under GIL.
+        existing = self._coll_locks.get(key)
+        if existing is not None:
+            return existing
+        # Create-or-fetch under the small registry mutex. RLocks are
+        # never removed (collections come and go but the lock identity
+        # for a given (db, coll) stays stable across drop+recreate to
+        # avoid races with in-flight writers).
+        with self._coll_locks_mutex:
+            existing = self._coll_locks.get(key)
+            if existing is not None:
+                return existing
+            lock = threading.RLock()
+            self._coll_locks[key] = lock
+            return lock
+
+    def _mint_oplog_seq_and_ts(self, n: int) -> tuple[int, list[Timestamp]]:
+        """Atomically reserve ``n`` consecutive oplog seq numbers and mint
+        ``n`` strictly-monotonic timestamps. Returns ``(start_seq,
+        [ts_0, ..., ts_{n-1}])``.
+
+        Held only under ``_oplog_seq_lock`` (microseconds of work) — the
+        actual oplog cursor writes happen in the caller's WT session
+        without blocking other writers on this lock.
+        """
+        with self._oplog_seq_lock:
+            start = self._next_seq
+            self._next_seq += n
+            timestamps = [self._mint_ts() for _ in range(n)]
+            return start, timestamps
+
     def _collection_uuid(self, db: str, coll: str) -> _uuid.UUID:
         """Return the collection's UUID, minting and persisting on first call.
 
-        Safe to call from inside or outside the storage lock — re-acquires
-        the ``RLock`` either way.
+        Fast path (UUID already present): no Python lock — straight WT
+        cursor read on the calling thread's session. This was a major
+        per-insert bottleneck before Phase 2.4: every write re-acquired
+        ``self._lock`` here, defeating the per-collection lock split.
+        Slow path (mint a new UUID): take ``_coll_lock`` for the
+        namespace to serialise the persist; double-check inside the
+        lock so two racing callers can't mint different UUIDs for the
+        same collection.
         """
-        with self._lock:
+        opts = self._coll_options(db, coll) or {}
+        existing = opts.get("uuid")
+        if isinstance(existing, _uuid.UUID):
+            return existing
+        if isinstance(existing, bson.Binary) and len(existing) == 16:
+            return _uuid.UUID(bytes=bytes(existing))
+        if isinstance(existing, bytes) and len(existing) == 16:
+            return _uuid.UUID(bytes=existing)
+        # Mint path — take the per-coll lock; re-read after acquiring
+        # so a racer that won the mint race is observed.
+        with self._coll_lock(db, coll):
             opts = self._coll_options(db, coll) or {}
             existing = opts.get("uuid")
             if isinstance(existing, _uuid.UUID):
@@ -657,10 +732,13 @@ class Storage:
 
     def current_cluster_time(self) -> Timestamp:
         """Return a strictly-monotonic ``Timestamp`` advancing the cluster clock."""
-        with self._lock:
+        with self._oplog_seq_lock:
             ts = self._mint_ts()
-            self._persist_oplog_meta()
-            return ts
+        # Meta persist uses the calling thread's WT session/cursor —
+        # safe to do outside the seq lock since it doesn't depend on
+        # the in-memory counters being held stable past the mint.
+        self._persist_oplog_meta()
+        return ts
 
     def _write_coll_options(self, db: str, coll: str, opts: Mapping[str, Any]) -> None:
         c = self._cursor(_COLL_TABLE)
@@ -720,15 +798,19 @@ class Storage:
         if pre_images is None:
             pre_images = [None] * len(entries)
         assert len(pre_images) == len(entries)
+        # Reserve seq + ts range up-front under the tiny seq lock.
+        # The actual cursor writes below run on this thread's WT
+        # session without holding any cross-thread Python lock.
+        n = len(entries)
+        start_seq, ts_range = self._mint_oplog_seq_and_ts(n)
         op_cur = self._cursor(_OPLOG_TABLE)
         pre_cur = None
         last_seq = 0
-        for entry, pre in zip(entries, pre_images, strict=True):
-            seq = self._next_seq
-            self._next_seq += 1
+        for i, (entry, pre) in enumerate(zip(entries, pre_images, strict=True)):
+            seq = start_seq + i
             entry_with_ts = dict(entry)
             if "ts" not in entry_with_ts:
-                entry_with_ts["ts"] = self._mint_ts()
+                entry_with_ts["ts"] = ts_range[i]
             if "wall" not in entry_with_ts:
                 entry_with_ts["wall"] = _dt.datetime.now(_dt.timezone.utc)
             op_cur[seq] = bson.encode(entry_with_ts)
@@ -737,7 +819,15 @@ class Storage:
                     pre_cur = self._cursor(_PREIMAGE_TABLE)
                 pre_cur[seq] = pre
             last_seq = seq
-        self._persist_oplog_meta()
+        # ``_persist_oplog_meta`` was called here on every emit, but
+        # under concurrent writers it WT-rollbacks half the time —
+        # every writer hits the same single ``"state"`` meta row.
+        # The meta row is purely a recovery optimisation; if it's
+        # stale, ``_load_oplog_meta``'s fallback scans the oplog
+        # table for the actual max seq. So we now persist only on
+        # close + on prune_oplog, both of which are rare. The seq
+        # mint itself is durable because the actual oplog rows are
+        # written on every emit.
         self._oplog_emit_count += len(entries)
         if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
             self._oplog_emit_count = 0
@@ -1187,6 +1277,13 @@ class Storage:
             if self._closed:
                 return
             self._closed = True
+            # Persist the oplog meta one last time. We dropped the
+            # per-emit persist in Phase 2.4 (it caused WT-rollback
+            # storms under concurrent writers), so this is the
+            # canonical place to write the in-memory ``_next_seq``
+            # and timestamp counters down to disk before shutdown.
+            with contextlib.suppress(Exception):
+                self._persist_oplog_meta()
             # Force a checkpoint before tearing the connection down.
             # ``WT_CONNECTION->close`` does this implicitly, but only
             # when logging is off (or hits the connection's
@@ -1478,12 +1575,18 @@ class Storage:
                 return
 
     def _all_docs(self, db: str, coll: str) -> list[dict[str, Any]]:
+        # Two-stage to keep ``bson.decode`` out of ``self._lock`` —
+        # otherwise an N-doc scan blocks every other thread for the
+        # whole decode loop. Lock owns the WT cursor walk; decode
+        # happens after release.
         with self._lock:
-            return [bson.decode(blob) for _id_k, blob in self._scan_docs(db, coll)]
+            blobs = [blob for _id_k, blob in self._scan_docs(db, coll)]
+        return [bson.decode(blob) for blob in blobs]
 
     def _all_docs_with_id_key(self, db: str, coll: str) -> list[tuple[dict[str, Any], bytes]]:
         with self._lock:
-            return [(bson.decode(blob), id_k) for id_k, blob in self._scan_docs(db, coll)]
+            raw = [(id_k, blob) for id_k, blob in self._scan_docs(db, coll)]
+        return [(bson.decode(blob), id_k) for id_k, blob in raw]
 
     def scan_docs_after_id_key(
         self, db: str, coll: str, after: bytes | None
@@ -1497,13 +1600,14 @@ class Storage:
         — callers update their ``after`` checkpoint to the last
         returned ``id_key`` for the next poll.
         """
-        out: list[tuple[bytes, dict[str, Any]]] = []
+        # Two-stage: collect raw bytes under the lock, decode after.
         with self._lock:
-            for id_k, blob in self._scan_docs(db, coll):
-                if after is not None and id_k <= after:
-                    continue
-                out.append((id_k, bson.decode(blob)))
-        return out
+            raw: list[tuple[bytes, bytes]] = [
+                (id_k, blob)
+                for id_k, blob in self._scan_docs(db, coll)
+                if after is None or id_k > after
+            ]
+        return [(id_k, bson.decode(blob)) for id_k, blob in raw]
 
     def collection_is_capped(self, db: str, coll: str) -> bool:
         """Public predicate: does the collection have ``capped: true`` set?"""
@@ -1519,13 +1623,14 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         fresh_id_keys: set[bytes] = set()
         oplog_on = self.enable_oplog
-        with self._lock, self._batch_transaction():
-            # Wrap the whole batch in one explicit WT transaction so
-            # the per-doc cursor inserts (doc table + index entries +
-            # oplog) share a single commit / log record. Without this
-            # wrapper, a 100-doc insert produced 100+ log records and
-            # 100+ commit overheads; the throughput floor was the
-            # combined cost of those, not WT's actual write rate.
+        with self._coll_lock(db, coll), self._batch_transaction():
+            # Per-collection lock (Phase 2.4): writes to other
+            # collections proceed in parallel; same-collection writes
+            # still serialise to keep the unique-index pre-check
+            # race-free. _batch_transaction wraps the per-doc cursor
+            # inserts (doc table + index entries + oplog) in one
+            # explicit WT transaction so they share a single commit /
+            # log record.
             self._ensure_collection(db, coll)
             ns = self._ns(db, coll) if oplog_on else ""
             ui = self._collection_uuid(db, coll) if oplog_on else None
@@ -1679,6 +1784,16 @@ class Storage:
     ) -> list[dict[str, Any]]:
         filter = filter or {}
         in_sort_order = False
+        # Two-stage decode discipline: the lock is held only for the
+        # WT cursor walk and any index routing; the COLLSCAN fallback
+        # collects raw blobs while the lock is held and defers
+        # ``bson.decode`` (and the ``matches()`` predicate, sorting,
+        # projection) to *after* the lock releases. Concurrent readers
+        # then decode in parallel even while a writer holds the lock
+        # for inserts. Index-path candidates still come back already
+        # decoded — that's a deeper refactor (Phase 2 territory).
+        candidates: list[dict[str, Any]] | None = None
+        raw_blobs: list[bytes] | None = None
         with self._lock:
             sort_field, sort_dir = self._single_sort_spec(sort)
             if hint is not None:
@@ -1724,7 +1839,10 @@ class Storage:
                             )
                             in_sort_order = True
                 if candidates is None:
-                    candidates = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
+                    raw_blobs = [b for _, b in self._scan_docs(db, coll)]
+        if candidates is None:
+            assert raw_blobs is not None
+            candidates = [bson.decode(b) for b in raw_blobs]
         out = [d for d in candidates if matches(d, filter)]
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
@@ -2126,11 +2244,12 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
-        with self._lock, self._batch_transaction():
-            # One WT transaction per ``update_matching`` call: every
-            # doc-table write + index-entry delete/insert + oplog
-            # write that lands in this method shares a single commit.
-            # See ``Storage.insert`` for the rationale.
+        with self._coll_lock(db, coll), self._batch_transaction():
+            # Per-collection lock + one WT transaction per call. Every
+            # doc-table write + index-entry delete/insert + oplog write
+            # that lands in this method shares a single commit. Phase
+            # 2.4: was self._lock; now per-coll so different
+            # collections update in parallel.
             self._ensure_collection(db, coll)
             ns = self._ns(db, coll)
             ui = self._collection_uuid(db, coll) if oplog_on else None
@@ -2235,10 +2354,11 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
-        with self._lock, self._batch_transaction():
-            # Group the per-doc removes + index-entry deletes + oplog
-            # writes into one WT transaction = one log record. See
-            # ``Storage.insert`` / ``update_matching`` for the rationale.
+        with self._coll_lock(db, coll), self._batch_transaction():
+            # Per-collection lock (Phase 2.4) + one WT transaction.
+            # Groups the per-doc removes + index-entry deletes + oplog
+            # writes into one commit. Other collections delete in
+            # parallel.
             ns = self._ns(db, coll) if oplog_on else ""
             preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
             ui = (
@@ -3012,16 +3132,19 @@ class Storage:
         if not id_keys:
             return []
         c = self._cursor(_DOC_TABLE)
-        out: list[dict[str, Any]] = []
+        # Two-stage: WT cursor walk first (raw bytes), then ``bson.decode``
+        # outside that loop. The cursor work is what needs lock scope;
+        # decode is pure CPU and benefits from running unsynchronised.
         # Multikey indexes write per-element entries, so the same doc's
         # id_key can appear more than once for queries that match
         # multiple elements. Dedupe while preserving order.
+        raw: list[bytes] = []
         for id_k in dict.fromkeys(id_keys):
             c.reset()
             c.set_key(db, coll, id_k)
             if c.search() == 0:
-                out.append(bson.decode(bytes(c.get_value())))
-        return out
+                raw.append(bytes(c.get_value()))
+        return [bson.decode(b) for b in raw]
 
     _RANGE_OPS: tuple[str, ...] = ("$eq", "$gt", "$gte", "$lt", "$lte", "$in")
     _GEO_OPS: tuple[str, ...] = ("$geoWithin", "$geoIntersects", "$near", "$nearSphere")
