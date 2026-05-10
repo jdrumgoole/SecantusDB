@@ -2216,3 +2216,94 @@ def test_bulk_smoke_via_php_driver(server: SecantusDBServer) -> None:
         f"php bulk smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Ruby + PHP — listdb_filter / sessions / cluster_roles
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _RUBY_AVAILABLE, reason="ruby >= 3.0 with bundle not on PATH")
+@pytest.mark.xdist_group(name="ruby_smokes")
+def test_listdb_filter_smoke_via_ruby_driver(server: SecantusDBServer) -> None:
+    if not _ensure_ruby_bundle():
+        pytest.skip("could not bundle install mongo-ruby-driver")
+    result = _run_ruby_smoke("listdb_filter_smoke.rb", server.uri)
+    assert result.returncode == 0, (
+        f"ruby listdb-filter smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _RUBY_AVAILABLE, reason="ruby >= 3.0 with bundle not on PATH")
+@pytest.mark.xdist_group(name="ruby_smokes")
+def test_sessions_smoke_via_ruby_driver(server: SecantusDBServer) -> None:
+    if not _ensure_ruby_bundle():
+        pytest.skip("could not bundle install mongo-ruby-driver")
+    result = _run_ruby_smoke("sessions_smoke.rb", server.uri)
+    assert result.returncode == 0, (
+        f"ruby sessions smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _RUBY_AVAILABLE, reason="ruby >= 3.0 with bundle not on PATH")
+@pytest.mark.xdist_group(name="ruby_smokes")
+def test_cluster_roles_smoke_via_ruby_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_ruby_bundle():
+        pytest.skip("could not bundle install mongo-ruby-driver")
+    result = _run_ruby_smoke(
+        "cluster_roles_smoke.rb",
+        server_with_auth.uri,
+        extra_env={"ADMIN_PASSWORD": _ADMIN_PWD},
+    )
+    assert result.returncode == 0, (
+        f"ruby cluster-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _PHP_AVAILABLE, reason="php with ext-mongodb + composer not on PATH")
+@pytest.mark.xdist_group(name="php_smokes")
+def test_listdb_filter_smoke_via_php_driver(server: SecantusDBServer) -> None:
+    if not _ensure_php_vendor():
+        pytest.skip("could not composer install mongodb/mongodb")
+    result = _run_php_smoke("listdb_filter_smoke.php", server.uri)
+    assert result.returncode == 0, (
+        f"php listdb-filter smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _PHP_AVAILABLE, reason="php with ext-mongodb + composer not on PATH")
+@pytest.mark.xdist_group(name="php_smokes")
+def test_sessions_smoke_via_php_driver(server: SecantusDBServer) -> None:
+    if not _ensure_php_vendor():
+        pytest.skip("could not composer install mongodb/mongodb")
+    result = _run_php_smoke("sessions_smoke.php", server.uri)
+    assert result.returncode == 0, (
+        f"php sessions smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _PHP_AVAILABLE, reason="php with ext-mongodb + composer not on PATH")
+@pytest.mark.xdist_group(name="php_smokes")
+def test_cluster_roles_smoke_via_php_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_php_vendor():
+        pytest.skip("could not composer install mongodb/mongodb")
+    result = _run_php_smoke(
+        "cluster_roles_smoke.php",
+        server_with_auth.uri,
+        extra_env={"ADMIN_PASSWORD": _ADMIN_PWD},
+    )
+    assert result.returncode == 0, (
+        f"php cluster-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
