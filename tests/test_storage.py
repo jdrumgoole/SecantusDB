@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import signal
+
 import bson
 import pytest
 
@@ -303,6 +305,65 @@ def test_checkpoint_after_close_is_safe(tmp_path) -> None:
     storage = Storage(str(tmp_path))
     storage.close()
     storage.checkpoint()  # no-op; must not raise.
+
+
+def test_inserts_survive_simulated_crash(tmp_path) -> None:
+    """Writes persist across SIGKILL — i.e. no checkpoint, no clean close.
+
+    Regression for the chaos-monkey finding (``bench/chaos.py``): with
+    WT logging disabled (the old default), every uncommitted write
+    between checkpoints was lost on SIGKILL. ``bench/chaos.py`` over a
+    3-minute, 17-kill run reported 432,881 acked / 1 persisted. With
+    logging enabled, the same workload now persists ~99.98% of acks.
+
+    This test exercises the same code path in miniature: a worker
+    subprocess writes ``N`` documents, then SIGKILLs itself before any
+    explicit checkpoint or clean close. The parent reopens the same
+    storage path and expects all ``N`` writes back.
+
+    Subprocess-based because Python can't safely simulate SIGKILL
+    in-process — the connection has to actually exit without WT
+    getting the chance to flush.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    n_writes = 1000
+    storage_dir = tmp_path / "wt"
+
+    worker_script = textwrap.dedent(
+        f"""
+        import os, signal
+        from secantus.storage import Storage
+        s = Storage({str(storage_dir)!r})
+        s.insert("db", "c", [{{"_id": i, "n": i}} for i in range(1, {n_writes + 1})])
+        # Simulate hard kill: don't close, don't checkpoint, don't even
+        # let the interpreter atexit run. SIGKILL the process from itself
+        # so WT cannot flush.
+        os.kill(os.getpid(), signal.SIGKILL)
+        """
+    )
+
+    # The kill happens before the subprocess exits cleanly, so we expect
+    # a non-zero return / -SIGKILL signal indication.
+    result = subprocess.run([sys.executable, "-c", worker_script], capture_output=True, timeout=30)
+    assert result.returncode == -signal.SIGKILL, (
+        f"worker did not SIGKILL itself; rc={result.returncode}, stderr={result.stderr!r}"
+    )
+
+    # Reopen the same storage path. With logging enabled, recovery
+    # replays the journal and all 1000 docs come back.
+    s2 = Storage(str(storage_dir))
+    try:
+        docs = s2.find_matching("db", "c", {})
+        ns = sorted(d["n"] for d in docs)
+        assert ns == list(range(1, n_writes + 1)), (
+            f"expected {n_writes} docs back after SIGKILL+reopen, "
+            f"got {len(docs)}; missing {set(range(1, n_writes + 1)) - set(ns)}"
+        )
+    finally:
+        s2.close()
 
 
 def test_profile_defaults_are_off(tmp_path) -> None:

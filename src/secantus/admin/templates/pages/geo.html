@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="/static/css/leaflet.css" />
+<script src="/static/js/leaflet.min.js"></script>
+
+<nav class="breadcrumb">
+  <a href="/db">Databases</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}">{{ db_name }}</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}/{{ coll_name }}">{{ coll_name }}</a>
+  <span class="sep">/</span>
+  <span>geo</span>
+</nav>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+{% if not geo_indexes %}
+  <p class="empty">
+    No <code>2dsphere</code> or <code>2d</code> index on
+    <code>{{ db_name }}.{{ coll_name }}</code>. Add one from the
+    <a href="/db/{{ db_name }}/{{ coll_name }}/indexes">indexes page</a>
+    to enable this view.
+  </p>
+{% else %}
+  <p class="modal-meta">
+    Geometry field: <code>{{ geo_field }}</code> · sampled {{ sample_size }} docs.
+    {% if geo_indexes %}
+      Indexes:
+      {% for ix in geo_indexes %}<span class="badge">{{ ix.name }}</span>{% endfor %}
+    {% endif %}
+  </p>
+  <div id="geo-map" class="geo-map"></div>
+  <script>
+  (function() {
+    const features = {{ features_json | safe }};
+    const map = L.map("geo-map", { preferCanvas: true }).setView([0, 0], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "© OpenStreetMap contributors",
+    }).addTo(map);
+    if (features.length > 0) {
+      const fc = {
+        type: "FeatureCollection",
+        features: features.map(f => ({
+          type: "Feature",
+          geometry: f.geometry,
+          properties: { _id: String(f._id) },
+        })),
+      };
+      const layer = L.geoJSON(fc, {
+        onEachFeature: (feat, lyr) => {
+          if (feat.properties && feat.properties._id) {
+            lyr.bindPopup("_id: " + feat.properties._id);
+          }
+        },
+      }).addTo(map);
+      const bounds = layer.getBounds();
+      if (bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30] });
+    }
+  })();
+  </script>
+{% endif %}
+{% endblock %}

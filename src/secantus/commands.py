@@ -44,8 +44,8 @@ from secantus.rbac import (
     A_DROP_INDEX,
     A_DROP_ROLE,
     A_DROP_USER,
-    A_FIND,
     A_ENABLE_PROFILER,
+    A_FIND,
     A_FSYNC,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
@@ -412,6 +412,29 @@ def _fsync(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     ctx.storage.checkpoint()
     return {"numFiles": 1, "ok": 1.0}
+
+
+def _secantus_admin_prune_oplog(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """SecantusDB extension: drop oplog rows past the retention window.
+
+    Real mongod auto-prunes the oplog opportunistically; SecantusDB
+    does the same on every emit. Surfacing this as a wire command lets
+    operators force an immediate sweep from the admin UI without
+    waiting for the next write.
+    """
+    pruned = ctx.storage.prune_oplog()
+    return {"pruned": int(pruned), "ok": 1.0}
+
+
+def _secantus_admin_prune_ttl(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """SecantusDB extension: run TTL pruning against every collection.
+
+    The background sweeper handles this on a 60-second cadence; the
+    wire command lets callers (the admin UI, tests) drive an immediate
+    pass when they need deterministic timing.
+    """
+    pruned = ctx.storage.prune_ttl_all_collections()
+    return {"pruned": int(pruned), "ok": 1.0}
 
 
 def _profile(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -2840,6 +2863,8 @@ _HANDLERS: dict[str, CommandHandler] = {
     "currentOp": _current_op,
     "fsync": _fsync,
     "profile": _profile,
+    "secantusAdmin.pruneOplog": _secantus_admin_prune_oplog,
+    "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
     "explain": _explain,
     "serverStatus": _server_status,
     "getCmdLineOpts": _get_cmd_line_opts,
@@ -2986,6 +3011,10 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "currentOp": (A_INPROG, SCOPE_CLUSTER),
     "fsync": (A_FSYNC, SCOPE_CLUSTER),
     "profile": (A_ENABLE_PROFILER, SCOPE_DATABASE),
+    # SecantusDB-extension prune commands reuse fsync's cluster-wide
+    # privilege — both are admin-only operations against shared state.
+    "secantusAdmin.pruneOplog": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
 }
 
 
@@ -3104,9 +3133,7 @@ def _profile_eligible_command(name: str, doc: dict[str, Any]) -> bool:
     # show up on the next read, growing without bound until the user
     # spots it.
     coll = doc.get(name)
-    if isinstance(coll, str) and coll == "system.profile":
-        return False
-    return True
+    return not (isinstance(coll, str) and coll == "system.profile")
 
 
 def _profile_op_label(name: str) -> str:

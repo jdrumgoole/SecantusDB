@@ -1,0 +1,47 @@
+<div
+  class="modal-overlay"
+  x-data="{ confirm: '' }"
+  @click.self="document.getElementById('modal').innerHTML = ''"
+>
+  <div class="modal modal-narrow">
+    <header class="modal-header">
+      <h2>Drop database</h2>
+      <button
+        type="button"
+        class="modal-close"
+        @click="document.getElementById('modal').innerHTML = ''"
+      >×</button>
+    </header>
+    <form
+      class="modal-body"
+      method="post"
+      action="/maintenance/drop-database"
+    >
+      <input type="hidden" name="db" value="{{ db_name }}" />
+      <p>
+        About to drop database <code>{{ db_name }}</code>, including
+        every collection inside it. This cannot be undone.
+      </p>
+      <p>Type the database name <code>{{ db_name }}</code> to confirm:</p>
+      <input
+        type="text"
+        class="confirm-input"
+        x-model="confirm"
+        autocomplete="off"
+        autofocus
+      />
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="document.getElementById('modal').innerHTML = ''"
+        >Cancel</button>
+        <button
+          type="submit"
+          class="btn-danger"
+          x-bind:disabled="confirm !== '{{ db_name }}'"
+        >Drop database</button>
+      </div>
+    </form>
+  </div>
+</div>

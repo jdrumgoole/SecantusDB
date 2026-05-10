@@ -476,11 +476,41 @@ class Storage:
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
+            # in_memory=true disables the journal entirely (no files);
+            # ephemeral by definition, so durability isn't a concern.
             config = "create,in_memory=true,session_max=1000,cache_size=1G"
         else:
             os.makedirs(path, exist_ok=True)
             home = path
-            config = "create,session_max=1000,cache_size=1G"
+            # ``log=(enabled=true)`` turns on WT's redo journal: every
+            # transaction commit writes a log record before it returns,
+            # and recovery replays the log on reopen. Without this,
+            # WT's only durability mechanism is checkpoints (default
+            # cadence: every 60s, or on clean ``WT_CONNECTION->close``).
+            # On SIGKILL between checkpoints, every uncommitted write
+            # is lost — which is exactly the failure mode observed by
+            # ``bench/chaos.py`` (3-min chaos run, 17 SIGKILLs:
+            # 432,881 acked / 1 persisted).
+            #
+            # ``transaction_sync=(enabled=false,method=fsync)`` is
+            # WT's default once logging is on: log records are written
+            # to the OS but not fsynced per commit. Result: SIGKILL
+            # of the process is durable (the OS still flushes its
+            # page cache), only true power-loss between commits and
+            # the next OS flush window can lose data. That matches
+            # mongod's default ``writeConcern: {w:1, j:false}``.
+            # Bumping to ``method=fsync,enabled=true`` would honour
+            # ``j:true`` durability but we don't yet plumb that
+            # write-concern down — backlog item.
+            #
+            # ``file_max=10MB`` bounds journal segment size; smaller
+            # files churn the log more, larger files delay reclamation.
+            # 10 MB matches mongod's WT default.
+            config = (
+                "create,session_max=1000,cache_size=1G,"
+                "log=(enabled=true,file_max=10MB),"
+                "transaction_sync=(enabled=false,method=fsync)"
+            )
         self._conn = wt.wiredtiger_open(home, config)
         self._tls = threading.local()
         self._all_sessions: list[Any] = []
@@ -1157,6 +1187,15 @@ class Storage:
             if self._closed:
                 return
             self._closed = True
+            # Force a checkpoint before tearing the connection down.
+            # ``WT_CONNECTION->close`` does this implicitly, but only
+            # when logging is off (or hits the connection's
+            # close-time flush window). Driving it explicitly here
+            # gives a durable on-disk image of the dataset at the
+            # moment of shutdown regardless of journal state — the
+            # behaviour callers reasonably expect from ``close()``.
+            with contextlib.suppress(Exception):
+                self._session().checkpoint()
             for s in self._all_sessions:
                 with contextlib.suppress(Exception):
                     s.close()
@@ -1314,6 +1353,45 @@ class Storage:
                 return
             self._session().checkpoint()
 
+    @contextlib.contextmanager
+    def _batch_transaction(self) -> Any:
+        """Group multiple cursor writes into one WT transaction = one log record.
+
+        WT auto-commits every individual ``cursor.insert()`` /
+        ``cursor.update()`` etc., which means N writes produce N log
+        records and N commit overheads. With this wrapper, the same N
+        writes share a single commit (and therefore a single log
+        record): on a typical bulk insert that's a 2-5x throughput
+        win for ``--batch-size > 1`` on the wire side, with the same
+        durability guarantee (all-or-nothing on commit).
+
+        Caller must already hold ``self._lock``. Reads within the
+        transaction observe the in-progress writes — fine for our
+        unique-conflict probes which need to see uncommitted siblings
+        in the same batch.
+
+        On exception the transaction is rolled back. Callers that
+        accumulate per-doc errors (e.g. ``ordered=False`` insert)
+        should NOT raise out of the block — they handle the per-doc
+        errors locally and let the surviving writes commit.
+        """
+        session = self._session()
+        # Cached cursors must be reset before begin_transaction so they
+        # don't carry a stale snapshot from before the transaction
+        # boundary. WT documents this requirement explicitly.
+        for c in getattr(self._tls, "cursors", {}).values():
+            with contextlib.suppress(Exception):
+                c.reset()
+        session.begin_transaction()
+        try:
+            yield session
+        except Exception:
+            with contextlib.suppress(Exception):
+                session.rollback_transaction()
+            raise
+        else:
+            session.commit_transaction()
+
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
         if s is None:
@@ -1441,7 +1519,13 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         fresh_id_keys: set[bytes] = set()
         oplog_on = self.enable_oplog
-        with self._lock:
+        with self._lock, self._batch_transaction():
+            # Wrap the whole batch in one explicit WT transaction so
+            # the per-doc cursor inserts (doc table + index entries +
+            # oplog) share a single commit / log record. Without this
+            # wrapper, a 100-doc insert produced 100+ log records and
+            # 100+ commit overheads; the throughput floor was the
+            # combined cost of those, not WT's actual write rate.
             self._ensure_collection(db, coll)
             ns = self._ns(db, coll) if oplog_on else ""
             ui = self._collection_uuid(db, coll) if oplog_on else None
@@ -2042,7 +2126,11 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
-        with self._lock:
+        with self._lock, self._batch_transaction():
+            # One WT transaction per ``update_matching`` call: every
+            # doc-table write + index-entry delete/insert + oplog
+            # write that lands in this method shares a single commit.
+            # See ``Storage.insert`` for the rationale.
             self._ensure_collection(db, coll)
             ns = self._ns(db, coll)
             ui = self._collection_uuid(db, coll) if oplog_on else None
@@ -2147,7 +2235,10 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
-        with self._lock:
+        with self._lock, self._batch_transaction():
+            # Group the per-doc removes + index-entry deletes + oplog
+            # writes into one WT transaction = one log record. See
+            # ``Storage.insert`` / ``update_matching`` for the rationale.
             ns = self._ns(db, coll) if oplog_on else ""
             preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
             ui = (

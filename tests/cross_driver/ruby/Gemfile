@@ -1,0 +1,11 @@
+# Cross-driver smokes for SecantusDB via the official mongo-ruby-driver.
+# Pinned to the 2.x major (latest stable). The orchestrator in
+# `tests/test_cross_driver_features.py` runs `bundle exec ruby
+# types_smoke.rb` against an embedded SecantusDB daemon.
+
+source "https://rubygems.org"
+
+gem "mongo", "~> 2.20"
+# Ruby 4.0 dropped these from bundled gems; the BSON / mongo gems still require them.
+gem "bigdecimal"
+gem "logger"

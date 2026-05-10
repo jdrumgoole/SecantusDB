@@ -1,0 +1,9 @@
+{% if error %}
+  <div class="error">{{ error }}</div>
+{% elif lines %}
+  <p class="modal-meta">{{ total }} lines retained · most-recent last</p>
+  <pre class="doc-body">{% for line in lines %}{{ line }}
+{% endfor %}</pre>
+{% else %}
+  <p class="empty">No log entries yet.</p>
+{% endif %}

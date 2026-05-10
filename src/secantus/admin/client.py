@@ -508,6 +508,79 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(str(exc)) from exc
 
+    # ---- maintenance ---------------------------------------------------
+
+    def fsync(self) -> dict[str, Any]:
+        """Force a WiredTiger checkpoint via the ``fsync`` command."""
+        return self._run_admin("fsync")
+
+    def prune_oplog(self) -> int:
+        """Drop oplog rows past the retention window. Returns docs pruned."""
+        out = self._run_admin("secantusAdmin.pruneOplog")
+        return int(out.get("pruned", 0) or 0)
+
+    def prune_ttl(self) -> int:
+        """Run TTL pruning against every collection. Returns docs pruned."""
+        out = self._run_admin("secantusAdmin.pruneTtl")
+        return int(out.get("pruned", 0) or 0)
+
+    def drop_database(self, db: str) -> None:
+        """Drop ``db`` entirely. Mongod-shape ``dropDatabase`` command."""
+        try:
+            self._get_client()[db].command("dropDatabase")
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def drop_collection(self, db: str, coll: str) -> None:
+        """Drop a single collection."""
+        try:
+            self._get_client()[db].drop_collection(coll)
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    # ---- schema sampler / logs / geo ------------------------------------
+
+    def sample_collection(self, db: str, coll: str, *, size: int = 100) -> list[dict[str, Any]]:
+        """Return up to ``size`` random docs via ``$sample``.
+
+        ``$sample`` is the right primitive for schema inference: it gives
+        an unbiased look at the collection without paging through the
+        whole thing. ``size`` is clamped to ``[1, 1000]``.
+        """
+        n = max(1, min(int(size), 1000))
+        try:
+            cursor = self._get_client()[db][coll].aggregate([{"$sample": {"size": n}}])
+            return [dict(d) for d in cursor]
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def get_log(self, name: str = "global") -> dict[str, Any]:
+        """Return the response of ``getLog``: ``{log: [...], totalLinesWritten}``."""
+        try:
+            return dict(self._get_client().admin.command("getLog", name))
+        except OperationFailure as exc:
+            raise MongoError(str(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(str(exc)) from exc
+
+    def geo_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
+        """Return only indexes that look like ``2dsphere`` / ``2d``."""
+        ixs = self.list_indexes(db, coll)
+        out: list[dict[str, Any]] = []
+        for ix in ixs:
+            key = ix.get("key") or {}
+            for v in key.values():
+                if v in ("2dsphere", "2d"):
+                    out.append(ix)
+                    break
+        return out
+
 
 __all__ = [
     "MongoFacade",

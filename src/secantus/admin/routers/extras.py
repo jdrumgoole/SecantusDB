@@ -1,0 +1,165 @@
+"""Extras: schema sampler / logs viewer / geo viewer pages.
+
+Three small pages that share a router because none of them is large
+enough to justify its own module.
+
+* ``GET /db/{db}/{coll}/schema`` — sample N docs and infer field
+  schema (paths, types, presence, top values)
+* ``GET /logs`` — render ``getLog`` output, polled every 2s via HTMX
+* ``GET /db/{db}/{coll}/geo`` — Leaflet map for collections with a
+  2dsphere / 2d index
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from bson import json_util
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+
+from secantus.admin.client import MongoError
+from secantus.admin.schema import summarize
+
+router = APIRouter()
+
+
+def _templates(request: Request) -> Jinja2Templates:
+    return Jinja2Templates(directory=request.app.state.templates_dir)
+
+
+# ---- schema sampler --------------------------------------------------------
+
+
+def _clamp_size(raw: str | None, *, default: int, lo: int, hi: int) -> int:
+    if raw is None or not raw.strip():
+        return default
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(n, hi))
+
+
+@router.get("/db/{db}/{coll}/schema", response_class=HTMLResponse)
+def schema_page(request: Request, db: str, coll: str) -> HTMLResponse:
+    sample_size = _clamp_size(request.query_params.get("sample_size"), default=100, lo=1, hi=1000)
+    error: str | None = None
+    summary: dict[str, Any] = {"sample_size": 0, "fields": []}
+    try:
+        docs = request.app.state.mongo.sample_collection(db, coll, size=sample_size)
+        summary = summarize(docs)
+    except MongoError as exc:
+        error = str(exc)
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "pages/schema.html",
+        {
+            "title": f"Schema · {db}.{coll}",
+            "active": "databases",
+            "db_name": db,
+            "coll_name": coll,
+            "sample_size": sample_size,
+            "summary": summary,
+            "error": error,
+        },
+    )
+
+
+# ---- logs viewer -----------------------------------------------------------
+
+
+@router.get("/logs", response_class=HTMLResponse)
+def logs_page(request: Request) -> HTMLResponse:
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "pages/logs.html",
+        {"title": "Logs", "active": "logs"},
+    )
+
+
+@router.get("/_partials/logs", response_class=HTMLResponse)
+def logs_partial(request: Request) -> HTMLResponse:
+    error: str | None = None
+    lines: list[str] = []
+    total = 0
+    try:
+        out = request.app.state.mongo.get_log("global")
+        lines = list(out.get("log") or [])
+        total = int(out.get("totalLinesWritten", 0) or 0)
+    except MongoError as exc:
+        error = str(exc)
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "partials/logs_lines.html",
+        {"lines": lines, "total": total, "error": error},
+    )
+
+
+# ---- geo viewer ------------------------------------------------------------
+
+
+def _extract_features(docs: list[dict[str, Any]], geo_field: str) -> list[dict[str, Any]]:
+    """Pluck GeoJSON-ish geometry values from each doc, ignoring misses.
+
+    Returns a list of ``{"_id": ..., "geometry": <GeoJSON>}`` so the
+    page can build a feature collection on the client side.
+    """
+    out: list[dict[str, Any]] = []
+    for d in docs:
+        geom = d.get(geo_field)
+        if isinstance(geom, dict) and "type" in geom and "coordinates" in geom:
+            out.append({"_id": d.get("_id"), "geometry": geom})
+        elif isinstance(geom, list) and len(geom) == 2:
+            # Legacy [lng, lat] pair.
+            out.append(
+                {
+                    "_id": d.get("_id"),
+                    "geometry": {"type": "Point", "coordinates": geom},
+                }
+            )
+    return out
+
+
+@router.get("/db/{db}/{coll}/geo", response_class=HTMLResponse)
+def geo_page(request: Request, db: str, coll: str) -> HTMLResponse:
+    sample_size = _clamp_size(request.query_params.get("sample_size"), default=200, lo=1, hi=1000)
+    error: str | None = None
+    geo_indexes: list[dict[str, Any]] = []
+    features_json = "[]"
+    geo_field: str | None = None
+    try:
+        geo_indexes = request.app.state.mongo.geo_indexes(db, coll)
+        if geo_indexes:
+            # Pick the first 2dsphere/2d field as the geometry source.
+            ix = geo_indexes[0]
+            for k, v in (ix.get("key") or {}).items():
+                if v in ("2dsphere", "2d"):
+                    geo_field = k
+                    break
+        if geo_field is not None:
+            docs = request.app.state.mongo.sample_collection(db, coll, size=sample_size)
+            features = _extract_features(docs, geo_field)
+            features_json = json_util.dumps(features)
+    except MongoError as exc:
+        error = str(exc)
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "pages/geo.html",
+        {
+            "title": f"Geo · {db}.{coll}",
+            "active": "databases",
+            "db_name": db,
+            "coll_name": coll,
+            "geo_indexes": geo_indexes,
+            "geo_field": geo_field,
+            "features_json": features_json,
+            "sample_size": sample_size,
+            "error": error,
+        },
+    )

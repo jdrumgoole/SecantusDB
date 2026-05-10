@@ -81,6 +81,97 @@ def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
 
 @task(
     help={
+        "uri": "MongoDB URI of the target server (default: mongodb://127.0.0.1:27017/).",
+        "db": "Target database (default: harness).",
+        "collection": "Target collection (default: inserts_8k).",
+        "count": "Number of documents to insert. Omit for continuous mode.",
+        "drop": "Drop the target collection before inserting.",
+        "progress-every": "Print a progress line every N inserts (default: 1000; 0 to disable).",
+    }
+)
+def load(
+    c: Context,
+    uri: str = "mongodb://127.0.0.1:27017/",
+    db: str = "harness",
+    collection: str = "inserts_8k",
+    count: int = 0,
+    drop: bool = False,
+    progress_every: int = 1000,
+) -> None:
+    """Insert standard 8 KiB documents with a sequence counter.
+
+    Pairs with ``invoke serve``: bring up a server in one terminal and
+    point this at it in another. ``--count 0`` (the default) means run
+    continuously until Ctrl-C; pass a positive integer for a bounded run.
+    Each document carries a monotonic ``n`` field (1, 2, 3, ...) and an
+    8192-byte payload, so total BSON size is comfortably ≥ 8 KiB.
+    """
+    # ``--no-sync`` skips uv's project-rebuild check: invoking the harness
+    # shouldn't trigger a multi-minute CMake/WiredTiger rebuild every
+    # time. Same pattern the docs / release tasks use.
+    cmd = (
+        "uv run --no-sync python -m bench.load_writer"
+        f" --uri {shlex.quote(uri)}"
+        f" --db {shlex.quote(db)}"
+        f" --collection {shlex.quote(collection)}"
+        f" --progress-every {int(progress_every)}"
+    )
+    if count > 0:
+        cmd += f" --count {int(count)}"
+    if drop:
+        cmd += " --drop"
+    c.run(cmd, pty=True)
+
+
+@task(
+    help={
+        "duration": "Total run time in seconds (default: 180).",
+        "min-interval": "Minimum seconds between SIGKILLs (default: 5).",
+        "max-interval": "Maximum seconds between SIGKILLs (default: 15).",
+        "port": "Server port (default: auto-pick a free port).",
+        "storage-path": "WiredTiger storage dir (default: tempdir, removed at end).",
+        "no-load": "Don't auto-start the load_writer (chaos only).",
+        "seed": "RNG seed for kill timing (default: random).",
+    }
+)
+def chaos(
+    c: Context,
+    duration: float = 180.0,
+    min_interval: float = 5.0,
+    max_interval: float = 15.0,
+    port: int = 0,
+    storage_path: str = "",
+    no_load: bool = False,
+    seed: int = 0,
+) -> None:
+    """Chaos monkey: random SIGKILL/restart of SecantusDB under live load.
+
+    Spawns SecantusDB on a free port with on-disk WiredTiger storage,
+    optionally starts ``bench.load_writer`` against it, then kills and
+    restarts the server at random intervals. After ``--duration``
+    seconds prints a report: kills, downtime, persisted docs, gaps in
+    the writer's ``n`` sequence (gaps == inserts that fell during
+    outages or were not durably committed before the kill).
+    """
+    cmd = (
+        "uv run --no-sync python -m bench.chaos"
+        f" --duration {float(duration)}"
+        f" --min-interval {float(min_interval)}"
+        f" --max-interval {float(max_interval)}"
+    )
+    if port:
+        cmd += f" --port {int(port)}"
+    if storage_path:
+        cmd += f" --storage-path {shlex.quote(storage_path)}"
+    if no_load:
+        cmd += " --no-load"
+    if seed:
+        cmd += f" --seed {int(seed)}"
+    c.run(cmd, pty=True)
+
+
+@task(
+    help={
         "uri": "MongoDB URI to administer.",
         "port": "Local HTTP port (0 = pick a free one).",
         "no_window": "Run headless (no pywebview window). Useful for CI.",

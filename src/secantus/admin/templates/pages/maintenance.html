@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block content %}
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if flash %}
+  <div class="flash flash-{{ flash.kind }}">{{ flash.msg }}</div>
+{% endif %}
+
+<h2 class="section-title">Safe</h2>
+<p class="modal-meta">
+  Idempotent operations that don't lose data. Use these to force
+  immediate cleanup that would otherwise wait for the background sweepers.
+</p>
+<div class="page-actions">
+  <form method="post" action="/maintenance/fsync" class="inline-form">
+    <button type="submit" class="btn-secondary">Force checkpoint (fsync)</button>
+  </form>
+  <form method="post" action="/maintenance/prune-oplog" class="inline-form">
+    <button type="submit" class="btn-secondary">Prune oplog</button>
+  </form>
+  <form method="post" action="/maintenance/prune-ttl" class="inline-form">
+    <button type="submit" class="btn-secondary">Prune TTL</button>
+  </form>
+</div>
+
+<h2 class="section-title">Danger zone</h2>
+<p class="modal-meta">
+  Drops are irreversible. Each one requires you to type the target
+  name verbatim into the confirmation modal before the wire command
+  is issued.
+</p>
+
+{% if db_error %}
+  <div class="error">{{ db_error }}</div>
+{% else %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Database</th>
+        <th class="num">Size on disk</th>
+        <th class="doc-actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for db in databases %}
+        <tr>
+          <td><code>{{ db.name }}</code></td>
+          <td class="num">{{ db.sizeOnDisk or 0 }}</td>
+          <td class="doc-actions">
+            <button
+              type="button"
+              class="btn-danger"
+              hx-get="/maintenance/drop-database/{{ db.name }}/confirm"
+              hx-target="#modal"
+              hx-swap="innerHTML"
+            >Drop database</button>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="empty">No databases.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h3 class="section-title">Drop collection</h3>
+<form
+  class="filter-form"
+  hx-get="/maintenance/drop-collection-redirect"
+  hx-target="#modal"
+  hx-swap="innerHTML"
+  onsubmit="event.preventDefault(); openDropCollModal(event.target);"
+>
+  <div class="filter-controls">
+    <label>Database <input type="text" name="db" required autocomplete="off" /></label>
+    <label>Collection <input type="text" name="coll" required autocomplete="off" /></label>
+  </div>
+  <div class="modal-actions">
+    <button type="submit" class="btn-danger">Drop collection…</button>
+  </div>
+</form>
+
+<div id="modal"></div>
+
+<script>
+function openDropCollModal(form) {
+  const db = form.elements.namedItem("db").value.trim();
+  const coll = form.elements.namedItem("coll").value.trim();
+  if (!db || !coll) return;
+  fetch(`/maintenance/drop-collection/${encodeURIComponent(db)}/${encodeURIComponent(coll)}/confirm`)
+    .then(r => r.text())
+    .then(html => { document.getElementById("modal").innerHTML = html; htmx.process(document.getElementById("modal")); });
+}
+</script>
+{% endblock %}

@@ -221,6 +221,21 @@ uv run python -m invoke publish --message "blog: post v0.3.0aN release notes"
 
 No version bump and no pytest. If a real-code change has snuck into the working tree, the refusal forces a normal commit (with full test suite) for the mixed batch instead.
 
+### Theme / template changes need an explicit website-dev merge
+
+Pelican builds the live site from whatever's checked out in the `website-dev` branch — *not* from `main`. So when a slice on `main` touches `website/themes/`, `website/themes/static/`, `website/pelicanconf.py`, or anything else under `website/` that isn't `content/blog/`, those changes **don't reach the deployed site automatically**. The `invoke publish` shortcut commits + builds + deploys whatever is in `website-dev`'s working tree, and a clean working tree (`nothing to publish — working tree is clean`) makes the task a no-op.
+
+This bit me when I shipped the alpha → beta theme rename in `main` and the blog post for the release: the blog landed on the live site (built against the still-alpha theme), but the banner kept saying "Alpha" because the theme rename was sitting unmerged on `main`.
+
+When you change anything under `website/themes/` or other build-affecting files in `main`:
+
+1. From the website worktree: `git fetch origin && git merge origin/main`. The merge usually has no conflicts because the theme tree is rarely touched concurrently.
+2. Push: `git push origin website-dev`.
+3. Force a deploy that doesn't depend on a dirty working tree: `cd website && ../../SecantusDB/.venv/bin/python -m invoke deploy`. (`invoke publish` would no-op on a clean tree; `invoke deploy` rebuilds + syncs + invalidates regardless.)
+4. Verify with `curl -s https://secantusdb.com/ | grep -oE '<class match>'` so you can see the new template made it through CloudFront.
+
+For releases that bring a theme change along with a blog post, do the merge step *before* running the release sub-agent so the publish step picks up everything in one shot.
+
 ### Blog post per release
 
 Every GitHub Release **must** have a matching blog post on secantusdb.com.

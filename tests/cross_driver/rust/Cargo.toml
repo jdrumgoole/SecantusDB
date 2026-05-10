@@ -1,0 +1,39 @@
+[package]
+name = "secantus-rust-smokes"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Cross-driver smoke binaries for SecantusDB. Each ``src/bin/<name>.rs``
+# is built as a standalone executable; the orchestrator in
+# ``tests/test_cross_driver_features.py`` runs ``cargo run --release
+# --bin <name>`` against an embedded SecantusDB daemon.
+#
+# **Status**: gated on mongo-rust-driver upstream compatibility.
+# As of writing, mongo-rust-driver 2.x doesn't compile against tokio
+# 1.40+ (Interval / watch::Sender API drift), and mongo-rust-driver
+# 3.x trips on a tokio Runtime API change with Rust 1.95.
+# The orchestrator skips the Rust smoke when ``cargo build`` exits
+# non-zero so the suite stays green; flip this back on by:
+#
+#   1. Bumping ``mongodb`` to whichever stable line builds cleanly
+#      against the current toolchain (check ``cargo build --release``)
+#   2. Removing the ``XFAIL`` tag from the orchestrator's Rust test.
+#
+# The wire-protocol surface this driver exercises (insert + find +
+# BSON type fidelity) hasn't changed across 2.x / 3.x, so the smoke
+# source under ``src/bin/types_smoke.rs`` remains representative
+# whichever driver line we land on.
+
+[[bin]]
+name = "types_smoke"
+path = "src/bin/types_smoke.rs"
+
+[dependencies]
+mongodb = { version = "3", default-features = false, features = ["sync"] }
+bson = "2"
+
+[profile.release]
+opt-level = 1
+lto = false
+incremental = true
