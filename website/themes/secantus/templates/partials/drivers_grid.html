@@ -19,11 +19,11 @@
       <span class="lang">Java</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">100.0%</span>
+      <span class="rate">94.4%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>8,023</strong> tests passed &middot; <strong>0</strong> failed</p>
-    <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run the full <code>:bson:test</code> and unit-test subset of <code>:driver-core:test</code> through the driver's bundled gradle wrapper.</p>
+    <p class="counts"><strong>17</strong> tests passed &middot; <strong>1</strong> failed</p>
+    <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run the curated <code>driver-sync/src/test/functional/</code> integration subset against an embedded SecantusDB daemon &mdash; every test opens a real <code>MongoClient</code>, SCRAM-authenticates, and exchanges wire commands end-to-end.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
@@ -36,8 +36,8 @@
       <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>460</strong> tests passed &middot; <strong>0</strong> failed</p>
-    <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. The import-clean unit-test subset runs cleanly against an embedded SecantusDB daemon.</p>
+    <p class="counts"><strong>40</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. We run the integration tests under <code>test/integration/</code> via <code>mocha --config test/mocha_mongodb.js</code> &mdash; real wire commands against an embedded SecantusDB daemon.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-node.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
@@ -47,11 +47,11 @@
       <span class="lang">Go</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">99.7%</span>
+      <span class="rate">99.3%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>5,676</strong> tests passed &middot; <strong>15</strong> failed</p>
-    <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here &mdash; an important second gauge.</p>
+    <p class="counts"><strong>287</strong> tests passed &middot; <strong>2</strong> failed</p>
+    <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> only &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
@@ -64,14 +64,14 @@
       <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>6,967</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="counts"><strong>97</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The official MongoDB Ruby driver (mongo + bson
-      5.x), the gem the Rails / Sinatra ecosystem builds on. The
-      lite-spec subset of <code>spec/mongo/</code> plus the
-      cross-driver YAML corpus under <code>spec/spec_tests/</code>
-      (BSON, URI parsing, SCRAM, SDAM, server selection, connection
-      strings, max-staleness, read / write concerns) runs cleanly
-      against an embedded SecantusDB daemon.</p>
+      5.x), the gem the Rails / Sinatra ecosystem builds on. We run
+      <code>spec/mongo/database_spec.rb</code> end-to-end against an
+      embedded SecantusDB daemon &mdash; every test opens a real
+      <code>Mongo::Client</code>, SCRAM-authenticates as a
+      pre-provisioned <code>root-user</code>, and exchanges wire
+      commands.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
