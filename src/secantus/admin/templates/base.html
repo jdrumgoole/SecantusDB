@@ -17,6 +17,7 @@
       </div>
       <nav>
         <ul>
+          <li class="nav-server"><a href="/server" class="{% if active == 'server' %}nav-current{% endif %}">Server</a></li>
           <li><a href="/" class="{% if active == 'dashboard' %}nav-current{% endif %}">Dashboard</a></li>
           <li><a href="/db" class="{% if active == 'databases' %}nav-current{% endif %}">Databases</a></li>
           <li><a href="/users" class="{% if active == 'users' %}nav-current{% endif %}">Users</a></li>
@@ -28,7 +29,6 @@
           <li><a href="/maintenance" class="{% if active == 'maintenance' %}nav-current{% endif %}">Maintenance</a></li>
           <li><a href="/logs" class="{% if active == 'logs' %}nav-current{% endif %}">Logs</a></li>
           <li><a href="/backup" class="{% if active == 'backup' %}nav-current{% endif %}">Backup</a></li>
-          <li><a href="/server" class="{% if active == 'server' %}nav-current{% endif %}">Server</a></li>
         </ul>
       </nav>
     </aside>

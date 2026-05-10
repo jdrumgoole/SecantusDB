@@ -43,6 +43,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help=(
+            "Drop the single-node replica-set advertisement from the "
+            "``hello`` reply, so drivers see SecantusDB as a STANDALONE "
+            "topology. Default is to advertise as a single-node "
+            "``secantus`` replica-set primary so pymongo's change-stream "
+            "machinery accepts the topology. Test gauges that need the "
+            "driver's single-node code path (e.g. mongo-java-driver's "
+            "``ClusterFixture.getSecondary()`` would otherwise loop "
+            "forever waiting for a SECONDARY) opt into this."
+        ),
+    )
+    parser.add_argument(
         "--noop-heartbeat-seconds",
         type=float,
         default=0.0,
@@ -71,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         storage_path=args.storage_path,
         require_auth=args.auth,
         noop_heartbeat_seconds=args.noop_heartbeat_seconds,
+        replica_set_name=None if args.standalone else "secantus",
     )
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:

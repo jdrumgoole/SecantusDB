@@ -127,22 +127,34 @@ def render(raw_path: Path, out_path: Path) -> None:
         "SecantusDB daemon.** The submodule at `vendor/node-mongodb-native/` "
         "is checked out at the pinned upstream tag with zero local edits. "
         "`node_validation/runner.py` ensures `node_modules/` is installed "
-        "(one-time `npm install`), spawns `python -m secantus --host "
-        "127.0.0.1 --port <free> --storage-path :memory:` as a subprocess, "
-        "exports `MONGODB_URI` (the env var the driver's "
-        "`test/tools/runner/hooks/configuration.ts` reads at bootstrap) and "
-        "`AUTH=noauth` (so the bootstrap doesn't fall back to the "
-        "auth-enabled default URI), then runs "
-        "`npx mocha --reporter json <paths>` for the in-scope set in "
-        "`node_validation/include_paths.py`."
+        "(one-time `npm install` + `npm run build:bundle`), then does a "
+        "two-phase spawn: phase 1 boots `python -m secantus --port 27018 "
+        "--storage-path <tempdir> --standalone` without `--auth` and uses "
+        "pymongo to createUser `root-user` (root role); phase 2 stops that "
+        "daemon and restarts on the same tempdir **with `--auth`**, so the "
+        "user record persists and the server now enforces auth. "
+        "`MONGODB_URI=mongodb://root-user:password@127.0.0.1:27018/"
+        "?authSource=admin` and `AUTH=auth` make the driver's "
+        "`test/tools/runner/hooks/configuration.ts` honour our URI rather "
+        "than fall back to the `bob:pwd123` default. Then "
+        "`npx mocha --config test/mocha_mongodb.js --reporter json <paths>`."
     )
     md.append("")
     md.append(
-        "Tests gated on real-mongod expectations (replica-set primary "
-        "elections, topology change events, mongocryptd, KMS, etc.) are out "
-        "of scope and not included in the in-scope path list. The pass rate "
-        "above measures how well SecantusDB satisfies the parts of the "
-        "Node.js driver's contract we DO aim to support."
+        "These are **integration tests** under `test/integration/` — every "
+        "test opens a real `MongoClient` against the SecantusDB daemon and "
+        "exchanges wire commands end-to-end. The pass rate is therefore a "
+        "true measure of SecantusDB's compatibility with the Node.js "
+        "driver, not of the driver's own pure-code logic."
+    )
+    md.append("")
+    md.append(
+        "The include set is currently narrow on purpose: a single broken "
+        "test in a change-streams or sessions file can pin the runner "
+        "indefinitely on a tailable getMore that never completes. Each "
+        "new file is added to `include_paths.py` only after a manual "
+        "confirmation that it terminates within the runner's wall-clock "
+        "guard (600 s by default)."
     )
     md.append("")
 

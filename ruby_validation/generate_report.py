@@ -135,21 +135,48 @@ def render(raw_path: Path, out_path: Path) -> None:
         "standalone SecantusDB daemon.** The submodule at "
         "`vendor/mongo-ruby-driver/` is checked out at the pinned upstream "
         "tag with zero local edits. `ruby_validation/runner.py` runs "
-        "`bundle install` (one-time per checkout), spawns "
-        "`python -m secantus --host 127.0.0.1 --port <free> --storage-path "
-        "':memory:'` as a subprocess, exports `MONGODB_URI` (the env var "
-        "`spec/support/spec_config.rb` reads at bootstrap), then runs "
-        "`bundle exec rspec --format json <paths>` for the in-scope set "
-        "in `ruby_validation/include_paths.py`."
+        "`bundle install` (one-time per checkout), then does a two-phase "
+        "spawn: phase 1 boots `python -m secantus --port 27018 "
+        "--storage-path <tempdir>` without `--auth` and uses pymongo to "
+        "createUser `root-user` (root role) and `ruby-test-user` "
+        "(readWriteAnyDatabase + dbAdminAnyDatabase); phase 2 stops that "
+        "daemon and restarts on the same tempdir **with `--auth`**, so "
+        "the user records persist and the server now enforces auth. "
+        "rspec runs against phase 2 with `MONGODB_URI=mongodb://"
+        "root-user:password@127.0.0.1:27018/?authSource=admin`. "
+        "On-disk tempdir is rmtree'd after the run."
     )
     md.append("")
     md.append(
-        "Initial scope is **lite specs only** — files that "
-        "`require 'lite_spec_helper'`. Those don't connect to a server, "
-        "so they exercise the BSON / URI / auth-handshake / event / "
-        "topology-decoding logic without depending on cluster behaviour. "
-        "Once the lite gauge is green, integration specs that work "
-        "against a single-node deployment will be added."
+        "These are **integration specs** — every test opens a real TCP "
+        "connection to the SecantusDB daemon, SCRAM-authenticates, and "
+        "exchanges wire commands end-to-end. The pass rate is therefore a "
+        "true measure of SecantusDB's compatibility with the Ruby driver, "
+        "not of the driver's own pure-code logic."
+    )
+    md.append("")
+    md.append(
+        "The include set is currently narrow on purpose: a single broken "
+        "test in `spec/mongo/cursor_spec.rb` or `spec/mongo/bulk_write_spec.rb` "
+        "can pin the runner indefinitely on a tailable getMore that never "
+        "completes. Each new file is added to `include_paths.py` only "
+        "after a manual confirmation that it terminates within the "
+        "runner's wall-clock guard (300 s by default)."
+    )
+    md.append("")
+    md.append(
+        "Pending tests are honest skips driven by mutually-exclusive "
+        "environment gates upstream tests opt into: `require_no_auth` "
+        "(skips when auth is configured — and our gauge always runs "
+        "with auth), `require_topology :single` (skips on replica-set "
+        "topology — we always advertise as a single-node RS primary so "
+        "change streams work), `min_server_version 4.5` (skips on >= "
+        "4.6 — we report 7.0.0). Resolving them would require running "
+        "additional gauge configurations rather than fixing SecantusDB "
+        "behaviour. The pending number is therefore a lower bound on "
+        "tests SecantusDB \"could pass\" if the runner spun up "
+        "alternate daemons; the failed number is the only signal that "
+        "matters for conformance."
     )
     md.append("")
 
