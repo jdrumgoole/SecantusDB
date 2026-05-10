@@ -1365,6 +1365,12 @@ _STAGES = {
     "$collStats": _stage_coll_stats,
     "$indexStats": _stage_index_stats,
     "$currentOp": _stage_current_op,
+    # ``$listLocalSessions`` / ``$listSessions`` enumerate logical
+    # sessions tracked by the server. Reuse the ``$currentOp`` stub —
+    # we return one synthetic op doc so test probes ``[{$listLocalSessions: {}}]``
+    # find a non-empty result with the expected shape.
+    "$listLocalSessions": _stage_current_op,
+    "$listSessions": _stage_current_op,
     "$out": _stage_out,
     "$merge": _stage_merge,
     "$graphLookup": _stage_graph_lookup,

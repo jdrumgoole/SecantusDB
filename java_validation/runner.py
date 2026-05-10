@@ -252,6 +252,14 @@ def main() -> int:
         for spec in INCLUDE:
             cmd = [
                 "./gradlew", "--no-daemon", "--console=plain",
+                # ``--rerun-tasks`` forces Gradle to re-execute the
+                # test task even when its inputs (Java sources, system
+                # properties) haven't changed. Without it, server-side
+                # SecantusDB changes don't invalidate Gradle's
+                # test-task cache and the same stale JUnit XML is read
+                # back, producing identical "171/183" numbers no
+                # matter what we fix on the server.
+                "--rerun-tasks",
                 f"-Dorg.mongodb.test.uri={uri}",
                 # Per-test wall-clock timeout. JUnit 5 (Jupiter)
                 # honours these system properties; with the default

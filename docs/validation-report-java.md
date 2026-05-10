@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-05-10 — SecantusDB 0.5.0b9 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-05-11 — SecantusDB 0.5.0b13 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -8,10 +8,10 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `driver-sync` | 171 | 183 | 310 | 664 | 48.3% |
-| **Overall** | **171** | **183** | **310** | **664** | **48.3%** |
+| `driver-sync` | 173 | 181 | 310 | 664 | 48.9% |
+| **Overall** | **173** | **181** | **310** | **664** | **48.9%** |
 
-## Failures (183)
+## Failures (181)
 
 First 30 failed tests for triage:
 
@@ -47,7 +47,7 @@ driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-upse
 driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-upsert: FindOneAndReplace when no documents match with id specified with upsert returning the document after modification
 driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#deleteMany-comment: deleteMany with string comment
 ```
-... and 153 more (see raw XML).
+... and 151 more (see raw XML).
 
 ## How this is generated
 

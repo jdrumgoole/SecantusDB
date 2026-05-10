@@ -1321,6 +1321,8 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     upsert = bool(doc.get("upsert", False))
     is_remove = bool(doc.get("remove", False))
     update = doc.get("update")
+    # ``let`` user-vars threaded into the filter / update predicate.
+    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
 
     if is_remove and update is not None:
         return {
@@ -1337,13 +1339,15 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             "codeName": "FailedToParse",
         }
 
-    candidates = ctx.storage.find_matching(ctx.db_name, coll, query, sort=sort, limit=1)
+    candidates = ctx.storage.find_matching(
+        ctx.db_name, coll, query, sort=sort, limit=1, let=let
+    )
 
     if not candidates:
         if upsert and not is_remove:
             try:
                 result = ctx.storage.update_matching(
-                    ctx.db_name, coll, query, update, multi=False, upsert=True
+                    ctx.db_name, coll, query, update, multi=False, upsert=True, let=let
                 )
             except IndexConflict as exc:
                 return {
@@ -1883,6 +1887,10 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["aggregate"]
     pipeline = doc.get("pipeline", [])
     hint = doc.get("hint")
+    # ``let`` user-vars threaded into the pipeline context so
+    # ``$expr`` clauses inside ``$match`` and the aggregation
+    # expression language can resolve ``$$name`` references.
+    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
     cursor_opts = doc.get("cursor") or {}
     raw_agg_batch = cursor_opts.get("batchSize")
     batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else int(raw_agg_batch)
@@ -1915,14 +1923,21 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 initial_filter = dict(first_stage["$match"])
                 pipeline = list(pipeline[1:])
             try:
-                docs = ctx.storage.find_matching(ctx.db_name, coll, initial_filter, hint=hint)
+                docs = ctx.storage.find_matching(
+                    ctx.db_name, coll, initial_filter, hint=hint, let=let
+                )
             except BadHint as exc:
                 return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
         ns = _ns(ctx.db_name, coll)
     else:
         docs = []
         ns = f"{ctx.db_name}.$cmd.aggregate"
-    pipeline_ctx = PipelineContext(storage=ctx.storage, db_name=ctx.db_name, coll_name=coll_name)
+    pipeline_ctx = PipelineContext(
+        storage=ctx.storage,
+        db_name=ctx.db_name,
+        coll_name=coll_name,
+        vars=dict(let) if let else {},
+    )
     docs = apply_pipeline(docs, pipeline, pipeline_ctx)
     first_batch, cursor_id = _split_into_cursor(docs, batch_size, ns, ctx.cursors)
     # Silence unused import in this branch.
