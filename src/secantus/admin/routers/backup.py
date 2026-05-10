@@ -34,9 +34,7 @@ def _templates(request: Request) -> Jinja2Templates:
 
 
 def _backup_root(request: Request) -> Path:
-    return getattr(
-        request.app.state, "backup_root", backup_lib.DEFAULT_BACKUP_ROOT
-    )
+    return getattr(request.app.state, "backup_root", backup_lib.DEFAULT_BACKUP_ROOT)
 
 
 def _humanize_bytes(n: int | float | None) -> str:

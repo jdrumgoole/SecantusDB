@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import subprocess
-from pathlib import Path
 
 from secantus.admin.backup import (
     list_backups,
@@ -34,9 +33,7 @@ def _ok_runner(captured: list[list[str]]):
 
 def _fail_runner() -> subprocess.CompletedProcess:
     def runner(cmd: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=1, stdout="", stderr="boom"
-        )
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="boom")
 
     return runner
 
@@ -124,9 +121,7 @@ def test_run_mongorestore_invokes_with_uri_and_dir(tmp_path) -> None:
         which=_fake_which_present,
     )
     assert out.ok is True
-    assert captured == [
-        ["/usr/local/bin/mongorestore", "--uri", "mongodb://x", str(dump_dir)]
-    ]
+    assert captured == [["/usr/local/bin/mongorestore", "--uri", "mongodb://x", str(dump_dir)]]
 
 
 def test_run_mongorestore_rejects_missing_dir(tmp_path) -> None:

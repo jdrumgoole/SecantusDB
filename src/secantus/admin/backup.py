@@ -89,9 +89,7 @@ def preflight(
                 "package (Homebrew: 'brew install mongodb/brew/mongodb-database-tools')."
             ),
         )
-    return PreflightResult(
-        ok=True, mongodump=dump_path, mongorestore=restore_path
-    )
+    return PreflightResult(ok=True, mongodump=dump_path, mongorestore=restore_path)
 
 
 def _stamp(now: _dt.datetime | None = None) -> str:
