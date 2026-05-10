@@ -82,6 +82,39 @@ async def test_dashboard_with_header_token_ok(http: AsyncClient) -> None:
     assert r.status_code == 200
 
 
+async def test_page_header_shows_target_server(server, http: AsyncClient) -> None:
+    """Every page renders the target URI badge (sanitized)."""
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "server-badge" in r.text
+    # Badge content is the URL the fixture actually started on (ephemeral
+    # port chosen by the kernel). Always loopback in tests.
+    assert "127.0.0.1" in r.text
+
+
+async def test_page_header_strips_password(server, tmp_path) -> None:
+    """Password in the URI doesn't leak into the rendered badge."""
+    app = create_app(
+        mongo_uri="mongodb://alice:s3cret@127.0.0.1:1/?authSource=admin",
+        token="testtoken",
+        history_path=tmp_path / "h.db",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as c:
+            r = await c.get(
+                "/", headers={HEADER_NAME: "testtoken"}
+            )
+            assert r.status_code == 200
+            assert "alice@127.0.0.1" in r.text
+            assert "s3cret" not in r.text
+            assert "authSource" not in r.text
+    finally:
+        app.state.mongo.close()
+
+
 async def test_query_token_sets_cookie(http: AsyncClient) -> None:
     r = await http.get(f"/?{QUERY_NAME}=testtoken")
     assert r.cookies.get(COOKIE_NAME) == "testtoken"
