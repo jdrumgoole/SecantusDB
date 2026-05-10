@@ -119,6 +119,14 @@ body {
   font-weight: 600;
 }
 
+/* Visual separator after the Server tab — it's the "global state"
+ * switcher, distinct from the per-target pages below it. */
+.sidebar nav li.nav-server {
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
 .sidebar nav li a.nav-disabled {
   color: var(--muted);
   pointer-events: none;
