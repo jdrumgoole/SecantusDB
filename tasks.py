@@ -132,6 +132,7 @@ def load(
         "storage-path": "WiredTiger storage dir (default: tempdir, removed at end).",
         "no-load": "Don't auto-start the load_writer (chaos only).",
         "seed": "RNG seed for kill timing (default: random).",
+        "batch-size": "Documents per insert call in the writer (default: 1).",
     }
 )
 def chaos(
@@ -143,6 +144,7 @@ def chaos(
     storage_path: str = "",
     no_load: bool = False,
     seed: int = 0,
+    batch_size: int = 1,
 ) -> None:
     """Chaos monkey: random SIGKILL/restart of SecantusDB under live load.
 
@@ -167,6 +169,8 @@ def chaos(
         cmd += " --no-load"
     if seed:
         cmd += f" --seed {int(seed)}"
+    if batch_size > 1:
+        cmd += f" --batch-size {int(batch_size)}"
     c.run(cmd, pty=True)
 
 
