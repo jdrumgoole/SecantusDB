@@ -27,6 +27,7 @@ from secantus.admin.client import MongoFacade
 from secantus.admin.history import HistoryStore
 from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
+    backup,
     changestream,
     collection,
     connections,
@@ -76,6 +77,7 @@ def create_app(
     mongo_uri: str,
     token: str,
     history_path: Path | str | None = None,
+    backup_root: Path | str | None = None,
 ) -> FastAPI:
     app = FastAPI(
         title="SecantusDB admin",
@@ -96,6 +98,8 @@ def create_app(
     # Persistent ad-hoc query history (sqlite). Tests pass a per-test
     # path; production defaults to the same dir as the persisted token.
     app.state.history = HistoryStore(history_path or _DEFAULT_HISTORY_PATH)
+    if backup_root is not None:
+        app.state.backup_root = Path(backup_root)
     # Sampler is started inside lifespan so the asyncio loop is live;
     # set to None here for the test path that constructs the app
     # without going through lifespan.
@@ -121,6 +125,7 @@ def create_app(
     app.include_router(profiler.router)
     app.include_router(maintenance.router)
     app.include_router(extras.router)
+    app.include_router(backup.router)
 
     return app
 
