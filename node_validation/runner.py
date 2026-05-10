@@ -49,7 +49,15 @@ ROOT_PASSWORD = "password"
 # integration tests can hang on tailable getMore polls or change-stream
 # resumes when the server doesn't deliver the exact event shape they
 # expect; without a guard, a single broken test would pin the runner.
-MOCHA_TIMEOUT_SECONDS = 600.0
+MOCHA_TIMEOUT_SECONDS = 300.0
+
+# Per-test budget passed to mocha as ``--timeout`` (in milliseconds).
+# Catches single-test hangs (tailable getMore polls that never
+# complete, change-stream resumes that never fire). mocha's default
+# is 60s for the mongodb config; we drop it to 15s so a runaway
+# test fails fast instead of pinning the whole gauge until the
+# total-wall-clock guard fires.
+MOCHA_PER_TEST_TIMEOUT_MS = 15_000
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -191,6 +199,7 @@ def main() -> int:
             "npx", "mocha",
             "--config", "test/mocha_mongodb.js",
             "--reporter", "json",
+            "--timeout", str(MOCHA_PER_TEST_TIMEOUT_MS),
             *INCLUDE,
         ]
         print(

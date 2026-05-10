@@ -849,8 +849,25 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # verbosity *omits* the executionStats key, so we have to honour
     # it rather than always returning both sections.
     verbosity = doc.get("verbosity", "executionStats")
-    if not isinstance(verbosity, str):
-        verbosity = "executionStats"
+    # Reject unknown verbosity strings. Mongod's three valid values
+    # are ``queryPlanner``, ``executionStats``, ``allPlansExecution``;
+    # anything else surfaces as ``BadValue`` (code 2). Driver tests
+    # like mongo-node-driver's ``explain.test.ts`` parametrize over
+    # invalid verbosity (``'invalid'``) and assert the response is a
+    # ``MongoServerError`` — they fail silently if we accept the bad
+    # value and return a normal explain doc.
+    if not isinstance(verbosity, str) or verbosity not in (
+        "queryPlanner", "executionStats", "allPlansExecution"
+    ):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"verbosity {verbosity!r} not recognized; expected one of "
+                "['queryPlanner', 'executionStats', 'allPlansExecution']"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
     namespace = _ns(ctx.db_name, coll) if coll else f"{ctx.db_name}.$cmd"
     if coll:
         plan = ctx.storage.explain_plan(ctx.db_name, coll, filter_, sort=sort, hint=hint)
@@ -875,21 +892,58 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     else:
         winning_plan = {"stage": "COLLSCAN", "filter": filter_}
         execution_stage = {"stage": "COLLSCAN", "nReturned": 0}
+    query_planner = {
+        "namespace": namespace,
+        "indexFilterSet": False,
+        "parsedQuery": filter_,
+        "winningPlan": winning_plan,
+        "rejectedPlans": [],
+    }
+    server_info = {
+        "host": "secantus",
+        "port": 0,
+        "version": SERVER_VERSION,
+        "gitVersion": "0" * 40,
+    }
+    # Aggregate-explain has a different shape from find-explain:
+    # mongod returns ``stages: [{$cursor: {queryPlanner, ...}}, ...]``
+    # so drivers can iterate the pipeline. Each non-cursor stage
+    # gets its own entry. mongo-node-driver's
+    # ``aggregation.test.ts#should correctly return a cursor and
+    # call explain`` asserts ``JSON.stringify(result)`` includes
+    # ``$cursor`` — without the stages wrapper that substring never
+    # appears.
+    if isinstance(inner, dict) and "aggregate" in inner:
+        pipeline = inner.get("pipeline") or []
+        cursor_stage: dict[str, Any] = {
+            "$cursor": {
+                "queryPlanner": query_planner,
+            }
+        }
+        if verbosity != "queryPlanner":
+            cursor_stage["$cursor"]["executionStats"] = {
+                "executionSuccess": True,
+                "nReturned": 0,
+                "executionTimeMillis": 0,
+                "totalKeysExamined": 0,
+                "totalDocsExamined": 0,
+                "executionStages": execution_stage,
+            }
+        stages: list[dict[str, Any]] = [cursor_stage]
+        for stage_doc in pipeline:
+            if isinstance(stage_doc, Mapping):
+                stages.append(dict(stage_doc))
+        return {
+            "stages": stages,
+            "explainVersion": "1",
+            "command": inner,
+            "serverInfo": server_info,
+            "ok": 1.0,
+        }
     reply: dict[str, Any] = {
-        "queryPlanner": {
-            "namespace": namespace,
-            "indexFilterSet": False,
-            "parsedQuery": filter_,
-            "winningPlan": winning_plan,
-            "rejectedPlans": [],
-        },
+        "queryPlanner": query_planner,
         "command": inner if isinstance(inner, dict) else {},
-        "serverInfo": {
-            "host": "secantus",
-            "port": 0,
-            "version": SERVER_VERSION,
-            "gitVersion": "0" * 40,
-        },
+        "serverInfo": server_info,
         "ok": 1.0,
     }
     if verbosity != "queryPlanner":

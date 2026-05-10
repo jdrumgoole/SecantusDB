@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-05-10 — SecantusDB 0.5.0b2 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-05-10 — SecantusDB 0.5.0b10 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -8,16 +8,46 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `driver-sync` | 59 | 1 | 66 | 126 | 98.3% |
-| **Overall** | **59** | **1** | **66** | **126** | **98.3%** |
+| `driver-sync` | 172 | 182 | 310 | 664 | 48.6% |
+| **Overall** | **172** | **182** | **310** | **664** | **48.6%** |
 
-## Failures (1)
+## Failures (182)
 
 First 30 failed tests for triage:
 
 ```
-driver-sync :: com.mongodb.client.MongoCollectionTest#testMapReduceWithGenerics()
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#bulkWrite-updateMany-pipeline: UpdateMany in bulk write using pipelines
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#deleteMany-collation: DeleteMany when many documents match with collation
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#deleteOne-let: deleteOne with let option
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#updateOne-dots_and_dollars: Updating document to set top-level dollar-prefixed key on 5.0+ server
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#updateOne-dots_and_dollars: Updating document to set top-level dotted key on 5.0+ server
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#updateOne-dots_and_dollars: Updating document to set dollar-prefixed key in embedded doc on 5.0+ server
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#updateOne-dots_and_dollars: Updating document to set dotted key in embedded doc on 5.0+ server
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#insertMany-dots_and_dollars: Inserting document with top-level dollar-prefixed key on 5.0+ server
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#insertMany-dots_and_dollars: Inserting document with top-level dotted key
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#insertMany-dots_and_dollars: Inserting document with dollar-prefixed key in embedded doc
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#insertMany-dots_and_dollars: Inserting document with dotted key in embedded doc
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-hint: FindOneAndReplace with hint string
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-hint: FindOneAndReplace with hint document
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-pipeline: FindOneAndUpdate using pipelines
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-arrayFilters: FindOneAndUpdate when no document matches arrayFilters
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-arrayFilters: FindOneAndUpdate when one document matches arrayFilters
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-arrayFilters: FindOneAndUpdate when multiple documents match arrayFilters
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#aggregate-out: Aggregate with $out
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#insertOne-comment: insertOne with string comment
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#insertOne-comment: insertOne with document comment
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#updateMany-let: updateMany with let option
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndDelete-collation: FindOneAndDelete when one document matches with collation
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-errorResponse: findOneAndUpdate DuplicateKey error is accessible
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-errorResponse: findOneAndUpdate document validation errInfo is accessible
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#find-let: Find with let option
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-upsert: FindOneAndReplace when no documents match without id specified with upsert returning the document before modification
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-upsert: FindOneAndReplace when no documents match without id specified with upsert returning the document after modification
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-upsert: FindOneAndReplace when no documents match with id specified with upsert returning the document before modification
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndReplace-upsert: FindOneAndReplace when no documents match with id specified with upsert returning the document after modification
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#deleteMany-comment: deleteMany with string comment
 ```
+... and 152 more (see raw XML).
 
 ## How this is generated
 
