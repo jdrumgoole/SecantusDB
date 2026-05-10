@@ -1,12 +1,22 @@
 """In-scope Go test packages under vendor/mongo-go-driver/.
 
-Conservative starting set: BSON serialization (server-independent;
-catches wire-format regressions) and the integration package (server-
-dependent; many tests will self-skip on topology requirements but the
-ones that survive give us "Go driver actually works against SecantusDB"
-coverage).
+**Integration-only.** Pure-BSON unit tests (``./bson/...``) and pure
+mongo-package tests (``./mongo``) verify the Go driver's own
+serialization and helper logic without ever opening a TCP connection
+to SecantusDB. They proved the Go driver works in our build
+environment but said nothing about wire-protocol conformance, so
+they're out of scope for this gauge.
+
+The integration package is the honest measure: every test opens a
+real ``mongo.Client`` against the SecantusDB daemon and exchanges
+wire commands end-to-end. Many tests self-skip on topology
+requirements (``require: replicaset``, encryption, CSFLE, etc.) —
+the ones that survive are the cross-driver gauge for "go-driver
+actually works against us".
 
 Out of scope:
+  ./bson/...              (pure unit; doesn't connect)
+  ./mongo                 (pure unit; doesn't connect)
   ./internal/csfle*       (client-side encryption)
   ./internal/aws*         (Atlas-only auth)
   ./internal/spectest/atlas-data-lake-testing
@@ -18,16 +28,6 @@ from __future__ import annotations
 
 # Package paths relative to the vendor/mongo-go-driver/ module root.
 INCLUDE: list[str] = [
-    "./bson/...",
-    "./mongo",
-    # Server-dependent integration tests. Drives mongo-go-driver's full
-    # CRUD / aggregate / change-stream / index-management surface
-    # against SecantusDB over TCP. Runtime: ~several minutes (the
-    # baseline tests run in seconds; this set adds the slow part).
-    # Many tests self-skip on topology requirements (`require:
-    # replicaset`, `require: sharded`, encryption, retryable-writes,
-    # CSFLE) — the ones that survive are the honest cross-driver
-    # gauge for "go-driver actually works against us".
     "./internal/integration/...",
 ]
 

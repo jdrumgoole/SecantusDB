@@ -29,6 +29,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -76,11 +77,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-java-driver"
 RESULTS_DIR = REPO_ROOT / ".validation" / "java-results"
 
+# Fixed port — ``27018``, the project-wide convention for SecantusDB
+# under test (see CLAUDE.md). All driver gauges share this port;
+# they run sequentially in CI so the shared port doesn't conflict.
+DAEMON_PORT = 27018
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+# Test users mongo-java-driver's ClusterFixture connection string
+# expects when ``-Dorg.mongodb.test.uri`` carries credentials.
+ROOT_USER = "root-user"
+ROOT_PASSWORD = "password"
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -148,22 +153,72 @@ def main() -> int:
     RESULTS_DIR.mkdir(parents=True)
 
     host = "127.0.0.1"
-    port = _find_free_port()
-    daemon_cmd = [
-        sys.executable, "-m", "secantus",
-        "--host", host,
-        "--port", str(port),
-        "--storage-path", ":memory:",
-        "--log-level", "WARNING",
-    ]
-    print(f"java_validation: starting daemon on {host}:{port}", file=sys.stderr)
-    daemon = subprocess.Popen(
-        daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    port = DAEMON_PORT
+
+    # Tempdir storage so the user records we seed in phase 1 survive
+    # the daemon restart in phase 2 with --auth.
+    storage_dir = tempfile.mkdtemp(prefix="secantus-java-gauge-")
+    print(
+        f"java_validation: storage tempdir {storage_dir} (will be cleaned up)",
+        file=sys.stderr,
     )
+
+    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+        cmd = [
+            sys.executable, "-m", "secantus",
+            "--host", host,
+            "--port", str(port),
+            "--storage-path", storage_dir,
+            "--log-level", "WARNING",
+            # Java's ``ClusterFixture.getSecondary()`` is an unbounded
+            # sleep loop on non-RS deployments — and our default
+            # ``hello`` reply advertises us as a single-node RS primary
+            # (so pymongo's change-stream machinery accepts the
+            # topology). For the Java gauge specifically we want
+            # standalone classification so the driver's
+            # ``assumeTrue(isReplicaSet())`` gate skips the multi-node
+            # tests instead of hanging.
+            "--standalone",
+        ]
+        if with_auth:
+            cmd.append("--auth")
+        return subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+
+    print(f"java_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
+    daemon = _spawn_daemon(with_auth=False)
+    try:
+        _wait_for_listener(host, port)
+        print("java_validation: seeding root-user", file=sys.stderr)
+        import pymongo
+        client = pymongo.MongoClient(
+            f"mongodb://{host}:{port}/", directConnection=True, serverSelectionTimeoutMS=5_000
+        )
+        client.admin.command(
+            "createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"]
+        )
+        client.close()
+    finally:
+        daemon.terminate()
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+    print(
+        f"java_validation: phase 2 — running gauge with --auth on {host}:{port}",
+        file=sys.stderr,
+    )
+    daemon = _spawn_daemon(with_auth=True)
     try:
         _wait_for_listener(host, port)
 
-        uri = f"mongodb://{host}:{port}"
+        uri = (
+            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/"
+            f"?authSource=admin"
+        )
         env = os.environ.copy()
         if java_home_override:
             env["JAVA_HOME"] = java_home_override
@@ -322,6 +377,7 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()
+        shutil.rmtree(storage_dir, ignore_errors=True)
 
     return 0
 

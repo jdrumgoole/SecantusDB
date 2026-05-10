@@ -1,19 +1,25 @@
 """Run mongo-node-driver's tests against a standalone SecantusDB daemon.
 
-Same shape as `go_validation/runner.py`: spawn SecantusDB as a
-subprocess, set `MONGODB_URI` (and `AUTH=noauth` so the driver's
-test bootstrap doesn't fall back to the auth-enabled default), then
-run the in-scope mocha test paths.
+End-to-end integration gauge: SecantusDB and the Node.js driver
+exchange real wire commands over TCP. The runner:
 
-mocha's JSON reporter writes the full test result to stdout as one
-big JSON document. We capture it to `.validation/node-raw.json` and
-let `generate_report.py` turn it into `docs/validation-report-node.md`.
+1. Spawns ``python -m secantus --port 27018 --storage-path <tempdir>
+   --standalone`` without ``--auth``; uses pymongo to ``createUser``
+   ``root-user`` (``root`` role).
+2. Stops that daemon and restarts on the same tempdir **with
+   ``--auth``** — user record persists, server now enforces auth.
+3. Runs ``npx mocha --config test/mocha_mongodb.js --reporter json
+   <paths>`` with ``MONGODB_URI=mongodb://root-user:password@127.0.0.1:27018/
+   ?authSource=admin`` so the driver authenticates against the
+   freshly-seeded user.
+4. ``generate_report.py`` renders the per-category breakdown into
+   ``docs/validation-report-node.md``.
 
-First run is slow because `npm install` has to fetch the driver's
-dev dependencies (~minute). Subsequent runs reuse the installed
-node_modules and complete in seconds.
+First run does ``npm install`` (~1-2 min). Subsequent runs reuse
+``node_modules/`` and complete in seconds plus mocha startup.
 
-Run via `uv run python -m invoke validate-node`.
+Run via ``uv run python -m invoke validate-node``. Requires Node.js
+>= 20 and ``npm`` on PATH.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,11 +39,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "node-mongodb-native"
 RAW_OUT = REPO_ROOT / ".validation" / "node-raw.json"
 
+# Project-wide convention — see CLAUDE.md ``Tooling`` section.
+DAEMON_PORT = 27018
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+ROOT_USER = "root-user"
+ROOT_PASSWORD = "password"
+
+# Hard wall-clock budget on the mocha run. mongo-node-driver
+# integration tests can hang on tailable getMore polls or change-stream
+# resumes when the server doesn't deliver the exact event shape they
+# expect; without a guard, a single broken test would pin the runner.
+MOCHA_TIMEOUT_SECONDS = 600.0
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -51,7 +64,6 @@ def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
 
 
 def _ensure_npm_install() -> int:
-    """Install node-mongodb-native's dev deps if node_modules is missing."""
     if (VENDOR / "node_modules" / "mocha").is_dir():
         return 0
     print("node_validation: running `npm install` (first time only, ~1-2 min)", file=sys.stderr)
@@ -63,12 +75,11 @@ def _ensure_npm_install() -> int:
 
 
 def _ensure_bundle_built() -> int:
-    """Build the test bundle if test/mongodb.ts hasn't been generated yet.
+    """Build the test bundle if test/mongodb.ts hasn't been generated.
 
-    `npm run build:bundle` produces test/tools/runner/bundle/driver-bundle.js
-    and rewrites test/mongodb.ts to re-export from it. The unit tests
-    import `test/mongodb` so without this step every test file fails to
-    resolve at module load.
+    ``npm run build:bundle`` produces ``test/tools/runner/bundle/driver-bundle.js``
+    and rewrites ``test/mongodb.ts`` to re-export from it. Integration tests
+    import from ``../../mongodb`` and need this bundle.
     """
     bundle = VENDOR / "test" / "tools" / "runner" / "bundle" / "driver-bundle.js"
     if bundle.is_file():
@@ -108,57 +119,107 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _find_free_port()
-    daemon_cmd = [
-        sys.executable, "-m", "secantus",
-        "--host", host,
-        "--port", str(port),
-        "--storage-path", ":memory:",
-        "--log-level", "WARNING",
-    ]
-    print(f"node_validation: starting daemon on {host}:{port}", file=sys.stderr)
-    daemon = subprocess.Popen(
-        daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    port = DAEMON_PORT
+
+    storage_dir = tempfile.mkdtemp(prefix="secantus-node-gauge-")
+    print(
+        f"node_validation: storage tempdir {storage_dir} (will be cleaned up)",
+        file=sys.stderr,
     )
+
+    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+        cmd = [
+            sys.executable, "-m", "secantus",
+            "--host", host,
+            "--port", str(port),
+            "--storage-path", storage_dir,
+            "--log-level", "WARNING",
+            "--standalone",
+        ]
+        if with_auth:
+            cmd.append("--auth")
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    print(f"node_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
+    daemon = _spawn_daemon(with_auth=False)
+    try:
+        _wait_for_listener(host, port)
+        print("node_validation: seeding root-user", file=sys.stderr)
+        import pymongo
+        client = pymongo.MongoClient(
+            f"mongodb://{host}:{port}/", directConnection=True, serverSelectionTimeoutMS=5_000
+        )
+        client.admin.command(
+            "createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"]
+        )
+        client.close()
+    finally:
+        daemon.terminate()
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+    print(
+        f"node_validation: phase 2 — running gauge with --auth on {host}:{port}",
+        file=sys.stderr,
+    )
+    daemon = _spawn_daemon(with_auth=True)
     try:
         _wait_for_listener(host, port)
 
         env = os.environ.copy()
-        env["MONGODB_URI"] = f"mongodb://{host}:{port}"
-        # Without this, the test bootstrap defaults the URI to
-        # `mongodb://bob:pwd123@localhost:27017` (auth=auth).
-        env["AUTH"] = "noauth"
-        # The driver's tests use ESM-style `import` statements without
-        # extensions (`from '../../mongodb'`). ts-node/register from .mocharc
-        # only handles CJS; ESM resolution refuses to auto-pick `.ts`.
-        # `--experimental-strip-types` (Node 22.6+) strips types at runtime
-        # so the imports resolve. Append rather than overwrite NODE_OPTIONS
-        # so user-supplied options (debug flags, etc.) survive.
+        env["MONGODB_URI"] = (
+            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/"
+            f"?authSource=admin"
+        )
+        # Required by ``test/tools/runner/hooks/configuration.ts`` —
+        # if AUTH != 'noauth' the bootstrap insists on the
+        # ``bob:pwd123`` default URI, overriding ours. Setting AUTH=auth
+        # tells the bootstrap to honour ``MONGODB_URI`` verbatim.
+        env["AUTH"] = "auth"
+        # The driver's tests use ESM-style imports without extensions
+        # (`from '../../mongodb'`). Node 22+'s
+        # ``--experimental-strip-types`` resolves them at runtime.
         existing = env.get("NODE_OPTIONS", "")
         env["NODE_OPTIONS"] = (
             existing + " --experimental-strip-types"
         ).strip()
 
-        cmd = ["npx", "mocha", "--reporter", "json", *INCLUDE]
+        cmd = [
+            "npx", "mocha",
+            "--config", "test/mocha_mongodb.js",
+            "--reporter", "json",
+            *INCLUDE,
+        ]
         print(
             f"node_validation: `{' '.join(cmd)}` in {VENDOR} "
             f"(MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
-        with RAW_OUT.open("w") as out:
-            proc = subprocess.run(
-                cmd, cwd=VENDOR, env=env, stdout=out, stderr=subprocess.PIPE
+        try:
+            with RAW_OUT.open("w") as out:
+                proc = subprocess.run(
+                    cmd, cwd=VENDOR, env=env, stdout=out, stderr=subprocess.PIPE,
+                    timeout=MOCHA_TIMEOUT_SECONDS,
+                )
+            stderr = proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            print(
+                f"node_validation: mocha exceeded {MOCHA_TIMEOUT_SECONDS:.0f}s "
+                "wall-clock budget; killed. Partial JSON (if any) is in "
+                f"{RAW_OUT}.",
+                file=sys.stderr,
             )
-        if proc.stderr:
-            sys.stderr.buffer.write(proc.stderr)
+            stderr = exc.stderr or b""
+        if stderr:
+            sys.stderr.buffer.write(stderr)
 
         if RAW_OUT.stat().st_size == 0:
-            print(
-                "node_validation: empty mocha output (build error?)", file=sys.stderr
-            )
+            print("node_validation: empty mocha output (build error?)", file=sys.stderr)
             return 1
 
-        # Quick one-line summary; full breakdown lives in the markdown report.
         import json as _json
         try:
             raw = _json.loads(RAW_OUT.read_text())
@@ -179,6 +240,7 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()
+        shutil.rmtree(storage_dir, ignore_errors=True)
 
     return 0
 
