@@ -212,6 +212,34 @@ For SecantusDB's *intended* niche — a single-process embeddable test surrogate
 
 Phase 2.5 verification: lowering the test threshold or marking it `xfail-on-cpython` is a reasonable next step. Re-evaluate when 3.13t / 3.14 land with stable no-GIL builds.
 
+#### Phase 2.6 spike (2026-05-10) — profile the actual bottleneck
+
+Before committing 13 days to a C-rewrite of the per-doc encoding (`_pack_entry`, `_index_key_variants`, `encode_value_directed`), ran `bench/profile_insert.py` — a single-thread `cProfile` of `Storage.insert` over 30,000 docs. The result invalidates the C-rewrite hypothesis.
+
+**Top cumulative-time consumers (15.55s total):**
+
+| % | Function | Layer |
+|---|---|---|
+| **30.5%** | `wiredtiger/packing.py:unpack` | WT SWIG bindings — pure-Python format-string packing |
+| **26.5%** | `bson/__init__.py:decode` (wraps C `_bson_to_dict`) | BSON read on cursor results |
+| **23.9%** | `wiredtiger/swig_wiredtiger.py:get_keys` | SWIG cursor result unpacking |
+| **20.9%** | `wiredtiger/swig_wiredtiger.py:get_values` | SWIG cursor result unpacking |
+| ~6% | our sortkey encoding (`_id_key`, `_encode_number`) | the C-rewrite target |
+| **NOT VISIBLE** | `_pack_entry`, `_index_key_variants` | the C-rewrite target |
+
+The hot path is the **WiredTiger Python bindings themselves**. Every cursor call round-trips through pure-Python `wiredtiger/packing.py` to handle WT's `key_format=SSu` / `value_format=u` / etc. encoding. That code holds the GIL throughout — so even if we move our own per-doc encoding to C, every WT call still serialises on the GIL.
+
+**Implication for the original C-rewrite plan**: rewriting `_pack_entry` etc. in C delivers **~5% improvement at best**, not the 3-5× I estimated. Wrong bottleneck.
+
+**Real path to lifting the GIL ceiling** (in increasing order of effort):
+1. Wait for free-threaded Python + a no-GIL-validated WT Python binding. Zero-cost to us; uncertain timeline.
+2. Fork WiredTiger's SWIG-generated Python bindings, replace with Cython or cffi that releases the GIL on every cursor op. ~4-6 weeks of careful work; needs feature parity across WT's full API surface; high regression risk.
+3. Add a "raw cursor" cffi shim alongside the SWIG layer, used only for the hot insert/scan paths. Smaller scope (~2 weeks) but bifurcates the codebase between the high-level (SWIG) and low-level (cffi) APIs.
+
+For SecantusDB's "single-process embeddable test surrogate" niche, option 1 (waiting) is the right answer. For "we want to compete on write throughput," option 2 is the work item.
+
+**Spike artefact kept**: `bench/profile_insert.py` is now a permanent diagnostic. Re-run it whenever someone asks "why isn't this faster?" — the answer will almost certainly still be in `wiredtiger/packing.py`.
+
 ### Phase 3 — WT explicit transactions per write batch (already done)
 
 The `Storage._batch_transaction()` context manager from a prior commit is already in place around `insert`/`update_matching`/`delete_matching`. Phase 2 keeps it; no new work here. Listing it for completeness in the plan.
