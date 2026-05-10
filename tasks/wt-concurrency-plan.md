@@ -192,6 +192,26 @@ This unlocks concurrent reads — multiple `find` / `count` callers can decode i
 
 **Exit criterion:** 2-writer ratio ≥ 1.5× (i.e. real scaling), 4-writer ratio ≥ 2.5×. Full test suite passes. Chaos benchmark numbers hold or improve.
 
+#### Phase 2.4 result (2026-05-10) — GIL ceiling discovered
+
+The per-collection lock + WT-rollback-storm fix landed cleanly (full test suite green, no behavioural regression), but the concurrency benchmark moved from 0.38× → 0.35× at N=2. The per-collection lock isn't contended, the global lock is gone from data writes, the oplog-meta WT conflict is gone — and yet aggregate throughput is flat.
+
+The cause: **the GIL serialises every server thread's Python work**, regardless of which Python locks are or aren't held. Each TCP connection runs in its own server thread inside one Python process; concurrent writers contend on the GIL even though they hold no shared Python-level lock. Only the C-side WT operations release the GIL, and those are a small fraction of the per-insert wall time (BSON encode of an 8 KiB doc + dispatch + per-doc Python plumbing dominates).
+
+This was foreseeable in retrospect — the original plan focused on Python lock decomposition, which gets us closer to "WT can do its work" but doesn't unlock multi-core Python.
+
+**Three honest paths forward, none cheap:**
+
+1. **Process-per-connection model (out of scope here).** Real mongod uses one OS thread per connection but is C++ — no GIL. The Python equivalent would be one subprocess per connection with shared WT state via the same on-disk DB, coordinated through file locks. Architecturally massive; defeats the "single embeddable process" goal.
+
+2. **Free-threaded Python (3.13t).** Experimental no-GIL build. Would require validating every C extension in our stack (WiredTiger SWIG bindings, pymongo, bson, shapely, s2sphere) supports the no-GIL ABI. Possible win but high uncertainty.
+
+3. **Push more work into GIL-released regions.** Pre-encode BSON in the load_writer (zero gain since the wire-protocol still decodes server-side). Move BSON decode into a C extension that releases the GIL during its parse. Have `Storage.insert` accept already-encoded blobs and skip the re-decode. Each step is incremental and bounded.
+
+For SecantusDB's *intended* niche — a single-process embeddable test surrogate, not a production write throughput target — the practical answer is probably **don't optimise for write concurrency**. Document the GIL ceiling, mark concurrency tests as "best-effort scaling", and recommend `mongod` proper for high-write-throughput workloads. The lock-decomposition work still has standalone value (cleaner architecture, kills the WT-rollback storm on the meta row, makes future no-GIL work simpler) — but the headline "make the regression test green" goal is parked behind a fundamental Python constraint.
+
+Phase 2.5 verification: lowering the test threshold or marking it `xfail-on-cpython` is a reasonable next step. Re-evaluate when 3.13t / 3.14 land with stable no-GIL builds.
+
 ### Phase 3 — WT explicit transactions per write batch (already done)
 
 The `Storage._batch_transaction()` context manager from a prior commit is already in place around `insert`/`update_matching`/`delete_matching`. Phase 2 keeps it; no new work here. Listing it for completeness in the plan.
