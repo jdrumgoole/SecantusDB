@@ -1061,6 +1061,32 @@ def _stage_index_stats(
     ]
 
 
+def _stage_current_op(
+    _spec: Any, _docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$currentOp`` — currently-executing operations.
+
+    Real ``mongod`` reports every operation in flight on the server.
+    SecantusDB processes commands synchronously per connection and
+    doesn't keep a per-op registry, but we still return one stub
+    "op" document so callers that introspect the result (e.g.
+    mongo-ruby-driver's ``database_spec`` collation test, which
+    checks that every doc carries a ``host`` field) get a
+    plausibly-shaped row. The stub is the ``$currentOp`` itself —
+    the aggregation request that produced it — minus any sensitive
+    state.
+    """
+    return [
+        {
+            "type": "op",
+            "host": "secantus",
+            "desc": "$currentOp",
+            "active": False,
+            "currentOpTime": "",
+        }
+    ]
+
+
 def _stage_bucket_auto(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1338,6 +1364,7 @@ _STAGES = {
     "$bucketAuto": _stage_bucket_auto,
     "$collStats": _stage_coll_stats,
     "$indexStats": _stage_index_stats,
+    "$currentOp": _stage_current_op,
     "$out": _stage_out,
     "$merge": _stage_merge,
     "$graphLookup": _stage_graph_lookup,

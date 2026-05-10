@@ -30,13 +30,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-go-driver"
 RAW_OUT = REPO_ROOT / ".validation" / "go-raw.ndjson"
 
-
-def _find_free_port() -> int:
-    """OS-assigned free TCP port. Race window between close and the
-    daemon's bind is acceptable for a dev tool."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+# Project-wide convention — see CLAUDE.md ``Tooling`` section.
+DAEMON_PORT = 27018
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -74,7 +69,7 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _find_free_port()
+    port = DAEMON_PORT
     daemon_cmd = [
         sys.executable,
         "-m",

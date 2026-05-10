@@ -356,6 +356,43 @@ def _start_session(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _kill_all_sessions(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop every active session.
+
+    Driver test suites (mongo-ruby-driver in particular) call this
+    between tests to guarantee clean session state. Real mongod
+    accepts an optional ``users`` array filter to limit the kill;
+    SecantusDB ignores the filter and clears all sessions, since the
+    sessions registry is not yet partitioned by principal.
+    """
+    if ctx.sessions is not None:
+        ctx.sessions.clear()
+    return {"ok": 1.0}
+
+
+def _kill_all_sessions_by_pattern(
+    _doc: dict[str, Any], ctx: CommandContext
+) -> dict[str, Any]:
+    """Pattern-filtered variant of ``killAllSessions``.
+
+    Same effective semantics as ``killAllSessions`` — drop every
+    session — because the registry isn't lsid-pattern-indexed.
+    """
+    if ctx.sessions is not None:
+        ctx.sessions.clear()
+    return {"ok": 1.0}
+
+
+def _kill_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Drop the listed sessions (driver-callable variant)."""
+    if ctx.sessions is not None:
+        for entry in doc.get("killSessions") or []:
+            lsid = _lsid_bytes_from_arg(entry)
+            if lsid is not None:
+                ctx.sessions.unregister(lsid)
+    return {"ok": 1.0}
+
+
 def _refresh_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Bump the idle TTL on listed sessions.
 
@@ -803,6 +840,19 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         filter_ = inner.get("filter") or inner.get("query") or {}
         sort = inner.get("sort")
         hint = inner.get("hint")
+    # ``verbosity`` controls which sections of the explain reply the
+    # client gets. Mongod's three levels:
+    #   queryPlanner       — winningPlan only, no execution
+    #   executionStats     — winningPlan + actual execution counts
+    #   allPlansExecution  — adds rejected-plan stats (we treat as
+    #                        executionStats since we have no
+    #                        rejected plans).
+    # mongo-java-driver's AbstractExplainTest asserts that QUERY_PLANNER
+    # verbosity *omits* the executionStats key, so we have to honour
+    # it rather than always returning both sections.
+    verbosity = doc.get("verbosity", "executionStats")
+    if not isinstance(verbosity, str):
+        verbosity = "executionStats"
     namespace = _ns(ctx.db_name, coll) if coll else f"{ctx.db_name}.$cmd"
     if coll:
         plan = ctx.storage.explain_plan(ctx.db_name, coll, filter_, sort=sort, hint=hint)
@@ -827,21 +877,13 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     else:
         winning_plan = {"stage": "COLLSCAN", "filter": filter_}
         execution_stage = {"stage": "COLLSCAN", "nReturned": 0}
-    return {
+    reply: dict[str, Any] = {
         "queryPlanner": {
             "namespace": namespace,
             "indexFilterSet": False,
             "parsedQuery": filter_,
             "winningPlan": winning_plan,
             "rejectedPlans": [],
-        },
-        "executionStats": {
-            "executionSuccess": True,
-            "nReturned": 0,
-            "executionTimeMillis": 0,
-            "totalKeysExamined": 0,
-            "totalDocsExamined": 0,
-            "executionStages": execution_stage,
         },
         "command": inner if isinstance(inner, dict) else {},
         "serverInfo": {
@@ -852,6 +894,16 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         },
         "ok": 1.0,
     }
+    if verbosity != "queryPlanner":
+        reply["executionStats"] = {
+            "executionSuccess": True,
+            "nReturned": 0,
+            "executionTimeMillis": 0,
+            "totalKeysExamined": 0,
+            "totalDocsExamined": 0,
+            "executionStages": execution_stage,
+        }
+    return reply
 
 
 def _ns(db: str, coll: str) -> str:
@@ -1075,6 +1127,19 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["count"]
     filter_ = doc.get("query") or {}
     n = ctx.storage.count_matching(ctx.db_name, coll, filter_)
+    # Mongod's ``count`` honours ``limit`` and ``skip`` — the cursor-side
+    # ``cursor.count()`` API in the Node / legacy drivers translates to a
+    # ``count`` command with these fields populated from the cursor's
+    # configured limits, and ``count`` is expected to return
+    # ``min(max(matches - skip, 0), limit)``. mongo-node-driver's
+    # ``crud_api`` integration test asserts this directly: a 4-doc
+    # collection, ``.limit(2)``, then ``cursor.count()`` should yield 2.
+    skip = int(doc.get("skip") or 0)
+    if skip > 0:
+        n = max(n - skip, 0)
+    limit = int(doc.get("limit") or 0)
+    if limit > 0:
+        n = min(n, limit)
     return {"n": n, "ok": 1.0}
 
 
@@ -2952,6 +3017,9 @@ _HANDLERS: dict[str, CommandHandler] = {
     "endSessions": _end_sessions,
     "startSession": _start_session,
     "refreshSessions": _refresh_sessions,
+    "killSessions": _kill_sessions,
+    "killAllSessions": _kill_all_sessions,
+    "killAllSessionsByPattern": _kill_all_sessions_by_pattern,
     "abortTransaction": _abort_transaction,
     "commitTransaction": _commit_transaction,
     "getLog": _get_log,
@@ -3320,8 +3388,54 @@ def _maybe_record_profile(
         logger.warning("profile-write failed for %s: %s", db, exc)
 
 
+# Read-concern levels mongod accepts. Anything else is a parse error
+# (code 9, FailedToParse). Real mongod's enum: ``local``, ``available``,
+# ``majority``, ``linearizable``, ``snapshot``. SecantusDB doesn't
+# implement a per-level read path — every read sees the latest committed
+# state — but we still validate the level so drivers that probe with
+# garbage values (e.g. mongo-ruby-driver's
+# ``read concern is not valid raises an exception`` test) get the same
+# error shape they'd see against real mongod.
+_VALID_READ_CONCERN_LEVELS = frozenset(
+    {"local", "available", "majority", "linearizable", "snapshot"}
+)
+
+# MongoDB stable API: only version "1" exists. Anything else surfaces
+# as ``APIVersionError`` (code 322), per the upstream
+# ``mongo-ruby-driver`` test ``database_spec.rb:874`` which asserts
+# exactly this code on ``apiVersion: 'does-not-exist'``.
+_VALID_API_VERSIONS = frozenset({"1"})
+
+
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
+    # Read-concern + apiVersion validation runs before every command
+    # — they're cross-cutting concerns the wire layer should reject
+    # uniformly, so invalid shapes don't silently pass through to
+    # handlers that don't read those fields.
+    rc = doc.get("readConcern")
+    if isinstance(rc, Mapping) and "level" in rc:
+        level = rc["level"]
+        if not isinstance(level, str) or level not in _VALID_READ_CONCERN_LEVELS:
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"Specified readConcern level {level!r} is not valid"
+                ),
+                "code": 9,
+                "codeName": "FailedToParse",
+            }
+    api_version = doc.get("apiVersion")
+    if api_version is not None and api_version not in _VALID_API_VERSIONS:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Provided apiVersion {api_version!r} is not supported. "
+                f"Supported versions: {sorted(_VALID_API_VERSIONS)}"
+            ),
+            "code": 322,
+            "codeName": "APIVersionError",
+        }
     # Count every dispatched command — even unknown / unauth-rejected
     # ones — so serverStatus.network.numRequests reflects raw wire
     # traffic, not just the successful subset. Mongod's accounting is
