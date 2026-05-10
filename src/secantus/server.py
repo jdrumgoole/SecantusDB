@@ -15,6 +15,7 @@ from secantus.auth import ConnectionAuth
 from secantus.commands import CommandContext, dispatch
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorRegistry
+from secantus.failpoints import FailPointRegistry
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.sessions import SessionRegistry
@@ -68,6 +69,7 @@ class SecantusDBServer:
         replica_set_name: str | None = "secantus",
         require_auth: bool = False,
         ttl_sweep_seconds: float = 60.0,
+        noop_heartbeat_seconds: float = 0.0,
         client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
     ) -> None:
@@ -93,6 +95,7 @@ class SecantusDBServer:
             storage_path,
             enable_oplog=replica_set_name is not None,
             ttl_sweep_seconds=ttl_sweep_seconds,
+            noop_heartbeat_seconds=noop_heartbeat_seconds,
         )
         self.cursors = CursorRegistry()
         # Per-server counters surfaced through `serverStatus`. Started
@@ -111,6 +114,11 @@ class SecantusDBServer:
         # session-management commands actually have state to operate
         # on instead of returning canned ``{ok: 1}``.
         self.sessions = SessionRegistry()
+        # Per-server registry of active ``configureFailPoint`` entries.
+        # Driver test suites lean on this to inject deterministic
+        # errors at the wire (failCommand → errorCode / writeConcernError).
+        # See ``secantus.failpoints`` for the supported subset.
+        self.failpoints = FailPointRegistry()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -263,6 +271,7 @@ class SecantusDBServer:
                             connections=self.connections,
                             logs=self.logs,
                             sessions=self.sessions,
+                            failpoints=self.failpoints,
                         )
                         response_doc = dispatch(body, ctx)
                         # `moreToCome` (bit 1) is the wire signal for
@@ -292,6 +301,7 @@ class SecantusDBServer:
                             connections=self.connections,
                             logs=self.logs,
                             sessions=self.sessions,
+                            failpoints=self.failpoints,
                         )
                         response_doc = dispatch(op.query, ctx)
                         reply = build_op_reply(
