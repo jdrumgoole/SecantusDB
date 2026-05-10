@@ -28,16 +28,17 @@
           <li><a href="/maintenance" class="{% if active == 'maintenance' %}nav-current{% endif %}">Maintenance</a></li>
           <li><a href="/logs" class="{% if active == 'logs' %}nav-current{% endif %}">Logs</a></li>
           <li><a href="/backup" class="{% if active == 'backup' %}nav-current{% endif %}">Backup</a></li>
+          <li><a href="/server" class="{% if active == 'server' %}nav-current{% endif %}">Server</a></li>
         </ul>
       </nav>
     </aside>
     <main class="content">
       <header class="page-header">
         <h1>{{ title }}</h1>
-        <span class="server-badge" title="Target server (passed via --uri)">
+        <a class="server-badge" href="/server" title="Click to change target server">
           <span class="server-badge-dot">●</span>
           <code>{{ request.app.state.mongo_uri_display }}</code>
-        </span>
+        </a>
       </header>
       {% block content %}{% endblock %}
     </main>
