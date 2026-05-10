@@ -2095,22 +2095,33 @@ def test_cluster_roles_smoke_via_java_driver(server_with_auth: SecantusDBServer)
 # ---------------------------------------------------------------------------
 
 
+def _run_ruby_smoke(
+    smoke_filename: str,
+    server_uri: str,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_uri,
+        "PATH": f"{Path(_RUBY).parent}:{os.environ.get('PATH', '')}",
+    }
+    if extra_env:
+        env.update(extra_env)
+    return _run(
+        [_BUNDLE, "exec", "ruby", str(_RUBY_SMOKE_DIR / smoke_filename)],
+        cwd=_RUBY_SMOKE_DIR,
+        env=env,
+        timeout=120.0,
+    )
+
+
 @pytest.mark.skipif(not _RUBY_AVAILABLE, reason="ruby >= 3.0 with bundle not on PATH")
 @pytest.mark.xdist_group(name="ruby_smokes")
 def test_types_smoke_via_ruby_driver(server: SecantusDBServer) -> None:
     if not _ensure_ruby_bundle():
         pytest.skip("could not bundle install mongo-ruby-driver")
-    env = {
-        **os.environ,
-        "MONGODB_URI": server.uri,
-        "PATH": f"{Path(_RUBY).parent}:{os.environ.get('PATH', '')}",
-    }
-    result = _run(
-        [_BUNDLE, "exec", "ruby", str(_RUBY_SMOKE_DIR / "types_smoke.rb")],
-        cwd=_RUBY_SMOKE_DIR,
-        env=env,
-        timeout=120.0,
-    )
+    result = _run_ruby_smoke("types_smoke.rb", server.uri)
     assert result.returncode == 0, (
         f"ruby types smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -2118,9 +2129,53 @@ def test_types_smoke_via_ruby_driver(server: SecantusDBServer) -> None:
     assert "OK" in result.stdout
 
 
+@pytest.mark.skipif(not _RUBY_AVAILABLE, reason="ruby >= 3.0 with bundle not on PATH")
+@pytest.mark.xdist_group(name="ruby_smokes")
+def test_rbac_smoke_via_ruby_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_ruby_bundle():
+        pytest.skip("could not bundle install mongo-ruby-driver")
+    result = _run_ruby_smoke(
+        "rbac_smoke.rb",
+        server_with_auth.uri,
+        extra_env={"ADMIN_PASSWORD": _ADMIN_PWD},
+    )
+    assert result.returncode == 0, (
+        f"ruby rbac smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _RUBY_AVAILABLE, reason="ruby >= 3.0 with bundle not on PATH")
+@pytest.mark.xdist_group(name="ruby_smokes")
+def test_bulk_smoke_via_ruby_driver(server: SecantusDBServer) -> None:
+    if not _ensure_ruby_bundle():
+        pytest.skip("could not bundle install mongo-ruby-driver")
+    result = _run_ruby_smoke("bulk_smoke.rb", server.uri)
+    assert result.returncode == 0, (
+        f"ruby bulk smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
 # ---------------------------------------------------------------------------
-# PHP (mongo-php-library + ext-mongodb) — BSON type fidelity
+# PHP (mongo-php-library + ext-mongodb) — feature matrix
 # ---------------------------------------------------------------------------
+
+
+def _run_php_smoke(
+    smoke_filename: str,
+    server_uri: str,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    env = {**os.environ, "MONGODB_URI": server_uri}
+    if extra_env:
+        env.update(extra_env)
+    return _run(
+        [_PHP, str(_PHP_SMOKE_DIR / smoke_filename)],
+        env=env,
+        timeout=60.0,
+    )
 
 
 @pytest.mark.skipif(not _PHP_AVAILABLE, reason="php with ext-mongodb + composer not on PATH")
@@ -2128,13 +2183,36 @@ def test_types_smoke_via_ruby_driver(server: SecantusDBServer) -> None:
 def test_types_smoke_via_php_driver(server: SecantusDBServer) -> None:
     if not _ensure_php_vendor():
         pytest.skip("could not composer install mongodb/mongodb")
-    env = {**os.environ, "MONGODB_URI": server.uri}
-    result = _run(
-        [_PHP, str(_PHP_SMOKE_DIR / "types_smoke.php")],
-        env=env,
-        timeout=60.0,
-    )
+    result = _run_php_smoke("types_smoke.php", server.uri)
     assert result.returncode == 0, (
         f"php types smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _PHP_AVAILABLE, reason="php with ext-mongodb + composer not on PATH")
+@pytest.mark.xdist_group(name="php_smokes")
+def test_rbac_smoke_via_php_driver(server_with_auth: SecantusDBServer) -> None:
+    if not _ensure_php_vendor():
+        pytest.skip("could not composer install mongodb/mongodb")
+    result = _run_php_smoke(
+        "rbac_smoke.php",
+        server_with_auth.uri,
+        extra_env={"ADMIN_PASSWORD": _ADMIN_PWD},
+    )
+    assert result.returncode == 0, (
+        f"php rbac smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+@pytest.mark.skipif(not _PHP_AVAILABLE, reason="php with ext-mongodb + composer not on PATH")
+@pytest.mark.xdist_group(name="php_smokes")
+def test_bulk_smoke_via_php_driver(server: SecantusDBServer) -> None:
+    if not _ensure_php_vendor():
+        pytest.skip("could not composer install mongodb/mongodb")
+    result = _run_php_smoke("bulk_smoke.php", server.uri)
+    assert result.returncode == 0, (
+        f"php bulk smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout
