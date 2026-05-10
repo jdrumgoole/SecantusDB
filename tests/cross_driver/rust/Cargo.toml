@@ -30,7 +30,20 @@ name = "types_smoke"
 path = "src/bin/types_smoke.rs"
 
 [dependencies]
-mongodb = { version = "3", default-features = false, features = ["sync"] }
+# mongo-rust-driver 3.x requires three explicit opt-ins that prior
+# 2.x lines didn't:
+#   * a TLS provider (we pick rustls-tls — pure Rust, no openssl link)
+#   * a BSON line (bson-2 keeps us on the bson 2.x crate we already
+#     pin below)
+#   * the forward-compat marker (compat-3-3-0) — driver upstream
+#     gates breaking changes behind this so callers acknowledge the
+#     3.3.x semantics they're targeting.
+# Without these the build errors with "At least one of the features
+# 'rustls-tls' / 'rustls-tls-aws-lc' / 'openssl-tls' must be enabled"
+# etc. The smoke binary itself doesn't actually open a TLS connection
+# (it's loopback to an embedded SecantusDB), but the driver's feature
+# system requires the choice be made at compile time.
+mongodb = { version = "3", default-features = false, features = ["sync", "rustls-tls", "bson-2", "compat-3-3-0"] }
 bson = "2"
 
 [profile.release]

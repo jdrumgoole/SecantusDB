@@ -28,6 +28,15 @@ import pytest
 
 from secantus import SecantusDBServer
 
+# See tests/test_cross_driver_features.py for rationale — same fcntl /
+# shell-script POSIX dependency.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Cross-driver smokes use fcntl.flock + POSIX shell scripts; "
+    "POSIX runners (Linux/macOS) cover the wire-protocol gaps these tests "
+    "are meant to catch.",
+)
+
 _HERE = Path(__file__).parent
 _CROSS_DRIVER = _HERE / "cross_driver"
 

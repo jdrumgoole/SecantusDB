@@ -33,21 +33,27 @@ from __future__ import annotations
 #   * ``root-user`` + ``ruby-test-user`` pre-provisioned (the runner
 #     does this via a setup pymongo client before invoking rspec).
 INCLUDE: list[str] = [
-    # Verified terminates against SecantusDB in ~30 s with 90 passes / 7
-    # failures / 15 pending out of 112 — full audit lives in
-    # docs/validation-report-ruby.md.
+    # Widening one file at a time. Each is added only after the
+    # runner's wall-clock guard confirms it terminates against
+    # SecantusDB.
     "spec/mongo/database_spec.rb",
-    # Other ``spec/mongo/*_spec.rb`` integration files have at least one
-    # test that hangs (tailable getMore, session-bound cursor wait,
-    # change-stream resume, etc.). They're staged here as comments so
-    # widening the gauge is just a matter of un-commenting one at a
-    # time and confirming the runner's wall-clock guard doesn't trip.
-    # "spec/mongo/collection_crud_spec.rb",
-    # "spec/mongo/collection_ddl_spec.rb",
-    # "spec/mongo/collection_spec.rb",
-    # "spec/mongo/cursor_spec.rb",
-    # "spec/mongo/bulk_write_spec.rb",
-    # "spec/mongo/index/view_spec.rb",
+    "spec/mongo/collection_ddl_spec.rb",
+    "spec/mongo/index/view_spec.rb",
+    "spec/mongo/address_spec.rb",
+    "spec/mongo/config_spec.rb",
+    # Deferred (each ran the 300s wall-clock kill when included):
+    # - ``collection_spec.rb`` — large suite with several tailable /
+    #   change-stream paths
+    # - ``server_spec.rb`` / ``cluster_spec.rb`` / ``auth_spec.rb`` —
+    #   SDAM + connection-pool retry loops that don't terminate
+    #   against our single-node-as-RS topology.
+    # Larger spec files staged for later (each has known hangs or
+    # depends on features SecantusDB doesn't aim to support):
+    # "spec/mongo/collection_crud_spec.rb",   # mostly works; widen separately
+    # "spec/mongo/cursor_spec.rb",            # tailable getMore hangs
+    # "spec/mongo/bulk_write_spec.rb",        # writeConcern enforcement
+    # "spec/mongo/session_spec.rb",           # multi-doc transactions
+    # "spec/mongo/session_transaction_spec.rb",
 ]
 
 # RSpec ``--tag ~<name>`` patterns to skip slow / env-dependent tests.

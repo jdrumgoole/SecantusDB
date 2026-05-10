@@ -24,6 +24,21 @@ from __future__ import annotations
 # which is the seam through which the test framework expects an actual
 # ``mongod`` (or in our case, SecantusDB) at ``MONGODB_URI``.
 INCLUDE: list[str] = [
-    # Verified terminates against SecantusDB. Add more as confirmed.
+    # Widening one file at a time — each verified to terminate
+    # within the runner's 600 s wall-clock guard before being
+    # added. The full ``test/integration/crud/`` set has ~20 files;
+    # blind-adding all of them surfaces tailable / change-stream
+    # hangs that pin the gauge, so we stage them in batches.
     "test/integration/crud/crud_api.test.ts",
+    "test/integration/crud/abstract_operation.test.ts",
+    "test/integration/crud/aggregation.test.ts",
+    "test/integration/crud/document_validation.test.ts",
+    "test/integration/crud/explain.test.ts",
+    "test/integration/crud/find.test.ts",
+    "test/integration/crud/find_and_modify.test.ts",
+    "test/integration/crud/insert.test.ts",
+    "test/integration/crud/remove.test.ts",
+    "test/integration/crud/stats.test.ts",
+    "test/integration/crud/unicode.test.ts",
+    "test/integration/crud/server_errors.test.ts",
 ]

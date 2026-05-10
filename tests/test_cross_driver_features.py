@@ -54,12 +54,28 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from secantus import SecantusDBServer
 from secantus.auth import SCRAM_SHA_256, derive_credentials
+
+# Cross-driver tooling-presence skipif gates assume a POSIX environment
+# (the node / java / ruby / go skipif checks pass on Windows runners
+# because npm / java / ruby ARE preinstalled, but the actual smoke
+# scripts use ``fcntl.flock`` for cross-xdist coordination and shell
+# scripts the runner can't exec). Skip the whole module on Windows
+# rather than try to port the coordination primitive — none of the
+# Windows-specific bugs the cross-driver gauges would catch are
+# different from what the POSIX runs already cover.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Cross-driver smokes use fcntl.flock + POSIX shell scripts; "
+    "POSIX runners (Linux/macOS) cover the wire-protocol gaps these tests "
+    "are meant to catch.",
+)
 
 _HERE = Path(__file__).parent
 _CROSS_DRIVER = _HERE / "cross_driver"
@@ -69,6 +85,7 @@ _JAVA_SMOKE_DIR = _CROSS_DRIVER / "java"
 _JAVA_SMOKES_JAR = _JAVA_SMOKE_DIR / "build" / "libs" / "secantus-java-smokes-all.jar"
 _RUBY_SMOKE_DIR = _CROSS_DRIVER / "ruby"
 _PHP_SMOKE_DIR = _CROSS_DRIVER / "php"
+_RUST_SMOKE_DIR = _CROSS_DRIVER / "rust"
 
 _MONGOSH = shutil.which("mongosh")
 _NODE = shutil.which("node")
@@ -76,6 +93,7 @@ _NPM = shutil.which("npm")
 _GO = shutil.which("go")
 _JAVA = shutil.which("java")
 _GRADLE = shutil.which("gradle")
+_CARGO = shutil.which("cargo")
 
 
 # Ruby + PHP toolchains. macOS's system Ruby (2.6.x at /usr/bin/ruby)
@@ -121,6 +139,7 @@ _PHP = _resolve_php()
 _COMPOSER = shutil.which("composer") or "/opt/homebrew/bin/composer"
 _RUBY_AVAILABLE = _RUBY is not None and _BUNDLE is not None
 _PHP_AVAILABLE = _PHP is not None and Path(_COMPOSER).is_file()
+_RUST_AVAILABLE = _CARGO is not None
 
 
 def _run(
@@ -2304,6 +2323,92 @@ def test_cluster_roles_smoke_via_php_driver(server_with_auth: SecantusDBServer) 
     )
     assert result.returncode == 0, (
         f"php cluster-roles smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Rust (mongo-rust-driver) — BSON type fidelity
+# ---------------------------------------------------------------------------
+#
+# The Rust smoke (``tests/cross_driver/rust/src/bin/types_smoke.rs``)
+# is the same shape as the Ruby / Java / Node / Go / PHP types tests:
+# insert one document touching every BSON variant, find it back, assert
+# round-trip parity. Skips cleanly if ``cargo`` isn't on PATH; xfail-
+# marked because mongo-rust-driver upstream has had recurrent
+# Rust-version / tokio / Decimal128 compatibility wobbles that are out
+# of scope to track in this repo. The xfail tag is ``strict=False`` so
+# unexpected passes don't fail the suite — they just surface in test
+# logs as "this stopped being broken, time to retire the xfail".
+
+
+_RUST_BIN_TYPES = _RUST_SMOKE_DIR / "target" / "release" / "types_smoke"
+
+
+def _ensure_rust_bin(bin_name: str) -> bool:
+    """Build a Rust smoke binary once via ``cargo build --release``.
+
+    Same xdist coordination pattern as ``_ensure_ruby_bundle`` /
+    ``_ensure_node_modules``: workers race on a cold ``target/`` dir,
+    so flock a sentinel file and let only one worker run cargo. The
+    others wait then observe the populated ``target/release/<bin>``.
+
+    Returns False if cargo is missing OR the build fails (the upstream
+    driver / toolchain churn the Cargo.toml header documents).
+    """
+    if not _RUST_AVAILABLE:
+        return False
+    target = _RUST_SMOKE_DIR / "target" / "release" / bin_name
+    if target.is_file():
+        return True
+    import fcntl
+
+    lock_path = _RUST_SMOKE_DIR / ".cargo.lock-build"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if target.is_file():
+            return True
+        # cargo build can take 60–120s on a cold target/. Give it
+        # enough room without making the harness hostage to a wedge.
+        result = _run(
+            [_CARGO, "build", "--release", "--bin", bin_name],
+            cwd=_RUST_SMOKE_DIR,
+            timeout=300.0,
+        )
+        return result.returncode == 0 and target.is_file()
+
+
+def _run_rust_smoke(
+    bin_path: Path,
+    server_uri: str,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    env = {
+        **os.environ,
+        "MONGODB_URI": server_uri,
+    }
+    if extra_env:
+        env.update(extra_env)
+    return _run([str(bin_path)], env=env, timeout=60.0)
+
+
+@pytest.mark.skipif(not _RUST_AVAILABLE, reason="cargo not on PATH")
+@pytest.mark.xdist_group(name="rust_smokes")
+@pytest.mark.xfail(
+    reason="mongo-rust-driver upstream has recurrent toolchain compat "
+    "issues (tokio / Decimal128 / Rust version drift). Tracked in "
+    "tests/cross_driver/rust/Cargo.toml header.",
+    strict=False,
+)
+def test_types_smoke_via_rust_driver(server: SecantusDBServer) -> None:
+    if not _ensure_rust_bin("types_smoke"):
+        pytest.skip("cargo build --release of types_smoke failed; see Cargo.toml header")
+    result = _run_rust_smoke(_RUST_BIN_TYPES, server.uri)
+    assert result.returncode == 0, (
+        f"rust types smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout

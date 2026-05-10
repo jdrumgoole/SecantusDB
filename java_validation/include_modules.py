@@ -81,6 +81,12 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     "com.mongodb.client.unified.CommandLoggingTest",
     "com.mongodb.client.unified.CommandMonitoringTest",
     "com.mongodb.client.unified.ConnectionPoolLoggingTest",
+    # More candidates being widened (safer: no change-streams /
+    # sessions / retryable in this batch — those have known
+    # tailable-getMore hang risk).
+    "com.mongodb.client.ClientMetadataTest",
+    "com.mongodb.client.ClusterEventPublishingTest",
+    "com.mongodb.client.unified.UnifiedCrudTest",
     # Excluded (need features that are intentionally out of scope, or
     # that need a deeper investigation to be tractable):
     # - ServerSelectionLoggingTest — half its scenarios depend on the
