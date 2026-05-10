@@ -13,3 +13,6 @@
 [submodule "vendor/mongo-java-driver"]
 	path = vendor/mongo-java-driver
 	url = https://github.com/mongodb/mongo-java-driver.git
+[submodule "vendor/mongo-ruby-driver"]
+	path = vendor/mongo-ruby-driver
+	url = https://github.com/mongodb/mongo-ruby-driver.git

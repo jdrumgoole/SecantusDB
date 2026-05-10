@@ -333,6 +333,36 @@ def validate_node(c: Context) -> None:
     print("\nWrote docs/validation-report-node.md")
 
 
+@task(name="validate-ruby")
+def validate_ruby(c: Context) -> None:
+    """Run mongo-ruby-driver's tests against an embedded SecantusDB.
+
+    Generates docs/validation-report-ruby.md with a per-category pass /
+    fail / pending / pass-rate breakdown — the Ruby-driver analogue of
+    the pymongo / Go / Node / Java gauges. Requires Ruby (>= 2.7) and
+    bundler on PATH (e.g. `brew install ruby` on macOS, then add
+    `/opt/homebrew/opt/ruby/bin` to PATH). First run does a one-time
+    `bundle install` (~1-2 min) inside vendor/mongo-ruby-driver/.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/mongo-ruby-driver/mongo.gemspec").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m ruby_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m ruby_validation.generate_report "
+        ".validation/ruby-raw.json docs/validation-report-ruby.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-ruby.md")
+
+
 @task(name="validate-java")
 def validate_java(c: Context) -> None:
     """Run mongo-java-driver's tests against an embedded SecantusDB.
