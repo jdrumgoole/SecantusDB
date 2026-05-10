@@ -59,30 +59,35 @@
     <header>
       <h3>mongo-ruby-driver</h3>
       <span class="lang">Ruby</span>
-      <span class="kind smoke">Smoke-tested</span>
+      <span class="kind smoke">Feature smokes</span>
     </header>
+    <div class="pass-rate">
+      <span class="rate">3 / 3</span>
+      <span class="rate-label">features verified</span>
+    </div>
     <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x).
-      Wire-protocol round-trip is verified by a BSON type-fidelity
-      smoke that inserts a doc with every distinct BSON class
-      (<code>ObjectId</code>, <code>Decimal128</code>,
-      <code>UTCDateTime</code>, <code>Binary</code>, int32 / int64,
-      bool / null, nested doc, mixed array) and asserts each field's
-      class &amp; value round-trip end-to-end.</p>
+      Wire-protocol round-trip is verified across BSON type fidelity,
+      RBAC denial (SCRAM-SHA-256 auth + privilege check), and a
+      mixed <code>bulkWrite</code> covering insert / update / replace
+      / upsert / delete with explicit count assertions.</p>
   </article>
 
   <article class="driver">
     <header>
       <h3>mongo-php-library</h3>
       <span class="lang">PHP</span>
-      <span class="kind smoke">Smoke-tested</span>
+      <span class="kind smoke">Feature smokes</span>
     </header>
+    <div class="pass-rate">
+      <span class="rate">3 / 3</span>
+      <span class="rate-label">features verified</span>
+    </div>
     <p class="note">The official high-level PHP library, built on
-      the C-based <code>ext-mongodb</code> extension. The same BSON
-      type-fidelity smoke is run via <code>composer install</code> +
-      <code>php types_smoke.php</code> against an embedded SecantusDB
-      daemon &mdash; <code>ObjectId</code>, <code>Decimal128</code>,
-      <code>UTCDateTime</code>, <code>Int64</code>, <code>Binary</code>
-      all round-trip cleanly.</p>
+      the C-based <code>ext-mongodb</code> extension. Same three
+      features (BSON type fidelity, RBAC denial, mixed
+      <code>bulkWrite</code>) verified end-to-end via
+      <code>composer install</code> + <code>php &lt;feature&gt;_smoke.php</code>
+      against an embedded SecantusDB daemon.</p>
   </article>
 
   <article class="driver">
