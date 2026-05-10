@@ -35,6 +35,9 @@ def _render(
     flash: str | None = None,
     pending_uri: str = "",
     status_code: int = 200,
+    embedded_flash: dict[str, str] | None = None,
+    embedded_error: str | None = None,
+    pending_storage: str = "",
 ) -> HTMLResponse:
     targets = []
     try:
@@ -62,6 +65,11 @@ def _render(
             "error": error,
             "flash": flash,
             "pending_uri": pending_uri,
+            "embedded": request.app.state.embedded.status(),
+            "embedded_default_path": str(request.app.state.embedded.default_storage_path),
+            "embedded_flash": embedded_flash,
+            "embedded_error": embedded_error,
+            "pending_storage": pending_storage,
         },
         status_code=status_code,
     )
@@ -108,3 +116,39 @@ def post_forget(
         )
     request.app.state.targets.forget(uri)
     return _render(request, flash=f"Forgot {display_uri(uri)}")
+
+
+@router.post("/embedded/start", response_class=HTMLResponse)
+def post_embedded_start(
+    request: Request,
+    storage_path: str = Form(""),
+) -> HTMLResponse:
+    path = storage_path.strip() or None
+    try:
+        uri = request.app.state.embedded.start(storage_path=path)
+    except OSError as exc:
+        return _render(
+            request,
+            embedded_error=f"Could not start embedded server: {exc}",
+            pending_storage=storage_path,
+        )
+    try:
+        swap_target(request.app, uri)
+        flash = {"kind": "ok", "msg": f"Started embedded server at {uri}"}
+    except SwapError as exc:
+        flash = {
+            "kind": "err",
+            "msg": (
+                f"Started embedded server at {uri}, but couldn't switch the admin app to it: {exc}"
+            ),
+        }
+    return _render(request, embedded_flash=flash)
+
+
+@router.post("/embedded/stop", response_class=HTMLResponse)
+def post_embedded_stop(request: Request) -> HTMLResponse:
+    request.app.state.embedded.stop()
+    return _render(
+        request,
+        embedded_flash={"kind": "ok", "msg": "Stopped embedded server."},
+    )

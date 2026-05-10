@@ -1646,16 +1646,27 @@ async def test_dashboard_badge_says_embedded_when_target_is_embedded(server, tmp
         app.state.mongo.close()
 
 
-# ---- Dashboard embedded-server widget ---------------------------------------
+# ---- /server embedded-server widget -----------------------------------------
 
 
-async def test_dashboard_renders_embedded_widget_when_stopped(
+async def test_server_page_renders_embedded_widget_when_stopped(
     http: AsyncClient,
 ) -> None:
-    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    """The embedded-server controls live on the /server tab (alongside
+    target switching), not on the dashboard."""
+    r = await http.get("/server", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "Embedded SecantusDB server" in r.text
     assert "stopped" in r.text
+
+
+async def test_dashboard_no_longer_shows_embedded_widget(
+    http: AsyncClient,
+) -> None:
+    """Reverse of the above: the dashboard is now metrics-only."""
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Embedded SecantusDB server" not in r.text
 
 
 async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:

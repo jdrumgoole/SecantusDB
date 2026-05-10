@@ -412,7 +412,13 @@ body {
   padding-top: 0.85rem;
 }
 
-.docs-table .doc-body {
+/* Default <pre class="doc-body"> styling. Used inline by query results,
+   change-stream events, profiler entries, etc. The .docs-table descendant
+   block below tightens it for table cells. The explicit margin: 0 here
+   matters: without it, the browser default of ~1em top + bottom stacks
+   with the parent flex/grid gap and produces a visible blank line
+   between consecutive documents. */
+.doc-body {
   margin: 0;
   padding: 0.5rem 0.75rem;
   background: var(--bg);
@@ -425,6 +431,11 @@ body {
   font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
   max-height: 240px;
   overflow: auto;
+}
+
+.docs-table .doc-body {
+  /* Inherits everything from .doc-body; left here as a hook in case a
+     future tweak needs to override only the tabular variant. */
 }
 
 .pager {
