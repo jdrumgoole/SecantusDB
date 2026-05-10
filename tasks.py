@@ -223,8 +223,23 @@ def admin(
     no_window: bool = False,
     token: str = "",
 ) -> None:
-    """Launch the SecantusDB admin web UI."""
-    cmd = ["uv", "run", "secantusdb-admin", "--uri", uri, "--port", str(port)]
+    """Launch the SecantusDB admin web UI.
+
+    Uses ``--extra admin`` so uv pulls in fastapi / uvicorn / pywebview
+    on first run; the base wheel deliberately doesn't ship them so an
+    embedded ``SecantusDBServer`` user isn't paying for the GUI stack.
+    """
+    cmd = [
+        "uv",
+        "run",
+        "--extra",
+        "admin",
+        "secantusdb-admin",
+        "--uri",
+        uri,
+        "--port",
+        str(port),
+    ]
     if no_window:
         cmd.append("--no-window")
     if token:
