@@ -508,7 +508,6 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(str(exc)) from exc
 
-
     # ---- maintenance ---------------------------------------------------
 
     def fsync(self) -> dict[str, Any]:
@@ -545,9 +544,7 @@ class MongoFacade:
 
     # ---- schema sampler / logs / geo ------------------------------------
 
-    def sample_collection(
-        self, db: str, coll: str, *, size: int = 100
-    ) -> list[dict[str, Any]]:
+    def sample_collection(self, db: str, coll: str, *, size: int = 100) -> list[dict[str, Any]]:
         """Return up to ``size`` random docs via ``$sample``.
 
         ``$sample`` is the right primitive for schema inference: it gives

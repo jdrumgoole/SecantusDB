@@ -127,9 +127,7 @@ def post_drop_database(
     "/maintenance/drop-collection/{db}/{coll}/confirm",
     response_class=HTMLResponse,
 )
-def drop_collection_confirm(
-    request: Request, db: str, coll: str
-) -> HTMLResponse:
+def drop_collection_confirm(request: Request, db: str, coll: str) -> HTMLResponse:
     templates = _templates(request)
     return templates.TemplateResponse(
         request,
@@ -150,6 +148,4 @@ def post_drop_collection(
         request.app.state.mongo.drop_collection(db, coll)
     except MongoError as exc:
         return _render(request, error=str(exc))
-    return _render(
-        request, flash={"kind": "ok", "msg": f"dropped collection {db}.{coll}"}
-    )
+    return _render(request, flash={"kind": "ok", "msg": f"dropped collection {db}.{coll}"})

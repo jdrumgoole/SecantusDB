@@ -47,6 +47,21 @@ tests/cross_driver/node/.node_modules.lock
 tests/cross_driver/java/.gradle/
 tests/cross_driver/java/.smokesjar.lock
 
+# Ruby bundler + PHP composer cache state for the cross-driver smokes.
+# Restored on first run via `bundle install` / `composer install`.
+tests/cross_driver/ruby/Gemfile.lock
+tests/cross_driver/ruby/.bundle/
+tests/cross_driver/ruby/.bundle.lock
+tests/cross_driver/ruby/vendor/
+tests/cross_driver/php/composer.lock
+tests/cross_driver/php/vendor/
+tests/cross_driver/php/.vendor.lock
+
+# Rust target dir for the cross-driver smokes (currently gated on
+# upstream mongo-rust-driver compatibility — see Cargo.toml).
+tests/cross_driver/rust/target/
+tests/cross_driver/rust/Cargo.lock
+
 # Pelican site build artifacts and ephemeral runtime state. The build
 # output is regenerated each `invoke build`; theme/static/img/ is copied
 # from ../brandkit/ at build time; secantus-data/ is a stray WiredTiger

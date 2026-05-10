@@ -1,0 +1,13 @@
+{
+  "name": "secantus/php-smokes",
+  "description": "Cross-driver smoke tests against SecantusDB via mongo-php-library.",
+  "type": "project",
+  "require": {
+    "php": "^8.1",
+    "ext-mongodb": "*",
+    "mongodb/mongodb": "^2.0"
+  },
+  "config": {
+    "sort-packages": true
+  }
+}

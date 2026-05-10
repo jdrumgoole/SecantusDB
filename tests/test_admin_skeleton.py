@@ -1073,9 +1073,7 @@ async def test_profiler_lists_entries_after_op(server, http: AsyncClient) -> Non
     finally:
         mc.close()
 
-    r = await http.get(
-        "/profiler?db=entries_db", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/profiler?db=entries_db", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     # The insert op shows up.
     assert "insert" in r.text
@@ -1102,25 +1100,19 @@ async def test_maintenance_page_renders(http: AsyncClient) -> None:
 
 
 async def test_maintenance_fsync_runs_and_flashes(http: AsyncClient) -> None:
-    r = await http.post(
-        "/maintenance/fsync", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.post("/maintenance/fsync", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "fsync ok" in r.text
 
 
 async def test_maintenance_prune_oplog_returns_count(http: AsyncClient) -> None:
-    r = await http.post(
-        "/maintenance/prune-oplog", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.post("/maintenance/prune-oplog", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "pruned" in r.text and "oplog row" in r.text
 
 
 async def test_maintenance_prune_ttl_returns_count(http: AsyncClient) -> None:
-    r = await http.post(
-        "/maintenance/prune-ttl", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.post("/maintenance/prune-ttl", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "TTL doc" in r.text
 
@@ -1135,9 +1127,7 @@ async def test_maintenance_drop_db_modal_typed_check(http: AsyncClient) -> None:
     assert "myapp" in r.text
 
 
-async def test_maintenance_drop_db_actually_drops(
-    server, http: AsyncClient
-) -> None:
+async def test_maintenance_drop_db_actually_drops(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -1171,17 +1161,12 @@ async def test_schema_page_summarises_fields(server, http: AsyncClient) -> None:
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
     try:
         mc["sdb"]["c"].insert_many(
-            [
-                {"_id": i, "name": f"row-{i}", "tags": ["a"]}
-                for i in range(5)
-            ]
+            [{"_id": i, "name": f"row-{i}", "tags": ["a"]} for i in range(5)]
         )
     finally:
         mc.close()
 
-    r = await http.get(
-        "/db/sdb/c/schema?sample_size=10", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/db/sdb/c/schema?sample_size=10", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     # All three top-level paths should appear.
     assert "name" in r.text
@@ -1191,24 +1176,18 @@ async def test_schema_page_summarises_fields(server, http: AsyncClient) -> None:
     assert "array" in r.text
 
 
-async def test_logs_page_renders_and_partial_returns_lines(
-    server, http: AsyncClient
-) -> None:
+async def test_logs_page_renders_and_partial_returns_lines(server, http: AsyncClient) -> None:
     # Drop a known marker into the in-memory log via the storage handle.
     server.logs.append("I", "TEST", "schema-test-marker")
     r = await http.get("/logs", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "Refreshes every 2 seconds" in r.text
-    r2 = await http.get(
-        "/_partials/logs", headers={HEADER_NAME: "testtoken"}
-    )
+    r2 = await http.get("/_partials/logs", headers={HEADER_NAME: "testtoken"})
     assert r2.status_code == 200
     assert "schema-test-marker" in r2.text
 
 
-async def test_geo_page_renders_empty_when_no_geo_index(
-    server, http: AsyncClient
-) -> None:
+async def test_geo_page_renders_empty_when_no_geo_index(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -1217,16 +1196,12 @@ async def test_geo_page_renders_empty_when_no_geo_index(
     finally:
         mc.close()
 
-    r = await http.get(
-        "/db/geo_db/plain/geo", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/db/geo_db/plain/geo", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "No" in r.text and "2dsphere" in r.text
 
 
-async def test_geo_page_renders_with_2dsphere_index(
-    server, http: AsyncClient
-) -> None:
+async def test_geo_page_renders_with_2dsphere_index(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -1245,9 +1220,7 @@ async def test_geo_page_renders_with_2dsphere_index(
     finally:
         mc.close()
 
-    r = await http.get(
-        "/db/geo_db2/places/geo", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/db/geo_db2/places/geo", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "Geometry field" in r.text
     assert "loc" in r.text
@@ -1255,9 +1228,7 @@ async def test_geo_page_renders_with_2dsphere_index(
     assert '"type": "Point"' in r.text or "type: 'Point'" in r.text
 
 
-async def test_maintenance_drop_coll_actually_drops(
-    server, http: AsyncClient
-) -> None:
+async def test_maintenance_drop_coll_actually_drops(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)

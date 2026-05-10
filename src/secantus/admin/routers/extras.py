@@ -44,9 +44,7 @@ def _clamp_size(raw: str | None, *, default: int, lo: int, hi: int) -> int:
 
 @router.get("/db/{db}/{coll}/schema", response_class=HTMLResponse)
 def schema_page(request: Request, db: str, coll: str) -> HTMLResponse:
-    sample_size = _clamp_size(
-        request.query_params.get("sample_size"), default=100, lo=1, hi=1000
-    )
+    sample_size = _clamp_size(request.query_params.get("sample_size"), default=100, lo=1, hi=1000)
     error: str | None = None
     summary: dict[str, Any] = {"sample_size": 0, "fields": []}
     try:
@@ -129,9 +127,7 @@ def _extract_features(docs: list[dict[str, Any]], geo_field: str) -> list[dict[s
 
 @router.get("/db/{db}/{coll}/geo", response_class=HTMLResponse)
 def geo_page(request: Request, db: str, coll: str) -> HTMLResponse:
-    sample_size = _clamp_size(
-        request.query_params.get("sample_size"), default=200, lo=1, hi=1000
-    )
+    sample_size = _clamp_size(request.query_params.get("sample_size"), default=200, lo=1, hi=1000)
     error: str | None = None
     geo_indexes: list[dict[str, Any]] = []
     features_json = "[]"
@@ -146,9 +142,7 @@ def geo_page(request: Request, db: str, coll: str) -> HTMLResponse:
                     geo_field = k
                     break
         if geo_field is not None:
-            docs = request.app.state.mongo.sample_collection(
-                db, coll, size=sample_size
-            )
+            docs = request.app.state.mongo.sample_collection(db, coll, size=sample_size)
             features = _extract_features(docs, geo_field)
             features_json = json_util.dumps(features)
     except MongoError as exc:

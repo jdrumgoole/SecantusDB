@@ -17,6 +17,7 @@ deciding which docs to sample (the route uses ``aggregate $sample``).
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 from collections import Counter
 from collections.abc import Iterable
@@ -26,7 +27,6 @@ from typing import Any
 
 from bson import Binary, Decimal128, ObjectId, Timestamp
 from bson.regex import Regex
-
 
 TOP_VALUES = 10
 
@@ -41,7 +41,7 @@ def _type_name(v: Any) -> str:
         return "int"
     if isinstance(v, float):
         return "double"
-    if isinstance(v, Decimal128) or isinstance(v, Decimal):
+    if isinstance(v, (Decimal128, Decimal)):
         return "decimal"
     if isinstance(v, str):
         return "string"
@@ -95,11 +95,10 @@ def _walk(
             else:
                 stat.types[_type_name(v)] += 1
                 if _is_scalar(v):
-                    try:
+                    # Unhashable values (lists / dicts can't reach here
+                    # but Binary etc. can) skip top-values tracking.
+                    with contextlib.suppress(TypeError):
                         stat.values[v] += 1
-                    except TypeError:
-                        # Unhashable value — skip top-values tracking for it.
-                        pass
             if isinstance(v, dict):
                 _walk(v, child, stats)
             elif isinstance(v, list):
@@ -141,9 +140,7 @@ def summarize(docs: Iterable[dict[str, Any]]) -> dict[str, Any]:
         types_sorted = sorted(s.types.items(), key=lambda kv: -kv[1])
         # Don't render top values when the field is structural (always
         # array / object) — they aren't meaningful comparisons.
-        scalar_share = sum(
-            n for t, n in s.types.items() if t not in ("array", "object")
-        )
+        scalar_share = sum(n for t, n in s.types.items() if t not in ("array", "object"))
         top_vals: list[tuple[Any, int]] = []
         if scalar_share:
             top_vals = s.values.most_common(TOP_VALUES)

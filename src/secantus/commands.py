@@ -44,8 +44,8 @@ from secantus.rbac import (
     A_DROP_INDEX,
     A_DROP_ROLE,
     A_DROP_USER,
-    A_FIND,
     A_ENABLE_PROFILER,
+    A_FIND,
     A_FSYNC,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
@@ -414,9 +414,7 @@ def _fsync(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"numFiles": 1, "ok": 1.0}
 
 
-def _secantus_admin_prune_oplog(
-    _doc: dict[str, Any], ctx: CommandContext
-) -> dict[str, Any]:
+def _secantus_admin_prune_oplog(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """SecantusDB extension: drop oplog rows past the retention window.
 
     Real mongod auto-prunes the oplog opportunistically; SecantusDB
@@ -428,9 +426,7 @@ def _secantus_admin_prune_oplog(
     return {"pruned": int(pruned), "ok": 1.0}
 
 
-def _secantus_admin_prune_ttl(
-    _doc: dict[str, Any], ctx: CommandContext
-) -> dict[str, Any]:
+def _secantus_admin_prune_ttl(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """SecantusDB extension: run TTL pruning against every collection.
 
     The background sweeper handles this on a 60-second cadence; the
@@ -3137,9 +3133,7 @@ def _profile_eligible_command(name: str, doc: dict[str, Any]) -> bool:
     # show up on the next read, growing without bound until the user
     # spots it.
     coll = doc.get(name)
-    if isinstance(coll, str) and coll == "system.profile":
-        return False
-    return True
+    return not (isinstance(coll, str) and coll == "system.profile")
 
 
 def _profile_op_label(name: str) -> str:

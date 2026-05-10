@@ -48,10 +48,7 @@ def _render(
         # Pull recent entries, newest-first. The cap is 10 MB so a few
         # hundred entries are typical; keep the page tight at 50.
         client = request.app.state.mongo._get_client()
-        rows = [
-            dict(d)
-            for d in client[db]["system.profile"].find().sort("ts", -1).limit(50)
-        ]
+        rows = [dict(d) for d in client[db]["system.profile"].find().sort("ts", -1).limit(50)]
     except Exception:
         # ``system.profile`` may not exist yet (level 0 since boot).
         rows = []
@@ -104,9 +101,7 @@ def update_profiler(
     if level not in (0, 1, 2):
         raise HTTPException(status_code=400, detail="level must be 0, 1, or 2")
     try:
-        request.app.state.mongo.set_profile(
-            db, level=level, slowms=slowms, sample_rate=sample_rate
-        )
+        request.app.state.mongo.set_profile(db, level=level, slowms=slowms, sample_rate=sample_rate)
     except MongoError as exc:
         return _render(request, db=db, error=str(exc), status_code=400)
     return HTMLResponse(
