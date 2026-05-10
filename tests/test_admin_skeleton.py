@@ -157,6 +157,10 @@ async def test_connection_switch_rejects_unreachable(server, http: AsyncClient) 
     )
     assert r.status_code == 400
     assert "could not reach target" in r.text
+    # Error must be cleaned — no pymongo topology dump / configured-timeouts
+    # noise in the rendered page.
+    assert "Topology Description" not in r.text
+    assert "configured timeouts" not in r.text
 
 
 async def test_connection_switch_rejects_blank_uri(http: AsyncClient) -> None:

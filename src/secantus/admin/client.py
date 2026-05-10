@@ -32,6 +32,36 @@ from secantus.admin.pagination import (
 DEFAULT_PAGE_SIZE = 50
 
 
+def friendly_error(exc: BaseException) -> str:
+    """Render a pymongo exception as a one-line human-friendly string.
+
+    PyMongo's ``ServerSelectionTimeoutError.__str__`` appends the full
+    topology description (multi-line, hundreds of chars of internal
+    state). That's noise for an end-user "couldn't connect" message —
+    it leaks pymongo internals into a popup that should say "the host
+    is down."
+
+    Strategy: chop everything after ``", Timeout:"`` (where the topology
+    block starts), drop ``"(configured timeouts: ...)"`` boilerplate,
+    keep the first line. Returns the exception class name as a fallback
+    when the message is empty.
+    """
+    import re
+
+    s = str(exc)
+    # ServerSelectionTimeoutError appends the topology description after
+    # ", Timeout:" — drop everything from that marker onward.
+    if ", Timeout:" in s:
+        s = s.split(", Timeout:", 1)[0]
+    # OperationFailure appends ", full error: { ... }" with the raw
+    # server reply dict — same noise.
+    if ", full error:" in s:
+        s = s.split(", full error:", 1)[0]
+    s = s.split("\n", 1)[0].strip()
+    s = re.sub(r"\s*\(configured timeouts:[^)]*\)", "", s)
+    return s or type(exc).__name__
+
+
 def display_uri(uri: str) -> str:
     """Strip the password from a MongoDB URI for display.
 
@@ -119,7 +149,7 @@ class MongoFacade:
             self._get_client().admin.command("ping")
             return HealthResult(ok=True, detail="ok")
         except PyMongoError as exc:
-            return HealthResult(ok=False, detail=str(exc))
+            return HealthResult(ok=False, detail=friendly_error(exc))
 
     def server_status(self) -> dict[str, Any]:
         return self._run_admin("serverStatus")
@@ -131,9 +161,9 @@ class MongoFacade:
         try:
             return dict(self._get_client().admin.command(name, **kwargs))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- databases + collections -----------------------------------------
 
@@ -158,9 +188,9 @@ class MongoFacade:
             db_obj = client[db]
             colls = list(db_obj.list_collections())
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
         out: list[dict[str, Any]] = []
         for c in colls:
@@ -210,9 +240,9 @@ class MongoFacade:
             coll_obj = self._get_client()[db][coll]
             rows = list(coll_obj.find(find_filter).sort("_id", sort_dir).limit(page_size + 1))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
         next_token = make_next_cursor(rows, page_size)
         return rows[:page_size], next_token
@@ -223,9 +253,9 @@ class MongoFacade:
         try:
             return self._get_client()[db][coll].find_one({"_id": doc_id})
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def replace_doc(
         self,
@@ -245,9 +275,9 @@ class MongoFacade:
         try:
             res = self._get_client()[db][coll].replace_one({"_id": doc_id}, new_doc)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
         return int(res.matched_count)
 
     def delete_doc(self, db: str, coll: str, doc_id: Any) -> int:
@@ -255,9 +285,9 @@ class MongoFacade:
         try:
             res = self._get_client()[db][coll].delete_one({"_id": doc_id})
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
         return int(res.deleted_count)
 
     # ---- indexes ---------------------------------------------------------
@@ -273,9 +303,9 @@ class MongoFacade:
         except OperationFailure as exc:
             if exc.code in (26,):  # NamespaceNotFound
                 return []
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def create_index(
         self,
@@ -300,9 +330,9 @@ class MongoFacade:
         try:
             return self._get_client()[db][coll].create_index(key, **kwargs)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def drop_index(self, db: str, coll: str, name: str) -> None:
         if name == "_id_":
@@ -310,9 +340,9 @@ class MongoFacade:
         try:
             self._get_client()[db][coll].drop_index(name)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- explain ---------------------------------------------------------
 
@@ -334,9 +364,9 @@ class MongoFacade:
         try:
             return dict(self._get_client()[db].command("explain", find_cmd))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- users ----------------------------------------------------------
 
@@ -345,18 +375,18 @@ class MongoFacade:
         try:
             out = self._get_client()[db].command("usersInfo", 1)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
         return [dict(u) for u in out.get("users", []) or []]
 
     def get_user(self, db: str, username: str) -> dict[str, Any] | None:
         try:
             out = self._get_client()[db].command("usersInfo", username)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
         users = out.get("users", []) or []
         return dict(users[0]) if users else None
 
@@ -370,25 +400,25 @@ class MongoFacade:
         try:
             self._get_client()[db].command("createUser", username, pwd=password, roles=list(roles))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def update_user_password(self, db: str, username: str, password: str) -> None:
         try:
             self._get_client()[db].command("updateUser", username, pwd=password)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def drop_user(self, db: str, username: str) -> None:
         try:
             self._get_client()[db].command("dropUser", username)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def grant_roles(
         self,
@@ -401,9 +431,9 @@ class MongoFacade:
         try:
             self._get_client()[db].command("grantRolesToUser", username, roles=list(roles))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def revoke_roles(
         self,
@@ -416,9 +446,9 @@ class MongoFacade:
         try:
             self._get_client()[db].command("revokeRolesFromUser", username, roles=list(roles))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- ad-hoc query console -------------------------------------------
 
@@ -447,9 +477,9 @@ class MongoFacade:
                 cursor = cursor.sort(list(dict(sort).items()))
             return [dict(d) for d in cursor]
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def run_aggregate(
         self,
@@ -470,18 +500,18 @@ class MongoFacade:
                     break
             return out
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def run_command(self, db: str, command: Mapping[str, Any]) -> dict[str, Any]:
         """Run an arbitrary command against ``db``. Returns the response doc."""
         try:
             return dict(self._get_client()[db].command(dict(command)))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- profiler -------------------------------------------------------
 
@@ -490,9 +520,9 @@ class MongoFacade:
         try:
             out = self._get_client()[db].command("profile", -1)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
         return {
             "level": int(out.get("was", 0) or 0),
             "slowms": int(out.get("slowms", 100) or 100),
@@ -513,9 +543,9 @@ class MongoFacade:
                 "profile", int(level), slowms=int(slowms), sampleRate=float(sample_rate)
             )
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- currentOp + cursor management ----------------------------------
 
@@ -540,9 +570,9 @@ class MongoFacade:
                 self._get_client()[db].command("killCursors", coll, cursors=[int(cursor_id)])
             )
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- maintenance ---------------------------------------------------
 
@@ -565,18 +595,18 @@ class MongoFacade:
         try:
             self._get_client()[db].command("dropDatabase")
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def drop_collection(self, db: str, coll: str) -> None:
         """Drop a single collection."""
         try:
             self._get_client()[db].drop_collection(coll)
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     # ---- schema sampler / logs / geo ------------------------------------
 
@@ -592,18 +622,18 @@ class MongoFacade:
             cursor = self._get_client()[db][coll].aggregate([{"$sample": {"size": n}}])
             return [dict(d) for d in cursor]
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def get_log(self, name: str = "global") -> dict[str, Any]:
         """Return the response of ``getLog``: ``{log: [...], totalLinesWritten}``."""
         try:
             return dict(self._get_client().admin.command("getLog", name))
         except OperationFailure as exc:
-            raise MongoError(str(exc), code=exc.code) from exc
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
-            raise MongoError(str(exc)) from exc
+            raise MongoError(friendly_error(exc)) from exc
 
     def geo_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
         """Return only indexes that look like ``2dsphere`` / ``2d``."""
@@ -624,4 +654,5 @@ __all__ = [
     "HealthResult",
     "DEFAULT_PAGE_SIZE",
     "display_uri",
+    "friendly_error",
 ]
