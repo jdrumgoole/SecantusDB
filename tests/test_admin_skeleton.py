@@ -36,6 +36,7 @@ def app(server: SecantusDBServer, tmp_path):
         mongo_uri=server.uri,
         token="testtoken",
         history_path=tmp_path / "history.db",
+        backup_root=tmp_path / "backups",
     )
     yield app
     app.state.mongo.close()
@@ -1199,6 +1200,36 @@ async def test_geo_page_renders_empty_when_no_geo_index(server, http: AsyncClien
     r = await http.get("/db/geo_db/plain/geo", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "No" in r.text and "2dsphere" in r.text
+
+
+# ---- /backup (Slice 12) ----------------------------------------------------
+
+
+async def test_backup_page_renders(http: AsyncClient) -> None:
+    r = await http.get("/backup", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Run mongodump now" in r.text
+    assert "Existing backups" in r.text
+
+
+async def test_backup_lists_existing_backups(app, http: AsyncClient) -> None:
+    # Drop a fake backup directory under the per-test backup_root.
+    root = app.state.backup_root
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "20260101T000000Z").mkdir()
+    r = await http.get("/backup", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "20260101T000000Z" in r.text
+
+
+async def test_backup_restore_rejects_traversal(http: AsyncClient) -> None:
+    r = await http.post(
+        "/backup/restore",
+        data={"name": "../etc"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "invalid backup name" in r.text
 
 
 async def test_geo_page_renders_with_2dsphere_index(server, http: AsyncClient) -> None:
