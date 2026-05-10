@@ -79,11 +79,12 @@ client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 ```
 
 The conformance evidence: the official test suites for **pymongo**,
-**mongo-go-driver**, **mongo-node-driver**, and **mongo-java-driver** all
-run against SecantusDB **unmodified** — see the
-[pymongo](validation-report.md), [Go-driver](validation-report-go.md),
-[Node-driver](validation-report-node.md), and
-[Java-driver](validation-report-java.md) validation reports for current
+**mongo-go-driver**, **mongo-node-driver**, **mongo-java-driver**, and
+**mongo-ruby-driver** all run against SecantusDB **unmodified** — see
+the [pymongo](validation-report.md), [Go-driver](validation-report-go.md),
+[Node-driver](validation-report-node.md),
+[Java-driver](validation-report-java.md), and
+[Ruby-driver](validation-report-ruby.md) validation reports for current
 pass-rates per feature category.
 
 ## What's in scope
@@ -189,5 +190,6 @@ validation-report
 validation-report-go
 validation-report-node
 validation-report-java
+validation-report-ruby
 api
 ```
