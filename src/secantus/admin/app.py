@@ -23,7 +23,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 import secantus
-from secantus.admin.client import MongoFacade
+from secantus.admin.client import MongoFacade, display_uri
 from secantus.admin.history import HistoryStore
 from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
@@ -89,6 +89,10 @@ def create_app(
     )
     app.state.mongo = MongoFacade(mongo_uri)
     app.state.mongo_uri = mongo_uri
+    # Sanitised version for the page-header badge — strips password and
+    # trailing query string. Templates read it via
+    # ``request.app.state.mongo_uri_display``.
+    app.state.mongo_uri_display = display_uri(mongo_uri)
     app.state.templates_dir = _TEMPLATES_DIR
     # Token is exposed on app.state so WS handlers can verify it (the
     # HTTP middleware doesn't see WebSocket scopes, so per-route checks

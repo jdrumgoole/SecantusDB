@@ -32,6 +32,42 @@ from secantus.admin.pagination import (
 DEFAULT_PAGE_SIZE = 50
 
 
+def display_uri(uri: str) -> str:
+    """Strip the password from a MongoDB URI for display.
+
+    Keeps the username (it's useful context — "who am I connecting as")
+    and drops the password and the trailing query string. Returns the
+    input unchanged when no userinfo is present.
+
+    >>> display_uri("mongodb://127.0.0.1:27017/")
+    'mongodb://127.0.0.1:27017'
+    >>> display_uri("mongodb://alice:s3cret@host:27017/?authSource=admin")
+    'mongodb://alice@host:27017'
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return uri
+    if not parts.netloc:
+        return uri
+    username = parts.username
+    host = parts.hostname or ""
+    port = parts.port
+    if username:
+        netloc = f"{username}@{host}"
+    else:
+        netloc = host
+    if port:
+        netloc = f"{netloc}:{port}"
+    # Drop the path's trailing slash and the query string — pymongo URIs
+    # often carry ``/?authSource=admin`` boilerplate that's noise in a
+    # status badge.
+    path = parts.path.rstrip("/")
+    return urlunsplit((parts.scheme, netloc, path, "", ""))
+
+
 class MongoError(Exception):
     """Translated pymongo failure surfaced by ``MongoFacade``."""
 
@@ -587,4 +623,5 @@ __all__ = [
     "MongoError",
     "HealthResult",
     "DEFAULT_PAGE_SIZE",
+    "display_uri",
 ]
