@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+<nav class="breadcrumb">
+  <a href="/db">Databases</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}">{{ db_name }}</a>
+  <span class="sep">/</span>
+  <a href="/db/{{ db_name }}/{{ coll_name }}">{{ coll_name }}</a>
+  <span class="sep">/</span>
+  <span>schema</span>
+</nav>
+
+<form class="filter-form" method="get" action="/db/{{ db_name }}/{{ coll_name }}/schema">
+  <div class="filter-controls">
+    <label>
+      Sample size
+      <input type="number" name="sample_size" min="1" max="1000" value="{{ sample_size }}" />
+    </label>
+    <button type="submit">Re-sample</button>
+  </div>
+</form>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<p class="modal-meta">
+  Walked <code>{{ summary.sample_size }}</code> sampled documents.
+</p>
+
+{% if summary.fields %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Path</th>
+        <th class="num">Presence</th>
+        <th>Types</th>
+        <th>Top values</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for f in summary.fields %}
+        <tr>
+          <td><code>{{ f.path }}</code></td>
+          <td class="num">{{ "%.0f%%" | format(f.presence * 100) }}<br><span class="modal-meta">{{ f.count }}/{{ summary.sample_size }}</span></td>
+          <td>
+            {% for t, n in f.types %}
+              <span class="badge">{{ t }} ({{ n }})</span>
+            {% endfor %}
+          </td>
+          <td>
+            {% for v, n in f.top_values %}
+              <code class="action-pill">{{ v }} ({{ n }})</code>
+            {% endfor %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">No fields seen — collection may be empty.</p>
+{% endif %}
+{% endblock %}

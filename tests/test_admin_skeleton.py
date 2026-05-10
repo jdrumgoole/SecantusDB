@@ -1162,6 +1162,99 @@ async def test_maintenance_drop_db_actually_drops(
         mc.close()
 
 
+# ---- /db/{db}/{coll}/schema, /logs, /db/{db}/{coll}/geo (Slice 11) ---------
+
+
+async def test_schema_page_summarises_fields(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["sdb"]["c"].insert_many(
+            [
+                {"_id": i, "name": f"row-{i}", "tags": ["a"]}
+                for i in range(5)
+            ]
+        )
+    finally:
+        mc.close()
+
+    r = await http.get(
+        "/db/sdb/c/schema?sample_size=10", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    # All three top-level paths should appear.
+    assert "name" in r.text
+    assert "tags" in r.text
+    # Type badges render.
+    assert "string" in r.text
+    assert "array" in r.text
+
+
+async def test_logs_page_renders_and_partial_returns_lines(
+    server, http: AsyncClient
+) -> None:
+    # Drop a known marker into the in-memory log via the storage handle.
+    server.logs.append("I", "TEST", "schema-test-marker")
+    r = await http.get("/logs", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Refreshes every 2 seconds" in r.text
+    r2 = await http.get(
+        "/_partials/logs", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r2.status_code == 200
+    assert "schema-test-marker" in r2.text
+
+
+async def test_geo_page_renders_empty_when_no_geo_index(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["geo_db"]["plain"].insert_one({"_id": 1, "name": "x"})
+    finally:
+        mc.close()
+
+    r = await http.get(
+        "/db/geo_db/plain/geo", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    assert "No" in r.text and "2dsphere" in r.text
+
+
+async def test_geo_page_renders_with_2dsphere_index(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        coll = mc["geo_db2"]["places"]
+        coll.create_index([("loc", "2dsphere")])
+        coll.insert_many(
+            [
+                {
+                    "_id": i,
+                    "loc": {"type": "Point", "coordinates": [0.1 * i, 0.1 * i]},
+                }
+                for i in range(3)
+            ]
+        )
+    finally:
+        mc.close()
+
+    r = await http.get(
+        "/db/geo_db2/places/geo", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    assert "Geometry field" in r.text
+    assert "loc" in r.text
+    # Features were serialized into the page.
+    assert '"type": "Point"' in r.text or "type: 'Point'" in r.text
+
+
 async def test_maintenance_drop_coll_actually_drops(
     server, http: AsyncClient
 ) -> None:

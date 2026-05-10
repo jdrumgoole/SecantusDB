@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="modal-meta">
+  Last entries from the in-memory <code>getLog("global")</code> ring.
+  Refreshes every 2 seconds.
+</p>
+<div
+  hx-get="/_partials/logs"
+  hx-trigger="load, every 2s"
+  hx-swap="innerHTML"
+>
+  <p class="empty">Loading…</p>
+</div>
+{% endblock %}
