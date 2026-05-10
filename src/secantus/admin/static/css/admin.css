@@ -412,7 +412,13 @@ body {
   padding-top: 0.85rem;
 }
 
-.docs-table .doc-body {
+/* Default <pre class="doc-body"> styling. Used inline by query results,
+   change-stream events, profiler entries, etc. The .docs-table descendant
+   block below tightens it for table cells. The explicit margin: 0 here
+   matters: without it, the browser default of ~1em top + bottom stacks
+   with the parent flex/grid gap and produces a visible blank line
+   between consecutive documents. */
+.doc-body {
   margin: 0;
   padding: 0.5rem 0.75rem;
   background: var(--bg);
@@ -425,6 +431,11 @@ body {
   font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
   max-height: 240px;
   overflow: auto;
+}
+
+.docs-table .doc-body {
+  /* Inherits everything from .doc-body; left here as a hook in case a
+     future tweak needs to override only the tabular variant. */
 }
 
 .pager {
@@ -1030,3 +1041,27 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
 }
+
+/* JSON pretty-printer tokens. Light by default, overridden in
+   prefers-color-scheme: dark (see :root override below). */
+:root {
+  --json-key: #0f766e;     /* teal-700 */
+  --json-string: #b45309;  /* amber-700 */
+  --json-number: #1d4ed8;  /* blue-700 */
+  --json-bool: #7c3aed;    /* violet-600 */
+  --json-null: var(--muted);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --json-key: #2dd4bf;     /* teal-400 */
+    --json-string: #fbbf24;  /* amber-400 */
+    --json-number: #60a5fa;  /* blue-400 */
+    --json-bool: #c4b5fd;    /* violet-300 */
+    --json-null: var(--muted);
+  }
+}
+.json-key    { color: var(--json-key); }
+.json-string { color: var(--json-string); }
+.json-number { color: var(--json-number); }
+.json-bool   { color: var(--json-bool); font-weight: 600; }
+.json-null   { color: var(--json-null); font-style: italic; }

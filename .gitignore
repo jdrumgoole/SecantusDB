@@ -58,9 +58,12 @@ tests/cross_driver/php/vendor/
 tests/cross_driver/php/.vendor.lock
 
 # Rust target dir for the cross-driver smokes (currently gated on
-# upstream mongo-rust-driver compatibility — see Cargo.toml).
+# upstream mongo-rust-driver compatibility — see Cargo.toml). The
+# .cargo.lock-build flock sentinel mirrors the Java/Ruby/Node pattern
+# for serialising xdist workers around the per-test cargo build.
 tests/cross_driver/rust/target/
 tests/cross_driver/rust/Cargo.lock
+tests/cross_driver/rust/.cargo.lock-build
 
 # Pelican site build artifacts and ephemeral runtime state. The build
 # output is regenerated each `invoke build`; theme/static/img/ is copied

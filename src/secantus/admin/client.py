@@ -501,6 +501,34 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(friendly_error(exc)) from exc
 
+    def insert_many(
+        self,
+        db: str,
+        coll: str,
+        docs: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Insert one or more documents into ``db.coll``.
+
+        Returns ``{"inserted_count": N, "inserted_ids": [...]}`` so the
+        UI can display per-doc ``_id`` values (auto-assigned ones in
+        particular). The pymongo driver mutates the input dicts to add
+        ``_id`` when missing, which the caller passes through to the
+        response.
+        """
+        if not docs:
+            raise MongoError("at least one document is required")
+        try:
+            coll_obj = self._get_client()[db][coll]
+            result = coll_obj.insert_many([dict(d) for d in docs], ordered=True)
+            return {
+                "inserted_count": len(result.inserted_ids),
+                "inserted_ids": list(result.inserted_ids),
+            }
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
     def run_command(self, db: str, command: Mapping[str, Any]) -> dict[str, Any]:
         """Run an arbitrary command against ``db``. Returns the response doc."""
         try:

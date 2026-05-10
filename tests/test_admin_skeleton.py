@@ -1646,16 +1646,27 @@ async def test_dashboard_badge_says_embedded_when_target_is_embedded(server, tmp
         app.state.mongo.close()
 
 
-# ---- Dashboard embedded-server widget ---------------------------------------
+# ---- /server embedded-server widget -----------------------------------------
 
 
-async def test_dashboard_renders_embedded_widget_when_stopped(
+async def test_server_page_renders_embedded_widget_when_stopped(
     http: AsyncClient,
 ) -> None:
-    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    """The embedded-server controls live on the /server tab (alongside
+    target switching), not on the dashboard."""
+    r = await http.get("/server", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "Embedded SecantusDB server" in r.text
     assert "stopped" in r.text
+
+
+async def test_dashboard_no_longer_shows_embedded_widget(
+    http: AsyncClient,
+) -> None:
+    """Reverse of the above: the dashboard is now metrics-only."""
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Embedded SecantusDB server" not in r.text
 
 
 async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:
@@ -1695,6 +1706,88 @@ async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:
         app.state.mongo.close()
 
 
+# ---- /insert (slice 13) -----------------------------------------------------
+
+
+async def test_insert_page_renders(http: AsyncClient) -> None:
+    r = await http.get("/insert", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert 'action="/insert"' in r.text
+    assert "Document(s)" in r.text
+
+
+async def test_insert_link_in_sidebar_below_query(http: AsyncClient) -> None:
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    body = r.text
+    qi = body.find('href="/query"')
+    ii = body.find('href="/insert"')
+    di = body.find('href="/db"')
+    assert qi != -1 and ii != -1 and di != -1
+    # Insert sits between Query and Databases.
+    assert qi < ii < di
+
+
+async def test_insert_single_document_round_trip(server, http: AsyncClient) -> None:
+    r = await http.post(
+        "/insert",
+        data={"db": "tdb", "coll": "things", "docs": '{"x": 1, "name": "alpha"}'},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "Inserted" in r.text
+    assert "1 doc" in r.text
+    # Sanity: real document landed in the underlying SecantusDB.
+    import pymongo
+    with pymongo.MongoClient(server.uri, serverSelectionTimeoutMS=2000) as c:
+        n = c["tdb"]["things"].count_documents({"x": 1, "name": "alpha"})
+    assert n == 1
+
+
+async def test_insert_array_payload(server, http: AsyncClient) -> None:
+    r = await http.post(
+        "/insert",
+        data={"db": "tdb2", "coll": "items", "docs": '[{"a": 1}, {"a": 2}, {"a": 3}]'},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "3 docs" in r.text
+
+
+async def test_insert_ndjson_payload(server, http: AsyncClient) -> None:
+    payload = '\n'.join(['{"k": 1}', '{"k": 2}', '', '{"k": 3}'])
+    r = await http.post(
+        "/insert",
+        data={"db": "tdb3", "coll": "rows", "docs": payload},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "3 docs" in r.text
+
+
+async def test_insert_missing_fields_renders_inline_errors(http: AsyncClient) -> None:
+    r = await http.post(
+        "/insert",
+        data={"db": "", "coll": "", "docs": ""},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    body = r.text
+    assert "Database is required" in body
+    assert "Collection is required" in body
+    assert "Document(s) field is required" in body
+
+
+async def test_insert_invalid_json_returns_400_not_500(http: AsyncClient) -> None:
+    r = await http.post(
+        "/insert",
+        data={"db": "tdb", "coll": "items", "docs": "{not real json"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "valid Extended JSON" in r.text or "JSON object" in r.text
+
+
 # ---- CLI surfaces a fix-it message when the admin extra is missing ---------
 
 
@@ -1720,3 +1813,28 @@ def test_cli_missing_admin_extra_shows_helpful_message(monkeypatch, capsys) -> N
     assert "admin' extra" in err
     assert "uvicorn" in err
     assert "pip install 'secantusdb[admin]'" in err
+
+
+async def test_json_pretty_script_loaded_on_every_page(http: AsyncClient) -> None:
+    """The pretty-printer script is loaded from base.html so every page
+    benefits from token highlighting on <pre class='doc-body'>."""
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "/static/js/json-pretty.js" in r.text
+
+
+async def test_json_pretty_static_file_served(http: AsyncClient) -> None:
+    """The script itself is reachable as a static asset."""
+    r = await http.get(
+        "/static/js/json-pretty.js", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    body = r.text
+    # Public helpers the changestream page (and any future Alpine page)
+    # depends on.
+    assert "secantusFormatJsonHtml" in body
+    assert "secantusPrettyJson" in body
+    # HTML-escape pass before tokenisation guards against XSS in stored
+    # documents — a doc with "<script>" in a string field must not turn
+    # into a real script tag in the rendered page.
+    assert "escapeHtml" in body

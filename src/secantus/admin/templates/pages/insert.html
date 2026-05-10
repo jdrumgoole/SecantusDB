@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="query"
+     x-data='insertPage({{ {
+       "db": form.db or "",
+       "coll": form.coll or "",
+       "docs": form.docs or ""
+     } | tojson }})'
+     x-init="init()">
+
+  <datalist id="ins-db-suggestions">
+    {% for d in databases %}
+      <option value="{{ d }}"></option>
+    {% endfor %}
+  </datalist>
+  <datalist id="ins-coll-suggestions">
+    <template x-for="c in collections" :key="c">
+      <option :value="c"></option>
+    </template>
+  </datalist>
+
+  <form class="filter-form" method="post" action="/insert">
+    <div class="filter-controls">
+      <label>Database
+        <input type="text" name="db" list="ins-db-suggestions" autocomplete="off"
+               x-model="db" @change="onDbChange($event.target.value)"
+               required />
+      </label>
+      <label>Collection
+        <input type="text" name="coll" list="ins-coll-suggestions" autocomplete="off"
+               x-model="coll" required />
+      </label>
+    </div>
+    <label class="filter-label">
+      Document(s)
+      <textarea
+        name="docs"
+        rows="14"
+        spellcheck="false"
+        placeholder='{"name": "alpha", "x": 1}
+&#10;or an array: [{"x": 1}, {"x": 2}]
+&#10;or NDJSON, one per line.'
+        x-model="docs"
+      ></textarea>
+    </label>
+    <p class="modal-meta">
+      Extended JSON is honoured — <code>{"$oid": "..."}</code>,
+      <code>{"$date": "..."}</code>, <code>{"$numberDecimal": "..."}</code>
+      etc. all decode to the same BSON types pymongo would send.
+      Documents without an <code>_id</code> get one auto-assigned and
+      echoed back in the result panel.
+    </p>
+    <div class="modal-actions">
+      <button type="submit" :disabled="!db.trim() || !coll.trim() || !docs.trim()">Insert</button>
+    </div>
+  </form>
+
+  {% for msg in errors %}
+    <div class="error">{{ msg }}</div>
+  {% endfor %}
+
+  {% if result %}
+    <h2 class="section-title">
+      Inserted
+      <span class="modal-meta">— {{ result.inserted_count }} doc{{ '' if result.inserted_count == 1 else 's' }} into <code>{{ form.db }}.{{ form.coll }}</code></span>
+    </h2>
+    <pre class="doc-body">{{ result_json }}</pre>
+  {% endif %}
+</div>
+
+<script>
+function insertPage(initial) {
+  return {
+    db: initial.db || "",
+    coll: initial.coll || "",
+    docs: initial.docs || "",
+    collections: [],
+
+    async init() {
+      if (this.db) await this.onDbChange(this.db);
+    },
+
+    async onDbChange(value) {
+      this.db = value;
+      this.collections = [];
+      if (!value) return;
+      try {
+        const r = await fetch(
+          `/insert/_collections?db=${encodeURIComponent(value)}`,
+        );
+        if (!r.ok) return;
+        const payload = await r.json();
+        this.collections = payload.collections || [];
+      } catch (_) {
+        // Free-text entry still works — leave the datalist empty.
+      }
+    },
+  };
+}
+</script>
+{% endblock %}
