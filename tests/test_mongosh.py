@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 
 import pytest
 from pymongo import MongoClient
@@ -27,9 +28,15 @@ from secantus import SecantusDBServer
 
 MONGOSH = shutil.which("mongosh")
 
+# Windows runners ship mongosh on PATH but the ``--eval`` JSON
+# argument round-trips through PowerShell's quoting, which mangles
+# the embedded ``"`` characters and the subprocess hangs to timeout.
+# Linux + macOS runners cover the wire-protocol round-trip these
+# tests are meant to catch.
 pytestmark = pytest.mark.skipif(
-    MONGOSH is None,
-    reason="mongosh not on PATH (install MongoDB Shell)",
+    MONGOSH is None or sys.platform == "win32",
+    reason="mongosh not on PATH (install MongoDB Shell) or running on "
+    "Windows (subprocess --eval argument quoting hangs).",
 )
 
 
