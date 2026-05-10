@@ -266,6 +266,20 @@ and open `docs/_build/html/index.html`. Highlights:
   Initial baseline is the `:bson:test` module (BSON serialization,
   ~289 test files); the JDBC-style integration modules can be added
   to `java_validation/include_modules.py` as we widen.
+- [Ruby-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html) —
+  same shape against **mongo-ruby-driver's own test suite, unmodified**.
+  Spawns a standalone SecantusDB daemon and runs `bundle exec rspec`
+  with `MONGODB_URI` pointed at it. Initial baseline is the lite-spec
+  subset — 90 files under `spec/mongo/` and 9 YAML-runner files under
+  `spec/spec_tests/` that `require 'lite_spec_helper'`. Covers BSON,
+  URI parsing, SCRAM-SHA-1/256 conversation framing, retry /
+  heartbeat protocols, CMAP, error-class encoding, plus the
+  cross-driver spec-test corpus for connection strings, server
+  selection, SDAM, auth mechanisms, max-staleness, and
+  read/write-concern document shapes. No real-mongod connection
+  required — SecantusDB doesn't have to satisfy any cluster
+  machinery for these. Auto-discovered by
+  `ruby_validation/include_paths.discover_lite()`.
 
 ## Development
 

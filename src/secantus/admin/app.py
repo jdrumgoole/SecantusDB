@@ -15,6 +15,7 @@ and drive it via ``httpx.AsyncClient(transport=ASGITransport(app))``.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,7 +24,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 import secantus
-from secantus.admin.client import MongoFacade
+from secantus.admin.client import MongoFacade, display_uri
 from secantus.admin.history import HistoryStore
 from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
@@ -40,9 +41,11 @@ from secantus.admin.routers import (
     maintenance,
     metrics,
     profiler,
+    server as server_router,
     users,
 )
 from secantus.admin.sampler import Hub, Sampler
+from secantus.admin.targets import TargetStore
 
 _ADMIN_PKG = Path(__file__).resolve().parent
 _STATIC_DIR = _ADMIN_PKG / "static"
@@ -89,6 +92,10 @@ def create_app(
     )
     app.state.mongo = MongoFacade(mongo_uri)
     app.state.mongo_uri = mongo_uri
+    # Sanitised version for the page-header badge — strips password and
+    # trailing query string. Templates read it via
+    # ``request.app.state.mongo_uri_display``.
+    app.state.mongo_uri_display = display_uri(mongo_uri)
     app.state.templates_dir = _TEMPLATES_DIR
     # Token is exposed on app.state so WS handlers can verify it (the
     # HTTP middleware doesn't see WebSocket scopes, so per-route checks
@@ -98,6 +105,14 @@ def create_app(
     # Persistent ad-hoc query history (sqlite). Tests pass a per-test
     # path; production defaults to the same dir as the persisted token.
     app.state.history = HistoryStore(history_path or _DEFAULT_HISTORY_PATH)
+    # Recently-used target URIs — drives the /connection page's "switch
+    # to..." list. Reuses the history DB file so we don't sprout a
+    # second sqlite path; the table lives in ``connection_targets``.
+    app.state.targets = TargetStore(history_path or _DEFAULT_HISTORY_PATH)
+    # Lock that ``swap_target`` uses to serialise reconfigurations of
+    # the sampler / facade. Constructed once; held briefly during the
+    # rebind.
+    app.state.swap_lock = threading.Lock()
     if backup_root is not None:
         app.state.backup_root = Path(backup_root)
     # Sampler is started inside lifespan so the asyncio loop is live;
@@ -126,6 +141,7 @@ def create_app(
     app.include_router(maintenance.router)
     app.include_router(extras.router)
     app.include_router(backup.router)
+    app.include_router(server_router.router)
 
     return app
 
