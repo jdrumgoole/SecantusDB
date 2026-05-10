@@ -62,14 +62,17 @@
       <span class="kind smoke">Feature smokes</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">3 / 3</span>
+      <span class="rate">6 / 6</span>
       <span class="rate-label">features verified</span>
     </div>
     <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x).
-      Wire-protocol round-trip is verified across BSON type fidelity,
-      RBAC denial (SCRAM-SHA-256 auth + privilege check), and a
-      mixed <code>bulkWrite</code> covering insert / update / replace
-      / upsert / delete with explicit count assertions.</p>
+      Six features verified end-to-end: BSON type fidelity, RBAC
+      denial (SCRAM-SHA-256), mixed <code>bulkWrite</code>,
+      <code>listDatabases</code> filter shape, logical-session
+      lifecycle (<code>startSession</code> /
+      <code>endSessions</code> / <code>refreshSessions</code>), and
+      cluster-role bundles (<code>clusterMonitor</code> /
+      <code>backup</code>).</p>
   </article>
 
   <article class="driver">
@@ -79,15 +82,16 @@
       <span class="kind smoke">Feature smokes</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">3 / 3</span>
+      <span class="rate">6 / 6</span>
       <span class="rate-label">features verified</span>
     </div>
     <p class="note">The official high-level PHP library, built on
-      the C-based <code>ext-mongodb</code> extension. Same three
-      features (BSON type fidelity, RBAC denial, mixed
-      <code>bulkWrite</code>) verified end-to-end via
-      <code>composer install</code> + <code>php &lt;feature&gt;_smoke.php</code>
-      against an embedded SecantusDB daemon.</p>
+      the C-based <code>ext-mongodb</code> extension. Same six
+      features as the Ruby driver — type fidelity, RBAC,
+      <code>bulkWrite</code>, <code>listDatabases</code> filter,
+      logical sessions, cluster-role bundles &mdash; verified
+      end-to-end via <code>composer install</code> +
+      <code>php &lt;feature&gt;_smoke.php</code>.</p>
   </article>
 
   <article class="driver">
