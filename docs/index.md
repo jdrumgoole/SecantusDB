@@ -154,6 +154,8 @@ clustering and infrastructure that `mongod` brings.
   `createUser` / `dropUser` / `usersInfo`.
 - [Admin web UI](admin.md) — `secantusdb-admin` console, page tour,
   security model, programmatic use.
+- [Concurrency](concurrency.md) — what scales, what doesn't, and why
+  multi-writer throughput is capped by WiredTiger.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
 - [API reference](api.md) — `SecantusDBServer`, `Storage`, public surface.
 
@@ -184,6 +186,7 @@ aggregation
 change-streams
 authentication
 admin
+concurrency
 compatibility
 benchmark
 validation-report
