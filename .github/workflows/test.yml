@@ -68,6 +68,13 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
+          # Default ``cache-dependency-glob`` is ``**/uv.lock``; on
+          # Windows the recursive walk trips over deep paths under
+          # vendor/mongo-ruby-driver (EPERM at .evergreen/atlas).
+          # We only have one lock file at the repo root, so the
+          # narrower glob both fixes Windows and avoids the wasted
+          # filesystem traversal on every runner.
+          cache-dependency-glob: uv.lock
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
