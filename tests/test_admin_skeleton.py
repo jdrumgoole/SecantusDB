@@ -1615,9 +1615,7 @@ async def test_global_validation_handler_renders_back_page(
     assert "← Back" in r.text
 
 
-async def test_dashboard_badge_says_embedded_when_target_is_embedded(
-    server, tmp_path
-) -> None:
+async def test_dashboard_badge_says_embedded_when_target_is_embedded(server, tmp_path) -> None:
     """Once the user starts the embedded server (which auto-swaps the
     target), the page-header badge should say 'Embedded SecantusDB'
     rather than the kernel-assigned port."""

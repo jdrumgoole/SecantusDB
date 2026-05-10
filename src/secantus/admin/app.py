@@ -172,16 +172,15 @@ def create_app(
         # Pull out the missing field names so the message is more
         # specific than "validation failed".
         missing = sorted(
-            {
-                err.get("loc", [""])[-1]
-                for err in exc.errors()
-                if err.get("type") == "missing"
-            }
+            {err.get("loc", [""])[-1] for err in exc.errors() if err.get("type") == "missing"}
         )
         if missing:
-            summary = "Missing required field" + (
-                "s" if len(missing) > 1 else ""
-            ) + ": " + ", ".join(missing)
+            summary = (
+                "Missing required field"
+                + ("s" if len(missing) > 1 else "")
+                + ": "
+                + ", ".join(missing)
+            )
         else:
             summary = "Form validation failed."
         # Best-effort referer for the Back link; falls back to /.

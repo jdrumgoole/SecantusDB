@@ -1100,9 +1100,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 if name not in _PIPELINE_UPDATE_STAGES:
                     return {
                         "ok": 0.0,
-                        "errmsg": (
-                            f"stage {name} not allowed in pipeline updates"
-                        ),
+                        "errmsg": (f"stage {name} not allowed in pipeline updates"),
                         "code": 168,
                         "codeName": "InvalidPipelineOperator",
                     }
