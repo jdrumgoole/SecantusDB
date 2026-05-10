@@ -87,6 +87,13 @@ def main() -> int:
         ":memory:",
         "--log-level",
         "WARNING",
+        # Mongod runs a 10s ``periodicNoopIntervalSecs`` heartbeat so
+        # change-stream resume tokens advance on quiet collections.
+        # The go-driver's TestChangeStream_ReplicaSet/
+        # resume_token_updated_on_empty_batch test asserts exactly
+        # this. Match mongod's default for a faithful gauge.
+        "--noop-heartbeat-seconds",
+        "10",
     ]
     print(f"go_validation: starting daemon on {host}:{port}", file=sys.stderr)
     daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

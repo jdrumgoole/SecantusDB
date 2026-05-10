@@ -48,6 +48,12 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: false  # we install gems via the runner's bundle install
+
       - name: Run pymongo validation
         run: uv run python -m invoke validate
 
@@ -59,6 +65,9 @@ jobs:
 
       - name: Run java-driver validation
         run: uv run python -m invoke validate-java
+
+      - name: Run ruby-driver validation
+        run: uv run python -m invoke validate-ruby
 
       - name: Show report summaries
         run: |
@@ -73,6 +82,9 @@ jobs:
           echo
           echo "=== java-driver ==="
           head -50 docs/validation-report-java.md
+          echo
+          echo "=== ruby-driver ==="
+          head -50 docs/validation-report-ruby.md
 
       # If either report changed, open a PR rather than committing directly to
       # main — keeps a human in the loop on coverage shifts.
@@ -80,7 +92,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md; then
+          if git diff --quiet docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md docs/validation-report-ruby.md; then
             echo "No change to validation reports."
             exit 0
           fi
@@ -88,9 +100,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md
-          git commit -m "Refresh validation reports (pymongo + go + node + java)"
+          git add docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md docs/validation-report-ruby.md
+          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins."
