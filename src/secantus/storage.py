@@ -1781,6 +1781,7 @@ class Storage:
         sort: Mapping[str, Any] | None = None,
         projection: Mapping[str, Any] | None = None,
         hint: str | Mapping[str, Any] | None = None,
+        let: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         filter = filter or {}
         in_sort_order = False
@@ -1843,7 +1844,7 @@ class Storage:
         if candidates is None:
             assert raw_blobs is not None
             candidates = [bson.decode(b) for b in raw_blobs]
-        out = [d for d in candidates if matches(d, filter)]
+        out = [d for d in candidates if matches(d, filter, vars=let)]
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
         if skip:
@@ -2193,11 +2194,18 @@ class Storage:
             "direction": direction,
         }
 
-    def count_matching(self, db: str, coll: str, filter: dict[str, Any] | None = None) -> int:
+    def count_matching(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any] | None = None,
+        *,
+        let: dict[str, Any] | None = None,
+    ) -> int:
         if not filter:
             with self._lock:
                 return sum(1 for _ in self._scan_docs(db, coll))
-        return sum(1 for doc in self._all_docs(db, coll) if matches(doc, filter))
+        return sum(1 for doc in self._all_docs(db, coll) if matches(doc, filter, vars=let))
 
     def collection_data_size(self, db: str, coll: str) -> int:
         """Sum of bson-encoded doc bytes for ``coll``.
@@ -2237,6 +2245,7 @@ class Storage:
         multi: bool = False,
         upsert: bool = False,
         array_filters: list[dict[str, Any]] | None = None,
+        let: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         matched = 0
         modified = 0
@@ -2264,7 +2273,7 @@ class Storage:
             candidates = self._candidates_iter(db, coll, filter)
             for id_k, blob in candidates:
                 doc = bson.decode(blob)
-                if not matches(doc, filter):
+                if not matches(doc, filter, vars=let):
                     continue
                 matched += 1
                 pos = find_positional_matches(doc, filter)
@@ -2349,7 +2358,15 @@ class Storage:
                 self._emit_oplog(oplog_entries, pre_images)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
 
-    def delete_matching(self, db: str, coll: str, filter: dict[str, Any], *, limit: int = 0) -> int:
+    def delete_matching(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        limit: int = 0,
+        let: dict[str, Any] | None = None,
+    ) -> int:
         deleted = 0
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
@@ -2373,7 +2390,7 @@ class Storage:
             candidates = self._candidates_iter(db, coll, filter)
             for id_k, blob in candidates:
                 doc = bson.decode(blob)
-                if not matches(doc, filter):
+                if not matches(doc, filter, vars=let):
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)

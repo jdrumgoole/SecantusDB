@@ -995,6 +995,9 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     sort = doc.get("sort") or None
     projection = doc.get("projection") or None
     hint = doc.get("hint")
+    # ``let`` declares user-vars visible to ``$expr`` clauses in the
+    # filter (MongoDB 5.0+).
+    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
     # ``batchSize`` is genuinely tri-state: absent (use default),
     # 0 ("open the cursor but send no docs in firstBatch"), or
     # explicit positive. The 0 case is load-bearing for drivers
@@ -1026,6 +1029,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             sort=sort,
             projection=projection,
             hint=hint,
+            let=let,
         )
     except BadHint as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
@@ -1124,6 +1128,8 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["update"]
     updates = doc.get("updates", [])
     ordered = bool(doc.get("ordered", True))
+    # ``let`` — see ``_delete`` for the wire-shape rationale.
+    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
     n = 0
     n_modified = 0
     upserted: list[dict[str, Any]] = []
@@ -1167,6 +1173,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 multi=bool(spec.get("multi", False)),
                 upsert=bool(spec.get("upsert", False)),
                 array_filters=spec.get("arrayFilters"),
+                let=let,
             )
         except IndexConflict as exc:
             write_errors.append({"index": index, "code": 11000, "errmsg": str(exc)})
@@ -1217,12 +1224,20 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["delete"]
     deletes = doc.get("deletes", [])
     ordered = bool(doc.get("ordered", True))
+    # ``let`` declares user-variables visible to ``$expr`` clauses in the
+    # filter (MongoDB 5.0+). Threaded through to ``matches()`` via the
+    # storage layer; without it, ``{$expr: {$eq: ['$_id', '$$id']}}``
+    # against ``let: {id: 1}`` raises "system variable $$id is not
+    # defined" and the test framework asserts failure.
+    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
     n = 0
     write_errors: list[dict[str, Any]] = []
     for index, spec in enumerate(deletes):
         try:
             n += ctx.storage.delete_matching(
-                ctx.db_name, coll, spec.get("q", {}), limit=int(spec.get("limit", 0))
+                ctx.db_name, coll, spec.get("q", {}),
+                limit=int(spec.get("limit", 0)),
+                let=let,
             )
         except QueryError as exc:
             # Same per-delete writeError shape as ``_update`` — the
