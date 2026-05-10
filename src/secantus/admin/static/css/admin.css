@@ -1030,3 +1030,27 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
 }
+
+/* JSON pretty-printer tokens. Light by default, overridden in
+   prefers-color-scheme: dark (see :root override below). */
+:root {
+  --json-key: #0f766e;     /* teal-700 */
+  --json-string: #b45309;  /* amber-700 */
+  --json-number: #1d4ed8;  /* blue-700 */
+  --json-bool: #7c3aed;    /* violet-600 */
+  --json-null: var(--muted);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --json-key: #2dd4bf;     /* teal-400 */
+    --json-string: #fbbf24;  /* amber-400 */
+    --json-number: #60a5fa;  /* blue-400 */
+    --json-bool: #c4b5fd;    /* violet-300 */
+    --json-null: var(--muted);
+  }
+}
+.json-key    { color: var(--json-key); }
+.json-string { color: var(--json-string); }
+.json-number { color: var(--json-number); }
+.json-bool   { color: var(--json-bool); font-weight: 600; }
+.json-null   { color: var(--json-null); font-style: italic; }

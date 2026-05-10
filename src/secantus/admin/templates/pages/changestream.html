@@ -46,7 +46,7 @@
             @click="copyResume(entry.event._id)"
           >Copy resume token</button>
         </div>
-        <pre class="doc-body" x-text="formatJson(entry.event)"></pre>
+        <pre class="doc-body" x-html="formatJson(entry.event)"></pre>
       </div>
     </template>
     <p x-show="events.length === 0" class="empty">
@@ -132,7 +132,9 @@ function changestreamPage(initial) {
     },
 
     formatJson(event) {
-      return JSON.stringify(event, null, 2);
+      return window.secantusFormatJsonHtml
+        ? window.secantusFormatJsonHtml(event)
+        : JSON.stringify(event, null, 2);
     },
 
     copyResume(token) {

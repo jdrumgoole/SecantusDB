@@ -1720,3 +1720,28 @@ def test_cli_missing_admin_extra_shows_helpful_message(monkeypatch, capsys) -> N
     assert "admin' extra" in err
     assert "uvicorn" in err
     assert "pip install 'secantusdb[admin]'" in err
+
+
+async def test_json_pretty_script_loaded_on_every_page(http: AsyncClient) -> None:
+    """The pretty-printer script is loaded from base.html so every page
+    benefits from token highlighting on <pre class='doc-body'>."""
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "/static/js/json-pretty.js" in r.text
+
+
+async def test_json_pretty_static_file_served(http: AsyncClient) -> None:
+    """The script itself is reachable as a static asset."""
+    r = await http.get(
+        "/static/js/json-pretty.js", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    body = r.text
+    # Public helpers the changestream page (and any future Alpine page)
+    # depends on.
+    assert "secantusFormatJsonHtml" in body
+    assert "secantusPrettyJson" in body
+    # HTML-escape pass before tokenisation guards against XSS in stored
+    # documents — a doc with "<script>" in a string field must not turn
+    # into a real script tag in the rendered page.
+    assert "escapeHtml" in body
