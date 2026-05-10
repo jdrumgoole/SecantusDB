@@ -1065,6 +1065,7 @@ def _find_tailable(
 
 def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import GeoExtractError, IndexConflict
+    from secantus.update import _PIPELINE_UPDATE_STAGES
 
     coll = doc["update"]
     updates = doc.get("updates", [])
@@ -1074,6 +1075,37 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     upserted: list[dict[str, Any]] = []
     write_errors: list[dict[str, Any]] = []
     for index, spec in enumerate(updates):
+        # Pre-validate the pipeline-update shape upfront so a no-match
+        # filter still surfaces parse errors to the client. Real
+        # mongod parses the pipeline before scanning the collection
+        # and returns a **command-level** error (``ok: 0``) for an
+        # unknown stage — not a per-doc writeError. The
+        # ``CommandLoggingTest#Failed bulk write command log
+        # message`` driver test asserts the driver fires
+        # ``Command failed`` (``ok: 0``) for ``$invalidOperator`` in
+        # the pipeline, so we mirror mongod's strict path here even
+        # though invalid query operators (``$unsupported``) DO go to
+        # writeErrors below.
+        u = spec.get("u")
+        if isinstance(u, list):
+            for stage in u:
+                if not isinstance(stage, Mapping) or len(stage) != 1:
+                    return {
+                        "ok": 0.0,
+                        "errmsg": "each pipeline stage must be a single-key document",
+                        "code": 9,
+                        "codeName": "FailedToParse",
+                    }
+                (name,) = stage.keys()
+                if name not in _PIPELINE_UPDATE_STAGES:
+                    return {
+                        "ok": 0.0,
+                        "errmsg": (
+                            f"stage {name} not allowed in pipeline updates"
+                        ),
+                        "code": 168,
+                        "codeName": "InvalidPipelineOperator",
+                    }
         try:
             result = ctx.storage.update_matching(
                 ctx.db_name,
@@ -1097,6 +1129,25 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             if ordered:
                 break
             continue
+        except QueryError as exc:
+            # Bad filter syntax (unknown operator, malformed regex, etc.)
+            # is a per-update writeError per mongod's wire shape — the
+            # ``update`` command itself succeeds with ``ok: 1`` and
+            # ``writeErrors: [...]`` populated, NOT ``ok: 0``. Drivers
+            # depend on this: mongo-java-driver's
+            # ``CommandMonitoringTest#updateOne with write errors``
+            # asserts a ``commandSucceededEvent`` for the call, not a
+            # ``commandFailedEvent``.
+            write_errors.append({"index": index, "code": 2, "errmsg": str(exc)})
+            if ordered:
+                break
+            continue
+        except UpdateError as exc:
+            # Same shape for malformed update operators.
+            write_errors.append({"index": index, "code": 9, "errmsg": str(exc)})
+            if ordered:
+                break
+            continue
         n += result["matched"]
         n_modified += result["modified"]
         if result["upserted_id"] is not None:
@@ -1113,12 +1164,27 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["delete"]
     deletes = doc.get("deletes", [])
+    ordered = bool(doc.get("ordered", True))
     n = 0
-    for spec in deletes:
-        n += ctx.storage.delete_matching(
-            ctx.db_name, coll, spec.get("q", {}), limit=int(spec.get("limit", 0))
-        )
-    return {"n": n, "ok": 1.0}
+    write_errors: list[dict[str, Any]] = []
+    for index, spec in enumerate(deletes):
+        try:
+            n += ctx.storage.delete_matching(
+                ctx.db_name, coll, spec.get("q", {}), limit=int(spec.get("limit", 0))
+            )
+        except QueryError as exc:
+            # Same per-delete writeError shape as ``_update`` — the
+            # ``delete`` command must succeed with ``ok: 1`` and
+            # ``writeErrors: [...]`` rather than failing the whole
+            # batch on one bad filter.
+            write_errors.append({"index": index, "code": 2, "errmsg": str(exc)})
+            if ordered:
+                break
+            continue
+    reply: dict[str, Any] = {"n": n, "ok": 1.0}
+    if write_errors:
+        reply["writeErrors"] = write_errors
+    return reply
 
 
 def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
