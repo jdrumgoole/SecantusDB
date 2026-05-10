@@ -86,6 +86,15 @@ jobs:
         # aren't exercised by pytest and would just slow CI down.
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
+      - name: Install tzdata (Windows)
+        if: runner.os == 'Windows'
+        # Windows ships no IANA timezone database; Python's
+        # ``zoneinfo`` returns nothing for ``ZoneInfo("Europe/Dublin")``
+        # without it. ``tzdata`` is a tiny pure-Python package that
+        # bundles the IANA data. Linux/macOS use the system tzdata,
+        # so we only need this on Windows runners.
+        run: uv pip install tzdata
+
       - name: Lint
         run: uv run ruff check src tests
 

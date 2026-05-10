@@ -54,12 +54,28 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from secantus import SecantusDBServer
 from secantus.auth import SCRAM_SHA_256, derive_credentials
+
+# Cross-driver tooling-presence skipif gates assume a POSIX environment
+# (the node / java / ruby / go skipif checks pass on Windows runners
+# because npm / java / ruby ARE preinstalled, but the actual smoke
+# scripts use ``fcntl.flock`` for cross-xdist coordination and shell
+# scripts the runner can't exec). Skip the whole module on Windows
+# rather than try to port the coordination primitive — none of the
+# Windows-specific bugs the cross-driver gauges would catch are
+# different from what the POSIX runs already cover.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Cross-driver smokes use fcntl.flock + POSIX shell scripts; "
+    "POSIX runners (Linux/macOS) cover the wire-protocol gaps these tests "
+    "are meant to catch.",
+)
 
 _HERE = Path(__file__).parent
 _CROSS_DRIVER = _HERE / "cross_driver"
