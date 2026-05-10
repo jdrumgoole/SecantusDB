@@ -73,3 +73,7 @@ website/infra/aws-state.json
 website/secantus-data/
 website/__pycache__/
 xunit-results/
+# Playwright MCP browser-session artefacts — Claude sessions write
+# them to repo root when capturing screenshots / DOM dumps. Always
+# untracked, never shipped.
+.playwright-mcp/
