@@ -1,20 +1,26 @@
-"""Concurrency-scaling regression test (Phase 0 of the WT concurrency plan).
+"""Concurrency-scaling diagnostic — known to fail at the WT-level ceiling.
 
-This test is **intentionally red on `main`**. It encodes the Phase 2
-exit criterion from ``tasks/wt-concurrency-plan.md``: 2 concurrent
-writers must deliver at least 0.7x the throughput of a single writer
-on the same hardware. Today's measured ratio is around 0.35x — the
-global ``Storage._lock`` collapses every write to one in-flight
-operation, then adds context-switch tax on top.
+This test was originally written as a Phase-2 exit criterion: ``2
+concurrent writers >= 0.7x of one``. The Phase-3 spike
+(``tasks/wt-bindings-plan.md`` + ``bench/wt_poc/``) proved that ceiling
+is unreachable on WiredTiger: even pure-C pthread writes through
+``libwiredtiger`` cap at ~1.3x at N=2 and either flatline or regress at
+higher N. The bottleneck is in WT's C library (page locks, log-write
+serialisation, eviction lock); no amount of Python-side rebinding lifts
+it.
 
-The test is marked ``slow`` so the default pytest run skips it (it
-spawns subprocesses and runs for ~12s wall-clock). Trigger it
-explicitly:
+The test is therefore marked ``xfail`` — *not* because the
+implementation is broken, but because the assertion encodes a goal the
+storage backend cannot deliver. Useful as a regression *detector* if WT
+ever ships a higher-concurrency story upstream: when this test
+unexpectedly passes, that's news worth investigating.
+
+Marked ``slow`` so the default pytest run skips it (it spawns
+subprocesses and runs for ~12s wall-clock). Trigger explicitly:
 
     uv run python -m pytest -m slow tests/test_concurrency.py
 
-When Phase 2 lands (decomposed locks, schema-snapshot pattern,
-WT-MVCC for the data path), this test should turn green.
+See ``docs/concurrency.md`` for the full architectural ceiling story.
 """
 
 from __future__ import annotations
@@ -128,12 +134,20 @@ def _measure(uri: str, n: int) -> float:
 
 
 @pytest.mark.slow
+@pytest.mark.xfail(
+    reason="WT-level concurrency ceiling: pure-C pthread writes also cap "
+           "at ~1.3x at N=2. See bench/wt_poc/ + docs/concurrency.md.",
+    strict=False,
+)
 def test_two_writers_scale_above_single_writer(tmp_path) -> None:
     """N=2 aggregate throughput >= 0.7 x N=1 single-writer throughput.
 
-    See ``tasks/wt-concurrency-plan.md`` for context. This test is
-    intentionally failing on `main` and the success criterion for
-    Phase 2 of the WT concurrency work.
+    Encoded the original Phase-2 exit criterion. Now expected to fail
+    until WiredTiger ships a higher-concurrency story upstream — see
+    ``docs/concurrency.md`` for the architectural ceiling and
+    ``tasks/wt-bindings-plan.md`` for the spike that proved it. If
+    this test ever unexpectedly passes, ``strict=False`` xfail won't
+    fail the suite, but the surprise is worth investigating.
     """
     storage = tmp_path / "wt"
     port = _free_port()
