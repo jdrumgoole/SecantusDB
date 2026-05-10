@@ -67,6 +67,8 @@ _NODE_SMOKE_DIR = _CROSS_DRIVER / "node"
 _GO_SMOKE_DIR = _CROSS_DRIVER / "go"
 _JAVA_SMOKE_DIR = _CROSS_DRIVER / "java"
 _JAVA_SMOKES_JAR = _JAVA_SMOKE_DIR / "build" / "libs" / "secantus-java-smokes-all.jar"
+_RUBY_SMOKE_DIR = _CROSS_DRIVER / "ruby"
+_PHP_SMOKE_DIR = _CROSS_DRIVER / "php"
 
 _MONGOSH = shutil.which("mongosh")
 _NODE = shutil.which("node")
@@ -74,6 +76,51 @@ _NPM = shutil.which("npm")
 _GO = shutil.which("go")
 _JAVA = shutil.which("java")
 _GRADLE = shutil.which("gradle")
+
+
+# Ruby + PHP toolchains. macOS's system Ruby (2.6.x at /usr/bin/ruby)
+# is too old for mongo-ruby-driver, so prefer Homebrew's modern Ruby
+# at /opt/homebrew/opt/ruby/bin/ruby when present. PHP follows the
+# same pattern.
+def _resolve_ruby() -> str | None:
+    for cand in ("/opt/homebrew/opt/ruby/bin/ruby", shutil.which("ruby")):
+        if cand and Path(cand).is_file():
+            check = subprocess.run(
+                [cand, "-e", "exit(RUBY_VERSION.to_f >= 3.0 ? 0 : 1)"],
+                capture_output=True,
+            )
+            if check.returncode == 0:
+                return cand
+    return None
+
+
+def _resolve_bundle(ruby_path: str | None) -> str | None:
+    if ruby_path is None:
+        return None
+    cand = Path(ruby_path).parent / "bundle"
+    if cand.is_file():
+        return str(cand)
+    return shutil.which("bundle")
+
+
+def _resolve_php() -> str | None:
+    for cand in ("/opt/homebrew/bin/php", shutil.which("php")):
+        if cand and Path(cand).is_file():
+            check = subprocess.run(
+                [cand, "-r", "exit(extension_loaded('mongodb') ? 0 : 1);"],
+                capture_output=True,
+            )
+            if check.returncode == 0:
+                return cand
+    return None
+
+
+_RUBY = _resolve_ruby()
+_BUNDLE = _resolve_bundle(_RUBY)
+_PHP = _resolve_php()
+_COMPOSER = shutil.which("composer") or "/opt/homebrew/bin/composer"
+_RUBY_AVAILABLE = _RUBY is not None and _BUNDLE is not None
+_PHP_AVAILABLE = _PHP is not None and Path(_COMPOSER).is_file()
 
 
 def _run(
@@ -116,6 +163,72 @@ def _ensure_node_modules() -> bool:
             return True
         result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
         return result.returncode == 0 and (nm / "mongodb").is_dir()
+
+
+def _ensure_ruby_bundle() -> bool:
+    """Install the mongo-ruby-driver gem set once via ``bundle install``.
+
+    Probes the runtime by asking ``bundle exec ruby`` to require the
+    ``mongo`` gem; if that succeeds, the bundle is good. Same flock
+    pattern as ``_ensure_node_modules`` — multiple xdist workers
+    racing on a cold ``Gemfile.lock`` would corrupt each other's gem
+    extraction.
+    """
+    if not _RUBY_AVAILABLE:
+        return False
+    env = {**os.environ, "PATH": f"{Path(_RUBY).parent}:{os.environ.get('PATH', '')}"}
+
+    def _probe() -> bool:
+        return (
+            _run(
+                [_BUNDLE, "exec", "ruby", "-e", "require 'mongo'"],
+                cwd=_RUBY_SMOKE_DIR,
+                env=env,
+                timeout=30.0,
+            ).returncode
+            == 0
+        )
+
+    if _probe():
+        return True
+    import fcntl
+
+    lock_path = _RUBY_SMOKE_DIR / ".bundle.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if _probe():
+            return True
+        result = _run(
+            [_BUNDLE, "install", "--quiet"],
+            cwd=_RUBY_SMOKE_DIR,
+            env=env,
+            timeout=300.0,
+        )
+        return result.returncode == 0 and _probe()
+
+
+def _ensure_php_vendor() -> bool:
+    """``composer install`` once so ``mongodb/mongodb`` is available."""
+    if not _PHP_AVAILABLE:
+        return False
+    nm = _PHP_SMOKE_DIR / "vendor" / "mongodb" / "mongodb"
+    if nm.is_dir():
+        return True
+    import fcntl
+
+    lock_path = _PHP_SMOKE_DIR / ".vendor.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if nm.is_dir():
+            return True
+        result = _run(
+            [_COMPOSER, "install", "--no-interaction", "--quiet"],
+            cwd=_PHP_SMOKE_DIR,
+            timeout=300.0,
+        )
+        return result.returncode == 0 and nm.is_dir()
 
 
 def _java_smokes_jar_is_fresh() -> bool:
@@ -1973,5 +2086,55 @@ def test_cluster_roles_smoke_via_java_driver(server_with_auth: SecantusDBServer)
     assert result.returncode == 0, (
         f"java cluster-roles smoke: rc={result.returncode}\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Ruby (mongo-ruby-driver) — BSON type fidelity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _RUBY_AVAILABLE, reason="ruby >= 3.0 with bundle not on PATH")
+@pytest.mark.xdist_group(name="ruby_smokes")
+def test_types_smoke_via_ruby_driver(server: SecantusDBServer) -> None:
+    if not _ensure_ruby_bundle():
+        pytest.skip("could not bundle install mongo-ruby-driver")
+    env = {
+        **os.environ,
+        "MONGODB_URI": server.uri,
+        "PATH": f"{Path(_RUBY).parent}:{os.environ.get('PATH', '')}",
+    }
+    result = _run(
+        [_BUNDLE, "exec", "ruby", str(_RUBY_SMOKE_DIR / "types_smoke.rb")],
+        cwd=_RUBY_SMOKE_DIR,
+        env=env,
+        timeout=120.0,
+    )
+    assert result.returncode == 0, (
+        f"ruby types smoke: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# PHP (mongo-php-library + ext-mongodb) — BSON type fidelity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _PHP_AVAILABLE, reason="php with ext-mongodb + composer not on PATH")
+@pytest.mark.xdist_group(name="php_smokes")
+def test_types_smoke_via_php_driver(server: SecantusDBServer) -> None:
+    if not _ensure_php_vendor():
+        pytest.skip("could not composer install mongodb/mongodb")
+    env = {**os.environ, "MONGODB_URI": server.uri}
+    result = _run(
+        [_PHP, str(_PHP_SMOKE_DIR / "types_smoke.php")],
+        env=env,
+        timeout=60.0,
+    )
+    assert result.returncode == 0, (
+        f"php types smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "OK" in result.stdout

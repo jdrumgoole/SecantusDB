@@ -1073,9 +1073,7 @@ async def test_profiler_lists_entries_after_op(server, http: AsyncClient) -> Non
     finally:
         mc.close()
 
-    r = await http.get(
-        "/profiler?db=entries_db", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/profiler?db=entries_db", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     # The insert op shows up.
     assert "insert" in r.text
@@ -1102,25 +1100,19 @@ async def test_maintenance_page_renders(http: AsyncClient) -> None:
 
 
 async def test_maintenance_fsync_runs_and_flashes(http: AsyncClient) -> None:
-    r = await http.post(
-        "/maintenance/fsync", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.post("/maintenance/fsync", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "fsync ok" in r.text
 
 
 async def test_maintenance_prune_oplog_returns_count(http: AsyncClient) -> None:
-    r = await http.post(
-        "/maintenance/prune-oplog", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.post("/maintenance/prune-oplog", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "pruned" in r.text and "oplog row" in r.text
 
 
 async def test_maintenance_prune_ttl_returns_count(http: AsyncClient) -> None:
-    r = await http.post(
-        "/maintenance/prune-ttl", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.post("/maintenance/prune-ttl", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     assert "TTL doc" in r.text
 
@@ -1135,9 +1127,7 @@ async def test_maintenance_drop_db_modal_typed_check(http: AsyncClient) -> None:
     assert "myapp" in r.text
 
 
-async def test_maintenance_drop_db_actually_drops(
-    server, http: AsyncClient
-) -> None:
+async def test_maintenance_drop_db_actually_drops(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
@@ -1162,9 +1152,7 @@ async def test_maintenance_drop_db_actually_drops(
         mc.close()
 
 
-async def test_maintenance_drop_coll_actually_drops(
-    server, http: AsyncClient
-) -> None:
+async def test_maintenance_drop_coll_actually_drops(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
