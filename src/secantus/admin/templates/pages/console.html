@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="console" x-data="consolePage({{ {'kind': kind} | tojson }})">
+<div class="console" x-data='consolePage({{ {"kind": kind} | tojson }})'>
   <nav class="console-tabs">
     <button type="button" :class="kind === 'find' ? 'tab-active' : ''" @click="kind = 'find'">find</button>
     <button type="button" :class="kind === 'aggregate' ? 'tab-active' : ''" @click="kind = 'aggregate'">aggregate</button>

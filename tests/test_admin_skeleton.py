@@ -857,6 +857,62 @@ async def test_console_page_renders_with_tabs(http: AsyncClient) -> None:
         assert tab in r.text
 
 
+@pytest.mark.parametrize("path", ["/console", "/changestream"])
+async def test_alpine_x_data_attribute_is_well_formed(http: AsyncClient, path: str) -> None:
+    """The Alpine ``x-data`` attribute on these pages embeds a JSON literal.
+
+    Regression for a template-quoting bug: writing
+    ``x-data="someFn({{ ctx | tojson }})"`` rendered to
+    ``x-data="someFn({"key": "value"})"`` — the embedded ``"`` from the
+    JSON terminated the attribute prematurely, so Alpine never received
+    a valid initialiser, and every ``x-show`` / ``@click`` /
+    ``:class`` directive on the page silently no-op'd. The console
+    page's tab buttons looked clickable but did nothing; the
+    changestream page never initialised its WebSocket.
+
+    This test asserts the rendered ``x-data`` attribute value parses
+    back as a valid ``fn(<json>)`` expression, which is what Alpine
+    actually evaluates. Using Python's stdlib HTML parser means we
+    catch any malformed-attribute regression regardless of which side
+    of the quoting (single vs. double, escaping, etc.) the fix lives
+    on.
+    """
+    import json
+    from html.parser import HTMLParser
+
+    r = await http.get(path, headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+
+    found: list[str] = []
+
+    class _XDataExtractor(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            for name, value in attrs:
+                if name == "x-data" and value is not None:
+                    found.append(value)
+
+    parser = _XDataExtractor()
+    parser.feed(r.text)
+
+    assert found, f"no x-data attribute found in {path} response"
+    for value in found:
+        # Expected shape: ``someFn({...json...})``. Strip the function
+        # wrapper and feed the inside to json.loads — broken attribute
+        # parsing would have truncated the JSON mid-string.
+        assert value.endswith(")"), (
+            f"{path}: x-data attribute looks truncated (no closing paren): {value!r}"
+        )
+        open_paren = value.index("(")
+        json_payload = value[open_paren + 1 : -1]
+        try:
+            json.loads(json_payload)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"{path}: x-data initialiser JSON failed to parse "
+                f"({exc}); rendered value was {value!r}"
+            ) from exc
+
+
 async def test_console_find_returns_docs(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 
