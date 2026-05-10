@@ -151,6 +151,8 @@ clustering and infrastructure that `mongod` brings.
   resume tokens, pre-images, retention.
 - [Authentication](authentication.md) — SCRAM-SHA-256, `--auth`,
   `createUser` / `dropUser` / `usersInfo`.
+- [Admin web UI](admin.md) — `secantusdb-admin` console, page tour,
+  security model, programmatic use.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
 - [API reference](api.md) — `SecantusDBServer`, `Storage`, public surface.
 
@@ -180,6 +182,7 @@ indexes
 aggregation
 change-streams
 authentication
+admin
 compatibility
 benchmark
 validation-report

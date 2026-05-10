@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="modal-meta">
+  Backups land in <code>{{ backup_root }}</code>. The admin UI shells
+  out to the official <code>mongodump</code> / <code>mongorestore</code>
+  binaries — SecantusDB speaks the same wire protocol as
+  <code>mongod</code>, so they work unchanged.
+</p>
+
+{% if not preflight_ok %}
+  <div class="error">{{ preflight_error }}</div>
+{% endif %}
+
+{% if flash %}
+  <div class="flash flash-{{ flash.kind }}">{{ flash.msg }}</div>
+{% endif %}
+
+<h2 class="section-title">Run backup</h2>
+<form method="post" action="/backup/dump" class="inline-form">
+  <button
+    type="submit"
+    class="btn-secondary"
+    {% if not preflight_ok %}disabled{% endif %}
+  >Run mongodump now</button>
+</form>
+
+<h2 class="section-title">Existing backups</h2>
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th class="num">Size</th>
+      <th class="doc-actions-col">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+      <tr>
+        <td><code>{{ r.name }}</code></td>
+        <td class="num">{{ r.size }}</td>
+        <td class="doc-actions">
+          <form method="post" action="/backup/restore" class="inline-form">
+            <input type="hidden" name="name" value="{{ r.name }}" />
+            <button
+              type="submit"
+              class="btn-danger"
+              {% if not preflight_ok %}disabled{% endif %}
+            >Restore</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3" class="empty">No backups yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if last_result %}
+  <h2 class="section-title">Last subprocess output</h2>
+  <p class="modal-meta">
+    Exit code <code>{{ last_result.returncode }}</code> ·
+    {% if last_result.ok %}<span class="badge">ok</span>{% else %}<span class="badge" style="border-color: var(--error); color: var(--error)">error</span>{% endif %}
+  </p>
+  {% if last_result.stdout %}
+    <h3 class="section-title">stdout</h3>
+    <pre class="doc-body">{{ last_result.stdout }}</pre>
+  {% endif %}
+  {% if last_result.stderr %}
+    <h3 class="section-title">stderr</h3>
+    <pre class="doc-body">{{ last_result.stderr }}</pre>
+  {% endif %}
+{% endif %}
+{% endblock %}

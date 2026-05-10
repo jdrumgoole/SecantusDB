@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <div
-  x-data="changestreamPage({{ {'scope': scope, 'db': db_name, 'coll': coll_name} | tojson }})"
+  x-data='changestreamPage({{ {"scope": scope, "db": db_name, "coll": coll_name} | tojson }})'
   x-init="init()"
 >
   <form class="filter-form" method="get" action="/changestream">
