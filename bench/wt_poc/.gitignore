@@ -1,0 +1,3 @@
+wt_pthread_bench
+wt_pthread_bench_nolog
+*.o
