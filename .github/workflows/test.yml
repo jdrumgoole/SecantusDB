@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +42,14 @@ jobs:
       - name: Install swig (macOS)
         if: runner.os == 'macOS'
         run: brew install swig
+
+      - name: Install swig (Windows)
+        if: runner.os == 'Windows'
+        # SWIG ships preinstalled on windows-2022 runners, but choco
+        # re-installs idempotently to defend against runner image
+        # refreshes that drop it. Same line cibuildwheel uses for
+        # publish-time wheel builds.
+        run: choco install -y swig
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4

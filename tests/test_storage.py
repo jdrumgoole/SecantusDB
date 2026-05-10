@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import signal
+import sys
 
 import bson
 import pytest
@@ -307,6 +308,11 @@ def test_checkpoint_after_close_is_safe(tmp_path) -> None:
     storage.checkpoint()  # no-op; must not raise.
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="signal.SIGKILL doesn't exist on Windows; the test simulates a "
+    "hard crash by self-SIGKILL which has no portable equivalent there.",
+)
 def test_inserts_survive_simulated_crash(tmp_path) -> None:
     """Writes persist across SIGKILL — i.e. no checkpoint, no clean close.
 
