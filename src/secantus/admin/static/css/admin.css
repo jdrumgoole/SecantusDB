@@ -172,6 +172,17 @@ body {
   color: var(--accent);
 }
 
+.server-badge-embedded {
+  background: var(--bg);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.server-badge-embedded span:not(.server-badge-dot) {
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
 .server-badge-dot {
   color: var(--accent);
   font-size: 0.7rem;
@@ -579,6 +590,14 @@ body {
   border-radius: 4px;
   font-weight: 500;
   cursor: pointer;
+}
+
+.modal-actions button[type="submit"]:disabled,
+.filter-form button[type="submit"]:disabled {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--muted);
+  cursor: not-allowed;
 }
 
 .modal-narrow {

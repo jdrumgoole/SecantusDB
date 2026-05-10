@@ -20,8 +20,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 import secantus
 from secantus.admin.client import MongoFacade, display_uri
@@ -153,6 +156,47 @@ def create_app(
     app.include_router(extras.router)
     app.include_router(backup.router)
     app.include_router(server_router.router)
+
+    @app.exception_handler(RequestValidationError)
+    async def _form_validation_handler(
+        request: Request, exc: RequestValidationError
+    ) -> HTMLResponse:
+        """Render a back-aware error page instead of FastAPI's default JSON 422.
+
+        Without this, a missing form field (e.g. blank Run command on
+        the /query page) lands on a bare ``{"detail":[{...}]}`` page
+        with no chrome — the user is stranded with no way back. We
+        render the standard sidebar + a one-line summary + Back link.
+        """
+        templates = Jinja2Templates(directory=app.state.templates_dir)
+        # Pull out the missing field names so the message is more
+        # specific than "validation failed".
+        missing = sorted(
+            {
+                err.get("loc", [""])[-1]
+                for err in exc.errors()
+                if err.get("type") == "missing"
+            }
+        )
+        if missing:
+            summary = "Missing required field" + (
+                "s" if len(missing) > 1 else ""
+            ) + ": " + ", ".join(missing)
+        else:
+            summary = "Form validation failed."
+        # Best-effort referer for the Back link; falls back to /.
+        back = request.headers.get("referer") or "/"
+        return templates.TemplateResponse(
+            request,
+            "pages/error.html",
+            {
+                "title": "Form error",
+                "active": "",
+                "summary": summary,
+                "back": back,
+            },
+            status_code=400,
+        )
 
     return app
 

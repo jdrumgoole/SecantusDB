@@ -35,10 +35,19 @@
     <main class="content">
       <header class="page-header">
         <h1>{{ title }}</h1>
-        <a class="server-badge" href="/server" title="Click to change target server">
-          <span class="server-badge-dot">●</span>
-          <code>{{ request.app.state.mongo_uri_display }}</code>
-        </a>
+        {% set embedded_uri = request.app.state.embedded.status().uri %}
+        {% if embedded_uri and embedded_uri == request.app.state.mongo_uri %}
+          <a class="server-badge server-badge-embedded" href="/server"
+             title="Embedded SecantusDB ({{ request.app.state.mongo_uri_display }})">
+            <span class="server-badge-dot">●</span>
+            <span>Embedded SecantusDB</span>
+          </a>
+        {% else %}
+          <a class="server-badge" href="/server" title="Click to change target server">
+            <span class="server-badge-dot">●</span>
+            <code>{{ request.app.state.mongo_uri_display }}</code>
+          </a>
+        {% endif %}
       </header>
       {% block content %}{% endblock %}
     </main>
