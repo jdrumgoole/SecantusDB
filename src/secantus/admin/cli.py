@@ -77,7 +77,21 @@ def main(argv: list[str] | None = None) -> int:
     # Lazy imports — the launcher pulls in fastapi / uvicorn / pywebview,
     # all heavyweight. Importing them inside ``main`` keeps ``--help``
     # fast and avoids cost when tests construct ``create_app`` directly.
-    from secantus.admin.launcher import run
+    # A missing extra is the most common error a user hits, so trade
+    # the bare ``ModuleNotFoundError`` for a fix-it hint.
+    try:
+        from secantus.admin.launcher import run
+    except ModuleNotFoundError as exc:
+        sys.stderr.write(
+            f"\nThe admin web UI requires the 'admin' extra "
+            f"(missing dependency: {exc.name}).\n\n"
+            f"Install it with one of:\n"
+            f"  pip install 'secantusdb[admin]'\n"
+            f"  uv sync --extra admin\n"
+            f"  uv run --extra admin secantusdb-admin\n\n"
+            f"From a checkout, ``uv run --extra admin invoke admin`` works too.\n"
+        )
+        return 1
 
     return run(
         mongo_uri=args.uri,
