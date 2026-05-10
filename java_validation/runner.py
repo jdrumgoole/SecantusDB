@@ -253,6 +253,23 @@ def main() -> int:
             cmd = [
                 "./gradlew", "--no-daemon", "--console=plain",
                 f"-Dorg.mongodb.test.uri={uri}",
+                # Per-test wall-clock timeout. JUnit 5 (Jupiter)
+                # honours these system properties; with the default
+                # 15s budget, a single test that hangs on a tailable
+                # getMore / change-stream resume / SDAM retry loop
+                # is killed with TimeoutException and the run keeps
+                # moving instead of pinning the whole gauge.
+                # ``mode=separate_thread`` ensures the timeout fires
+                # even if the test is blocked on a native call.
+                "-Djunit.jupiter.execution.timeout.default=15s",
+                "-Djunit.jupiter.execution.timeout.test.method.default=15s",
+                "-Djunit.jupiter.execution.timeout.testable.method.default=15s",
+                "-Djunit.jupiter.execution.timeout.mode=enabled_on_non_parallel_tests",
+                # Spock 1.x reads its own timeout config. We can't
+                # set per-test from outside without editing the spec
+                # tree, but the driver doesn't use slow Spock tests
+                # in our include set (those are in ``ExcludeSlow``
+                # already, gated by ``-Dspock.configuration``).
                 spec.task,
             ]
             for fqn in spec.test_classes:
