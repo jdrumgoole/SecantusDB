@@ -54,12 +54,57 @@
     <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here &mdash; an important second gauge.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
   </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-ruby-driver</h3>
+      <span class="lang">Ruby</span>
+      <span class="kind smoke">Smoke-tested</span>
+    </header>
+    <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x).
+      Wire-protocol round-trip is verified by a BSON type-fidelity
+      smoke that inserts a doc with every distinct BSON class
+      (<code>ObjectId</code>, <code>Decimal128</code>,
+      <code>UTCDateTime</code>, <code>Binary</code>, int32 / int64,
+      bool / null, nested doc, mixed array) and asserts each field's
+      class &amp; value round-trip end-to-end.</p>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-php-library</h3>
+      <span class="lang">PHP</span>
+      <span class="kind smoke">Smoke-tested</span>
+    </header>
+    <p class="note">The official high-level PHP library, built on
+      the C-based <code>ext-mongodb</code> extension. The same BSON
+      type-fidelity smoke is run via <code>composer install</code> +
+      <code>php types_smoke.php</code> against an embedded SecantusDB
+      daemon &mdash; <code>ObjectId</code>, <code>Decimal128</code>,
+      <code>UTCDateTime</code>, <code>Int64</code>, <code>Binary</code>
+      all round-trip cleanly.</p>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-rust-driver</h3>
+      <span class="lang">Rust</span>
+      <span class="kind pending">Pending</span>
+    </header>
+    <p class="note">A type-fidelity smoke is staged in
+      <code>tests/cross_driver/rust/</code>. Activation is gated on
+      mongo-rust-driver upstream catching up with the current
+      <code>tokio</code> / Rust toolchain &mdash; the 2.x line
+      doesn't compile against tokio 1.40+ and 3.x trips on a
+      <code>Runtime</code> API change with Rust 1.95. The smoke will
+      flip on once a stable build path lands.</p>
+  </article>
 </div>
 
 <p class="drivers-foot">
   Plus a <strong>cross-driver feature matrix</strong>: every shipped feature
   (auth, change streams, custom roles, sessions, geo, bulk writes, type
-  fidelity&hellip;) is verified end-to-end through <em>all four</em> drivers
-  via dedicated smoke tests &mdash; so a wire-shape divergence that one driver
-  is permissive about gets caught by another.
+  fidelity&hellip;) is verified end-to-end through the Python / Java /
+  Node / Go drivers via dedicated smoke tests &mdash; so a wire-shape
+  divergence that one driver is permissive about gets caught by another.
 </p>
