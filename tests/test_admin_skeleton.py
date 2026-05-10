@@ -1631,3 +1631,33 @@ async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:
     finally:
         app.state.embedded.stop()
         app.state.mongo.close()
+
+
+# ---- CLI surfaces a fix-it message when the admin extra is missing ---------
+
+
+def test_cli_missing_admin_extra_shows_helpful_message(monkeypatch, capsys) -> None:
+    """When fastapi/uvicorn aren't installed the CLI must point the user
+    at the right install command — not raise ``ModuleNotFoundError``."""
+    import sys
+
+    from secantus.admin import cli as admin_cli
+
+    real_import = __import__
+
+    def faux_import(name, *args, **kwargs):
+        if name == "secantus.admin.launcher":
+            raise ModuleNotFoundError(
+                "No module named 'uvicorn'", name="uvicorn"
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", faux_import)
+
+    rc = admin_cli.main(["--no-window"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    err = captured.err
+    assert "admin' extra" in err
+    assert "uvicorn" in err
+    assert "pip install 'secantusdb[admin]'" in err
