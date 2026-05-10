@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 import secantus
 from secantus.admin.client import MongoFacade, display_uri
+from secantus.admin.embedded import EmbeddedServer
 from secantus.admin.history import HistoryStore
 from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
@@ -32,7 +33,6 @@ from secantus.admin.routers import (
     changestream,
     collection,
     connections,
-    console,
     dashboard,
     databases,
     extras,
@@ -41,6 +41,7 @@ from secantus.admin.routers import (
     maintenance,
     metrics,
     profiler,
+    query,
     server as server_router,
     users,
 )
@@ -70,6 +71,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         sampler.stop()
         app.state.mongo.close()
+        # Tear down any embedded SecantusDBServer the user spun up
+        # from the dashboard. Safe when nothing is running.
+        try:
+            app.state.embedded.stop()
+        except Exception:
+            pass
 
 
 _DEFAULT_HISTORY_PATH = Path.home() / ".secantus" / "admin.db"
@@ -81,6 +88,7 @@ def create_app(
     token: str,
     history_path: Path | str | None = None,
     backup_root: Path | str | None = None,
+    embedded_storage: Path | str | None = None,
 ) -> FastAPI:
     app = FastAPI(
         title="SecantusDB admin",
@@ -115,6 +123,9 @@ def create_app(
     app.state.swap_lock = threading.Lock()
     if backup_root is not None:
         app.state.backup_root = Path(backup_root)
+    # Embedded SecantusDB server controlled from the dashboard. Created
+    # in stopped state; user clicks Start to spin up an in-process server.
+    app.state.embedded = EmbeddedServer(default_storage_path=embedded_storage)
     # Sampler is started inside lifespan so the asyncio loop is live;
     # set to None here for the test path that constructs the app
     # without going through lifespan.
@@ -135,7 +146,7 @@ def create_app(
     app.include_router(metrics.router)
     app.include_router(users.router)
     app.include_router(changestream.router)
-    app.include_router(console.router)
+    app.include_router(query.router)
     app.include_router(connections.router)
     app.include_router(profiler.router)
     app.include_router(maintenance.router)

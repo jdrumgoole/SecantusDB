@@ -879,14 +879,14 @@ body {
 
 /* Console tabs + history */
 
-.console-tabs {
+.query-tabs {
   display: flex;
   gap: 0.25rem;
   border-bottom: 1px solid var(--border);
   margin-bottom: 1rem;
 }
 
-.console-tabs button {
+.query-tabs button {
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
@@ -897,11 +897,11 @@ body {
   color: var(--muted);
 }
 
-.console-tabs button:hover {
+.query-tabs button:hover {
   color: var(--fg);
 }
 
-.console-tabs button.tab-active {
+.query-tabs button.tab-active {
   color: var(--fg);
   border-bottom-color: var(--accent);
 }
@@ -953,6 +953,53 @@ body {
 .flash-ok {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.flash-err {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+/* Embedded-server widget on the dashboard */
+
+.embedded-panel {
+  margin-bottom: 1.5rem;
+}
+
+.embedded-row {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.embedded-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.embedded-form {
+  margin-bottom: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  display: flex;
+  align-items: end;
+  gap: 0.6rem;
+}
+
+.embedded-form input {
+  width: 18rem;
+}
+
+.tile-value-quiet {
+  color: var(--muted);
+  font-style: italic;
 }
 
 /* Geo viewer map */

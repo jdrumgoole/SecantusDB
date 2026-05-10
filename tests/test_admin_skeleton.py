@@ -1035,17 +1035,17 @@ async def test_delete_doc_removes_and_returns_empty(server, http: AsyncClient) -
         mc.close()
 
 
-# ---- /console (Slice 7) ----------------------------------------------------
+# ---- /query (Slice 7) ----------------------------------------------------
 
 
 async def test_console_page_renders_with_tabs(http: AsyncClient) -> None:
-    r = await http.get("/console", headers={HEADER_NAME: "testtoken"})
+    r = await http.get("/query", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     for tab in ("find", "aggregate", "runCommand"):
         assert tab in r.text
 
 
-@pytest.mark.parametrize("path", ["/console", "/changestream"])
+@pytest.mark.parametrize("path", ["/query", "/changestream"])
 async def test_alpine_x_data_attribute_is_well_formed(http: AsyncClient, path: str) -> None:
     """The Alpine ``x-data`` attribute on these pages embeds a JSON literal.
 
@@ -1111,7 +1111,7 @@ async def test_console_find_returns_docs(server, http: AsyncClient) -> None:
         mc.close()
 
     r = await http.post(
-        "/console/find",
+        "/query/find",
         data={
             "db": "console_db",
             "coll": "c",
@@ -1134,7 +1134,7 @@ async def test_console_find_invalid_filter_renders_error(
     http: AsyncClient,
 ) -> None:
     r = await http.post(
-        "/console/find",
+        "/query/find",
         data={
             "db": "x",
             "coll": "c",
@@ -1159,7 +1159,7 @@ async def test_console_aggregate_returns_docs(server, http: AsyncClient) -> None
         mc.close()
 
     r = await http.post(
-        "/console/aggregate",
+        "/query/aggregate",
         data={
             "db": "agg_db",
             "coll": "c",
@@ -1175,7 +1175,7 @@ async def test_console_aggregate_returns_docs(server, http: AsyncClient) -> None
 
 async def test_console_run_command_returns_response(http: AsyncClient) -> None:
     r = await http.post(
-        "/console/runCommand",
+        "/query/runCommand",
         data={"db": "admin", "command": '{"ping": 1}'},
         headers={HEADER_NAME: "testtoken"},
     )
@@ -1189,19 +1189,19 @@ async def test_console_history_endpoint_returns_payload(
 ) -> None:
     # Submit a runCommand so the history has at least one entry.
     await http.post(
-        "/console/runCommand",
+        "/query/runCommand",
         data={"db": "admin", "command": '{"ping": 1}'},
         headers={HEADER_NAME: "testtoken"},
     )
     # Pull the rendered page to find the most recent entry id.
-    r = await http.get("/console", headers={HEADER_NAME: "testtoken"})
+    r = await http.get("/query", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     import re
 
     match = re.search(r"loadHistory\((\d+),\s*'(runCommand|find|aggregate)'\)", r.text)
     assert match is not None
     entry_id = int(match.group(1))
-    r2 = await http.get(f"/console/history/{entry_id}", headers={HEADER_NAME: "testtoken"})
+    r2 = await http.get(f"/query/history/{entry_id}", headers={HEADER_NAME: "testtoken"})
     assert r2.status_code == 200
     payload = r2.json()
     assert payload["db"] == "admin"
@@ -1528,3 +1528,106 @@ async def test_maintenance_drop_coll_actually_drops(server, http: AsyncClient) -
         assert "stay" in names
     finally:
         mc.close()
+
+
+# ---- /query datalists + collections endpoint --------------------------------
+
+
+async def test_query_page_lists_databases_in_datalist(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["alpha"]["c"].insert_one({"_id": 1})
+        mc["beta"]["c"].insert_one({"_id": 1})
+    finally:
+        mc.close()
+
+    r = await http.get("/query", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    # The datalist contains every database we just seeded.
+    assert 'value="alpha"' in r.text
+    assert 'value="beta"' in r.text
+
+
+async def test_query_collections_endpoint_returns_names(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["zoo"]["lions"].insert_one({"_id": 1})
+        mc["zoo"]["tigers"].insert_one({"_id": 1})
+    finally:
+        mc.close()
+
+    r = await http.get(
+        "/query/_collections?db=zoo", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    payload = r.json()
+    assert sorted(payload["collections"]) == ["lions", "tigers"]
+
+
+async def test_query_collections_endpoint_unknown_db_empty(
+    http: AsyncClient,
+) -> None:
+    r = await http.get(
+        "/query/_collections?db=", headers={HEADER_NAME: "testtoken"}
+    )
+    assert r.status_code == 200
+    assert r.json()["collections"] == []
+
+
+# ---- Dashboard embedded-server widget ---------------------------------------
+
+
+async def test_dashboard_renders_embedded_widget_when_stopped(
+    http: AsyncClient,
+) -> None:
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Embedded SecantusDB server" in r.text
+    assert "stopped" in r.text
+
+
+async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:
+    """Starting the embedded server boots an in-process listener and
+    swaps the admin app's target to it."""
+    app = create_app(
+        mongo_uri=server.uri,
+        token="testtoken",
+        history_path=tmp_path / "hist.db",
+        embedded_storage=tmp_path / "embed",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as c:
+            r = await c.post(
+                "/embedded/start",
+                data={"storage_path": ""},
+                headers={HEADER_NAME: "testtoken"},
+            )
+            assert r.status_code == 200
+            assert "Started embedded server" in r.text
+
+            # The admin app's target now points at the embedded URI.
+            embedded_uri = app.state.embedded.status()["uri"]
+            assert embedded_uri is not None
+            assert app.state.mongo_uri == embedded_uri
+
+            # Stop again — page reflects "stopped".
+            r2 = await c.post(
+                "/embedded/stop", headers={HEADER_NAME: "testtoken"}
+            )
+            assert r2.status_code == 200
+            assert "Stopped embedded server" in r2.text
+            assert app.state.embedded.status()["running"] is False
+    finally:
+        app.state.embedded.stop()
+        app.state.mongo.close()

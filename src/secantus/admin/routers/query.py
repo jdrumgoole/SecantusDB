@@ -1,4 +1,4 @@
-"""Ad-hoc query console.
+"""Ad-hoc query page.
 
 Three submission shapes:
 
@@ -9,6 +9,11 @@ Three submission shapes:
 
 Each successful submission is recorded in the per-URI history store so
 the page can render a "Recent" panel that re-populates the form on click.
+
+The db / coll inputs are HTML5 ``<input list>`` datalists populated
+from the connected target's ``listDatabases`` / ``listCollections``,
+so the user can pick from existing namespaces but still type a new
+one for collections that don't exist yet.
 """
 
 from __future__ import annotations
@@ -48,18 +53,20 @@ def _serialize_results(rows: list[dict[str, Any]]) -> list[str]:
     return [json_util.dumps(d, indent=2) for d in rows]
 
 
-@router.get("/console", response_class=HTMLResponse)
-def console_page(request: Request) -> HTMLResponse:
+@router.get("/query", response_class=HTMLResponse)
+def query_page(request: Request) -> HTMLResponse:
     history = request.app.state.history.recent(request.app.state.mongo_uri)
+    databases = _list_database_names(request)
     templates = _templates(request)
     return templates.TemplateResponse(
         request,
-        "pages/console.html",
+        "pages/query.html",
         {
-            "title": "Console",
-            "active": "console",
+            "title": "Query",
+            "active": "query",
             "kind": request.query_params.get("kind") or "find",
             "history": history,
+            "databases": databases,
             # Form values when re-populating from history (filled by JS).
             "form": {},
             "results": None,
@@ -67,6 +74,30 @@ def console_page(request: Request) -> HTMLResponse:
             "stats": None,
         },
     )
+
+
+def _list_database_names(request: Request) -> list[str]:
+    """Best-effort list of database names; empty list when unreachable."""
+    try:
+        return sorted(
+            d.get("name", "")
+            for d in request.app.state.mongo.list_databases()
+            if d.get("name")
+        )
+    except MongoError:
+        return []
+
+
+@router.get("/query/_collections")
+def list_collections_for_db(request: Request, db: str) -> dict[str, Any]:
+    """JSON helper — Alpine fetches this when the user picks a database."""
+    if not db.strip():
+        return {"collections": []}
+    try:
+        rows = request.app.state.mongo.list_collections_with_stats(db)
+    except MongoError:
+        return {"collections": []}
+    return {"collections": sorted(r["name"] for r in rows)}
 
 
 def _render_results(
@@ -80,15 +111,17 @@ def _render_results(
 ) -> HTMLResponse:
     templates = _templates(request)
     history = request.app.state.history.recent(request.app.state.mongo_uri)
+    databases = _list_database_names(request)
     status = 200 if not errors else 400
     return templates.TemplateResponse(
         request,
-        "pages/console.html",
+        "pages/query.html",
         {
-            "title": "Console",
-            "active": "console",
+            "title": "Query",
+            "active": "query",
             "kind": kind,
             "history": history,
+            "databases": databases,
             "form": form,
             "results": results,
             "errors": errors,
@@ -98,7 +131,7 @@ def _render_results(
     )
 
 
-@router.post("/console/find", response_class=HTMLResponse)
+@router.post("/query/find", response_class=HTMLResponse)
 def run_find(
     request: Request,
     db: str = Form(...),
@@ -164,7 +197,7 @@ def run_find(
     )
 
 
-@router.post("/console/aggregate", response_class=HTMLResponse)
+@router.post("/query/aggregate", response_class=HTMLResponse)
 def run_aggregate(
     request: Request,
     db: str = Form(...),
@@ -211,7 +244,7 @@ def run_aggregate(
     )
 
 
-@router.post("/console/runCommand", response_class=HTMLResponse)
+@router.post("/query/runCommand", response_class=HTMLResponse)
 def run_command(
     request: Request,
     db: str = Form(...),
@@ -256,7 +289,7 @@ def run_command(
     )
 
 
-@router.get("/console/history/{entry_id}")
+@router.get("/query/history/{entry_id}")
 def history_entry(request: Request, entry_id: int) -> HTMLResponse:
     """Return a JSON blob with the entry's payload — JS uses it to refill the form."""
     rows = request.app.state.history.recent(request.app.state.mongo_uri, limit=1000)
