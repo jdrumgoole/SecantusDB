@@ -82,6 +82,194 @@ async def test_dashboard_with_header_token_ok(http: AsyncClient) -> None:
     assert r.status_code == 200
 
 
+async def test_page_header_shows_target_server(server, http: AsyncClient) -> None:
+    """Every page renders the target URI badge (sanitized)."""
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "server-badge" in r.text
+    # Badge content is the URL the fixture actually started on (ephemeral
+    # port chosen by the kernel). Always loopback in tests.
+    assert "127.0.0.1" in r.text
+
+
+# ---- /server — live target swap --------------------------------------------
+
+
+async def test_connection_page_shows_current(http: AsyncClient) -> None:
+    r = await http.get("/server", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Currently connected to" in r.text
+    assert "Switch to a new target" in r.text
+
+
+async def test_connection_switch_rebinds_facade(server, tmp_path) -> None:
+    """Switching the URI through the page actually rebinds app.state.mongo."""
+    from pymongo import MongoClient
+
+    # Stand up a SECOND server so we have a valid alternate target.
+    other_path = tmp_path / "other"
+    other_path.mkdir()
+    with SecantusDBServer(port=0, storage_path=str(other_path)) as srv2:
+        # Seed each server with a unique collection so we can prove the
+        # facade actually pivoted afterward.
+        mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            mc["mark"]["a"].insert_one({"_id": 1, "where": "first"})
+        finally:
+            mc.close()
+        mc = MongoClient(srv2.uri, serverSelectionTimeoutMS=2000)
+        try:
+            mc["mark"]["b"].insert_one({"_id": 1, "where": "second"})
+        finally:
+            mc.close()
+
+        app = create_app(
+            mongo_uri=server.uri,
+            token="testtoken",
+            history_path=tmp_path / "hist.db",
+        )
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as c:
+                r = await c.post(
+                    "/server/switch",
+                    data={"uri": srv2.uri},
+                    headers={HEADER_NAME: "testtoken"},
+                )
+                assert r.status_code == 200
+                assert "Switched to" in r.text
+                assert app.state.mongo_uri == srv2.uri
+                # The new facade can see the second server's collection.
+                colls = sorted(app.state.mongo.list_collections_with_stats("mark"))
+                names = [c["name"] for c in app.state.mongo.list_collections_with_stats("mark")]
+                assert names == ["b"]
+        finally:
+            app.state.mongo.close()
+
+
+async def test_connection_switch_rejects_unreachable(server, http: AsyncClient) -> None:
+    r = await http.post(
+        "/server/switch",
+        data={"uri": "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "could not reach target" in r.text
+    # Error must be cleaned — no pymongo topology dump / configured-timeouts
+    # noise in the rendered page.
+    assert "Topology Description" not in r.text
+    assert "configured timeouts" not in r.text
+
+
+async def test_connection_switch_rejects_blank_uri(http: AsyncClient) -> None:
+    r = await http.post(
+        "/server/switch",
+        data={"uri": "   "},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "URI is required" in r.text
+
+
+async def test_connection_recent_lists_after_switch(server, tmp_path) -> None:
+    """Saved-target list reflects past switches; current is flagged."""
+    other_path = tmp_path / "other"
+    other_path.mkdir()
+    with SecantusDBServer(port=0, storage_path=str(other_path)) as srv2:
+        app = create_app(
+            mongo_uri=server.uri,
+            token="testtoken",
+            history_path=tmp_path / "hist.db",
+        )
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as c:
+                # Switch once so the new URI lands in the targets store.
+                await c.post(
+                    "/server/switch",
+                    data={"uri": srv2.uri},
+                    headers={HEADER_NAME: "testtoken"},
+                )
+                r = await c.get(
+                    "/server", headers={HEADER_NAME: "testtoken"}
+                )
+                assert r.status_code == 200
+                # The newly-current URI shows up flagged "current".
+                assert "current" in r.text
+                # And the URI itself is in the page (sanitised form).
+                assert srv2.uri.rstrip("/") in r.text
+        finally:
+            app.state.mongo.close()
+
+
+async def test_connection_forget_removes_saved_uri(server, tmp_path) -> None:
+    other_path = tmp_path / "other"
+    other_path.mkdir()
+    with SecantusDBServer(port=0, storage_path=str(other_path)) as srv2:
+        app = create_app(
+            mongo_uri=server.uri,
+            token="testtoken",
+            history_path=tmp_path / "hist.db",
+        )
+        try:
+            # Pre-record an unrelated URI in the store directly.
+            saved = "mongodb://stale:1234/"
+            app.state.targets.record(saved)
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as c:
+                r = await c.post(
+                    "/server/forget",
+                    data={"uri": saved},
+                    headers={HEADER_NAME: "testtoken"},
+                )
+                assert r.status_code == 200
+                assert "Forgot" in r.text
+                assert all(
+                    e.uri != saved for e in app.state.targets.recent()
+                )
+        finally:
+            app.state.mongo.close()
+
+
+async def test_connection_cannot_forget_current(http: AsyncClient, app) -> None:
+    r = await http.post(
+        "/server/forget",
+        data={"uri": app.state.mongo_uri},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "currently connected" in r.text
+
+
+async def test_page_header_strips_password(server, tmp_path) -> None:
+    """Password in the URI doesn't leak into the rendered badge."""
+    app = create_app(
+        mongo_uri="mongodb://alice:s3cret@127.0.0.1:1/?authSource=admin",
+        token="testtoken",
+        history_path=tmp_path / "h.db",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as c:
+            r = await c.get(
+                "/", headers={HEADER_NAME: "testtoken"}
+            )
+            assert r.status_code == 200
+            assert "alice@127.0.0.1" in r.text
+            assert "s3cret" not in r.text
+            assert "authSource" not in r.text
+    finally:
+        app.state.mongo.close()
+
+
 async def test_query_token_sets_cookie(http: AsyncClient) -> None:
     r = await http.get(f"/?{QUERY_NAME}=testtoken")
     assert r.cookies.get(COOKIE_NAME) == "testtoken"

@@ -1,23 +1,28 @@
 """Run mongo-ruby-driver's RSpec suite against a SecantusDB daemon.
 
-Same daemon-subprocess pattern as ``go_validation`` / ``node_validation``:
+End-to-end integration gauge: SecantusDB and the Ruby driver
+exchange real wire commands over TCP. The runner:
 
-1. Spawn ``python -m secantus --port <free> --storage-path :memory:``
-   as a subprocess.
-2. Wait for the listener to come up.
-3. Set ``MONGODB_URI`` so the driver's ``spec/support/spec_config.rb``
-   reader points at our daemon.
-4. Run the curated test files in ``include_paths.INCLUDE`` via
-   ``bundle exec rspec --format json``.
-5. Capture the JSON output to ``.validation/ruby-raw.json``;
-   ``generate_report.py`` renders it to
+1. Spawns ``python -m secantus --host 127.0.0.1 --port 20718
+   --storage-path :memory:`` as a subprocess.
+2. Waits for the listener to come up.
+3. Pre-provisions ``root-user`` and ``ruby-test-user`` via a setup
+   pymongo client. mongo-ruby-driver's spec_helper assumes both
+   exist and authenticates as them when opening
+   ``authorized_client`` / ``root_authorized_client`` builders.
+4. Runs ``bundle exec rspec --format json --out <raw.json>`` with
+   ``MONGODB_URI=mongodb://root-user:password@127.0.0.1:20718/?authSource=admin``
+   so the driver authenticates against the freshly-seeded users.
+5. ``generate_report.py`` renders the per-spec breakdown into
    ``docs/validation-report-ruby.md``.
 
-First run does ``bundle install`` (slow). Subsequent runs reuse the
-installed gem cache and complete in under a minute for the lite
+First run does ``bundle install`` (~1-2 min). Subsequent runs reuse
+the gem cache and complete in seconds for the curated integration
 include set.
 
-Run via ``uv run python -m invoke validate-ruby``.
+Run via ``uv run python -m invoke validate-ruby``. Requires Ruby
+>= 2.7 with bundler on PATH (``brew install ruby`` on macOS, then
+prepend ``/opt/homebrew/opt/ruby/bin``).
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -37,11 +43,32 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-ruby-driver"
 RAW_OUT = REPO_ROOT / ".validation" / "ruby-raw.json"
 
+# Fixed port — ``27018``, the project-wide convention for SecantusDB
+# under test (see CLAUDE.md). It's mongod's standard "alternate" port,
+# out of the way of any real ``mongod`` listening on ``27017`` but
+# predictable enough that failure messages cite a verbatim address
+# you can hit by hand. All driver gauges share this port; only one
+# can run at a time, which is fine — gauges run sequentially in CI.
+DAEMON_PORT = 27018
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+# Hard wall-clock limit on the rspec invocation. The Ruby driver's
+# integration suite has tests that wait indefinitely on tailable
+# cursors / change-stream getMore round-trips when the server doesn't
+# return the exact event shape they expect — a single broken test can
+# pin the runner forever. Kill the rspec subprocess after this many
+# seconds and report the partial results that did make it to the JSON
+# file. Generous enough that a clean ``database_spec.rb`` (~30 s)
+# completes with comfortable margin; widen as the include set grows.
+RSPEC_TIMEOUT_SECONDS = 300.0
+
+# Test users mongo-ruby-driver's spec/support/spec_config.rb expects.
+# Mirrors the names in their ``rake spec:prepare`` step. The roles
+# match what the test_user provisioning code in spec_setup.rb wants.
+ROOT_USER = "root-user"
+ROOT_PASSWORD = "password"
+TEST_USER = "ruby-test-user"
+TEST_PASSWORD = "password"
+TEST_DB = "ruby-driver"
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -81,15 +108,9 @@ def _resolve_ruby_bin() -> tuple[str, str] | None:
 
 
 def _ensure_bundle_install(bundle_bin: str, ruby_bin: str) -> int:
-    """Install gem dependencies via ``bundle install`` if needed.
-
-    Detects "already installed" by probing for ``vendor/bundle`` (we
-    install path-locally so the system gemset isn't polluted). First
-    run takes ~1-2 min; subsequent runs are no-ops.
-    """
+    """Install gem dependencies via ``bundle install`` if needed."""
     bundle_dir = VENDOR / ".bundle"
     if bundle_dir.is_dir() and (VENDOR / "Gemfile.lock").exists():
-        # Already configured; verify gems are actually installed.
         check = subprocess.run(
             [bundle_bin, "check"],
             cwd=VENDOR,
@@ -110,6 +131,40 @@ def _ensure_bundle_install(bundle_bin: str, ruby_bin: str) -> int:
         env=env,
     )
     return proc.returncode
+
+
+def _seed_users(host: str, port: int) -> None:
+    """Pre-create root-user + ruby-test-user via a pymongo setup client.
+
+    The Ruby driver's ``spec_helper`` opens an ``authorized_client``
+    that SCRAM-authenticates as one of these. SecantusDB's SCRAM
+    handler validates against actual stored credentials, so the users
+    must exist before rspec invokes any per-test client. We do this
+    against an unauthenticated daemon (no ``--auth`` flag) so the
+    ``createUser`` commands themselves don't need credentials.
+    """
+    import pymongo  # delayed import: pymongo isn't a hard runner-side dep
+
+    client = pymongo.MongoClient(
+        f"mongodb://{host}:{port}/", directConnection=True, serverSelectionTimeoutMS=5_000
+    )
+    admin = client.admin
+    # ``root`` covers user-admin + cluster-admin + read/write on every
+    # db, matching the scope of mongo-ruby-driver's hardcoded root_user.
+    admin.command("createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"])
+    # The test user needs read/write on the primary test database +
+    # the various per-feature dbs spec_config.rb names. Granting
+    # ``readWriteAnyDatabase`` + ``dbAdminAnyDatabase`` covers them
+    # all without enumerating each one — driver tests don't actually
+    # rely on the specific role grants, just on having sufficient
+    # privilege.
+    admin.command(
+        "createUser",
+        TEST_USER,
+        pwd=TEST_PASSWORD,
+        roles=["readWriteAnyDatabase", "dbAdminAnyDatabase"],
+    )
+    client.close()
 
 
 def main() -> int:
@@ -146,34 +201,71 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _find_free_port()
-    daemon_cmd = [
-        sys.executable,
-        "-m",
-        "secantus",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--storage-path",
-        ":memory:",
-        "--log-level",
-        "WARNING",
-    ]
-    print(f"ruby_validation: starting daemon on {host}:{port}", file=sys.stderr)
-    daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    port = DAEMON_PORT
+
+    # Use an on-disk tempdir (NOT ``:memory:``) so the user records we
+    # seed survive the auth-mode flip below. ``:memory:`` would lose
+    # them when the daemon stops, defeating the whole point of running
+    # the auth-on phase against pre-provisioned users.
+    storage_dir = tempfile.mkdtemp(prefix="secantus-ruby-gauge-")
+    print(
+        f"ruby_validation: storage tempdir {storage_dir} (will be cleaned up)",
+        file=sys.stderr,
+    )
+
+    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+        cmd = [
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--storage-path",
+            storage_dir,
+            "--log-level",
+            "WARNING",
+        ]
+        if with_auth:
+            cmd.append("--auth")
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    print(f"ruby_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
+    daemon = _spawn_daemon(with_auth=False)
+    try:
+        _wait_for_listener(host, port)
+        print("ruby_validation: seeding root-user + ruby-test-user", file=sys.stderr)
+        _seed_users(host, port)
+    finally:
+        daemon.terminate()
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+    print(
+        f"ruby_validation: phase 2 — running gauge with --auth on {host}:{port}",
+        file=sys.stderr,
+    )
+    daemon = _spawn_daemon(with_auth=True)
     try:
         _wait_for_listener(host, port)
 
         env = os.environ.copy()
-        env["MONGODB_URI"] = f"mongodb://{host}:{port}"
+        env["MONGODB_URI"] = (
+            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"
+        )
         env["PATH"] = f"{Path(ruby_bin).parent}:{env.get('PATH', '')}"
 
-        # Use rspec ``--out`` so the JSON lands in a file directly.
-        # Capturing stdout doesn't work — the mongo-ruby-driver's
-        # Mongo::Logger writes warnings to STDOUT (the lite_spec_helper
-        # sets ``STDOUT.sync = true`` for that purpose), which would
-        # corrupt the JSON we tried to capture.
+        # Use rspec ``--out`` so JSON lands in a file directly. The
+        # mongo-ruby-driver's ``Mongo::Logger`` writes warnings to
+        # STDOUT, which would corrupt the JSON if we captured stdout.
         cmd = [bundle_bin, "exec", "rspec", "--format", "json", "--out", str(RAW_OUT)]
         for tag in SKIP_TAGS:
             cmd.extend(["--tag", f"~{tag}"])
@@ -183,15 +275,27 @@ def main() -> int:
             f"(MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
-        proc = subprocess.run(
-            cmd,
-            cwd=VENDOR,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        if proc.stderr:
-            sys.stderr.buffer.write(proc.stderr)
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=VENDOR,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=RSPEC_TIMEOUT_SECONDS,
+            )
+            stderr = proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            print(
+                f"ruby_validation: rspec exceeded "
+                f"{RSPEC_TIMEOUT_SECONDS:.0f}s wall-clock budget; "
+                "killed. Partial results (if any) are in "
+                f"{RAW_OUT}.",
+                file=sys.stderr,
+            )
+            stderr = exc.stderr or b""
+        if stderr:
+            sys.stderr.buffer.write(stderr)
 
         if RAW_OUT.stat().st_size == 0:
             print("ruby_validation: empty rspec output (build error?)", file=sys.stderr)
@@ -203,8 +307,13 @@ def main() -> int:
             print("ruby_validation: rspec JSON parse failed", file=sys.stderr)
             return 1
         summary = raw.get("summary", {})
+        passed = (
+            summary.get("example_count", 0)
+            - summary.get("failure_count", 0)
+            - summary.get("pending_count", 0)
+        )
         print(
-            f"ruby_validation: {summary.get('example_count', 0) - summary.get('failure_count', 0) - summary.get('pending_count', 0)} passed, "
+            f"ruby_validation: {passed} passed, "
             f"{summary.get('failure_count', 0)} failed, "
             f"{summary.get('pending_count', 0)} pending "
             f"({summary.get('example_count', 0)} total) "
@@ -217,6 +326,9 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()
+        # Storage tempdir is single-run scratch — drop it so we don't
+        # leak a wiredtiger directory per gauge invocation.
+        shutil.rmtree(storage_dir, ignore_errors=True)
 
     return 0
 

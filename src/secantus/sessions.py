@@ -84,6 +84,16 @@ class SessionRegistry:
         with self._lock:
             self._sessions.pop(lsid_bytes, None)
 
+    def clear(self) -> None:
+        """Drop every session.
+
+        Used by the ``killAllSessions`` admin command; driver test
+        suites call it between tests to guarantee a clean session
+        state before the next subtest's setup.
+        """
+        with self._lock:
+            self._sessions.clear()
+
     def is_known(self, lsid_bytes: bytes) -> bool:
         with self._lock:
             return lsid_bytes in self._sessions

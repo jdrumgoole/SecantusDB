@@ -176,6 +176,40 @@ def chaos(
 
 @task(
     help={
+        "duration": "Wall-clock seconds per writer count (default: 30).",
+        "batch-size": "Documents per insert call (default: 100).",
+        "writers": 'Comma-separated writer counts (default: "1,2,4").',
+        "shared-collection": "All writers share one collection (max contention).",
+    }
+)
+def concurrency(
+    c: Context,
+    duration: float = 30.0,
+    batch_size: int = 100,
+    writers: str = "1,2,4",
+    shared_collection: bool = False,
+) -> None:
+    """N-writer scaling benchmark for the storage layer.
+
+    Phase 0 instrument from ``tasks/wt-concurrency-plan.md``. Spawns
+    one server, then runs each writer count back to back; prints
+    aggregate throughput + a scaling ratio per row. Today's expected
+    number is 0.35x at N=2 on a single collection (Storage._lock
+    contention dominates); Phase 2 has to push it above 1.5x.
+    """
+    cmd = (
+        "uv run --no-sync python -m bench.concurrency"
+        f" --duration {float(duration)}"
+        f" --batch-size {int(batch_size)}"
+        f" --writers {shlex.quote(writers)}"
+    )
+    if shared_collection:
+        cmd += " --shared-collection"
+    c.run(cmd, pty=True)
+
+
+@task(
+    help={
         "uri": "MongoDB URI to administer.",
         "port": "Local HTTP port (0 = pick a free one).",
         "no_window": "Run headless (no pywebview window). Useful for CI.",

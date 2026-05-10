@@ -17,6 +17,7 @@
       </div>
       <nav>
         <ul>
+          <li class="nav-server"><a href="/server" class="{% if active == 'server' %}nav-current{% endif %}">Server</a></li>
           <li><a href="/" class="{% if active == 'dashboard' %}nav-current{% endif %}">Dashboard</a></li>
           <li><a href="/db" class="{% if active == 'databases' %}nav-current{% endif %}">Databases</a></li>
           <li><a href="/users" class="{% if active == 'users' %}nav-current{% endif %}">Users</a></li>
@@ -34,6 +35,10 @@
     <main class="content">
       <header class="page-header">
         <h1>{{ title }}</h1>
+        <a class="server-badge" href="/server" title="Click to change target server">
+          <span class="server-badge-dot">●</span>
+          <code>{{ request.app.state.mongo_uri_display }}</code>
+        </a>
       </header>
       {% block content %}{% endblock %}
     </main>

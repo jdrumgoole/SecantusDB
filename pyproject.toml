@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.4.0b12"
+version = "0.5.0b1"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -162,10 +162,11 @@ testpaths = ["tests"]
 # Online tests hit the public internet (PyPI, GitHub, RTD) and depend
 # on a published release, so they belong in `invoke validate-readme`
 # rather than every dev pytest run.
-addopts = "-n auto --dist=loadgroup -m 'not perf and not online'"
+addopts = "-n auto --dist=loadgroup -m 'not perf and not online and not slow'"
 markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
     "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",
+    "slow: long-running benchmarks / scaling regressions (run via `pytest -m slow`, not in default suite)",
 ]
 
 [tool.ruff]

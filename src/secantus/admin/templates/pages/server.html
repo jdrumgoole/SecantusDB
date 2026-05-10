@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="modal-meta">
+  Currently connected to <code>{{ current_uri_display }}</code>.
+  Switching the URI rebinds the admin app to a new target without
+  restarting — open WebSocket clients (dashboard metrics, change-stream
+  tail) keep their queues and start streaming from the new server on
+  the next tick.
+</p>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if flash %}<div class="flash flash-ok">{{ flash }}</div>{% endif %}
+
+<h2 class="section-title">Switch to a new target</h2>
+<form class="filter-form" method="post" action="/server/switch">
+  <label class="filter-label">
+    MongoDB URI
+    <input
+      type="text"
+      name="uri"
+      autocomplete="off"
+      placeholder="mongodb://127.0.0.1:27017/"
+      value="{{ pending_uri }}"
+      required
+    />
+  </label>
+  <p class="modal-meta">
+    Same URI grammar as <code>--uri</code> at launch. Credentials embed
+    in the URI: <code>mongodb://alice:secret@host:27017/?authSource=admin</code>.
+  </p>
+  <div class="modal-actions">
+    <button type="submit">Switch</button>
+  </div>
+</form>
+
+<h2 class="section-title">Recently used</h2>
+
+{% if targets %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>URI</th>
+        <th class="doc-actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in targets %}
+        <tr>
+          <td>
+            <code>{{ t.display_uri }}</code>
+            {% if t.is_current %}<span class="badge">current</span>{% endif %}
+          </td>
+          <td class="doc-actions">
+            {% if not t.is_current %}
+              <form method="post" action="/server/switch" class="inline-form">
+                <input type="hidden" name="uri" value="{{ t.uri }}" />
+                <button type="submit" class="btn-secondary">Switch</button>
+              </form>
+              <form method="post" action="/server/forget" class="inline-form">
+                <input type="hidden" name="uri" value="{{ t.uri }}" />
+                <button type="submit" class="btn-danger">Forget</button>
+              </form>
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">No saved targets yet — switch to one above and it'll show up here.</p>
+{% endif %}
+{% endblock %}
