@@ -1567,6 +1567,87 @@ async def test_query_collections_endpoint_unknown_db_empty(
     assert r.json()["collections"] == []
 
 
+async def test_query_runcommand_blank_renders_error_inline(
+    http: AsyncClient,
+) -> None:
+    """Posting an empty runCommand form must NOT 422 with raw JSON —
+    the handler returns the page with an inline error so the user can
+    fix it without losing the chrome."""
+    r = await http.post(
+        "/query/runCommand",
+        data={"db": "", "command": ""},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Database is required" in r.text
+    assert "Command is required" in r.text
+    # Page chrome (sidebar) is still there.
+    assert "Dashboard" in r.text
+    assert '"detail"' not in r.text
+
+
+async def test_query_aggregate_blank_renders_error_inline(
+    http: AsyncClient,
+) -> None:
+    r = await http.post(
+        "/query/aggregate",
+        data={"db": "", "coll": "", "pipeline": ""},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Database is required" in r.text
+    assert "Collection is required" in r.text
+    assert "Pipeline is required" in r.text
+
+
+async def test_global_validation_handler_renders_back_page(
+    http: AsyncClient,
+) -> None:
+    """A POST that's missing a Form field FastAPI considers required
+    should hit our exception handler, not the raw 422 JSON page."""
+    r = await http.post(
+        "/maintenance/drop-database",
+        data={},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Missing required field" in r.text or "Form validation" in r.text
+    assert "← Back" in r.text
+
+
+async def test_dashboard_badge_says_embedded_when_target_is_embedded(
+    server, tmp_path
+) -> None:
+    """Once the user starts the embedded server (which auto-swaps the
+    target), the page-header badge should say 'Embedded SecantusDB'
+    rather than the kernel-assigned port."""
+    app = create_app(
+        mongo_uri=server.uri,
+        token="testtoken",
+        history_path=tmp_path / "hist.db",
+        embedded_storage=tmp_path / "emb",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as c:
+            r0 = await c.get("/", headers={HEADER_NAME: "testtoken"})
+            # The badge starts as a regular URI badge — no embedded class.
+            assert "server-badge-embedded" not in r0.text
+
+            r1 = await c.post(
+                "/embedded/start",
+                data={"storage_path": ""},
+                headers={HEADER_NAME: "testtoken"},
+            )
+            assert r1.status_code == 200
+            assert "server-badge-embedded" in r1.text
+    finally:
+        app.state.embedded.stop()
+        app.state.mongo.close()
+
+
 # ---- Dashboard embedded-server widget ---------------------------------------
 
 

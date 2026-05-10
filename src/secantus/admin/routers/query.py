@@ -132,8 +132,8 @@ def _render_results(
 @router.post("/query/find", response_class=HTMLResponse)
 def run_find(
     request: Request,
-    db: str = Form(...),
-    coll: str = Form(...),
+    db: str = Form(""),
+    coll: str = Form(""),
     filter: str = Form(""),  # noqa: A002 — matches the form field name
     sort: str = Form(""),
     projection: str = Form(""),
@@ -148,6 +148,11 @@ def run_find(
         "limit": str(limit),
     }
     errors: list[str] = []
+
+    if not db.strip():
+        errors.append("Database is required.")
+    if not coll.strip():
+        errors.append("Collection is required.")
 
     filter_doc, err = _parse_json_field("Filter", filter, required_type=dict, default={})
     if err:
@@ -198,20 +203,27 @@ def run_find(
 @router.post("/query/aggregate", response_class=HTMLResponse)
 def run_aggregate(
     request: Request,
-    db: str = Form(...),
-    coll: str = Form(...),
-    pipeline: str = Form(...),
+    db: str = Form(""),
+    coll: str = Form(""),
+    pipeline: str = Form(""),
     limit: int = Form(200),
 ) -> HTMLResponse:
     form = {"db": db, "coll": coll, "pipeline": pipeline, "limit": str(limit)}
+    errors: list[str] = []
+    if not db.strip():
+        errors.append("Database is required.")
+    if not coll.strip():
+        errors.append("Collection is required.")
     parsed, err = _parse_json_field("Pipeline", pipeline, required_type=list, default=None)
     if err or parsed is None:
+        errors.append(err or "Pipeline is required.")
+    if errors:
         return _render_results(
             request,
             kind="aggregate",
             form=form,
             results=None,
-            errors=[err or "Pipeline is required."],
+            errors=errors,
             stats=None,
         )
 
@@ -245,18 +257,23 @@ def run_aggregate(
 @router.post("/query/runCommand", response_class=HTMLResponse)
 def run_command(
     request: Request,
-    db: str = Form(...),
-    command: str = Form(...),
+    db: str = Form(""),
+    command: str = Form(""),
 ) -> HTMLResponse:
     form = {"db": db, "command": command}
+    errors: list[str] = []
+    if not db.strip():
+        errors.append("Database is required.")
     parsed, err = _parse_json_field("Command", command, required_type=dict, default=None)
     if err or parsed is None:
+        errors.append(err or "Command is required.")
+    if errors:
         return _render_results(
             request,
             kind="runCommand",
             form=form,
             results=None,
-            errors=[err or "Command is required."],
+            errors=errors,
             stats=None,
         )
 

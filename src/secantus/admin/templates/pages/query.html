@@ -1,6 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="query" x-data='queryPage({{ {"kind": kind, "db": form.db or "", "coll": form.coll or ""} | tojson }})' x-init="init()">
+<div class="query"
+     x-data='queryPage({{ {
+       "kind": kind,
+       "db": form.db or "",
+       "coll": form.coll or "",
+       "pipeline": form.pipeline or "",
+       "command": form.command or "",
+       "cmdDb": form.db or "admin"
+     } | tojson }})'
+     x-init="init()">
   <nav class="query-tabs">
     <button type="button" :class="kind === 'find' ? 'tab-active' : ''" @click="kind = 'find'">find</button>
     <button type="button" :class="kind === 'aggregate' ? 'tab-active' : ''" @click="kind = 'aggregate'">aggregate</button>
@@ -53,7 +62,7 @@
       <textarea name="projection" rows="1" placeholder='{"name": 1}'>{{ form.projection or '' }}</textarea>
     </label>
     <div class="modal-actions">
-      <button type="submit">Run find</button>
+      <button type="submit" :disabled="!db.trim() || !coll.trim()">Run find</button>
     </div>
   </form>
 
@@ -78,10 +87,11 @@
     </div>
     <label class="filter-label">
       Pipeline (Extended JSON array)
-      <textarea name="pipeline" rows="6" placeholder='[{"$match": {}}, {"$count": "n"}]'>{{ form.pipeline or '' }}</textarea>
+      <textarea name="pipeline" rows="6" x-model="pipeline"
+                placeholder='[{"$match": {}}, {"$count": "n"}]'></textarea>
     </label>
     <div class="modal-actions">
-      <button type="submit">Run aggregate</button>
+      <button type="submit" :disabled="!db.trim() || !coll.trim() || !pipeline.trim()">Run aggregate</button>
     </div>
   </form>
 
@@ -95,15 +105,16 @@
     <div class="filter-controls">
       <label>Database
         <input type="text" name="db" list="db-suggestions" autocomplete="off"
-               value="{{ form.db or 'admin' }}" required />
+               x-model="cmdDb" required />
       </label>
     </div>
     <label class="filter-label">
       Command (Extended JSON object)
-      <textarea name="command" rows="4" placeholder='{"serverStatus": 1}'>{{ form.command or '' }}</textarea>
+      <textarea name="command" rows="4" x-model="command"
+                placeholder='{"serverStatus": 1}'></textarea>
     </label>
     <div class="modal-actions">
-      <button type="submit">Run command</button>
+      <button type="submit" :disabled="!cmdDb.trim() || !command.trim()">Run command</button>
     </div>
   </form>
 
@@ -151,6 +162,9 @@ function queryPage(initial) {
     kind: initial.kind || "find",
     db: initial.db || "",
     coll: initial.coll || "",
+    pipeline: initial.pipeline || "",
+    command: initial.command || "",
+    cmdDb: initial.cmdDb || "admin",
     collections: [],
 
     async init() {
@@ -182,19 +196,28 @@ function queryPage(initial) {
       const r = await fetch(`/query/history/${id}`);
       if (!r.ok) return;
       const payload = await r.json();
-      // Re-populate the active form's fields from the stored payload.
-      const form = document.querySelector(
-        `form[action="/query/${kind}"]`
-      );
-      if (!form) return;
-      for (const [name, value] of Object.entries(payload)) {
-        const field = form.elements.namedItem(name);
-        if (field) field.value = value;
+      // Re-populate the active form's fields. Mirror into Alpine state
+      // so the disabled-button reactivity sees the new values.
+      if (kind === "runCommand") {
+        if (payload.db) this.cmdDb = payload.db;
+        if (payload.command !== undefined) this.command = payload.command;
+      } else {
+        if (payload.db) {
+          await this.onDbChange(payload.db);
+        }
+        if (payload.coll !== undefined) this.coll = payload.coll;
+        if (payload.pipeline !== undefined) this.pipeline = payload.pipeline;
+        // Non-Alpine form fields (filter / sort / projection / limit) —
+        // write directly to the DOM.
+        const form = document.querySelector(`form[action="/query/${kind}"]`);
+        if (form) {
+          for (const [name, value] of Object.entries(payload)) {
+            if (["db", "coll", "pipeline", "command"].includes(name)) continue;
+            const field = form.elements.namedItem(name);
+            if (field) field.value = value;
+          }
+        }
       }
-      // Mirror db/coll into the Alpine state so the collection
-      // datalist refreshes for the loaded entry.
-      if (payload.db) await this.onDbChange(payload.db);
-      if (payload.coll) this.coll = payload.coll;
     },
   };
 }

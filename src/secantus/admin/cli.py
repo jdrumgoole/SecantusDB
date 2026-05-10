@@ -72,6 +72,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    # Override the OS-level process name before pywebview brings up the
+    # AppKit window so the menu bar / Dock / Activity Monitor read
+    # "SecantusDB admin" rather than "Python".
+    from secantus.admin._proc_name import set_process_name
+
+    set_process_name("SecantusDB admin")
+
     token = _resolve_token(override=args.token, token_path=Path(args.token_path))
 
     # Lazy imports — the launcher pulls in fastapi / uvicorn / pywebview,
