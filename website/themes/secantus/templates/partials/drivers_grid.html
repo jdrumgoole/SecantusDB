@@ -59,20 +59,20 @@
     <header>
       <h3>mongo-ruby-driver</h3>
       <span class="lang">Ruby</span>
-      <span class="kind smoke">Feature smokes</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">6 / 6</span>
-      <span class="rate-label">features verified</span>
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
     </div>
-    <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x).
-      Six features verified end-to-end: BSON type fidelity, RBAC
-      denial (SCRAM-SHA-256), mixed <code>bulkWrite</code>,
-      <code>listDatabases</code> filter shape, logical-session
-      lifecycle (<code>startSession</code> /
-      <code>endSessions</code> / <code>refreshSessions</code>), and
-      cluster-role bundles (<code>clusterMonitor</code> /
-      <code>backup</code>).</p>
+    <p class="counts"><strong>6,967</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The official MongoDB Ruby driver (mongo + bson
+      5.x), the gem the Rails / Sinatra ecosystem builds on. The
+      lite-spec subset of <code>spec/mongo/</code> plus the
+      cross-driver YAML corpus under <code>spec/spec_tests/</code>
+      (BSON, URI parsing, SCRAM, SDAM, server selection, connection
+      strings, max-staleness, read / write concerns) runs cleanly
+      against an embedded SecantusDB daemon.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -114,6 +114,7 @@
   Plus a <strong>cross-driver feature matrix</strong>: every shipped feature
   (auth, change streams, custom roles, sessions, geo, bulk writes, type
   fidelity&hellip;) is verified end-to-end through the Python / Java /
-  Node / Go drivers via dedicated smoke tests &mdash; so a wire-shape
-  divergence that one driver is permissive about gets caught by another.
+  Node / Go / Ruby / PHP drivers via dedicated smoke tests &mdash; so a
+  wire-shape divergence that one driver is permissive about gets caught
+  by another.
 </p>
