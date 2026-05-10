@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="query"
+     x-data='queryPage({{ {
+       "kind": kind,
+       "db": form.db or "",
+       "coll": form.coll or "",
+       "pipeline": form.pipeline or "",
+       "command": form.command or "",
+       "cmdDb": form.db or "admin"
+     } | tojson }})'
+     x-init="init()">
+  <nav class="query-tabs">
+    <button type="button" :class="kind === 'find' ? 'tab-active' : ''" @click="kind = 'find'">find</button>
+    <button type="button" :class="kind === 'aggregate' ? 'tab-active' : ''" @click="kind = 'aggregate'">aggregate</button>
+    <button type="button" :class="kind === 'runCommand' ? 'tab-active' : ''" @click="kind = 'runCommand'">runCommand</button>
+  </nav>
+
+  <!-- Datalists shared by find / aggregate forms. ``<input list="...">``
+       gives a dropdown of suggestions but still allows free-text entry,
+       so the user can type a brand-new collection name when needed. -->
+  <datalist id="db-suggestions">
+    {% for d in databases %}
+      <option value="{{ d }}"></option>
+    {% endfor %}
+  </datalist>
+  <datalist id="coll-suggestions">
+    <template x-for="c in collections" :key="c">
+      <option :value="c"></option>
+    </template>
+  </datalist>
+
+  <!-- find -->
+  <form
+    x-show="kind === 'find'"
+    class="filter-form"
+    method="post"
+    action="/query/find"
+  >
+    <div class="filter-controls">
+      <label>Database
+        <input type="text" name="db" list="db-suggestions" autocomplete="off"
+               x-model="db" @change="onDbChange($event.target.value)"
+               required />
+      </label>
+      <label>Collection
+        <input type="text" name="coll" list="coll-suggestions" autocomplete="off"
+               x-model="coll" required />
+      </label>
+      <label>Limit <input type="number" name="limit" min="1" max="200" value="{{ form.limit or '50' }}" /></label>
+    </div>
+    <label class="filter-label">
+      Filter (Extended JSON)
+      <textarea name="filter" rows="2" placeholder='{"status": "active"}'>{{ form.filter or '' }}</textarea>
+    </label>
+    <label class="filter-label">
+      Sort (Extended JSON, optional)
+      <textarea name="sort" rows="1" placeholder='{"created_at": -1}'>{{ form.sort or '' }}</textarea>
+    </label>
+    <label class="filter-label">
+      Projection (Extended JSON, optional)
+      <textarea name="projection" rows="1" placeholder='{"name": 1}'>{{ form.projection or '' }}</textarea>
+    </label>
+    <div class="modal-actions">
+      <button type="submit" :disabled="!db.trim() || !coll.trim()">Run find</button>
+    </div>
+  </form>
+
+  <!-- aggregate -->
+  <form
+    x-show="kind === 'aggregate'"
+    class="filter-form"
+    method="post"
+    action="/query/aggregate"
+  >
+    <div class="filter-controls">
+      <label>Database
+        <input type="text" name="db" list="db-suggestions" autocomplete="off"
+               x-model="db" @change="onDbChange($event.target.value)"
+               required />
+      </label>
+      <label>Collection
+        <input type="text" name="coll" list="coll-suggestions" autocomplete="off"
+               x-model="coll" required />
+      </label>
+      <label>Limit <input type="number" name="limit" min="1" max="1000" value="{{ form.limit or '200' }}" /></label>
+    </div>
+    <label class="filter-label">
+      Pipeline (Extended JSON array)
+      <textarea name="pipeline" rows="6" x-model="pipeline"
+                placeholder='[{"$match": {}}, {"$count": "n"}]'></textarea>
+    </label>
+    <div class="modal-actions">
+      <button type="submit" :disabled="!db.trim() || !coll.trim() || !pipeline.trim()">Run aggregate</button>
+    </div>
+  </form>
+
+  <!-- runCommand -->
+  <form
+    x-show="kind === 'runCommand'"
+    class="filter-form"
+    method="post"
+    action="/query/runCommand"
+  >
+    <div class="filter-controls">
+      <label>Database
+        <input type="text" name="db" list="db-suggestions" autocomplete="off"
+               x-model="cmdDb" required />
+      </label>
+    </div>
+    <label class="filter-label">
+      Command (Extended JSON object)
+      <textarea name="command" rows="4" x-model="command"
+                placeholder='{"serverStatus": 1}'></textarea>
+    </label>
+    <div class="modal-actions">
+      <button type="submit" :disabled="!cmdDb.trim() || !command.trim()">Run command</button>
+    </div>
+  </form>
+
+  {% for msg in errors %}
+    <div class="error">{{ msg }}</div>
+  {% endfor %}
+
+  {% if results is not none %}
+    <h2 class="section-title">
+      Results
+      {% if stats %}<span class="modal-meta">— {{ stats.count }} doc{{ '' if stats.count == 1 else 's' }} from <code>{{ stats.ns }}</code></span>{% endif %}
+    </h2>
+    {% if results %}
+      <div class="changestream-log">
+        {% for body in results %}
+          <pre class="doc-body">{{ body }}</pre>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="empty">No documents.</p>
+    {% endif %}
+  {% endif %}
+
+  {% if history %}
+    <h2 class="section-title">Recent</h2>
+    <ul class="history-list">
+      {% for entry in history %}
+        <li>
+          <button
+            type="button"
+            class="btn-secondary"
+            @click="loadHistory({{ entry.id }}, '{{ entry.kind }}')"
+          >{{ entry.kind }} #{{ entry.id }}</button>
+          <code class="history-summary" x-text="''"></code>
+          <span class="history-payload">{{ entry.payload }}</span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</div>
+
+<script>
+function queryPage(initial) {
+  return {
+    kind: initial.kind || "find",
+    db: initial.db || "",
+    coll: initial.coll || "",
+    pipeline: initial.pipeline || "",
+    command: initial.command || "",
+    cmdDb: initial.cmdDb || "admin",
+    collections: [],
+
+    async init() {
+      // If the page already has a database picked (history re-populate
+      // or POST round-trip), eagerly pull its collection list so the
+      // datalist is useful immediately.
+      if (this.db) await this.onDbChange(this.db);
+    },
+
+    async onDbChange(value) {
+      this.db = value;
+      this.collections = [];
+      if (!value) return;
+      try {
+        const r = await fetch(
+          `/query/_collections?db=${encodeURIComponent(value)}`,
+        );
+        if (!r.ok) return;
+        const payload = await r.json();
+        this.collections = payload.collections || [];
+      } catch (_) {
+        // Network or auth issue — leave the suggestion list empty;
+        // the input still accepts free-text.
+      }
+    },
+
+    async loadHistory(id, kind) {
+      this.kind = kind;
+      const r = await fetch(`/query/history/${id}`);
+      if (!r.ok) return;
+      const payload = await r.json();
+      // Re-populate the active form's fields. Mirror into Alpine state
+      // so the disabled-button reactivity sees the new values.
+      if (kind === "runCommand") {
+        if (payload.db) this.cmdDb = payload.db;
+        if (payload.command !== undefined) this.command = payload.command;
+      } else {
+        if (payload.db) {
+          await this.onDbChange(payload.db);
+        }
+        if (payload.coll !== undefined) this.coll = payload.coll;
+        if (payload.pipeline !== undefined) this.pipeline = payload.pipeline;
+        // Non-Alpine form fields (filter / sort / projection / limit) —
+        // write directly to the DOM.
+        const form = document.querySelector(`form[action="/query/${kind}"]`);
+        if (form) {
+          for (const [name, value] of Object.entries(payload)) {
+            if (["db", "coll", "pipeline", "command"].includes(name)) continue;
+            const field = form.elements.namedItem(name);
+            if (field) field.value = value;
+          }
+        }
+      }
+    },
+  };
+}
+</script>
+{% endblock %}

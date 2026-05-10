@@ -8,11 +8,12 @@ container that HTMX immediately backfills via
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from secantus.admin.client import MongoError
+from secantus.admin.swap import SwapError, swap_target
 
 router = APIRouter()
 
@@ -71,14 +72,69 @@ def _format_uptime(seconds: int) -> str:
     return f"{days}d {hours}h"
 
 
-@router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request) -> HTMLResponse:
+def _render_dashboard(
+    request: Request,
+    *,
+    flash: dict[str, str] | None = None,
+    error: str | None = None,
+    pending_storage: str = "",
+) -> HTMLResponse:
     templates = Jinja2Templates(directory=request.app.state.templates_dir)
+    embedded_status = request.app.state.embedded.status()
     return templates.TemplateResponse(
         request,
         "pages/dashboard.html",
-        {"title": "Dashboard", "active": "dashboard"},
+        {
+            "title": "Dashboard",
+            "active": "dashboard",
+            "embedded": embedded_status,
+            "embedded_default_path": str(request.app.state.embedded.default_storage_path),
+            "pending_storage": pending_storage,
+            "flash": flash,
+            "error": error,
+        },
     )
+
+
+@router.get("/", response_class=HTMLResponse)
+def dashboard(request: Request) -> HTMLResponse:
+    return _render_dashboard(request)
+
+
+@router.post("/embedded/start", response_class=HTMLResponse)
+def post_embedded_start(
+    request: Request,
+    storage_path: str = Form(""),
+) -> HTMLResponse:
+    path = storage_path.strip() or None
+    try:
+        uri = request.app.state.embedded.start(storage_path=path)
+    except OSError as exc:
+        return _render_dashboard(
+            request,
+            error=f"Could not start embedded server: {exc}",
+            pending_storage=storage_path,
+        )
+    # Swap the admin app's target to the new embedded server so the
+    # rest of the UI talks to it without the user having to flip the
+    # /server page.
+    try:
+        swap_target(request.app, uri)
+        flash = {"kind": "ok", "msg": f"Started embedded server at {uri}"}
+    except SwapError as exc:
+        flash = {
+            "kind": "err",
+            "msg": (
+                f"Started embedded server at {uri}, but couldn't switch the admin app to it: {exc}"
+            ),
+        }
+    return _render_dashboard(request, flash=flash)
+
+
+@router.post("/embedded/stop", response_class=HTMLResponse)
+def post_embedded_stop(request: Request) -> HTMLResponse:
+    request.app.state.embedded.stop()
+    return _render_dashboard(request, flash={"kind": "ok", "msg": "Stopped embedded server."})
 
 
 @router.get("/_partials/dashboard-tiles", response_class=HTMLResponse)

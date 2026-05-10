@@ -89,12 +89,8 @@ def post_switch(
     try:
         swap_target(request.app, new_uri)
     except SwapError as exc:
-        return _render(
-            request, error=str(exc), pending_uri=new_uri, status_code=400
-        )
-    return _render(
-        request, flash=f"Switched to {display_uri(new_uri)}"
-    )
+        return _render(request, error=str(exc), pending_uri=new_uri, status_code=400)
+    return _render(request, flash=f"Switched to {display_uri(new_uri)}")
 
 
 @router.post("/server/forget", response_class=HTMLResponse)

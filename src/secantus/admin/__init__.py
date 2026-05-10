@@ -24,6 +24,7 @@ def create_app(
     token: str,
     history_path=None,
     backup_root=None,
+    embedded_storage=None,
 ):
     """Re-export ``app.create_app`` lazily to avoid pulling fastapi for tests
     that only import ``secantus.admin``."""
@@ -34,4 +35,5 @@ def create_app(
         token=token,
         history_path=history_path,
         backup_root=backup_root,
+        embedded_storage=embedded_storage,
     )

@@ -62,11 +62,43 @@ class ModuleSpec:
 # confirms it completes. Add new candidates by FQN as they prove
 # good citizens.
 _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
+    # Initial verified-good set.
     "com.mongodb.client.MongoCollectionTest",
     "com.mongodb.client.MongoClientTest",
     "com.mongodb.client.ExplainTest",
     "com.mongodb.client.ReadConcernTest",
     "com.mongodb.client.MongoWriteConcernWithResponseExceptionTest",
+    # Widen — basic CRUD / connectivity / index surface.
+    "com.mongodb.client.ConnectivityTest",
+    "com.mongodb.client.ContextProviderTest",
+    "com.mongodb.client.InContextMqlValuesFunctionalTest",
+    "com.mongodb.client.unified.IndexManagementTest",
+    # Unified spec runners — driver-level event / logging / monitoring
+    # protocols. Tests that need features SecantusDB intentionally
+    # doesn't implement (transactions, retryable-writes write-errors,
+    # log-id propagation hooks) self-skip via the YAML run-on
+    # constraints.
+    "com.mongodb.client.unified.CommandLoggingTest",
+    "com.mongodb.client.unified.CommandMonitoringTest",
+    "com.mongodb.client.unified.ConnectionPoolLoggingTest",
+    # Excluded (need features that are intentionally out of scope, or
+    # that need a deeper investigation to be tractable):
+    # - ServerSelectionLoggingTest — half its scenarios depend on the
+    #   ``configureFailPoint`` ``closeConnection: true`` mode (we
+    #   only support ``errorCode`` / ``writeConcernError`` modes
+    #   today) plus an ``Unknown`` server-description event the
+    #   driver fires on connection close.
+    # - ExplicitUuidCodecUuidRepresentationTest — UUID legacy/standard
+    #   binary subtype round-trip. SecantusDB stores BSON blobs
+    #   unchanged (subtype preserved at the byte level), but the
+    #   parametrized test surfaces a real id-key normalization issue
+    #   that needs its own slice to fix safely.
+    # - CollectionManagementTest — clustered indexes + time-series
+    #   collections; both are MongoDB 5.0+ features this gauge
+    #   doesn't aim to support yet.
+    # - CrudProseTest — depends on writeErrors[].errInfo (rich
+    #   validation-error details, MongoDB 5.0+); accept-on-the-wire
+    #   only today.
 ]
 
 

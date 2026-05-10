@@ -85,10 +85,7 @@ def display_uri(uri: str) -> str:
     username = parts.username
     host = parts.hostname or ""
     port = parts.port
-    if username:
-        netloc = f"{username}@{host}"
-    else:
-        netloc = host
+    netloc = f"{username}@{host}" if username else host
     if port:
         netloc = f"{netloc}:{port}"
     # Drop the path's trailing slash and the query string — pymongo URIs

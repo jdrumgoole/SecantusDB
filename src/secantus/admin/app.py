@@ -17,14 +17,18 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 import secantus
 from secantus.admin.client import MongoFacade, display_uri
+from secantus.admin.embedded import EmbeddedServer
 from secantus.admin.history import HistoryStore
 from secantus.admin.middleware import TokenAuthMiddleware
 from secantus.admin.routers import (
@@ -32,7 +36,6 @@ from secantus.admin.routers import (
     changestream,
     collection,
     connections,
-    console,
     dashboard,
     databases,
     extras,
@@ -41,8 +44,11 @@ from secantus.admin.routers import (
     maintenance,
     metrics,
     profiler,
-    server as server_router,
+    query,
     users,
+)
+from secantus.admin.routers import (
+    server as server_router,
 )
 from secantus.admin.sampler import Hub, Sampler
 from secantus.admin.targets import TargetStore
@@ -70,6 +76,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         sampler.stop()
         app.state.mongo.close()
+        # Tear down any embedded SecantusDBServer the user spun up
+        # from the dashboard. Safe when nothing is running.
+        with suppress(Exception):
+            app.state.embedded.stop()
 
 
 _DEFAULT_HISTORY_PATH = Path.home() / ".secantus" / "admin.db"
@@ -81,6 +91,7 @@ def create_app(
     token: str,
     history_path: Path | str | None = None,
     backup_root: Path | str | None = None,
+    embedded_storage: Path | str | None = None,
 ) -> FastAPI:
     app = FastAPI(
         title="SecantusDB admin",
@@ -115,6 +126,9 @@ def create_app(
     app.state.swap_lock = threading.Lock()
     if backup_root is not None:
         app.state.backup_root = Path(backup_root)
+    # Embedded SecantusDB server controlled from the dashboard. Created
+    # in stopped state; user clicks Start to spin up an in-process server.
+    app.state.embedded = EmbeddedServer(default_storage_path=embedded_storage)
     # Sampler is started inside lifespan so the asyncio loop is live;
     # set to None here for the test path that constructs the app
     # without going through lifespan.
@@ -135,13 +149,53 @@ def create_app(
     app.include_router(metrics.router)
     app.include_router(users.router)
     app.include_router(changestream.router)
-    app.include_router(console.router)
+    app.include_router(query.router)
     app.include_router(connections.router)
     app.include_router(profiler.router)
     app.include_router(maintenance.router)
     app.include_router(extras.router)
     app.include_router(backup.router)
     app.include_router(server_router.router)
+
+    @app.exception_handler(RequestValidationError)
+    async def _form_validation_handler(
+        request: Request, exc: RequestValidationError
+    ) -> HTMLResponse:
+        """Render a back-aware error page instead of FastAPI's default JSON 422.
+
+        Without this, a missing form field (e.g. blank Run command on
+        the /query page) lands on a bare ``{"detail":[{...}]}`` page
+        with no chrome — the user is stranded with no way back. We
+        render the standard sidebar + a one-line summary + Back link.
+        """
+        templates = Jinja2Templates(directory=app.state.templates_dir)
+        # Pull out the missing field names so the message is more
+        # specific than "validation failed".
+        missing = sorted(
+            {err.get("loc", [""])[-1] for err in exc.errors() if err.get("type") == "missing"}
+        )
+        if missing:
+            summary = (
+                "Missing required field"
+                + ("s" if len(missing) > 1 else "")
+                + ": "
+                + ", ".join(missing)
+            )
+        else:
+            summary = "Form validation failed."
+        # Best-effort referer for the Back link; falls back to /.
+        back = request.headers.get("referer") or "/"
+        return templates.TemplateResponse(
+            request,
+            "pages/error.html",
+            {
+                "title": "Form error",
+                "active": "",
+                "summary": summary,
+                "back": back,
+            },
+            status_code=400,
+        )
 
     return app
 

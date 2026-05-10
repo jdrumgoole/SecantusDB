@@ -142,7 +142,6 @@ async def test_connection_switch_rebinds_facade(server, tmp_path) -> None:
                 assert "Switched to" in r.text
                 assert app.state.mongo_uri == srv2.uri
                 # The new facade can see the second server's collection.
-                colls = sorted(app.state.mongo.list_collections_with_stats("mark"))
                 names = [c["name"] for c in app.state.mongo.list_collections_with_stats("mark")]
                 assert names == ["b"]
         finally:
@@ -194,9 +193,7 @@ async def test_connection_recent_lists_after_switch(server, tmp_path) -> None:
                     data={"uri": srv2.uri},
                     headers={HEADER_NAME: "testtoken"},
                 )
-                r = await c.get(
-                    "/server", headers={HEADER_NAME: "testtoken"}
-                )
+                r = await c.get("/server", headers={HEADER_NAME: "testtoken"})
                 assert r.status_code == 200
                 # The newly-current URI shows up flagged "current".
                 assert "current" in r.text
@@ -209,7 +206,7 @@ async def test_connection_recent_lists_after_switch(server, tmp_path) -> None:
 async def test_connection_forget_removes_saved_uri(server, tmp_path) -> None:
     other_path = tmp_path / "other"
     other_path.mkdir()
-    with SecantusDBServer(port=0, storage_path=str(other_path)) as srv2:
+    with SecantusDBServer(port=0, storage_path=str(other_path)):
         app = create_app(
             mongo_uri=server.uri,
             token="testtoken",
@@ -230,9 +227,7 @@ async def test_connection_forget_removes_saved_uri(server, tmp_path) -> None:
                 )
                 assert r.status_code == 200
                 assert "Forgot" in r.text
-                assert all(
-                    e.uri != saved for e in app.state.targets.recent()
-                )
+                assert all(e.uri != saved for e in app.state.targets.recent())
         finally:
             app.state.mongo.close()
 
@@ -259,9 +254,7 @@ async def test_page_header_strips_password(server, tmp_path) -> None:
             transport=ASGITransport(app=app),
             base_url="http://testserver",
         ) as c:
-            r = await c.get(
-                "/", headers={HEADER_NAME: "testtoken"}
-            )
+            r = await c.get("/", headers={HEADER_NAME: "testtoken"})
             assert r.status_code == 200
             assert "alice@127.0.0.1" in r.text
             assert "s3cret" not in r.text
@@ -1035,17 +1028,17 @@ async def test_delete_doc_removes_and_returns_empty(server, http: AsyncClient) -
         mc.close()
 
 
-# ---- /console (Slice 7) ----------------------------------------------------
+# ---- /query (Slice 7) ----------------------------------------------------
 
 
 async def test_console_page_renders_with_tabs(http: AsyncClient) -> None:
-    r = await http.get("/console", headers={HEADER_NAME: "testtoken"})
+    r = await http.get("/query", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     for tab in ("find", "aggregate", "runCommand"):
         assert tab in r.text
 
 
-@pytest.mark.parametrize("path", ["/console", "/changestream"])
+@pytest.mark.parametrize("path", ["/query", "/changestream"])
 async def test_alpine_x_data_attribute_is_well_formed(http: AsyncClient, path: str) -> None:
     """The Alpine ``x-data`` attribute on these pages embeds a JSON literal.
 
@@ -1111,7 +1104,7 @@ async def test_console_find_returns_docs(server, http: AsyncClient) -> None:
         mc.close()
 
     r = await http.post(
-        "/console/find",
+        "/query/find",
         data={
             "db": "console_db",
             "coll": "c",
@@ -1134,7 +1127,7 @@ async def test_console_find_invalid_filter_renders_error(
     http: AsyncClient,
 ) -> None:
     r = await http.post(
-        "/console/find",
+        "/query/find",
         data={
             "db": "x",
             "coll": "c",
@@ -1159,7 +1152,7 @@ async def test_console_aggregate_returns_docs(server, http: AsyncClient) -> None
         mc.close()
 
     r = await http.post(
-        "/console/aggregate",
+        "/query/aggregate",
         data={
             "db": "agg_db",
             "coll": "c",
@@ -1175,7 +1168,7 @@ async def test_console_aggregate_returns_docs(server, http: AsyncClient) -> None
 
 async def test_console_run_command_returns_response(http: AsyncClient) -> None:
     r = await http.post(
-        "/console/runCommand",
+        "/query/runCommand",
         data={"db": "admin", "command": '{"ping": 1}'},
         headers={HEADER_NAME: "testtoken"},
     )
@@ -1189,19 +1182,19 @@ async def test_console_history_endpoint_returns_payload(
 ) -> None:
     # Submit a runCommand so the history has at least one entry.
     await http.post(
-        "/console/runCommand",
+        "/query/runCommand",
         data={"db": "admin", "command": '{"ping": 1}'},
         headers={HEADER_NAME: "testtoken"},
     )
     # Pull the rendered page to find the most recent entry id.
-    r = await http.get("/console", headers={HEADER_NAME: "testtoken"})
+    r = await http.get("/query", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     import re
 
     match = re.search(r"loadHistory\((\d+),\s*'(runCommand|find|aggregate)'\)", r.text)
     assert match is not None
     entry_id = int(match.group(1))
-    r2 = await http.get(f"/console/history/{entry_id}", headers={HEADER_NAME: "testtoken"})
+    r2 = await http.get(f"/query/history/{entry_id}", headers={HEADER_NAME: "testtoken"})
     assert r2.status_code == 200
     payload = r2.json()
     assert payload["db"] == "admin"
@@ -1528,3 +1521,202 @@ async def test_maintenance_drop_coll_actually_drops(server, http: AsyncClient) -
         assert "stay" in names
     finally:
         mc.close()
+
+
+# ---- /query datalists + collections endpoint --------------------------------
+
+
+async def test_query_page_lists_databases_in_datalist(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["alpha"]["c"].insert_one({"_id": 1})
+        mc["beta"]["c"].insert_one({"_id": 1})
+    finally:
+        mc.close()
+
+    r = await http.get("/query", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    # The datalist contains every database we just seeded.
+    assert 'value="alpha"' in r.text
+    assert 'value="beta"' in r.text
+
+
+async def test_query_collections_endpoint_returns_names(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["zoo"]["lions"].insert_one({"_id": 1})
+        mc["zoo"]["tigers"].insert_one({"_id": 1})
+    finally:
+        mc.close()
+
+    r = await http.get("/query/_collections?db=zoo", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    payload = r.json()
+    assert sorted(payload["collections"]) == ["lions", "tigers"]
+
+
+async def test_query_collections_endpoint_unknown_db_empty(
+    http: AsyncClient,
+) -> None:
+    r = await http.get("/query/_collections?db=", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert r.json()["collections"] == []
+
+
+async def test_query_runcommand_blank_renders_error_inline(
+    http: AsyncClient,
+) -> None:
+    """Posting an empty runCommand form must NOT 422 with raw JSON —
+    the handler returns the page with an inline error so the user can
+    fix it without losing the chrome."""
+    r = await http.post(
+        "/query/runCommand",
+        data={"db": "", "command": ""},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Database is required" in r.text
+    assert "Command is required" in r.text
+    # Page chrome (sidebar) is still there.
+    assert "Dashboard" in r.text
+    assert '"detail"' not in r.text
+
+
+async def test_query_aggregate_blank_renders_error_inline(
+    http: AsyncClient,
+) -> None:
+    r = await http.post(
+        "/query/aggregate",
+        data={"db": "", "coll": "", "pipeline": ""},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Database is required" in r.text
+    assert "Collection is required" in r.text
+    assert "Pipeline is required" in r.text
+
+
+async def test_global_validation_handler_renders_back_page(
+    http: AsyncClient,
+) -> None:
+    """A POST that's missing a Form field FastAPI considers required
+    should hit our exception handler, not the raw 422 JSON page."""
+    r = await http.post(
+        "/maintenance/drop-database",
+        data={},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "Missing required field" in r.text or "Form validation" in r.text
+    assert "← Back" in r.text
+
+
+async def test_dashboard_badge_says_embedded_when_target_is_embedded(server, tmp_path) -> None:
+    """Once the user starts the embedded server (which auto-swaps the
+    target), the page-header badge should say 'Embedded SecantusDB'
+    rather than the kernel-assigned port."""
+    app = create_app(
+        mongo_uri=server.uri,
+        token="testtoken",
+        history_path=tmp_path / "hist.db",
+        embedded_storage=tmp_path / "emb",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as c:
+            r0 = await c.get("/", headers={HEADER_NAME: "testtoken"})
+            # The badge starts as a regular URI badge — no embedded class.
+            assert "server-badge-embedded" not in r0.text
+
+            r1 = await c.post(
+                "/embedded/start",
+                data={"storage_path": ""},
+                headers={HEADER_NAME: "testtoken"},
+            )
+            assert r1.status_code == 200
+            assert "server-badge-embedded" in r1.text
+    finally:
+        app.state.embedded.stop()
+        app.state.mongo.close()
+
+
+# ---- Dashboard embedded-server widget ---------------------------------------
+
+
+async def test_dashboard_renders_embedded_widget_when_stopped(
+    http: AsyncClient,
+) -> None:
+    r = await http.get("/", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "Embedded SecantusDB server" in r.text
+    assert "stopped" in r.text
+
+
+async def test_embedded_start_stop_round_trip(server, tmp_path) -> None:
+    """Starting the embedded server boots an in-process listener and
+    swaps the admin app's target to it."""
+    app = create_app(
+        mongo_uri=server.uri,
+        token="testtoken",
+        history_path=tmp_path / "hist.db",
+        embedded_storage=tmp_path / "embed",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as c:
+            r = await c.post(
+                "/embedded/start",
+                data={"storage_path": ""},
+                headers={HEADER_NAME: "testtoken"},
+            )
+            assert r.status_code == 200
+            assert "Started embedded server" in r.text
+
+            # The admin app's target now points at the embedded URI.
+            embedded_uri = app.state.embedded.status()["uri"]
+            assert embedded_uri is not None
+            assert app.state.mongo_uri == embedded_uri
+
+            # Stop again — page reflects "stopped".
+            r2 = await c.post("/embedded/stop", headers={HEADER_NAME: "testtoken"})
+            assert r2.status_code == 200
+            assert "Stopped embedded server" in r2.text
+            assert app.state.embedded.status()["running"] is False
+    finally:
+        app.state.embedded.stop()
+        app.state.mongo.close()
+
+
+# ---- CLI surfaces a fix-it message when the admin extra is missing ---------
+
+
+def test_cli_missing_admin_extra_shows_helpful_message(monkeypatch, capsys) -> None:
+    """When fastapi/uvicorn aren't installed the CLI must point the user
+    at the right install command — not raise ``ModuleNotFoundError``."""
+
+    from secantus.admin import cli as admin_cli
+
+    real_import = __import__
+
+    def faux_import(name, *args, **kwargs):
+        if name == "secantus.admin.launcher":
+            raise ModuleNotFoundError("No module named 'uvicorn'", name="uvicorn")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", faux_import)
+
+    rc = admin_cli.main(["--no-window"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    err = captured.err
+    assert "admin' extra" in err
+    assert "uvicorn" in err
+    assert "pip install 'secantusdb[admin]'" in err

@@ -19,10 +19,10 @@
         <ul>
           <li class="nav-server"><a href="/server" class="{% if active == 'server' %}nav-current{% endif %}">Server</a></li>
           <li><a href="/" class="{% if active == 'dashboard' %}nav-current{% endif %}">Dashboard</a></li>
+          <li><a href="/query" class="{% if active == 'query' %}nav-current{% endif %}">Query</a></li>
           <li><a href="/db" class="{% if active == 'databases' %}nav-current{% endif %}">Databases</a></li>
           <li><a href="/users" class="{% if active == 'users' %}nav-current{% endif %}">Users</a></li>
           <li><a href="/changestream" class="{% if active == 'changestream' %}nav-current{% endif %}">Change stream</a></li>
-          <li><a href="/console" class="{% if active == 'console' %}nav-current{% endif %}">Console</a></li>
           <li><a href="/connections" class="{% if active == 'connections' %}nav-current{% endif %}">Connections</a></li>
           <li><a href="/cursors" class="{% if active == 'cursors' %}nav-current{% endif %}">Cursors</a></li>
           <li><a href="/profiler" class="{% if active == 'profiler' %}nav-current{% endif %}">Profiler</a></li>
@@ -35,10 +35,19 @@
     <main class="content">
       <header class="page-header">
         <h1>{{ title }}</h1>
-        <a class="server-badge" href="/server" title="Click to change target server">
-          <span class="server-badge-dot">●</span>
-          <code>{{ request.app.state.mongo_uri_display }}</code>
-        </a>
+        {% set embedded_uri = request.app.state.embedded.status().uri %}
+        {% if embedded_uri and embedded_uri == request.app.state.mongo_uri %}
+          <a class="server-badge server-badge-embedded" href="/server"
+             title="Embedded SecantusDB ({{ request.app.state.mongo_uri_display }})">
+            <span class="server-badge-dot">●</span>
+            <span>Embedded SecantusDB</span>
+          </a>
+        {% else %}
+          <a class="server-badge" href="/server" title="Click to change target server">
+            <span class="server-badge-dot">●</span>
+            <code>{{ request.app.state.mongo_uri_display }}</code>
+          </a>
+        {% endif %}
       </header>
       {% block content %}{% endblock %}
     </main>

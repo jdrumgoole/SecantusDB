@@ -16,7 +16,7 @@ import asyncio
 import logging
 from typing import Any
 
-from secantus.admin.client import MongoFacade, MongoError, display_uri
+from secantus.admin.client import MongoError, MongoFacade, display_uri
 from secantus.admin.sampler import Sampler
 
 logger = logging.getLogger(__name__)
