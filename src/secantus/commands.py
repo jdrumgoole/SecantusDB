@@ -25,6 +25,7 @@ from secantus.auth import (
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorNotFound, CursorRegistry
 from secantus.expressions import ExpressionError
+from secantus.failpoints import FailPointRegistry
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
@@ -102,6 +103,33 @@ SERVER_VERSION_ARRAY = [7, 0, 0, 0]
 DEFAULT_BATCH_SIZE = 101
 
 
+# Mongod's well-known error codes that crop up in failpoint tests +
+# the ad-hoc errors we already emit. Used by `_code_name_for` to give
+# failpoint-injected errors a plausible ``codeName`` instead of a
+# generic one. The map is intentionally small — drivers only assert on
+# ``code`` (the integer) for failpoint errors, so unknown codes get a
+# best-effort ``Location<N>`` to match mongod's fallback shape.
+_ERROR_CODE_NAMES: dict[int, str] = {
+    1: "InternalError",
+    2: "BadValue",
+    9: "FailedToParse",
+    11: "DuplicateKey",
+    13: "Unauthorized",
+    14: "TypeMismatch",
+    18: "AuthenticationFailed",
+    26: "NamespaceNotFound",
+    43: "CursorNotFound",
+    50: "MaxTimeMSExpired",
+    59: "CommandNotFound",
+    100: "UnsatisfiableWriteConcern",
+    136: "CappedPositionLost",
+}
+
+
+def _code_name_for(code: int) -> str:
+    return _ERROR_CODE_NAMES.get(code, f"Location{code}")
+
+
 @dataclass
 class CommandContext:
     connection_id: int
@@ -116,6 +144,7 @@ class CommandContext:
     connections: ConnectionRegistry | None = None
     logs: LogBuffer | None = None
     sessions: SessionRegistry | None = None
+    failpoints: FailPointRegistry | None = None
 
 
 def _split_into_cursor(
@@ -412,6 +441,33 @@ def _fsync(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     ctx.storage.checkpoint()
     return {"numFiles": 1, "ok": 1.0}
+
+
+def _configure_fail_point(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Mongod-shaped ``configureFailPoint`` admin command.
+
+    Driver test suites lean on this heavily — mongo-go-driver's
+    cursor / database tests open by saying "fail ``getMore`` /
+    ``killCursors`` / ``insert`` with code 100, then assert the driver
+    surfaces it as a ``mongo.CommandError``." See
+    ``secantus.failpoints`` for the exact subset implemented here.
+    """
+    if ctx.failpoints is None:
+        return {"ok": 1.0}
+    name = doc.get("configureFailPoint")
+    if not isinstance(name, str):
+        return {
+            "ok": 0.0,
+            "errmsg": "configureFailPoint requires a string name",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    mode = doc.get("mode")
+    data = doc.get("data") or {}
+    if not isinstance(data, dict):
+        data = {}
+    ctx.failpoints.configure(name, mode, data)
+    return {"ok": 1.0}
 
 
 def _secantus_admin_prune_oplog(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -1276,8 +1332,21 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"ok": 1.0}
 
 
-def _list_collections(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """List collections honouring ``filter`` and ``nameOnly`` per mongod.
+
+    ``filter`` is a regular query predicate evaluated against each
+    collection descriptor (``{name, type, options, info, idIndex}``).
+    ``nameOnly: true`` strips down each entry to ``{name, type}`` —
+    drivers use this when they only care about names. Both options
+    are normal mongod arguments; failing to honour them causes the
+    Go driver's ``ListCollectionNames`` filter test to see
+    unexpected matches.
+    """
     names = ctx.storage.list_collections(ctx.db_name)
+    name_only = bool(doc.get("nameOnly", False))
+    filter_doc = doc.get("filter")
+
     batch: list[dict[str, Any]] = []
     for n in names:
         raw = ctx.storage.get_collection_options(ctx.db_name, n)
@@ -1291,11 +1360,33 @@ def _list_collections(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
         batch.append(
             {"name": n, "type": "collection", "options": opts, "info": {"readOnly": False}}
         )
+
+    if isinstance(filter_doc, dict) and filter_doc:
+        batch = [d for d in batch if matches(d, filter_doc)]
+
+    if name_only:
+        batch = [{"name": d["name"], "type": d["type"]} for d in batch]
+
+    # Honour ``batchSize`` so drivers that pass a small batch get a
+    # real cursor + getMore round trip — the mongo-go-driver
+    # ``listCollections/getMore_commands_are_monitored`` test asserts
+    # that at least one getMore is emitted when batchSize=2 on a
+    # database with three collections. Without pagination, listCollections
+    # always returns id=0 and the test fails.
+    cursor_spec = doc.get("cursor")
+    if isinstance(cursor_spec, dict) and "batchSize" in cursor_spec:
+        raw_batch_size: Any = cursor_spec.get("batchSize")
+    else:
+        raw_batch_size = doc.get("batchSize")
+    batch_size = DEFAULT_BATCH_SIZE if raw_batch_size is None else int(raw_batch_size)
+    ns = f"{ctx.db_name}.$cmd.listCollections"
+    first_batch, cursor_id = _split_into_cursor(batch, batch_size, ns, ctx.cursors)
+
     return {
         "cursor": {
-            "firstBatch": batch,
-            "id": bson.Int64(0),
-            "ns": f"{ctx.db_name}.$cmd.listCollections",
+            "firstBatch": first_batch,
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
         },
         "ok": 1.0,
     }
@@ -1768,12 +1859,18 @@ def _aggregate_change_stream(
             return []
         rows = storage.read_oplog(start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter)
         if not rows:
-            # No new oplog entries since last poll. Still refresh
-            # ``last_token`` so the next ``postBatchResumeToken``
-            # carries the current cluster time — consumers on quiet
-            # collections can advance their resume position even
-            # when no events are visible. Token's ns / docKey stay
-            # at the last-seen value (drivers tolerate the placeholder).
+            # No new MATCHING oplog entries since last poll, but the
+            # oplog as a whole may have moved on (writes on other
+            # collections, periodic noop heartbeats). The
+            # postBatchResumeToken should advance to reflect the
+            # latest oplog position so consumers on quiet collections
+            # can resume past unrelated activity — mongo-go-driver's
+            # ``resume_token_updated_on_empty_batch`` test asserts
+            # exactly that. Pin ``position_seq`` to the oplog tail so
+            # the next read starts from there.
+            tail_seq = storage.oplog_tail_seq()
+            if tail_seq > entry.position_seq:
+                entry.position_seq = tail_seq
             ts = storage.current_cluster_time()
             entry.last_token = changestreams.make_resume_token(
                 changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
@@ -2896,6 +2993,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "aggregate": _aggregate,
     "saslStart": _sasl_start,
     "saslContinue": _sasl_continue,
+    "configureFailPoint": _configure_fail_point,
     "createUser": _create_user,
     "updateUser": _update_user,
     "dropUser": _drop_user,
@@ -3293,6 +3391,33 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     "code": 13,
                     "codeName": "Unauthorized",
                 }
+    # Failpoint match — short-circuit with ``errorCode`` before the
+    # handler runs, or fall through and remember a ``writeConcernError``
+    # to attach to the successful response. ``configureFailPoint``
+    # itself is exempt: the test setup that installs the failpoint
+    # would otherwise loop on its own configuration.
+    failpoint_wce: dict[str, Any] | None = None
+    failpoint_labels: tuple[str, ...] = ()
+    if ctx.failpoints is not None and name != "configureFailPoint":
+        match = ctx.failpoints.match(name)
+        if match is not None:
+            if match.error_code is not None:
+                result: dict[str, Any] = {
+                    "ok": 0.0,
+                    "errmsg": "Failing command via 'failCommand' failpoint",
+                    "code": match.error_code,
+                    "codeName": _code_name_for(match.error_code),
+                }
+                if match.error_labels:
+                    result["errorLabels"] = list(match.error_labels)
+                return result
+            if match.write_concern_error is not None:
+                wce = dict(match.write_concern_error)
+                wce.setdefault("errmsg", "failCommand failpoint")
+                wce.setdefault("codeName", _code_name_for(int(wce.get("code", 0))))
+                failpoint_wce = wce
+                failpoint_labels = match.error_labels
+
     profile_eligible = _profile_eligible_command(name, doc)
     start_ns = _time.monotonic_ns() if profile_eligible else 0
     try:
@@ -3326,4 +3451,8 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     if profile_eligible:
         _maybe_record_profile(ctx, name, doc, result, start_ns)
+    if failpoint_wce is not None and result.get("ok", 0.0):
+        result["writeConcernError"] = failpoint_wce
+        if failpoint_labels:
+            result["errorLabels"] = list(failpoint_labels)
     return result

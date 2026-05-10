@@ -42,6 +42,19 @@ def build_parser() -> argparse.ArgumentParser:
             "createUser, then restart with --auth. Off by default."
         ),
     )
+    parser.add_argument(
+        "--noop-heartbeat-seconds",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "Emit a periodic ``{op: 'n'}`` oplog heartbeat every N seconds "
+            "so quiet change-stream cursors keep their resume token inside "
+            "the oplog retention window (mongod's default is 10s). 0 = "
+            "disabled (the default; embedded test users typically don't "
+            "want the extra writes)."
+        ),
+    )
     return parser
 
 
@@ -57,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         storage_path=args.storage_path,
         require_auth=args.auth,
+        noop_heartbeat_seconds=args.noop_heartbeat_seconds,
     )
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:
