@@ -1334,6 +1334,57 @@ def test_create_capped_surfaces_options_via_list_collections(client: MongoClient
     assert info["options"].get("max") == 10
 
 
+def test_list_collections_emits_info_uuid_and_idindex(client: MongoClient) -> None:
+    """Each listCollections descriptor must carry ``info.uuid`` (BSON
+    Binary subtype 4) and ``idIndex`` (mongod's implicit ``_id_`` index
+    spec).
+
+    Regression: mongo-go-driver's
+    ``TestDatabase/list_collection_specifications/filter_passed_to_listCollections``
+    reads both fields off the cursor and the ``ListCollectionSpecifications``
+    helper requires them to populate its return value.
+    """
+    import bson as _bson
+
+    db = client["lc_uuid_idx_db"]
+    db.create_collection("widgets")
+    db.create_collection("logs", capped=True, size=4096)
+    specs = {c["name"]: c for c in db.list_collections()}
+    for name in ("widgets", "logs"):
+        spec = specs[name]
+        info = spec["info"]
+        assert info.get("readOnly") is False
+        uuid_val = info.get("uuid")
+        assert isinstance(uuid_val, _bson.Binary), (
+            f"expected info.uuid to be bson.Binary, got {type(uuid_val).__name__}"
+        )
+        assert uuid_val.subtype == 4
+        assert len(uuid_val) == 16
+        id_index = spec["idIndex"]
+        assert id_index == {
+            "v": 2,
+            "key": {"_id": 1},
+            "name": "_id_",
+            "ns": f"lc_uuid_idx_db.{name}",
+        }
+
+
+def test_list_collections_filter_on_options_capped(client: MongoClient) -> None:
+    """``listCollections`` honours a server-side filter on dotted paths
+    into nested descriptor fields (``options.capped`` here). The
+    mongo-go-driver test of the same name relies on this — without the
+    server-side filter, the driver would return every collection in the
+    database and ``ListCollectionSpecifications`` would mis-report
+    counts."""
+    db = client["lc_filter_db"]
+    db.create_collection("regular")
+    db.create_collection("capped_one", capped=True, size=4096)
+    db.create_collection("capped_two", capped=True, size=8192)
+    matching = list(db.list_collections(filter={"options.capped": True}))
+    names = sorted(c["name"] for c in matching)
+    assert names == ["capped_one", "capped_two"]
+
+
 def test_create_capped_without_size_rejected(client: MongoClient) -> None:
     from pymongo.errors import OperationFailure
 

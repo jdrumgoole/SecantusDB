@@ -1832,13 +1832,14 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """List collections honouring ``filter`` and ``nameOnly`` per mongod.
 
-    ``filter`` is a regular query predicate evaluated against each
-    collection descriptor (``{name, type, options, info, idIndex}``).
-    ``nameOnly: true`` strips down each entry to ``{name, type}`` —
-    drivers use this when they only care about names. Both options
-    are normal mongod arguments; failing to honour them causes the
-    Go driver's ``ListCollectionNames`` filter test to see
-    unexpected matches.
+    Each descriptor mirrors mongod's wire shape:
+    ``{name, type, options, info: {readOnly, uuid}, idIndex: {v, key, name, ns}}``.
+    ``filter`` is a regular query predicate evaluated against the
+    descriptor (the dotted-path matcher walks into the nested fields so
+    ``{options.capped: true}`` works the way the Go driver's
+    ``filter_passed_to_listCollections`` test expects). ``nameOnly: true``
+    strips down each entry to ``{name, type}`` — drivers use this when
+    they only care about names.
     """
     names = ctx.storage.list_collections(ctx.db_name)
     name_only = bool(doc.get("nameOnly", False))
@@ -1854,8 +1855,34 @@ def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
                 opts["size"] = raw["size"]
             if "max" in raw:
                 opts["max"] = raw["max"]
+        # info.uuid: BSON Binary subtype 4 (the standard "old UUID"
+        # subtype mongod uses in listCollections / change-stream events).
+        # The mongo-go-driver's ``ListCollectionSpecifications`` checks
+        # ``info.uuid`` is present and decodes it via ``Binary``; pymongo's
+        # ``listCollections`` cursor round-trips it as a ``bson.Binary``
+        # with the same subtype.
+        coll_uuid = ctx.storage.collection_uuid(ctx.db_name, n)
+        info = {
+            "readOnly": False,
+            "uuid": bson.Binary(coll_uuid.bytes, 4),
+        }
+        # idIndex: every collection has an implicit ``_id_`` unique index.
+        # ``storage.list_indexes`` puts it first in the list; mongod's
+        # wire shape uses ``ns`` (namespace), ``key``, ``name``, ``v``.
+        id_index = {
+            "v": 2,
+            "key": {"_id": 1},
+            "name": "_id_",
+            "ns": f"{ctx.db_name}.{n}",
+        }
         batch.append(
-            {"name": n, "type": "collection", "options": opts, "info": {"readOnly": False}}
+            {
+                "name": n,
+                "type": "collection",
+                "options": opts,
+                "info": info,
+                "idIndex": id_index,
+            }
         )
 
     if isinstance(filter_doc, dict) and filter_doc:
