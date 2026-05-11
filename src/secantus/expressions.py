@@ -415,9 +415,7 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
         if not isinstance(field, str):
             raise ExpressionError("$getField field must evaluate to a string")
     else:
-        raise ExpressionError(
-            "$getField requires a string or {field, input} document"
-        )
+        raise ExpressionError("$getField requires a string or {field, input} document")
     input_doc = _eval(input_expr, ctx)
     if input_doc is None or not isinstance(input_doc, Mapping):
         return None

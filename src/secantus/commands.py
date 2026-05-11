@@ -872,7 +872,9 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # ``MongoServerError`` — they fail silently if we accept the bad
     # value and return a normal explain doc.
     if not isinstance(verbosity, str) or verbosity not in (
-        "queryPlanner", "executionStats", "allPlansExecution"
+        "queryPlanner",
+        "executionStats",
+        "allPlansExecution",
     ):
         return {
             "ok": 0.0,
@@ -1280,7 +1282,9 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     for index, spec in enumerate(deletes):
         try:
             n += ctx.storage.delete_matching(
-                ctx.db_name, coll, spec.get("q", {}),
+                ctx.db_name,
+                coll,
+                spec.get("q", {}),
                 limit=int(spec.get("limit", 0)),
                 let=let,
             )
@@ -1391,16 +1395,19 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             "codeName": "FailedToParse",
         }
 
-    candidates = ctx.storage.find_matching(
-        ctx.db_name, coll, query, sort=sort, limit=1, let=let
-    )
+    candidates = ctx.storage.find_matching(ctx.db_name, coll, query, sort=sort, limit=1, let=let)
 
     if not candidates:
         if upsert and not is_remove:
             try:
                 result = ctx.storage.update_matching(
-                    ctx.db_name, coll, query, update,
-                    multi=False, upsert=True, let=let,
+                    ctx.db_name,
+                    coll,
+                    query,
+                    update,
+                    multi=False,
+                    upsert=True,
+                    let=let,
                     array_filters=array_filters,
                 )
             except IndexConflict as exc:
@@ -1461,8 +1468,12 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
 
     try:
         ctx.storage.update_matching(
-            ctx.db_name, coll, {"_id": matched_id}, update,
-            multi=False, array_filters=array_filters,
+            ctx.db_name,
+            coll,
+            {"_id": matched_id},
+            update,
+            multi=False,
+            array_filters=array_filters,
         )
     except IndexConflict as exc:
         reply2: dict[str, Any] = {

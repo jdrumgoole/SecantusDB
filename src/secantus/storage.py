@@ -1667,8 +1667,7 @@ class Storage:
                             "index": index,
                             "code": 11000,
                             "errmsg": (
-                                f"E11000 duplicate key error in index {cname}: "
-                                f"_id={doc['_id']!r}"
+                                f"E11000 duplicate key error in index {cname}: _id={doc['_id']!r}"
                             ),
                             "keyPattern": kpat,
                             "keyValue": kval,
@@ -2297,7 +2296,8 @@ class Storage:
                 matched += 1
                 pos = find_positional_matches(doc, filter)
                 new = apply_update(
-                    doc, update,
+                    doc,
+                    update,
                     array_filters=array_filters,
                     positional_matches=pos,
                     let=let,
@@ -2309,9 +2309,7 @@ class Storage:
                     )
                     if conflict is not None:
                         cname, kpat, kval = conflict
-                        raise IndexConflict(
-                            cname, new["_id"], key_pattern=kpat, key_value=kval
-                        )
+                        raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
                     # Geo validation must reject the update before any
                     # write happens, otherwise we'd be left with a
                     # half-deleted set of index entries.
@@ -2358,9 +2356,7 @@ class Storage:
                 )
                 if conflict is not None:
                     cname, kpat, kval = conflict
-                    raise IndexConflict(
-                        cname, new["_id"], key_pattern=kpat, key_value=kval
-                    )
+                    raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
                 self._validate_geo_indexes(db, coll, new, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
@@ -3139,8 +3135,7 @@ class Storage:
                     break
                 if exclude_id_key is None or row_id != exclude_id_key:
                     key_value = {
-                        field: get_path(candidate_doc, field, default=None)
-                        for field in key_spec
+                        field: get_path(candidate_doc, field, default=None) for field in key_spec
                     }
                     return name, dict(key_spec), key_value
                 if c.next() != 0:
