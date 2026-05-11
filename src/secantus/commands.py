@@ -1986,13 +1986,15 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # collation_and_csppi`` test installs each one then asserts the
     # echo. Mongo-ruby-driver's ``listCollection ... options.validator``
     # spec is the same shape.
+    # ``writeConcern`` is a per-command option, not a collection
+    # option — real mongod doesn't echo it in listCollections.
+    # ``lsid`` and ``$db`` are wire envelope fields, never stored.
     _PASSTHROUGH_CREATE_OPTIONS = (
         "storageEngine",
         "indexOptionDefaults",
         "validationAction",
         "validationLevel",
         "collation",
-        "writeConcern",
         "expireAfterSeconds",
         "timeseries",
         "clusteredIndex",
@@ -2183,11 +2185,20 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    # Honour ``cursor.batchSize`` so callers with many indexes
+    # actually round-trip via ``getMore`` — mongo-go-driver's
+    # ``TestIndexView/list/getMore_commands_are_monitored`` test
+    # asserts at least one getMore fires when batchSize < total.
+    cursor_opts = doc.get("cursor") or {}
+    raw_bs = cursor_opts.get("batchSize")
+    batch_size = DEFAULT_BATCH_SIZE if raw_bs is None else int(raw_bs)
+    ns = f"{ctx.db_name}.$cmd.listIndexes.{coll}"
+    first_batch, cursor_id = _split_into_cursor(indexes, batch_size, ns, ctx.cursors)
     return {
         "cursor": {
-            "firstBatch": indexes,
-            "id": bson.Int64(0),
-            "ns": f"{ctx.db_name}.$cmd.listIndexes.{coll}",
+            "firstBatch": first_batch,
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
         },
         "ok": 1.0,
     }

@@ -8,47 +8,18 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 331 | 62 | 33 | 426 | 84.2% |
+| `internal/integration` | 351 | 2 | 51 | 404 | 99.4% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **373** | **62** | **33** | **468** | **85.7%** |
+| **Overall** | **393** | **2** | **51** | **446** | **99.5%** |
 
-## Failures (62)
+## Failures (2)
 
 First 30 failed tests for triage:
 
 ```
-internal/integration :: TestDatabase/list_collection_specifications/filter_passed_to_listCollections
-internal/integration :: TestDatabase/list_collection_specifications
-internal/integration :: TestDatabase/create_collection/options/all_options_except_collation_and_csppi
-internal/integration :: TestDatabase/create_collection/options/changeStreamPreAndPostImages
-internal/integration :: TestDatabase/create_collection/options
-internal/integration :: TestDatabase/create_collection
-internal/integration :: TestDatabase/create_view/function_parameters_are_translated_into_options
-internal/integration :: TestDatabase/create_view
-internal/integration :: TestDatabase
-internal/integration :: TestErrors
-internal/integration :: TestGridFS/download/error_if_files_collection_document_does_not_have_a_chunkSize_field
-internal/integration :: TestGridFS/download/cursor_error_during_read_after_downloading
-internal/integration :: TestGridFS/download/cursor_error_during_skip_after_downloading
-internal/integration :: TestGridFS/download
-internal/integration :: TestGridFS/bucket_collection_accessors/default_bucket_name
-internal/integration :: TestGridFS/bucket_collection_accessors/custom_bucket_name
-internal/integration :: TestGridFS/bucket_collection_accessors
-internal/integration :: TestGridFS/Find
-internal/integration :: TestGridFS
-internal/integration :: TestHandshakeProse/1._valid_AWS
-internal/integration :: TestHandshakeProse/2._valid_Azure
-internal/integration :: TestHandshakeProse/3._valid_GCP
-internal/integration :: TestHandshakeProse/4._valid_Vercel
-internal/integration :: TestHandshakeProse/5._invalid_multiple_providers
-internal/integration :: TestHandshakeProse/6._invalid_long_string
-internal/integration :: TestHandshakeProse/7._invalid_wrong_types
-internal/integration :: TestHandshakeProse/8._Invalid_-_AWS_EXECUTION_ENV_does_not_start_with_"AWS_Lambda_"
-internal/integration :: TestHandshakeProse/driver_info_included
-internal/integration :: TestHandshakeProse
-internal/integration :: TestLoadBalancedConnectionHandshake/non-LB_connection_handshake_uses_OP_QUERY
+internal/integration :: TestChangeStream_ReplicaSet/resume_token_updated_on_empty_batch
+internal/integration :: TestChangeStream_ReplicaSet
 ```
-... and 32 more (see raw NDJSON).
 
 ## How this is generated
 
