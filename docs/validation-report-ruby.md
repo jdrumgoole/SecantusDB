@@ -12,7 +12,7 @@ Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the ana
 | `spec/support` | 85 | 4 | 8 | 97 | 95.5% |
 | **Overall** | **278** | **16** | **24** | **318** | **94.6%** |
 
-Run time: 13.72s.
+Run time: 12.99s.
 
 ## Failures (16)
 

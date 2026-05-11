@@ -174,10 +174,14 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
                 "code": 79,
                 "codeName": "UnknownReplWriteConcern",
             }
-    if "j" in wc and not isinstance(wc["j"], bool):
+    if "j" in wc and not isinstance(wc["j"], (bool, int)):
+        # Real mongod is loose on the ``j`` type — bool or int both
+        # work (truthiness used). Mongo-node-driver's
+        # ``findOneAnd... passes through the writeConcern`` test sends
+        # ``{j: 1}`` and expects the command to succeed.
         return {
             "ok": 0.0,
-            "errmsg": "writeConcern.j must be a boolean",
+            "errmsg": "writeConcern.j must be a boolean or integer",
             "code": 14,
             "codeName": "TypeMismatch",
         }
@@ -963,14 +967,28 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # cycle is a no-op read; combining it with a write concern is
     # ill-formed. Mongo-node-driver's ``aggregation.test.ts`` has two
     # cases that assert the rejection.
-    wc = doc.get("writeConcern")
-    if isinstance(wc, dict) and (wc.get("j") is True or wc.get("w") == "majority"):
-        return {
-            "ok": 0.0,
-            "errmsg": ("Command does not support writeConcern when used with explain"),
-            "code": 72,
-            "codeName": "InvalidOptions",
-        }
+    # ``writeConcern`` may live on the outer ``explain`` doc or be
+    # nested inside the wrapped command (drivers handle both shapes).
+    wc_outer = doc.get("writeConcern")
+    wc_inner = inner.get("writeConcern") if isinstance(inner, dict) else None
+    for wc in (wc_outer, wc_inner):
+        if isinstance(wc, dict) and (
+            wc.get("j") is True or wc.get("j") == 1 or wc.get("w") == "majority"
+        ):
+            return {
+                "ok": 0.0,
+                "errmsg": ("Command does not support writeConcern when used with explain"),
+                "code": 72,
+                "codeName": "InvalidOptions",
+            }
+    # ``maxTimeMS`` accepted but not enforced — operations complete
+    # immediately on this in-process daemon so a real timeout never
+    # fires. Pre-Node's CSOT, explain helpers just attach the value
+    # for the wire-shape audit; mongo-node-driver's
+    # ``explain helpers w/ maxTimeMS attaches maxTimeMS to the explain
+    # command`` test reads the started-command event, not the server
+    # response. The "explain command times out after timeoutMS" tests
+    # rely on a server-side failpoint (not us) to actually time out.
     # ``verbosity`` controls which sections of the explain reply the
     # client gets. Mongod's three levels:
     #   queryPlanner       — winningPlan only, no execution
@@ -1659,7 +1677,7 @@ def _key_present(doc: dict[str, Any], path: str) -> bool:
 
 
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import GeoExtractError, IndexConflict
+    from secantus.storage import DocumentValidationError, GeoExtractError, IndexConflict
 
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
@@ -1704,6 +1722,22 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
 
     if not candidates:
         if upsert and not is_remove:
+            # Validator on the upsert path too — mongo-node-driver's
+            # ``Document Validation should allow bypassing document
+            # validation on findAndModify`` test calls
+            # ``findOneAndUpdate(..., upsert=true)`` against a
+            # validator-bound collection and asserts a
+            # ``MongoServerError`` when bypass is off.
+            bypass_validation_fam_up = bool(doc.get("bypassDocumentValidation", False))
+            coll_opts_up = ctx.storage.get_collection_options(ctx.db_name, coll)
+            validator_spec_up = coll_opts_up.get("validator")
+            validator_up = (
+                dict(validator_spec_up)
+                if isinstance(validator_spec_up, dict)
+                and validator_spec_up
+                and not bypass_validation_fam_up
+                else None
+            )
             try:
                 result = ctx.storage.update_matching(
                     ctx.db_name,
@@ -1715,7 +1749,19 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                     let=let,
                     array_filters=array_filters,
                     collation=collation,
+                    validator=validator_up,
                 )
+            except DocumentValidationError as exc:
+                return {
+                    "ok": 0.0,
+                    "errmsg": "Document failed validation",
+                    "code": 121,
+                    "codeName": "DocumentValidationFailure",
+                    "errInfo": {
+                        "failingDocumentId": exc.doc_id,
+                        "details": {"operatorName": "validator"},
+                    },
+                }
             except IndexConflict as exc:
                 reply: dict[str, Any] = {
                     "ok": 0.0,
@@ -2558,6 +2604,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         coll_name=coll_name,
         vars=dict(let) if let else {},
         collation=collation,
+        command_doc=dict(doc),
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)

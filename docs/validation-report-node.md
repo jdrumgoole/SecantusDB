@@ -8,19 +8,14 @@ Run `uv run python -m invoke validate-node` to refresh. The pass rate is the ana
 
 | Category | Passed | Failed | Pending | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `integration` | 334 | 30 | 5 | 369 | 91.8% |
-| **Overall** | **334** | **30** | **5** | **369** | **91.8%** |
+| `integration` | 345 | 14 | 5 | 364 | 96.1% |
+| **Overall** | **345** | **14** | **5** | **364** | **96.1%** |
 
-## Failures (30)
+## Failures (14)
 
 First 30 failed test titles for triage:
 
 ```
-integration :: Aggregation should correctly execute db.aggregate() with $currentOp
-integration :: Aggregation should correctly execute db.aggregate() with $currentOp
-integration :: Aggregation should fail if you try to use explain flag with { readConcern: { level: 'local' }, writeConcern: { j: true } }
-integration :: Aggregation should fail if you try to use explain flag with { writeConcern: { j: true } }
-integration :: Document Validation should allow bypassing document validation on findAndModify
 integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a cursor api is being explained when timeoutMS is provided the explain command times out after timeoutMS
 integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a cursor api is being explained when timeoutMS is provided the explain command has the calculated maxTimeMS value attached
 integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a cursor api is being explained when timeoutMS is provided the explained command does not have a maxTimeMS value attached
@@ -35,17 +30,6 @@ integration :: CRUD API explain option explain with timeoutMS fluent api timeout
 integration :: CRUD API explain option explain with timeoutMS fluent api timeoutMS precedence and inheritance aggregate([], { timeoutMS} ).explain({}, { timeoutMS }) the timeoutMS from the explain helper has precedence
 integration :: Find should correctly return error from mongodb on findOneAndUpdate forced error
 integration :: Find should correctly sort using text search in find
-integration :: Collection (#findOneAnd...) #findOneAndDelete when passing in writeConcern when provided at the operation level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndDelete when passing in writeConcern when provided at the collection level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndDelete when passing in writeConcern when provided at the db level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndDelete when passing in writeConcern "after each" hook for "passes through the writeConcern"
-integration :: Collection (#findOneAnd...) #findOneAndDelete when passing in writeConcern when provided at the db level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndUpdate when passing in writeConcern when provided at the operation level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndUpdate when passing in writeConcern when provided at the collection level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndUpdate when passing in writeConcern when provided at the db level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndUpdate when passing in writeConcern "after each" hook for "passes through the writeConcern"
-integration :: Collection (#findOneAnd...) #findOneAndUpdate when passing in writeConcern when provided at the db level passes through the writeConcern
-integration :: Collection (#findOneAnd...) #findOneAndReplace when passing in writeConcern when provided at the operation level passes through the writeConcern
 ```
 
 ## How this is generated

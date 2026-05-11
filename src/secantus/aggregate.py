@@ -33,6 +33,11 @@ class PipelineContext:
     # request's ``collation`` argument; ``None`` keeps default
     # codepoint comparison.
     collation: Any = None
+    # The aggregate command's request body (minus the ``$db`` /
+    # ``lsid`` envelope fields). Surfaced by ``$currentOp`` as the
+    # ``command`` sub-doc on the self-row mongo-node-driver's
+    # ``$currentOp`` test introspects.
+    command_doc: dict[str, Any] | None = None
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
@@ -42,6 +47,7 @@ class PipelineContext:
             vars={**self.vars, **more},
             change_stream=self.change_stream,
             collation=self.collation,
+            command_doc=self.command_doc,
         )
 
 
@@ -1120,6 +1126,18 @@ def _stage_current_op(
     the aggregation request that produced it — minus any sensitive
     state.
     """
+    # Mongo-node-driver's ``Aggregation should correctly execute
+    # db.aggregate() with $currentOp`` test asserts the op's
+    # ``command`` matches the actual aggregate request (pipeline,
+    # cursor, $db). Use the real command doc threaded through
+    # PipelineContext; fall back to the stub shape so older callers
+    # still see *something*.
+    if isinstance(_ctx.command_doc, dict) and "aggregate" in _ctx.command_doc:
+        command_doc: dict[str, Any] = dict(_ctx.command_doc)
+        command_doc.setdefault("$db", _ctx.db_name)
+        command_doc.setdefault("cursor", {})
+    else:
+        command_doc = {"aggregate": 1}
     return [
         {
             "type": "op",
@@ -1127,14 +1145,8 @@ def _stage_current_op(
             "desc": "$currentOp",
             "active": False,
             "currentOpTime": "",
-            # Mongo-node-driver's ``Aggregation ... $currentOp`` test
-            # scans the result for entries where
-            # ``op.command.aggregate`` matches — without ``command``
-            # present, the read throws ``Cannot read properties of
-            # undefined``. Real mongod always sets ``command`` on
-            # ``$currentOp`` rows even when the op is idle.
-            "command": {"aggregate": 1},
-            "ns": "",
+            "command": command_doc,
+            "ns": _ctx.db_name + "." + (_ctx.coll_name or "$cmd.aggregate"),
             "op": "command",
         }
     ]

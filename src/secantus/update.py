@@ -41,7 +41,9 @@ def apply_update(
     new = copy.deepcopy(dict(update))
     if "_id" in doc:
         if "_id" in new and new["_id"] != doc["_id"]:
-            raise UpdateError("cannot change the _id of a document")
+            raise UpdateError(
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            )
         new["_id"] = doc["_id"]
     return new
 
@@ -201,7 +203,9 @@ def _apply_pipeline_update(
         if "_id" not in new:
             new["_id"] = doc["_id"]
         elif new["_id"] != doc["_id"]:
-            raise UpdateError("pipeline update cannot change the _id of a document")
+            raise UpdateError(
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            )
     return new
 
 
