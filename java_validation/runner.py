@@ -250,10 +250,21 @@ def main() -> int:
         # module (bson). Each invocation pays gradle's startup cost (~10s
         # without --daemon), but the alternative is a single multi-task
         # invocation where Gradle CLI's `--tests` would apply globally.
+        # Phase 3: parallel JVM forks for the test tasks. The driver's
+        # ``conventions/testing-base.gradle.kts`` hardcodes
+        # ``maxParallelForks = 1``; we override via an init-script
+        # (vendored tree stays unmodified). Worker count is the runner's
+        # CPU count by default; ``SECANTUS_GAUGE_PARALLEL_FORKS`` overrides.
+        init_script = REPO_ROOT / "java_validation" / "init.gradle.kts"
+        forks = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
+        if forks is None:
+            env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(os.cpu_count() or 1)
+
         gradle_rcs: list[int] = []
         for spec in INCLUDE:
             cmd = [
                 "./gradlew", "--no-daemon", "--console=plain",
+                "--init-script", str(init_script),
                 # ``--rerun-tasks`` forces Gradle to re-execute the
                 # test task even when its inputs (Java sources, system
                 # properties) haven't changed. Without it, server-side
