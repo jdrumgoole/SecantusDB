@@ -1469,7 +1469,8 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.collation import cmp_key, parse as _parse_collation
+    from secantus.collation import cmp_key
+    from secantus.collation import parse as _parse_collation
     from secantus.paths import get_path
 
     coll = doc["distinct"]

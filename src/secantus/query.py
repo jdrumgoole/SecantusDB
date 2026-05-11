@@ -9,7 +9,9 @@ from typing import Any
 
 from bson import Binary, Decimal128, ObjectId, Regex
 
-from secantus.collation import Collation, equal as _coll_equal, compare_keys as _coll_compare
+from secantus.collation import Collation
+from secantus.collation import compare_keys as _coll_compare
+from secantus.collation import equal as _coll_equal
 
 
 class _Missing:

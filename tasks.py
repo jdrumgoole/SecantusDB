@@ -539,6 +539,31 @@ def clean(c: Context) -> None:
         "rm -rf build dist *.egg-info .pytest_cache .ruff_cache .coverage htmlcov docs/_build",
         pty=True,
     )
+    # Sweep leaked gauge tempdirs. Aborted runs of ``invoke validate-*``
+    # leave ``secantus-<driver>-gauge-XXXXXX`` directories under the
+    # system tempdir (``/var/folders/.../T`` on macOS, ``/tmp`` on
+    # Linux). Each holds a WiredTiger store — tens of MB at minimum.
+    # Reap anything older than an hour so an active gauge isn't
+    # interrupted.
+    import glob
+    import os
+    import shutil
+    import tempfile
+    import time
+
+    cutoff = time.time() - 3600.0
+    base = tempfile.gettempdir()
+    candidates = glob.glob(os.path.join(base, "secantus-*-gauge-*"))
+    swept = 0
+    for path in candidates:
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+                swept += 1
+        except FileNotFoundError:
+            continue
+    if swept:
+        print(f"clean: swept {swept} stale gauge tempdir(s) older than 1h under {base}")
 
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([ab]\d+|rc\d+)?$")

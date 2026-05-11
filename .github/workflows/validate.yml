@@ -57,11 +57,37 @@ jobs:
         with:
           go-version: "1.25"
 
+      - name: Cache Go modules + build
+        if: matrix.driver.name == 'go'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          # Pin the cache to the vendored mongo-go-driver submodule SHA so a
+          # submodule bump invalidates cleanly. ``go.sum`` is captured inside
+          # the submodule already; using the submodule pointer file (``.gitmodules``
+          # entry + the parent commit's tree) would be equivalent but harder
+          # to spell in ``hashFiles``. The submodule SHA is what changed in
+          # the parent commit, so its hash is the right cache key.
+          key: ${{ runner.os }}-go-${{ hashFiles('vendor/mongo-go-driver/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
       - name: Set up Node.js
         if: matrix.driver.name == 'node'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+
+      - name: Cache node_modules
+        if: matrix.driver.name == 'node'
+        uses: actions/cache@v4
+        with:
+          path: vendor/node-mongodb-native/node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('vendor/node-mongodb-native/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
         if: matrix.driver.name == 'java'
@@ -70,12 +96,37 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Cache Gradle caches + wrapper
+        if: matrix.driver.name == 'java'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Cache the gradle distribution (``~/.gradle/wrapper`` is ~150 MB)
+          # plus dependency caches. Key on every build script + version
+          # catalogue file in the vendored driver, so any version bump
+          # invalidates cleanly. The buildSrc compile (~1m on cold cache)
+          # is by far the biggest win here.
+          key: ${{ runner.os }}-gradle-${{ hashFiles('vendor/mongo-java-driver/gradle/wrapper/gradle-wrapper.properties', 'vendor/mongo-java-driver/**/*.gradle*', 'vendor/mongo-java-driver/gradle/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Set up Ruby
         if: matrix.driver.name == 'ruby'
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
           bundler-cache: false  # gems installed via runner's bundle install
+
+      - name: Cache Ruby bundle
+        if: matrix.driver.name == 'ruby'
+        uses: actions/cache@v4
+        with:
+          path: vendor/mongo-ruby-driver/.bundle
+          key: ${{ runner.os }}-ruby-bundle-${{ hashFiles('vendor/mongo-ruby-driver/Gemfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ruby-bundle-
 
       - name: Run ${{ matrix.driver.name }} validation
         run: uv run python -m invoke ${{ matrix.driver.task }}

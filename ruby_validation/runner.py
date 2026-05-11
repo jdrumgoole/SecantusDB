@@ -245,7 +245,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()
@@ -323,7 +323,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()

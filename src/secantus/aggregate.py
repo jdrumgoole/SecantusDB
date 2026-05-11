@@ -463,7 +463,7 @@ def _stage_group(
             raise AggregateError(f"unsupported $group accumulator: {op}")
         compiled.append((field, handler, arg))
 
-    from secantus.collation import cmp_key, parse as _parse_collation
+    from secantus.collation import parse as _parse_collation
 
     coll_obj = _parse_collation(ctx.collation)
     groups: dict[Any, dict[str, Any]] = {}
