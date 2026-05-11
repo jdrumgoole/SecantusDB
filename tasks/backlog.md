@@ -76,6 +76,7 @@ Subtler than the above; these may bite specific test suites.
 - [ ] **`$type: "number"`** in queries — handles `int`, `float`, `Decimal128`, but the int32-vs-int64 distinction depends on Python value range, not the original BSON type tag (which we throw away on decode). A doc inserted as `Int64(5)` reads back as a small Python int and matches `$type: "int"`, not `"long"`.
 - [ ] **`$lookup` simple-form-plus-pipeline** — when both `localField`/`foreignField` and `pipeline` are present, we pre-filter by the simple form and then run the pipeline. Real MongoDB does this too in modern versions, but the documentation isn't crystal clear on the order. If a test breaks here, this is the place to look.
 - [ ] **Aggregation `$group` stable order** — group buckets are emitted in first-seen order, not sorted. Matches MongoDB for unsharded but might differ from sharded behavior (which we don't model).
+- [ ] **`listCollections` filter handling** — mongo-go-driver's `TestDatabase/list_collection_specifications/filter_passed_to_listCollections` fails on the on-disk go gauge (surfaced when `go_validation/runner.py` moved from `:memory:` to a tempdir under the Phase 0 policy). The test passes a server-side filter to `listCollections` and expects only the matching collections back; our implementation likely returns the full collection list (or applies the filter incorrectly). Look at the `listCollections` handler in `src/secantus/commands.py` and confirm the `filter` field is honoured.
 
 ---
 

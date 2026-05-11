@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pymongo
 import pytest
 from bson import ObjectId
 from pymongo import MongoClient
@@ -1451,3 +1452,85 @@ def test_capped_collection_eviction_emits_change_stream_deletes(
         ops = [e["operationType"] for e in events]
         assert "insert" in ops
         assert "delete" in ops
+
+
+# ---- tailable cursors on capped collections --------------------------------
+
+
+def test_tailable_await_delivers_initial_docs_past_first_batch(client: MongoClient) -> None:
+    """find().tailable_await() with batchSize < initial-match-count must deliver
+    the rest via getMore, not throw them away.
+
+    Regression for the bug surfaced by mongo-go-driver's
+    ``TestCursor_RemainingBatchLength/first_batch_is_non_empty``:
+    ``_find_tailable`` used to set the producer's watermark to the
+    last doc in the collection, silently dropping ``initial_docs[batch_size:]``.
+    First batch worked, but the second batch was always empty —
+    awaitData blocking then masked the loss as a tailable poll, so the
+    client either looped forever (Go's ``cursor.Next``) or gave up
+    after firstBatch (pymongo's ``StopIteration``).
+    """
+    db = client["tail_init_db"]
+    db.tailcap.drop()
+    db.create_collection("tailcap", capped=True, size=64 * 1024)
+    db.tailcap.insert_many([{"x": i} for i in range(1, 6)])
+
+    cur = db.tailcap.find(
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        batch_size=2,
+    ).max_await_time_ms(100)
+    cur.batch_size(2)
+
+    seen = []
+    deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+    while len(seen) < 5 and dt.datetime.now() < deadline:
+        try:
+            doc = cur.next()
+        except StopIteration:
+            break
+        seen.append(doc["x"])
+        if len(seen) == 5:
+            break
+
+    assert seen == [1, 2, 3, 4, 5], (
+        f"expected all 5 seeded docs via firstBatch + getMore, got {seen}"
+    )
+    try:
+        cur.close()
+    except Exception:
+        pass
+
+
+def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None:
+    """After firstBatch drains, the producer must surface docs inserted
+    *after* the find — the canonical tailable use case."""
+    db = client["tail_follow_db"]
+    db.tailcap.drop()
+    db.create_collection("tailcap", capped=True, size=64 * 1024)
+    db.tailcap.insert_one({"x": 1})
+
+    cur = db.tailcap.find(
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        batch_size=10,
+    ).max_await_time_ms(100)
+
+    first = cur.next()
+    assert first["x"] == 1
+
+    # New insert after the find: the next getMore must surface it.
+    db.tailcap.insert_one({"x": 2})
+
+    second = None
+    deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+    while second is None and dt.datetime.now() < deadline:
+        try:
+            second = cur.next()
+        except StopIteration:
+            break
+    assert second is not None and second["x"] == 2, (
+        f"tailable cursor did not surface follow-up insert, got {second!r}"
+    )
+    try:
+        cur.close()
+    except Exception:
+        pass

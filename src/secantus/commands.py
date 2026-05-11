@@ -1080,23 +1080,42 @@ def _find_tailable(
 ) -> dict[str, Any]:
     """Build a tailable cursor on a capped collection.
 
-    The producer scans the doc table for rows with ``id_key`` strictly
-    greater than the last one we've returned. ``id_key`` is the
-    byte-sortable ``_id`` encoding (see ``secantus.sortkey``); for
-    monotonic ``ObjectId``-style ``_id`` values that order matches
-    insertion order, which is exactly what tailable consumers expect.
-    Capped collections eviction-prune oldest rows in the same order,
-    so the producer naturally tracks the trailing edge.
+    Two doc sources feed the cursor:
+
+    * The matched docs that ``find`` already produced. ``firstBatch``
+      gets the leading ``batch_size`` of them; the remainder is queued
+      on the cursor for the next ``getMore`` to drain (mongo-go-driver's
+      ``TestCursor_RemainingBatchLength/first_batch_is_non_empty``
+      relies on this — open a tailable cursor over 5 capped-coll docs
+      with ``batchSize=2`` and the second batch must deliver
+      ``{x:3},{x:4}`` via getMore, not block on awaitData).
+    * Docs inserted *after* this find. A producer closure scans the
+      doc table for rows with ``id_key`` strictly greater than the
+      last one we've returned. ``id_key`` is the byte-sortable ``_id``
+      encoding (see ``secantus.sortkey``); for monotonic
+      ``ObjectId``-style ``_id`` values that order matches insertion
+      order, which is exactly what tailable consumers expect. Capped
+      collections eviction-prune oldest rows in the same order, so the
+      producer naturally tracks the trailing edge.
     """
+    from secantus.sortkey import encode_value as _encode_id_key
+
     db_name = ctx.db_name
     storage = ctx.storage
-    # Track our current-watermark id_key on a mutable container so the
-    # producer closure can update it. Walk the collection once now to
-    # find the highest current id_key — that becomes the starting
-    # checkpoint after we hand back ``firstBatch``. Subsequent
-    # ``getMore`` polls re-scan from that checkpoint forward.
-    rows = storage.scan_docs_after_id_key(db_name, coll, after=None)
-    state = {"after_id_key": rows[-1][0] if rows else None}
+    first_batch = initial_docs[:batch_size]
+    initial_remaining = initial_docs[batch_size:]
+    # Watermark for the producer: highest id_key among the docs we've
+    # already handed to the client (either in firstBatch or queued in
+    # initial_remaining). Setting it to ``rows[-1][0]`` (the last doc
+    # in the collection) instead would silently drop any matched docs
+    # past ``batch_size`` — the original bug surfaced by the go gauge.
+    if initial_docs:
+        watermark = _encode_id_key(initial_docs[-1]["_id"])
+    else:
+        # Empty collection: walk from the start so the producer picks
+        # up the very first insert that happens after this find.
+        watermark = None
+    state = {"after_id_key": watermark}
 
     def producer() -> list[dict[str, Any]]:
         new_rows = storage.scan_docs_after_id_key(db_name, coll, after=state["after_id_key"])
@@ -1105,11 +1124,11 @@ def _find_tailable(
         state["after_id_key"] = new_rows[-1][0]
         return [doc for _id_k, doc in new_rows]
 
-    first_batch = initial_docs[:batch_size]
     cursor_id = ctx.cursors.register_tailable(
         ns,
         producer,
         await_data=await_data,
+        initial_remaining=initial_remaining,
     )
     return {
         "cursor": {

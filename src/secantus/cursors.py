@@ -130,8 +130,15 @@ class CursorRegistry:
         no_cursor_timeout: bool = False,
         position_seq: int = 0,
         collection_uuid: _uuid.UUID | None = None,
+        initial_remaining: list[dict[str, Any]] | None = None,
     ) -> int:
         """Register a tailable cursor backed by a producer closure.
+
+        ``initial_remaining`` lets the caller pre-seed the cursor's
+        ``remaining`` queue with docs already matched at ``find`` time
+        that didn't fit in ``firstBatch``. Subsequent ``getMore``s drain
+        that queue first, then fall through to ``producer()`` for
+        newly-inserted docs.
 
         Cursor IDs are int64-random (above 2**32) to match what real
         ``mongod`` issues for change streams; some drivers compare these
@@ -151,7 +158,7 @@ class CursorRegistry:
             self._cursors[cursor_id] = _Entry(
                 cursor_id=cursor_id,
                 namespace=namespace,
-                remaining=[],
+                remaining=list(initial_remaining) if initial_remaining else [],
                 last_access=self._time(),
                 tailable=True,
                 await_data=await_data,
