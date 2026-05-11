@@ -77,15 +77,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-java-driver"
 RESULTS_DIR = REPO_ROOT / ".validation" / "java-results"
 
-# Fixed port — ``27018``, the project-wide convention for SecantusDB
-# under test (see CLAUDE.md). All driver gauges share this port;
-# they run sequentially in CI so the shared port doesn't conflict.
-DAEMON_PORT = 27018
-
 # Test users mongo-java-driver's ClusterFixture connection string
 # expects when ``-Dorg.mongodb.test.uri`` carries credentials.
 ROOT_USER = "root-user"
 ROOT_PASSWORD = "password"
+
+
+def _pick_ephemeral_port() -> int:
+    """Ask the kernel for a free ephemeral TCP port. See ``go_validation.runner``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -153,7 +155,7 @@ def main() -> int:
     RESULTS_DIR.mkdir(parents=True)
 
     host = "127.0.0.1"
-    port = DAEMON_PORT
+    port = _pick_ephemeral_port()
 
     # Tempdir storage so the user records we seed in phase 1 survive
     # the daemon restart in phase 2 with --auth.

@@ -37,8 +37,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-go-driver"
 RAW_OUT = REPO_ROOT / ".validation" / "go-raw.ndjson"
 
-# Project-wide convention — see CLAUDE.md ``Tooling`` section.
-DAEMON_PORT = 27018
+
+def _pick_ephemeral_port() -> int:
+    """Ask the kernel for a free ephemeral TCP port, close the socket, return
+    the number. Lets the daemon and validate-all fan-out run in parallel
+    without colliding on a fixed port. Tiny TOCTOU window between close and
+    the daemon's own bind — fine on a clean CI runner where nothing else
+    grabs the port; locally the worst case is a retry."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -76,7 +84,7 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = DAEMON_PORT
+    port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-go-gauge-")
     print(
         f"go_validation: storage tempdir {storage_dir} (will be cleaned up)",
