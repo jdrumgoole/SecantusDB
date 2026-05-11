@@ -427,6 +427,22 @@ class IndexConflict(Exception):
         self.key_value = key_value
 
 
+class CreateIndexUnsupported(Exception):
+    """``create_index`` was given an index type SecantusDB doesn't support
+    (currently ``text`` / ``hashed``). Caught at the command layer and
+    surfaced as a typed wire error rather than letting the cell-encoder
+    later trip over an opaque internal exception."""
+
+
+class IndexOptionsConflict(Exception):
+    """``create_index`` was called with a name that already exists in the
+    collection but with conflicting options (different ``unique`` /
+    ``sparse`` / ``hidden`` / ``expireAfterSeconds`` /
+    ``partialFilterExpression``). Real mongod rejects with
+    ``IndexOptionsConflict`` (code 85); drivers (mongo-ruby-driver's
+    ``Collection#create_indexes`` specs) assert on the rejection."""
+
+
 class GeoExtractError(Exception):
     """Doc's geo field can't be indexed — bad shape or out-of-bounds coords.
 
@@ -2815,12 +2831,46 @@ class Storage:
     ) -> bool:
         if name == _ID_INDEX_NAME:
             return False
+        # Text / hashed indexes are documented out-of-scope (CLAUDE.md
+        # "Out of scope regardless: text / hashed / wildcard indexes").
+        # Surface the rejection as a typed exception (caught in
+        # ``commands._create_indexes``) instead of letting the geo
+        # picker / encoder later fall over with an opaque internal
+        # error. Mongo-node-driver's ``Find should correctly sort using
+        # text search`` test expects a clean error here.
+        for _field, _spec_val in key_spec.items():
+            if _spec_val in ("text", "hashed"):
+                raise CreateIndexUnsupported(
+                    f"{_spec_val} indexes are not supported by SecantusDB"
+                )
         options = dict(options or {})
         with self._lock:
             self._ensure_collection(db, coll)
             c = self._cursor(_IDX_TABLE)
             c.set_key(db, coll, name)
             if c.search() == 0:
+                # Index exists. Mongo rejects re-creation with conflicting
+                # options (different ``unique`` / ``sparse`` / ``hidden``
+                # / ``expireAfterSeconds``). Silently succeeding hides
+                # a bug surface that mongo-ruby-driver's ``Collection#
+                # create_indexes when index creation fails`` test pins.
+                existing_raw = bytes(c.get_value())
+                existing = bson.decode(existing_raw) if existing_raw else {}
+                existing_opts = dict(existing.get("options") or {})
+                _CONFLICTING_OPTS = (
+                    "unique",
+                    "sparse",
+                    "hidden",
+                    "expireAfterSeconds",
+                    "partialFilterExpression",
+                )
+                for opt in _CONFLICTING_OPTS:
+                    if opt in options or opt in existing_opts:
+                        if options.get(opt) != existing_opts.get(opt):
+                            raise IndexOptionsConflict(
+                                f"Index with name '{name}' already exists with "
+                                f"different options"
+                            )
                 return False
             sparse = bool(options.get("sparse"))
             unique = bool(options.get("unique"))

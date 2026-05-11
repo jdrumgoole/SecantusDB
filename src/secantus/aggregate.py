@@ -1127,6 +1127,15 @@ def _stage_current_op(
             "desc": "$currentOp",
             "active": False,
             "currentOpTime": "",
+            # Mongo-node-driver's ``Aggregation ... $currentOp`` test
+            # scans the result for entries where
+            # ``op.command.aggregate`` matches — without ``command``
+            # present, the read throws ``Cannot read properties of
+            # undefined``. Real mongod always sets ``command`` on
+            # ``$currentOp`` rows even when the op is idle.
+            "command": {"aggregate": 1},
+            "ns": "",
+            "op": "command",
         }
     ]
 

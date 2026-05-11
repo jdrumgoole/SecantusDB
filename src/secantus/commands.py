@@ -130,6 +130,70 @@ def _code_name_for(code: int) -> str:
     return _ERROR_CODE_NAMES.get(code, f"Location{code}")
 
 
+def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Reject malformed ``writeConcern`` per mongod.
+
+    Real mongod rejects:
+      * ``w`` that's a string other than ``"majority"`` /
+        any configured tag-set (we accept ``"majority"`` only — we're
+        standalone, no tags). Returns code 79 ``UnknownReplWriteConcern``.
+      * ``w`` that's a non-int / non-string. BadValue (2).
+      * ``j`` that isn't a bool. TypeMismatch (14).
+      * ``wtimeout`` that isn't a number. TypeMismatch (14).
+
+    Returns a server-error response on failure, ``None`` on success or
+    when no ``writeConcern`` is present. Callers prepend this check
+    to write commands (``insert`` / ``update`` / ``delete`` /
+    ``findAndModify`` / ``create*`` / ``drop*`` etc.). Mongo-ruby-
+    driver's ``Collection#create when... INVALID_WRITE_CONCERN``
+    specs pin the wire shape.
+    """
+    wc = doc.get("writeConcern")
+    if wc is None:
+        return None
+    if not isinstance(wc, Mapping):
+        return {
+            "ok": 0.0,
+            "errmsg": "writeConcern must be a document",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if "w" in wc:
+        w = wc["w"]
+        if isinstance(w, bool) or not isinstance(w, (int, str)):
+            return {
+                "ok": 0.0,
+                "errmsg": "writeConcern.w must be a number or string",
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        if isinstance(w, str) and w != "majority":
+            return {
+                "ok": 0.0,
+                "errmsg": f"No write concern mode named {w!r} found in replica set configuration",
+                "code": 79,
+                "codeName": "UnknownReplWriteConcern",
+            }
+    if "j" in wc and not isinstance(wc["j"], bool):
+        return {
+            "ok": 0.0,
+            "errmsg": "writeConcern.j must be a boolean",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if "wtimeout" in wc and (
+        isinstance(wc["wtimeout"], bool)
+        or not isinstance(wc["wtimeout"], (int, float))
+    ):
+        return {
+            "ok": 0.0,
+            "errmsg": "writeConcern.wtimeout must be a number",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    return None
+
+
 def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
     # MongoDB 5.0+ command-level ``let`` values are aggregation
     # expressions: ``{y: {$literal: "bar"}}`` binds ``$$y`` to "bar",
@@ -483,6 +547,19 @@ def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     "active": conn.last_command_name is not None,
                     "op": conn.last_command_name or "none",
                     "ns": "",
+                    # ``command`` is the body of the last operation
+                    # on this connection. Real mongod always populates
+                    # it (even if the op already completed) — drivers
+                    # iterating ``inprog`` filter on ``command.<name>``
+                    # to find specific ops. Mongo-node-driver's
+                    # ``Aggregation should ... $currentOp`` test does
+                    # exactly that; without the field it crashes with
+                    # ``Cannot read properties of undefined``.
+                    "command": (
+                        {conn.last_command_name: 1}
+                        if conn.last_command_name
+                        else {}
+                    ),
                     "currentOpTime": opened_iso,
                     "secs_running": 0,
                     "microsecs_running": 0,
@@ -886,6 +963,21 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         filter_ = inner.get("filter") or inner.get("query") or {}
         sort = inner.get("sort")
         hint = inner.get("hint")
+    # MongoDB rejects ``explain`` paired with a journaled write concern
+    # (``writeConcern: {j: true}`` or ``{w: "majority"}``). The explain
+    # cycle is a no-op read; combining it with a write concern is
+    # ill-formed. Mongo-node-driver's ``aggregation.test.ts`` has two
+    # cases that assert the rejection.
+    wc = doc.get("writeConcern")
+    if isinstance(wc, dict) and (wc.get("j") is True or wc.get("w") == "majority"):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "Command does not support writeConcern when used with explain"
+            ),
+            "code": 72,
+            "codeName": "InvalidOptions",
+        }
     # ``verbosity`` controls which sections of the explain reply the
     # client gets. Mongod's three levels:
     #   queryPlanner       — winningPlan only, no execution
@@ -1026,6 +1118,9 @@ def _ns(db: str, coll: str) -> str:
 
 
 def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["insert"]
     documents = doc.get("documents", [])
     if not isinstance(documents, list) or len(documents) == 0:
@@ -1264,6 +1359,9 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import GeoExtractError, IndexConflict
     from secantus.update import _PIPELINE_UPDATE_STAGES
 
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["update"]
     updates = doc.get("updates", [])
     ordered = bool(doc.get("ordered", True))
@@ -1383,6 +1481,9 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["delete"]
     deletes = doc.get("deletes", [])
     ordered = bool(doc.get("ordered", True))
@@ -1523,6 +1624,9 @@ def _key_present(doc: dict[str, Any], path: str) -> bool:
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import GeoExtractError, IndexConflict
 
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["findAndModify"]
     query = doc.get("query") or {}
     sort = doc.get("sort") or None
@@ -1705,6 +1809,9 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
 
 
 def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["drop"]
     existed = ctx.storage.drop_collection(ctx.db_name, coll)
     if not existed:
@@ -1748,6 +1855,9 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
 
 
 def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["create"]
     capped = bool(doc.get("capped", False))
     if capped:
@@ -1773,19 +1883,38 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "InvalidOptions",
             }
     ctx.storage.create_collection(ctx.db_name, coll)
+    stored: dict[str, Any] = {}
     if capped:
-        opts: dict[str, Any] = {"capped": True, "size": int(doc["size"])}
+        stored["capped"] = True
+        stored["size"] = int(doc["size"])
         if doc.get("max") is not None:
-            opts["max"] = int(doc["max"])
-        ctx.storage.set_collection_options(ctx.db_name, coll, **opts)
+            stored["max"] = int(doc["max"])
     pre_post = doc.get("changeStreamPreAndPostImages")
     if isinstance(pre_post, Mapping):
-        ctx.storage.set_collection_options(
-            ctx.db_name, coll, changeStreamPreAndPostImages=dict(pre_post)
-        )
+        stored["changeStreamPreAndPostImages"] = dict(pre_post)
     validator = doc.get("validator")
     if isinstance(validator, Mapping):
-        ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
+        stored["validator"] = dict(validator)
+    # ``listCollections`` round-trips all of these options under
+    # ``options`` per real mongod. Mongo-go-driver's
+    # ``TestDatabase/create_collection/options/all_options_except_
+    # collation_and_csppi`` test installs each one then asserts the
+    # echo. Mongo-ruby-driver's ``listCollection ... options.validator``
+    # spec is the same shape.
+    _PASSTHROUGH_CREATE_OPTIONS = (
+        "storageEngine",
+        "indexOptionDefaults",
+        "validationAction",
+        "validationLevel",
+        "collation",
+        "writeConcern",
+        "expireAfterSeconds",
+        "timeseries",
+        "clusteredIndex",
+    )
+    for opt_name in _PASSTHROUGH_CREATE_OPTIONS:
+        if opt_name in doc:
+            stored[opt_name] = doc[opt_name]
     # MongoDB 3.4+ ``viewOn`` + ``pipeline`` makes the collection a
     # read-only view of another collection filtered through an
     # aggregation pipeline. Mongo-java-driver's
@@ -1797,13 +1926,17 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         view_pipeline = doc.get("pipeline") or []
         if not isinstance(view_pipeline, list):
             view_pipeline = []
-        ctx.storage.set_collection_options(
-            ctx.db_name, coll, viewOn=view_on, viewPipeline=list(view_pipeline)
-        )
+        stored["viewOn"] = view_on
+        stored["viewPipeline"] = list(view_pipeline)
+    if stored:
+        ctx.storage.set_collection_options(ctx.db_name, coll, **stored)
     return {"ok": 1.0}
 
 
 def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["collMod"]
     if not ctx.storage.collection_exists(ctx.db_name, coll):
         return {
@@ -1845,16 +1978,27 @@ def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
     name_only = bool(doc.get("nameOnly", False))
     filter_doc = doc.get("filter")
 
+    # Storage keys that are server-side bookkeeping, not user-facing
+    # options. Anything else in the stored map round-trips into the
+    # ``options`` reply so drivers can read back exactly what was
+    # passed to ``create`` / ``collMod`` (mongo-go-driver's
+    # ``TestDatabase/create_collection/options/*`` + mongo-ruby-driver's
+    # ``listCollection ... options.validator`` specs both rely on this).
+    _INTERNAL_COLL_OPTIONS = {"uuid"}
     batch: list[dict[str, Any]] = []
     for n in names:
         raw = ctx.storage.get_collection_options(ctx.db_name, n)
-        opts: dict[str, Any] = {}
-        if raw.get("capped"):
-            opts["capped"] = True
-            if "size" in raw:
-                opts["size"] = raw["size"]
-            if "max" in raw:
-                opts["max"] = raw["max"]
+        opts: dict[str, Any] = {
+            k: v for k, v in raw.items() if k not in _INTERNAL_COLL_OPTIONS
+        }
+        # ``viewOn`` collections surface as ``type: "view"`` and the
+        # view's pipeline lives under ``options.pipeline`` (the
+        # storage layer keeps it as ``viewPipeline`` so the option-blob
+        # key doesn't collide with ``pipeline`` arguments on other
+        # commands; rename on the way out).
+        is_view = isinstance(opts.get("viewOn"), str)
+        if "viewPipeline" in opts:
+            opts["pipeline"] = opts.pop("viewPipeline")
         # info.uuid: BSON Binary subtype 4 (the standard "old UUID"
         # subtype mongod uses in listCollections / change-stream events).
         # The mongo-go-driver's ``ListCollectionSpecifications`` checks
@@ -1863,27 +2007,25 @@ def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
         # with the same subtype.
         coll_uuid = ctx.storage.collection_uuid(ctx.db_name, n)
         info = {
-            "readOnly": False,
+            "readOnly": is_view,
             "uuid": bson.Binary(coll_uuid.bytes, 4),
         }
-        # idIndex: every collection has an implicit ``_id_`` unique index.
-        # ``storage.list_indexes`` puts it first in the list; mongod's
-        # wire shape uses ``ns`` (namespace), ``key``, ``name``, ``v``.
-        id_index = {
-            "v": 2,
-            "key": {"_id": 1},
-            "name": "_id_",
-            "ns": f"{ctx.db_name}.{n}",
+        entry: dict[str, Any] = {
+            "name": n,
+            "type": "view" if is_view else "collection",
+            "options": opts,
+            "info": info,
         }
-        batch.append(
-            {
-                "name": n,
-                "type": "collection",
-                "options": opts,
-                "info": info,
-                "idIndex": id_index,
+        # ``idIndex`` is only meaningful on real collections; views
+        # don't have one (mongod omits the field on views).
+        if not is_view:
+            entry["idIndex"] = {
+                "v": 2,
+                "key": {"_id": 1},
+                "name": "_id_",
+                "ns": f"{ctx.db_name}.{n}",
             }
-        )
+        batch.append(entry)
 
     if isinstance(filter_doc, dict) and filter_doc:
         batch = [d for d in batch if matches(d, filter_doc)]
@@ -1969,8 +2111,16 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import GeoExtractError, IndexConflict
+    from secantus.storage import (
+        CreateIndexUnsupported,
+        GeoExtractError,
+        IndexConflict,
+        IndexOptionsConflict,
+    )
 
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["createIndexes"]
     indexes = doc.get("indexes", [])
     created_auto = not ctx.storage.collection_exists(ctx.db_name, coll)
@@ -1995,8 +2145,62 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "TypeMismatch",
             }
         options = {k: v for k, v in idx_spec.items() if k not in ("key", "name")}
+        # Canonicalise option-blob shape per mongod: falsy values for
+        # ``hidden`` / ``sparse`` / ``unique`` are stripped (mongod stores
+        # only the non-default form). Mongo-ruby-driver's
+        # ``Collection#indexes`` specs assert ``hidden: false`` does NOT
+        # come back in the index spec — same logic for ``sparse`` /
+        # ``unique`` since the default is false there too.
+        for _falsy_opt in ("hidden", "sparse", "unique"):
+            if _falsy_opt in options and not options[_falsy_opt]:
+                options.pop(_falsy_opt)
+        # ``commitQuorum`` is the replica-set knob for "how many voting
+        # members must replicate the index before the build returns".
+        # On a standalone topology mongod rejects unknown string values
+        # (only the named modes ``"majority"`` / ``"votingMembers"`` /
+        # ints are valid). We're standalone too — surface the same
+        # rejection so mongo-ruby-driver's ``unsupported-value``
+        # commitQuorum test passes.
+        commit_quorum = options.get("commitQuorum")
+        if commit_quorum is not None and not (
+            isinstance(commit_quorum, int)
+            or commit_quorum in ("majority", "votingMembers")
+        ):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"Invalid value for commitQuorum: {commit_quorum!r}. "
+                    "Expected an integer, 'majority', or 'votingMembers'."
+                ),
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        # ``partialFilterExpression`` must be a document. Numbers / strings
+        # / arrays etc. are rejected by mongod with BadValue.
+        pfe = options.get("partialFilterExpression")
+        if pfe is not None and not isinstance(pfe, dict):
+            return {
+                "ok": 0.0,
+                "errmsg": "partialFilterExpression must be a document",
+                "code": 2,
+                "codeName": "BadValue",
+            }
         try:
             new = ctx.storage.create_index(ctx.db_name, coll, name, key_spec, options)
+        except CreateIndexUnsupported as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 67,
+                "codeName": "CannotCreateIndex",
+            }
+        except IndexOptionsConflict as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 85,
+                "codeName": "IndexOptionsConflict",
+            }
         except IndexConflict as exc:
             return {
                 "ok": 0.0,
@@ -2026,6 +2230,9 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     coll = doc["dropIndexes"]
     target = doc.get("index", "*")
     num_before = len(ctx.storage.list_indexes(ctx.db_name, coll))

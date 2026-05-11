@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-05-11 — SecantusDB 0.5.0b3 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-05-11 — SecantusDB 0.5.0b12 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -8,19 +8,47 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 286 | 3 | 30 | 319 | 99.0% |
+| `internal/integration` | 332 | 62 | 33 | 427 | 84.3% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **328** | **3** | **30** | **361** | **99.1%** |
+| **Overall** | **374** | **62** | **33** | **469** | **85.8%** |
 
-## Failures (3)
+## Failures (62)
 
 First 30 failed tests for triage:
 
 ```
 internal/integration :: TestDatabase/list_collection_specifications/filter_passed_to_listCollections
 internal/integration :: TestDatabase/list_collection_specifications
+internal/integration :: TestDatabase/create_collection/options/all_options_except_collation_and_csppi
+internal/integration :: TestDatabase/create_collection/options/changeStreamPreAndPostImages
+internal/integration :: TestDatabase/create_collection/options
+internal/integration :: TestDatabase/create_collection
+internal/integration :: TestDatabase/create_view/function_parameters_are_translated_into_options
+internal/integration :: TestDatabase/create_view
 internal/integration :: TestDatabase
+internal/integration :: TestErrors
+internal/integration :: TestGridFS/download/cursor_error_during_read_after_downloading
+internal/integration :: TestGridFS/download/cursor_error_during_skip_after_downloading
+internal/integration :: TestGridFS/download
+internal/integration :: TestGridFS/bucket_collection_accessors/default_bucket_name
+internal/integration :: TestGridFS/bucket_collection_accessors/custom_bucket_name
+internal/integration :: TestGridFS/bucket_collection_accessors
+internal/integration :: TestGridFS/Find
+internal/integration :: TestGridFS
+internal/integration :: TestHandshakeProse/1._valid_AWS
+internal/integration :: TestHandshakeProse/2._valid_Azure
+internal/integration :: TestHandshakeProse/3._valid_GCP
+internal/integration :: TestHandshakeProse/4._valid_Vercel
+internal/integration :: TestHandshakeProse/5._invalid_multiple_providers
+internal/integration :: TestHandshakeProse/6._invalid_long_string
+internal/integration :: TestHandshakeProse/7._invalid_wrong_types
+internal/integration :: TestHandshakeProse/8._Invalid_-_AWS_EXECUTION_ENV_does_not_start_with_"AWS_Lambda_"
+internal/integration :: TestHandshakeProse/driver_info_included
+internal/integration :: TestHandshakeProse
+internal/integration :: TestLoadBalancedConnectionHandshake/non-LB_connection_handshake_uses_OP_QUERY
+internal/integration :: TestLoadBalancedConnectionHandshake
 ```
+... and 32 more (see raw NDJSON).
 
 ## How this is generated
 

@@ -640,8 +640,29 @@ def _op_size(values: list[Any], size: Any) -> bool:
 def _op_all(values: list[Any], required: Any) -> bool:
     if not isinstance(required, list):
         raise QueryError("$all requires an array")
+
+    def _elem_matches_required(elem: Any, r: Any) -> bool:
+        # Regex elements in the ``$all`` array match as patterns, not by
+        # equality. Mongo-node-driver's ``Find should correctly find
+        # documents by regExp`` test passes an array of regexes; if we
+        # used bare ``==`` (which compares Regex objects by identity)
+        # the find would silently return no docs.
+        if isinstance(r, Regex):
+            pattern = r.pattern
+            flags = _re_flags(r.flags)
+            if isinstance(elem, str):
+                return _compile_regex(pattern, flags).search(elem) is not None
+            return False
+        if isinstance(r, re.Pattern):
+            if isinstance(elem, str):
+                return r.search(elem) is not None
+            return False
+        return elem == r
+
     for v in values:
-        if isinstance(v, list) and all(any(elem == r for elem in v) for r in required):
+        if isinstance(v, list) and all(
+            any(_elem_matches_required(elem, r) for elem in v) for r in required
+        ):
             return True
     return False
 
