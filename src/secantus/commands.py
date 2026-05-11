@@ -1132,12 +1132,9 @@ def _find_tailable(
     # initial_remaining). Setting it to ``rows[-1][0]`` (the last doc
     # in the collection) instead would silently drop any matched docs
     # past ``batch_size`` — the original bug surfaced by the go gauge.
-    if initial_docs:
-        watermark = _encode_id_key(initial_docs[-1]["_id"])
-    else:
-        # Empty collection: walk from the start so the producer picks
-        # up the very first insert that happens after this find.
-        watermark = None
+    # Empty collection: watermark is None, so the producer walks from
+    # the start and picks up the very first insert after this find.
+    watermark = _encode_id_key(initial_docs[-1]["_id"]) if initial_docs else None
     state = {"after_id_key": watermark}
 
     def producer() -> list[dict[str, Any]]:
@@ -1959,10 +1956,8 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import IndexConflict
-
     from secantus import changestreams
-    from secantus.storage import BadHint
+    from secantus.storage import BadHint, IndexConflict
 
     coll = doc["aggregate"]
     pipeline = doc.get("pipeline", [])

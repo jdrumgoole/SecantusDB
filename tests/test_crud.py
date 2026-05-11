@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 
 import pymongo
@@ -1495,10 +1496,8 @@ def test_tailable_await_delivers_initial_docs_past_first_batch(client: MongoClie
     assert seen == [1, 2, 3, 4, 5], (
         f"expected all 5 seeded docs via firstBatch + getMore, got {seen}"
     )
-    try:
+    with contextlib.suppress(Exception):
         cur.close()
-    except Exception:
-        pass
 
 
 def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None:
@@ -1530,7 +1529,5 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
     assert second is not None and second["x"] == 2, (
         f"tailable cursor did not surface follow-up insert, got {second!r}"
     )
-    try:
+    with contextlib.suppress(Exception):
         cur.close()
-    except Exception:
-        pass
