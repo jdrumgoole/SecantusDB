@@ -982,7 +982,20 @@ def _stage_merge(
         existing = ctx.storage.find_matching(target_db, target_coll, match_filter, limit=1)
         if existing:
             if when_matched == "fail":
-                raise AggregateError("$merge whenMatched=fail and a match exists")
+                # Real mongod raises a duplicate-key style error (code
+                # 11000) with ``keyPattern`` and ``keyValue`` so drivers
+                # can surface it through their DuplicateKeyException
+                # path. Mongo-java-driver's
+                # ``aggregate-merge-errorResponse`` test asserts both
+                # fields on the ``errorResponse``.
+                from secantus.storage import IndexConflict
+
+                raise IndexConflict(
+                    "_id_",
+                    doc.get("_id"),
+                    key_pattern={f: 1 for f in on_fields},
+                    key_value=match_filter,
+                )
             if when_matched == "keepExisting":
                 continue
             if when_matched == "replace":

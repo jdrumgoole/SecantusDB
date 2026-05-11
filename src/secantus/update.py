@@ -19,9 +19,10 @@ def apply_update(
     is_upsert: bool = False,
     array_filters: list[Mapping[str, Any]] | None = None,
     positional_matches: Mapping[str, int] | None = None,
+    let: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if isinstance(update, list):
-        return _apply_pipeline_update(doc, update)
+        return _apply_pipeline_update(doc, update, let=let)
     if not update:
         return copy.deepcopy(doc)
     keys = list(update.keys())
@@ -168,7 +169,10 @@ _PIPELINE_UPDATE_STAGES = {
 
 
 def _apply_pipeline_update(
-    doc: dict[str, Any], pipeline: list[Mapping[str, Any]]
+    doc: dict[str, Any],
+    pipeline: list[Mapping[str, Any]],
+    *,
+    let: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     for stage in pipeline:
         if not isinstance(stage, Mapping) or len(stage) != 1:
@@ -176,9 +180,13 @@ def _apply_pipeline_update(
         (name,) = stage.keys()
         if name not in _PIPELINE_UPDATE_STAGES:
             raise UpdateError(f"stage {name} not allowed in pipeline updates")
-    from secantus.aggregate import apply_pipeline
+    from secantus.aggregate import PipelineContext, apply_pipeline
 
-    result = apply_pipeline([doc], list(pipeline))
+    # Thread ``let`` user-vars into the pipeline context so
+    # ``$$varname`` references inside pipeline-update stages
+    # (e.g. ``{$set: {x: "$$x"}}``) resolve via the let map.
+    ctx = PipelineContext(vars=dict(let) if let else {})
+    result = apply_pipeline([doc], list(pipeline), ctx)
     if not result:
         return copy.deepcopy(doc)
     new = result[0]

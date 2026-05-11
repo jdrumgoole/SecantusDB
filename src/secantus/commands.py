@@ -130,6 +130,21 @@ def _code_name_for(code: int) -> str:
     return _ERROR_CODE_NAMES.get(code, f"Location{code}")
 
 
+def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
+    # MongoDB 5.0+ command-level ``let`` values are aggregation
+    # expressions: ``{y: {$literal: "bar"}}`` binds ``$$y`` to "bar",
+    # ``{n: {$add: [1, 2]}}`` binds ``$$n`` to 3. Driver tests
+    # (mongo-java-driver's ``UnifiedCrudTest#updateMany-let``)
+    # depend on this — passing the raw mapping through would bind
+    # ``$$y`` to the dict ``{$literal: "bar"}`` instead of the
+    # string. Scalars are passed through unchanged.
+    if not isinstance(let, dict):
+        return None
+    from secantus.expressions import evaluate
+
+    return {name: evaluate(value, {}) for name, value in let.items()}
+
+
 @dataclass
 class CommandContext:
     connection_id: int
@@ -997,7 +1012,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     hint = doc.get("hint")
     # ``let`` declares user-vars visible to ``$expr`` clauses in the
     # filter (MongoDB 5.0+).
-    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
+    let = _resolve_let_vars(doc.get("let"))
     # ``batchSize`` is genuinely tri-state: absent (use default),
     # 0 ("open the cursor but send no docs in firstBatch"), or
     # explicit positive. The 0 case is load-bearing for drivers
@@ -1016,9 +1031,15 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # mongo-go-driver test ``find/invalid_identifier_error``) rejects
     # at the find command level.
     try:
-        matches({}, filter_)
+        matches({}, filter_, vars=let)
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    except ExpressionError:
+        # $expr against empty doc with unresolved field refs is fine —
+        # the validation pass is only meant to catch parse-level errors.
+        # Real evaluation happens per-doc inside find_matching with the
+        # actual document and threaded ``let`` vars.
+        pass
     try:
         docs = ctx.storage.find_matching(
             ctx.db_name,
@@ -1129,7 +1150,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     updates = doc.get("updates", [])
     ordered = bool(doc.get("ordered", True))
     # ``let`` — see ``_delete`` for the wire-shape rationale.
-    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
+    let = _resolve_let_vars(doc.get("let"))
     n = 0
     n_modified = 0
     upserted: list[dict[str, Any]] = []
@@ -1176,7 +1197,12 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 let=let,
             )
         except IndexConflict as exc:
-            write_errors.append({"index": index, "code": 11000, "errmsg": str(exc)})
+            err: dict[str, Any] = {"index": index, "code": 11000, "errmsg": str(exc)}
+            if exc.key_pattern is not None:
+                err["keyPattern"] = exc.key_pattern
+            if exc.key_value is not None:
+                err["keyValue"] = exc.key_value
+            write_errors.append(err)
             if ordered:
                 break
             continue
@@ -1229,7 +1255,7 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # storage layer; without it, ``{$expr: {$eq: ['$_id', '$$id']}}``
     # against ``let: {id: 1}`` raises "system variable $$id is not
     # defined" and the test framework asserts failure.
-    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
+    let = _resolve_let_vars(doc.get("let"))
     n = 0
     write_errors: list[dict[str, Any]] = []
     for index, spec in enumerate(deletes):
@@ -1322,7 +1348,14 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     is_remove = bool(doc.get("remove", False))
     update = doc.get("update")
     # ``let`` user-vars threaded into the filter / update predicate.
-    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
+    let = _resolve_let_vars(doc.get("let"))
+    # arrayFilters carries ``[{<id>: <subfilter>}, ...]`` entries
+    # the update's ``$[<id>]`` positional refs resolve against. Used
+    # by mongo-java-driver's ``findOneAndUpdate-arrayFilters``
+    # tests — without plumbing through, the update raises
+    # ``UpdateError: arrayFilters has no entry for identifier 'i'``
+    # before reaching the actual array element.
+    array_filters = doc.get("arrayFilters")
 
     if is_remove and update is not None:
         return {
@@ -1347,15 +1380,22 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
         if upsert and not is_remove:
             try:
                 result = ctx.storage.update_matching(
-                    ctx.db_name, coll, query, update, multi=False, upsert=True, let=let
+                    ctx.db_name, coll, query, update,
+                    multi=False, upsert=True, let=let,
+                    array_filters=array_filters,
                 )
             except IndexConflict as exc:
-                return {
+                reply: dict[str, Any] = {
                     "ok": 0.0,
                     "errmsg": str(exc),
                     "code": 11000,
                     "codeName": "DuplicateKey",
                 }
+                if exc.key_pattern is not None:
+                    reply["keyPattern"] = exc.key_pattern
+                if exc.key_value is not None:
+                    reply["keyValue"] = exc.key_value
+                return reply
             except GeoExtractError as exc:
                 return {
                     "ok": 0.0,
@@ -1401,14 +1441,22 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
         }
 
     try:
-        ctx.storage.update_matching(ctx.db_name, coll, {"_id": matched_id}, update, multi=False)
+        ctx.storage.update_matching(
+            ctx.db_name, coll, {"_id": matched_id}, update,
+            multi=False, array_filters=array_filters,
+        )
     except IndexConflict as exc:
-        return {
+        reply2: dict[str, Any] = {
             "ok": 0.0,
             "errmsg": str(exc),
             "code": 11000,
             "codeName": "DuplicateKey",
         }
+        if exc.key_pattern is not None:
+            reply2["keyPattern"] = exc.key_pattern
+        if exc.key_value is not None:
+            reply2["keyValue"] = exc.key_value
+        return reply2
     except GeoExtractError as exc:
         return {
             "ok": 0.0,
@@ -1881,6 +1929,8 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus.storage import IndexConflict
+
     from secantus import changestreams
     from secantus.storage import BadHint
 
@@ -1890,7 +1940,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # ``let`` user-vars threaded into the pipeline context so
     # ``$expr`` clauses inside ``$match`` and the aggregation
     # expression language can resolve ``$$name`` references.
-    let = doc.get("let") if isinstance(doc.get("let"), dict) else None
+    let = _resolve_let_vars(doc.get("let"))
     cursor_opts = doc.get("cursor") or {}
     raw_agg_batch = cursor_opts.get("batchSize")
     batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else int(raw_agg_batch)
@@ -1938,7 +1988,23 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         coll_name=coll_name,
         vars=dict(let) if let else {},
     )
-    docs = apply_pipeline(docs, pipeline, pipeline_ctx)
+    try:
+        docs = apply_pipeline(docs, pipeline, pipeline_ctx)
+    except IndexConflict as exc:
+        # ``$merge whenMatched=fail`` raises this — surface mongod's
+        # dup-key shape (code 11000 + keyPattern + keyValue) so the
+        # driver's DuplicateKeyException path lights up.
+        reply: dict[str, Any] = {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": 11000,
+            "codeName": "DuplicateKey",
+        }
+        if exc.key_pattern is not None:
+            reply["keyPattern"] = exc.key_pattern
+        if exc.key_value is not None:
+            reply["keyValue"] = exc.key_value
+        return reply
     first_batch, cursor_id = _split_into_cursor(docs, batch_size, ns, ctx.cursors)
     # Silence unused import in this branch.
     _ = changestreams

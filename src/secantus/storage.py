@@ -405,10 +405,26 @@ _ID_INDEX_NAME = "_id_"
 
 
 class IndexConflict(Exception):
-    def __init__(self, index_name: str, doc_id: Any) -> None:
+    def __init__(
+        self,
+        index_name: str,
+        doc_id: Any,
+        *,
+        key_pattern: dict[str, Any] | None = None,
+        key_value: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(f"E11000 duplicate key error in index {index_name}: _id={doc_id!r}")
         self.index_name = index_name
         self.doc_id = doc_id
+        # Real mongod returns ``keyPattern`` (the index spec) and
+        # ``keyValue`` (the conflicting field values) in the dup-key
+        # error response. Drivers expose them as ``errorResponse``
+        # fields; mongo-java-driver's ``findOneAndUpdate-errorResponse``
+        # asserts both. Optional because legacy raise-sites
+        # (``_id`` collision before index machinery, recovery paths)
+        # don't have the index spec handy.
+        self.key_pattern = key_pattern
+        self.key_value = key_value
 
 
 class GeoExtractError(Exception):
@@ -1645,14 +1661,17 @@ class Storage:
                     db, coll, doc, indexes, exclude_id_key=None, partials=partials
                 )
                 if conflict is not None:
+                    cname, kpat, kval = conflict
                     errors.append(
                         {
                             "index": index,
                             "code": 11000,
                             "errmsg": (
-                                f"E11000 duplicate key error in index {conflict}: "
+                                f"E11000 duplicate key error in index {cname}: "
                                 f"_id={doc['_id']!r}"
                             ),
+                            "keyPattern": kpat,
+                            "keyValue": kval,
                         }
                     )
                     if ordered:
@@ -2277,14 +2296,22 @@ class Storage:
                     continue
                 matched += 1
                 pos = find_positional_matches(doc, filter)
-                new = apply_update(doc, update, array_filters=array_filters, positional_matches=pos)
+                new = apply_update(
+                    doc, update,
+                    array_filters=array_filters,
+                    positional_matches=pos,
+                    let=let,
+                )
                 if new != doc:
                     new_id_key = _id_key(new["_id"])
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_id_key=id_k, partials=partials
                     )
                     if conflict is not None:
-                        raise IndexConflict(conflict, new["_id"])
+                        cname, kpat, kval = conflict
+                        raise IndexConflict(
+                            cname, new["_id"], key_pattern=kpat, key_value=kval
+                        )
                     # Geo validation must reject the update before any
                     # write happens, otherwise we'd be left with a
                     # half-deleted set of index entries.
@@ -2330,7 +2357,10 @@ class Storage:
                     db, coll, new, indexes, exclude_id_key=None, partials=partials
                 )
                 if conflict is not None:
-                    raise IndexConflict(conflict, new["_id"])
+                    cname, kpat, kval = conflict
+                    raise IndexConflict(
+                        cname, new["_id"], key_pattern=kpat, key_value=kval
+                    )
                 self._validate_geo_indexes(db, coll, new, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
@@ -3071,7 +3101,11 @@ class Storage:
         *,
         exclude_id_key: bytes | None,
         partials: dict[str, dict[str, Any]] | None = None,
-    ) -> str | None:
+    ) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+        # Returns ``(index_name, key_pattern, key_value)`` so callers
+        # can build a mongod-shaped dup-key error response with the
+        # ``keyPattern`` + ``keyValue`` fields drivers' errorResponse
+        # tests assert on. ``None`` when no conflict.
         if not indexes:
             return None
         c = self._cursor(_IDX_ENTRIES_TABLE)
@@ -3104,7 +3138,11 @@ class Storage:
                 if row_esc != esc_kb:
                     break
                 if exclude_id_key is None or row_id != exclude_id_key:
-                    return name
+                    key_value = {
+                        field: get_path(candidate_doc, field, default=None)
+                        for field in key_spec
+                    }
+                    return name, dict(key_spec), key_value
                 if c.next() != 0:
                     break
         return None
