@@ -1286,8 +1286,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             return {
                 "ok": 0.0,
                 "errmsg": (
-                    "The 'sort' option is not supported on update commands "
-                    "before MongoDB 8.0"
+                    "The 'sort' option is not supported on update commands before MongoDB 8.0"
                 ),
                 "code": 9,
                 "codeName": "FailedToParse",
@@ -1449,9 +1448,7 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         if limit > 0:
             n = min(n, limit)
         return {"n": n, "ok": 1.0}
-    n = ctx.storage.count_matching(
-        ctx.db_name, coll, filter_, collation=doc.get("collation")
-    )
+    n = ctx.storage.count_matching(ctx.db_name, coll, filter_, collation=doc.get("collation"))
     # Mongod's ``count`` honours ``limit`` and ``skip`` — the cursor-side
     # ``cursor.count()`` API in the Node / legacy drivers translates to a
     # ``count`` command with these fields populated from the cursor's
@@ -1657,9 +1654,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
         except Exception:
             simulated = None
         if simulated is not None:
-            verr = _validate_doc_against_collection(
-                ctx.storage, ctx.db_name, coll, simulated
-            )
+            verr = _validate_doc_against_collection(ctx.storage, ctx.db_name, coll, simulated)
             if verr is not None:
                 return verr
 
@@ -2217,9 +2212,7 @@ def _map_reduce(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     field = m.group(1)
     pipeline = [{"$group": {"_id": f"${field}", "value": {"$sum": 1}}}]
-    pipeline_ctx = PipelineContext(
-        storage=ctx.storage, db_name=ctx.db_name, coll_name=coll
-    )
+    pipeline_ctx = PipelineContext(storage=ctx.storage, db_name=ctx.db_name, coll_name=coll)
     docs = ctx.storage.find_matching(ctx.db_name, coll, {})
     result_docs = apply_pipeline(docs, pipeline, pipeline_ctx)
     # Real mongod's mapReduce always returns ``value`` as a double
