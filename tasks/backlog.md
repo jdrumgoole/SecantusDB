@@ -76,6 +76,11 @@ Subtler than the above; these may bite specific test suites.
 - [ ] **`$type: "number"`** in queries — handles `int`, `float`, `Decimal128`, but the int32-vs-int64 distinction depends on Python value range, not the original BSON type tag (which we throw away on decode). A doc inserted as `Int64(5)` reads back as a small Python int and matches `$type: "int"`, not `"long"`.
 - [ ] **`$lookup` simple-form-plus-pipeline** — when both `localField`/`foreignField` and `pipeline` are present, we pre-filter by the simple form and then run the pipeline. Real MongoDB does this too in modern versions, but the documentation isn't crystal clear on the order. If a test breaks here, this is the place to look.
 - [ ] **Aggregation `$group` stable order** — group buckets are emitted in first-seen order, not sorted. Matches MongoDB for unsharded but might differ from sharded behavior (which we don't model).
+- [ ] **`createCollection` option handling gaps** — three mongo-go-driver tests in `internal/integration::TestDatabase/create_collection` regressed when the parallel session's collation rollout in `b7ad85c` made them reachable (prior they were gated out by missing feature support). Each is a specific `createCollection` option round-trip that our handler doesn't accept / surface back via `listCollections`:
+  - `options/all_options_except_collation_and_csppi` — accepting the full "all standard options minus collation and changeStreamPreAndPostImages" bundle in a single `create` (likely missing one or more of `validator`, `validationLevel`, `validationAction`, `expireAfterSeconds`, `clusteredIndex`, `pipeline`/`viewOn`, `writeConcern` echo).
+  - `options/changeStreamPreAndPostImages` — `create` accepts `changeStreamPreAndPostImages: {enabled: true}` per the `collMod` path, but `listCollections` doesn't surface it back under `options` for verification.
+  - `collation` — `create` with a `collation` option needs to round-trip back through `listCollections.options.collation` matching the spec the driver supplied. The collation work in `b7ad85c` made the feature reachable but didn't wire the option-echo path.
+  Look at `_create` and `_list_collections` in `src/secantus/commands.py` and `Storage.get_collection_options` to see what's persisted vs surfaced.
 
 ---
 
