@@ -2,9 +2,15 @@
 
 The mongo-go-driver tests assume they're connecting to a real running
 `mongod` over TCP. We oblige: spawn `python -m secantus --port <free>
---storage-path :memory:` as a subprocess, wait for the listener, point
-the tests at it via `MONGODB_URI`, then tear the daemon down. Zero
-modifications to the vendored go-driver tree.
+--storage-path <tempdir>` as a subprocess, wait for the listener, point
+the tests at it via `MONGODB_URI`, then tear the daemon down and remove
+the tempdir. Zero modifications to the vendored go-driver tree.
+
+Storage is on-disk (a fresh `tempfile.mkdtemp()`), not `:memory:`. Per
+project policy (`CLAUDE.md` → Tooling) the conformance gauges exercise
+the real WiredTiger persistence path — schema, journal, close-and-
+reopen — same as the default test suite. Only the perf-regression
+suite stays on `:memory:` for stable baselines.
 
 `go test -json` emits NDJSON of test events. We collect that into
 `.validation/go-raw.ndjson` and let `generate_report.py` turn it into
@@ -21,6 +27,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -70,6 +77,11 @@ def main() -> int:
 
     host = "127.0.0.1"
     port = DAEMON_PORT
+    storage_dir = tempfile.mkdtemp(prefix="secantus-go-gauge-")
+    print(
+        f"go_validation: storage tempdir {storage_dir} (will be cleaned up)",
+        file=sys.stderr,
+    )
     daemon_cmd = [
         sys.executable,
         "-m",
@@ -79,7 +91,7 @@ def main() -> int:
         "--port",
         str(port),
         "--storage-path",
-        ":memory:",
+        storage_dir,
         "--log-level",
         "WARNING",
         # Mongod runs a 10s ``periodicNoopIntervalSecs`` heartbeat so
@@ -152,6 +164,7 @@ def main() -> int:
             daemon.wait()
         # Surface daemon stderr only on test failures, otherwise suppress noise.
         # (Daemon stdout was sent to /dev/null.)
+        shutil.rmtree(storage_dir, ignore_errors=True)
 
     return 0
 
