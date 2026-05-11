@@ -26,6 +26,13 @@ class PipelineContext:
     coll_name: str = ""
     vars: dict[str, Any] = _dc_field(default_factory=dict)
     change_stream: Any = None  # changestreams.ChangeStreamSpec | None — set by $changeStream stage
+    # MongoDB 3.4+ ``collation`` flows through every stage that does
+    # string comparison — ``$match`` (forwarded to query.matches),
+    # ``$group`` / ``$sortByCount`` (bucket keys), ``$sort`` (string
+    # ordering). Set by the ``aggregate`` command handler from the
+    # request's ``collation`` argument; ``None`` keeps default
+    # codepoint comparison.
+    collation: Any = None
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
@@ -34,6 +41,7 @@ class PipelineContext:
             coll_name=self.coll_name,
             vars={**self.vars, **more},
             change_stream=self.change_stream,
+            collation=self.collation,
         )
 
 
@@ -68,7 +76,10 @@ def _apply_stage(
 def _stage_match(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return [d for d in docs if matches(d, spec, vars=ctx.vars)]
+    from secantus.collation import parse as _parse_collation
+
+    coll_obj = _parse_collation(ctx.collation)
+    return [d for d in docs if matches(d, spec, vars=ctx.vars, collation=coll_obj)]
 
 
 def _stage_count(
@@ -452,11 +463,21 @@ def _stage_group(
             raise AggregateError(f"unsupported $group accumulator: {op}")
         compiled.append((field, handler, arg))
 
+    from secantus.collation import cmp_key, parse as _parse_collation
+
+    coll_obj = _parse_collation(ctx.collation)
     groups: dict[Any, dict[str, Any]] = {}
     order: list[Any] = []
     for d in docs:
         key = evaluate(id_expr, d, ctx.vars)
-        hashable_key = _hashable(key)
+        # Apply the collation's string normalisation to the bucket key
+        # so case-insensitive ``$group`` collapses ``"a"`` / ``"A"`` /
+        # ``"a"`` into one bucket. ``cmp_key`` only touches strings;
+        # other types pass through unchanged.
+        if coll_obj is not None:
+            hashable_key = _hashable_with_collation(key, coll_obj)
+        else:
+            hashable_key = _hashable(key)
         if hashable_key not in groups:
             groups[hashable_key] = {"_id": key}
             order.append(hashable_key)
@@ -464,6 +485,16 @@ def _stage_group(
         for field, handler, arg in compiled:
             handler(bucket, field, arg, d, ctx.vars)
     return [_finalize(groups[k]) for k in order]
+
+
+def _hashable_with_collation(value: Any, collation: Any) -> Any:
+    from secantus.collation import cmp_key
+
+    if isinstance(value, Mapping):
+        return tuple(sorted((k, _hashable_with_collation(v, collation)) for k, v in value.items()))
+    if isinstance(value, list):
+        return tuple(_hashable_with_collation(v, collation) for v in value)
+    return cmp_key(value, collation)
 
 
 def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:

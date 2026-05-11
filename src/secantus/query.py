@@ -9,6 +9,8 @@ from typing import Any
 
 from bson import Binary, Decimal128, ObjectId, Regex
 
+from secantus.collation import Collation, equal as _coll_equal, compare_keys as _coll_compare
+
 
 class _Missing:
     _instance: _Missing | None = None
@@ -34,10 +36,11 @@ def matches(
     query: Mapping[str, Any],
     *,
     vars: dict[str, Any] | None = None,
+    collation: Collation | None = None,
 ) -> bool:
     if not query:
         return True
-    return all(_match_clause(doc, k, v, vars) for k, v in query.items())
+    return all(_match_clause(doc, k, v, vars, collation) for k, v in query.items())
 
 
 def _match_clause(
@@ -45,13 +48,14 @@ def _match_clause(
     key: str,
     condition: Any,
     vars: dict[str, Any] | None,
+    collation: Collation | None,
 ) -> bool:
     if key == "$and":
-        return all(matches(doc, c, vars=vars) for c in condition)
+        return all(matches(doc, c, vars=vars, collation=collation) for c in condition)
     if key == "$or":
-        return any(matches(doc, c, vars=vars) for c in condition)
+        return any(matches(doc, c, vars=vars, collation=collation) for c in condition)
     if key == "$nor":
-        return not any(matches(doc, c, vars=vars) for c in condition)
+        return not any(matches(doc, c, vars=vars, collation=collation) for c in condition)
     if key == "$expr":
         from secantus.expressions import evaluate
 
@@ -62,7 +66,7 @@ def _match_clause(
         return _validate_json_schema(doc, condition)
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
-    return _field_matches(_resolve_path(doc, key), condition)
+    return _field_matches(_resolve_path(doc, key), condition, collation)
 
 
 def _validate_json_schema(value: Any, schema: Any) -> bool:
@@ -172,7 +176,7 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
     return current
 
 
-def _field_matches(values: list[Any], condition: Any) -> bool:
+def _field_matches(values: list[Any], condition: Any, collation: Collation | None = None) -> bool:
     if isinstance(condition, Regex):
         return _op_regex(values, condition.pattern, condition.flags)
     if isinstance(condition, Mapping) and condition and all(k.startswith("$") for k in condition):
@@ -182,37 +186,43 @@ def _field_matches(values: list[Any], condition: Any) -> bool:
             if op == "$regex":
                 if not _op_regex(values, arg, condition.get("$options", "")):
                     return False
-            elif not _op_matches(values, op, arg):
+            elif not _op_matches(values, op, arg, collation):
                 return False
         return True
-    return _eq_with_array(values, condition)
+    return _eq_with_array(values, condition, collation)
 
 
-def _eq_with_array(values: list[Any], expected: Any) -> bool:
+def _eq_with_array(values: list[Any], expected: Any, collation: Collation | None = None) -> bool:
     for v in values:
         if v is MISSING:
             if expected is None:
                 return True
             continue
-        if _eq_numeric_aware(v, expected):
+        if _eq_numeric_aware(v, expected, collation):
             return True
-        if isinstance(v, list) and any(_eq_numeric_aware(e, expected) for e in v):
+        if isinstance(v, list) and any(_eq_numeric_aware(e, expected, collation) for e in v):
             return True
     return False
 
 
-def _eq_numeric_aware(a: Any, b: Any) -> bool:
+def _eq_numeric_aware(a: Any, b: Any, collation: Collation | None = None) -> bool:
     """Equality that bridges int / float / Decimal128 but keeps bool distinct.
 
     MongoDB treats int / float / Decimal128 as a single numeric type for
     equality but ranks bool as a separate type — ``{x: 1}`` does not match
     ``x: true``. Python's ``True == 1`` and ``Decimal128.__eq__`` are both
     wrong for our purposes, so we have to handle both directions here.
+
+    String-vs-string equality routes through ``collation.equal`` when a
+    collation is in effect — ``strength 2`` makes ``"ping" == "PING"``
+    so case-insensitive find / update / delete tests pass.
     """
     a_bool = isinstance(a, bool)
     b_bool = isinstance(b, bool)
     if a_bool != b_bool:
         return False
+    if collation is not None and isinstance(a, str) and isinstance(b, str):
+        return _coll_equal(a, b, collation)
     if a == b:
         return True
     a2, b2 = _coerce_numeric(a, b)
@@ -221,28 +231,28 @@ def _eq_numeric_aware(a: Any, b: Any) -> bool:
     return a2 == b2
 
 
-def _op_matches(values: list[Any], op: str, arg: Any) -> bool:
+def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | None = None) -> bool:
     if op == "$eq":
-        return _eq_with_array(values, arg)
+        return _eq_with_array(values, arg, collation)
     if op == "$ne":
-        return not _eq_with_array(values, arg)
+        return not _eq_with_array(values, arg, collation)
     if op == "$gt":
-        return _cmp(values, arg, lambda a, b: a > b)
+        return _cmp(values, arg, lambda a, b: a > b, collation)
     if op == "$gte":
-        return _cmp(values, arg, lambda a, b: a >= b)
+        return _cmp(values, arg, lambda a, b: a >= b, collation)
     if op == "$lt":
-        return _cmp(values, arg, lambda a, b: a < b)
+        return _cmp(values, arg, lambda a, b: a < b, collation)
     if op == "$lte":
-        return _cmp(values, arg, lambda a, b: a <= b)
+        return _cmp(values, arg, lambda a, b: a <= b, collation)
     if op == "$in":
-        return any(_eq_with_array(values, candidate) for candidate in arg)
+        return any(_eq_with_array(values, candidate, collation) for candidate in arg)
     if op == "$nin":
-        return not any(_eq_with_array(values, candidate) for candidate in arg)
+        return not any(_eq_with_array(values, candidate, collation) for candidate in arg)
     if op == "$exists":
         present = any(v is not MISSING for v in values)
         return present == bool(arg)
     if op == "$not":
-        return not _field_matches(values, arg)
+        return not _field_matches(values, arg, collation)
     if op == "$type":
         return _op_type(values, arg)
     if op == "$size":
@@ -418,20 +428,36 @@ def _op_bitwise(values: list[Any], arg: Any, predicate: Callable[[int, int], boo
     return False
 
 
-def _cmp(values: list[Any], target: Any, op: Callable[[Any, Any], bool]) -> bool:
+def _cmp(
+    values: list[Any],
+    target: Any,
+    op: Callable[[Any, Any], bool],
+    collation: Collation | None = None,
+) -> bool:
     for v in values:
         if v is MISSING:
             continue
-        if _try_cmp(v, target, op):
+        if _try_cmp(v, target, op, collation):
             return True
         if isinstance(v, list):
             for elem in v:
-                if _try_cmp(elem, target, op):
+                if _try_cmp(elem, target, op, collation):
                     return True
     return False
 
 
-def _try_cmp(a: Any, b: Any, op: Callable[[Any, Any], bool]) -> bool:
+def _try_cmp(
+    a: Any, b: Any, op: Callable[[Any, Any], bool], collation: Collation | None = None
+) -> bool:
+    if collation is not None and isinstance(a, str) and isinstance(b, str):
+        # Route through collation-aware compare. ``op`` operates on the
+        # numeric result of ``compare_keys`` interpreted as the sign of
+        # ``a - b``.
+        c = _coll_compare(a, b, collation)
+        try:
+            return bool(op(c, 0))
+        except TypeError:
+            return False
     a, b = _coerce_numeric(a, b)
     try:
         return bool(op(a, b))

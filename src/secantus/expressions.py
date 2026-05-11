@@ -320,6 +320,17 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
     return math.log10(v) if v is not None and v > 0 else None
 
 
+def _op_rand(arg: Any, _ctx: _Ctx) -> float:
+    # MongoDB 5.0+: ``{$rand: {}}`` returns a uniform random double in
+    # [0, 1). Argument must be an empty document; anything else is a
+    # parse error in mongod (we mirror).
+    if not (isinstance(arg, Mapping) and not arg):
+        raise ExpressionError("$rand expects an empty document")
+    import random as _random
+
+    return _random.random()
+
+
 def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
     import math
 
@@ -1427,6 +1438,7 @@ _OPS = {
     "$ln": _op_ln,
     "$log": _op_log,
     "$log10": _op_log10,
+    "$rand": _op_rand,
     "$trunc": _op_trunc,
     "$mergeObjects": _op_merge_objects,
     "$objectToArray": _op_object_to_array,

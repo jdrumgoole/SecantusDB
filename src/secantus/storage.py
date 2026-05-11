@@ -777,6 +777,7 @@ class Storage:
 
     def get_collection_options(self, db: str, coll: str) -> dict[str, Any]:
         """Return the collection's options blob, or ``{}`` if absent."""
+        self._refresh_read_snapshot()
         with self._lock:
             opts = self._coll_options(db, coll) or {}
             # Decode UUID Binary back into uuid.UUID for callers.
@@ -1515,6 +1516,36 @@ class Storage:
                 self._all_sessions.append(s)
         return s
 
+    def _refresh_read_snapshot(self) -> None:
+        """Force the per-thread WT session to acquire a fresh read snapshot.
+
+        WiredTiger's default snapshot isolation pins a session's read
+        view at first cursor access; subsequent reads on the same
+        session see exactly that point-in-time view until the session
+        commits / rolls back a transaction. That's correct for a single
+        in-flight operation, but our daemon reuses one session per
+        connection thread across the full lifetime of a TCP connection.
+        Without an explicit snapshot refresh, a long-lived client
+        connection (Java's ``ClusterFixture`` is the canonical case)
+        does an insert, idles while another connection commits a
+        write, then reads — and sees the stale pre-other-write view.
+
+        ``session.reset_snapshot()`` releases the held snapshot so the
+        next cursor read picks up the latest committed state. Called at
+        the top of every public read entry point (``find_matching``,
+        ``count_matching``, ``list_*``, ``explain_plan``) so cross-
+        connection visibility matches real ``mongod``.
+        """
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            return
+        with contextlib.suppress(Exception):
+            # ``reset_snapshot()`` errors if the session is in an
+            # explicit transaction. Reads never run inside one
+            # (``_batch_transaction`` is write-only), so the exception
+            # path is defensive — log via ``suppress`` and move on.
+            s.reset_snapshot()
+
     def _cursor(self, table: str, *, overwrite: bool = True) -> Any:
         self._session()
         cursors: dict[tuple[str, bool], Any] = self._tls.cursors
@@ -1800,7 +1831,12 @@ class Storage:
         projection: Mapping[str, Any] | None = None,
         hint: str | Mapping[str, Any] | None = None,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
     ) -> list[dict[str, Any]]:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
         filter = filter or {}
         in_sort_order = False
         # Two-stage decode discipline: the lock is held only for the
@@ -1820,6 +1856,19 @@ class Storage:
                 candidates, in_sort_order = self._candidates_from_hint(
                     db, coll, resolved, sort_field, sort_dir
                 )
+            elif collation_obj is not None:
+                # Index entries are byte-encoded under the default
+                # codepoint ordering — they don't carry the collation's
+                # case- or accent-folding. A case-insensitive equality
+                # like ``{x: "PING"}`` would miss an indexed doc with
+                # ``x: "ping"`` because the entries are stored under
+                # the literal bytes of the inserted value. Force a
+                # COLLSCAN so ``matches()`` does the comparison with
+                # the collation in hand. ``mongod`` only honours an
+                # index when its definition's collation matches the
+                # query's; we don't support per-index collation yet,
+                # so the safe path is always-COLLSCAN-when-collation.
+                raw_blobs = [b for _, b in self._scan_docs(db, coll)]
             else:
                 candidates = self._try_index_lookup(db, coll, filter)
                 if candidates is not None and sort_field is not None:
@@ -1862,7 +1911,7 @@ class Storage:
         if candidates is None:
             assert raw_blobs is not None
             candidates = [bson.decode(b) for b in raw_blobs]
-        out = [d for d in candidates if matches(d, filter, vars=let)]
+        out = [d for d in candidates if matches(d, filter, vars=let, collation=collation_obj)]
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
         if skip:
@@ -2219,11 +2268,20 @@ class Storage:
         filter: dict[str, Any] | None = None,
         *,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
     ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
         if not filter:
             with self._lock:
                 return sum(1 for _ in self._scan_docs(db, coll))
-        return sum(1 for doc in self._all_docs(db, coll) if matches(doc, filter, vars=let))
+        return sum(
+            1
+            for doc in self._all_docs(db, coll)
+            if matches(doc, filter, vars=let, collation=collation_obj)
+        )
 
     def collection_data_size(self, db: str, coll: str) -> int:
         """Sum of bson-encoded doc bytes for ``coll``.
@@ -2264,7 +2322,18 @@ class Storage:
         upsert: bool = False,
         array_filters: list[dict[str, Any]] | None = None,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
     ) -> dict[str, Any]:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        # Release any sticky session snapshot before the write's
+        # ``begin_transaction`` acquires a new one. Otherwise the
+        # transaction inherits a stale view and the candidate scan
+        # misses rows committed by other connections (the cross-
+        # connection visibility fix applied to reads — see
+        # ``_refresh_read_snapshot``).
+        self._refresh_read_snapshot()
         matched = 0
         modified = 0
         upserted_id: Any = None
@@ -2288,10 +2357,20 @@ class Storage:
             # come back from the index walk); full scan otherwise. Either
             # way the doc cursor isn't held across writes — bytes are
             # eagerly buffered. Only matching docs pay ``bson.decode``.
-            candidates = self._candidates_iter(db, coll, filter)
+            # With a collation in effect, fall back to a doc-table scan:
+            # the index entries don't carry the collation's folding, so
+            # an indexed equality probe would miss case-insensitive
+            # matches. Always materialise the list — the update loop
+            # rewrites the doc table via the cached cursor, which
+            # invalidates a still-walking ``_scan_docs`` cursor on the
+            # same session.
+            if collation_obj is not None:
+                candidates = list(self._scan_docs(db, coll))
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
             for id_k, blob in candidates:
                 doc = bson.decode(blob)
-                if not matches(doc, filter, vars=let):
+                if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
                 matched += 1
                 pos = find_positional_matches(doc, filter)
@@ -2392,7 +2471,14 @@ class Storage:
         *,
         limit: int = 0,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
     ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        # See ``update_matching`` — release the sticky snapshot so the
+        # candidate scan sees writes committed by other connections.
+        self._refresh_read_snapshot()
         deleted = 0
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
@@ -2413,10 +2499,18 @@ class Storage:
             partials = self._partial_filters(db, coll)
             # Index-routed candidates when the filter is covered; full scan
             # otherwise. See update_matching for the full-scan rationale.
-            candidates = self._candidates_iter(db, coll, filter)
+            # Collation forces a full scan — index entries don't carry the
+            # collation's folding. Always materialise into a list so the
+            # delete loop's writes don't invalidate the iteration cursor
+            # mid-scan (deletes via ``_cursor(_DOC_TABLE)`` share the
+            # cached cursor with ``_scan_docs``).
+            if collation_obj is not None:
+                candidates = list(self._scan_docs(db, coll))
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
             for id_k, blob in candidates:
                 doc = bson.decode(blob)
-                if not matches(doc, filter, vars=let):
+                if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
@@ -2680,6 +2774,7 @@ class Storage:
             return True, None
 
     def list_collections(self, db: str) -> list[str]:
+        self._refresh_read_snapshot()
         with self._lock:
             c = self._cursor(_COLL_TABLE)
             c.set_key(db, "")
@@ -2699,6 +2794,7 @@ class Storage:
             return sorted(out)
 
     def list_databases(self) -> list[str]:
+        self._refresh_read_snapshot()
         with self._lock:
             c = self._cursor(_COLL_TABLE)
             seen: set[str] = set()
@@ -2811,6 +2907,7 @@ class Storage:
             return True
 
     def list_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
+        self._refresh_read_snapshot()
         with self._lock:
             if self._coll_options(db, coll) is None:
                 return []

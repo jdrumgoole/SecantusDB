@@ -145,6 +145,39 @@ def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
     return {name: evaluate(value, {}) for name, value in let.items()}
 
 
+def _validate_doc_against_collection(
+    storage: Storage, db: str, coll: str, doc: dict[str, Any]
+) -> dict[str, Any] | None:
+    """If the collection has a ``validator``, check the doc against it.
+
+    Returns a mongod-shaped ``DocumentValidationFailure`` (code 121)
+    error response when validation fails, else ``None``. The
+    ``errInfo.failingDocumentId`` lets drivers' errorResponse tests
+    pick out which doc was rejected without parsing the whole error.
+    """
+    opts = storage.get_collection_options(db, coll)
+    validator = opts.get("validator")
+    if not isinstance(validator, dict) or not validator:
+        return None
+    if matches(doc, validator):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": "Document failed validation",
+        "code": 121,
+        "codeName": "DocumentValidationFailure",
+        "errInfo": {
+            "failingDocumentId": doc.get("_id"),
+            "details": {
+                "operatorName": "validator",
+                "schemaRulesNotSatisfied": [
+                    {"operatorName": k, "specifiedAs": {k: v}} for k, v in validator.items()
+                ],
+            },
+        },
+    }
+
+
 @dataclass
 class CommandContext:
     connection_id: int
@@ -932,31 +965,44 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # appears.
     if isinstance(inner, dict) and "aggregate" in inner:
         pipeline = inner.get("pipeline") or []
+        execution_stats = {
+            "executionSuccess": True,
+            "nReturned": 0,
+            "executionTimeMillis": 0,
+            "totalKeysExamined": 0,
+            "totalDocsExamined": 0,
+            "executionStages": execution_stage,
+        }
         cursor_stage: dict[str, Any] = {
             "$cursor": {
                 "queryPlanner": query_planner,
             }
         }
         if verbosity != "queryPlanner":
-            cursor_stage["$cursor"]["executionStats"] = {
-                "executionSuccess": True,
-                "nReturned": 0,
-                "executionTimeMillis": 0,
-                "totalKeysExamined": 0,
-                "totalDocsExamined": 0,
-                "executionStages": execution_stage,
-            }
+            cursor_stage["$cursor"]["executionStats"] = execution_stats
         stages: list[dict[str, Any]] = [cursor_stage]
         for stage_doc in pipeline:
             if isinstance(stage_doc, Mapping):
                 stages.append(dict(stage_doc))
-        return {
+        # mongod's modern aggregate-explain returns ``queryPlanner`` /
+        # ``executionStats`` at the **top level** on standalone — same
+        # shape ``find``'s explain uses. The ``stages`` array is the
+        # pipeline-level breakdown that mongo-node-driver's
+        # ``aggregation.test.ts`` looks for. Mongo-java-driver's
+        # ``AbstractExplainTest#testExplainOfAggregateWithNewResponse
+        # Structure`` looks at the top level. Returning both keeps
+        # everyone happy.
+        reply_agg: dict[str, Any] = {
             "stages": stages,
+            "queryPlanner": query_planner,
             "explainVersion": "1",
             "command": inner,
             "serverInfo": server_info,
             "ok": 1.0,
         }
+        if verbosity != "queryPlanner":
+            reply_agg["executionStats"] = execution_stats
+        return reply_agg
     reply: dict[str, Any] = {
         "queryPlanner": query_planner,
         "command": inner if isinstance(inner, dict) else {},
@@ -994,10 +1040,62 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "InvalidLength",
         }
     ordered = doc.get("ordered", True)
-    inserted, errors = ctx.storage.insert(ctx.db_name, coll, documents, ordered=ordered)
+    # ``_id`` documents may not contain top-level ``$``-prefixed keys
+    # in any server version — MongoDB always restricted this and
+    # mongo-java-driver's ``insertOne-dots_and_dollars`` test pins it.
+    # Surface the rejection as a per-doc writeError so unordered
+    # batches keep the surviving inserts.
+    pre_errors: list[dict[str, Any]] = []
+    surviving: list[dict[str, Any]] = []
+    for index, d in enumerate(documents):
+        if isinstance(d, dict):
+            id_value = d.get("_id")
+            if isinstance(id_value, dict) and any(
+                isinstance(k, str) and k.startswith("$") for k in id_value
+            ):
+                pre_errors.append(
+                    {
+                        "index": index,
+                        "code": 2,
+                        "errmsg": (
+                            "_id fields may not contain '$'-prefixed fields: "
+                            f"{next(iter(id_value))!s} is not valid for storage."
+                        ),
+                    }
+                )
+                if ordered:
+                    break
+                continue
+        surviving.append(d)
+    if pre_errors and ordered:
+        # In ordered mode, abort at the first bad doc — anything
+        # before it has not been attempted yet, anything after is
+        # not attempted either. Match the per-doc writeError shape.
+        return {"n": 0, "ok": 1.0, "writeErrors": pre_errors}
+    if not surviving:
+        return {"n": 0, "ok": 1.0, "writeErrors": pre_errors}
+    inserted, errors = ctx.storage.insert(ctx.db_name, coll, surviving, ordered=ordered)
     reply: dict[str, Any] = {"n": inserted, "ok": 1.0}
-    if errors:
-        reply["writeErrors"] = errors
+    if pre_errors or errors:
+        # writeErrors index refers to the position in the *original*
+        # documents array — pre_errors already use the original index;
+        # storage.insert's errors index into ``surviving``, remap via
+        # the surviving→original mapping.
+        survivor_to_orig: list[int] = []
+        for i, d in enumerate(documents):
+            if isinstance(d, dict):
+                id_value = d.get("_id")
+                if isinstance(id_value, dict) and any(
+                    isinstance(k, str) and k.startswith("$") for k in id_value
+                ):
+                    continue
+            survivor_to_orig.append(i)
+        remapped: list[dict[str, Any]] = []
+        for err in errors:
+            new_err = dict(err)
+            new_err["index"] = survivor_to_orig[err["index"]]
+            remapped.append(new_err)
+        reply["writeErrors"] = pre_errors + remapped
     return reply
 
 
@@ -1015,6 +1113,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # ``let`` declares user-vars visible to ``$expr`` clauses in the
     # filter (MongoDB 5.0+).
     let = _resolve_let_vars(doc.get("let"))
+    collation = doc.get("collation")
     # ``batchSize`` is genuinely tri-state: absent (use default),
     # 0 ("open the cursor but send no docs in firstBatch"), or
     # explicit positive. The 0 case is load-bearing for drivers
@@ -1053,6 +1152,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             projection=projection,
             hint=hint,
             let=let,
+            collation=collation,
         )
     except BadHint as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
@@ -1174,6 +1274,24 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     upserted: list[dict[str, Any]] = []
     write_errors: list[dict[str, Any]] = []
     for index, spec in enumerate(updates):
+        # MongoDB 8.0 added a ``sort`` option to update spec entries
+        # (matches in sort order then updates the first). Pre-8.0 the
+        # server rejects it as a parse error. We advertise wire
+        # version 17 (7.0), so mirror mongod's pre-8.0 behaviour: a
+        # command-level FailedToParse. Drivers' ``updateOne-sort`` /
+        # ``replaceOne-sort`` / ``BulkWrite updateOne-sort`` /
+        # ``BulkWrite replaceOne-sort`` tests with
+        # ``maxServerVersion: "7.99"`` assert this.
+        if "sort" in spec:
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "The 'sort' option is not supported on update commands "
+                    "before MongoDB 8.0"
+                ),
+                "code": 9,
+                "codeName": "FailedToParse",
+            }
         # Pre-validate the pipeline-update shape upfront so a no-match
         # filter still surfaces parse errors to the client. Real
         # mongod parses the pipeline before scanning the collection
@@ -1213,6 +1331,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 upsert=bool(spec.get("upsert", False)),
                 array_filters=spec.get("arrayFilters"),
                 let=let,
+                collation=spec.get("collation"),
             )
         except IndexConflict as exc:
             err: dict[str, Any] = {"index": index, "code": 11000, "errmsg": str(exc)}
@@ -1284,6 +1403,7 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 spec.get("q", {}),
                 limit=int(spec.get("limit", 0)),
                 let=let,
+                collation=spec.get("collation"),
             )
         except QueryError as exc:
             # Same per-delete writeError shape as ``_update`` — the
@@ -1303,7 +1423,35 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["count"]
     filter_ = doc.get("query") or {}
-    n = ctx.storage.count_matching(ctx.db_name, coll, filter_)
+    # View support: if the collection is a view (``viewOn`` set),
+    # run the view's pipeline + the count's query filter via the
+    # aggregation engine and return its row count. Mongo-java-
+    # driver's ``estimatedDocumentCount works correctly on views``
+    # test relies on this.
+    coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll)
+    view_on = coll_opts.get("viewOn")
+    if isinstance(view_on, str):
+        pipeline = list(coll_opts.get("viewPipeline") or [])
+        if filter_:
+            pipeline.append({"$match": filter_})
+        docs = ctx.storage.find_matching(ctx.db_name, view_on, {})
+        pipeline_ctx = PipelineContext(
+            storage=ctx.storage,
+            db_name=ctx.db_name,
+            coll_name=view_on,
+        )
+        result_docs = apply_pipeline(docs, pipeline, pipeline_ctx)
+        n = len(result_docs)
+        skip = int(doc.get("skip") or 0)
+        if skip > 0:
+            n = max(n - skip, 0)
+        limit = int(doc.get("limit") or 0)
+        if limit > 0:
+            n = min(n, limit)
+        return {"n": n, "ok": 1.0}
+    n = ctx.storage.count_matching(
+        ctx.db_name, coll, filter_, collation=doc.get("collation")
+    )
     # Mongod's ``count`` honours ``limit`` and ``skip`` — the cursor-side
     # ``cursor.count()`` API in the Node / legacy drivers translates to a
     # ``count`` command with these fields populated from the cursor's
@@ -1321,6 +1469,7 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus.collation import cmp_key, parse as _parse_collation
     from secantus.paths import get_path
 
     coll = doc["distinct"]
@@ -1333,16 +1482,33 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 14,
             "codeName": "TypeMismatch",
         }
-    matched = ctx.storage.find_matching(ctx.db_name, coll, filter_)
+    collation = doc.get("collation")
+    collation_obj = _parse_collation(collation)
+    matched = ctx.storage.find_matching(ctx.db_name, coll, filter_, collation=collation)
     seen: list[Any] = []
+    seen_keys: set[Any] = set()
+
+    def _add(v: Any) -> None:
+        ck = cmp_key(v, collation_obj)
+        try:
+            # cmp_key returns a hashable normalised form for strings;
+            # but a non-string value (dict, list) may not be hashable.
+            # Fall back to linear scan in that case.
+            if ck in seen_keys:
+                return
+            seen_keys.add(ck)
+        except TypeError:
+            if any(v == s for s in seen):
+                return
+        seen.append(v)
+
     for d in matched:
         value = get_path(d, key)
         if isinstance(value, list):
             for elem in value:
-                if elem not in seen:
-                    seen.append(elem)
-        elif (value is not None or _key_present(d, key)) and value not in seen:
-            seen.append(value)
+                _add(elem)
+        elif value is not None or _key_present(d, key):
+            _add(value)
     return {"values": seen, "ok": 1.0}
 
 
@@ -1376,6 +1542,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     # ``UpdateError: arrayFilters has no entry for identifier 'i'``
     # before reaching the actual array element.
     array_filters = doc.get("arrayFilters")
+    collation = doc.get("collation")
 
     if is_remove and update is not None:
         return {
@@ -1392,7 +1559,9 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             "codeName": "FailedToParse",
         }
 
-    candidates = ctx.storage.find_matching(ctx.db_name, coll, query, sort=sort, limit=1, let=let)
+    candidates = ctx.storage.find_matching(
+        ctx.db_name, coll, query, sort=sort, limit=1, let=let, collation=collation
+    )
 
     if not candidates:
         if upsert and not is_remove:
@@ -1406,6 +1575,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                     upsert=True,
                     let=let,
                     array_filters=array_filters,
+                    collation=collation,
                 )
             except IndexConflict as exc:
                 reply: dict[str, Any] = {
@@ -1463,6 +1633,35 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             "ok": 1.0,
         }
 
+    # Document validator check: if the collection has a ``validator``
+    # set via ``collMod``/``create``, simulate the update first and
+    # reject when the resulting doc fails validation. Mongo-java-
+    # driver's ``findOneAndUpdate-errorResponse`` test pins this
+    # path — without it, the update silently succeeds and the test
+    # fails because no exception was thrown.
+    coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll)
+    validator_spec = coll_opts.get("validator")
+    if isinstance(validator_spec, dict) and validator_spec:
+        from secantus.update import apply_update as _apply_update_check
+        from secantus.update import find_positional_matches as _pos_matches
+
+        try:
+            simulated = _apply_update_check(
+                matched_doc,
+                update,
+                array_filters=array_filters,
+                positional_matches=_pos_matches(matched_doc, {"_id": matched_id}),
+                let=let,
+            )
+        except Exception:
+            simulated = None
+        if simulated is not None:
+            verr = _validate_doc_against_collection(
+                ctx.storage, ctx.db_name, coll, simulated
+            )
+            if verr is not None:
+                return verr
+
     try:
         ctx.storage.update_matching(
             ctx.db_name,
@@ -1471,6 +1670,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             update,
             multi=False,
             array_filters=array_filters,
+            let=let,
         )
     except IndexConflict as exc:
         reply2: dict[str, Any] = {
@@ -1587,6 +1787,23 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         ctx.storage.set_collection_options(
             ctx.db_name, coll, changeStreamPreAndPostImages=dict(pre_post)
         )
+    validator = doc.get("validator")
+    if isinstance(validator, Mapping):
+        ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
+    # MongoDB 3.4+ ``viewOn`` + ``pipeline`` makes the collection a
+    # read-only view of another collection filtered through an
+    # aggregation pipeline. Mongo-java-driver's
+    # ``estimatedDocumentCount works correctly on views`` test
+    # creates one and asserts ``count`` returns the right number
+    # after the pipeline filters the source docs.
+    view_on = doc.get("viewOn")
+    if isinstance(view_on, str):
+        view_pipeline = doc.get("pipeline") or []
+        if not isinstance(view_pipeline, list):
+            view_pipeline = []
+        ctx.storage.set_collection_options(
+            ctx.db_name, coll, viewOn=view_on, viewPipeline=list(view_pipeline)
+        )
     return {"ok": 1.0}
 
 
@@ -1604,6 +1821,15 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         ctx.storage.set_collection_options(
             ctx.db_name, coll, changeStreamPreAndPostImages=dict(pre_post)
         )
+    # MongoDB 3.2+ ``validator``: a query predicate that every
+    # subsequent insert / update must satisfy. Mongo-java-driver's
+    # ``findOneAndUpdate-errorResponse`` test installs a validator
+    # via ``modifyCollection`` then asserts that an update that
+    # violates it surfaces as a ``DocumentValidationFailure``
+    # (code 121) with ``errInfo.failingDocumentId`` + ``details``.
+    validator = doc.get("validator")
+    if isinstance(validator, Mapping):
+        ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
     return {"ok": 1.0}
 
 
@@ -1955,6 +2181,55 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _map_reduce(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Minimal ``mapReduce`` — translates the canonical emit/count
+    pattern to a ``$group`` aggregation. No general JS evaluation:
+    only the ``function() { emit(this.<field>, 1); }`` map +
+    ``function(key, values) { return values.length; }`` reduce shape
+    that mongo-java-driver's ``testMapReduceWithGenerics`` test uses
+    (and that real apps overwhelmingly use to mean "count by field").
+    Anything else returns the deprecation error mongod 5.0 introduced.
+    """
+    import re as _re
+
+    coll = doc["mapReduce"]
+    map_fn = str(doc.get("map") or "")
+    reduce_fn = str(doc.get("reduce") or "")
+    out = doc.get("out") or {}
+    if not (isinstance(out, dict) and "inline" in out):
+        return {
+            "ok": 0.0,
+            "errmsg": "mapReduce on this server only supports {out: {inline: 1}}",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    m = _re.search(r"emit\s*\(\s*this\.(\w+)\s*,\s*1\s*\)", map_fn)
+    if m is None or "values.length" not in reduce_fn:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "mapReduce is supported only for the canonical "
+                "``emit(this.<field>, 1)`` + ``values.length`` count pattern"
+            ),
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    field = m.group(1)
+    pipeline = [{"$group": {"_id": f"${field}", "value": {"$sum": 1}}}]
+    pipeline_ctx = PipelineContext(
+        storage=ctx.storage, db_name=ctx.db_name, coll_name=coll
+    )
+    docs = ctx.storage.find_matching(ctx.db_name, coll, {})
+    result_docs = apply_pipeline(docs, pipeline, pipeline_ctx)
+    # Real mongod's mapReduce always returns ``value`` as a double
+    # (the JS engine treats numbers as doubles). The Java driver
+    # decoder enforces this — ``readDouble`` throws on Int32. Cast.
+    for d in result_docs:
+        if "value" in d and isinstance(d["value"], int) and not isinstance(d["value"], bool):
+            d["value"] = float(d["value"])
+    return {"results": result_docs, "ok": 1.0}
+
+
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus import changestreams
     from secantus.storage import BadHint, IndexConflict
@@ -1966,6 +2241,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # ``$expr`` clauses inside ``$match`` and the aggregation
     # expression language can resolve ``$$name`` references.
     let = _resolve_let_vars(doc.get("let"))
+    collation = doc.get("collation")
     cursor_opts = doc.get("cursor") or {}
     raw_agg_batch = cursor_opts.get("batchSize")
     batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else int(raw_agg_batch)
@@ -1999,7 +2275,12 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 pipeline = list(pipeline[1:])
             try:
                 docs = ctx.storage.find_matching(
-                    ctx.db_name, coll, initial_filter, hint=hint, let=let
+                    ctx.db_name,
+                    coll,
+                    initial_filter,
+                    hint=hint,
+                    let=let,
+                    collation=collation,
                 )
             except BadHint as exc:
                 return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
@@ -2012,6 +2293,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         db_name=ctx.db_name,
         coll_name=coll_name,
         vars=dict(let) if let else {},
+        collation=collation,
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)
@@ -3296,6 +3578,8 @@ _HANDLERS: dict[str, CommandHandler] = {
     "killCursors": _kill_cursors,
     "getMore": _get_more,
     "aggregate": _aggregate,
+    "mapReduce": _map_reduce,
+    "mapreduce": _map_reduce,
     "saslStart": _sasl_start,
     "saslContinue": _sasl_continue,
     "configureFailPoint": _configure_fail_point,
@@ -3355,6 +3639,8 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "distinct": (A_FIND, SCOPE_COLLECTION),
     # $out/$merge stages do their own write-action checks at stage time.
     "aggregate": (A_FIND, SCOPE_COLLECTION),
+    "mapReduce": (A_FIND, SCOPE_COLLECTION),
+    "mapreduce": (A_FIND, SCOPE_COLLECTION),
     "explain": (A_FIND, SCOPE_COLLECTION),
     "insert": (A_INSERT, SCOPE_COLLECTION),
     "update": (A_UPDATE, SCOPE_COLLECTION),
@@ -3750,6 +4036,16 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if ctx.failpoints is not None and name != "configureFailPoint":
         match = ctx.failpoints.match(name)
         if match is not None:
+            if match.close_connection:
+                # The failpoint asked us to abruptly drop the TCP
+                # connection without responding. Drivers detect the
+                # broken socket and report it as a client-side
+                # network error. Used by mongo-java-driver's
+                # ``estimatedDocumentCount errors correctly--socket
+                # error`` test.
+                from secantus.failpoints import CloseConnectionRequested
+
+                raise CloseConnectionRequested()
             if match.error_code is not None:
                 result: dict[str, Any] = {
                     "ok": 0.0,

@@ -190,8 +190,18 @@ def _apply_pipeline_update(
     if not result:
         return copy.deepcopy(doc)
     new = result[0]
-    if "_id" in doc and new.get("_id") != doc.get("_id"):
-        raise UpdateError("pipeline update cannot change the _id of a document")
+    if "_id" in doc:
+        # ``$replaceRoot`` and ``$replaceWith`` can drop ``_id`` from
+        # the result. Real mongod preserves the original ``_id`` in
+        # that case — only an explicit *change* to a different
+        # ``_id`` is rejected. Mongo-java-driver's
+        # ``updateOne-pipeline`` and ``bulkWrite-updateOne-pipeline``
+        # tests rely on this (the pipeline reroots a sub-document
+        # that has no ``_id``).
+        if "_id" not in new:
+            new["_id"] = doc["_id"]
+        elif new["_id"] != doc["_id"]:
+            raise UpdateError("pipeline update cannot change the _id of a document")
     return new
 
 
