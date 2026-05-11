@@ -8,9 +8,9 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 332 | 62 | 33 | 427 | 84.3% |
+| `internal/integration` | 331 | 62 | 33 | 426 | 84.2% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **374** | **62** | **33** | **469** | **85.8%** |
+| **Overall** | **373** | **62** | **33** | **468** | **85.7%** |
 
 ## Failures (62)
 
@@ -27,6 +27,7 @@ internal/integration :: TestDatabase/create_view/function_parameters_are_transla
 internal/integration :: TestDatabase/create_view
 internal/integration :: TestDatabase
 internal/integration :: TestErrors
+internal/integration :: TestGridFS/download/error_if_files_collection_document_does_not_have_a_chunkSize_field
 internal/integration :: TestGridFS/download/cursor_error_during_read_after_downloading
 internal/integration :: TestGridFS/download/cursor_error_during_skip_after_downloading
 internal/integration :: TestGridFS/download
@@ -46,7 +47,6 @@ internal/integration :: TestHandshakeProse/8._Invalid_-_AWS_EXECUTION_ENV_does_n
 internal/integration :: TestHandshakeProse/driver_info_included
 internal/integration :: TestHandshakeProse
 internal/integration :: TestLoadBalancedConnectionHandshake/non-LB_connection_handshake_uses_OP_QUERY
-internal/integration :: TestLoadBalancedConnectionHandshake
 ```
 ... and 32 more (see raw NDJSON).
 

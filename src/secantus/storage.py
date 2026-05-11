@@ -365,26 +365,63 @@ class _SortKey:
             a, b = other.val, self.val
         else:
             a, b = self.val, other.val
-        ra = _bson_type_rank(a)
-        rb = _bson_type_rank(b)
-        if ra != rb:
-            return ra < rb
-        if a is None or b is None:
-            return False
-        if isinstance(a, Decimal128) or isinstance(b, Decimal128):
-            try:
-                ad = _to_decimal(a)
-                bd = _to_decimal(b)
-                return bool(ad < bd)
-            except (InvalidOperation, ValueError):
-                pass
-        try:
-            return bool(a < b)
-        except TypeError:
-            return type(a).__name__ < type(b).__name__
+        return _bson_lt(a, b)
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, _SortKey) and self.val == other.val
+
+
+def _bson_lt(a: Any, b: Any) -> bool:
+    """BSON sort-order ``<`` for two values.
+
+    Handles the four cases ``__lt__`` used to inline: cross-type rank,
+    Decimal128 widening, native ``<``, and the embedded-document /
+    array recursion — mongo-node-driver's
+    ``Aggregation ... pipeline using array`` test sorts grouped docs
+    by an embedded ``_id`` field and the previous inline ``a < b``
+    raised ``TypeError`` on Python's dicts.
+    """
+    ra = _bson_type_rank(a)
+    rb = _bson_type_rank(b)
+    if ra != rb:
+        return ra < rb
+    if a is None or b is None:
+        return False
+    if isinstance(a, Decimal128) or isinstance(b, Decimal128):
+        try:
+            ad = _to_decimal(a)
+            bd = _to_decimal(b)
+            return bool(ad < bd)
+        except (InvalidOperation, ValueError):
+            pass
+    # Embedded documents: compare field-by-field in insertion order,
+    # first differing pair wins. Real BSON sort recurses; Python's dict
+    # ``<`` raises ``TypeError`` so without this branch sort would be
+    # a no-op on grouped ``_id`` keys.
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        a_items = list(a.items())
+        b_items = list(b.items())
+        for (ak, av), (bk, bv) in zip(a_items, b_items, strict=False):
+            if ak != bk:
+                return ak < bk
+            if _bson_lt(av, bv):
+                return True
+            if _bson_lt(bv, av):
+                return False
+        return len(a_items) < len(b_items)
+    # Arrays: lexicographic, element-by-element. Same TypeError trap
+    # as the dict case for arrays-of-mixed-types.
+    if isinstance(a, list) and isinstance(b, list):
+        for av, bv in zip(a, b, strict=False):
+            if _bson_lt(av, bv):
+                return True
+            if _bson_lt(bv, av):
+                return False
+        return len(a) < len(b)
+    try:
+        return bool(a < b)
+    except TypeError:
+        return type(a).__name__ < type(b).__name__
 
 
 def sort_docs(
@@ -425,6 +462,18 @@ class IndexConflict(Exception):
         # don't have the index spec handy.
         self.key_pattern = key_pattern
         self.key_value = key_value
+
+
+class DocumentValidationError(Exception):
+    """A write produced a doc that didn't satisfy the collection's
+    ``validator``. Caught at the command layer and surfaced as the
+    mongod-shaped writeError (code 121, ``DocumentValidationFailure``)
+    with the ``errInfo.failingDocumentId`` field drivers' errorResponse
+    tests assert on."""
+
+    def __init__(self, doc_id: Any) -> None:
+        super().__init__("Document failed validation")
+        self.doc_id = doc_id
 
 
 class CreateIndexUnsupported(Exception):
@@ -2339,6 +2388,7 @@ class Storage:
         array_filters: list[dict[str, Any]] | None = None,
         let: dict[str, Any] | None = None,
         collation: Any = None,
+        validator: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from secantus.collation import parse as _parse_collation
 
@@ -2398,6 +2448,13 @@ class Storage:
                     let=let,
                 )
                 if new != doc:
+                    # Document-validator check: collection-level
+                    # ``validator`` (set via ``create`` / ``collMod``)
+                    # rejects updates whose result fails the predicate.
+                    # Caller passes ``None`` to skip
+                    # (``bypassDocumentValidation: true``).
+                    if validator is not None and not matches(new, validator):
+                        raise DocumentValidationError(new.get("_id"))
                     new_id_key = _id_key(new["_id"])
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_id_key=id_k, partials=partials
@@ -2445,6 +2502,8 @@ class Storage:
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
+                if validator is not None and not matches(new, validator):
+                    raise DocumentValidationError(new.get("_id"))
                 upserted_id = new["_id"]
                 conflict = self._unique_conflict(
                     db, coll, new, indexes, exclude_id_key=None, partials=partials
@@ -2840,9 +2899,7 @@ class Storage:
         # text search`` test expects a clean error here.
         for _field, _spec_val in key_spec.items():
             if _spec_val in ("text", "hashed"):
-                raise CreateIndexUnsupported(
-                    f"{_spec_val} indexes are not supported by SecantusDB"
-                )
+                raise CreateIndexUnsupported(f"{_spec_val} indexes are not supported by SecantusDB")
         options = dict(options or {})
         with self._lock:
             self._ensure_collection(db, coll)
@@ -2865,12 +2922,12 @@ class Storage:
                     "partialFilterExpression",
                 )
                 for opt in _CONFLICTING_OPTS:
-                    if opt in options or opt in existing_opts:
-                        if options.get(opt) != existing_opts.get(opt):
-                            raise IndexOptionsConflict(
-                                f"Index with name '{name}' already exists with "
-                                f"different options"
-                            )
+                    if (opt in options or opt in existing_opts) and options.get(
+                        opt
+                    ) != existing_opts.get(opt):
+                        raise IndexOptionsConflict(
+                            f"Index with name '{name}' already exists with different options"
+                        )
                 return False
             sparse = bool(options.get("sparse"))
             unique = bool(options.get("unique"))

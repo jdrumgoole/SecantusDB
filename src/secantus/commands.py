@@ -182,8 +182,7 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
             "codeName": "TypeMismatch",
         }
     if "wtimeout" in wc and (
-        isinstance(wc["wtimeout"], bool)
-        or not isinstance(wc["wtimeout"], (int, float))
+        isinstance(wc["wtimeout"], bool) or not isinstance(wc["wtimeout"], (int, float))
     ):
         return {
             "ok": 0.0,
@@ -555,11 +554,7 @@ def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     # ``Aggregation should ... $currentOp`` test does
                     # exactly that; without the field it crashes with
                     # ``Cannot read properties of undefined``.
-                    "command": (
-                        {conn.last_command_name: 1}
-                        if conn.last_command_name
-                        else {}
-                    ),
+                    "command": ({conn.last_command_name: 1} if conn.last_command_name else {}),
                     "currentOpTime": opened_iso,
                     "secs_running": 0,
                     "microsecs_running": 0,
@@ -972,9 +967,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if isinstance(wc, dict) and (wc.get("j") is True or wc.get("w") == "majority"):
         return {
             "ok": 0.0,
-            "errmsg": (
-                "Command does not support writeConcern when used with explain"
-            ),
+            "errmsg": ("Command does not support writeConcern when used with explain"),
             "code": 72,
             "codeName": "InvalidOptions",
         }
@@ -1135,6 +1128,17 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "InvalidLength",
         }
     ordered = doc.get("ordered", True)
+    bypass_validation = bool(doc.get("bypassDocumentValidation", False))
+    # Collection-level ``validator`` (set via ``create`` / ``collMod``)
+    # is enforced unless the caller passed ``bypassDocumentValidation:
+    # true``. Mongo-node-driver's ``Document Validation should allow
+    # bypassing document validation on inserts`` test installs a
+    # validator then asserts (a) a violating insert fails with
+    # ``MongoServerError`` and (b) the same insert with the bypass flag
+    # succeeds.
+    coll_opts_for_validation = ctx.storage.get_collection_options(ctx.db_name, coll)
+    validator_spec = coll_opts_for_validation.get("validator")
+    validator_active = isinstance(validator_spec, dict) and validator_spec and not bypass_validation
     # ``_id`` documents may not contain top-level ``$``-prefixed keys
     # in any server version — MongoDB always restricted this and
     # mongo-java-driver's ``insertOne-dots_and_dollars`` test pins it.
@@ -1161,6 +1165,21 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 if ordered:
                     break
                 continue
+            if validator_active and not matches(d, validator_spec):
+                pre_errors.append(
+                    {
+                        "index": index,
+                        "code": 121,
+                        "errmsg": "Document failed validation",
+                        "errInfo": {
+                            "failingDocumentId": id_value,
+                            "details": {"operatorName": "validator"},
+                        },
+                    }
+                )
+                if ordered:
+                    break
+                continue
         surviving.append(d)
     if pre_errors and ordered:
         # In ordered mode, abort at the first bad doc — anything
@@ -1172,19 +1191,14 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     inserted, errors = ctx.storage.insert(ctx.db_name, coll, surviving, ordered=ordered)
     reply: dict[str, Any] = {"n": inserted, "ok": 1.0}
     if pre_errors or errors:
-        # writeErrors index refers to the position in the *original*
-        # documents array — pre_errors already use the original index;
-        # storage.insert's errors index into ``surviving``, remap via
-        # the surviving→original mapping.
-        survivor_to_orig: list[int] = []
-        for i, d in enumerate(documents):
-            if isinstance(d, dict):
-                id_value = d.get("_id")
-                if isinstance(id_value, dict) and any(
-                    isinstance(k, str) and k.startswith("$") for k in id_value
-                ):
-                    continue
-            survivor_to_orig.append(i)
+        # ``writeErrors`` index refers to the position in the
+        # *original* ``documents`` array. ``pre_errors`` already use
+        # the original index; ``storage.insert``'s errors index into
+        # ``surviving``, so remap via the per-doc reject mask.
+        rejected_indices = {err["index"] for err in pre_errors}
+        survivor_to_orig: list[int] = [
+            i for i in range(len(documents)) if i not in rejected_indices
+        ]
         remapped: list[dict[str, Any]] = []
         for err in errors:
             new_err = dict(err)
@@ -1356,7 +1370,7 @@ def _find_tailable(
 
 
 def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import GeoExtractError, IndexConflict
+    from secantus.storage import DocumentValidationError, GeoExtractError, IndexConflict
     from secantus.update import _PIPELINE_UPDATE_STAGES
 
     wc_err = _validate_write_concern(doc)
@@ -1365,8 +1379,15 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["update"]
     updates = doc.get("updates", [])
     ordered = bool(doc.get("ordered", True))
+    bypass_validation = bool(doc.get("bypassDocumentValidation", False))
     # ``let`` — see ``_delete`` for the wire-shape rationale.
     let = _resolve_let_vars(doc.get("let"))
+    # Collection validator enforced unless bypass requested. Mongo-node-
+    # driver's ``Document Validation should allow bypassing document
+    # validation on updates`` test asserts both directions.
+    coll_opts_for_validation = ctx.storage.get_collection_options(ctx.db_name, coll)
+    validator_spec = coll_opts_for_validation.get("validator")
+    validator_active = isinstance(validator_spec, dict) and validator_spec and not bypass_validation
     n = 0
     n_modified = 0
     upserted: list[dict[str, Any]] = []
@@ -1429,7 +1450,23 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 array_filters=spec.get("arrayFilters"),
                 let=let,
                 collation=spec.get("collation"),
+                validator=validator_spec if validator_active else None,
             )
+        except DocumentValidationError as exc:
+            write_errors.append(
+                {
+                    "index": index,
+                    "code": 121,
+                    "errmsg": "Document failed validation",
+                    "errInfo": {
+                        "failingDocumentId": exc.doc_id,
+                        "details": {"operatorName": "validator"},
+                    },
+                }
+            )
+            if ordered:
+                break
+            continue
         except IndexConflict as exc:
             err: dict[str, Any] = {"index": index, "code": 11000, "errmsg": str(exc)}
             if exc.key_pattern is not None:
@@ -1740,10 +1777,12 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     # reject when the resulting doc fails validation. Mongo-java-
     # driver's ``findOneAndUpdate-errorResponse`` test pins this
     # path — without it, the update silently succeeds and the test
-    # fails because no exception was thrown.
+    # fails because no exception was thrown. Honour
+    # ``bypassDocumentValidation: true``.
+    bypass_validation_fam = bool(doc.get("bypassDocumentValidation", False))
     coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll)
     validator_spec = coll_opts.get("validator")
-    if isinstance(validator_spec, dict) and validator_spec:
+    if isinstance(validator_spec, dict) and validator_spec and not bypass_validation_fam:
         from secantus.update import apply_update as _apply_update_check
         from secantus.update import find_positional_matches as _pos_matches
 
@@ -1988,9 +2027,7 @@ def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
     batch: list[dict[str, Any]] = []
     for n in names:
         raw = ctx.storage.get_collection_options(ctx.db_name, n)
-        opts: dict[str, Any] = {
-            k: v for k, v in raw.items() if k not in _INTERNAL_COLL_OPTIONS
-        }
+        opts: dict[str, Any] = {k: v for k, v in raw.items() if k not in _INTERNAL_COLL_OPTIONS}
         # ``viewOn`` collections surface as ``type: "view"`` and the
         # view's pipeline lives under ``options.pipeline`` (the
         # storage layer keeps it as ``viewPipeline`` so the option-blob
@@ -2163,8 +2200,7 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # commitQuorum test passes.
         commit_quorum = options.get("commitQuorum")
         if commit_quorum is not None and not (
-            isinstance(commit_quorum, int)
-            or commit_quorum in ("majority", "votingMembers")
+            isinstance(commit_quorum, int) or commit_quorum in ("majority", "votingMembers")
         ):
             return {
                 "ok": 0.0,

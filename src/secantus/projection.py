@@ -151,6 +151,4 @@ def _detect_inclusion(spec: Mapping[str, Any]) -> bool:
     # Match mongod's literal error text — mongo-node-driver's
     # ``server_errors.test.ts`` asserts on the exact string ("Cannot
     # do exclusion on field ... in inclusion projection").
-    raise ProjectionError(
-        "Projection cannot have a mix of inclusion and exclusion."
-    )
+    raise ProjectionError("Projection cannot have a mix of inclusion and exclusion.")
