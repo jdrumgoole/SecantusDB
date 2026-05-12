@@ -46,9 +46,7 @@ def _jstack_all_javas(jstack_dir: Path, java_home: str | None) -> None:
         candidate = Path(java_home) / "bin" / "jstack"
         if candidate.is_file():
             jstack_bin = str(candidate)
-    pids_proc = subprocess.run(
-        ["pgrep", "-f", "java"], capture_output=True, text=True
-    )
+    pids_proc = subprocess.run(["pgrep", "-f", "java"], capture_output=True, text=True)
     pids = [p for p in pids_proc.stdout.split() if p.strip()]
     if not pids:
         print("jstack-on-hang: no java PIDs to dump", file=sys.stderr)
@@ -72,6 +70,7 @@ def _jstack_all_javas(jstack_dir: Path, java_home: str | None) -> None:
         f"jstack-on-hang: wrote {written} thread dump(s) to {jstack_dir}",
         file=sys.stderr,
     )
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-java-driver"
@@ -167,11 +166,17 @@ def main() -> int:
 
     def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
         cmd = [
-            sys.executable, "-m", "secantus",
-            "--host", host,
-            "--port", str(port),
-            "--storage-path", storage_dir,
-            "--log-level", "WARNING",
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--storage-path",
+            storage_dir,
+            "--log-level",
+            "WARNING",
             # Java's ``ClusterFixture.getSecondary()`` is an unbounded
             # sleep loop on non-RS deployments — and our default
             # ``hello`` reply advertises us as a single-node RS primary
@@ -184,22 +189,21 @@ def main() -> int:
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-    print(f"java_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
+    print(
+        f"java_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr
+    )
     daemon = _spawn_daemon(with_auth=False)
     try:
         _wait_for_listener(host, port)
         print("java_validation: seeding root-user", file=sys.stderr)
         import pymongo
+
         client = pymongo.MongoClient(
             f"mongodb://{host}:{port}/", directConnection=True, serverSelectionTimeoutMS=5_000
         )
-        client.admin.command(
-            "createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"]
-        )
+        client.admin.command("createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"])
         client.close()
     finally:
         daemon.terminate()
@@ -217,10 +221,7 @@ def main() -> int:
     try:
         _wait_for_listener(host, port)
 
-        uri = (
-            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/"
-            f"?authSource=admin"
-        )
+        uri = f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"
         env = os.environ.copy()
         if java_home_override:
             env["JAVA_HOME"] = java_home_override
@@ -263,8 +264,11 @@ def main() -> int:
         gradle_rcs: list[int] = []
         for spec in INCLUDE:
             cmd = [
-                "./gradlew", "--no-daemon", "--console=plain",
-                "--init-script", str(init_script),
+                "./gradlew",
+                "--no-daemon",
+                "--console=plain",
+                "--init-script",
+                str(init_script),
                 # ``--rerun-tasks`` forces Gradle to re-execute the
                 # test task even when its inputs (Java sources, system
                 # properties) haven't changed. Without it, server-side
@@ -295,21 +299,20 @@ def main() -> int:
             ]
             for fqn in spec.test_classes:
                 cmd.extend(["--tests", fqn])
-            filter_msg = (
-                f" ({len(spec.test_classes)} --tests filters)"
-                if spec.test_classes
-                else ""
-            )
+            filter_msg = f" ({len(spec.test_classes)} --tests filters)" if spec.test_classes else ""
             print(
-                f"java_validation: running {spec.task}{filter_msg} "
-                f"in {VENDOR} (URI={uri})",
+                f"java_validation: running {spec.task}{filter_msg} in {VENDOR} (URI={uri})",
                 file=sys.stderr,
             )
 
             proc = subprocess.Popen(
-                cmd, cwd=VENDOR, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=1, text=True,
+                cmd,
+                cwd=VENDOR,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                text=True,
             )
             last_output_ts = [time.monotonic()]
             forward_done = threading.Event()
@@ -383,8 +386,7 @@ def main() -> int:
 
         if copied == 0:
             print(
-                "java_validation: no JUnit XML written "
-                f"(gradle exit {gradle_rc}; build error?)",
+                f"java_validation: no JUnit XML written (gradle exit {gradle_rc}; build error?)",
                 file=sys.stderr,
             )
             return 1
@@ -392,6 +394,7 @@ def main() -> int:
         # Quick one-line summary.
         passed = failed = skipped = 0
         import xml.etree.ElementTree as ET
+
         for xml in RESULTS_DIR.rglob("TEST-*.xml"):
             try:
                 root = ET.parse(xml).getroot()
