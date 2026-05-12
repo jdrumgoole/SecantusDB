@@ -1,5 +1,5 @@
 from secantus.server import SecantusDBServer
 
-__version__ = "0.5.0b15"
+__version__ = "0.5.0b16"
 
 __all__ = ["SecantusDBServer", "__version__"]
