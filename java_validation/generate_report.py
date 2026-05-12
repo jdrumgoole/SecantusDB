@@ -33,6 +33,34 @@ def _read_driver_version() -> str:
     return "unknown"
 
 
+def _driver_sync_functional_scope() -> tuple[int, int]:
+    """Return ``(included, total_upstream)``: number of driver-sync
+    functional test classes the gauge runs versus the total available
+    in ``vendor/mongo-java-driver/driver-sync/src/test/functional/``.
+
+    The point is to surface the denominator the bare pass-rate hides:
+    a 100% on a 13-of-112 include set is a different number from a 100%
+    on all 112. Counts test classes rather than test methods because the
+    include set is class-granular.
+    """
+    from java_validation.include_modules import INCLUDE
+
+    included = sum(len(m.test_classes) for m in INCLUDE if m.task.endswith(":driver-sync:test"))
+    functional_dir = (
+        Path(__file__).resolve().parent.parent
+        / "vendor"
+        / "mongo-java-driver"
+        / "driver-sync"
+        / "src"
+        / "test"
+        / "functional"
+    )
+    if not functional_dir.is_dir():
+        return included, 0
+    total = sum(1 for _ in functional_dir.rglob("*Test.java"))
+    return included, total
+
+
 def render(xml_dir: Path, out_path: Path) -> None:
     by_mod: dict[str, dict[str, int]] = defaultdict(
         lambda: {"passed": 0, "failed": 0, "skipped": 0}
@@ -85,6 +113,23 @@ def render(xml_dir: Path, out_path: Path) -> None:
         "rate is the analogue of the pymongo / mongo-go-driver / "
         "mongo-node-driver gauges for the official Java driver — the "
         "language enterprise MongoDB consumers most often use."
+    )
+    md.append("")
+    md.append("## Scope")
+    md.append("")
+    included, total_in_tree = _driver_sync_functional_scope()
+    pct = (included / total_in_tree * 100) if total_in_tree else 0.0
+    md.append(
+        f"`driver-sync/src/test/functional/` contains **{total_in_tree}** "
+        f"test classes upstream. The gauge currently runs **{included}** "
+        f"of them (~{pct:.0f}%). The other {total_in_tree - included} are "
+        "either intentionally out of scope (encryption / atlas-search / "
+        "kotlin-or-scala wrappers / OCSP / DNS / retryable / monitoring) "
+        "or unaudited — they haven't been added to "
+        "`java_validation/include_modules.py` because each new class needs "
+        "the runner's wall-clock guard to confirm it terminates before it "
+        "ships. The pass rate below describes the included subset, "
+        "not the whole functional tree."
     )
     md.append("")
     md.append("## Summary by module")
