@@ -1517,8 +1517,13 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 break
             continue
         except UpdateError as exc:
-            # Same shape for malformed update operators.
-            write_errors.append({"index": index, "code": 9, "errmsg": str(exc)})
+            # ``_id`` immutability gets a special code (66
+            # ImmutableField) so drivers' canonical handling triggers.
+            # Everything else falls under FailedToParse (9) — malformed
+            # operators / mixed ops & replacement fields.
+            msg = str(exc)
+            code = 66 if "immutable field" in msg else 9
+            write_errors.append({"index": index, "code": code, "errmsg": msg})
             if ordered:
                 break
             continue

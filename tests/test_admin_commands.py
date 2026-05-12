@@ -154,7 +154,7 @@ def test_host_info_returns_real_system_info(client: MongoClient) -> None:
     assert os_block["name"] == platform.system()
 
 
-def test_host_info_memory_size_nonzero_on_posix() -> None:
+def test_host_info_memory_size_nonzero_on_posix(tmp_path) -> None:
     """On POSIX systems, ``memSizeMB`` reports the real physical RAM
     via sysconf, not 0. (Skipped when sysconf doesn't expose
     SC_PHYS_PAGES — e.g. on Windows runners — though SecantusDB
@@ -171,7 +171,7 @@ def test_host_info_memory_size_nonzero_on_posix() -> None:
         pytest.skip("sysconf returned no usable memory size")
 
     # Pull through the server fixture for a realistic round-trip.
-    with SecantusDBServer(port=0, storage_path=":memory:") as srv:
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
         mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
         try:
             out = mc.admin.command("hostInfo")

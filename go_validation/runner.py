@@ -131,7 +131,98 @@ def main() -> int:
         # flight when the killer fired.
         cmd = ["go", "test", "-json", "-count=1", "-timeout=30m"]
         if SKIP_PATTERNS:
-            cmd.append(f"-skip={'|'.join(SKIP_PATTERNS)}")
+            # Go test's ``-skip`` is treated like ``-run``: at flag-
+            # parse time the regexp is split at unbracketed-unparen'd
+            # ``/`` characters into one regex per hierarchy level;
+            # at match time each level of the test identifier must
+            # match its corresponding part, and a test is *only*
+            # skipped when the regex has *no extra* parts past the
+            # test's depth (see ``testing/match.go``'s
+            # ``simpleMatch.matches`` returning
+            # ``partial = len(name) < len(m)`` and ``fullName``'s
+            # ``skip && !partialSkip`` guard).
+            #
+            # Two consequences for pipe-joining patterns naively:
+            #   1. Each pattern's substring-match semantics let a
+            #      shorter sibling like ``resume_token`` match a
+            #      longer real subtest name like
+            #      ``resume_token_updated_on_empty_batch``. The
+            #      shorter sibling then returns ``ok=true`` with
+            #      ``partial=true`` (regex 3-parts vs name 2-parts),
+            #      and ``alternationMatch.matches`` short-circuits
+            #      on the first ``ok`` it sees — the longer pattern
+            #      we actually wrote never gets tested.
+            #   2. A 0-slash pattern alongside a multi-slash pattern
+            #      in the same flag value means the multi-slash
+            #      one's depth is what's used for the splittin /
+            #      partial-match logic, which silently breaks the
+            #      bare top-level skip.
+            #
+            # Fix: anchor *each part* of every multi-level pattern
+            # with ``^…$``. Top-level-only patterns (no ``/``) stay
+            # unanchored on purpose — they're prefix-style matches
+            # intended to catch both the parent and all its subtests
+            # (``TestGridFS`` is meant to also catch
+            # ``TestGridFS/download/...``, etc.). For multi-level
+            # patterns, anchoring per part makes the substring-match
+            # bug disappear and the ``partial`` accounting precise.
+            def _anchor(p: str) -> str:
+                # Walk only unbracketed / unparen'd slashes, mirroring
+                # Go's splitRegexp logic (see testing/match.go).
+                # Patterns without an unbracketed ``/`` are returned
+                # unchanged so the existing prefix-style top-level
+                # skips (``TestCSOT_``, ``TestGridFS``, etc.) keep
+                # working.
+                cs = 0
+                cp = 0
+                has_slash = False
+                for ch in p:
+                    if ch == "\\":
+                        continue
+                    if ch == "[":
+                        cs += 1
+                    elif ch == "]":
+                        cs = max(cs - 1, 0)
+                    elif ch == "(" and cs == 0:
+                        cp += 1
+                    elif ch == ")" and cs == 0:
+                        cp = max(cp - 1, 0)
+                    elif ch == "/" and cs == 0 and cp == 0:
+                        has_slash = True
+                        break
+                if not has_slash:
+                    return p
+                # Walk again, splitting at unbracketed-unparen'd ``/``
+                # and wrapping each piece with ``^…$``.
+                out: list[str] = ["^"]
+                cs = 0
+                cp = 0
+                i = 0
+                while i < len(p):
+                    ch = p[i]
+                    if ch == "\\" and i + 1 < len(p):
+                        out.append(p[i : i + 2])
+                        i += 2
+                        continue
+                    if ch == "[":
+                        cs += 1
+                    elif ch == "]":
+                        cs = max(cs - 1, 0)
+                    elif ch == "(" and cs == 0:
+                        cp += 1
+                    elif ch == ")" and cs == 0:
+                        cp = max(cp - 1, 0)
+                    elif ch == "/" and cs == 0 and cp == 0:
+                        out.append("$/^")
+                        i += 1
+                        continue
+                    out.append(ch)
+                    i += 1
+                out.append("$")
+                return "".join(out)
+
+            anchored = [_anchor(p) for p in SKIP_PATTERNS]
+            cmd.append(f"-skip={'|'.join(anchored)}")
         cmd.extend(INCLUDE)
         print(
             f"go_validation: `{' '.join(cmd)}` in {VENDOR} (MONGODB_URI={env['MONGODB_URI']})",

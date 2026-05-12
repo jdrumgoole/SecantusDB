@@ -54,8 +54,11 @@ git commit -am "Bump go-validation target -> vX.Y.Z"
 1. `go_validation/runner.py` finds an OS-assigned free port, then
    spawns SecantusDB **as a standalone daemon subprocess** — the same
    thing you'd run by hand: `python -m secantus --host 127.0.0.1
-   --port <free> --storage-path :memory:`. The go-driver tests see a
-   real `mongod`-shaped TCP server, no embedding.
+   --port <free> --storage-path <tempdir>`. Storage is a fresh
+   `tempfile.mkdtemp(prefix="secantus-go-gauge-")` (real on-disk
+   WiredTiger — never `:memory:`, so the checkpoint / journal paths
+   stay exercised). The go-driver tests see a real `mongod`-shaped
+   TCP server, no embedding.
 2. Waits for the daemon's TCP listener to accept a connection.
 3. Sets `MONGODB_URI` to `mongodb://<host>:<port>` — the seam
    mongo-go-driver's `internal/integtest.MongoDBURI` and

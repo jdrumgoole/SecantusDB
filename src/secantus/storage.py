@@ -554,6 +554,10 @@ class Storage:
         # 1 GB gives generous headroom for tests + reasonable
         # in-process workloads while staying well under the limits
         # ``mongod`` itself runs with on a normal box.
+        # Tracked so ``checkpoint()`` calls are skipped in in-memory
+        # mode (WT's in_memory backend rejects them with a noisy
+        # ``__wt_inmem_unsupported_op`` log line on every call).
+        self._in_memory = path == ":memory:"
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
@@ -1373,8 +1377,12 @@ class Storage:
             # gives a durable on-disk image of the dataset at the
             # moment of shutdown regardless of journal state — the
             # behaviour callers reasonably expect from ``close()``.
-            with contextlib.suppress(Exception):
-                self._session().checkpoint()
+            # Skip for in-memory backends: WT's in_memory engine
+            # rejects checkpoint() with a noisy stderr log
+            # (``__wt_inmem_unsupported_op``) on every call.
+            if not self._in_memory:
+                with contextlib.suppress(Exception):
+                    self._session().checkpoint()
             for s in self._all_sessions:
                 with contextlib.suppress(Exception):
                     s.close()
@@ -1526,9 +1534,12 @@ class Storage:
 
         Backs the ``fsync`` command and the admin UI's maintenance
         slice. Lock-protected so concurrent commands wait their turn.
+        On in-memory backends the call is a no-op (WT's in_memory
+        engine has no disk to flush and rejects with a noisy stderr
+        log).
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._in_memory:
                 return
             self._session().checkpoint()
 

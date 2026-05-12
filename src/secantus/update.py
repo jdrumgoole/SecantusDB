@@ -37,6 +37,16 @@ def apply_update(
             if op == "$setOnInsert" and not is_upsert:
                 continue
             _apply_op(result, op, payload, filter_map, pos)
+        # ``_id`` is immutable in every server version — ``$set:
+        # {_id: ...}`` and friends are rejected post-apply.
+        # Mongo-go-driver's
+        # ``TestCollection/bulk_write/update_write_errors`` test
+        # asserts mongod's error code 66 (ImmutableField) when an
+        # operator update tries to change ``_id``.
+        if "_id" in doc and result.get("_id") != doc.get("_id"):
+            raise UpdateError(
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            )
         return result
     new = copy.deepcopy(dict(update))
     if "_id" in doc:

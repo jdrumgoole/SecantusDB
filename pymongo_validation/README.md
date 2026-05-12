@@ -43,8 +43,10 @@ git commit -am "Bump pymongo validation target -> vX.Y.Z"
 2. In `pytest_configure` — runs *before* test collection, *before*
    pymongo's `helpers_shared.py` reads its env vars at import time —
    the plugin starts an embedded `SecantusDBServer(host="127.0.0.1",
-   port=0, storage_path=":memory:")` and writes the bound host/port
-   into `DB_IP` and `DB_PORT`.
+   port=0, storage_path=<fresh tempdir>)` (real on-disk WiredTiger
+   via `tempfile.mkdtemp(prefix="secantus-pymongo-gauge-")`, never
+   `:memory:`) and writes the bound host/port into `DB_IP` and
+   `DB_PORT`.
 3. pytest collects from the paths in `pymongo_validation/include_paths.py`.
 4. `pytest-json-report` writes a machine-readable result to
    `.validation/raw.json`.
