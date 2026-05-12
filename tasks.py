@@ -510,6 +510,23 @@ def validate_all(c: Context) -> None:
         sys.exit(1)
 
 
+@task(name="validate-summary")
+def validate_summary(c: Context) -> None:
+    """Generate ``docs/validation-summary.md`` from the five gauges' raw output.
+
+    Each gauge writes its raw artifact to ``.validation/`` (``raw.json``,
+    ``go-raw.ndjson``, ``node-raw.json``, ``ruby-raw.json``,
+    ``java-results/``). This task reads them all and renders one table
+    in ``docs/validation-summary.md`` so the five gauges can be compared
+    like for like — every row counts one assertion outcome.
+
+    Gauges that have never been run (no raw artifact) are silently
+    omitted from the table. Run ``invoke validate-all`` first if you
+    want a complete snapshot.
+    """
+    c.run("uv run --no-sync python -m validation_summary.generate", pty=True)
+
+
 @task(name="validate-readme")
 def validate_readme(c: Context) -> None:
     """HEAD-check every URL in the published PyPI README.

@@ -95,6 +95,15 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     "com.mongodb.client.unified.ChangeStreamsTest",
     "com.mongodb.client.unified.UnifiedWriteConcernTest",
     "com.mongodb.client.unified.VersionedApiTest",
+    # Wave 3 widening — features SecantusDB ships at the wire level:
+    # SCRAM-SHA-256 auth (UnifiedAuthTest), GridFS-as-CRUD on the
+    # ``.files``/``.chunks`` pair (UnifiedGridFSTest), and logical
+    # session tracking (SessionsTest). Transaction-only and
+    # multi-node-only scenarios self-skip via the YAML
+    # ``runOnRequirements`` blocks the unified runner respects.
+    "com.mongodb.client.unified.UnifiedAuthTest",
+    "com.mongodb.client.unified.UnifiedGridFSTest",
+    "com.mongodb.client.unified.SessionsTest",
     # Excluded (need features that are intentionally out of scope, or
     # that need a deeper investigation to be tractable):
     # - ServerSelectionLoggingTest — half its scenarios depend on the

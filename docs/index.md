@@ -189,6 +189,7 @@ admin
 concurrency
 compatibility
 benchmark
+validation-summary
 validation-report
 validation-report-go
 validation-report-node
