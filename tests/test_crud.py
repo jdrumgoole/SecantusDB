@@ -682,6 +682,90 @@ def test_sparse_unique_index_via_pymongo(coll) -> None:
     assert coll.count_documents({}) == 3
 
 
+def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient) -> None:
+    # mongo-ruby-driver's `create_one ... invalid wildcardProjection`
+    # / `wildcard projection to an invalid base index` specs match
+    # the error messages by regex. Real mongod rejects with
+    # CannotCreateIndex (67) when the option is malformed or applied
+    # to a non-wildcard base index.
+    from pymongo.errors import OperationFailure
+
+    db = client["wcp_validation_db"]
+
+    # Non-doc wildcardProjection (test sends `wildcard_projection: 5`).
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [{"key": {"$**": 1}, "name": "wild_int", "wildcardProjection": 5}],
+            }
+        )
+    assert "wildcardProjection" in str(exc.value)
+    assert "non-empty object" in str(exc.value)
+
+    # Empty doc wildcardProjection.
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [{"key": {"$**": 1}, "name": "wild_empty", "wildcardProjection": {}}],
+            }
+        )
+    assert "non-empty object" in str(exc.value)
+
+    # wildcardProjection on a non-wildcard base index.
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [
+                    {
+                        "key": {"x": 1},
+                        "name": "x_with_wcp",
+                        "wildcardProjection": {"rating": 1},
+                    }
+                ],
+            }
+        )
+    assert "only allowed" in str(exc.value)
+
+    # Valid wildcardProjection on a wildcard key — accepted.
+    db.command(
+        {
+            "createIndexes": "things",
+            "indexes": [
+                {
+                    "key": {"$**": 1},
+                    "name": "wild_ok",
+                    "wildcardProjection": {"rating": 1},
+                }
+            ],
+        }
+    )
+
+
+def test_create_indexes_rejects_unsupported_commit_quorum(client: MongoClient) -> None:
+    # mongo-ruby-driver's commit_quorum unsupported-value tests match
+    # the error message via regex: ``No write concern mode named
+    # '<value>' found in replica set configuration``. Real mongod
+    # surfaces unknown commitQuorum strings as a write-concern-mode
+    # lookup miss (code 79, UnknownReplWriteConcern).
+    from pymongo.errors import OperationFailure
+
+    db = client["commit_quorum_db"]
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [{"key": {"x": 1}, "name": "x_1"}],
+                "commitQuorum": "unsupported-value",
+            }
+        )
+    assert exc.value.code == 79
+    assert "No write concern mode named" in str(exc.value)
+    assert "unsupported-value" in str(exc.value)
+
+
 def test_query_elem_match_subdoc(coll) -> None:
     coll.insert_many(
         [
