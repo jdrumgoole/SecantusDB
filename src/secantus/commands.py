@@ -2256,6 +2256,23 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return wc_err
     coll = doc["createIndexes"]
     indexes = doc.get("indexes", [])
+    # ``commitQuorum`` is a top-level option on ``createIndexes`` (not
+    # per-index). MongoDB 4.4+ accepts an integer, ``"majority"``, or
+    # ``"votingMembers"``; unknown strings trigger a write-concern-mode
+    # lookup miss in the replica-set config. mongo-ruby-driver's
+    # ``unsupported-value`` commit_quorum spec pins the regex.
+    commit_quorum = doc.get("commitQuorum")
+    if commit_quorum is not None and not (
+        isinstance(commit_quorum, int) or commit_quorum in ("majority", "votingMembers")
+    ):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"No write concern mode named {commit_quorum!r} found in replica set configuration"
+            ),
+            "code": 79,
+            "codeName": "UnknownReplWriteConcern",
+        }
     created_auto = not ctx.storage.collection_exists(ctx.db_name, coll)
     num_before = len(ctx.storage.list_indexes(ctx.db_name, coll)) if not created_auto else 1
     ctx.storage.create_collection(ctx.db_name, coll)
@@ -2287,26 +2304,6 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         for _falsy_opt in ("hidden", "sparse", "unique"):
             if _falsy_opt in options and not options[_falsy_opt]:
                 options.pop(_falsy_opt)
-        # ``commitQuorum`` is the replica-set knob for "how many voting
-        # members must replicate the index before the build returns".
-        # On a standalone topology mongod rejects unknown string values
-        # (only the named modes ``"majority"`` / ``"votingMembers"`` /
-        # ints are valid). We're standalone too — surface the same
-        # rejection so mongo-ruby-driver's ``unsupported-value``
-        # commitQuorum test passes.
-        commit_quorum = options.get("commitQuorum")
-        if commit_quorum is not None and not (
-            isinstance(commit_quorum, int) or commit_quorum in ("majority", "votingMembers")
-        ):
-            return {
-                "ok": 0.0,
-                "errmsg": (
-                    f"Invalid value for commitQuorum: {commit_quorum!r}. "
-                    "Expected an integer, 'majority', or 'votingMembers'."
-                ),
-                "code": 14,
-                "codeName": "TypeMismatch",
-            }
         # ``partialFilterExpression`` must be a document. Numbers / strings
         # / arrays etc. are rejected by mongod with BadValue.
         pfe = options.get("partialFilterExpression")
@@ -2317,6 +2314,39 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 2,
                 "codeName": "BadValue",
             }
+        # ``wildcardProjection`` is only valid on wildcard indexes (a key
+        # of the form ``{ "$**": 1 }`` or ``{ "field.$**": 1 }``). When
+        # present it must be a non-empty document — mongod rejects ints,
+        # strings, empty docs, etc. mongo-ruby-driver's ``invalid wildcard
+        # projection expression`` and ``wildcard projection to an invalid
+        # base index`` tests pin both messages via regex.
+        wcp = options.get("wildcardProjection")
+        if wcp is not None:
+            if not isinstance(wcp, Mapping) or not wcp:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Error in specification {{ key: {dict(key_spec)!r}, "
+                        f"wildcardProjection: {wcp!r} }} :: caused by :: "
+                        "wildcardProjection must be a non-empty object"
+                    ),
+                    "code": 67,
+                    "codeName": "CannotCreateIndex",
+                }
+            is_wildcard_key = any(
+                isinstance(k, str) and (k == "$**" or k.endswith(".$**")) for k in key_spec
+            )
+            if not is_wildcard_key:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Error in specification {{ key: {dict(key_spec)!r}, "
+                        f"wildcardProjection: {dict(wcp)!r} }} :: caused by :: "
+                        "wildcardProjection is only allowed on wildcard indexes"
+                    ),
+                    "code": 67,
+                    "codeName": "CannotCreateIndex",
+                }
         try:
             new = ctx.storage.create_index(ctx.db_name, coll, name, key_spec, options)
         except CreateIndexUnsupported as exc:

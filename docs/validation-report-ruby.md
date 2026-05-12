@@ -1,6 +1,6 @@
 # mongo-ruby-driver Validation Report
 
-Generated 2026-05-12 — SecantusDB 0.5.0b12 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
+Generated 2026-05-12 — SecantusDB 0.5.0b14 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
 
 Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver gauges for the official Ruby driver — the same gem Rails + Sinatra applications and the Ruby ecosystem build on.
 
@@ -8,13 +8,13 @@ Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the ana
 
 | Category | Passed | Failed | Pending | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `spec/mongo` | 199 | 6 | 16 | 221 | 97.1% |
+| `spec/mongo` | 203 | 2 | 16 | 221 | 99.0% |
 | `spec/support` | 86 | 3 | 8 | 97 | 96.6% |
-| **Overall** | **285** | **9** | **24** | **318** | **96.9%** |
+| **Overall** | **289** | **5** | **24** | **318** | **98.3%** |
 
-Run time: 12.77s.
+Run time: 12.75s.
 
-## Failures (9)
+## Failures (5)
 
 First 30 failed examples for triage:
 
@@ -23,11 +23,7 @@ spec/mongo :: Mongo::Collection#create when the collection has options when the 
 spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a write concern when write concern passed in as an option applies the write concern passed in as an option
 spec/support :: Mongo::Collection#create when the collection has options when a session is provided behaves like a failed operation using a session raises an error
 spec/support :: Mongo::Collection#indexes when a session is provided behaves like a failed operation using a session raises an error
-spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing multi-args when commit quorum options are specified on server versions >= 4.4 when commit_quorum value is not supported raises an exception
 spec/support :: Mongo::Index::View#create_one when the index is created when provided a session behaves like a failed operation using a session raises an error
-spec/mongo :: Mongo::Index::View#create_one when providing an invalid wildcard projection expression raises an exception
-spec/mongo :: Mongo::Index::View#create_one when providing a wildcard projection to an invalid base index raises an exception
-spec/mongo :: Mongo::Index::View#create_one when providing commit_quorum option on server versions >= 4.4 when commit_quorum value is not supported raises an exception
 ```
 
 ## How this is generated
