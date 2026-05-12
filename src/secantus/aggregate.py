@@ -1073,7 +1073,7 @@ def _stage_coll_stats(
     }
     spec = spec if isinstance(spec, Mapping) else {}
     if "storageStats" in spec:
-        out["storageStats"] = {
+        storage_stats: dict[str, Any] = {
             "size": 0,
             "count": count,
             "avgObjSize": 0,
@@ -1083,6 +1083,20 @@ def _stage_coll_stats(
             "scaleFactor": 1,
             "nindexes": len(indexes),
         }
+        # Surface capped-collection bounds from the stored options.
+        # Real mongod renames the user-set ``size`` to ``maxSize`` in
+        # the storageStats payload (so callers can distinguish the
+        # current data size from the cap). mongo-ruby-driver's
+        # ``Collection#create ... applies the options`` capped spec
+        # reads `storageStats.{capped, max, maxSize}` directly.
+        opts = ctx.storage.get_collection_options(ctx.db_name, ctx.coll_name)
+        if opts.get("capped"):
+            storage_stats["capped"] = True
+            if "size" in opts:
+                storage_stats["maxSize"] = int(opts["size"])
+            if "max" in opts:
+                storage_stats["max"] = int(opts["max"])
+        out["storageStats"] = storage_stats
     if "latencyStats" in spec:
         out["latencyStats"] = {
             "reads": {"latency": 0, "ops": 0},

@@ -744,6 +744,31 @@ def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient)
     )
 
 
+def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) -> None:
+    # mongo-ruby-driver's ``Collection#create ... when the collection
+    # is capped ... applies the options`` spec runs
+    # ``coll.aggregate([{$collStats: {storageStats: {}}}])`` and reads
+    # ``storageStats.{capped, max, maxSize}``. Real mongod renames the
+    # user-set ``size`` to ``maxSize`` so callers can distinguish the
+    # current data size from the cap.
+    db = client["cs_capped_db"]
+    db.create_collection("things", capped=True, size=4096, max=512)
+    cs = list(db["things"].aggregate([{"$collStats": {"storageStats": {}}}]))
+    assert len(cs) == 1
+    storage_stats = cs[0]["storageStats"]
+    assert storage_stats["capped"] is True
+    assert storage_stats["max"] == 512
+    assert storage_stats["maxSize"] == 4096
+
+    # Non-capped collection: ``capped`` field absent (real mongod
+    # omits these fields entirely on uncapped colls).
+    db.create_collection("plain")
+    cs = list(db["plain"].aggregate([{"$collStats": {"storageStats": {}}}]))
+    assert "capped" not in cs[0]["storageStats"]
+    assert "max" not in cs[0]["storageStats"]
+    assert "maxSize" not in cs[0]["storageStats"]
+
+
 def test_list_indexes_rejects_negative_batch_size(client: MongoClient) -> None:
     # Real mongod rejects negative batchSize with BadValue.
     # mongo-ruby-driver's `failed_operation using a session` shared
