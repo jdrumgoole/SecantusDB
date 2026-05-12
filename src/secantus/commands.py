@@ -2228,9 +2228,31 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # actually round-trip via ``getMore`` — mongo-go-driver's
     # ``TestIndexView/list/getMore_commands_are_monitored`` test
     # asserts at least one getMore fires when batchSize < total.
+    # Negative ``batchSize`` is rejected: real mongod returns
+    # BadValue. mongo-ruby-driver's ``failed_operation`` shared spec
+    # constructs ``authorized_collection.indexes(batch_size: -100, ...)``
+    # specifically to provoke this.
     cursor_opts = doc.get("cursor") or {}
     raw_bs = cursor_opts.get("batchSize")
-    batch_size = DEFAULT_BATCH_SIZE if raw_bs is None else int(raw_bs)
+    if raw_bs is not None:
+        try:
+            batch_size = int(raw_bs)
+        except (TypeError, ValueError):
+            return {
+                "ok": 0.0,
+                "errmsg": "BSON field 'batchSize' must be a number",
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        if batch_size < 0:
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field 'batchSize' value must be >= 0, actual value {batch_size}",
+                "code": 51024,
+                "codeName": "BadValue",
+            }
+    else:
+        batch_size = DEFAULT_BATCH_SIZE
     ns = f"{ctx.db_name}.$cmd.listIndexes.{coll}"
     first_batch, cursor_id = _split_into_cursor(indexes, batch_size, ns, ctx.cursors)
     return {

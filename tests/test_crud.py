@@ -744,6 +744,25 @@ def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient)
     )
 
 
+def test_list_indexes_rejects_negative_batch_size(client: MongoClient) -> None:
+    # Real mongod rejects negative batchSize with BadValue.
+    # mongo-ruby-driver's `failed_operation using a session` shared
+    # spec for `indexes` passes `batch_size: -100` specifically to
+    # provoke this rejection.
+    from pymongo.errors import OperationFailure
+
+    db = client["lib_bs_db"]
+    db.command({"create": "things"})
+    with pytest.raises(OperationFailure) as exc:
+        db.command({"listIndexes": "things", "cursor": {"batchSize": -100}})
+    assert "batchSize" in str(exc.value)
+    assert ">= 0" in str(exc.value)
+
+    # batchSize=0 is valid (returns empty firstBatch + open cursor).
+    reply = db.command({"listIndexes": "things", "cursor": {"batchSize": 0}})
+    assert reply["ok"] == 1.0
+
+
 def test_create_indexes_rejects_unsupported_commit_quorum(client: MongoClient) -> None:
     # mongo-ruby-driver's commit_quorum unsupported-value tests match
     # the error message via regex: ``No write concern mode named
