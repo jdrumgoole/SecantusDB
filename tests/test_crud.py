@@ -769,6 +769,32 @@ def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) ->
     assert "maxSize" not in cs[0]["storageStats"]
 
 
+def test_snapshot_read_concern_rejected_on_standalone(client: MongoClient) -> None:
+    # Snapshot read concern requires a real replica set with
+    # majority-committed snapshots; mongod rejects with code 246
+    # (SnapshotUnavailable) on standalone. mongo-java-driver's
+    # ``snapshot-sessions-not-supported-server-error`` unified spec
+    # asserts the error on find / aggregate / distinct.
+    from pymongo.errors import OperationFailure
+
+    db = client["snapshot_rc_db"]
+    db.create_collection("things")
+
+    for cmd in (
+        {"find": "things", "readConcern": {"level": "snapshot"}},
+        {"aggregate": "things", "pipeline": [], "cursor": {}, "readConcern": {"level": "snapshot"}},
+        {"distinct": "things", "key": "x", "readConcern": {"level": "snapshot"}},
+    ):
+        with pytest.raises(OperationFailure) as exc:
+            db.command(cmd)
+        assert exc.value.code == 246
+        assert "snapshot" in str(exc.value).lower()
+
+    # Other levels still accepted.
+    reply = db.command({"find": "things", "readConcern": {"level": "majority"}})
+    assert reply["ok"] == 1.0
+
+
 def test_list_indexes_rejects_negative_batch_size(client: MongoClient) -> None:
     # Real mongod rejects negative batchSize with BadValue.
     # mongo-ruby-driver's `failed_operation using a session` shared

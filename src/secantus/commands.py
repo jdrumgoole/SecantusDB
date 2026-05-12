@@ -4359,6 +4359,21 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 9,
                 "codeName": "FailedToParse",
             }
+        # ``snapshot`` read concern requires a WiredTiger timestamp-pinned
+        # read view that's only meaningful in a real replica set with
+        # majority-committed snapshots. SecantusDB is single-node — real
+        # mongod on standalone rejects ``snapshot`` with
+        # ``SnapshotUnavailable`` (246) so drivers can fall back. The Java
+        # ``snapshot-sessions-not-supported-server-error`` unified spec
+        # asserts the error shape (any ``ok: 0`` reply on find / aggregate
+        # / distinct with ``readConcern.level: snapshot``).
+        if level == "snapshot":
+            return {
+                "ok": 0.0,
+                "errmsg": "Snapshot read concern is not supported on standalone",
+                "code": 246,
+                "codeName": "SnapshotUnavailable",
+            }
     api_version = doc.get("apiVersion")
     if api_version is not None and api_version not in _VALID_API_VERSIONS:
         return {
