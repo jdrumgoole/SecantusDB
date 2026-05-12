@@ -225,8 +225,7 @@ def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
             "code": 100,
             "codeName": "CannotSatisfyWriteConcern",
             "errmsg": (
-                f"Not enough data-bearing nodes; requested w={w} but only 1 "
-                f"member is configured"
+                f"Not enough data-bearing nodes; requested w={w} but only 1 member is configured"
             ),
         }
     return None
