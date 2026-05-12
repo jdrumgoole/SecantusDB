@@ -87,6 +87,14 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     "com.mongodb.client.ClientMetadataTest",
     "com.mongodb.client.ClusterEventPublishingTest",
     "com.mongodb.client.unified.UnifiedCrudTest",
+    # Wave 2 widening — each is a unified spec runner that drives
+    # YAML test files. The runner's ``runOnRequirements`` blocks
+    # self-skip scenarios that need features SecantusDB doesn't have
+    # (transactions, multi-node replica, retryable etc.), so
+    # individual misses surface as `skipped` rather than hangs.
+    "com.mongodb.client.unified.ChangeStreamsTest",
+    "com.mongodb.client.unified.UnifiedWriteConcernTest",
+    "com.mongodb.client.unified.VersionedApiTest",
     # Excluded (need features that are intentionally out of scope, or
     # that need a deeper investigation to be tractable):
     # - ServerSelectionLoggingTest — half its scenarios depend on the
