@@ -197,6 +197,41 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
+    """If ``writeConcern.w`` can't be satisfied, return the mongod-shaped
+    ``writeConcernError`` to attach to a successful reply.
+
+    SecantusDB advertises as a single-node replica set (`setName:
+    "secantus"`, one member). Real mongod with the same topology
+    executes write commands normally but tacks a ``writeConcernError``
+    with code 100 / ``CannotSatisfyWriteConcern`` onto the reply when
+    ``w`` is an integer above the member count. Drivers see the wce and
+    raise ``OperationFailure`` (mongo-ruby-driver's
+    ``Mongo::Collection#create ... applies the write concern`` spec
+    relies on exactly this). Returns ``None`` when ``w`` is absent,
+    ``"majority"``, or ``<= 1``.
+    """
+    wc = doc.get("writeConcern")
+    if not isinstance(wc, Mapping):
+        return None
+    w = wc.get("w")
+    # ``bool`` is an ``int`` subclass in Python — exclude it explicitly so
+    # ``w: true`` doesn't trip the comparison below. The ``True``/``False``
+    # case is unspecified at the protocol level; let the wire shape pass.
+    if isinstance(w, bool):
+        return None
+    if isinstance(w, int) and w > 1:
+        return {
+            "code": 100,
+            "codeName": "CannotSatisfyWriteConcern",
+            "errmsg": (
+                f"Not enough data-bearing nodes; requested w={w} but only 1 "
+                f"member is configured"
+            ),
+        }
+    return None
+
+
 def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
     # MongoDB 5.0+ command-level ``let`` values are aggregation
     # expressions: ``{y: {$literal: "bar"}}`` binds ``$$y`` to "bar",
@@ -4427,4 +4462,13 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         result["writeConcernError"] = failpoint_wce
         if failpoint_labels:
             result["errorLabels"] = list(failpoint_labels)
+    elif result.get("ok", 0.0):
+        # An unsatisfiable ``writeConcern.w`` (e.g. ``w: 4000`` against
+        # our single-node "secantus" replica set) gets a
+        # ``writeConcernError`` attached to the successful reply, the
+        # same way real mongod does. Drivers raise ``OperationFailure``
+        # on the wce. Failpoint-attached wces win when both apply.
+        wc_wce = _unsatisfiable_wc_error(doc)
+        if wc_wce is not None:
+            result["writeConcernError"] = wc_wce
     return result

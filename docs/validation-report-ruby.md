@@ -1,6 +1,6 @@
 # mongo-ruby-driver Validation Report
 
-Generated 2026-05-11 — SecantusDB 0.5.0b12 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
+Generated 2026-05-12 — SecantusDB 0.5.0b12 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
 
 Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver gauges for the official Ruby driver — the same gem Rails + Sinatra applications and the Ruby ecosystem build on.
 
@@ -8,30 +8,23 @@ Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the ana
 
 | Category | Passed | Failed | Pending | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `spec/mongo` | 193 | 12 | 16 | 221 | 94.1% |
-| `spec/support` | 85 | 4 | 8 | 97 | 95.5% |
-| **Overall** | **278** | **16** | **24** | **318** | **94.6%** |
+| `spec/mongo` | 199 | 6 | 16 | 221 | 97.1% |
+| `spec/support` | 86 | 3 | 8 | 97 | 96.6% |
+| **Overall** | **285** | **9** | **24** | **318** | **96.9%** |
 
-Run time: 12.99s.
+Run time: 12.77s.
 
-## Failures (16)
+## Failures (9)
 
 First 30 failed examples for triage:
 
 ```
 spec/mongo :: Mongo::Collection#create when the collection has options when the collection is capped when instantiating a collection using create applies the options
-spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a write concern when the server supports write concern on the create command applies the write concern
+spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a write concern when write concern passed in as an option applies the write concern passed in as an option
 spec/support :: Mongo::Collection#create when the collection has options when a session is provided behaves like a failed operation using a session raises an error
-spec/support :: Mongo::Collection#drop when the collection exists when a session is provided can set write concern behaves like a failed operation using a session raises an error
-spec/mongo :: Mongo::Collection#drop when the collection exists when the collection has a write concern when the server supports write concern on the drop command applies the write concern
 spec/support :: Mongo::Collection#indexes when a session is provided behaves like a failed operation using a session raises an error
-spec/mongo :: Mongo::Index::View#drop_one when the collection has a write concern when the server accepts writeConcern for the dropIndexes operation applies the write concern
-spec/mongo :: Mongo::Index::View#drop_all when indexes exists when the collection has a write concern when the server accepts writeConcern for the dropIndexes operation applies the write concern
 spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing multi-args when commit quorum options are specified on server versions >= 4.4 when commit_quorum value is not supported raises an exception
-spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing multi-args when the collection has a write concern when the server accepts writeConcern for the createIndexes operation applies the write concern
-spec/mongo :: Mongo::Index::View#create_many when the indexes are created when passing an array when the collection has a write concern when the server accepts writeConcern for the createIndexes operation applies the write concern
 spec/support :: Mongo::Index::View#create_one when the index is created when provided a session behaves like a failed operation using a session raises an error
-spec/mongo :: Mongo::Index::View#create_one when the index is created when the collection has a write concern when the server accepts writeConcern for the createIndexes operation applies the write concern
 spec/mongo :: Mongo::Index::View#create_one when providing an invalid wildcard projection expression raises an exception
 spec/mongo :: Mongo::Index::View#create_one when providing a wildcard projection to an invalid base index raises an exception
 spec/mongo :: Mongo::Index::View#create_one when providing commit_quorum option on server versions >= 4.4 when commit_quorum value is not supported raises an exception
