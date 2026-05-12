@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 
+import pymongo
 import pytest
 from bson import ObjectId
 from pymongo import MongoClient
@@ -680,6 +682,134 @@ def test_sparse_unique_index_via_pymongo(coll) -> None:
     assert coll.count_documents({}) == 3
 
 
+def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient) -> None:
+    # mongo-ruby-driver's `create_one ... invalid wildcardProjection`
+    # / `wildcard projection to an invalid base index` specs match
+    # the error messages by regex. Real mongod rejects with
+    # CannotCreateIndex (67) when the option is malformed or applied
+    # to a non-wildcard base index.
+    from pymongo.errors import OperationFailure
+
+    db = client["wcp_validation_db"]
+
+    # Non-doc wildcardProjection (test sends `wildcard_projection: 5`).
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [{"key": {"$**": 1}, "name": "wild_int", "wildcardProjection": 5}],
+            }
+        )
+    assert "wildcardProjection" in str(exc.value)
+    assert "non-empty object" in str(exc.value)
+
+    # Empty doc wildcardProjection.
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [{"key": {"$**": 1}, "name": "wild_empty", "wildcardProjection": {}}],
+            }
+        )
+    assert "non-empty object" in str(exc.value)
+
+    # wildcardProjection on a non-wildcard base index.
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [
+                    {
+                        "key": {"x": 1},
+                        "name": "x_with_wcp",
+                        "wildcardProjection": {"rating": 1},
+                    }
+                ],
+            }
+        )
+    assert "only allowed" in str(exc.value)
+
+    # Valid wildcardProjection on a wildcard key — accepted.
+    db.command(
+        {
+            "createIndexes": "things",
+            "indexes": [
+                {
+                    "key": {"$**": 1},
+                    "name": "wild_ok",
+                    "wildcardProjection": {"rating": 1},
+                }
+            ],
+        }
+    )
+
+
+def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) -> None:
+    # mongo-ruby-driver's ``Collection#create ... when the collection
+    # is capped ... applies the options`` spec runs
+    # ``coll.aggregate([{$collStats: {storageStats: {}}}])`` and reads
+    # ``storageStats.{capped, max, maxSize}``. Real mongod renames the
+    # user-set ``size`` to ``maxSize`` so callers can distinguish the
+    # current data size from the cap.
+    db = client["cs_capped_db"]
+    db.create_collection("things", capped=True, size=4096, max=512)
+    cs = list(db["things"].aggregate([{"$collStats": {"storageStats": {}}}]))
+    assert len(cs) == 1
+    storage_stats = cs[0]["storageStats"]
+    assert storage_stats["capped"] is True
+    assert storage_stats["max"] == 512
+    assert storage_stats["maxSize"] == 4096
+
+    # Non-capped collection: ``capped`` field absent (real mongod
+    # omits these fields entirely on uncapped colls).
+    db.create_collection("plain")
+    cs = list(db["plain"].aggregate([{"$collStats": {"storageStats": {}}}]))
+    assert "capped" not in cs[0]["storageStats"]
+    assert "max" not in cs[0]["storageStats"]
+    assert "maxSize" not in cs[0]["storageStats"]
+
+
+def test_list_indexes_rejects_negative_batch_size(client: MongoClient) -> None:
+    # Real mongod rejects negative batchSize with BadValue.
+    # mongo-ruby-driver's `failed_operation using a session` shared
+    # spec for `indexes` passes `batch_size: -100` specifically to
+    # provoke this rejection.
+    from pymongo.errors import OperationFailure
+
+    db = client["lib_bs_db"]
+    db.command({"create": "things"})
+    with pytest.raises(OperationFailure) as exc:
+        db.command({"listIndexes": "things", "cursor": {"batchSize": -100}})
+    assert "batchSize" in str(exc.value)
+    assert ">= 0" in str(exc.value)
+
+    # batchSize=0 is valid (returns empty firstBatch + open cursor).
+    reply = db.command({"listIndexes": "things", "cursor": {"batchSize": 0}})
+    assert reply["ok"] == 1.0
+
+
+def test_create_indexes_rejects_unsupported_commit_quorum(client: MongoClient) -> None:
+    # mongo-ruby-driver's commit_quorum unsupported-value tests match
+    # the error message via regex: ``No write concern mode named
+    # '<value>' found in replica set configuration``. Real mongod
+    # surfaces unknown commitQuorum strings as a write-concern-mode
+    # lookup miss (code 79, UnknownReplWriteConcern).
+    from pymongo.errors import OperationFailure
+
+    db = client["commit_quorum_db"]
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            {
+                "createIndexes": "things",
+                "indexes": [{"key": {"x": 1}, "name": "x_1"}],
+                "commitQuorum": "unsupported-value",
+            }
+        )
+    assert exc.value.code == 79
+    assert "No write concern mode named" in str(exc.value)
+    assert "unsupported-value" in str(exc.value)
+
+
 def test_query_elem_match_subdoc(coll) -> None:
     coll.insert_many(
         [
@@ -1294,6 +1424,44 @@ def test_aggregate_with_unknown_hint(coll) -> None:
     assert exc.value.code == 2
 
 
+def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
+    # Real mongod with a 1-member replica set executes write commands but
+    # attaches `writeConcernError` (code 100, CannotSatisfyWriteConcern)
+    # when `w` is an int above member count. mongo-ruby-driver's
+    # `Mongo::Collection#create ... applies the write concern` spec relies
+    # on this: it raises `OperationFailure` because of the wce. pymongo's
+    # `Database.command()` returns the raw doc rather than raising — check
+    # the wce directly on the reply.
+    db = client["wc_unsat_db"]
+    # `create` with w:4000 — collection IS created (the op runs), reply
+    # carries writeConcernError.
+    reply = db.command({"create": "things", "writeConcern": {"w": 4000}})
+    assert reply["ok"] == 1.0
+    wce = reply.get("writeConcernError")
+    assert wce is not None, f"expected writeConcernError, got {reply!r}"
+    assert wce["code"] == 100
+    assert wce["codeName"] == "CannotSatisfyWriteConcern"
+    assert "things" in db.list_collection_names()
+
+    # `drop` with w:4000 — same shape: op runs, wce attached.
+    reply = db.command({"drop": "things", "writeConcern": {"w": 4000}})
+    assert reply["ok"] == 1.0
+    assert reply.get("writeConcernError", {}).get("code") == 100
+    assert "things" not in db.list_collection_names()
+
+    # `w: 1` satisfiable — no wce.
+    reply = db.command({"create": "ok_things", "writeConcern": {"w": 1}})
+    assert reply["ok"] == 1.0
+    assert "writeConcernError" not in reply
+    assert "ok_things" in db.list_collection_names()
+
+    # `w: "majority"` satisfiable on single-node (majority of 1 is 1).
+    reply = db.command({"create": "majority_things", "writeConcern": {"w": "majority"}})
+    assert reply["ok"] == 1.0
+    assert "writeConcernError" not in reply
+    assert "majority_things" in db.list_collection_names()
+
+
 def test_unacknowledged_writes_do_not_desync_connection(server: SecantusDBServer) -> None:
     # `writeConcern: {w: 0}` triggers OP_MSG with the moreToCome flag set
     # — server must not reply. If it does, the next genuine response is
@@ -1330,6 +1498,57 @@ def test_create_capped_surfaces_options_via_list_collections(client: MongoClient
     assert info["options"].get("capped") is True
     assert info["options"].get("size") == 4096
     assert info["options"].get("max") == 10
+
+
+def test_list_collections_emits_info_uuid_and_idindex(client: MongoClient) -> None:
+    """Each listCollections descriptor must carry ``info.uuid`` (BSON
+    Binary subtype 4) and ``idIndex`` (mongod's implicit ``_id_`` index
+    spec).
+
+    Regression: mongo-go-driver's
+    ``TestDatabase/list_collection_specifications/filter_passed_to_listCollections``
+    reads both fields off the cursor and the ``ListCollectionSpecifications``
+    helper requires them to populate its return value.
+    """
+    import bson as _bson
+
+    db = client["lc_uuid_idx_db"]
+    db.create_collection("widgets")
+    db.create_collection("logs", capped=True, size=4096)
+    specs = {c["name"]: c for c in db.list_collections()}
+    for name in ("widgets", "logs"):
+        spec = specs[name]
+        info = spec["info"]
+        assert info.get("readOnly") is False
+        uuid_val = info.get("uuid")
+        assert isinstance(uuid_val, _bson.Binary), (
+            f"expected info.uuid to be bson.Binary, got {type(uuid_val).__name__}"
+        )
+        assert uuid_val.subtype == 4
+        assert len(uuid_val) == 16
+        id_index = spec["idIndex"]
+        assert id_index == {
+            "v": 2,
+            "key": {"_id": 1},
+            "name": "_id_",
+            "ns": f"lc_uuid_idx_db.{name}",
+        }
+
+
+def test_list_collections_filter_on_options_capped(client: MongoClient) -> None:
+    """``listCollections`` honours a server-side filter on dotted paths
+    into nested descriptor fields (``options.capped`` here). The
+    mongo-go-driver test of the same name relies on this — without the
+    server-side filter, the driver would return every collection in the
+    database and ``ListCollectionSpecifications`` would mis-report
+    counts."""
+    db = client["lc_filter_db"]
+    db.create_collection("regular")
+    db.create_collection("capped_one", capped=True, size=4096)
+    db.create_collection("capped_two", capped=True, size=8192)
+    matching = list(db.list_collections(filter={"options.capped": True}))
+    names = sorted(c["name"] for c in matching)
+    assert names == ["capped_one", "capped_two"]
 
 
 def test_create_capped_without_size_rejected(client: MongoClient) -> None:
@@ -1451,3 +1670,81 @@ def test_capped_collection_eviction_emits_change_stream_deletes(
         ops = [e["operationType"] for e in events]
         assert "insert" in ops
         assert "delete" in ops
+
+
+# ---- tailable cursors on capped collections --------------------------------
+
+
+def test_tailable_await_delivers_initial_docs_past_first_batch(client: MongoClient) -> None:
+    """find().tailable_await() with batchSize < initial-match-count must deliver
+    the rest via getMore, not throw them away.
+
+    Regression for the bug surfaced by mongo-go-driver's
+    ``TestCursor_RemainingBatchLength/first_batch_is_non_empty``:
+    ``_find_tailable`` used to set the producer's watermark to the
+    last doc in the collection, silently dropping ``initial_docs[batch_size:]``.
+    First batch worked, but the second batch was always empty —
+    awaitData blocking then masked the loss as a tailable poll, so the
+    client either looped forever (Go's ``cursor.Next``) or gave up
+    after firstBatch (pymongo's ``StopIteration``).
+    """
+    db = client["tail_init_db"]
+    db.tailcap.drop()
+    db.create_collection("tailcap", capped=True, size=64 * 1024)
+    db.tailcap.insert_many([{"x": i} for i in range(1, 6)])
+
+    cur = db.tailcap.find(
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        batch_size=2,
+    ).max_await_time_ms(100)
+    cur.batch_size(2)
+
+    seen = []
+    deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+    while len(seen) < 5 and dt.datetime.now() < deadline:
+        try:
+            doc = cur.next()
+        except StopIteration:
+            break
+        seen.append(doc["x"])
+        if len(seen) == 5:
+            break
+
+    assert seen == [1, 2, 3, 4, 5], (
+        f"expected all 5 seeded docs via firstBatch + getMore, got {seen}"
+    )
+    with contextlib.suppress(Exception):
+        cur.close()
+
+
+def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None:
+    """After firstBatch drains, the producer must surface docs inserted
+    *after* the find — the canonical tailable use case."""
+    db = client["tail_follow_db"]
+    db.tailcap.drop()
+    db.create_collection("tailcap", capped=True, size=64 * 1024)
+    db.tailcap.insert_one({"x": 1})
+
+    cur = db.tailcap.find(
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        batch_size=10,
+    ).max_await_time_ms(100)
+
+    first = cur.next()
+    assert first["x"] == 1
+
+    # New insert after the find: the next getMore must surface it.
+    db.tailcap.insert_one({"x": 2})
+
+    second = None
+    deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+    while second is None and dt.datetime.now() < deadline:
+        try:
+            second = cur.next()
+        except StopIteration:
+            break
+    assert second is not None and second["x"] == 2, (
+        f"tailable cursor did not surface follow-up insert, got {second!r}"
+    )
+    with contextlib.suppress(Exception):
+        cur.close()

@@ -47,11 +47,20 @@ def _eval(expr: Any, ctx: _Ctx) -> Any:
     return expr
 
 
+_REMOVE_SENTINEL: Any = object()
+
+
 def _resolve_var(name: str, ctx: _Ctx) -> Any:
     if name in ctx.vars:
         return ctx.vars[name]
     if name in ("ROOT", "CURRENT"):
         return ctx.doc
+    if name == "REMOVE":
+        # MongoDB 5.0+ ``$$REMOVE`` is a sentinel that, when used as a
+        # ``$setField`` / ``$addFields`` / ``$project`` value, deletes
+        # the field instead of writing it. ``_op_set_field`` checks for
+        # this identity to drop the key.
+        return _REMOVE_SENTINEL
     raise ExpressionError(f"system variable $${name} is not defined")
 
 
@@ -311,6 +320,17 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
     return math.log10(v) if v is not None and v > 0 else None
 
 
+def _op_rand(arg: Any, _ctx: _Ctx) -> float:
+    # MongoDB 5.0+: ``{$rand: {}}`` returns a uniform random double in
+    # [0, 1). Argument must be an empty document; anything else is a
+    # parse error in mongod (we mirror).
+    if not (isinstance(arg, Mapping) and not arg):
+        raise ExpressionError("$rand expects an empty document")
+    import random as _random
+
+    return _random.random()
+
+
 def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
     import math
 
@@ -348,6 +368,69 @@ def _op_object_to_array(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(v, Mapping):
         raise ExpressionError("$objectToArray requires a document")
     return [{"k": k, "v": val} for k, val in v.items()]
+
+
+def _op_set_field(arg: Any, ctx: _Ctx) -> Any:
+    """MongoDB 5.0+ ``$setField`` — set/replace a field in a document.
+
+    Accepts ``{field, input, value}`` or its array-form alias. The
+    field name is evaluated (so dynamic field names work), but
+    typically a constant string. Used by drivers' dots-and-dollars
+    tests to write keys that the normal document-builder API would
+    refuse.
+    """
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$setField requires {field, input, value}")
+    field_expr = arg.get("field")
+    input_expr = arg.get("input")
+    value_expr = arg.get("value")
+    if field_expr is None or input_expr is None or value_expr is None:
+        raise ExpressionError("$setField requires field, input, value")
+    field = _eval(field_expr, ctx)
+    if not isinstance(field, str):
+        raise ExpressionError("$setField field must evaluate to a string")
+    input_doc = _eval(input_expr, ctx)
+    if input_doc is None:
+        return None
+    if not isinstance(input_doc, Mapping):
+        raise ExpressionError("$setField input must evaluate to a document")
+    value = _eval(value_expr, ctx)
+    result = dict(input_doc)
+    # Sentinel-equivalent for removal: ``$$REMOVE`` (system var) maps
+    # to the same MISSING marker we use for "field doesn't exist". If
+    # the user supplied ``"$$REMOVE"`` or it resolved to None-via-
+    # MISSING, drop the key. Anything else is a normal assignment.
+    if value is _REMOVE_SENTINEL:
+        result.pop(field, None)
+    else:
+        result[field] = value
+    return result
+
+
+def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
+    """MongoDB 5.0+ ``$getField`` — read a field by name from a document.
+
+    Accepts ``{field, input}`` (full form) or a bare string (shorthand
+    for ``{field: <string>, input: $$CURRENT}``). The field name may
+    contain dots / dollars without being interpreted as a path —
+    that's the whole point of ``$getField`` vs. a bare ``$path``.
+    """
+    if isinstance(arg, str):
+        field, input_expr = arg, "$$CURRENT"
+    elif isinstance(arg, Mapping):
+        field_expr = arg.get("field")
+        input_expr = arg.get("input", "$$CURRENT")
+        if field_expr is None:
+            raise ExpressionError("$getField requires a field")
+        field = _eval(field_expr, ctx)
+        if not isinstance(field, str):
+            raise ExpressionError("$getField field must evaluate to a string")
+    else:
+        raise ExpressionError("$getField requires a string or {field, input} document")
+    input_doc = _eval(input_expr, ctx)
+    if input_doc is None or not isinstance(input_doc, Mapping):
+        return None
+    return input_doc.get(field)
 
 
 def _op_switch(arg: Any, ctx: _Ctx) -> Any:
@@ -1355,9 +1438,12 @@ _OPS = {
     "$ln": _op_ln,
     "$log": _op_log,
     "$log10": _op_log10,
+    "$rand": _op_rand,
     "$trunc": _op_trunc,
     "$mergeObjects": _op_merge_objects,
     "$objectToArray": _op_object_to_array,
+    "$setField": _op_set_field,
+    "$getField": _op_get_field,
     "$arrayToObject": _op_array_to_object,
     "$switch": _op_switch,
     "$regexMatch": _op_regex_match,

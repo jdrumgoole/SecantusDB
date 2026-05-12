@@ -365,26 +365,63 @@ class _SortKey:
             a, b = other.val, self.val
         else:
             a, b = self.val, other.val
-        ra = _bson_type_rank(a)
-        rb = _bson_type_rank(b)
-        if ra != rb:
-            return ra < rb
-        if a is None or b is None:
-            return False
-        if isinstance(a, Decimal128) or isinstance(b, Decimal128):
-            try:
-                ad = _to_decimal(a)
-                bd = _to_decimal(b)
-                return bool(ad < bd)
-            except (InvalidOperation, ValueError):
-                pass
-        try:
-            return bool(a < b)
-        except TypeError:
-            return type(a).__name__ < type(b).__name__
+        return _bson_lt(a, b)
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, _SortKey) and self.val == other.val
+
+
+def _bson_lt(a: Any, b: Any) -> bool:
+    """BSON sort-order ``<`` for two values.
+
+    Handles the four cases ``__lt__`` used to inline: cross-type rank,
+    Decimal128 widening, native ``<``, and the embedded-document /
+    array recursion — mongo-node-driver's
+    ``Aggregation ... pipeline using array`` test sorts grouped docs
+    by an embedded ``_id`` field and the previous inline ``a < b``
+    raised ``TypeError`` on Python's dicts.
+    """
+    ra = _bson_type_rank(a)
+    rb = _bson_type_rank(b)
+    if ra != rb:
+        return ra < rb
+    if a is None or b is None:
+        return False
+    if isinstance(a, Decimal128) or isinstance(b, Decimal128):
+        try:
+            ad = _to_decimal(a)
+            bd = _to_decimal(b)
+            return bool(ad < bd)
+        except (InvalidOperation, ValueError):
+            pass
+    # Embedded documents: compare field-by-field in insertion order,
+    # first differing pair wins. Real BSON sort recurses; Python's dict
+    # ``<`` raises ``TypeError`` so without this branch sort would be
+    # a no-op on grouped ``_id`` keys.
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        a_items = list(a.items())
+        b_items = list(b.items())
+        for (ak, av), (bk, bv) in zip(a_items, b_items, strict=False):
+            if ak != bk:
+                return ak < bk
+            if _bson_lt(av, bv):
+                return True
+            if _bson_lt(bv, av):
+                return False
+        return len(a_items) < len(b_items)
+    # Arrays: lexicographic, element-by-element. Same TypeError trap
+    # as the dict case for arrays-of-mixed-types.
+    if isinstance(a, list) and isinstance(b, list):
+        for av, bv in zip(a, b, strict=False):
+            if _bson_lt(av, bv):
+                return True
+            if _bson_lt(bv, av):
+                return False
+        return len(a) < len(b)
+    try:
+        return bool(a < b)
+    except TypeError:
+        return type(a).__name__ < type(b).__name__
 
 
 def sort_docs(
@@ -405,10 +442,54 @@ _ID_INDEX_NAME = "_id_"
 
 
 class IndexConflict(Exception):
-    def __init__(self, index_name: str, doc_id: Any) -> None:
+    def __init__(
+        self,
+        index_name: str,
+        doc_id: Any,
+        *,
+        key_pattern: dict[str, Any] | None = None,
+        key_value: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(f"E11000 duplicate key error in index {index_name}: _id={doc_id!r}")
         self.index_name = index_name
         self.doc_id = doc_id
+        # Real mongod returns ``keyPattern`` (the index spec) and
+        # ``keyValue`` (the conflicting field values) in the dup-key
+        # error response. Drivers expose them as ``errorResponse``
+        # fields; mongo-java-driver's ``findOneAndUpdate-errorResponse``
+        # asserts both. Optional because legacy raise-sites
+        # (``_id`` collision before index machinery, recovery paths)
+        # don't have the index spec handy.
+        self.key_pattern = key_pattern
+        self.key_value = key_value
+
+
+class DocumentValidationError(Exception):
+    """A write produced a doc that didn't satisfy the collection's
+    ``validator``. Caught at the command layer and surfaced as the
+    mongod-shaped writeError (code 121, ``DocumentValidationFailure``)
+    with the ``errInfo.failingDocumentId`` field drivers' errorResponse
+    tests assert on."""
+
+    def __init__(self, doc_id: Any) -> None:
+        super().__init__("Document failed validation")
+        self.doc_id = doc_id
+
+
+class CreateIndexUnsupported(Exception):
+    """``create_index`` was given an index type SecantusDB doesn't support
+    (currently ``text`` / ``hashed``). Caught at the command layer and
+    surfaced as a typed wire error rather than letting the cell-encoder
+    later trip over an opaque internal exception."""
+
+
+class IndexOptionsConflict(Exception):
+    """``create_index`` was called with a name that already exists in the
+    collection but with conflicting options (different ``unique`` /
+    ``sparse`` / ``hidden`` / ``expireAfterSeconds`` /
+    ``partialFilterExpression``). Real mongod rejects with
+    ``IndexOptionsConflict`` (code 85); drivers (mongo-ruby-driver's
+    ``Collection#create_indexes`` specs) assert on the rejection."""
 
 
 class GeoExtractError(Exception):
@@ -473,6 +554,10 @@ class Storage:
         # 1 GB gives generous headroom for tests + reasonable
         # in-process workloads while staying well under the limits
         # ``mongod`` itself runs with on a normal box.
+        # Tracked so ``checkpoint()`` calls are skipped in in-memory
+        # mode (WT's in_memory backend rejects them with a noisy
+        # ``__wt_inmem_unsupported_op`` log line on every call).
+        self._in_memory = path == ":memory:"
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
@@ -761,6 +846,7 @@ class Storage:
 
     def get_collection_options(self, db: str, coll: str) -> dict[str, Any]:
         """Return the collection's options blob, or ``{}`` if absent."""
+        self._refresh_read_snapshot()
         with self._lock:
             opts = self._coll_options(db, coll) or {}
             # Decode UUID Binary back into uuid.UUID for callers.
@@ -1291,8 +1377,12 @@ class Storage:
             # gives a durable on-disk image of the dataset at the
             # moment of shutdown regardless of journal state — the
             # behaviour callers reasonably expect from ``close()``.
-            with contextlib.suppress(Exception):
-                self._session().checkpoint()
+            # Skip for in-memory backends: WT's in_memory engine
+            # rejects checkpoint() with a noisy stderr log
+            # (``__wt_inmem_unsupported_op``) on every call.
+            if not self._in_memory:
+                with contextlib.suppress(Exception):
+                    self._session().checkpoint()
             for s in self._all_sessions:
                 with contextlib.suppress(Exception):
                     s.close()
@@ -1444,9 +1534,12 @@ class Storage:
 
         Backs the ``fsync`` command and the admin UI's maintenance
         slice. Lock-protected so concurrent commands wait their turn.
+        On in-memory backends the call is a no-op (WT's in_memory
+        engine has no disk to flush and rejects with a noisy stderr
+        log).
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._in_memory:
                 return
             self._session().checkpoint()
 
@@ -1498,6 +1591,36 @@ class Storage:
             with self._lock:
                 self._all_sessions.append(s)
         return s
+
+    def _refresh_read_snapshot(self) -> None:
+        """Force the per-thread WT session to acquire a fresh read snapshot.
+
+        WiredTiger's default snapshot isolation pins a session's read
+        view at first cursor access; subsequent reads on the same
+        session see exactly that point-in-time view until the session
+        commits / rolls back a transaction. That's correct for a single
+        in-flight operation, but our daemon reuses one session per
+        connection thread across the full lifetime of a TCP connection.
+        Without an explicit snapshot refresh, a long-lived client
+        connection (Java's ``ClusterFixture`` is the canonical case)
+        does an insert, idles while another connection commits a
+        write, then reads — and sees the stale pre-other-write view.
+
+        ``session.reset_snapshot()`` releases the held snapshot so the
+        next cursor read picks up the latest committed state. Called at
+        the top of every public read entry point (``find_matching``,
+        ``count_matching``, ``list_*``, ``explain_plan``) so cross-
+        connection visibility matches real ``mongod``.
+        """
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            return
+        with contextlib.suppress(Exception):
+            # ``reset_snapshot()`` errors if the session is in an
+            # explicit transaction. Reads never run inside one
+            # (``_batch_transaction`` is write-only), so the exception
+            # path is defensive — log via ``suppress`` and move on.
+            s.reset_snapshot()
 
     def _cursor(self, table: str, *, overwrite: bool = True) -> Any:
         self._session()
@@ -1645,14 +1768,16 @@ class Storage:
                     db, coll, doc, indexes, exclude_id_key=None, partials=partials
                 )
                 if conflict is not None:
+                    cname, kpat, kval = conflict
                     errors.append(
                         {
                             "index": index,
                             "code": 11000,
                             "errmsg": (
-                                f"E11000 duplicate key error in index {conflict}: "
-                                f"_id={doc['_id']!r}"
+                                f"E11000 duplicate key error in index {cname}: _id={doc['_id']!r}"
                             ),
+                            "keyPattern": kpat,
+                            "keyValue": kval,
                         }
                     )
                     if ordered:
@@ -1782,7 +1907,12 @@ class Storage:
         projection: Mapping[str, Any] | None = None,
         hint: str | Mapping[str, Any] | None = None,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
     ) -> list[dict[str, Any]]:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
         filter = filter or {}
         in_sort_order = False
         # Two-stage decode discipline: the lock is held only for the
@@ -1802,6 +1932,19 @@ class Storage:
                 candidates, in_sort_order = self._candidates_from_hint(
                     db, coll, resolved, sort_field, sort_dir
                 )
+            elif collation_obj is not None:
+                # Index entries are byte-encoded under the default
+                # codepoint ordering — they don't carry the collation's
+                # case- or accent-folding. A case-insensitive equality
+                # like ``{x: "PING"}`` would miss an indexed doc with
+                # ``x: "ping"`` because the entries are stored under
+                # the literal bytes of the inserted value. Force a
+                # COLLSCAN so ``matches()`` does the comparison with
+                # the collation in hand. ``mongod`` only honours an
+                # index when its definition's collation matches the
+                # query's; we don't support per-index collation yet,
+                # so the safe path is always-COLLSCAN-when-collation.
+                raw_blobs = [b for _, b in self._scan_docs(db, coll)]
             else:
                 candidates = self._try_index_lookup(db, coll, filter)
                 if candidates is not None and sort_field is not None:
@@ -1844,7 +1987,7 @@ class Storage:
         if candidates is None:
             assert raw_blobs is not None
             candidates = [bson.decode(b) for b in raw_blobs]
-        out = [d for d in candidates if matches(d, filter, vars=let)]
+        out = [d for d in candidates if matches(d, filter, vars=let, collation=collation_obj)]
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
         if skip:
@@ -2201,11 +2344,20 @@ class Storage:
         filter: dict[str, Any] | None = None,
         *,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
     ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
         if not filter:
             with self._lock:
                 return sum(1 for _ in self._scan_docs(db, coll))
-        return sum(1 for doc in self._all_docs(db, coll) if matches(doc, filter, vars=let))
+        return sum(
+            1
+            for doc in self._all_docs(db, coll)
+            if matches(doc, filter, vars=let, collation=collation_obj)
+        )
 
     def collection_data_size(self, db: str, coll: str) -> int:
         """Sum of bson-encoded doc bytes for ``coll``.
@@ -2246,7 +2398,19 @@ class Storage:
         upsert: bool = False,
         array_filters: list[dict[str, Any]] | None = None,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
+        validator: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        # Release any sticky session snapshot before the write's
+        # ``begin_transaction`` acquires a new one. Otherwise the
+        # transaction inherits a stale view and the candidate scan
+        # misses rows committed by other connections (the cross-
+        # connection visibility fix applied to reads — see
+        # ``_refresh_read_snapshot``).
+        self._refresh_read_snapshot()
         matched = 0
         modified = 0
         upserted_id: Any = None
@@ -2270,21 +2434,45 @@ class Storage:
             # come back from the index walk); full scan otherwise. Either
             # way the doc cursor isn't held across writes — bytes are
             # eagerly buffered. Only matching docs pay ``bson.decode``.
-            candidates = self._candidates_iter(db, coll, filter)
+            # With a collation in effect, fall back to a doc-table scan:
+            # the index entries don't carry the collation's folding, so
+            # an indexed equality probe would miss case-insensitive
+            # matches. Always materialise the list — the update loop
+            # rewrites the doc table via the cached cursor, which
+            # invalidates a still-walking ``_scan_docs`` cursor on the
+            # same session.
+            if collation_obj is not None:
+                candidates = list(self._scan_docs(db, coll))
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
             for id_k, blob in candidates:
                 doc = bson.decode(blob)
-                if not matches(doc, filter, vars=let):
+                if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
                 matched += 1
                 pos = find_positional_matches(doc, filter)
-                new = apply_update(doc, update, array_filters=array_filters, positional_matches=pos)
+                new = apply_update(
+                    doc,
+                    update,
+                    array_filters=array_filters,
+                    positional_matches=pos,
+                    let=let,
+                )
                 if new != doc:
+                    # Document-validator check: collection-level
+                    # ``validator`` (set via ``create`` / ``collMod``)
+                    # rejects updates whose result fails the predicate.
+                    # Caller passes ``None`` to skip
+                    # (``bypassDocumentValidation: true``).
+                    if validator is not None and not matches(new, validator):
+                        raise DocumentValidationError(new.get("_id"))
                     new_id_key = _id_key(new["_id"])
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_id_key=id_k, partials=partials
                     )
                     if conflict is not None:
-                        raise IndexConflict(conflict, new["_id"])
+                        cname, kpat, kval = conflict
+                        raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
                     # Geo validation must reject the update before any
                     # write happens, otherwise we'd be left with a
                     # half-deleted set of index entries.
@@ -2325,12 +2513,15 @@ class Storage:
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
+                if validator is not None and not matches(new, validator):
+                    raise DocumentValidationError(new.get("_id"))
                 upserted_id = new["_id"]
                 conflict = self._unique_conflict(
                     db, coll, new, indexes, exclude_id_key=None, partials=partials
                 )
                 if conflict is not None:
-                    raise IndexConflict(conflict, new["_id"])
+                    cname, kpat, kval = conflict
+                    raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
                 self._validate_geo_indexes(db, coll, new, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
@@ -2366,7 +2557,14 @@ class Storage:
         *,
         limit: int = 0,
         let: dict[str, Any] | None = None,
+        collation: Any = None,
     ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        # See ``update_matching`` — release the sticky snapshot so the
+        # candidate scan sees writes committed by other connections.
+        self._refresh_read_snapshot()
         deleted = 0
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
@@ -2387,10 +2585,18 @@ class Storage:
             partials = self._partial_filters(db, coll)
             # Index-routed candidates when the filter is covered; full scan
             # otherwise. See update_matching for the full-scan rationale.
-            candidates = self._candidates_iter(db, coll, filter)
+            # Collation forces a full scan — index entries don't carry the
+            # collation's folding. Always materialise into a list so the
+            # delete loop's writes don't invalidate the iteration cursor
+            # mid-scan (deletes via ``_cursor(_DOC_TABLE)`` share the
+            # cached cursor with ``_scan_docs``).
+            if collation_obj is not None:
+                candidates = list(self._scan_docs(db, coll))
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
             for id_k, blob in candidates:
                 doc = bson.decode(blob)
-                if not matches(doc, filter, vars=let):
+                if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials)
                 doc_cur = self._cursor(_DOC_TABLE)
@@ -2654,6 +2860,7 @@ class Storage:
             return True, None
 
     def list_collections(self, db: str) -> list[str]:
+        self._refresh_read_snapshot()
         with self._lock:
             c = self._cursor(_COLL_TABLE)
             c.set_key(db, "")
@@ -2673,6 +2880,7 @@ class Storage:
             return sorted(out)
 
     def list_databases(self) -> list[str]:
+        self._refresh_read_snapshot()
         with self._lock:
             c = self._cursor(_COLL_TABLE)
             seen: set[str] = set()
@@ -2693,12 +2901,44 @@ class Storage:
     ) -> bool:
         if name == _ID_INDEX_NAME:
             return False
+        # Text / hashed indexes are documented out-of-scope (CLAUDE.md
+        # "Out of scope regardless: text / hashed / wildcard indexes").
+        # Surface the rejection as a typed exception (caught in
+        # ``commands._create_indexes``) instead of letting the geo
+        # picker / encoder later fall over with an opaque internal
+        # error. Mongo-node-driver's ``Find should correctly sort using
+        # text search`` test expects a clean error here.
+        for _field, _spec_val in key_spec.items():
+            if _spec_val in ("text", "hashed"):
+                raise CreateIndexUnsupported(f"{_spec_val} indexes are not supported by SecantusDB")
         options = dict(options or {})
         with self._lock:
             self._ensure_collection(db, coll)
             c = self._cursor(_IDX_TABLE)
             c.set_key(db, coll, name)
             if c.search() == 0:
+                # Index exists. Mongo rejects re-creation with conflicting
+                # options (different ``unique`` / ``sparse`` / ``hidden``
+                # / ``expireAfterSeconds``). Silently succeeding hides
+                # a bug surface that mongo-ruby-driver's ``Collection#
+                # create_indexes when index creation fails`` test pins.
+                existing_raw = bytes(c.get_value())
+                existing = bson.decode(existing_raw) if existing_raw else {}
+                existing_opts = dict(existing.get("options") or {})
+                _CONFLICTING_OPTS = (
+                    "unique",
+                    "sparse",
+                    "hidden",
+                    "expireAfterSeconds",
+                    "partialFilterExpression",
+                )
+                for opt in _CONFLICTING_OPTS:
+                    if (opt in options or opt in existing_opts) and options.get(
+                        opt
+                    ) != existing_opts.get(opt):
+                        raise IndexOptionsConflict(
+                            f"Index with name '{name}' already exists with different options"
+                        )
                 return False
             sparse = bool(options.get("sparse"))
             unique = bool(options.get("unique"))
@@ -2785,6 +3025,7 @@ class Storage:
             return True
 
     def list_indexes(self, db: str, coll: str) -> list[dict[str, Any]]:
+        self._refresh_read_snapshot()
         with self._lock:
             if self._coll_options(db, coll) is None:
                 return []
@@ -3071,7 +3312,11 @@ class Storage:
         *,
         exclude_id_key: bytes | None,
         partials: dict[str, dict[str, Any]] | None = None,
-    ) -> str | None:
+    ) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+        # Returns ``(index_name, key_pattern, key_value)`` so callers
+        # can build a mongod-shaped dup-key error response with the
+        # ``keyPattern`` + ``keyValue`` fields drivers' errorResponse
+        # tests assert on. ``None`` when no conflict.
         if not indexes:
             return None
         c = self._cursor(_IDX_ENTRIES_TABLE)
@@ -3104,7 +3349,10 @@ class Storage:
                 if row_esc != esc_kb:
                     break
                 if exclude_id_key is None or row_id != exclude_id_key:
-                    return name
+                    key_value = {
+                        field: get_path(candidate_doc, field, default=None) for field in key_spec
+                    }
+                    return name, dict(key_spec), key_value
                 if c.next() != 0:
                     break
         return None

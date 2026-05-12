@@ -77,15 +77,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-java-driver"
 RESULTS_DIR = REPO_ROOT / ".validation" / "java-results"
 
-# Fixed port — ``27018``, the project-wide convention for SecantusDB
-# under test (see CLAUDE.md). All driver gauges share this port;
-# they run sequentially in CI so the shared port doesn't conflict.
-DAEMON_PORT = 27018
-
 # Test users mongo-java-driver's ClusterFixture connection string
 # expects when ``-Dorg.mongodb.test.uri`` carries credentials.
 ROOT_USER = "root-user"
 ROOT_PASSWORD = "password"
+
+
+def _pick_ephemeral_port() -> int:
+    """Ask the kernel for a free ephemeral TCP port. See ``go_validation.runner``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -153,7 +155,7 @@ def main() -> int:
     RESULTS_DIR.mkdir(parents=True)
 
     host = "127.0.0.1"
-    port = DAEMON_PORT
+    port = _pick_ephemeral_port()
 
     # Tempdir storage so the user records we seed in phase 1 survive
     # the daemon restart in phase 2 with --auth.
@@ -202,7 +204,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()
@@ -248,10 +250,29 @@ def main() -> int:
         # module (bson). Each invocation pays gradle's startup cost (~10s
         # without --daemon), but the alternative is a single multi-task
         # invocation where Gradle CLI's `--tests` would apply globally.
+        # Phase 3: parallel JVM forks for the test tasks. The driver's
+        # ``conventions/testing-base.gradle.kts`` hardcodes
+        # ``maxParallelForks = 1``; we override via an init-script
+        # (vendored tree stays unmodified). Worker count is the runner's
+        # CPU count by default; ``SECANTUS_GAUGE_PARALLEL_FORKS`` overrides.
+        init_script = REPO_ROOT / "java_validation" / "init.gradle.kts"
+        forks = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
+        if forks is None:
+            env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(os.cpu_count() or 1)
+
         gradle_rcs: list[int] = []
         for spec in INCLUDE:
             cmd = [
                 "./gradlew", "--no-daemon", "--console=plain",
+                "--init-script", str(init_script),
+                # ``--rerun-tasks`` forces Gradle to re-execute the
+                # test task even when its inputs (Java sources, system
+                # properties) haven't changed. Without it, server-side
+                # SecantusDB changes don't invalidate Gradle's
+                # test-task cache and the same stale JUnit XML is read
+                # back, producing identical "171/183" numbers no
+                # matter what we fix on the server.
+                "--rerun-tasks",
                 f"-Dorg.mongodb.test.uri={uri}",
                 # Per-test wall-clock timeout. JUnit 5 (Jupiter)
                 # honours these system properties; with the default
@@ -390,7 +411,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()

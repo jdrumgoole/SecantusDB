@@ -451,6 +451,65 @@ def validate_java(c: Context) -> None:
     print("\nWrote docs/validation-report-java.md")
 
 
+@task(name="validate-all")
+def validate_all(c: Context) -> None:
+    """Run all five driver gauges in parallel.
+
+    Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
+    fans out ``invoke validate / validate-go / validate-node /
+    validate-java / validate-ruby`` across a 5-wide thread pool. Each
+    gauge spawns its own SecantusDB daemon on a kernel-assigned
+    ephemeral port + its own tempdir, so they don't collide.
+
+    Wall-clock is the slowest single gauge (usually node or java); on
+    a dev laptop ~5x faster than the previous serial run. Output from
+    the five subprocesses interleaves on stdout/stderr — accepted
+    trade-off for live progress. Exit code is non-zero if any gauge
+    failed.
+    """
+    import concurrent.futures
+    import subprocess
+    import sys
+
+    GAUGES = [
+        ("pymongo", "validate"),
+        ("go", "validate-go"),
+        ("node", "validate-node"),
+        ("java", "validate-java"),
+        ("ruby", "validate-ruby"),
+    ]
+
+    def _run(name_task: tuple[str, str]) -> tuple[str, int]:
+        name, task_name = name_task
+        # Stream stdout/stderr directly so the user gets live progress.
+        # We don't capture — interleaving is the price of parallelism.
+        result = subprocess.run(
+            ["uv", "run", "--no-sync", "python", "-m", "invoke", task_name],
+            check=False,
+        )
+        return name, result.returncode
+
+    print(f"validate-all: dispatching {len(GAUGES)} gauges in parallel\n", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GAUGES)) as pool:
+        futures = {pool.submit(_run, ng): ng[0] for ng in GAUGES}
+        results = {
+            future.result()[0]: future.result()[1]
+            for future in concurrent.futures.as_completed(futures)
+        }
+
+    print("\n=== validate-all summary ===", flush=True)
+    failed = []
+    for name, _ in GAUGES:
+        rc = results.get(name, 1)
+        status = "ok" if rc == 0 else f"FAILED (rc={rc})"
+        print(f"  {name:<8} {status}", flush=True)
+        if rc != 0:
+            failed.append(name)
+    if failed:
+        print(f"\n{len(failed)} gauge(s) failed: {', '.join(failed)}", flush=True)
+        sys.exit(1)
+
+
 @task(name="validate-readme")
 def validate_readme(c: Context) -> None:
     """HEAD-check every URL in the published PyPI README.
@@ -480,6 +539,31 @@ def clean(c: Context) -> None:
         "rm -rf build dist *.egg-info .pytest_cache .ruff_cache .coverage htmlcov docs/_build",
         pty=True,
     )
+    # Sweep leaked gauge tempdirs. Aborted runs of ``invoke validate-*``
+    # leave ``secantus-<driver>-gauge-XXXXXX`` directories under the
+    # system tempdir (``/var/folders/.../T`` on macOS, ``/tmp`` on
+    # Linux). Each holds a WiredTiger store — tens of MB at minimum.
+    # Reap anything older than an hour so an active gauge isn't
+    # interrupted.
+    import glob
+    import os
+    import shutil
+    import tempfile
+    import time
+
+    cutoff = time.time() - 3600.0
+    base = tempfile.gettempdir()
+    candidates = glob.glob(os.path.join(base, "secantus-*-gauge-*"))
+    swept = 0
+    for path in candidates:
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+                swept += 1
+        except FileNotFoundError:
+            continue
+    if swept:
+        print(f"clean: swept {swept} stale gauge tempdir(s) older than 1h under {base}")
 
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([ab]\d+|rc\d+)?$")

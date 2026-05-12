@@ -1739,6 +1739,7 @@ async def test_insert_single_document_round_trip(server, http: AsyncClient) -> N
     assert "1 doc" in r.text
     # Sanity: real document landed in the underlying SecantusDB.
     import pymongo
+
     with pymongo.MongoClient(server.uri, serverSelectionTimeoutMS=2000) as c:
         n = c["tdb"]["things"].count_documents({"x": 1, "name": "alpha"})
     assert n == 1
@@ -1755,7 +1756,7 @@ async def test_insert_array_payload(server, http: AsyncClient) -> None:
 
 
 async def test_insert_ndjson_payload(server, http: AsyncClient) -> None:
-    payload = '\n'.join(['{"k": 1}', '{"k": 2}', '', '{"k": 3}'])
+    payload = "\n".join(['{"k": 1}', '{"k": 2}', "", '{"k": 3}'])
     r = await http.post(
         "/insert",
         data={"db": "tdb3", "coll": "rows", "docs": payload},
@@ -1825,9 +1826,7 @@ async def test_json_pretty_script_loaded_on_every_page(http: AsyncClient) -> Non
 
 async def test_json_pretty_static_file_served(http: AsyncClient) -> None:
     """The script itself is reachable as a static asset."""
-    r = await http.get(
-        "/static/js/json-pretty.js", headers={HEADER_NAME: "testtoken"}
-    )
+    r = await http.get("/static/js/json-pretty.js", headers={HEADER_NAME: "testtoken"})
     assert r.status_code == 200
     body = r.text
     # Public helpers the changestream page (and any future Alpine page)

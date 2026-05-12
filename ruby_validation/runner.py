@@ -3,8 +3,10 @@
 End-to-end integration gauge: SecantusDB and the Ruby driver
 exchange real wire commands over TCP. The runner:
 
-1. Spawns ``python -m secantus --host 127.0.0.1 --port 20718
-   --storage-path :memory:`` as a subprocess.
+1. Spawns ``python -m secantus --host 127.0.0.1 --port <picked>
+   --storage-path <tempdir>`` as a subprocess. The port is a fresh
+   kernel-assigned ephemeral one so multiple gauges can run in
+   parallel (see Phase 2 of the parallelization plan).
 2. Waits for the listener to come up.
 3. Pre-provisions ``root-user`` and ``ruby-test-user`` via a setup
    pymongo client. mongo-ruby-driver's spec_helper assumes both
@@ -43,14 +45,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-ruby-driver"
 RAW_OUT = REPO_ROOT / ".validation" / "ruby-raw.json"
 
-# Fixed port — ``27018``, the project-wide convention for SecantusDB
-# under test (see CLAUDE.md). It's mongod's standard "alternate" port,
-# out of the way of any real ``mongod`` listening on ``27017`` but
-# predictable enough that failure messages cite a verbatim address
-# you can hit by hand. All driver gauges share this port; only one
-# can run at a time, which is fine — gauges run sequentially in CI.
-DAEMON_PORT = 27018
-
 # Hard wall-clock limit on the rspec invocation. The Ruby driver's
 # integration suite has tests that wait indefinitely on tailable
 # cursors / change-stream getMore round-trips when the server doesn't
@@ -69,6 +63,13 @@ ROOT_PASSWORD = "password"
 TEST_USER = "ruby-test-user"
 TEST_PASSWORD = "password"
 TEST_DB = "ruby-driver"
+
+
+def _pick_ephemeral_port() -> int:
+    """Ask the kernel for a free ephemeral TCP port. See ``go_validation.runner``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
@@ -201,7 +202,7 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = DAEMON_PORT
+    port = _pick_ephemeral_port()
 
     # Use an on-disk tempdir (NOT ``:memory:``) so the user records we
     # seed survive the auth-mode flip below. ``:memory:`` would lose
@@ -244,7 +245,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()
@@ -322,7 +323,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()

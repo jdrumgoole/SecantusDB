@@ -1,9 +1,18 @@
-name: Validate (pymongo conformance)
+name: Validate (driver conformance)
 
-# Runs the vendored pymongo test suite against an embedded SecantusDB
-# and regenerates docs/validation-report.md. Slow (~1-2 min on a fresh
-# WT build) so this is NOT on every push — it runs weekly on Monday and
-# can be triggered manually.
+# Runs the vendored driver test suites (pymongo, go, node, java, ruby)
+# against SecantusDB and regenerates the per-driver `docs/validation-
+# report*.md` files. Slow (~10–15 min per driver on a fresh WT build)
+# so this is NOT on every push — it runs weekly on Monday and can be
+# triggered manually.
+#
+# Layout: each driver gauge runs as its own matrix entry on a fresh
+# runner with only the toolchain it needs. The `aggregate` job that
+# follows downloads every gauge's report artifact, drops them into
+# `docs/`, and opens a single PR with the combined diff if anything
+# changed. Splitting the gauges across runners turns the ~30–40 min
+# serial run into ~10–15 min of wall-clock, at the cost of 5×
+# runner-minutes total — fine for weekly cadence.
 
 on:
   schedule:
@@ -12,11 +21,21 @@ on:
 
 jobs:
   validate:
+    name: ${{ matrix.driver.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        driver:
+          - { name: pymongo, task: validate,      report: docs/validation-report.md }
+          - { name: go,      task: validate-go,   report: docs/validation-report-go.md }
+          - { name: node,    task: validate-node, report: docs/validation-report-node.md }
+          - { name: java,    task: validate-java, report: docs/validation-report-java.md }
+          - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive   # pulls vendor/wiredtiger AND vendor/pymongo-tests
+          submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
       - name: Install swig
         run: sudo apt-get update && sudo apt-get install -y swig
@@ -33,66 +52,131 @@ jobs:
         run: uv sync --extra dev   # builds vendored WT, installs pytest-json-report
 
       - name: Set up Go
+        if: matrix.driver.name == 'go'
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
 
+      - name: Cache Go modules + build
+        if: matrix.driver.name == 'go'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          # Pin the cache to the vendored mongo-go-driver submodule SHA so a
+          # submodule bump invalidates cleanly. ``go.sum`` is captured inside
+          # the submodule already; using the submodule pointer file (``.gitmodules``
+          # entry + the parent commit's tree) would be equivalent but harder
+          # to spell in ``hashFiles``. The submodule SHA is what changed in
+          # the parent commit, so its hash is the right cache key.
+          key: ${{ runner.os }}-go-${{ hashFiles('vendor/mongo-go-driver/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
       - name: Set up Node.js
+        if: matrix.driver.name == 'node'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
+      - name: Cache node_modules
+        if: matrix.driver.name == 'node'
+        uses: actions/cache@v4
+        with:
+          path: vendor/node-mongodb-native/node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('vendor/node-mongodb-native/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-modules-
+
       - name: Set up JDK
+        if: matrix.driver.name == 'java'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
 
+      - name: Cache Gradle caches + wrapper
+        if: matrix.driver.name == 'java'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Cache the gradle distribution (``~/.gradle/wrapper`` is ~150 MB)
+          # plus dependency caches. Key on every build script + version
+          # catalogue file in the vendored driver, so any version bump
+          # invalidates cleanly. The buildSrc compile (~1m on cold cache)
+          # is by far the biggest win here.
+          key: ${{ runner.os }}-gradle-${{ hashFiles('vendor/mongo-java-driver/gradle/wrapper/gradle-wrapper.properties', 'vendor/mongo-java-driver/**/*.gradle*', 'vendor/mongo-java-driver/gradle/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Set up Ruby
+        if: matrix.driver.name == 'ruby'
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
-          bundler-cache: false  # we install gems via the runner's bundle install
+          bundler-cache: false  # gems installed via runner's bundle install
 
-      - name: Run pymongo validation
-        run: uv run python -m invoke validate
+      - name: Cache Ruby bundle
+        if: matrix.driver.name == 'ruby'
+        uses: actions/cache@v4
+        with:
+          path: vendor/mongo-ruby-driver/.bundle
+          key: ${{ runner.os }}-ruby-bundle-${{ hashFiles('vendor/mongo-ruby-driver/Gemfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ruby-bundle-
 
-      - name: Run go-driver validation
-        run: uv run python -m invoke validate-go
+      - name: Run ${{ matrix.driver.name }} validation
+        run: uv run python -m invoke ${{ matrix.driver.task }}
 
-      - name: Run node-driver validation
-        run: uv run python -m invoke validate-node
+      - name: Show report summary
+        run: head -50 ${{ matrix.driver.report }}
 
-      - name: Run java-driver validation
-        run: uv run python -m invoke validate-java
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.driver.name }}
+          path: ${{ matrix.driver.report }}
+          if-no-files-found: error
 
-      - name: Run ruby-driver validation
-        run: uv run python -m invoke validate-ruby
+  aggregate:
+    name: Aggregate reports and open PR
+    needs: validate
+    runs-on: ubuntu-latest
+    # `always()` so the aggregate step runs even if one driver gauge fails —
+    # we still want to ship the reports for the gauges that did succeed so a
+    # regression in one driver doesn't hide partial progress in the others.
+    if: always() && !cancelled()
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Show report summaries
+      - name: Download all report artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage downloaded reports into docs/
         run: |
-          echo "=== pymongo ==="
-          head -50 docs/validation-report.md
-          echo
-          echo "=== go-driver ==="
-          head -50 docs/validation-report-go.md
-          echo
-          echo "=== node-driver ==="
-          head -50 docs/validation-report-node.md
-          echo
-          echo "=== java-driver ==="
-          head -50 docs/validation-report-java.md
-          echo
-          echo "=== ruby-driver ==="
-          head -50 docs/validation-report-ruby.md
+          # Each artifact is `report-<driver>` and contains the single
+          # `docs/validation-report*.md` it produced (path was preserved
+          # by upload-artifact). Copy into the checkout so a `git diff`
+          # against main captures every gauge's update in one place.
+          shopt -s nullglob
+          for f in artifacts/report-*/docs/validation-report*.md; do
+            cp "$f" docs/
+          done
+          ls -la docs/validation-report*.md
 
-      # If either report changed, open a PR rather than committing directly to
-      # main — keeps a human in the loop on coverage shifts.
       - name: Open PR if reports changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md docs/validation-report-ruby.md; then
+          if git diff --quiet docs/validation-report*.md; then
             echo "No change to validation reports."
             exit 0
           fi
@@ -100,9 +184,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add docs/validation-report.md docs/validation-report-go.md docs/validation-report-node.md docs/validation-report-java.md docs/validation-report-ruby.md
+          git add docs/validation-report*.md
           git commit -m "Refresh validation reports (pymongo + go + node + java + ruby)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test output."

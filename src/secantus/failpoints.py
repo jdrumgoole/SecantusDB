@@ -52,6 +52,9 @@ class _FailCommand:
 
     error_labels: tuple[str, ...] = ()
 
+    close_connection: bool = False
+    """If True, drop the TCP connection abruptly when matched."""
+
     times_remaining: int | None = None
     """``None`` == ``alwaysOn``; an int counts down to zero."""
 
@@ -66,6 +69,11 @@ class FailPointMatch:
     error_code: int | None = None
     error_labels: tuple[str, ...] = ()
     write_concern_error: dict[str, Any] | None = None
+    close_connection: bool = False
+
+
+class CloseConnectionRequested(Exception):
+    """Failpoint asked us to drop the connection. Caught in server.py."""
 
 
 class FailPointRegistry:
@@ -125,6 +133,7 @@ class FailPointRegistry:
                     else None
                 ),
                 error_labels=tuple(data.get("errorLabels") or ()),
+                close_connection=bool(data.get("closeConnection", False)),
                 times_remaining=times,
                 skip_remaining=skip,
             )
@@ -151,5 +160,6 @@ class FailPointRegistry:
                     error_code=fc.error_code,
                     error_labels=fc.error_labels,
                     write_concern_error=fc.write_concern_error,
+                    close_connection=fc.close_connection,
                 )
             return None

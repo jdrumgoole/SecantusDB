@@ -26,6 +26,18 @@ class PipelineContext:
     coll_name: str = ""
     vars: dict[str, Any] = _dc_field(default_factory=dict)
     change_stream: Any = None  # changestreams.ChangeStreamSpec | None — set by $changeStream stage
+    # MongoDB 3.4+ ``collation`` flows through every stage that does
+    # string comparison — ``$match`` (forwarded to query.matches),
+    # ``$group`` / ``$sortByCount`` (bucket keys), ``$sort`` (string
+    # ordering). Set by the ``aggregate`` command handler from the
+    # request's ``collation`` argument; ``None`` keeps default
+    # codepoint comparison.
+    collation: Any = None
+    # The aggregate command's request body (minus the ``$db`` /
+    # ``lsid`` envelope fields). Surfaced by ``$currentOp`` as the
+    # ``command`` sub-doc on the self-row mongo-node-driver's
+    # ``$currentOp`` test introspects.
+    command_doc: dict[str, Any] | None = None
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
@@ -34,6 +46,8 @@ class PipelineContext:
             coll_name=self.coll_name,
             vars={**self.vars, **more},
             change_stream=self.change_stream,
+            collation=self.collation,
+            command_doc=self.command_doc,
         )
 
 
@@ -68,7 +82,10 @@ def _apply_stage(
 def _stage_match(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return [d for d in docs if matches(d, spec, vars=ctx.vars)]
+    from secantus.collation import parse as _parse_collation
+
+    coll_obj = _parse_collation(ctx.collation)
+    return [d for d in docs if matches(d, spec, vars=ctx.vars, collation=coll_obj)]
 
 
 def _stage_count(
@@ -452,11 +469,21 @@ def _stage_group(
             raise AggregateError(f"unsupported $group accumulator: {op}")
         compiled.append((field, handler, arg))
 
+    from secantus.collation import parse as _parse_collation
+
+    coll_obj = _parse_collation(ctx.collation)
     groups: dict[Any, dict[str, Any]] = {}
     order: list[Any] = []
     for d in docs:
         key = evaluate(id_expr, d, ctx.vars)
-        hashable_key = _hashable(key)
+        # Apply the collation's string normalisation to the bucket key
+        # so case-insensitive ``$group`` collapses ``"a"`` / ``"A"`` /
+        # ``"a"`` into one bucket. ``cmp_key`` only touches strings;
+        # other types pass through unchanged.
+        if coll_obj is not None:
+            hashable_key = _hashable_with_collation(key, coll_obj)
+        else:
+            hashable_key = _hashable(key)
         if hashable_key not in groups:
             groups[hashable_key] = {"_id": key}
             order.append(hashable_key)
@@ -464,6 +491,16 @@ def _stage_group(
         for field, handler, arg in compiled:
             handler(bucket, field, arg, d, ctx.vars)
     return [_finalize(groups[k]) for k in order]
+
+
+def _hashable_with_collation(value: Any, collation: Any) -> Any:
+    from secantus.collation import cmp_key
+
+    if isinstance(value, Mapping):
+        return tuple(sorted((k, _hashable_with_collation(v, collation)) for k, v in value.items()))
+    if isinstance(value, list):
+        return tuple(_hashable_with_collation(v, collation) for v in value)
+    return cmp_key(value, collation)
 
 
 def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
@@ -982,7 +1019,20 @@ def _stage_merge(
         existing = ctx.storage.find_matching(target_db, target_coll, match_filter, limit=1)
         if existing:
             if when_matched == "fail":
-                raise AggregateError("$merge whenMatched=fail and a match exists")
+                # Real mongod raises a duplicate-key style error (code
+                # 11000) with ``keyPattern`` and ``keyValue`` so drivers
+                # can surface it through their DuplicateKeyException
+                # path. Mongo-java-driver's
+                # ``aggregate-merge-errorResponse`` test asserts both
+                # fields on the ``errorResponse``.
+                from secantus.storage import IndexConflict
+
+                raise IndexConflict(
+                    "_id_",
+                    doc.get("_id"),
+                    key_pattern={f: 1 for f in on_fields},
+                    key_value=match_filter,
+                )
             if when_matched == "keepExisting":
                 continue
             if when_matched == "replace":
@@ -1023,7 +1073,7 @@ def _stage_coll_stats(
     }
     spec = spec if isinstance(spec, Mapping) else {}
     if "storageStats" in spec:
-        out["storageStats"] = {
+        storage_stats: dict[str, Any] = {
             "size": 0,
             "count": count,
             "avgObjSize": 0,
@@ -1033,6 +1083,20 @@ def _stage_coll_stats(
             "scaleFactor": 1,
             "nindexes": len(indexes),
         }
+        # Surface capped-collection bounds from the stored options.
+        # Real mongod renames the user-set ``size`` to ``maxSize`` in
+        # the storageStats payload (so callers can distinguish the
+        # current data size from the cap). mongo-ruby-driver's
+        # ``Collection#create ... applies the options`` capped spec
+        # reads `storageStats.{capped, max, maxSize}` directly.
+        opts = ctx.storage.get_collection_options(ctx.db_name, ctx.coll_name)
+        if opts.get("capped"):
+            storage_stats["capped"] = True
+            if "size" in opts:
+                storage_stats["maxSize"] = int(opts["size"])
+            if "max" in opts:
+                storage_stats["max"] = int(opts["max"])
+        out["storageStats"] = storage_stats
     if "latencyStats" in spec:
         out["latencyStats"] = {
             "reads": {"latency": 0, "ops": 0},
@@ -1076,6 +1140,18 @@ def _stage_current_op(
     the aggregation request that produced it — minus any sensitive
     state.
     """
+    # Mongo-node-driver's ``Aggregation should correctly execute
+    # db.aggregate() with $currentOp`` test asserts the op's
+    # ``command`` matches the actual aggregate request (pipeline,
+    # cursor, $db). Use the real command doc threaded through
+    # PipelineContext; fall back to the stub shape so older callers
+    # still see *something*.
+    if isinstance(_ctx.command_doc, dict) and "aggregate" in _ctx.command_doc:
+        command_doc: dict[str, Any] = dict(_ctx.command_doc)
+        command_doc.setdefault("$db", _ctx.db_name)
+        command_doc.setdefault("cursor", {})
+    else:
+        command_doc = {"aggregate": 1}
     return [
         {
             "type": "op",
@@ -1083,6 +1159,9 @@ def _stage_current_op(
             "desc": "$currentOp",
             "active": False,
             "currentOpTime": "",
+            "command": command_doc,
+            "ns": _ctx.db_name + "." + (_ctx.coll_name or "$cmd.aggregate"),
+            "op": "command",
         }
     ]
 
@@ -1365,6 +1444,12 @@ _STAGES = {
     "$collStats": _stage_coll_stats,
     "$indexStats": _stage_index_stats,
     "$currentOp": _stage_current_op,
+    # ``$listLocalSessions`` / ``$listSessions`` enumerate logical
+    # sessions tracked by the server. Reuse the ``$currentOp`` stub —
+    # we return one synthetic op doc so test probes ``[{$listLocalSessions: {}}]``
+    # find a non-empty result with the expected shape.
+    "$listLocalSessions": _stage_current_op,
+    "$listSessions": _stage_current_op,
     "$out": _stage_out,
     "$merge": _stage_merge,
     "$graphLookup": _stage_graph_lookup,

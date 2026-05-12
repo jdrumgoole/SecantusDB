@@ -19,9 +19,10 @@ def apply_update(
     is_upsert: bool = False,
     array_filters: list[Mapping[str, Any]] | None = None,
     positional_matches: Mapping[str, int] | None = None,
+    let: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if isinstance(update, list):
-        return _apply_pipeline_update(doc, update)
+        return _apply_pipeline_update(doc, update, let=let)
     if not update:
         return copy.deepcopy(doc)
     keys = list(update.keys())
@@ -36,11 +37,23 @@ def apply_update(
             if op == "$setOnInsert" and not is_upsert:
                 continue
             _apply_op(result, op, payload, filter_map, pos)
+        # ``_id`` is immutable in every server version — ``$set:
+        # {_id: ...}`` and friends are rejected post-apply.
+        # Mongo-go-driver's
+        # ``TestCollection/bulk_write/update_write_errors`` test
+        # asserts mongod's error code 66 (ImmutableField) when an
+        # operator update tries to change ``_id``.
+        if "_id" in doc and result.get("_id") != doc.get("_id"):
+            raise UpdateError(
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            )
         return result
     new = copy.deepcopy(dict(update))
     if "_id" in doc:
         if "_id" in new and new["_id"] != doc["_id"]:
-            raise UpdateError("cannot change the _id of a document")
+            raise UpdateError(
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            )
         new["_id"] = doc["_id"]
     return new
 
@@ -168,7 +181,10 @@ _PIPELINE_UPDATE_STAGES = {
 
 
 def _apply_pipeline_update(
-    doc: dict[str, Any], pipeline: list[Mapping[str, Any]]
+    doc: dict[str, Any],
+    pipeline: list[Mapping[str, Any]],
+    *,
+    let: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     for stage in pipeline:
         if not isinstance(stage, Mapping) or len(stage) != 1:
@@ -176,14 +192,30 @@ def _apply_pipeline_update(
         (name,) = stage.keys()
         if name not in _PIPELINE_UPDATE_STAGES:
             raise UpdateError(f"stage {name} not allowed in pipeline updates")
-    from secantus.aggregate import apply_pipeline
+    from secantus.aggregate import PipelineContext, apply_pipeline
 
-    result = apply_pipeline([doc], list(pipeline))
+    # Thread ``let`` user-vars into the pipeline context so
+    # ``$$varname`` references inside pipeline-update stages
+    # (e.g. ``{$set: {x: "$$x"}}``) resolve via the let map.
+    ctx = PipelineContext(vars=dict(let) if let else {})
+    result = apply_pipeline([doc], list(pipeline), ctx)
     if not result:
         return copy.deepcopy(doc)
     new = result[0]
-    if "_id" in doc and new.get("_id") != doc.get("_id"):
-        raise UpdateError("pipeline update cannot change the _id of a document")
+    if "_id" in doc:
+        # ``$replaceRoot`` and ``$replaceWith`` can drop ``_id`` from
+        # the result. Real mongod preserves the original ``_id`` in
+        # that case — only an explicit *change* to a different
+        # ``_id`` is rejected. Mongo-java-driver's
+        # ``updateOne-pipeline`` and ``bulkWrite-updateOne-pipeline``
+        # tests rely on this (the pipeline reroots a sub-document
+        # that has no ``_id``).
+        if "_id" not in new:
+            new["_id"] = doc["_id"]
+        elif new["_id"] != doc["_id"]:
+            raise UpdateError(
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            )
     return new
 
 

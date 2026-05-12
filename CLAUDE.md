@@ -106,183 +106,23 @@ When secondary indexes land they will be WT indexes over typed sort-key columns 
 
 ## Tooling
 
-- **The canonical SecantusDB test port is `27018`.** Every gauge runner, every cross-driver smoke, every ad-hoc reproducer must spawn SecantusDB on `127.0.0.1:27018` (mongod's standard "alternate" port — out of the way of any real `mongod` running on `27017`, but predictable enough that test-failure messages cite a verbatim address you can hit by hand). Test scripts that need to talk to SecantusDB should try `127.0.0.1:27018` first before falling back to anything else. The pytest plugin under `pymongo_validation/plugin.py` is the one exception — it embeds `SecantusDBServer(port=0)` inside the pytest process and writes the picked port to `DB_PORT`, because that gauge runs in-process rather than over TCP. Everything else: `27018`.
+- **Ad-hoc reproducers and cross-driver smokes use `127.0.0.1:27018`** (mongod's standard "alternate" port — out of the way of any real `mongod` running on `27017`, but predictable enough that test-failure messages cite a verbatim address you can hit by hand). Test scripts that need to talk to SecantusDB ad hoc should try `127.0.0.1:27018` first. (Conformance gauges use kernel-assigned ephemeral ports per run — see `/conformance-gauges`.)
 - Python 3.12 pinned via `.python-version`. Managed with `uv`. Always invoke Python via `uv run python -m ...` so `pyenv` doesn't intercept.
 - Build/admin tasks: `tasks.py` (`invoke`). `invoke test`, `invoke lint`, `invoke fmt`, `invoke docs`, `invoke serve`.
 - `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`). Tests must use `port=0` and a unique `storage_path` per test — pytest's `tmp_path` fixture gives both isolation and automatic cleanup. The default suite runs against real on-disk WiredTiger so the schema, persistence, and close-and-reopen paths are continuously exercised (`tests/test_storage.py` includes explicit `Storage` and `SecantusDBServer` reopen-roundtrip tests). The perf-regression suite (`tests/test_perf_regression.py`) is the only test file that stays on `:memory:` storage, because the gates compare against fixed in-memory baselines where on-disk variance would invalidate the thresholds.
-- **pymongo conformance suite** lives in `pymongo_validation/` + `vendor/pymongo-tests/` (a git submodule pinned to a pymongo release). **pymongo's tests run unmodified** — the submodule has zero local edits (`git diff HEAD` inside it is empty); the integration is entirely external. Run via `uv run python -m invoke validate` — starts an embedded `SecantusDBServer(port=0, storage_path=":memory:")` in a pytest plugin (`pymongo_validation/plugin.py`), sets `DB_IP`+`DB_PORT` (the env vars pymongo's `helpers_shared.py` reads at import time), runs the curated in-scope test set in `pymongo_validation/include_paths.py`, and writes `docs/validation-report.md`. The pass rate is the honest "MongoDB compatibility" gauge — those are pymongo's actual tests, the same ones pymongo's CI runs against `mongod`. To widen coverage when a new in-scope feature lands, add the relevant pymongo test path to `include_paths.py` and re-run validate. Both `vendor/pymongo-tests/` and `pymongo_validation/` are dev-only — `pyproject.toml`'s `sdist.exclude` keeps them out of the published package. Validation also runs weekly on `.github/workflows/validate.yml`.
-- **mongo-go-driver conformance suite** lives in `go_validation/` + `vendor/mongo-go-driver/` (git submodule pinned to a mongo-go-driver release). Same pattern as the pymongo suite, with one important shape difference: `go_validation/runner.py` spawns SecantusDB **as a standalone daemon subprocess** (`python -m secantus --port <free> --storage-path :memory:`) and points the go-driver tests at it via `MONGODB_URI`. The go-driver tests then see exactly what they'd see against a real `mongod` over TCP — zero embedding, zero modifications. Run via `uv run python -m invoke validate-go` (requires `go` 1.21+ on PATH). Report at `docs/validation-report-go.md`. The Go driver is type-strict where pymongo is permissive (e.g. cursor.id MUST be int64, not int32) — that's exactly the class of wire-protocol bug the pymongo gauge can't catch. The Go driver also underpins `mongodump`, `mongorestore`, and most non-Python tooling; if it works here, the broader MongoDB ecosystem works here. Dev-only; excluded from sdist/wheel.
-- **mongo-node-driver conformance suite** lives in `node_validation/` + `vendor/node-mongodb-native/` (git submodule pinned to a mongo-node-driver release). Same daemon-subprocess shape as the Go suite. Runner does a one-time `npm install` + `npm run build:bundle` then runs `npx mocha --reporter json` with `MONGODB_URI` and `AUTH=noauth` set. Run via `uv run python -m invoke validate-node` (requires Node.js >=20 on PATH). Report at `docs/validation-report-node.md`. Initial include set is restricted to the import-clean subset of unit tests because mongo-node-driver v7.2.0 has 68 unit files using extensionless ESM imports (`from '../../mongodb'`) that need a non-trivial Node loader chain to resolve `.ts` — patching their `.mocharc` would defeat the "unmodified" gauge property, so the include list trades coverage for honesty. To widen, solve the loader problem upstream (or wait for a release that uses extensions). Dev-only; excluded from sdist/wheel.
-- **mongo-java-driver conformance suite** lives in `java_validation/` + `vendor/mongo-java-driver/` (git submodule pinned to a mongo-java-driver release). Same daemon-subprocess shape. Runner spawns the daemon, then invokes the driver's bundled `./gradlew --no-daemon -Dorg.mongodb.test.uri=mongodb://...` for the in-scope Gradle modules in `include_modules.py`. The system property is the seam Java's `ClusterFixture` test infrastructure reads. After Gradle exits, the runner copies JUnit XML out of `<module>/build/test-results/test/TEST-*.xml` (so the submodule stays untouched) into `.validation/java-results/`; `generate_report.py` walks them. Run via `uv run python -m invoke validate-java` (requires a JDK >=8 on PATH — `javac`, not just `java`; the runner errors helpfully if only a JRE is present). Report at `docs/validation-report-java.md`. Initial include set is `:bson:test` only (BSON serialization, ~289 unit test files); the integration modules (`:driver-core:test`, `:driver-sync:test`) need a real-mongod topology that's out of scope. Dev-only; excluded from sdist/wheel.
-- **mongo-ruby-driver conformance suite** lives in `ruby_validation/` + `vendor/mongo-ruby-driver/` (git submodule pinned to v2.24.0). Same daemon-subprocess shape: runner spawns SecantusDB on a free port, exports `MONGODB_URI` (the env var `spec/support/spec_config.rb` reads at bootstrap), then runs `bundle exec rspec --format json --out <raw.json>` against the include set in `include_paths.discover_lite()`. The discovery walks `spec/mongo/` for files that `require 'lite_spec_helper'` and skips one upstream-broken-under-lite file (`server/monitor/app_metadata_spec.rb` references shared examples only loaded by the full helper). Mixing in any spec that requires the full `spec_helper.rb` poisons the run by triggering a global authorized-client setup that fails SCRAM-256 against our unauthenticated daemon — so the gauge stays lite-only until a separate include path is added for full-helper integration specs. Run via `uv run python -m invoke validate-ruby` (requires Ruby >= 2.7 with `bundler` on PATH — on macOS `brew install ruby` then prepend `/opt/homebrew/opt/ruby/bin`). Report at `docs/validation-report-ruby.md`. The runner uses rspec's `--out` flag (not stdout capture) because the mongo-ruby-driver's `Mongo::Logger` writes to STDOUT and would corrupt JSON capture. Dev-only; excluded from sdist/wheel.
+- **Driver-conformance gauges** — five gauges run **unmodified** upstream tests against SecantusDB: pymongo (embedded; the headline "MongoDB compatibility" number), and mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver (each a daemon subprocess via `MONGODB_URI`). The other-language gauges catch wire-protocol bugs that pymongo's permissive client misses (e.g. cursor.id-must-be-int64). Invocation (`invoke validate{,-go,-node,-java,-ruby,-all}`), include paths, language toolchain requirements, and current per-gauge caveats live in `/conformance-gauges`. All gauge dirs are dev-only (excluded from sdist/wheel). Validation runs weekly on `.github/workflows/validate.yml`.
 - WiredTiger is **vendored** as a git submodule at `vendor/wiredtiger` (mongodb-7.0.33). The CMake build is driven by `CMakeLists.txt` (scikit-build-core + ExternalProject) and produces self-contained binary wheels via `cibuildwheel` for cp312 + cp313 on macOS arm64, manylinux2014 + musllinux_1_2 x86_64/aarch64, and Windows AMD64. macOS x86_64 is intentionally absent (runner-pool scarcity, Apple Silicon is the active target). `pip install secantus` ships pre-built on supported platforms; users never need `cmake`/`ninja`/`swig`. The `cmake/patch_wt_*.py` scripts apply small idempotent patches to the vendored WT tree at `PATCH_COMMAND` time (off64_t→off_t for musl, Python module SUFFIX/dynamic_lookup, etc.); fix WT-side incompat by extending one of these patchers, not by editing the submodule directly.
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
 - PyPI publishing is OIDC-only via `.github/workflows/publish.yml` on `vX.Y.Z` tags. The workflow refuses to publish if the tag doesn't match `pyproject.toml`'s version. Never run `uv publish` / `twine upload` manually.
 - The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The package and PyPI name are `secantus`.
 
-## Releases
+## Releases and website
 
-**The canonical release path: `release-prepare` once in foreground, then `release-finalize` in a foreground retry loop until exit-0.** A release end-to-end takes ~15-25 minutes; the polling phase routinely exceeds the harness's 10-minute per-Bash-call cap. Sub-agents handle this by retrying the idempotent finalize step — a single 10-min Bash call can't cover the whole polling window, but each attempt picks up exactly where the prior one left off because every step short-circuits on already-done state.
+Both procedures are managed by skills — they auto-fire on the relevant trigger phrases. To inspect or invoke manually: `/secantusdb-release` and `/secantusdb-website`. The skill files are under `~/.claude/skills/`; treat them as the source of truth and edit them there, not here.
 
-The `run_in_background=true` pattern is **broken by design** for agents: dispatching a bg task and then waiting for the completion notification doesn't keep the agent's tool loop alive — agents terminate after the dispatch and the bg process gets killed with them. Foreground + retry is the reliable pattern; the agent's natural tool calls keep the loop active.
-
-Sub-agent invocation pattern (use `general-purpose`, not Explore — it needs to run shell commands):
-
-> **Step 1 — `release-prepare` (single attempt, ~5–7 min).** Bash call with `timeout: 600000`:
->
-> ```
-> cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-prepare X.Y.Z
-> ```
->
-> Runs pre-flight, full pytest, perf gates, version bump, commit, tag, push, GitHub Release. `READTHEDOCS_TOKEN` auto-loads from `.env` at the repo root. **If this step fails, abort the whole release and report — don't retry.** Failures here mean tests broke or pre-flight rejected the working tree, neither of which retrying fixes.
->
-> **Step 2 — `release-finalize` retry loop (up to 4 attempts × 10 min each = 40 min total budget).** For attempt in 1..4:
->
-> ```
-> cd /Users/jdrumgoole/GIT/SecantusDB && uv run --no-sync python -m invoke release-finalize X.Y.Z
-> ```
->
-> with `timeout: 600000`. Exit code 0 → done, verify externally and report PASS. Non-zero exit code (typically a SIGKILL at the 10-min wall) → polling was interrupted mid-step; **immediately re-run the same command**. Every step in `release-finalize` is idempotent (publish workflow already concluded → short-circuits; PyPI already lists version → short-circuits; RTD build already finished → short-circuits; etc.), so retries pick up where the prior 10-min window left off. Bail and report FAIL only after **4 consecutive non-zero exits** — that's 40 minutes of polling, well over the 25-minute worst-case release time.
->
-> ⚠️ **Watch the Bash response carefully on each finalize attempt.** The harness sometimes auto-backgrounds long-timeout Bash calls — instead of stdout you'll get a `Command running in background with ID: <id>. Output is being written to: <file>` message. **That's a foreground-mode failure**, not the pattern this contract is built on. If you see it: immediately call `TaskStop` with that task ID, then re-issue the same Bash call. The bg task is fine to kill — `release-finalize` is idempotent and the next foreground attempt picks up cleanly.
-
-`invoke release X.Y.Z` is a thin wrapper that calls both phases in sequence — fine for a developer running it locally, **not safe for sub-agents** because the second half exceeds the per-Bash 10-min cap.
-
-Combined pipeline (the two phases together):
-
-1. Pre-flight: branch=`main`, working tree clean (vendored-submodule drift in either ` m vendor/...` or ` M vendor/...` form tolerated, everything else rejects), `HEAD == origin/main`, tag `vX.Y.Z` not already on origin, `READTHEDOCS_TOKEN` available (either in the shell env or in `.env` at the repo root).
-2. Full default test suite (parallel, perf-excluded — currently 653 tests).
-3. Perf regression gates (serial — six benchmarks with hard upper bounds).
-4. Bump `pyproject.toml` + `src/secantus/__init__.py` + `uv.lock`.
-5. `git commit -m "Release vX.Y.Z"` + `git tag -a vX.Y.Z` + push both.
-6. `gh release create vX.Y.Z --generate-notes` — creates the user-facing GitHub Release page with auto-generated notes (marked `--prerelease` for `aN` / `bN` / `rcN` versions). **End of `release-prepare`.**
-7. Wait for the GitHub `Publish to PyPI` workflow to conclude `success`. **Start of `release-finalize`.**
-8. Wait for PyPI's JSON API to list the new version under `releases`.
-9. Wait for Read the Docs to publish a successful build for the release commit on the `latest` slug.
-10. Activate the `vX.Y.Z` RTD slug and wait for its build to finish — gives users a stable deep link to that release's docs.
-11. PATCH RTD's `default_version` to `vX.Y.Z` so `secantusdb.readthedocs.io/` redirects to the freshly-released tag instead of the previous default (`stable` was pinned to v0.1.0 because RTD's `stable` only tracks non-prereleases; this step is the cure).
-
-`release-prepare` aborts cleanly on any failure — leaves the working tree as it was before the bump. `release-finalize` is idempotent: every step short-circuits if the desired state is already true (publish workflow already concluded, PyPI already lists the version, RTD build already finished, slug already active, `default_version` already set), so re-running after any timeout or interruption picks up where it left off.
-
-Pre-requisite: an RTD API token with read+write scope, exposed as `READTHEDOCS_TOKEN`. The release tasks resolve it from (1) the process env, then (2) a `READTHEDOCS_TOKEN=…` line in `.env` at the repo root (gitignored — `.env` is on `.gitignore`). Mint at https://app.readthedocs.org/accounts/tokens/. Both `release-prepare` and `release-finalize` refuse to start without it, since steps 10–11 are the whole reason the docs version stays in sync with PyPI.
-
-Do **not** run `git tag` / `git push` / `uv build` / `uv publish` manually for releases, and do **not** edit RTD's default_version through the dashboard — `release-finalize` owns that value. The only sanctioned path is `invoke release-prepare` + `invoke release-finalize` via sub-agent (or `invoke release` for a developer running it directly). The publish workflow rejects tag/version mismatches anyway, and the manual path is easy to get wrong (out-of-sync `__init__.py`, missed `uv.lock`, no RTD/PyPI confirmation, RTD default left dangling).
-
-### Always work on the website from a dedicated worktree
-
-**Never edit `website/` files directly on `main`.** Concurrent `invoke release` runs (often from a parallel Claude session) gate on a clean working tree, and their first move is `git stash push -u -m "auto: parallel session..."` of any uncommitted changes — including all your in-flight website edits. The stash is **never popped back automatically** (the release session has no way to know which Claude was using those files), so any work-in-progress on `main` silently disappears between turns.
-
-Cure: do website work in a separate worktree:
-
-```bash
-git worktree add ../SecantusDB-website -b website-dev   # one-time
-cd ../SecantusDB-website                                # all website edits live here
-ln -sfn /Users/jdrumgoole/GIT/SecantusDB/.venv .venv    # reuse the main repo's venv;
-                                                        # avoids re-building secantusdb
-                                                        # (CMake + WiredTiger) just to
-                                                        # run pelican / boto3
-```
-
-From inside the worktree:
-
-```bash
-cd website
-uv run python -m invoke build --prod         # local build
-uv run python -m invoke publish --message "..."  # commit + push + deploy
-```
-
-When the `website-dev` branch is green, merge to `main` from the worktree (or from main itself):
-
-```bash
-cd /Users/jdrumgoole/GIT/SecantusDB
-git merge --no-ff website-dev -m "Merge website-dev: <what>"
-git push origin main
-```
-
-The worktree stays alive between releases — keep iterating on it. If you ever find website changes have vanished from `main`'s working tree (and you weren't expecting it), look at `git stash list` first: stashes named `auto: parallel session... set aside for X release` are the culprit, and `git stash show -p stash@{N}` will tell you exactly what got shelved. Apply (don't pop, per the global "don't tear down stashes you didn't create" rule) into the worktree to recover.
-
-### Website-only commits skip the full test suite
-
-The marketing site under `website/` is excluded from sdist/wheel and never touches SecantusDB's runtime code. The global "always run the full test suite before committing" rule does **not** apply to website-only commits — running 700+ pytest tests just to ship a copy edit or a new blog post is wasted compute.
-
-Use the dedicated shortcut (defined in `website/tasks.py`), **from inside the website worktree**:
-
-```bash
-cd ../SecantusDB-website/website
-uv run python -m invoke publish --message "blog: post v0.3.0aN release notes"
-```
-
-`publish` runs in this order:
-
-1. **Refuses if any non-website change is staged or modified** (anything not under `website/` or the project `CLAUDE.md` aborts the task with a list of offending paths). Vendor submodule drift (` m vendor/...`) is tolerated.
-2. `git add` of the matched paths.
-3. `git commit -m "<message>" -m "Co-Authored-By: Claude ..."`.
-4. `git push origin <current-branch>`.
-5. `invoke deploy` — production Pelican build, `aws s3 sync`, CloudFront `/*` invalidation.
-
-No version bump and no pytest. If a real-code change has snuck into the working tree, the refusal forces a normal commit (with full test suite) for the mixed batch instead.
-
-### Theme / template changes need an explicit website-dev merge
-
-Pelican builds the live site from whatever's checked out in the `website-dev` branch — *not* from `main`. So when a slice on `main` touches `website/themes/`, `website/themes/static/`, `website/pelicanconf.py`, or anything else under `website/` that isn't `content/blog/`, those changes **don't reach the deployed site automatically**. The `invoke publish` shortcut commits + builds + deploys whatever is in `website-dev`'s working tree, and a clean working tree (`nothing to publish — working tree is clean`) makes the task a no-op.
-
-This bit me when I shipped the alpha → beta theme rename in `main` and the blog post for the release: the blog landed on the live site (built against the still-alpha theme), but the banner kept saying "Alpha" because the theme rename was sitting unmerged on `main`.
-
-When you change anything under `website/themes/` or other build-affecting files in `main`:
-
-1. From the website worktree: `git fetch origin && git merge origin/main`. The merge usually has no conflicts because the theme tree is rarely touched concurrently.
-2. Push: `git push origin website-dev`.
-3. Force a deploy that doesn't depend on a dirty working tree: `cd website && ../../SecantusDB/.venv/bin/python -m invoke deploy`. (`invoke publish` would no-op on a clean tree; `invoke deploy` rebuilds + syncs + invalidates regardless.)
-4. Verify with `curl -s https://secantusdb.com/ | grep -oE '<class match>'` so you can see the new template made it through CloudFront.
-
-For releases that bring a theme change along with a blog post, do the merge step *before* running the release sub-agent so the publish step picks up everything in one shot.
-
-### Blog post per release
-
-Every GitHub Release **must** have a matching blog post on secantusdb.com.
-
-**Posts must describe the changes, not link to them.** GitHub's auto-generated release notes are a list of PR links — useful as a reference, useless as a blog post. The blog is the user-facing changelog, so each post needs:
-
-1. A **descriptive title** that names the headline change. Not "SecantusDB vX.Y.ZaN" — something a reader would actually click on, e.g. "Change streams land — single-node, oplog-backed, pymongo-validated" or "Compound-index sort acceleration".
-2. A **prose body** of 1–3 short paragraphs explaining what shipped, why it matters, and any caveats. Reference real MongoDB behaviour and concrete operator names where it helps. If the release was small (a CLAUDE.md tweak, a CI fix), say that — short and honest beats inflated.
-3. A **trailing link bar** with three short links: GitHub release page, PyPI version page, git tag.
-
-To gather the actual changes for a post, run from inside the website worktree:
-
-```bash
-git -C ../SecantusDB log --oneline <prev-tag>..<this-tag>
-gh release view <this-tag> --repo jdrumgoole/SecantusDB --json body --jq .body
-```
-
-The commit log between consecutive tags is the source of truth — it's where the merge-commit titles tell you which feature branches landed.
-
-Post template (`website/content/blog/YYYY-MM-DD-release-X-Y-ZaN.md`):
-
-```
-Title: <headline change in plain English>
-Date: YYYY-MM-DD HH:MM:SS         # release publishedAt, local TZ ok
-Slug: release-X-Y-ZaN
-Author: Joe Drumgoole
-Category: Releases
-Tags: release
-Summary: <Title> (vX.Y.ZaN).
-
-<one to three short paragraphs describing what shipped and why>
-
-[Full release notes on GitHub](https://github.com/jdrumgoole/SecantusDB/releases/tag/vX.Y.ZaN) ·
-[Install from PyPI](https://pypi.org/project/SecantusDB/X.Y.ZaN/) ·
-[Tag](https://github.com/jdrumgoole/SecantusDB/tree/vX.Y.ZaN)
-```
-
-Then publish from the website worktree (per the worktree convention above):
-
-```bash
-cd ../SecantusDB-website/website
-../../SecantusDB/.venv/bin/python -m invoke publish --message "blog: vX.Y.ZaN release notes"
-```
-
-**No version bump needed for a release-blog-post deploy** — the website tree is excluded from sdist/wheel (per the global rule in `~/CLAUDE.md`). The release post is what makes the blog index a real changelog rather than a dev journal — keep it in sync.
+- **`secantusdb-release`** — the two-phase pipeline (`release-prepare` once in foreground, `release-finalize` in a foreground retry loop), the sub-agent contract, foreground-only constraints, the 11-step pipeline (pre-flight → pytest → perf gates → bump → tag → push → GitHub Release → PyPI workflow → PyPI listing → RTD build → RTD slug activation → RTD `default_version`), the `READTHEDOCS_TOKEN` requirement, and the hard prohibitions against manual `git tag`/`uv publish`/RTD-dashboard edits.
+- **`secantusdb-website`** — the dedicated `SecantusDB-website` worktree pattern (and why parallel-release auto-stash makes editing `website/` on `main` unsafe), the theme/template merge requirement (`website-dev` is what Pelican builds from, not `main`), the `invoke publish` shortcut (no pytest, no version bump, refuses non-website changes), and the per-release blog-post template (descriptive title + prose body + link bar — never a stub linking out to GitHub).
 
 ## Backlog of stubs and stopgaps
 
@@ -290,33 +130,7 @@ cd ../SecantusDB-website/website
 
 ## CI is load-bearing — failures are serious bugs, not flakes
 
-After every push to `main` (and after every push to a feature branch that has CI configured), check the corresponding GitHub Actions run and resolve any failures *before* moving on to the next slice. CI is the source of truth, not the local test result — CI catches a class of bugs that local-only testing misses:
-
-- **Cold caches**: locally, `node_modules/`, the Java smokes uber-jar, the Go module cache, and `.pytest_cache` are all populated from prior runs. CI starts fresh every time, exposing race conditions in test bootstrap (e.g. multiple xdist workers calling `_ensure_node_modules()` simultaneously and clobbering `npm install`).
-- **Cross-platform**: macOS and Linux differ in subtle ways (sysconf keys, default locale, file system case-sensitivity, default temp dir, line endings).
-- **Cross-Python**: 3.10–3.13 see different stdlib behaviours (`datetime.UTC`, removed `imp`, dataclass slots semantics, walrus precedence in match statements, etc).
-- **Missing extras**: the CI workflow installs a specific subset of `pyproject.toml` extras (currently `--extra dev --extra admin`). Adding new tests that depend on a different extra silently passes locally (`uv sync --all-extras` is the dev default) and fails only on CI. When you add a test file that imports something new, check whether the import chain is covered by `--extra dev --extra admin` — if not, either move the dep into `dev`/`admin` or update the workflow.
-
-**Procedure** after pushing:
-
-```
-gh run list --repo jdrumgoole/SecantusDB --branch main --limit 3 \
-  --json databaseId,name,status,conclusion
-# pick the most recent Tests run, then either watch:
-gh run watch <id> --repo jdrumgoole/SecantusDB --exit-status
-# or, if you've moved on to other work, check status later:
-gh run view <id> --repo jdrumgoole/SecantusDB --json conclusion,jobs
-# on failure:
-gh run view <id> --repo jdrumgoole/SecantusDB --log-failed
-```
-
-If CI fails, treat it like a failing local test: stop, diagnose root cause, fix. Do not push more commits on top of a broken `main` — they pile up, and the eventual fix has to bisect through all of them.
-
-**Recurring patterns to recognise**:
-
-- **xdist parallel-worker races on shared install state** — the `--extra admin` miss, the Java-jar build race, the Node `npm install` race were all variants. Fix: `fcntl.flock` around the install + `xdist_group(name="<group>")` markers + `--dist=loadgroup` so the test serialise onto one worker.
-- **Per-platform `os.sysconf` keys** — `SC_PHYS_PAGES` exists on Linux/macOS but not Windows; wrap with `try/except (ValueError, OSError, AttributeError)`.
-- **`pytest-subtests` outcome accounting** — its parent-test outcome is `"subtests passed"`, not `"passed"`. Anywhere we bucket pytest outcomes (e.g. `pymongo_validation/generate_report.py`) needs an explicit handler or it falls into the default branch silently.
+After every push to `main` (or to a feature branch with CI configured), check the corresponding GitHub Actions run and **resolve any failures before moving on**. CI is the source of truth — it catches cold-cache races, cross-platform / cross-Python drift, and missing-CI-extra gaps that local-only testing misses. Procedure (`gh run list`/`watch`/`view --log-failed`), the docs-only `paths-ignore` exception (markdown / LICENSE / `docs/**` commits skip CI by design), and the recurring-failure-pattern catalog (xdist install-state races, per-platform sysconf, `pytest-subtests` outcome accounting) all live in `/ci-check`. Add new patterns to that skill as they show up.
 
 ## Conventions for changes here
 

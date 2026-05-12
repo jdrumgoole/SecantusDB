@@ -15,7 +15,7 @@ from secantus.auth import ConnectionAuth
 from secantus.commands import CommandContext, dispatch
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorRegistry
-from secantus.failpoints import FailPointRegistry
+from secantus.failpoints import CloseConnectionRequested, FailPointRegistry
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.sessions import SessionRegistry
@@ -273,7 +273,19 @@ class SecantusDBServer:
                             sessions=self.sessions,
                             failpoints=self.failpoints,
                         )
-                        response_doc = dispatch(body, ctx)
+                        try:
+                            response_doc = dispatch(body, ctx)
+                        except CloseConnectionRequested:
+                            # ``failCommand`` failpoint with
+                            # ``closeConnection: true``: drop the TCP
+                            # connection without replying. The driver
+                            # sees a closed socket and surfaces it as
+                            # a client-side network error.
+                            logger.debug(
+                                "closeConnection failpoint fired on conn %d",
+                                connection_id,
+                            )
+                            return
                         # `moreToCome` (bit 1) is the wire signal for
                         # fire-and-forget requests — `writeConcern: {w: 0}`
                         # unacknowledged writes use it. The spec requires the
@@ -303,7 +315,14 @@ class SecantusDBServer:
                             sessions=self.sessions,
                             failpoints=self.failpoints,
                         )
-                        response_doc = dispatch(op.query, ctx)
+                        try:
+                            response_doc = dispatch(op.query, ctx)
+                        except CloseConnectionRequested:
+                            logger.debug(
+                                "closeConnection failpoint fired on conn %d (OP_QUERY)",
+                                connection_id,
+                            )
+                            return
                         reply = build_op_reply(
                             response_to=message.header.request_id,
                             request_id=next(reply_ids),

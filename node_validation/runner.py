@@ -3,13 +3,15 @@
 End-to-end integration gauge: SecantusDB and the Node.js driver
 exchange real wire commands over TCP. The runner:
 
-1. Spawns ``python -m secantus --port 27018 --storage-path <tempdir>
+1. Spawns ``python -m secantus --port <picked> --storage-path <tempdir>
    --standalone`` without ``--auth``; uses pymongo to ``createUser``
-   ``root-user`` (``root`` role).
-2. Stops that daemon and restarts on the same tempdir **with
+   ``root-user`` (``root`` role). The port is a fresh kernel-assigned
+   ephemeral one so multiple gauges can run in parallel (see Phase 2
+   of the parallelization plan).
+2. Stops that daemon and restarts on the same tempdir+port **with
    ``--auth``** — user record persists, server now enforces auth.
 3. Runs ``npx mocha --config test/mocha_mongodb.js --reporter json
-   <paths>`` with ``MONGODB_URI=mongodb://root-user:password@127.0.0.1:27018/
+   <paths>`` with ``MONGODB_URI=mongodb://root-user:password@127.0.0.1:<picked>/
    ?authSource=admin`` so the driver authenticates against the
    freshly-seeded user.
 4. ``generate_report.py`` renders the per-category breakdown into
@@ -39,8 +41,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "node-mongodb-native"
 RAW_OUT = REPO_ROOT / ".validation" / "node-raw.json"
 
-# Project-wide convention — see CLAUDE.md ``Tooling`` section.
-DAEMON_PORT = 27018
+
+def _pick_ephemeral_port() -> int:
+    """Ask the kernel for a free ephemeral TCP port. See ``go_validation.runner``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 ROOT_USER = "root-user"
 ROOT_PASSWORD = "password"
@@ -127,7 +133,7 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = DAEMON_PORT
+    port = _pick_ephemeral_port()
 
     storage_dir = tempfile.mkdtemp(prefix="secantus-node-gauge-")
     print(
@@ -164,7 +170,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()
@@ -245,7 +251,7 @@ def main() -> int:
     finally:
         daemon.terminate()
         try:
-            daemon.wait(timeout=5)
+            daemon.wait(timeout=1)
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait()

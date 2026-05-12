@@ -164,14 +164,17 @@ def test_server_status_tracks_connections_total(server: SecantusDBServer) -> Non
     assert after > baseline
 
 
-def test_connection_status_surfaces_authenticated_user_roles() -> None:
+def test_connection_status_surfaces_authenticated_user_roles(tmp_path) -> None:
     """`connectionStatus.authInfo.authenticatedUserRoles` reflects the
     role bindings the connection inherited at SCRAM completion. Without
     --auth on, the list is empty (legacy default-allow mode)."""
     from secantus.auth import SCRAM_SHA_256, derive_credentials
 
     with SecantusDBServer(
-        host="127.0.0.1", port=0, storage_path=":memory:", require_auth=True
+        host="127.0.0.1",
+        port=0,
+        storage_path=str(tmp_path / "wt"),
+        require_auth=True,
     ) as srv:
         creds = derive_credentials("p")
         srv.storage.add_user(
