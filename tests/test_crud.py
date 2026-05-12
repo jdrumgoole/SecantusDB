@@ -1296,6 +1296,44 @@ def test_aggregate_with_unknown_hint(coll) -> None:
     assert exc.value.code == 2
 
 
+def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
+    # Real mongod with a 1-member replica set executes write commands but
+    # attaches `writeConcernError` (code 100, CannotSatisfyWriteConcern)
+    # when `w` is an int above member count. mongo-ruby-driver's
+    # `Mongo::Collection#create ... applies the write concern` spec relies
+    # on this: it raises `OperationFailure` because of the wce. pymongo's
+    # `Database.command()` returns the raw doc rather than raising — check
+    # the wce directly on the reply.
+    db = client["wc_unsat_db"]
+    # `create` with w:4000 — collection IS created (the op runs), reply
+    # carries writeConcernError.
+    reply = db.command({"create": "things", "writeConcern": {"w": 4000}})
+    assert reply["ok"] == 1.0
+    wce = reply.get("writeConcernError")
+    assert wce is not None, f"expected writeConcernError, got {reply!r}"
+    assert wce["code"] == 100
+    assert wce["codeName"] == "CannotSatisfyWriteConcern"
+    assert "things" in db.list_collection_names()
+
+    # `drop` with w:4000 — same shape: op runs, wce attached.
+    reply = db.command({"drop": "things", "writeConcern": {"w": 4000}})
+    assert reply["ok"] == 1.0
+    assert reply.get("writeConcernError", {}).get("code") == 100
+    assert "things" not in db.list_collection_names()
+
+    # `w: 1` satisfiable — no wce.
+    reply = db.command({"create": "ok_things", "writeConcern": {"w": 1}})
+    assert reply["ok"] == 1.0
+    assert "writeConcernError" not in reply
+    assert "ok_things" in db.list_collection_names()
+
+    # `w: "majority"` satisfiable on single-node (majority of 1 is 1).
+    reply = db.command({"create": "majority_things", "writeConcern": {"w": "majority"}})
+    assert reply["ok"] == 1.0
+    assert "writeConcernError" not in reply
+    assert "majority_things" in db.list_collection_names()
+
+
 def test_unacknowledged_writes_do_not_desync_connection(server: SecantusDBServer) -> None:
     # `writeConcern: {w: 0}` triggers OP_MSG with the moreToCome flag set
     # — server must not reply. If it does, the next genuine response is
