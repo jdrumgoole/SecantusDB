@@ -878,6 +878,16 @@ def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
         "enableTestCommands": False,
         "logLevel": 0,
         "quiet": False,
+        # Real ``mongod`` exposes the list of enabled auth mechanisms
+        # via ``getParameter authenticationMechanisms``. Driver test
+        # runners (mongo-java-driver's unified ``RunOnRequirementsMatcher``
+        # at line 81-88) read this to decide whether to run a test that
+        # gates on ``authMechanism: "MONGODB-OIDC"``. We implement only
+        # SCRAM-SHA-256, so advertise only that — tests requiring
+        # ``MONGODB-OIDC`` / ``MONGODB-X509`` / ``GSSAPI`` / ``PLAIN``
+        # then self-skip via ``assumeTrue`` instead of running and
+        # failing on the missing handshake.
+        "authenticationMechanisms": ["SCRAM-SHA-256"],
     }
     arg = doc.get("getParameter")
     if isinstance(arg, str) and arg == "*":

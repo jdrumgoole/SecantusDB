@@ -769,6 +769,27 @@ def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) ->
     assert "maxSize" not in cs[0]["storageStats"]
 
 
+def test_get_parameter_advertises_only_scram_auth_mechanism(client: MongoClient) -> None:
+    # Real mongod exposes enabled SASL mechanisms via
+    # ``getParameter authenticationMechanisms``. mongo-java-driver's
+    # unified ``RunOnRequirementsMatcher`` reads this to decide whether
+    # to skip a test gated on ``authMechanism: "MONGODB-OIDC"``. We
+    # support only SCRAM-SHA-256, so the array must list just that —
+    # listing OIDC would lie to the driver and unskip tests we can't
+    # actually pass.
+    reply = client.admin.command({"getParameter": 1, "authenticationMechanisms": 1})
+    assert reply["ok"] == 1.0
+    assert reply["authenticationMechanisms"] == ["SCRAM-SHA-256"]
+
+    # ``getParameter: "*"`` should also include it.
+    reply = client.admin.command({"getParameter": "*"})
+    assert "SCRAM-SHA-256" in reply["authenticationMechanisms"]
+    # We do NOT support OIDC / X509 / GSSAPI / PLAIN — those must
+    # stay out of the list so driver gauges self-skip correctly.
+    for unsupported in ("MONGODB-OIDC", "MONGODB-X509", "GSSAPI", "PLAIN"):
+        assert unsupported not in reply["authenticationMechanisms"]
+
+
 def test_snapshot_read_concern_rejected_on_standalone(client: MongoClient) -> None:
     # Snapshot read concern requires a real replica set with
     # majority-committed snapshots; mongod rejects with code 246

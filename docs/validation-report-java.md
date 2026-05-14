@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-05-14 — SecantusDB 0.5.1b4 vs mongo-java-driver ref: refs/he (`vendor/mongo-java-driver/`).
+Generated 2026-05-14 — SecantusDB 0.5.1b5 vs mongo-java-driver ref: refs/he (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -13,10 +13,10 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `bson` | 3809 | 0 | 11 | 3820 | 100.0% |
-| `driver-sync` | 433 | 10 | 447 | 890 | 97.7% |
-| **Overall** | **4242** | **10** | **458** | **4710** | **99.8%** |
+| `driver-sync` | 433 | 4 | 453 | 890 | 99.1% |
+| **Overall** | **4242** | **4** | **464** | **4710** | **99.9%** |
 
-## Failures (10)
+## Failures (4)
 
 First 30 failed tests for triage:
 
@@ -25,12 +25,6 @@ driver-sync :: com.mongodb.client.unified.UnifiedWriteConcernTest#default-write-
 driver-sync :: com.mongodb.client.unified.VersionedApiTest#CRUD Api Version 1 (strict): aggregate on database appends declared API version
 driver-sync :: com.mongodb.client.unified.VersionedApiTest#CRUD Api Version 1 (strict): distinct appends declared API version
 driver-sync :: com.mongodb.client.unified.ChangeStreamsTest#change-streams-errors: The watch helper must not throw a custom exception when executed against a single server topology, but instead depend on a server error
-driver-sync :: com.mongodb.client.unified.UnifiedAuthTest#MONGODB-OIDC authentication with retry disabled: A read operation should succeed
-driver-sync :: com.mongodb.client.unified.UnifiedAuthTest#MONGODB-OIDC authentication with retry disabled: A write operation should succeed
-driver-sync :: com.mongodb.client.unified.UnifiedAuthTest#MONGODB-OIDC authentication with retry disabled: Read commands should reauthenticate and retry when a ReauthenticationRequired error happens
-driver-sync :: com.mongodb.client.unified.UnifiedAuthTest#MONGODB-OIDC authentication with retry disabled: Write commands should reauthenticate and retry when a ReauthenticationRequired error happens
-driver-sync :: com.mongodb.client.unified.UnifiedAuthTest#MONGODB-OIDC authentication with retry disabled: Handshake with cached token should use speculative authentication
-driver-sync :: com.mongodb.client.unified.UnifiedAuthTest#MONGODB-OIDC authentication with retry disabled: Handshake without cached token should not use speculative authentication
 ```
 
 ## How this is generated
