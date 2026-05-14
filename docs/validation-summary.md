@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-05-12 — SecantusDB 0.5.1b2. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the five gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-05-14 — SecantusDB 0.5.1b4. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the five gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 ## Summary by driver
 
@@ -8,10 +8,10 @@ Generated 2026-05-12 — SecantusDB 0.5.1b2. Each per-driver gauge runs the driv
 |---|---|---|---:|---:|---:|---:|---:|
 | `pymongo` | Python | `f2103a95870a` | 1341 | 959 | 0 | 382 | 100.0% |
 | `mongo-java-driver` | Java | `cb45be6bb147` | 4710 | 4242 | 10 | 458 | 99.8% |
-| `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 395 | 6 | 52 | 98.5% |
-| `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 345 | 14 | 5 | 96.1% |
+| `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 398 | 3 | 52 | 99.3% |
+| `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 346 | 13 | 5 | 96.4% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 318 | 291 | 3 | 24 | 99.0% |
-| **All drivers** | — | — | **7186** | **6232** | **33** | **921** | **99.5%** |
+| **All drivers** | — | — | **7186** | **6236** | **29** | **921** | **99.5%** |
 
 ## Per-driver scope
 
