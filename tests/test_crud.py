@@ -769,6 +769,39 @@ def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) ->
     assert "maxSize" not in cs[0]["storageStats"]
 
 
+def test_configure_failpoint_block_connection(client: MongoClient) -> None:
+    # mongo-node-driver's ``explain with timeoutMS`` CSOT tests configure
+    # a ``failCommand`` with ``blockConnection: true, blockTimeMS: 500``
+    # so the client-side ``timeoutMS`` timer fires before the server
+    # responds. Verify the failpoint actually blocks before dispatching
+    # the matched command.
+    import time
+
+    db = client["block_db"]
+    db.create_collection("things")
+
+    # Install a 500 ms block on ``find``.
+    client.admin.command(
+        {
+            "configureFailPoint": "failCommand",
+            "mode": {"times": 1},
+            "data": {"failCommands": ["find"], "blockConnection": True, "blockTimeMS": 500},
+        }
+    )
+
+    # Find should block ~500 ms then return normally.
+    start = time.monotonic()
+    list(db["things"].find())
+    elapsed_ms = (time.monotonic() - start) * 1000
+    assert 400 <= elapsed_ms <= 1500, f"expected ~500ms block, got {elapsed_ms:.0f}ms"
+
+    # Second find — failpoint exhausted (``times: 1``), should be fast.
+    start = time.monotonic()
+    list(db["things"].find())
+    elapsed_ms = (time.monotonic() - start) * 1000
+    assert elapsed_ms < 200, f"second find should be unblocked, took {elapsed_ms:.0f}ms"
+
+
 def test_get_parameter_advertises_only_scram_auth_mechanism(client: MongoClient) -> None:
     # Real mongod exposes enabled SASL mechanisms via
     # ``getParameter authenticationMechanisms``. mongo-java-driver's

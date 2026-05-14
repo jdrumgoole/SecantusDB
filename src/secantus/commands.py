@@ -4484,6 +4484,15 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 from secantus.failpoints import CloseConnectionRequested
 
                 raise CloseConnectionRequested()
+            if match.block_connection and match.block_time_ms > 0:
+                # Sleep before processing — mongo-node-driver's CSOT
+                # ``explain with timeoutMS`` tests configure a 2000 ms
+                # block specifically so the client's ``timeoutMS: 1000``
+                # timer fires first and surfaces as
+                # ``MongoOperationTimeoutError``. The block is what the
+                # driver test gates on; the actual timeout firing is
+                # client-side and we never have to send a reply.
+                _time.sleep(match.block_time_ms / 1000.0)
             if match.error_code is not None:
                 result: dict[str, Any] = {
                     "ok": 0.0,
