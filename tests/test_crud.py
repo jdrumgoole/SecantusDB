@@ -769,6 +769,29 @@ def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) ->
     assert "maxSize" not in cs[0]["storageStats"]
 
 
+def test_change_stream_rejected_on_standalone(tmp_path) -> None:
+    # When SecantusDB is booted in standalone mode (no replica-set
+    # advertisement in ``hello``), opening a change stream must
+    # fail with code 40573 — mongo-java-driver's ``change-streams-
+    # errors.yml`` single-topology test asserts exactly this. The
+    # default replica-set mode still permits change streams.
+    from pymongo.errors import OperationFailure
+
+    standalone_srv = SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "stand"), replica_set_name=None
+    )
+    standalone_srv.start()
+    try:
+        mc = MongoClient(standalone_srv.uri, serverSelectionTimeoutMS=2000, directConnection=True)
+        with pytest.raises(OperationFailure) as exc:
+            mc["db"]["c"].watch()
+        assert exc.value.code == 40573
+        assert "replica sets" in str(exc.value)
+        mc.close()
+    finally:
+        standalone_srv.stop()
+
+
 def test_configure_failpoint_block_connection(client: MongoClient) -> None:
     # mongo-node-driver's ``explain with timeoutMS`` CSOT tests configure
     # a ``failCommand`` with ``blockConnection: true, blockTimeMS: 500``

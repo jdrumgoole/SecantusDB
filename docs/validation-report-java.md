@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-05-14 — SecantusDB 0.5.1b5 vs mongo-java-driver ref: refs/he (`vendor/mongo-java-driver/`).
+Generated 2026-05-15 — SecantusDB 0.5.1b7 vs mongo-java-driver ref: refs/he (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -13,18 +13,16 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `bson` | 3809 | 0 | 11 | 3820 | 100.0% |
-| `driver-sync` | 433 | 4 | 453 | 890 | 99.1% |
-| **Overall** | **4242** | **4** | **464** | **4710** | **99.9%** |
+| `driver-sync` | 435 | 2 | 453 | 890 | 99.5% |
+| **Overall** | **4244** | **2** | **464** | **4710** | **100.0%** |
 
-## Failures (4)
+## Failures (2)
 
 First 30 failed tests for triage:
 
 ```
-driver-sync :: com.mongodb.client.unified.UnifiedWriteConcernTest#default-write-concern-3.4: MapReduce omits default write concern
 driver-sync :: com.mongodb.client.unified.VersionedApiTest#CRUD Api Version 1 (strict): aggregate on database appends declared API version
 driver-sync :: com.mongodb.client.unified.VersionedApiTest#CRUD Api Version 1 (strict): distinct appends declared API version
-driver-sync :: com.mongodb.client.unified.ChangeStreamsTest#change-streams-errors: The watch helper must not throw a custom exception when executed against a single server topology, but instead depend on a server error
 ```
 
 ## How this is generated
