@@ -18,8 +18,9 @@ from bson import json_util
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from pymongo.errors import PyMongoError
 
-from secantus.admin.client import MongoError
+from secantus.admin.client import MongoError, friendly_error
 
 router = APIRouter()
 
@@ -49,9 +50,14 @@ def _render(
         # hundred entries are typical; keep the page tight at 50.
         client = request.app.state.mongo._get_client()
         rows = [dict(d) for d in client[db]["system.profile"].find().sort("ts", -1).limit(50)]
-    except Exception:
-        # ``system.profile`` may not exist yet (level 0 since boot).
+    except PyMongoError as exc:
+        # ``system.profile`` not existing yet (level 0 since boot) is fine —
+        # find() on a missing collection returns an empty cursor, no error.
+        # But a real PyMongoError (server unreachable, auth failure) needs
+        # to surface, not get swallowed as "no entries yet".
         rows = []
+        if fetch_error is None:
+            fetch_error = friendly_error(exc)
 
     formatted = [
         {
@@ -104,11 +110,10 @@ def update_profiler(
         request.app.state.mongo.set_profile(db, level=level, slowms=slowms, sample_rate=sample_rate)
     except MongoError as exc:
         return _render(request, db=db, error=str(exc), status_code=400)
-    return HTMLResponse(
-        "",
-        status_code=303,
-        headers={
-            "HX-Redirect": f"/profiler?db={db}",
-            "Location": f"/profiler?db={db}",
-        },
+    return _render(
+        request,
+        db=db,
+        flash=(
+            f"Profile settings applied: level={level}, slowms={slowms}, sampleRate={sample_rate}."
+        ),
     )

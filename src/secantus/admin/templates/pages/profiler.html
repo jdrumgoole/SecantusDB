@@ -10,6 +10,7 @@
 </nav>
 
 {% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if flash %}<div class="flash flash-ok">{{ flash }}</div>{% endif %}
 
 <form
   class="filter-form"
