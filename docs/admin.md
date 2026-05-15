@@ -198,9 +198,10 @@ The bridge from pymongo's sync `ChangeStream` to async runs the cursor
 in a thread (`asyncio.to_thread(stream.try_next)`); the cursor is
 closed cleanly on disconnect.
 
-### Console (`/console`)
+### Query (`/query`)
 
-Three Alpine-toggled tabs:
+Three Alpine-toggled tabs that ride a single `queryPage` component
+in `static/js/query.js`:
 
 * **find** — db, collection, filter / sort / projection (Extended
   JSON), limit clamped to ≤ 200.
@@ -211,7 +212,40 @@ Three Alpine-toggled tabs:
 Results render as Extended-JSON pre blocks. Every successful submit
 is recorded in a per-URI history at `~/.secantus/admin.db` (SQLite,
 capped at 50 entries per URI). Click a "Recent" row to repopulate the
-active form via `fetch(/console/history/{id})`.
+active form via `fetch(/query/history/{id})`.
+
+### Insert (`/insert`)
+
+A dedicated page for adding documents — a sibling to Query rather
+than a fourth tab, because the input shape (one or more documents,
+no filter / sort / projection) doesn't fit the find / aggregate /
+runCommand mould.
+
+* **db / coll** — datalist-backed inputs reusing the same
+  `listDatabases` / `listCollections` sources as Query.
+* **Document(s)** — Extended-JSON textarea. Accepts a single
+  object `{...}` or a JSON array `[{...}, {...}]`; both shapes
+  route through `insertMany`.
+
+The response renders inline below the form with the inserted
+`_id`s.
+
+### Server (`/server`)
+
+Target-switching plus the embedded server's lifecycle:
+
+* **Embedded SecantusDB server** — start / stop the in-process
+  server. Optional `storage_path` selects an on-disk directory;
+  blank defaults to a per-launch tempdir. Starting it switches
+  the admin app's target to the embedded URI automatically.
+* **Switch to a new target** — accepts any URI the CLI's
+  `--uri` flag would accept, credentials inline.
+  Open WebSocket clients (dashboard metrics, change-stream tail)
+  keep their queues and start streaming from the new server on
+  the next tick.
+* **Recently used** — table of prior targets. Per-row Switch
+  / Forget actions. The "current" target is tagged with a badge
+  and has no actions.
 
 ### Connections + cursors (`/connections`, `/cursors`)
 

@@ -88,15 +88,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ### P0 — broken / silently wrong
 
-- [ ] **Doc tour describes non-existent `/console` page** — `docs/admin.md:201-214` walks the user through "the Console" with three Alpine-toggled tabs (find / aggregate / runCommand). The page was renamed to `/query` mid-refactor; `templates/pages/query.html` has the actual implementation, and `/insert` is a separate top-level route. Replace the Console subsection with `### Query (/query)` + `### Insert (/insert)` matching the sidebar. Also add the missing `### Server (/server)` subsection — current target switching, recently-used targets, and embedded-server start/stop are documented nowhere.
-
-- [ ] **Maintenance "Drop collection" form references a dead route** — `templates/pages/maintenance.html:68-71` has `hx-get="/maintenance/drop-collection-redirect"` but no such route exists in `routers/maintenance.py`. Currently masked because `onsubmit` line 71 intercepts and calls `openDropCollModal()`; with JS disabled or a HTMX/JS race, the user gets a 404. Drop the dead `hx-get` attribute and rely on the JS handler, or wire a real `/maintenance/drop-collection/{db}/{coll}/confirm` endpoint and use Alpine `:hx-get` to assemble it.
-
-- [ ] **Dead dashboard partial + endpoint** — `routers/dashboard.py:91-106` exposes `GET /_partials/dashboard-tiles` rendering `templates/partials/dashboard_tiles.html`, but `pages/dashboard.html` is now fully WebSocket-driven via Alpine (lines 4-55) and never includes the partial. The HTMX-polling fallback the docstring at `dashboard.py:1-7` describes is dead code. Delete both, or repurpose the partial as a `<noscript>` fallback inside `dashboard.html`.
-
-- [ ] **Profiler page accepts `flash` kwarg but never renders it** — `routers/profiler.py:31-84` passes `flash` to the template; `templates/pages/profiler.html` has no flash banner block. POST → `HX-Redirect` (line 109) means HTMX submits get zero confirmation feedback. Add a flash banner block to `profiler.html` and stop using `HX-Redirect`, or accept that the form-value change is the only feedback.
-
-- [ ] **Profiler swallows every exception reading `system.profile`** — `routers/profiler.py:52` has a bare `except Exception:` that masks server-down errors as "no entries yet — run an operation to see one appear here." Narrow to `except (PyMongoError, OperationFailure):` so target-disconnect surfaces.
+(None at present.)
 
 ### P1 — significant inconsistency / usability
 
