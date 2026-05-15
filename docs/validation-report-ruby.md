@@ -1,6 +1,6 @@
 # mongo-ruby-driver Validation Report
 
-Generated 2026-05-14 — SecantusDB 0.5.1b4 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
+Generated 2026-05-15 — SecantusDB 0.5.1b8 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
 
 Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver gauges for the official Ruby driver — the same gem Rails + Sinatra applications and the Ruby ecosystem build on.
 
@@ -9,18 +9,17 @@ Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the ana
 | Category | Passed | Failed | Pending | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `spec/mongo` | 204 | 1 | 16 | 221 | 99.5% |
-| `spec/support` | 87 | 2 | 8 | 97 | 97.8% |
-| **Overall** | **291** | **3** | **24** | **318** | **99.0%** |
+| `spec/support` | 88 | 1 | 8 | 97 | 98.9% |
+| **Overall** | **292** | **2** | **24** | **318** | **99.3%** |
 
-Run time: 14.91s.
+Run time: 12.69s.
 
-## Failures (3)
+## Failures (2)
 
 First 30 failed examples for triage:
 
 ```
 spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a write concern when write concern passed in as an option applies the write concern passed in as an option
-spec/support :: Mongo::Collection#create when the collection has options when a session is provided behaves like a failed operation using a session raises an error
 spec/support :: Mongo::Index::View#create_one when the index is created when provided a session behaves like a failed operation using a session raises an error
 ```
 

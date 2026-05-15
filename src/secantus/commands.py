@@ -1992,6 +1992,24 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    # Reject unknown top-level options on ``create``. Real mongod
+    # surfaces unknown fields as ``Location40415`` (40415, IDLUnknownField).
+    # mongo-ruby-driver's ``Collection#create ... a failed operation
+    # using a session`` shared spec passes ``invalid: true`` specifically
+    # to provoke this rejection. The whitelist below covers every
+    # option mongod's ``create`` IDL accepts plus the wire envelope
+    # fields any driver may attach.
+    unknown = next(
+        (k for k in doc if k not in _CREATE_KNOWN_OPTIONS and not k.startswith("$")),
+        None,
+    )
+    if unknown is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"BSON field 'create.{unknown}' is an unknown field",
+            "code": 40415,
+            "codeName": "Location40415",
+        }
     coll = doc["create"]
     capped = bool(doc.get("capped", False))
     if capped:
@@ -2327,6 +2345,27 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "TypeMismatch",
             }
         options = {k: v for k, v in idx_spec.items() if k not in ("key", "name")}
+        # Reject unknown options on the index spec itself. Real mongod
+        # rejects with ``Location40415`` (40415, IDLUnknownField).
+        # mongo-ruby-driver's ``Index::View#create_one when provided a
+        # session`` shared spec passes ``invalid: true`` specifically to
+        # provoke this rejection. The whitelist below covers every
+        # option mongod's index-spec IDL accepts plus the legacy /
+        # deprecated forms drivers still emit.
+        unknown_idx = next(
+            (k for k in options if k not in _INDEX_SPEC_KNOWN_OPTIONS),
+            None,
+        )
+        if unknown_idx is not None:
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"Error in specification {dict(idx_spec)!r}: "
+                    f"the field '{unknown_idx}' is an unknown field"
+                ),
+                "code": 40415,
+                "codeName": "Location40415",
+            }
         # Canonicalise option-blob shape per mongod: falsy values for
         # ``hidden`` / ``sparse`` / ``unique`` are stripped (mongod stores
         # only the non-default form). Mongo-ruby-driver's
@@ -4369,6 +4408,96 @@ _VALID_READ_CONCERN_LEVELS = frozenset(
 # exactly this code on ``apiVersion: 'does-not-exist'``.
 _VALID_API_VERSIONS = frozenset({"1"})
 
+# Per-index options the ``createIndexes`` command accepts inside each
+# entry of the ``indexes`` array. Anything outside this set is
+# rejected with ``Location40415`` (40415, IDLUnknownField), matching
+# mongod's IDL. mongo-ruby-driver's ``Index::View#create_one when
+# provided a session`` spec passes ``invalid: true`` to trigger this.
+_INDEX_SPEC_KNOWN_OPTIONS = frozenset(
+    {
+        # Geometric / vector indexes.
+        "2dsphereIndexVersion",
+        "bits",
+        "min",
+        "max",
+        # Wildcard.
+        "wildcardProjection",
+        # Standard knobs.
+        "unique",
+        "sparse",
+        "hidden",
+        "background",
+        "expireAfterSeconds",
+        "partialFilterExpression",
+        "collation",
+        "storageEngine",
+        # Text — accepted on the wire, even though we don't implement
+        # text indexes (storage rejects with CreateIndexUnsupported).
+        "weights",
+        "default_language",
+        "language_override",
+        "textIndexVersion",
+        # Index format version + namespace (legacy drivers).
+        "v",
+        "ns",
+        # Haystack (deprecated).
+        "bucketSize",
+    }
+)
+
+
+# Top-level options the ``create`` command accepts. Anything outside
+# this set is rejected with ``Location40415`` (40415, IDLUnknownField),
+# matching mongod's IDL behaviour. mongo-ruby-driver's ``Collection#create
+# when a session is provided`` shared spec exercises this by sending
+# ``invalid: true`` and asserting an ``OperationFailure``.
+_CREATE_KNOWN_OPTIONS = frozenset(
+    {
+        # Command name (always present).
+        "create",
+        # Per-create options mongod's IDL exposes.
+        "capped",
+        "size",
+        "max",
+        "validator",
+        "validationAction",
+        "validationLevel",
+        "viewOn",
+        "pipeline",
+        "collation",
+        "expireAfterSeconds",
+        "timeseries",
+        "clusteredIndex",
+        "changeStreamPreAndPostImages",
+        "storageEngine",
+        "indexOptionDefaults",
+        "writeConcern",
+        "comment",
+        "maxTimeMS",
+        # mongorestore sends ``idIndex`` (the full ``_id_`` spec from
+        # the source collection's listCollections output) so the
+        # restored target gets the right index version / options. Real
+        # mongod accepts this on ``create``.
+        "idIndex",
+        # Legacy / deprecated but tolerated.
+        "autoIndexId",
+        "flags",
+        # Wire envelope fields (all ``$``-prefixed keys are accepted
+        # unconditionally via the ``startswith("$")`` check above, but
+        # list the common non-``$``-prefixed envelope keys explicitly
+        # so driver tests passing them at the command level don't trip
+        # the unknown-field rejection).
+        "lsid",
+        "txnNumber",
+        "autocommit",
+        "startTransaction",
+        "readConcern",
+        "apiVersion",
+        "apiStrict",
+        "apiDeprecationErrors",
+    }
+)
+
 # Commands allowed under ``apiVersion: 1, apiStrict: true`` per
 # MongoDB's Stable API contract. Anything outside this set with
 # ``apiStrict: true`` set surfaces as ``APIStrictError`` (code 323).
@@ -4491,23 +4620,34 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 322,
             "codeName": "APIVersionError",
         }
-    # NOTE: ``apiStrict: true`` enforcement is deliberately not done
-    # here. A previous attempt (commit d-stub) added the obvious
-    # whitelist + ``APIStrictError`` rejection for non-v1 commands and
-    # aggregation stages. It correctly turned mongo-java-driver's
-    # ``distinct`` and ``$listLocalSessions`` ``versioned-api`` tests
-    # into passes, but the Java driver's connection pool reacts to
-    # those expected errors by **pausing the pool** for the rest of
-    # the test class run — six subsequent tests in the same suite
-    # (bulkWrite, deleteMany, deleteOne, estimatedDocumentCount,
-    # find+getMore, findOneAndDelete) then fail with
-    # ``MongoConnectionPoolClearedException`` before they can even
-    # send their commands. Net: -2 failures, +6 cascade failures.
-    # Until the cascade is understood (specific error-shape signal the
-    # Java driver reads as "pool-clearing") the gate is left off; the
-    # two ``versioned-api`` tests stay in the known-failure list. See
-    # ``_API_V1_COMMANDS`` / ``_API_V1_AGG_STAGES`` below — kept in
-    # source so a later attempt can pick them back up.
+    # ``apiStrict: true`` narrows the allowed surface to the Stable API
+    # contract. Aggregation stages outside ``_API_V1_AGG_STAGES`` are
+    # rejected with ``APIStrictError`` (code 323) — lights up
+    # mongo-java-driver's ``versioned-api/aggregate on database
+    # appends declared API version`` test (which probes with
+    # ``$listLocalSessions``) without triggering the connection-pool
+    # cascade the **command-level** gate caused (rejecting ``distinct``
+    # at the command-name level made the Java driver pause its pool on
+    # the resulting expected error, failing 6 subsequent tests with
+    # ``MongoConnectionPoolClearedException``). The command-name gate
+    # is intentionally left out — see the ``_API_V1_COMMANDS`` set
+    # below for what a future attempt would enable.
+    if doc.get("apiStrict") and name == "aggregate":
+        pipeline = doc.get("pipeline") or []
+        if isinstance(pipeline, list):
+            for stage in pipeline:
+                if isinstance(stage, Mapping):
+                    stage_name = next(iter(stage), "")
+                    if stage_name and stage_name not in _API_V1_AGG_STAGES:
+                        return {
+                            "ok": 0.0,
+                            "errmsg": (
+                                f"Provided aggregation pipeline stage "
+                                f"{stage_name} is not in API Version 1"
+                            ),
+                            "code": 323,
+                            "codeName": "APIStrictError",
+                        }
     # Count every dispatched command — even unknown / unauth-rejected
     # ones — so serverStatus.network.numRequests reflects raw wire
     # traffic, not just the successful subset. Mongod's accounting is

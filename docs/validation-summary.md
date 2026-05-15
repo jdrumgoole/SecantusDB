@@ -7,11 +7,11 @@ Generated 2026-05-15 — SecantusDB 0.5.1b8. Each per-driver gauge runs the driv
 | Driver | Language | Driver version | Tests run | Passed | Failed | Skipped | Pass rate |
 |---|---|---|---:|---:|---:|---:|---:|
 | `pymongo` | Python | `f2103a95870a` | 1341 | 959 | 0 | 382 | 100.0% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 4710 | 4244 | 2 | 464 | 100.0% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 4710 | 4245 | 1 | 464 | 100.0% |
 | `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 398 | 3 | 52 | 99.3% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 358 | 1 | 5 | 99.7% |
-| `mongo-ruby-driver` | Ruby | `f68d676643c1` | 318 | 291 | 3 | 24 | 99.0% |
-| **All drivers** | — | — | **7186** | **6250** | **9** | **927** | **99.9%** |
+| `mongo-ruby-driver` | Ruby | `f68d676643c1` | 318 | 292 | 2 | 24 | 99.3% |
+| **All drivers** | — | — | **7186** | **6252** | **7** | **927** | **99.9%** |
 
 ## Per-driver scope
 
