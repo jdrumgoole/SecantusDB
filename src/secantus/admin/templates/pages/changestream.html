@@ -12,7 +12,7 @@
     <div class="filter-controls">
       <label>
         Scope
-        <select x-model="scope">
+        <select name="scope" x-model="scope">
           <option value="cluster">cluster</option>
           <option value="db">db</option>
           <option value="coll">coll</option>
@@ -20,11 +20,11 @@
       </label>
       <label x-show="scope !== 'cluster'">
         Database
-        <input type="text" x-model="db" autocomplete="off" />
+        <input type="text" name="db" x-model="db" autocomplete="off" />
       </label>
       <label x-show="scope === 'coll'">
         Collection
-        <input type="text" x-model="coll" autocomplete="off" />
+        <input type="text" name="coll" x-model="coll" autocomplete="off" />
       </label>
       <label class="checkbox-label">
         <input type="checkbox" x-model="ddlOn" /> Show DDL events

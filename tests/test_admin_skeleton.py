@@ -366,14 +366,27 @@ async def test_collection_viewer_paginates_to_completion(server, http: AsyncClie
     for _ in range(10):  # safety bound
         r = await http.get(url, headers={HEADER_NAME: "testtoken"})
         assert r.status_code == 200
-        # Pull the next-page href if present.
+        # Pull the next-page href if present. The pager may also include
+        # a "First page" link on non-first pages, so locate the next-page
+        # anchor specifically by its href carrying ``cursor=``.
         text = r.text
         if "Next page" not in text:
             break
-        # Extract the cursor query parameter from the next-page anchor.
-        start = text.find('href="/db/page_db/c?')
-        end = text.find('"', start + 6)
-        href = text[start + 6 : end].replace("&amp;", "&")
+        # Extract the next-page anchor — the only one with a cursor param.
+        marker = 'href="/db/page_db/c?'
+        start = 0
+        href = ""
+        while True:
+            start = text.find(marker, start)
+            if start == -1:
+                break
+            end = text.find('"', start + 6)
+            candidate = text[start + 6 : end].replace("&amp;", "&")
+            if "cursor=" in candidate:
+                href = candidate
+                break
+            start = end
+        assert href, "expected a next-page href with cursor= but found none"
         params = parse_qs(urlparse(href).query)
         url = "/db/page_db/c?" + "&".join(f"{k}={v[0]}" for k, v in params.items())
     # The last page contains _id 10 and 11 (12 docs / page_size 5 = 3 pages).

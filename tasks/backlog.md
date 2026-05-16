@@ -92,27 +92,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ### P1 — significant inconsistency / usability
 
-- [ ] **No `hx-indicator` anywhere — long-running ops look frozen** — grep for `hx-indicator` in `templates/` returns zero hits. HTMX adds the `htmx-request` class during in-flight requests; without an indicator element the user has no signal when (a) opening a modal, (b) submitting a form, (c) deleting an index/document/cursor, (d) running an aggregate with `$lookup`. On a slow target this looks like the UI froze. Add a small inline spinner pattern in `base.html` and reference it from the long-running endpoints.
-
-- [ ] **`/backup/dump` and `/backup/restore` block the request thread** — `routers/backup.py:91, 110` call `backup_lib.run_mongodump` / `run_mongorestore` synchronously. A 500MB collection dump hangs the page for tens of seconds with no spinner, no progress, no async wrapper. At minimum disable the button + show a spinner; ideally wrap in a background task with poll status.
-
-- [ ] **`data-table` empty-state row hardcodes `colspan` in 8 templates** — `pages/{databases,collections,connections,cursors,users,indexes,maintenance,backup}.html`. Future "add a column" edits silently break alignment in every other empty state. Pull into a shared partial (or use an out-of-table `.empty-state` div).
-
-- [ ] **Collection viewer pager is one-directional** — `pages/collection.html:58-63` has only "Next page →". Skip-by-`_id` pagination makes Previous expensive but a "← First page" reset link is free; without it a user who paged 12 times has no way back to page 1 except deep-link or sidebar bounce.
-
-- [ ] **Form-validation feedback is inconsistent or missing** — three drift cases:
-  - `/users` create-user POST returns 400 on missing fields (`routers/users.py:103-107`); the client `hx-on::after-request` (`pages/users.html:32`) only reloads on `event.detail.successful`, so 400s never surface. Use the form-validation handler in `app.py:162-200` or render the error inline.
-  - `/changestream` Watch button is inside a `<form method="get">` with no submit handler (`pages/changestream.html:7-30`); pressing Enter in any field does a GET form submit and reloads the page, losing in-flight events. Drop the `<form>` wrapper or add an Alpine Enter handler.
-  - Server-switch URI form (`pages/server.html:66-85`) does no client-side validation; user discovers `htt://typo` only after submit. Add `pattern="mongodb(\\+srv)?://.*"` and `inputmode="url"`.
-
-- [ ] **Maintenance "Drop collection" form has no db/coll datalist** — `pages/maintenance.html:73-76`. Forces the user to remember exact names; `/insert` and `/query` already populate datalists from `listDatabases`. Reuse the same pattern.
+- [ ] **`/backup/dump` and `/backup/restore` block the request thread** — `routers/backup.py:91, 110` call `backup_lib.run_mongodump` / `run_mongorestore` synchronously. A 500MB collection dump hangs the page for tens of seconds, though it now shows a spinner + disabled button while running (admin-ui-polish, May 2026). Ideally wrap in a background task with poll status for tens-of-seconds workloads.
 
 - [ ] **`HX-Redirect` on indexes POST forces a full reload that loses scroll position** — `routers/indexes.py:179-186`. Long index lists drop the user back to the top. Switch to `HX-Trigger: indexes-changed` plus `hx-trigger="indexes-changed from:body"` on the table tbody to swap rows only.
 
 ### P2 — polish
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code:
-  - **Dead CSS**: `.loading` (`admin.css:233-235`), `.nav-disabled` (`admin.css:130-133, 297-300`) — neither is referenced in any template.
   - **Undefined-but-used class**: `.filter-label` is used in 17 places but never defined in `admin.css`. Either define it (currently `.filter-form label` is the de-facto rule) or replace usages.
   - **Inline error styling** in `pages/profiler.html:67` and `pages/backup.html:62` (`style="border-color: var(--error); color: var(--error)"`) — promote to `.badge-error` and use a class.
   - **Brand-mark glyph reuse**: `●` is used as the brand glyph, the server-badge dot, and the embedded-server "running" indicator — three semantic uses of one character. Different glyphs or sizes for state-indicator vs brand-mark would help.
