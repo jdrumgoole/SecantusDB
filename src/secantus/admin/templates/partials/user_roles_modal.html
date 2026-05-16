@@ -1,11 +1,17 @@
-<div class="modal-overlay" @click.self="document.getElementById('modal').innerHTML = ''">
-  <div class="modal">
+<div
+  class="modal-overlay"
+  x-init="setupModal($el)"
+  @click.self="closeModal()"
+  @keydown.escape.window="closeModal()"
+>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <header class="modal-header">
-      <h2>Manage roles</h2>
+      <h2 id="modal-title">Manage roles</h2>
       <button
         type="button"
         class="modal-close"
-        @click="document.getElementById('modal').innerHTML = ''"
+        aria-label="Close"
+        @click="closeModal()"
       >×</button>
     </header>
     <form
@@ -31,7 +37,7 @@
         <button
           type="button"
           class="btn-secondary"
-          @click="document.getElementById('modal').innerHTML = ''"
+          @click="closeModal()"
         >Cancel</button>
         <button type="submit">Apply</button>
       </div>

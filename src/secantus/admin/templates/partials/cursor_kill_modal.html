@@ -1,15 +1,18 @@
 <div
   class="modal-overlay"
   x-data="{ confirm: '' }"
-  @click.self="document.getElementById('modal').innerHTML = ''"
+  x-init="setupModal($el)"
+  @click.self="closeModal()"
+  @keydown.escape.window="closeModal()"
 >
-  <div class="modal modal-narrow">
+  <div class="modal modal-narrow" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <header class="modal-header">
-      <h2>Kill cursor</h2>
+      <h2 id="modal-title">Kill cursor</h2>
       <button
         type="button"
         class="modal-close"
-        @click="document.getElementById('modal').innerHTML = ''"
+        aria-label="Close"
+        @click="closeModal()"
       >×</button>
     </header>
     <div class="modal-body">
@@ -18,7 +21,7 @@
         <code>{{ ns }}</code>. Active tailable consumers will see the
         stream end on their next <code>getMore</code>.
       </p>
-      <p>Type the cursor id <code>{{ cursor_id }}</code> to confirm:</p>
+      <p>Type the namespace <code>{{ ns }}</code> to confirm:</p>
       <input
         type="text"
         class="confirm-input"
@@ -30,17 +33,17 @@
         <button
           type="button"
           class="btn-secondary"
-          @click="document.getElementById('modal').innerHTML = ''"
+          @click="closeModal()"
         >Cancel</button>
         <button
           type="button"
           class="btn-danger"
-          x-bind:disabled="confirm !== '{{ cursor_id }}'"
+          x-bind:disabled="confirm !== '{{ ns }}'"
           hx-delete="/cursors/{{ cursor_id }}?ns={{ ns | urlencode }}"
           hx-target="#cursor-{{ cursor_id }}"
           hx-swap="outerHTML"
-          hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
-        >Kill</button>
+          hx-on::after-request="if(event.detail.successful) closeModal()"
+        >Kill cursor</button>
       </div>
     </div>
   </div>

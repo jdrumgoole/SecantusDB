@@ -1,19 +1,24 @@
-<div class="modal-overlay" @click.self="document.getElementById('modal').innerHTML = ''">
-  <div class="modal">
+<div
+  class="modal-overlay"
+  x-init="setupModal($el)"
+  @click.self="closeModal()"
+  @keydown.escape.window="closeModal()"
+>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <header class="modal-header">
-      <h2>Edit document</h2>
+      <h2 id="modal-title">Edit document</h2>
       <button
         type="button"
         class="modal-close"
-        @click="document.getElementById('modal').innerHTML = ''"
         aria-label="Close"
+        @click="closeModal()"
       >×</button>
     </header>
     <form
       hx-post="/db/{{ db_name }}/{{ coll_name }}/docs/{{ id_token }}"
       hx-target="#row-{{ id_token }}"
       hx-swap="outerHTML"
-      hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
+      hx-on::after-request="if(event.detail.successful) closeModal()"
     >
       <p class="modal-meta">_id: <code>{{ doc_id }}</code> (immutable)</p>
       {% if error %}
@@ -24,7 +29,7 @@
         <button
           type="button"
           class="btn-secondary"
-          @click="document.getElementById('modal').innerHTML = ''"
+          @click="closeModal()"
         >Cancel</button>
         <button type="submit">Save</button>
       </div>
