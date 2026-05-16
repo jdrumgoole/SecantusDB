@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
 <p class="modal-meta">
-  Live snapshot from <code>currentOp</code>. Connections refresh on
-  page reload — kill-on-row is deferred until SecantusDB grows
-  <code>killOp</code>.
+  Live snapshot from <code>currentOp</code>. Table auto-refreshes
+  every 5s. Connection-kill is deferred until SecantusDB grows
+  <code>killOp</code> — the Actions column mirrors the Cursors page
+  for symmetry but is non-functional today.
 </p>
 
 {% if error %}
@@ -19,23 +20,9 @@
       <th>Last op</th>
       <th>Active</th>
       <th>Connected at</th>
+      <th class="doc-actions-col">Actions</th>
     </tr>
   </thead>
-  <tbody>
-    {% for r in rows %}
-      <tr>
-        <td><code>{{ r.conn_id }}</code></td>
-        <td><code>{{ r.client }}</code></td>
-        <td>
-          {% if r.user.user %}<code>{{ r.user.user }}@{{ r.user.db }}</code>{% else %}<span class="muted">—</span>{% endif %}
-        </td>
-        <td><code>{{ r.op or '—' }}</code></td>
-        <td>{% if r.active %}<span class="badge">active</span>{% else %}<span class="muted">idle</span>{% endif %}</td>
-        <td><code>{{ r.opened_at }}</code></td>
-      </tr>
-    {% else %}
-      <tr><td colspan="6" class="empty">No connections.</td></tr>
-    {% endfor %}
-  </tbody>
+  {% include "partials/connections_rows.html" %}
 </table>
 {% endblock %}

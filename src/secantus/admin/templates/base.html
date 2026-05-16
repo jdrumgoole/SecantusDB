@@ -25,7 +25,8 @@
           <li><a href="/insert" class="{% if active == 'insert' %}nav-current{% endif %}">Insert</a></li>
           <li><a href="/db" class="{% if active == 'databases' %}nav-current{% endif %}">Databases</a></li>
           <li><a href="/users" class="{% if active == 'users' %}nav-current{% endif %}">Users</a></li>
-          <li><a href="/changestream" class="{% if active == 'changestream' %}nav-current{% endif %}">Change stream</a></li>
+          <li class="nav-sub"><a href="/roles" class="{% if active == 'roles' %}nav-current{% endif %}">Roles</a></li>
+          <li class="nav-ops-start"><a href="/changestream" class="{% if active == 'changestream' %}nav-current{% endif %}">Change stream</a></li>
           <li><a href="/connections" class="{% if active == 'connections' %}nav-current{% endif %}">Connections</a></li>
           <li><a href="/cursors" class="{% if active == 'cursors' %}nav-current{% endif %}">Cursors</a></li>
           <li><a href="/profiler" class="{% if active == 'profiler' %}nav-current{% endif %}">Profiler</a></li>

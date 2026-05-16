@@ -41,27 +41,52 @@ def _format_iso(value: Any) -> str:
     return ""
 
 
-@router.get("/connections", response_class=HTMLResponse)
-def connections_page(request: Request) -> HTMLResponse:
-    error: str | None = None
+def _connection_rows(request: Request) -> tuple[list[dict[str, Any]], str | None]:
     rows: list[dict[str, Any]] = []
     try:
         inprog = request.app.state.mongo.current_op()
-        conns, _ = _split(inprog)
-        for c in conns:
-            rows.append(
-                {
-                    "conn_id": int(c.get("connectionId", 0) or 0),
-                    "client": c.get("client", "") or "",
-                    "user": (c.get("effectiveUsers") or [{}])[0],
-                    "op": c.get("op", "") or "",
-                    "active": bool(c.get("active", False)),
-                    "opened_at": _format_iso(c.get("currentOpTime")),
-                }
-            )
-        rows.sort(key=lambda r: r["conn_id"])
     except MongoError as exc:
-        error = str(exc)
+        return rows, str(exc)
+    conns, _ = _split(inprog)
+    for c in conns:
+        rows.append(
+            {
+                "conn_id": int(c.get("connectionId", 0) or 0),
+                "client": c.get("client", "") or "",
+                "user": (c.get("effectiveUsers") or [{}])[0],
+                "op": c.get("op", "") or "",
+                "active": bool(c.get("active", False)),
+                "opened_at": _format_iso(c.get("currentOpTime")),
+            }
+        )
+    rows.sort(key=lambda r: r["conn_id"])
+    return rows, None
+
+
+def _cursor_rows(request: Request) -> tuple[list[dict[str, Any]], str | None]:
+    rows: list[dict[str, Any]] = []
+    try:
+        inprog = request.app.state.mongo.current_op()
+    except MongoError as exc:
+        return rows, str(exc)
+    _, cursors = _split(inprog)
+    for c in cursors:
+        rows.append(
+            {
+                "cursor_id": int(c.get("cursorId", 0) or 0),
+                "ns": c.get("ns", "") or "",
+                "tailable": bool(c.get("tailable", False)),
+                "await_data": bool(c.get("awaitData", False)),
+                "killable": bool(c.get("ns")),
+            }
+        )
+    rows.sort(key=lambda r: r["cursor_id"])
+    return rows, None
+
+
+@router.get("/connections", response_class=HTMLResponse)
+def connections_page(request: Request) -> HTMLResponse:
+    rows, error = _connection_rows(request)
     templates = _templates(request)
     return templates.TemplateResponse(
         request,
@@ -75,26 +100,20 @@ def connections_page(request: Request) -> HTMLResponse:
     )
 
 
+@router.get("/connections/_rows", response_class=HTMLResponse)
+def connections_rows(request: Request) -> HTMLResponse:
+    rows, _ = _connection_rows(request)
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "partials/connections_rows.html",
+        {"rows": rows},
+    )
+
+
 @router.get("/cursors", response_class=HTMLResponse)
 def cursors_page(request: Request) -> HTMLResponse:
-    error: str | None = None
-    rows: list[dict[str, Any]] = []
-    try:
-        inprog = request.app.state.mongo.current_op()
-        _, cursors = _split(inprog)
-        for c in cursors:
-            rows.append(
-                {
-                    "cursor_id": int(c.get("cursorId", 0) or 0),
-                    "ns": c.get("ns", "") or "",
-                    "tailable": bool(c.get("tailable", False)),
-                    "await_data": bool(c.get("awaitData", False)),
-                    "killable": bool(c.get("ns")),
-                }
-            )
-        rows.sort(key=lambda r: r["cursor_id"])
-    except MongoError as exc:
-        error = str(exc)
+    rows, error = _cursor_rows(request)
     templates = _templates(request)
     return templates.TemplateResponse(
         request,
@@ -105,6 +124,17 @@ def cursors_page(request: Request) -> HTMLResponse:
             "rows": rows,
             "error": error,
         },
+    )
+
+
+@router.get("/cursors/_rows", response_class=HTMLResponse)
+def cursors_rows(request: Request) -> HTMLResponse:
+    rows, _ = _cursor_rows(request)
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "partials/cursors_rows.html",
+        {"rows": rows},
     )
 
 
