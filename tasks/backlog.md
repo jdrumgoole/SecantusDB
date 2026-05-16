@@ -96,13 +96,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 - [ ] **Sidebar visual grouping is incomplete** — `static/css/admin.css:124-128` has one separator above "Server"; the next logical group break (after Users, separating "per-target operations" from "operational state": Change stream / Connections / Cursors / Profiler / Maintenance / Logs / Backup) has no visual cue. Add a second `.nav-separator` rule and apply it on the first item of the operational-state group.
 
-- [ ] **Modal patterns drift across the 8 confirmation modals** — `templates/partials/{index_drop,user_drop,user_password,user_roles,cursor_kill,doc_edit,doc_delete,maintenance_drop_db,maintenance_drop_coll}_modal.html`. Five sub-issues:
-  - Destructive button copy: Drop / Delete / Kill / "Drop database" / "Drop collection" — pick one convention (always restate action+noun).
-  - Typed-confirm targets: doc-delete asks for the **collection name** (shared by every doc on the page), not the doc `_id`; cursor-kill asks for the giant int cursor id. Use `_id` (or literal "delete") for documents; use `ns` for cursors.
-  - Escape key doesn't dismiss any modal. Add `@keydown.escape.window` handler in the overlay div.
-  - Focus is not restored to the trigger element after close; Tab key escapes the modal back into the page (no focus trap).
-  - `aria-label="Close"` is on `doc_delete_modal` and `doc_edit_modal` only — apply to all 8.
-
 - [ ] **No `hx-indicator` anywhere — long-running ops look frozen** — grep for `hx-indicator` in `templates/` returns zero hits. HTMX adds the `htmx-request` class during in-flight requests; without an indicator element the user has no signal when (a) opening a modal, (b) submitting a form, (c) deleting an index/document/cursor, (d) running an aggregate with `$lookup`. On a slow target this looks like the UI froze. Add a small inline spinner pattern in `base.html` and reference it from the long-running endpoints.
 
 - [ ] **`/backup/dump` and `/backup/restore` block the request thread** — `routers/backup.py:91, 110` call `backup_lib.run_mongodump` / `run_mongorestore` synchronously. A 500MB collection dump hangs the page for tens of seconds with no spinner, no progress, no async wrapper. At minimum disable the button + show a spinner; ideally wrap in a background task with poll status.
