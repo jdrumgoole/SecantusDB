@@ -1,3 +1,4 @@
+{% from "partials/_macros.html" import empty_row %}
 <tbody
   id="connections-tbody"
   hx-get="/connections/_rows"
@@ -19,6 +20,6 @@
       </td>
     </tr>
   {% else %}
-    <tr><td colspan="7" class="empty">No connections.</td></tr>
+    {{ empty_row(7, "No connections.") }}
   {% endfor %}
 </tbody>

@@ -70,8 +70,11 @@
       type="text"
       name="uri"
       autocomplete="off"
+      inputmode="url"
       placeholder="mongodb://127.0.0.1:27017/"
       value="{{ pending_uri }}"
+      pattern="mongodb(\+srv)?://.*"
+      title="URI must start with mongodb:// or mongodb+srv://"
       required
     />
   </label>

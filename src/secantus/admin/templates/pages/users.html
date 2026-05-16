@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "partials/_macros.html" import empty_row %}
 {% block content %}
 <nav class="breadcrumb">
   <span>Home database</span>
@@ -29,8 +30,22 @@
     action="/users?db={{ db_name }}"
     hx-post="/users?db={{ db_name }}"
     hx-swap="none"
-    hx-on::after-request="if(event.detail.successful) window.location.reload()"
+    x-data="{ errorMsg: '' }"
+    hx-on::after-request="
+      if (event.detail.successful) {
+        window.location.reload();
+      } else {
+        const xhr = event.detail.xhr;
+        let msg = (xhr.responseText || '').trim();
+        try {
+          const j = JSON.parse(msg);
+          if (j.detail) msg = j.detail;
+        } catch (_) {}
+        errorMsg = msg || ('Create user failed (HTTP ' + xhr.status + ').');
+      }
+    "
   >
+    <div class="error" x-show="errorMsg" x-text="errorMsg" x-cloak></div>
     <div class="filter-controls">
       <label>
         Username
@@ -100,7 +115,7 @@
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="3" class="empty">No users on this database.</td></tr>
+      {{ empty_row(3, "No users on this database.") }}
     {% endfor %}
   </tbody>
 </table>

@@ -1,3 +1,4 @@
+{% from "partials/_macros.html" import empty_row %}
 <tbody
   id="cursors-tbody"
   hx-get="/cursors/_rows"
@@ -27,6 +28,6 @@
       </td>
     </tr>
   {% else %}
-    <tr><td colspan="4" class="empty">No cursors.</td></tr>
+    {{ empty_row(4, "No cursors.") }}
   {% endfor %}
 </tbody>
