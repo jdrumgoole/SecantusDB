@@ -92,21 +92,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ### P1 — significant inconsistency / usability
 
-- [ ] **`/roles` is reachable but invisible in sidebar, and highlights wrong nav item** — `templates/base.html:19-34` lists 13 nav items; Roles isn't one. The route is real (`routers/users.py:254-278`), only discoverable via the breadcrumb on `/users`. Worse, `roles.html` sets `active="users"` so the wrong sidebar item highlights when on `/roles`. Either add a Roles entry under Users in the sidebar with `active="roles"`, or commit to Users-as-parent and add an explicit Users-page sub-nav.
-
-- [ ] **Sidebar visual grouping is incomplete** — `static/css/admin.css:124-128` has one separator above "Server"; the next logical group break (after Users, separating "per-target operations" from "operational state": Change stream / Connections / Cursors / Profiler / Maintenance / Logs / Backup) has no visual cue. Add a second `.nav-separator` rule and apply it on the first item of the operational-state group.
-
 - [ ] **No `hx-indicator` anywhere — long-running ops look frozen** — grep for `hx-indicator` in `templates/` returns zero hits. HTMX adds the `htmx-request` class during in-flight requests; without an indicator element the user has no signal when (a) opening a modal, (b) submitting a form, (c) deleting an index/document/cursor, (d) running an aggregate with `$lookup`. On a slow target this looks like the UI froze. Add a small inline spinner pattern in `base.html` and reference it from the long-running endpoints.
 
 - [ ] **`/backup/dump` and `/backup/restore` block the request thread** — `routers/backup.py:91, 110` call `backup_lib.run_mongodump` / `run_mongorestore` synchronously. A 500MB collection dump hangs the page for tens of seconds with no spinner, no progress, no async wrapper. At minimum disable the button + show a spinner; ideally wrap in a background task with poll status.
 
-- [ ] **`/connections` and `/cursors` have no auto-refresh and no manual refresh** — sister pages to the dashboard (which polls 1Hz over WS), but both are static snapshots requiring F5. Add `hx-trigger="every 5s"` on the table tbody, or at minimum a "Refresh" button.
-
 - [ ] **`data-table` empty-state row hardcodes `colspan` in 8 templates** — `pages/{databases,collections,connections,cursors,users,indexes,maintenance,backup}.html`. Future "add a column" edits silently break alignment in every other empty state. Pull into a shared partial (or use an out-of-table `.empty-state` div).
 
 - [ ] **Collection viewer pager is one-directional** — `pages/collection.html:58-63` has only "Next page →". Skip-by-`_id` pagination makes Previous expensive but a "← First page" reset link is free; without it a user who paged 12 times has no way back to page 1 except deep-link or sidebar bounce.
-
-- [ ] **`/connections` / `/cursors` table-shape asymmetry** — `pages/connections.html` has 6 columns + no Actions column (because `killOp` isn't implemented); `pages/cursors.html` has 4 columns + Actions. Sister pages should match. Add a disabled, tooltip-explained Actions column to Connections so the layouts mirror, and link the "kill not implemented" tooltip to the `killOp` deferred entry in this backlog.
 
 - [ ] **Form-validation feedback is inconsistent or missing** — three drift cases:
   - `/users` create-user POST returns 400 on missing fields (`routers/users.py:103-107`); the client `hx-on::after-request` (`pages/users.html:32`) only reloads on `event.detail.successful`, so 400s never surface. Use the form-validation handler in `app.py:162-200` or render the error inline.
