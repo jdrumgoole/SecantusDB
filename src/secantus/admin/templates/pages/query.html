@@ -36,6 +36,7 @@
     class="filter-form"
     method="post"
     action="/query/find"
+    @submit="busy = true"
   >
     <div class="filter-controls">
       <label>Database
@@ -62,7 +63,10 @@
       <textarea name="projection" rows="1" placeholder='{"name": 1}'>{{ form.projection or '' }}</textarea>
     </label>
     <div class="modal-actions">
-      <button type="submit" :disabled="!db.trim() || !coll.trim()">Run find</button>
+      <button type="submit" :disabled="busy || !db.trim() || !coll.trim()">
+        <span x-show="!busy">Run find</span>
+        <span x-show="busy" x-cloak><span class="spinner"></span> Running…</span>
+      </button>
     </div>
   </form>
 
@@ -72,6 +76,7 @@
     class="filter-form"
     method="post"
     action="/query/aggregate"
+    @submit="busy = true"
   >
     <div class="filter-controls">
       <label>Database
@@ -91,7 +96,10 @@
                 placeholder='[{"$match": {}}, {"$count": "n"}]'></textarea>
     </label>
     <div class="modal-actions">
-      <button type="submit" :disabled="!db.trim() || !coll.trim() || !pipeline.trim()">Run aggregate</button>
+      <button type="submit" :disabled="busy || !db.trim() || !coll.trim() || !pipeline.trim()">
+        <span x-show="!busy">Run aggregate</span>
+        <span x-show="busy" x-cloak><span class="spinner"></span> Running…</span>
+      </button>
     </div>
   </form>
 
@@ -101,6 +109,7 @@
     class="filter-form"
     method="post"
     action="/query/runCommand"
+    @submit="busy = true"
   >
     <div class="filter-controls">
       <label>Database
@@ -114,7 +123,10 @@
                 placeholder='{"serverStatus": 1}'></textarea>
     </label>
     <div class="modal-actions">
-      <button type="submit" :disabled="!cmdDb.trim() || !command.trim()">Run command</button>
+      <button type="submit" :disabled="busy || !cmdDb.trim() || !command.trim()">
+        <span x-show="!busy">Run command</span>
+        <span x-show="busy" x-cloak><span class="spinner"></span> Running…</span>
+      </button>
     </div>
   </form>
 
@@ -166,6 +178,7 @@ function queryPage(initial) {
     command: initial.command || "",
     cmdDb: initial.cmdDb || "admin",
     collections: [],
+    busy: false,
 
     async init() {
       // If the page already has a database picked (history re-populate

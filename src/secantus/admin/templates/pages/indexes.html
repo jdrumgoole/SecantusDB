@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "partials/_macros.html" import empty_row %}
 {% block content %}
 <nav class="breadcrumb">
   <a href="/db">Databases</a>
@@ -93,7 +94,7 @@
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="4" class="empty">No indexes (collection may not exist).</td></tr>
+      {{ empty_row(4, "No indexes (collection may not exist).") }}
     {% endfor %}
   </tbody>
 </table>

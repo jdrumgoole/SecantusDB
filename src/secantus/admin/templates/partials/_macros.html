@@ -1,0 +1,14 @@
+{# Jinja2 macros shared across admin templates. Import like:
+
+       {% from "partials/_macros.html" import empty_row %}
+
+   The ``empty_row`` macro renders the standard ``data-table``
+   empty-state row. ``colspan`` should always equal the number of
+   ``<th>`` columns in the surrounding ``<thead>``; pulling it through
+   here means a future "add a column" edit fails in one place instead
+   of going silently mis-aligned in every table on the page.
+#}
+
+{% macro empty_row(colspan, message) -%}
+<tr><td colspan="{{ colspan }}" class="empty">{{ message }}</td></tr>
+{%- endmacro %}

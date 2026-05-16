@@ -126,6 +126,7 @@ def view_collection(
             "page_size": page_size,
             "rows": formatted_rows,
             "next_cursor": next_cursor,
+            "is_first_page": not raw_cursor,
             "errors": error_lines,
         },
     )

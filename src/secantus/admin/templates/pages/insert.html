@@ -19,7 +19,7 @@
     </template>
   </datalist>
 
-  <form class="filter-form" method="post" action="/insert">
+  <form class="filter-form" method="post" action="/insert" @submit="busy = true">
     <div class="filter-controls">
       <label>Database
         <input type="text" name="db" list="ins-db-suggestions" autocomplete="off"
@@ -51,7 +51,10 @@
       echoed back in the result panel.
     </p>
     <div class="modal-actions">
-      <button type="submit" :disabled="!db.trim() || !coll.trim() || !docs.trim()">Insert</button>
+      <button type="submit" :disabled="busy || !db.trim() || !coll.trim() || !docs.trim()">
+        <span x-show="!busy">Insert</span>
+        <span x-show="busy" x-cloak><span class="spinner"></span> Inserting…</span>
+      </button>
     </div>
   </form>
 
@@ -75,6 +78,7 @@ function insertPage(initial) {
     coll: initial.coll || "",
     docs: initial.docs || "",
     collections: [],
+    busy: false,
 
     async init() {
       if (this.db) await this.onDbChange(this.db);
