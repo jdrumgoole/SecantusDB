@@ -542,12 +542,12 @@ async def test_delete_confirm_modal_includes_typed_check(server, http: AsyncClie
         headers={HEADER_NAME: "testtoken"},
     )
     assert r.status_code == 200
-    # The user types the collection name to confirm; UI gates the button
+    # The user types the doc's _id value to confirm; UI gates the button
     # on it via Alpine. Server-side test: just verify the contract.
-    assert "things" in r.text  # collection name shown
-    assert "Type the collection name" in r.text
+    assert "things" in r.text  # collection name still shown for context
+    assert "Type the <code>_id</code> value" in r.text
     assert "hx-delete" in r.text
-    assert "confirm !== 'things'" in r.text  # Alpine guard wired up
+    assert "confirm !== '1'" in r.text  # Alpine guard wired up against _id
 
 
 async def _ensure_test_indexes(server, db_name: str, coll_name: str) -> None:
@@ -1207,8 +1207,9 @@ async def test_kill_cursor_confirm_modal_renders(http: AsyncClient) -> None:
         headers={HEADER_NAME: "testtoken"},
     )
     assert r.status_code == 200
-    assert "Type the cursor id" in r.text
-    assert "12345" in r.text
+    assert "Type the namespace" in r.text
+    assert "db.coll" in r.text  # ns is the typed-confirm target
+    assert "12345" in r.text  # cursor id still shown for context
 
 
 async def test_kill_cursor_endpoint_kills(server, http: AsyncClient) -> None:

@@ -1,15 +1,18 @@
 <div
   class="modal-overlay"
   x-data="{ confirm: '' }"
-  @click.self="document.getElementById('modal').innerHTML = ''"
+  x-init="setupModal($el)"
+  @click.self="closeModal()"
+  @keydown.escape.window="closeModal()"
 >
-  <div class="modal modal-narrow">
+  <div class="modal modal-narrow" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <header class="modal-header">
-      <h2>Drop user</h2>
+      <h2 id="modal-title">Drop user</h2>
       <button
         type="button"
         class="modal-close"
-        @click="document.getElementById('modal').innerHTML = ''"
+        aria-label="Close"
+        @click="closeModal()"
       >×</button>
     </header>
     <div class="modal-body">
@@ -30,7 +33,7 @@
         <button
           type="button"
           class="btn-secondary"
-          @click="document.getElementById('modal').innerHTML = ''"
+          @click="closeModal()"
         >Cancel</button>
         <button
           type="button"
@@ -39,8 +42,8 @@
           hx-delete="/users/{{ db_name }}/{{ username }}"
           hx-target="#user-{{ username }}"
           hx-swap="outerHTML"
-          hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
-        >Drop</button>
+          hx-on::after-request="if(event.detail.successful) closeModal()"
+        >Drop user</button>
       </div>
     </div>
   </div>

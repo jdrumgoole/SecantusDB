@@ -83,9 +83,7 @@ function openDropCollModal(form) {
   const db = form.elements.namedItem("db").value.trim();
   const coll = form.elements.namedItem("coll").value.trim();
   if (!db || !coll) return;
-  fetch(`/maintenance/drop-collection/${encodeURIComponent(db)}/${encodeURIComponent(coll)}/confirm`)
-    .then(r => r.text())
-    .then(html => { document.getElementById("modal").innerHTML = html; htmx.process(document.getElementById("modal")); });
+  openModal(`/maintenance/drop-collection/${encodeURIComponent(db)}/${encodeURIComponent(coll)}/confirm`);
 }
 </script>
 {% endblock %}

@@ -1,16 +1,18 @@
 <div
   class="modal-overlay"
   x-data="{ confirm: '' }"
-  @click.self="document.getElementById('modal').innerHTML = ''"
+  x-init="setupModal($el)"
+  @click.self="closeModal()"
+  @keydown.escape.window="closeModal()"
 >
-  <div class="modal modal-narrow">
+  <div class="modal modal-narrow" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <header class="modal-header">
-      <h2>Delete document</h2>
+      <h2 id="modal-title">Delete document</h2>
       <button
         type="button"
         class="modal-close"
-        @click="document.getElementById('modal').innerHTML = ''"
         aria-label="Close"
+        @click="closeModal()"
       >×</button>
     </header>
     <div class="modal-body">
@@ -21,9 +23,7 @@
       </p>
       <p class="modal-meta">_id: <code>{{ doc_id }}</code></p>
       <pre class="doc-body">{{ doc_json }}</pre>
-      <p>
-        Type the collection name <code>{{ coll_name }}</code> to confirm:
-      </p>
+      <p>Type the <code>_id</code> value <code>{{ doc_id }}</code> to confirm:</p>
       <input
         type="text"
         class="confirm-input"
@@ -35,17 +35,17 @@
         <button
           type="button"
           class="btn-secondary"
-          @click="document.getElementById('modal').innerHTML = ''"
+          @click="closeModal()"
         >Cancel</button>
         <button
           type="button"
           class="btn-danger"
-          x-bind:disabled="confirm !== '{{ coll_name }}'"
+          x-bind:disabled="confirm !== '{{ doc_id }}'"
           hx-delete="/db/{{ db_name }}/{{ coll_name }}/docs/{{ id_token }}"
           hx-target="#row-{{ id_token }}"
           hx-swap="outerHTML"
-          hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML = ''"
-        >Delete</button>
+          hx-on::after-request="if(event.detail.successful) closeModal()"
+        >Delete document</button>
       </div>
     </div>
   </div>
