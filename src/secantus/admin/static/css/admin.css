@@ -127,6 +127,23 @@ body {
   padding-bottom: 0.5rem;
 }
 
+/* Visual separator above the first item of the operational-state
+ * group (Change stream / Connections / Cursors / Profiler / Maintenance
+ * / Logs / Backup). Separates per-target data pages above from
+ * runtime / observability pages below. */
+.sidebar nav li.nav-ops-start {
+  border-top: 1px solid var(--border);
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+}
+
+/* Sub-nav indent for child pages reached via a parent (Roles under
+ * Users today). Keeps the parent/child relationship visible. */
+.sidebar nav li.nav-sub a {
+  padding-left: calc(1.25rem + 0.75rem);
+  font-size: 0.95em;
+}
+
 .sidebar nav li a.nav-disabled {
   color: var(--muted);
   pointer-events: none;
