@@ -398,6 +398,7 @@ print(JSON.stringify({ findCount: findRes.length, inserted, errCode, errMsg }));
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_rbac_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
     """RBAC denial round-trip via mongosh.
 
@@ -525,6 +526,7 @@ print(JSON.stringify({ events }));
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_ddl_smoke_via_mongosh(server: SecantusDBServer) -> None:
     """DDL change-stream events via mongosh."""
     result = _run(
@@ -611,6 +613,7 @@ _UPDATEUSER_MONGOSH_PING_SCRIPT = (
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_updateuser_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
     """updateUser rotation via mongosh."""
     admin_uri = (
@@ -737,6 +740,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_connstatus_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
     """connectionStatus surfaces authenticatedUserRoles via mongosh."""
     admin_uri = (
@@ -855,6 +859,7 @@ print(EJSON.stringify(got, { relaxed: false }));
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_types_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [_MONGOSH, "--quiet", f"{server.uri}types_xd", "--eval", _TYPES_MONGOSH_SCRIPT],
@@ -971,6 +976,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_bulk_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [_MONGOSH, "--quiet", f"{server.uri}bulk_xd", "--eval", _BULK_MONGOSH_SCRIPT],
@@ -1102,6 +1108,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_cs_resume_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [
@@ -1199,6 +1206,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_listdb_filter_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [_MONGOSH, "--quiet", f"{server.uri}admin", "--eval", _LISTDB_MONGOSH_SCRIPT],
@@ -1290,6 +1298,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_batchsize_zero_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [_MONGOSH, "--quiet", f"{server.uri}batch_zero_xd", "--eval", _BATCHSIZE_MONGOSH_SCRIPT],
@@ -1391,6 +1400,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_drop_all_users_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
     admin_uri = (
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
@@ -1494,6 +1504,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_scram_sha1_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
     admin_uri = (
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
@@ -1599,6 +1610,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_pbrt_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [_MONGOSH, "--quiet", f"{server.uri}pbrt_xd", "--eval", _PBRT_MONGOSH_SCRIPT],
@@ -1691,6 +1703,7 @@ print(JSON.stringify({first: first._id, second: got ? got._id : null}));
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_tailable_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [_MONGOSH, "--quiet", f"{server.uri}tailable_xd", "--eval", _TAILABLE_MONGOSH_SCRIPT],
@@ -1816,6 +1829,7 @@ print(JSON.stringify({inserted}));
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_custom_roles_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
     admin_uri = (
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
@@ -1962,6 +1976,7 @@ print(JSON.stringify({
 
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
+@pytest.mark.xdist_group(name="mongosh_smokes")
 def test_sessions_smoke_via_mongosh(server: SecantusDBServer) -> None:
     result = _run(
         [_MONGOSH, "--quiet", server.uri, "--eval", _SESSIONS_MONGOSH_SCRIPT],
