@@ -197,6 +197,30 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict[str, Any] | None:
+    """Refuse any write to the synthetic ``local.oplog.rs`` view.
+
+    Returns a mongod-shaped error doc (caller short-circuits with it)
+    when the target is ``(local, oplog.rs)``. ``None`` otherwise. Mongod
+    refuses arbitrary writes to ``oplog.rs`` — only the internal
+    replication system writes there — and surfaces it as an
+    ``Unauthorized`` (code 13). SecantusDB's oplog is a read-only
+    synthetic view, so we mirror the rejection with the same code +
+    a clear errmsg so debuggers know what they hit.
+    """
+    if ctx.db_name == "local" and coll == "oplog.rs":
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"not authorized for {op_name} on local.oplog.rs "
+                "(synthetic read-only view of the SecantusDB oplog)"
+            ),
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    return None
+
+
 def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     """If ``writeConcern.w`` can't be satisfied, return the mongod-shaped
     ``writeConcernError`` to attach to a successful reply.
@@ -1177,6 +1201,9 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if wc_err is not None:
         return wc_err
     coll = doc["insert"]
+    oplog_err = _reject_oplog_rs_write(ctx, coll, "insert")
+    if oplog_err is not None:
+        return oplog_err
     documents = doc.get("documents", [])
     if not isinstance(documents, list) or len(documents) == 0:
         # mongod rejects an empty `documents` array with code 4
@@ -1439,6 +1466,9 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if wc_err is not None:
         return wc_err
     coll = doc["update"]
+    oplog_err = _reject_oplog_rs_write(ctx, coll, "update")
+    if oplog_err is not None:
+        return oplog_err
     updates = doc.get("updates", [])
     ordered = bool(doc.get("ordered", True))
     bypass_validation = bool(doc.get("bypassDocumentValidation", False))
@@ -1589,6 +1619,9 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if wc_err is not None:
         return wc_err
     coll = doc["delete"]
+    oplog_err = _reject_oplog_rs_write(ctx, coll, "delete")
+    if oplog_err is not None:
+        return oplog_err
     deletes = doc.get("deletes", [])
     ordered = bool(doc.get("ordered", True))
     # ``let`` declares user-variables visible to ``$expr`` clauses in the
@@ -1732,6 +1765,9 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     if wc_err is not None:
         return wc_err
     coll = doc["findAndModify"]
+    oplog_err = _reject_oplog_rs_write(ctx, coll, "findAndModify")
+    if oplog_err is not None:
+        return oplog_err
     query = doc.get("query") or {}
     sort = doc.get("sort") or None
     fields = doc.get("fields") or None
@@ -1947,6 +1983,9 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if wc_err is not None:
         return wc_err
     coll = doc["drop"]
+    oplog_err = _reject_oplog_rs_write(ctx, coll, "drop")
+    if oplog_err is not None:
+        return oplog_err
     existed = ctx.storage.drop_collection(ctx.db_name, coll)
     if not existed:
         return {"ok": 0.0, "errmsg": "ns not found", "code": 26, "codeName": "NamespaceNotFound"}
@@ -2011,6 +2050,9 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "Location40415",
         }
     coll = doc["create"]
+    oplog_err = _reject_oplog_rs_write(ctx, coll, "create")
+    if oplog_err is not None:
+        return oplog_err
     capped = bool(doc.get("capped", False))
     if capped:
         size = doc.get("size")
@@ -2305,6 +2347,9 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if wc_err is not None:
         return wc_err
     coll = doc["createIndexes"]
+    oplog_err = _reject_oplog_rs_write(ctx, coll, "createIndexes")
+    if oplog_err is not None:
+        return oplog_err
     indexes = doc.get("indexes", [])
     # ``commitQuorum`` is a top-level option on ``createIndexes`` (not
     # per-index). MongoDB 4.4+ accepts an integer, ``"majority"``, or

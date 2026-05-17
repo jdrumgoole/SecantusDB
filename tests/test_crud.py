@@ -2009,3 +2009,85 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
     )
     with contextlib.suppress(Exception):
         cur.close()
+
+
+# --- local.oplog.rs wire-surface (pymongo-driven) -------------------------
+
+
+def test_oplog_rs_listed_via_pymongo(client: MongoClient) -> None:
+    local = client["local"]
+    names = set(local.list_collection_names())
+    assert "oplog.rs" in names
+
+
+def test_oplog_rs_capped_options_via_pymongo(client: MongoClient) -> None:
+    local = client["local"]
+    [info] = list(local.list_collections(filter={"name": "oplog.rs"}))
+    opts = info.get("options") or {}
+    assert opts.get("capped") is True
+    assert isinstance(opts.get("size"), int) and opts["size"] > 0
+    assert isinstance(opts.get("max"), int) and opts["max"] > 0
+
+
+def test_oplog_rs_find_via_pymongo_sees_inserts(client: MongoClient) -> None:
+    db = client["oplog_rs_xd"]
+    db["things"].insert_many([{"_id": 1, "v": "alpha"}, {"_id": 2, "v": "beta"}])
+    oplog = client["local"]["oplog.rs"]
+    i_rows = list(oplog.find({"op": "i", "ns": "oplog_rs_xd.things"}))
+    assert len(i_rows) >= 2
+    ids = sorted(r["o"]["_id"] for r in i_rows)
+    assert ids == [1, 2]
+
+
+def test_oplog_rs_count_via_pymongo(client: MongoClient) -> None:
+    db = client["oplog_rs_count_xd"]
+    db["c"].insert_many([{"_id": i} for i in range(4)])
+    oplog = client["local"]["oplog.rs"]
+    n = oplog.count_documents({"op": "i", "ns": "oplog_rs_count_xd.c"})
+    assert n == 4
+
+
+def test_oplog_rs_sort_descending_via_pymongo(client: MongoClient) -> None:
+    db = client["oplog_rs_sort_xd"]
+    db["c"].insert_one({"_id": 1})
+    db["c"].insert_one({"_id": 2})
+    oplog = client["local"]["oplog.rs"]
+    rows = list(oplog.find({"op": "i", "ns": "oplog_rs_sort_xd.c"}).sort("ts", -1).limit(2))
+    assert rows[0]["o"]["_id"] == 2
+    assert rows[1]["o"]["_id"] == 1
+
+
+def test_oplog_rs_insert_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure) as exc_info:
+        client["local"]["oplog.rs"].insert_one({"forged": True})
+    assert exc_info.value.code == 13
+
+
+def test_oplog_rs_update_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"]["oplog.rs"].update_one({"op": "i"}, {"$set": {"x": 1}})
+
+
+def test_oplog_rs_delete_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"]["oplog.rs"].delete_many({})
+
+
+def test_oplog_rs_drop_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"].drop_collection("oplog.rs")
+
+
+def test_oplog_rs_create_index_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"]["oplog.rs"].create_index("ns")
