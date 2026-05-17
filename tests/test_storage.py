@@ -526,3 +526,58 @@ def test_oplog_rs_disabled_when_oplog_off(tmp_path) -> None:
         assert "local" not in s.list_databases()
     finally:
         s.close()
+
+
+# --- WT-checkpoint backup -------------------------------------------------
+
+
+def test_create_archive_round_trips_inserts(tmp_path) -> None:
+    """Checkpoint+tar an on-disk WT home, extract elsewhere, verify docs survive."""
+    import tarfile
+
+    src = tmp_path / "src"
+    archive = tmp_path / "backup.tar.gz"
+    dst = tmp_path / "dst"
+
+    s = Storage(str(src))
+    try:
+        s.insert("appdb", "things", [{"_id": 1, "v": "alpha"}, {"_id": 2, "v": "beta"}])
+        result = s.create_archive(str(archive))
+        assert result["path"] == str(archive)
+        assert int(result["sizeBytes"]) > 0
+        assert archive.exists()
+    finally:
+        s.close()
+
+    dst.mkdir()
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.extractall(dst)
+    s2 = Storage(str(dst))
+    try:
+        rows = sorted(s2.find_matching("appdb", "things"), key=lambda d: d["_id"])
+        assert [r["v"] for r in rows] == ["alpha", "beta"]
+    finally:
+        s2.close()
+
+
+def test_create_archive_in_memory_refuses(tmp_path) -> None:
+    import pytest
+
+    s = Storage()  # :memory: default
+    try:
+        with pytest.raises(RuntimeError, match="in-memory"):
+            s.create_archive(str(tmp_path / "x.tar.gz"))
+    finally:
+        s.close()
+
+
+def test_create_archive_creates_parent_directory(tmp_path) -> None:
+    s = Storage(str(tmp_path / "src"))
+    try:
+        s.insert("appdb", "c", [{"_id": 1}])
+        out = tmp_path / "nested" / "dirs" / "backup.tar.gz"
+        result = s.create_archive(str(out))
+        assert out.exists()
+        assert result["sizeBytes"] > 0
+    finally:
+        s.close()

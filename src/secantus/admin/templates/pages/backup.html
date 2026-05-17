@@ -2,10 +2,13 @@
 {% from "partials/_macros.html" import empty_row %}
 {% block content %}
 <p class="modal-meta">
-  Backups land in <code>{{ backup_root }}</code>. The admin UI shells
-  out to the official <code>mongodump</code> / <code>mongorestore</code>
-  binaries — SecantusDB speaks the same wire protocol as
-  <code>mongod</code>, so they work unchanged.
+  Backups land in <code>{{ backup_root }}</code>. Two paths:
+  <strong>mongodump / mongorestore</strong> for a portable BSON dump
+  any <code>mongod</code> can ingest (slower; goes through the wire);
+  <strong>native checkpoint archive</strong> for a fast atomic
+  <code>.tar.gz</code> of the WT storage directory
+  (SecantusDB-specific; restore is "extract + start a new SecantusDB
+  pointing at it").
 </p>
 
 {% if not preflight_ok %}
@@ -17,22 +20,41 @@
 {% endif %}
 
 <h2 class="section-title">Run backup</h2>
-<form
-  method="post"
-  action="/backup/dump"
-  class="inline-form"
-  x-data="{ busy: false }"
-  @submit="busy = true"
->
-  <button
-    type="submit"
-    class="btn-secondary"
-    x-bind:disabled="busy{% if not preflight_ok %} || true{% endif %}"
+<div class="page-actions">
+  <form
+    method="post"
+    action="/backup/dump"
+    class="inline-form"
+    x-data="{ busy: false }"
+    @submit="busy = true"
   >
-    <span x-show="!busy">Run mongodump now</span>
-    <span x-show="busy" x-cloak><span class="spinner"></span> Running mongodump…</span>
-  </button>
-</form>
+    <button
+      type="submit"
+      class="btn-secondary"
+      x-bind:disabled="busy{% if not preflight_ok %} || true{% endif %}"
+    >
+      <span x-show="!busy">Run mongodump now</span>
+      <span x-show="busy" x-cloak><span class="spinner"></span> Running mongodump…</span>
+    </button>
+  </form>
+  <form
+    method="post"
+    action="/backup/archive"
+    class="inline-form"
+    x-data="{ busy: false }"
+    @submit="busy = true"
+  >
+    <button
+      type="submit"
+      class="btn-secondary"
+      x-bind:disabled="busy"
+      title="Force a WT checkpoint and tar the storage directory — fast + atomic, SecantusDB-only"
+    >
+      <span x-show="!busy">Run native checkpoint backup</span>
+      <span x-show="busy" x-cloak><span class="spinner"></span> Archiving…</span>
+    </button>
+  </form>
+</div>
 
 <h2 class="section-title">Existing backups</h2>
 <table class="data-table">
