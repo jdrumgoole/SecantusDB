@@ -81,10 +81,13 @@ MongoDB's 10-minute cursor TTL). The clock is injectable via
 
 ## Deferred
 
-- Aggregation expressions: `$function` (out of scope — needs JS).
-- Aggregation stages: `$fill` (planned), `$densify` with `unit:` for
-  date ranges (planned; numeric `$densify` is implemented).
-- `mapReduce` — deprecated by MongoDB; not implemented.
+- `$densify` with `month` / `quarter` / `year` units — rejected;
+  numeric ranges and fixed-duration date units (`week` / `day` /
+  `hour` / `minute` / `second` / `millisecond`) are implemented.
+- Per-index collation — the per-query infrastructure honours
+  `collation` for `find` / `count` / `distinct` / `findAndModify`,
+  but index entries are written in BSON codepoint order; queries
+  carrying `collation` fall through to COLLSCAN by design.
 
 ## Out of scope
 
@@ -92,7 +95,8 @@ These are explicit non-goals:
 
 - **Replica sets / sharding** — depend on multi-node cluster topology.
   SecantusDB is single-process. (Change streams *are* supported —
-  oplog-backed and single-node — see [Change streams](change-streams.md).)
+  oplog-backed and single-node — see [Change streams](change-streams.md).
+  The oplog is queryable at `local.oplog.rs` like real mongod.)
 - **Authentication mechanisms beyond SCRAM-SHA-256** — x509, LDAP,
   Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC. SCRAM-SHA-256 itself
   *is* implemented; SCRAM-SHA-1 is not advertised (modern drivers
@@ -104,16 +108,28 @@ These are explicit non-goals:
   use only on a trusted network.
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told
   the server doesn't support compression.
-- **Text search** (`$text`, `$meta: "textScore"`, text indexes).
-- **Geo** (`$near`, `$nearSphere`, `$geoWithin`, `$geoIntersects`,
-  `2d` / `2dsphere` indexes).
-- **`$where`** — runs JavaScript. We don't ship a JS runtime.
-- **Capped collections** — fixed-size, FIFO collections.
-- **Profiling** (`setProfilingLevel`, `system.profile` collection).
-- **Tailable cursors on capped collections** — capped collections are
-  out of scope, so tailable-on-capped is too. (The change-stream
-  cursors *are* tailable with `awaitData` blocking against the oplog —
-  see [Change streams](change-streams.md).)
+- **Text search** (`$text`, `$meta: "textScore"`, text indexes) —
+  would need a full-text index implementation.
+- **`$where` / `$function` / `$accumulator` / `mapReduce`** — all
+  four evaluate user-supplied JavaScript and would need an embedded
+  JS engine + sandbox + BSON↔JS shim layer. `mapReduce` is also
+  explicitly deprecated by MongoDB; the canonical
+  `emit(this.<field>, 1)` + `values.length` count pattern is
+  recognised and translated to `$group`, but anything else needs
+  real `mongod`.
+- **Real transaction rollback** — `commitTransaction` /
+  `abortTransaction` return `{ok: 1}` but operations take effect
+  immediately. Logical sessions ARE tracked end-to-end.
+
+What HAS shipped that's worth calling out (was previously listed as
+"deferred" or "out of scope"): geo operators + `2d` / `2dsphere`
+indexes; capped collections (`create capped: true`) with FIFO
+eviction; profiling (`profile` command + `<db>.system.profile`);
+SCRAM-SHA-256 authentication; the oplog as a queryable
+`local.oplog.rs` collection. See the [changelog](changelog.md) for
+the full inventory and [aggregation](aggregation.md) /
+[indexes](indexes.md) / [change streams](change-streams.md) for the
+detail.
 
 ## Known edge cases
 

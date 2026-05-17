@@ -332,10 +332,13 @@ backlog at `tasks/backlog.md`.
 * **Connection-kill** isn't implemented — `/connections` is read-only.
   Needs `killOp` (interruptible commands at the dispatch layer) on
   the SecantusDB side.
-* **Oplog window inspector** is deferred. The plan is to surface
-  `local.oplog.rs` as a synthetic queryable collection so the existing
-  collection viewer renders it; until then, `/changestream` is the
-  closest equivalent and only shows events from "now".
+* **Oplog window inspector** is deferred. The data source is now in
+  place — `local.oplog.rs` queryable from any pymongo client (see
+  [Change streams → Querying the oplog directly](change-streams.md#querying-the-oplog-directly))
+  — so the admin UI page can land as a follow-up using the standard
+  collection-viewer pattern. Until then, `/changestream` shows events
+  from "now" and a pymongo shell against `client.local.oplog_rs.find()`
+  is the way to browse historical entries.
 * **Native WT-checkpoint backup** isn't exposed. Only mongodump-driven
   backup ships today. The native path needs a server-side
   `secantusAdmin.backupArchive` command (the admin app talks only over

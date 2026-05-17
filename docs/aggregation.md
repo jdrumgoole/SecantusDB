@@ -15,18 +15,23 @@ applied in order; each stage gets the documents emitted by the previous one.
 | `$addFields` / `$set` | Add / overwrite fields (computed via expressions) |
 | `$unset` | Remove paths (string or array) |
 | `$unwind` | Path string or doc form (`preserveNullAndEmptyArrays`, `includeArrayIndex`) |
-| `$densify` | Numeric ranges only (`bounds: "full"` / `[min, max]`, `partitionByFields`, positive `step`); date `unit` deferred |
+| `$densify` | Numeric ranges and fixed-duration date units (`week` / `day` / `hour` / `minute` / `second` / `millisecond`); variable-length `month` / `quarter` / `year` rejected (would need a `relativedelta` dep) |
+| `$fill` | `{value: <expr>}` evaluates per-doc; `{method: "locf"}` carries last observation forward; `{method: "linear"}` interpolates between bracketing non-null anchors along `sortBy` (numbers + datetimes). Partition via `partitionBy` / `partitionByFields`; `sortBy` required when any output uses `method` |
 | `$replaceRoot` / `$replaceWith` | Replace the root with a sub-document |
 | `$group` | See accumulators below |
-| `$lookup` | Both simple (`localField`/`foreignField`) and `let`/`pipeline` forms; uses an O(N+M) hash-join (foreign array values expanded element-wise) |
+| `$lookup` | Both simple (`localField`/`foreignField`) and `let`/`pipeline` forms. Uses an index-driven path when the foreign collection has an index whose leading field is `foreignField`; otherwise an O(N+M) hash-join (foreign array values expanded element-wise) |
 | `$sample` | `random.sample` — deterministic only if the test calls `random.seed(...)` first |
 | `$sortByCount` | Equivalent to `$group` + `$sort` |
 | `$facet` | Run multiple sub-pipelines in parallel |
-| `$bucket` | `groupBy`, `boundaries`, `default`, `output` |
-| `$merge` | `whenMatched`: `merge` (deep recursive merge), `replace`, `keepExisting`, `fail`. `whenNotMatched`: `insert`, `discard`, `fail`. `into` may be a string or `{db, coll}` |
+| `$bucket` / `$bucketAuto` | `groupBy`, `boundaries`, `default`, `output` (bucket); `groupBy`, `buckets`, `output` (bucketAuto) |
+| `$merge` | `into` is a string or `{db, coll}`. `whenMatched`: `"merge"` (deep recursive merge, default), `"replace"`, `"keepExisting"`, `"fail"`, `"delete"` (5.0+), or `[<sub-pipeline>]` with `$$new` binding + user `let` vars. `whenNotMatched`: `"insert"` (default), `"discard"`, `"fail"`. `on` non-`_id` fields require a `unique: true` index covering them (mongod's rule) |
 | `$out` | Replace target collection with pipeline output |
-| `$collStats` | Returns count + size metrics from the WT tables |
+| `$collStats` / `$indexStats` | Count + size metrics; capped bounds (`storageStats.{capped, max, maxSize}`) surface for capped collections |
+| `$currentOp` / `$listLocalSessions` / `$listSessions` | Session and operation enumeration |
+| `$geoNear` | Spherical (`2dsphere`) or planar (`2d`); auto-picks the geo index when one exists, falls back to a full-scan distance computation otherwise. See [Indexes](indexes.md) for the geo-index path |
 | `$graphLookup` | Recursive lookup with `maxDepth` |
+| `$documents` | Inline document source (5.1+) |
+| `$changeStream` | Pipeline-form change-stream entry point |
 
 ### `$group` accumulators
 
@@ -44,8 +49,14 @@ The `$expr` operator inside `$match`, plus computed fields in `$project` /
 
 - `"$x.y"` — path into the current doc.
 - `"$$ROOT"` / `"$$CURRENT"` — current doc.
-- `"$$varname"` — user variable (set via `$let` or `$lookup`'s `let`).
+- `"$$varname"` — user variable (set via `$let`, `$lookup`'s `let`, or
+  `$merge`'s `let`).
+- `"$$ROOT.field.path"` / `"$$varname.field.path"` — walk a dotted path
+  into a resolved variable (useful inside `$merge`'s `whenMatched`
+  sub-pipeline for `$$new.field`).
 - `{$literal: ...}` — bypass field-path / operator interpretation.
+- `"$$REMOVE"` — sentinel that removes the field when used as a
+  computed-field value in `$project` / `$addFields` / `$setField`.
 
 ### Arithmetic and comparison
 
@@ -105,14 +116,22 @@ on decode).
 
 ## What's not supported
 
-- `$where` — needs a JavaScript runtime; out of scope.
-- `$function` — same reason.
-- `$densify` with `unit` (date ranges) — deferred.
-- `$fill` — deferred.
-- `mapReduce` — deprecated by MongoDB; not implemented.
+- `$where` / `$function` / `$accumulator` — all three evaluate
+  user-supplied JavaScript and would need an embedded JS engine,
+  sandbox, and BSON↔JS shim layer. SecantusDB doesn't ship a JS
+  runtime; not on the roadmap (see `tasks/backlog.md` §4 for the
+  rejected `lang: "python"` alternative and the trusted-plugin
+  escape hatch).
+- `mapReduce` — same JS-runtime dependency; also explicitly
+  deprecated by MongoDB (removed from the Stable API in 5.0). The
+  canonical `emit(this.<field>, 1)` + `values.length` "count by
+  field" pattern is recognised and translated to an equivalent
+  `$group` aggregation; non-canonical bodies return
+  `{results: [], ok: 1}` so wire-shape probes pass.
+- `$densify` with `month` / `quarter` / `year` units — rejected; would
+  need `relativedelta`-style arithmetic and a new dependency.
 - Text search (`$text`, `$meta: "textScore"`) — would need a full-text
   index implementation.
-- Geo (`$near`, `$geoWithin`, ...) — would need geometric primitives.
 
 ## Pipeline tips
 

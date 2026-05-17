@@ -130,6 +130,53 @@ A resume token whose seq has been pruned surfaces
 `OperationFailure` so the standard "resume failure" handling on the
 client side works as written.
 
+## Querying the oplog directly
+
+For the same reason real `mongod` does, SecantusDB exposes the oplog
+as a queryable collection at `local.oplog.rs`. It's a read-only
+synthetic view over the WiredTiger oplog table — `find` / `count` /
+`listCollections` route to the persisted oplog rows; writes
+(`insert` / `update` / `delete` / `drop` / `createIndexes` / `create`)
+are refused with code 13 (Unauthorized), matching mongod.
+
+This is the right surface for debugging a change-stream pipeline,
+auditing what just got written, or building dashboards on top of the
+operation log. The entries are the mongod oplog shape — `ts`, `op`
+(`"i"` / `"u"` / `"d"` / `"c"` / `"n"`), `ns`, `ui` (collection UUID),
+`o` (the operation payload), `o2` (the update predicate for `op:"u"`),
+`wall` (datetime).
+
+```python
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://127.0.0.1:27017/")
+oplog = client["local"]["oplog.rs"]
+
+# What just happened, newest first
+for entry in oplog.find().sort("ts", -1).limit(10):
+    print(entry["ts"], entry["op"], entry["ns"])
+
+# All updates against a specific collection
+for entry in oplog.find({"op": "u", "ns": "appdb.users"}):
+    print(entry["o2"]["_id"], entry["o"]["diff"])
+
+# Oplog window
+oldest = oplog.find().sort("ts", 1).limit(1)[0]["ts"]
+newest = oplog.find().sort("ts", -1).limit(1)[0]["ts"]
+print(f"oplog covers {oldest} → {newest}")
+```
+
+The collection appears in `client.list_database_names()` (under
+`local`) and `client.local.list_collection_names()` as long as the
+oplog is enabled. Capped-collection metadata (`size`, `max`) reads back
+through `listCollections.options` so admin tools that probe the shape
+see what they expect.
+
+`enable_oplog=False` (passed to `SecantusDBServer` / `Storage`) hides
+the entire surface — no `local` database, no `oplog.rs` collection,
+no oplog rows. The default is `True` since change streams depend on
+it.
+
 ## Invalidation
 
 A change stream ends with a final `invalidate` event when the watched
