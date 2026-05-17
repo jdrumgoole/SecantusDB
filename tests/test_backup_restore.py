@@ -37,10 +37,21 @@ from secantus import SecantusDBServer
 from secantus.auth import derive_credentials
 
 
+@pytest.fixture
+def server(tmp_path):
+    """Per-test on-disk SecantusDB. ``tmp_path`` is xdist-unique and
+    cleaned up automatically. The server's storage path lives at
+    ``<tmp_path>/src`` so the test can use sibling paths
+    (``<tmp_path>/restored``, ``<tmp_path>/archive.tar.gz``) without
+    name collisions."""
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "src")) as srv:
+        yield srv
+
+
 def _extract(archive: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(target)
+        tar.extractall(target, filter="data")
 
 
 def _take_backup(client: MongoClient, archive: Path) -> dict[str, Any]:
@@ -182,8 +193,12 @@ def test_backup_preserves_capped_collection_options(server, tmp_path) -> None:
     try:
         db = client["capped_xd"]
         db.create_collection("logs", capped=True, size=4096, max=5)
-        db["logs"].insert_many([{"_id": i, "msg": f"m{i}"} for i in range(7)])
-        # FIFO eviction kept the last 5.
+        # Insert one-at-a-time so each batch's ``fresh_id_keys`` shield
+        # only contains the newest doc — eviction kicks in per-insert
+        # once the count is past ``max``. (A single ``insert_many``
+        # batch is treated as "all fresh" and would skip eviction.)
+        for i in range(7):
+            db["logs"].insert_one({"_id": i, "msg": f"m{i}"})
         assert [d["_id"] for d in db["logs"].find().sort("_id", 1)] == [2, 3, 4, 5, 6]
         _take_backup(client, archive)
     finally:

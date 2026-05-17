@@ -73,6 +73,20 @@ varied run-to-run.
 - `SECANTUS_SAMPLE_SEED` env var (read at `aggregate` module
   import) — `$sample` uses a dedicated `random.Random(seed)`
   when set.
+- `secantusAdmin.backupArchive` wire command + `Storage.create_archive`
+  + admin UI "Run native checkpoint backup" button: forces a WT
+  checkpoint then tars the storage directory into a single
+  `.tar.gz`. Faster + atomic vs `mongodump`; restore is "extract
+  + start a new SecantusDB pointing at it". Rigorous round-trip
+  test coverage in `tests/test_backup_restore.py` (doc identity at
+  scale, every non-default index shape, oplog tail continuity,
+  capped collection options + FIFO state, SCRAM users / roles,
+  concurrent-writes consistency, archive portability, repeated-
+  backup idempotency).
+- `$densify` month / quarter / year units via
+  `dateutil.relativedelta`. `quarter` is canonically 3 months.
+  Adds `python-dateutil>=2.8` to the runtime dependencies (pure
+  Python, available almost everywhere as a transitive dep).
 
 #### Changed
 - `changestreams.project` suppresses `createIndexes` / `dropIndexes`

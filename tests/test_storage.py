@@ -551,7 +551,7 @@ def test_create_archive_round_trips_inserts(tmp_path) -> None:
 
     dst.mkdir()
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(dst)
+        tar.extractall(dst, filter="data")
     s2 = Storage(str(dst))
     try:
         rows = sorted(s2.find_matching("appdb", "things"), key=lambda d: d["_id"])

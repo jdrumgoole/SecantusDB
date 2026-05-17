@@ -753,12 +753,18 @@ def test_densify_date_unit_year_walks_anniversaries() -> None:
             }
         ],
     )
-    # relativedelta snaps Feb 29 → Feb 28 in non-leap years.
+    # relativedelta snaps Feb 29 → Feb 28 in non-leap years. Because
+    # the walk advances ``cursor + 1 year`` step-by-step (not from the
+    # original anchor), once it snaps to Feb 28 it stays at Feb 28
+    # on every subsequent step — so 2028's filler is Feb 28 even
+    # though 2028 itself is a leap year. The original Feb 29 doc
+    # still appears at the end (cursor advances past hi first).
     assert [d["ts"] for d in out] == [
         dt.datetime(2024, 2, 29),
         dt.datetime(2025, 2, 28),
         dt.datetime(2026, 2, 28),
         dt.datetime(2027, 2, 28),
+        dt.datetime(2028, 2, 28),
         dt.datetime(2028, 2, 29),
     ]
 

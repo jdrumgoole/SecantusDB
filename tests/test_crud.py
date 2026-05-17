@@ -2192,7 +2192,7 @@ def test_backup_archive_via_pymongo_round_trips_data(server, tmp_path) -> None:
     restored_dir = tmp_path / "restored"
     restored_dir.mkdir()
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(restored_dir)
+        tar.extractall(restored_dir, filter="data")
 
     with SecantusDBServer(port=0, storage_path=str(restored_dir)) as restored:
         client2 = MongoClient(restored.uri, serverSelectionTimeoutMS=2000)
