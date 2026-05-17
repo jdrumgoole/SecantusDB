@@ -16,7 +16,13 @@
       <td>{% if r.active %}<span class="badge">active</span>{% else %}<span class="muted">idle</span>{% endif %}</td>
       <td><code>{{ r.opened_at }}</code></td>
       <td class="doc-actions">
-        <span class="muted" title="Connection-kill is deferred until SecantusDB grows killOp (see tasks/backlog.md §3).">—</span>
+        <button
+          type="button"
+          class="btn-danger"
+          hx-get="/connections/{{ r.conn_id }}/kill-confirm"
+          hx-target="#modal"
+          hx-swap="innerHTML"
+        >Kill</button>
       </td>
     </tr>
   {% else %}

@@ -1,0 +1,31 @@
+{% from "partials/_macros.html" import empty_row %}
+{# Build the query-string portion that the auto-refresh poll reuses,
+   so a user-picked filter / window survives the swap. ``_rows`` is
+   the endpoint that receives it. #}
+{%- set qs_parts = [] -%}
+{%- if limit -%}{%- set _ = qs_parts.append('limit=' ~ limit) -%}{%- endif -%}
+{%- for op in selected_ops -%}{%- set _ = qs_parts.append('op=' ~ op) -%}{%- endfor -%}
+{%- if ns_query -%}{%- set _ = qs_parts.append('ns=' ~ (ns_query | urlencode)) -%}{%- endif -%}
+{%- set qs = qs_parts | join('&') -%}
+<tbody
+  id="oplog-tbody"
+  hx-get="/oplog/_rows{% if qs %}?{{ qs }}{% endif %}"
+  hx-trigger="every 5s"
+  hx-swap="outerHTML"
+>
+  {% for r in rows %}
+    <tr>
+      <td><code>{{ r.ts }}</code></td>
+      <td><span class="badge" title="{{ r.op_label }}">{{ r.op }}</span></td>
+      <td><code>{{ r.ns or '—' }}</code></td>
+      <td>
+        <details>
+          <summary>view</summary>
+          <pre class="doc-body">{{ r.json }}</pre>
+        </details>
+      </td>
+    </tr>
+  {% else %}
+    {{ empty_row(4, "No oplog entries match.") }}
+  {% endfor %}
+</tbody>

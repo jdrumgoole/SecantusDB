@@ -182,6 +182,30 @@ def test_sample_size_larger_than_input_returns_all() -> None:
     assert len(out) == 3
 
 
+def test_sample_with_secantus_sample_seed_is_deterministic(monkeypatch) -> None:
+    """Setting ``SECANTUS_SAMPLE_SEED`` makes ``$sample`` reproducible.
+
+    The seed is captured at module import time, so changing it
+    mid-process via env-var alone won't help — we have to rebuild the
+    RNG via the private helper. This test pins the deterministic-
+    behaviour contract that the env-var injects a dedicated
+    ``random.Random(seed)`` (rather than seeding the module-level
+    ``random`` and leaking state into other code in the same process).
+    """
+    import secantus.aggregate as agg
+
+    monkeypatch.setenv("SECANTUS_SAMPLE_SEED", "42")
+    monkeypatch.setattr(agg, "_SAMPLE_RNG", agg._build_sample_rng())
+
+    docs = [{"i": i} for i in range(20)]
+    a = apply_pipeline(docs, [{"$sample": {"size": 5}}])
+    # Reset the RNG to the same seed and re-run — must be identical.
+    monkeypatch.setattr(agg, "_SAMPLE_RNG", agg._build_sample_rng())
+    b = apply_pipeline(docs, [{"$sample": {"size": 5}}])
+    assert a == b
+    assert len(a) == 5
+
+
 def test_sort_by_count() -> None:
     docs = [{"t": "a"}, {"t": "b"}, {"t": "a"}, {"t": "c"}, {"t": "a"}]
     out = apply_pipeline(docs, [{"$sortByCount": "$t"}])

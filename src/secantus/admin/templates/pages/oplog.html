@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="modal-meta">
+  Live view of <code>local.oplog.rs</code> — the synthetic oplog
+  collection. Table auto-refreshes every 5 s; the window /
+  <code>op</code> filter / <code>ns</code> filter below shape the
+  query. See <a href="https://secantusdb.readthedocs.io/en/latest/change-streams.html#querying-the-oplog-directly" rel="noopener">Querying the oplog directly</a> for the entry shape.
+</p>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<form class="filter-form" method="get" action="/oplog">
+  <div class="filter-controls">
+    <label>
+      Window
+      <select name="limit">
+        {% for n in window_limits %}
+          <option value="{{ n }}" {% if n == limit %}selected{% endif %}>last {{ n }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <fieldset class="checkbox-group">
+      <legend>op</legend>
+      {% for op in all_ops %}
+        <label class="checkbox-label">
+          <input type="checkbox" name="op" value="{{ op }}"
+                 {% if op in selected_ops %}checked{% endif %} />
+          <code>{{ op }}</code>
+        </label>
+      {% endfor %}
+    </fieldset>
+    <label>
+      ns contains
+      <input type="text" name="ns" value="{{ ns_query }}" placeholder="appdb.users" autocomplete="off" />
+    </label>
+    <div class="modal-actions">
+      <button type="submit">Apply</button>
+    </div>
+  </div>
+</form>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>ts</th>
+      <th>op</th>
+      <th>ns</th>
+      <th>entry</th>
+    </tr>
+  </thead>
+  {% include "partials/oplog_rows.html" %}
+</table>
+{% endblock %}

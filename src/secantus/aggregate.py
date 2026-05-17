@@ -1040,6 +1040,30 @@ def _lookup_match(local: Any, foreign: Any) -> bool:
     return local == foreign
 
 
+# Optional deterministic RNG for ``$sample``. The env var
+# ``SECANTUS_SAMPLE_SEED`` (read once at module load) installs a
+# dedicated ``random.Random(seed)`` instance so test suites can pin
+# the sample order without leaking the seed into the module-level
+# ``random`` state (which other code in the same process may also
+# consume). Unset → use ``random.sample`` directly, fresh entropy
+# per call as before.
+def _build_sample_rng() -> object | None:
+    import os
+    import random as _random
+
+    raw = os.environ.get("SECANTUS_SAMPLE_SEED")
+    if raw is None or raw == "":
+        return None
+    try:
+        seed: int | str = int(raw)
+    except ValueError:
+        seed = raw
+    return _random.Random(seed)
+
+
+_SAMPLE_RNG = _build_sample_rng()
+
+
 def _stage_sample(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1050,7 +1074,8 @@ def _stage_sample(
     size = int(spec["size"])
     if size >= len(docs):
         return list(docs)
-    return random.sample(list(docs), size)
+    rng = _SAMPLE_RNG if _SAMPLE_RNG is not None else random
+    return rng.sample(list(docs), size)
 
 
 def _stage_sort_by_count(

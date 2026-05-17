@@ -362,14 +362,14 @@ def test_cursor_id_is_int64_random(client: MongoClient) -> None:
 def test_create_indexes_emits_change_event(client: MongoClient) -> None:
     """A `createIndexes` on a watched collection produces an event with
     operationType=createIndexes and the new index spec under
-    operationDescription.indexes[0]. Apps that watch index lifecycle for
-    schema-migration tooling now see them; previously the projection
-    dropped them entirely."""
+    operationDescription.indexes[0] WHEN show_expanded_events is set.
+    Without the opt-in, mongod (and SecantusDB since v0.5.1b18)
+    suppresses these so the v1 spec's event set stays stable."""
     db = client["csdb_create_idx"]
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=2000)
+    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
     time.sleep(0.3)
     coll.create_index([("x", 1)])
 
@@ -387,13 +387,14 @@ def test_create_indexes_emits_change_event(client: MongoClient) -> None:
 
 def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
     """`dropIndexes` surfaces with operationType=dropIndexes and the
-    index name under operationDescription.indexes[0]."""
+    index name under operationDescription.indexes[0] WHEN
+    show_expanded_events is set."""
     db = client["csdb_drop_idx"]
     coll = db["c"]
     db.create_collection("c")
     coll.create_index([("x", 1)])  # one index to drop
 
-    cs = coll.watch(max_await_time_ms=2000)
+    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
     time.sleep(0.3)
     coll.drop_index("x_1")
 
@@ -406,6 +407,30 @@ def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
     assert e["operationDescription"]["indexes"] == [{"name": "x_1"}]
 
 
+def test_create_indexes_suppressed_without_show_expanded_events(client: MongoClient) -> None:
+    """Default ``coll.watch()`` (no ``showExpandedEvents``) suppresses
+    DDL "expanded" events like createIndexes / dropIndexes — matches
+    mongod's default behaviour. The v1 spec's stable event set
+    (insert / update / delete / replace / drop / dropDatabase /
+    rename / invalidate) stays the surface unless the user opts in.
+    """
+    db = client["csdb_no_expand"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs = coll.watch(max_await_time_ms=1000)
+    time.sleep(0.3)
+    coll.create_index([("x", 1)])
+    # Insert one real event so _drain has something to find — otherwise
+    # the await blocks for the full timeout.
+    coll.insert_one({"_id": 1})
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    assert events[0]["operationType"] == "insert"
+
+
 def test_index_lifecycle_at_database_scope(client: MongoClient) -> None:
     """db.watch() picks up createIndexes/dropIndexes from any collection
     in the database — same routing as the existing drop / dropDatabase
@@ -414,7 +439,7 @@ def test_index_lifecycle_at_database_scope(client: MongoClient) -> None:
     db.create_collection("a")
     db.create_collection("b")
 
-    cs = db.watch(max_await_time_ms=2000)
+    cs = db.watch(max_await_time_ms=2000, show_expanded_events=True)
     time.sleep(0.3)
     db["a"].create_index([("x", 1)])
     db["b"].create_index([("y", 1)])

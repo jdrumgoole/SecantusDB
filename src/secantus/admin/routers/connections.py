@@ -111,6 +111,38 @@ def connections_rows(request: Request) -> HTMLResponse:
     )
 
 
+@router.get(
+    "/connections/{conn_id}/kill-confirm",
+    response_class=HTMLResponse,
+)
+def kill_connection_confirm(request: Request, conn_id: int) -> HTMLResponse:
+    # Look up the connection's client address for the modal copy so
+    # the user has context for the typed-confirm. Falls back gracefully
+    # if the connection just disappeared between the page render and
+    # the modal click.
+    rows, _ = _connection_rows(request)
+    client = ""
+    for r in rows:
+        if r["conn_id"] == conn_id:
+            client = r["client"]
+            break
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "partials/connection_kill_modal.html",
+        {"conn_id": conn_id, "client": client or "(disconnected)"},
+    )
+
+
+@router.delete("/connections/{conn_id}", response_class=HTMLResponse)
+def kill_connection(request: Request, conn_id: int) -> HTMLResponse:
+    try:
+        request.app.state.mongo.kill_connection(conn_id)
+    except MongoError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return HTMLResponse("", headers={"HX-Trigger": "connection-killed"})
+
+
 @router.get("/cursors", response_class=HTMLResponse)
 def cursors_page(request: Request) -> HTMLResponse:
     rows, error = _cursor_rows(request)

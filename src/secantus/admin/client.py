@@ -599,6 +599,21 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(friendly_error(exc)) from exc
 
+    def kill_connection(self, conn_id: int) -> dict[str, Any]:
+        """Issue ``killOp`` against the connection's ``opid``.
+
+        SecantusDB maps ``opid`` to ``conn_id`` one-to-one (each
+        connection has one in-flight op), so the value the admin UI
+        shows in the ``conn_id`` column on /connections is what the
+        ``killOp`` command takes as ``op``.
+        """
+        try:
+            return dict(self._get_client().admin.command("killOp", op=int(conn_id)))
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
     # ---- maintenance ---------------------------------------------------
 
     def fsync(self) -> dict[str, Any]:
