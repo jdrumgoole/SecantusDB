@@ -19,11 +19,11 @@
       <span class="lang">Java</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">48.6%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>172</strong> tests passed &middot; <strong>182</strong> failed</p>
-    <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run the curated <code>driver-sync/src/test/functional/</code> integration subset plus the unified-spec CRUD / event / monitoring / logging runners against an embedded SecantusDB daemon. The <code>UnifiedCrudTest</code> YAML-driven cross-driver CRUD spec dominates the test count — each failure surfaces a real wire-shape divergence (pipeline-update outcomes, bulk-write result shapes) that we haven't matched yet.</p>
+    <p class="counts"><strong>4245</strong> tests passed &middot; <strong>0</strong> failed &middot; <strong>1</strong> documented failure (see report)</p>
+    <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run a curated subset of <code>driver-sync/src/test/functional/</code> plus the BSON unit tests against an embedded SecantusDB daemon. Type-strict decoders catch wire-shape divergences pymongo's permissive client accepts silently.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
@@ -33,11 +33,11 @@
       <span class="lang">Node.js</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">89.9%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>328</strong> tests passed &middot; <strong>37</strong> failed</p>
-    <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. We run the <code>test/integration/crud/</code> set (12 files: crud, aggregation, explain, find, insert, remove, ...) via <code>mocha --config test/mocha_mongodb.js</code> &mdash; real wire commands against an embedded SecantusDB daemon.</p>
+    <p class="counts"><strong>358</strong> tests passed &middot; <strong>0</strong> failed &middot; <strong>1</strong> documented failure (see report)</p>
+    <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. We run a curated <code>test/integration/</code> spec set via <code>mocha --config test/mocha_mongodb.js</code> &mdash; real wire commands against an embedded SecantusDB daemon.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-node.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
@@ -47,11 +47,11 @@
       <span class="lang">Go</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">99.3%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>287</strong> tests passed &middot; <strong>2</strong> failed</p>
-    <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> only &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
+    <p class="counts"><strong>399</strong> tests passed &middot; <strong>0</strong> failed &middot; <strong>2</strong> documented failures (see report)</p>
+    <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
@@ -61,18 +61,11 @@
       <span class="lang">Ruby</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">90.1%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>265</strong> tests passed &middot; <strong>29</strong> failed</p>
-    <p class="note">The official MongoDB Ruby driver (mongo + bson
-      5.x), the gem the Rails / Sinatra ecosystem builds on. We run
-      five integration spec files (database, collection_ddl,
-      index/view, address, config) end-to-end against an embedded
-      SecantusDB daemon &mdash; every test opens a real
-      <code>Mongo::Client</code>, SCRAM-authenticates as a
-      pre-provisioned <code>root-user</code>, and exchanges wire
-      commands.</p>
+    <p class="counts"><strong>293</strong> tests passed &middot; <strong>0</strong> failed &middot; <strong>1</strong> documented failure (see report)</p>
+    <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x), the gem the Rails / Sinatra ecosystem builds on. We run a curated set of integration spec files end-to-end against an embedded SecantusDB daemon &mdash; every test opens a real <code>Mongo::Client</code>, SCRAM-authenticates as a pre-provisioned <code>root-user</code>, and exchanges wire commands.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
@@ -86,13 +79,7 @@
       <span class="rate">6 / 6</span>
       <span class="rate-label">features verified</span>
     </div>
-    <p class="note">The official high-level PHP library, built on
-      the C-based <code>ext-mongodb</code> extension. Same six
-      features as the Ruby driver — type fidelity, RBAC,
-      <code>bulkWrite</code>, <code>listDatabases</code> filter,
-      logical sessions, cluster-role bundles &mdash; verified
-      end-to-end via <code>composer install</code> +
-      <code>php &lt;feature&gt;_smoke.php</code>.</p>
+    <p class="note">The official high-level PHP library, built on the C-based <code>ext-mongodb</code> extension. Same six features as the Ruby driver &mdash; type fidelity, RBAC, <code>bulkWrite</code>, <code>listDatabases</code> filter, logical sessions, cluster-role bundles &mdash; verified end-to-end via <code>composer install</code> + <code>php &lt;feature&gt;_smoke.php</code>.</p>
   </article>
 
   <article class="driver">
@@ -101,13 +88,7 @@
       <span class="lang">Rust</span>
       <span class="kind pending">Pending</span>
     </header>
-    <p class="note">A type-fidelity smoke is staged in
-      <code>tests/cross_driver/rust/</code>. Activation is gated on
-      mongo-rust-driver upstream catching up with the current
-      <code>tokio</code> / Rust toolchain &mdash; the 2.x line
-      doesn't compile against tokio 1.40+ and 3.x trips on a
-      <code>Runtime</code> API change with Rust 1.95. The smoke will
-      flip on once a stable build path lands.</p>
+    <p class="note">A type-fidelity smoke is staged in <code>tests/cross_driver/rust/</code>. Activation is gated on mongo-rust-driver upstream catching up with the current <code>tokio</code> / Rust toolchain &mdash; the 2.x line doesn't compile against tokio 1.40+ and 3.x trips on a <code>Runtime</code> API change with Rust 1.95. The smoke will flip on once a stable build path lands.</p>
   </article>
 </div>
 
