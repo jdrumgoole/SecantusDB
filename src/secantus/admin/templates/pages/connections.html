@@ -2,9 +2,9 @@
 {% block content %}
 <p class="modal-meta">
   Live snapshot from <code>currentOp</code>. Table auto-refreshes
-  every 5s. Connection-kill is deferred until SecantusDB grows
-  <code>killOp</code> — the Actions column mirrors the Cursors page
-  for symmetry but is non-functional today.
+  every 5s. The Kill button issues <code>killOp</code> against the
+  target server — SecantusDB closes the connection's socket so the
+  thread can be reaped; any in-flight command finishes first.
 </p>
 
 {% if error %}
@@ -25,4 +25,6 @@
   </thead>
   {% include "partials/connections_rows.html" %}
 </table>
+
+<div id="modal"></div>
 {% endblock %}

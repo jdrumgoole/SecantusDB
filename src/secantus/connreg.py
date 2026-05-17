@@ -20,7 +20,9 @@ Pure module — no I/O, no Storage import. Held on
 
 from __future__ import annotations
 
+import contextlib
 import itertools
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -45,16 +47,26 @@ class ConnectionRegistry:
     All public methods take the internal lock; snapshots are returned as
     fresh ``ConnInfo`` instances so the caller cannot accidentally mutate
     registry state.
+
+    ``kill(conn_id)`` shuts down the underlying socket so the per-
+    connection thread's blocking ``recv`` returns and the loop exits.
+    The socket reference lives alongside ``ConnInfo`` but is never
+    handed out — only the registry calls ``shutdown`` on it.
     """
 
     def __init__(self, time_func: object | None = None) -> None:
         self._conns: dict[int, ConnInfo] = {}
+        self._sockets: dict[int, socket.socket] = {}
         self._lock = threading.Lock()
         self._next_id = itertools.count(1)
         self._time = time_func if callable(time_func) else time.time
 
-    def open(self, peer_addr: tuple[str, int]) -> int:
-        """Register a new connection and return its assigned ``conn_id``."""
+    def open(self, peer_addr: tuple[str, int], sock: socket.socket | None = None) -> int:
+        """Register a new connection and return its assigned ``conn_id``.
+
+        ``sock`` is the per-connection socket. When non-None it's kept
+        so ``kill(conn_id)`` can shut it down from another thread.
+        """
         with self._lock:
             conn_id = next(self._next_id)
             self._conns[conn_id] = ConnInfo(
@@ -62,12 +74,37 @@ class ConnectionRegistry:
                 peer_addr=peer_addr,
                 opened_at=self._time(),
             )
+            if sock is not None:
+                self._sockets[conn_id] = sock
             return conn_id
 
     def close(self, conn_id: int) -> None:
         """Drop a connection from the registry. No-op if already closed."""
         with self._lock:
             self._conns.pop(conn_id, None)
+            self._sockets.pop(conn_id, None)
+
+    def kill(self, conn_id: int) -> bool:
+        """Forcibly close the connection by shutting down its socket.
+
+        Returns True if the connection existed (and a shutdown was
+        attempted), False if already gone. Real mongod's ``killOp``
+        signals an interrupt flag the long-running paths poll; we
+        don't have per-op cancellation, so the closest faithful
+        semantic is "close the socket" — any in-flight command runs
+        to completion, the connection thread's next ``recv`` returns
+        0, the loop exits, and the connection unregisters cleanly.
+
+        Idempotent: a second call after the thread has already
+        unregistered returns False with no error.
+        """
+        with self._lock:
+            sock = self._sockets.get(conn_id)
+            if sock is None:
+                return False
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        return True
 
     def record_command(self, conn_id: int, name: str) -> None:
         """Bump ``op_count`` and set ``last_command_name`` / ``last_cmd_at``."""

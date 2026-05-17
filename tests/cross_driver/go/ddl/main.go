@@ -44,7 +44,9 @@ func main() {
 
 	// Open a change stream, then drive DDL.
 	cs, err := coll.Watch(ctx, mongo.Pipeline{},
-		options.ChangeStream().SetMaxAwaitTime(2*time.Second))
+		options.ChangeStream().
+			SetMaxAwaitTime(2*time.Second).
+			SetShowExpandedEvents(true))
 	must(err)
 	defer cs.Close(ctx)
 

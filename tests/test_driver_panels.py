@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from validation_summary.driver_panels import (
     PANEL_PROSE,
     SMOKE_PANELS,

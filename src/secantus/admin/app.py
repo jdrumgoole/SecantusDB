@@ -44,6 +44,7 @@ from secantus.admin.routers import (
     insert,
     maintenance,
     metrics,
+    oplog,
     profiler,
     query,
     users,
@@ -155,6 +156,7 @@ def create_app(
     app.include_router(connections.router)
     app.include_router(profiler.router)
     app.include_router(maintenance.router)
+    app.include_router(oplog.router)
     app.include_router(extras.router)
     app.include_router(backup.router)
     app.include_router(server_router.router)

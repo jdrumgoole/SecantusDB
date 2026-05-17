@@ -1,23 +1,29 @@
 """Backup + restore page.
 
-Lists existing backups under ``~/.secantus/backups/`` and offers two
+Lists existing backups under ``~/.secantus/backups/`` and offers three
 actions:
 
 * "Run mongodump" — POST /backup/dump runs ``mongodump`` against the
-  target URI and writes to a fresh stamped directory.
-* "Restore" per backup — POST /backup/restore with a name parameter
-  runs ``mongorestore`` from the named directory.
+  target URI and writes to a fresh stamped directory. Slower than the
+  native path below but produces a portable BSON dump that any mongod
+  can ingest.
+* "Run native checkpoint backup" — POST /backup/archive runs the
+  ``secantusAdmin.backupArchive`` wire command. Forces a WT
+  checkpoint then tars the storage directory into a single
+  ``.tar.gz``. Faster + atomic vs mongodump; SecantusDB-specific
+  format (restore is "extract + start a new SecantusDB pointing at
+  it").
+* "Restore" per BSON backup — POST /backup/restore with a name
+  parameter runs ``mongorestore`` from the named directory.
 
-Both wait for the subprocess to finish (no streaming progress in v1)
-and re-render the page with the captured stdout / stderr in a flash
-panel below the actions.
-
-WT-checkpoint → tar backup is intentionally not exposed here yet — see
-``tasks/backlog.md``.
+All three wait for the operation to finish and re-render the page
+with the captured stdout / stderr / size in a flash panel.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
+import time as _time
 from pathlib import Path
 
 from fastapi import APIRouter, Form, Request
@@ -25,6 +31,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from secantus.admin import backup as backup_lib
+from secantus.admin.client import MongoError
 
 router = APIRouter()
 
@@ -101,6 +108,33 @@ def post_dump(request: Request) -> HTMLResponse:
         ),
     }
     return _render(request, flash=flash, last_result=result)
+
+
+@router.post("/backup/archive", response_class=HTMLResponse)
+def post_archive(request: Request) -> HTMLResponse:
+    """Run the native ``secantusAdmin.backupArchive`` wire command.
+
+    Writes a ``.tar.gz`` under the same ``backup_root`` mongodump uses
+    so the user sees both kinds of backup side-by-side. The output
+    path stamps with a timestamp so successive runs don't overwrite.
+    """
+    root = _backup_root(request)
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+    archive = root / f"archive-{stamp}.tar.gz"
+    started = _time.monotonic()
+    try:
+        result = request.app.state.mongo.backup_archive(str(archive))
+    except MongoError as exc:
+        flash = {"kind": "err", "msg": f"backupArchive failed: {exc}"}
+        return _render(request, flash=flash)
+    elapsed_ms = int((_time.monotonic() - started) * 1000)
+    size_pretty = _humanize_bytes(result.get("sizeBytes", 0))
+    flash = {
+        "kind": "ok",
+        "msg": (f"backupArchive → {archive.name} ({size_pretty} in {elapsed_ms} ms)"),
+    }
+    return _render(request, flash=flash)
 
 
 @router.post("/backup/restore", response_class=HTMLResponse)

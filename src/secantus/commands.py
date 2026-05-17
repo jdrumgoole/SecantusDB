@@ -55,6 +55,7 @@ from secantus.rbac import (
     A_INPROG,
     A_INSERT,
     A_KILL_CURSORS,
+    A_KILLOP,
     A_LIST_COLLECTIONS,
     A_LIST_DATABASES,
     A_LIST_INDEXES,
@@ -643,6 +644,44 @@ def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"inprog": inprog, "ok": 1.0}
 
 
+def _kill_op(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """``killOp``: forcibly close a client connection by its opid.
+
+    Real mongod's ``killOp`` signals a per-op interrupt flag the
+    long-running paths poll. SecantusDB doesn't carry per-op
+    cancellation state, so the closest faithful semantic is "close
+    the socket" — any in-flight command finishes, the connection
+    thread's next ``recv`` returns 0, the loop exits, and the
+    connection unregisters.
+
+    Our ``opid`` is the connection's ``conn_id`` (one in-flight op
+    per connection in our model), so the user can pass the value
+    they read off ``currentOp`` directly. Accepts ``Int32`` /
+    ``Int64`` / plain int / numeric string for the ``op`` field —
+    different drivers serialise it differently.
+    """
+    raw = doc.get("op")
+    try:
+        op_id = int(raw)
+    except (TypeError, ValueError):
+        return {
+            "ok": 0.0,
+            "errmsg": f"killOp requires an integer ``op`` field, got {raw!r}",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if ctx.connections is None:
+        return {"info": "no connection registry", "ok": 1.0}
+    killed = ctx.connections.kill(op_id)
+    # mongod always returns ``ok: 1`` from killOp regardless of whether
+    # the op was found — it's fire-and-forget. The ``info`` field
+    # surfaces what we did so admin tooling can confirm.
+    return {
+        "info": "operation killed" if killed else "no operation with that opid",
+        "ok": 1.0,
+    }
+
+
 def _fsync(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # mongod's `fsync` defaults to flushing all data to disk. With
     # ``lock: true`` it also blocks subsequent writes until ``fsyncUnlock``
@@ -708,6 +747,40 @@ def _secantus_admin_prune_ttl(_doc: dict[str, Any], ctx: CommandContext) -> dict
     """
     pruned = ctx.storage.prune_ttl_all_collections()
     return {"pruned": int(pruned), "ok": 1.0}
+
+
+def _secantus_admin_backup_archive(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """SecantusDB extension: force a checkpoint, then tar the WT home.
+
+    ``mongodump``/``mongorestore`` go through the wire protocol — they
+    walk every collection, BSON-encode every doc, write to BSON files,
+    then replay on restore. For a single-node test surrogate this is
+    slower (and not atomic across collections) than a snapshot of the
+    underlying WT directory. This command does the latter:
+
+    1. Lock the storage,
+    2. Force a WT checkpoint (durable flush + consistent snapshot),
+    3. Tar the WT home directory into ``outputPath`` (.tar.gz).
+
+    ``outputPath`` is a server-side path the SecantusDB process can
+    write to. Returns ``{path, sizeBytes, ok: 1}``. Restore is
+    "stop SecantusDB, extract the archive into a new storage path,
+    start SecantusDB pointing at it" — a separate slice will land a
+    server-side restore command.
+    """
+    output_path = doc.get("outputPath")
+    if not isinstance(output_path, str) or not output_path:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.backupArchive requires outputPath: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    try:
+        result = ctx.storage.create_archive(output_path)
+    except RuntimeError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {"path": result["path"], "sizeBytes": result["sizeBytes"], "ok": 1.0}
 
 
 def _profile(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -2996,6 +3069,7 @@ def _aggregate_change_stream(
                     storage=storage,
                     full_document_mode=cs_spec.full_document_mode,
                     full_document_before_change_mode=cs_spec.full_document_before_change_mode,
+                    show_expanded_events=cs_spec.show_expanded_events,
                     scope=scope,
                 )
             except changestreams.ChangeStreamFatalError as exc:
@@ -4069,10 +4143,12 @@ _HANDLERS: dict[str, CommandHandler] = {
     "whatsmyuri": _whatsmyuri,
     "hostInfo": _hostinfo,
     "currentOp": _current_op,
+    "killOp": _kill_op,
     "fsync": _fsync,
     "profile": _profile,
     "secantusAdmin.pruneOplog": _secantus_admin_prune_oplog,
     "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
+    "secantusAdmin.backupArchive": _secantus_admin_backup_archive,
     "explain": _explain,
     "serverStatus": _server_status,
     "getCmdLineOpts": _get_cmd_line_opts,
@@ -4222,12 +4298,14 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "getParameter": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
     "getLog": (A_GET_LOG, SCOPE_CLUSTER),
     "currentOp": (A_INPROG, SCOPE_CLUSTER),
+    "killOp": (A_KILLOP, SCOPE_CLUSTER),
     "fsync": (A_FSYNC, SCOPE_CLUSTER),
     "profile": (A_ENABLE_PROFILER, SCOPE_DATABASE),
     # SecantusDB-extension prune commands reuse fsync's cluster-wide
     # privilege — both are admin-only operations against shared state.
     "secantusAdmin.pruneOplog": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.backupArchive": (A_FSYNC, SCOPE_CLUSTER),
 }
 
 

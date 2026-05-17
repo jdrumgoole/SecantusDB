@@ -182,6 +182,30 @@ def test_sample_size_larger_than_input_returns_all() -> None:
     assert len(out) == 3
 
 
+def test_sample_with_secantus_sample_seed_is_deterministic(monkeypatch) -> None:
+    """Setting ``SECANTUS_SAMPLE_SEED`` makes ``$sample`` reproducible.
+
+    The seed is captured at module import time, so changing it
+    mid-process via env-var alone won't help — we have to rebuild the
+    RNG via the private helper. This test pins the deterministic-
+    behaviour contract that the env-var injects a dedicated
+    ``random.Random(seed)`` (rather than seeding the module-level
+    ``random`` and leaking state into other code in the same process).
+    """
+    import secantus.aggregate as agg
+
+    monkeypatch.setenv("SECANTUS_SAMPLE_SEED", "42")
+    monkeypatch.setattr(agg, "_SAMPLE_RNG", agg._build_sample_rng())
+
+    docs = [{"i": i} for i in range(20)]
+    a = apply_pipeline(docs, [{"$sample": {"size": 5}}])
+    # Reset the RNG to the same seed and re-run — must be identical.
+    monkeypatch.setattr(agg, "_SAMPLE_RNG", agg._build_sample_rng())
+    b = apply_pipeline(docs, [{"$sample": {"size": 5}}])
+    assert a == b
+    assert len(a) == 5
+
+
 def test_sort_by_count() -> None:
     docs = [{"t": "a"}, {"t": "b"}, {"t": "a"}, {"t": "c"}, {"t": "a"}]
     out = apply_pipeline(docs, [{"$sortByCount": "$t"}])
@@ -650,24 +674,99 @@ def test_densify_date_partitions_independently() -> None:
     ]
 
 
-def test_densify_date_unit_month_rejected() -> None:
-    """``month`` / ``quarter`` / ``year`` are variable-length and
-    can't be expressed as a fixed timedelta — rejected with a clear
-    error pointing at the supported set."""
+def test_densify_date_unit_month_fills_gaps() -> None:
+    """``month`` densify walks via ``relativedelta`` so February's 28/29
+    days, October-November's 30-vs-31 days, and the year roll-over all
+    handle correctly."""
     import datetime as dt
 
-    with pytest.raises(AggregateError, match="variable-length"):
-        apply_pipeline(
-            [{"ts": dt.datetime(2026, 1, 1)}],
-            [
-                {
-                    "$densify": {
-                        "field": "ts",
-                        "range": {"bounds": "full", "step": 1, "unit": "month"},
-                    }
+    docs = [
+        {"ts": dt.datetime(2026, 1, 31)},
+        {"ts": dt.datetime(2026, 5, 31)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {"bounds": "full", "step": 1, "unit": "month"},
                 }
-            ],
-        )
+            }
+        ],
+    )
+    # ``relativedelta`` snaps to the last valid day per month — Jan 31
+    # → Feb 28 → Mar 28 → Apr 28 → May 28 (not May 31). The original
+    # May-31 doc still appears at the end.
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 31),
+        dt.datetime(2026, 2, 28),
+        dt.datetime(2026, 3, 28),
+        dt.datetime(2026, 4, 28),
+        dt.datetime(2026, 5, 28),
+        dt.datetime(2026, 5, 31),
+    ]
+
+
+def test_densify_date_unit_quarter_steps_three_months() -> None:
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2026, 1, 1)},
+        {"ts": dt.datetime(2027, 1, 1)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {"bounds": "full", "step": 1, "unit": "quarter"},
+                }
+            }
+        ],
+    )
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 1),
+        dt.datetime(2026, 4, 1),
+        dt.datetime(2026, 7, 1),
+        dt.datetime(2026, 10, 1),
+        dt.datetime(2027, 1, 1),
+    ]
+
+
+def test_densify_date_unit_year_walks_anniversaries() -> None:
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2024, 2, 29)},  # leap day
+        {"ts": dt.datetime(2028, 2, 29)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {"bounds": "full", "step": 1, "unit": "year"},
+                }
+            }
+        ],
+    )
+    # relativedelta snaps Feb 29 → Feb 28 in non-leap years. Because
+    # the walk advances ``cursor + 1 year`` step-by-step (not from the
+    # original anchor), once it snaps to Feb 28 it stays at Feb 28
+    # on every subsequent step — so 2028's filler is Feb 28 even
+    # though 2028 itself is a leap year. The original Feb 29 doc
+    # still appears at the end (cursor advances past hi first).
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2024, 2, 29),
+        dt.datetime(2025, 2, 28),
+        dt.datetime(2026, 2, 28),
+        dt.datetime(2027, 2, 28),
+        dt.datetime(2028, 2, 28),
+        dt.datetime(2028, 2, 29),
+    ]
 
 
 def test_densify_date_unrecognised_unit_rejected() -> None:

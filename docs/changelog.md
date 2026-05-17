@@ -20,7 +20,99 @@ the API surface itself is shaped by Semantic Versioning intent.
 ## [Unreleased]
 
 (No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b17.)
+`main` after v0.5.1b18.)
+
+## [0.5.1b18] — 2026-05-18
+
+### Native WT-checkpoint backups, admin UI /oplog page, and change-stream fidelity wins
+
+The natural follow-on to v0.5.1b17's `local.oplog.rs` synthetic
+collection lands as the admin UI `/oplog` page: a paged entry
+browser with a window selector (last 50 / 500 / 5000), `op`-checkbox
+filter (`i` / `u` / `d` / `c` / `n`), `ns` substring filter, and a
+per-row expandable JSON body. Auto-refreshes every 5 s. The data
+source is just `client.local.oplog_rs.find()` — no new server-side
+surface needed, only the page chrome and an `_rows` partial that
+follows the same pattern as `/connections` + `/cursors`.
+
+`showExpandedEvents` on change streams now matches mongod: the flag
+defaults to `false`, and DDL "expanded" events (`createIndexes`,
+`dropIndexes`) are suppressed unless the user opts in via
+`coll.watch(show_expanded_events=True)`. Previously these surfaced
+unconditionally — more permissive than mongod, and broke the
+conformance contract for tests that assume the stable v1 event set.
+
+`killOp` lands as a real wire command that closes the target
+connection's socket via `shutdown(SHUT_RDWR)`. Any in-flight command
+finishes, the per-connection thread's next `recv` returns 0, the
+loop exits, and the connection unregisters cleanly. Real mongod uses
+a per-op interrupt flag, which would need cancellation infrastructure
+SecantusDB doesn't carry — but "close the socket" is the visible
+end-state users care about, and the kill-and-reap admin button on
+`/connections` is now functional.
+
+`$sample` becomes deterministic when `SECANTUS_SAMPLE_SEED=<n>` is
+set in the environment. Builds a dedicated `random.Random(seed)`
+instance at module load instead of mutating the global `random`
+state, so other code sharing the process keeps its own entropy.
+Closes the long-standing test-flake source where `$sample` results
+varied run-to-run.
+
+#### Added
+- Admin UI `/oplog` page (`routers/oplog.py` +
+  `templates/pages/oplog.html` + `templates/partials/oplog_rows.html`):
+  window / op / ns filters, expandable per-row JSON, 5 s
+  auto-refresh, sidebar entry between Profiler and Maintenance.
+- `killOp` wire command + `kill(conn_id)` on
+  `ConnectionRegistry` (shuts down the socket via
+  `shutdown(SHUT_RDWR)`). Per-connection sockets are now stashed on
+  the registry at `_handle_client` time.
+- `A_KILLOP` privilege action in `secantus.rbac`; granted by
+  `clusterAdmin` and `root`.
+- Admin UI `/connections` Kill button (was a placeholder),
+  typed-confirm modal (`partials/connection_kill_modal.html`),
+  facade `kill_connection(conn_id)` method.
+- `ChangeStreamSpec.show_expanded_events` parsed from
+  `$changeStream.showExpandedEvents`; threaded into
+  `changestreams.project`.
+- `SECANTUS_SAMPLE_SEED` env var (read at `aggregate` module
+  import) — `$sample` uses a dedicated `random.Random(seed)`
+  when set.
+- `secantusAdmin.backupArchive` wire command + `Storage.create_archive`
+  + admin UI "Run native checkpoint backup" button: forces a WT
+  checkpoint then tars the storage directory into a single
+  `.tar.gz`. Faster + atomic vs `mongodump`; restore is "extract
+  + start a new SecantusDB pointing at it". Rigorous round-trip
+  test coverage in `tests/test_backup_restore.py` (doc identity at
+  scale, every non-default index shape, oplog tail continuity,
+  capped collection options + FIFO state, SCRAM users / roles,
+  concurrent-writes consistency, archive portability, repeated-
+  backup idempotency).
+- `$densify` month / quarter / year units via
+  `dateutil.relativedelta`. `quarter` is canonically 3 months.
+  Adds `python-dateutil>=2.8` to the runtime dependencies (pure
+  Python, available almost everywhere as a transitive dep).
+
+#### Changed
+- `changestreams.project` suppresses `createIndexes` / `dropIndexes`
+  events unless the caller passed `show_expanded_events=True`
+  (mongod-faithful default-off). The three existing tests +
+  cross-driver DDL smokes (mongosh / node / go / java) all set the
+  opt-in.
+
+#### Fixed
+- Closes backlog entry `$sample uses random.sample without a fixed
+  seed` — deterministic via env var.
+- Closes backlog entry `killOp / connection-close command` — admin
+  UI Kill button is functional.
+- Closes backlog entry `showExpandedEvents — accepted, ignored`.
+- Closes backlog entry `Admin UI /oplog page`.
+- `updateDescription.truncatedArrays` now emits for any array
+  shrink (not just strict head-prefix), with indexed ``updatedFields``
+  for kept-prefix changes — matches mongod's $v:2 in-place diff
+  rather than wholesale-replacing on any reshape. Same-length-with-
+  changes arrays also produce indexed ``arr.<i>`` updates now
+  (previously wholesale). Closes the §3.2 backlog entry.
 
 ## [0.5.1b17] — 2026-05-17
 
@@ -388,7 +480,8 @@ of record. See the [GitHub
 Releases](https://github.com/jdrumgoole/SecantusDB/releases) page for
 the auto-generated commit-list notes from those tags.
 
-[Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b17...HEAD
+[Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b18...HEAD
+[0.5.1b18]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b18
 [0.5.1b17]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b17
 [0.5.1b16]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b16
 [0.5.1b15]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b15

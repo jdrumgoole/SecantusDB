@@ -23,7 +23,7 @@ async function main() {
     await coll.drop().catch(() => {});
     await coll.insertOne({ _id: 1 });
 
-    const stream = coll.watch([], { maxAwaitTimeMS: 2000 });
+    const stream = coll.watch([], { maxAwaitTimeMS: 2000, showExpandedEvents: true });
     const events = [];
     stream.on('change', (e) => {
       events.push(e.operationType);

@@ -3,31 +3,32 @@
 The output mirrors what real ``mongod`` puts on a change-stream ``update``
 event:
 
-- ``updatedFields``: ``{dotted.path: new_value}`` for every leaf that changed
-  or was added.
-- ``removedFields``: ``[dotted.path, ...]`` for every leaf that disappeared.
-- ``truncatedArrays``: ``[{field: dotted.path, newSize: N}, ...]`` when the
-  post array is a strict head-prefix of the pre array (leading elements
-  match, post is shorter). Otherwise the array is replaced wholesale via
-  ``updatedFields``.
+- ``updatedFields``: ``{dotted.path: new_value}`` for every leaf that
+  changed or was added. Array elements that changed in place produce
+  ``arr.<index>`` paths; nested sub-doc fields produce
+  ``arr.<index>.<field>`` paths.
+- ``removedFields``: ``[dotted.path, ...]`` for every leaf that
+  disappeared.
+- ``truncatedArrays``: ``[{field: dotted.path, newSize: N}, ...]``
+  whenever an array got shorter (``len(post) < len(pre)``). The kept
+  prefix is diffed pairwise, so changed elements inside a truncated
+  array surface as indexed ``updatedFields`` alongside the
+  ``truncatedArrays`` entry — matching mongod's ``$v: 2`` semantics.
 
-Nested dicts are walked element-wise so that changing one nested leaf
-emits only that leaf rather than the whole sub-document. Arrays whose
-contents shifted (insertion / deletion in the middle) are replaced
-wholesale, matching mongod's $v:2 diff semantics in the simple case.
+Arrays whose post version is **longer** than pre still wholesale-
+replace (mongod's $v:2 can encode appends via index updates, but our
+simpler model treats "the array grew" as a wholesale change so
+downstream consumers re-fetch). Same-length-with-changes arrays diff
+pairwise.
+
+Nested dicts walk element-wise so that changing one nested leaf
+emits only that leaf rather than the whole sub-document.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
-
-
-def _is_truncation(pre: list[Any], post: list[Any]) -> bool:
-    """True if ``post`` is a strict head-prefix of ``pre`` (and shorter)."""
-    if len(post) >= len(pre):
-        return False
-    return pre[: len(post)] == post
 
 
 def _walk(
@@ -54,12 +55,22 @@ def _walk(
     if isinstance(pre, list) and isinstance(post, list):
         if pre == post:
             return
-        if _is_truncation(pre, post):
-            truncated.append({"field": path, "newSize": len(post)})
+        # If post is longer, we can't represent the change as indexed
+        # updates without an "append" operator — wholesale-replace.
+        # mongod's $v:2 supports indexed insertion, but the simpler
+        # wholesale fallback is correct (just less compact).
+        if len(post) > len(pre):
+            updated[path] = post
             return
-        # Fall back to wholesale replacement; preserve the original semantics
-        # of "this array changed" so consumers can re-fetch.
-        updated[path] = post
+        # ``len(post) <= len(pre)``: walk the kept prefix pairwise so
+        # changes to individual elements surface as ``arr.<i>`` updates
+        # (and, for kept elements that are sub-docs, as
+        # ``arr.<i>.<field>`` updates via recursion).
+        for i in range(len(post)):
+            child_path = f"{path}.{i}" if path else str(i)
+            _walk(pre[i], post[i], child_path, updated, removed, truncated)
+        if len(post) < len(pre):
+            truncated.append({"field": path, "newSize": len(post)})
         return
     if pre != post:
         updated[path] = post

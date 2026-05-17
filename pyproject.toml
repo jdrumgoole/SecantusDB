@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.1b17"
+version = "0.5.1b18"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,11 @@ dependencies = [
     # no PyPI dependency on the standalone wiredtiger package.
     "s2sphere>=0.2.5",
     "shapely>=2.0",
+    # python-dateutil powers variable-length date arithmetic in
+    # ``$densify`` (month / quarter / year units). Pure-Python, no
+    # native components; on virtually every box already as a
+    # transitive dep of botocore / pytest / etc.
+    "python-dateutil>=2.8",
 ]
 
 [project.optional-dependencies]

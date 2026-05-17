@@ -1621,10 +1621,11 @@ wheels = [
 
 [[package]]
 name = "secantusdb"
-version = "0.5.1b17"
+version = "0.5.1b18"
 source = { editable = "." }
 dependencies = [
     { name = "pymongo" },
+    { name = "python-dateutil" },
     { name = "s2sphere" },
     { name = "shapely" },
 ]
@@ -1676,6 +1677,7 @@ requires-dist = [
     { name = "pytest-benchmark", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pytest-json-report", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.5" },
+    { name = "python-dateutil", specifier = ">=2.8" },
     { name = "python-multipart", marker = "extra == 'admin'", specifier = ">=0.0.9" },
     { name = "pywebview", marker = "extra == 'admin'", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
