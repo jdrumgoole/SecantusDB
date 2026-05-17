@@ -749,6 +749,40 @@ def _secantus_admin_prune_ttl(_doc: dict[str, Any], ctx: CommandContext) -> dict
     return {"pruned": int(pruned), "ok": 1.0}
 
 
+def _secantus_admin_backup_archive(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """SecantusDB extension: force a checkpoint, then tar the WT home.
+
+    ``mongodump``/``mongorestore`` go through the wire protocol — they
+    walk every collection, BSON-encode every doc, write to BSON files,
+    then replay on restore. For a single-node test surrogate this is
+    slower (and not atomic across collections) than a snapshot of the
+    underlying WT directory. This command does the latter:
+
+    1. Lock the storage,
+    2. Force a WT checkpoint (durable flush + consistent snapshot),
+    3. Tar the WT home directory into ``outputPath`` (.tar.gz).
+
+    ``outputPath`` is a server-side path the SecantusDB process can
+    write to. Returns ``{path, sizeBytes, ok: 1}``. Restore is
+    "stop SecantusDB, extract the archive into a new storage path,
+    start SecantusDB pointing at it" — a separate slice will land a
+    server-side restore command.
+    """
+    output_path = doc.get("outputPath")
+    if not isinstance(output_path, str) or not output_path:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.backupArchive requires outputPath: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    try:
+        result = ctx.storage.create_archive(output_path)
+    except RuntimeError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {"path": result["path"], "sizeBytes": result["sizeBytes"], "ok": 1.0}
+
+
 def _profile(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Get / set per-database profiling level (mongod ``profile`` shape).
 
@@ -4114,6 +4148,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "profile": _profile,
     "secantusAdmin.pruneOplog": _secantus_admin_prune_oplog,
     "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
+    "secantusAdmin.backupArchive": _secantus_admin_backup_archive,
     "explain": _explain,
     "serverStatus": _server_status,
     "getCmdLineOpts": _get_cmd_line_opts,
@@ -4270,6 +4305,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     # privilege — both are admin-only operations against shared state.
     "secantusAdmin.pruneOplog": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.backupArchive": (A_FSYNC, SCOPE_CLUSTER),
 }
 
 

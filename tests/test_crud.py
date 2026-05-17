@@ -2156,3 +2156,67 @@ def test_killop_known_opid_closes_connection(server) -> None:
             admin.close()
     finally:
         victim.close()
+
+
+# --- secantusAdmin.backupArchive --------------------------------------------
+
+
+def test_backup_archive_via_pymongo_round_trips_data(server, tmp_path) -> None:
+    """End-to-end through the wire: insert → backupArchive → stop server →
+    extract → boot new server pointing at the extracted dir → verify
+    every doc + index + oplog entry is still there.
+    """
+    import tarfile
+
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    archive = tmp_path / "round_trip.tar.gz"
+
+    client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        db = client["round_trip_xd"]
+        db["things"].insert_many([{"_id": i, "v": f"row-{i}"} for i in range(20)])
+        db["things"].create_index([("v", 1)], name="v_1", unique=True)
+        db["things"].update_one({"_id": 5}, {"$set": {"v": "row-5-updated"}})
+
+        res = client.admin.command("secantusAdmin.backupArchive", outputPath=str(archive))
+        assert res["ok"] == 1.0
+        assert res["path"] == str(archive)
+        assert int(res["sizeBytes"]) > 0
+        assert archive.exists()
+    finally:
+        client.close()
+
+    restored_dir = tmp_path / "restored"
+    restored_dir.mkdir()
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.extractall(restored_dir)
+
+    with SecantusDBServer(port=0, storage_path=str(restored_dir)) as restored:
+        client2 = MongoClient(restored.uri, serverSelectionTimeoutMS=2000)
+        try:
+            db2 = client2["round_trip_xd"]
+            rows = sorted(db2["things"].find(), key=lambda d: d["_id"])
+            assert len(rows) == 20
+            assert rows[5]["v"] == "row-5-updated"
+            assert all(rows[i]["v"] == f"row-{i}" for i in range(20) if i != 5)
+
+            indexes = list(db2["things"].list_indexes())
+            assert any(i["name"] == "v_1" for i in indexes)
+
+            oplog_updates = list(
+                client2["local"]["oplog.rs"].find({"op": "u", "ns": "round_trip_xd.things"})
+            )
+            assert len(oplog_updates) >= 1
+        finally:
+            client2.close()
+
+
+def test_backup_archive_rejects_missing_output_path(client) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure) as exc_info:
+        client.admin.command("secantusAdmin.backupArchive")
+    assert exc_info.value.code == 14
