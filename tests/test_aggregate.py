@@ -674,24 +674,93 @@ def test_densify_date_partitions_independently() -> None:
     ]
 
 
-def test_densify_date_unit_month_rejected() -> None:
-    """``month`` / ``quarter`` / ``year`` are variable-length and
-    can't be expressed as a fixed timedelta — rejected with a clear
-    error pointing at the supported set."""
+def test_densify_date_unit_month_fills_gaps() -> None:
+    """``month`` densify walks via ``relativedelta`` so February's 28/29
+    days, October-November's 30-vs-31 days, and the year roll-over all
+    handle correctly."""
     import datetime as dt
 
-    with pytest.raises(AggregateError, match="variable-length"):
-        apply_pipeline(
-            [{"ts": dt.datetime(2026, 1, 1)}],
-            [
-                {
-                    "$densify": {
-                        "field": "ts",
-                        "range": {"bounds": "full", "step": 1, "unit": "month"},
-                    }
+    docs = [
+        {"ts": dt.datetime(2026, 1, 31)},
+        {"ts": dt.datetime(2026, 5, 31)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {"bounds": "full", "step": 1, "unit": "month"},
                 }
-            ],
-        )
+            }
+        ],
+    )
+    # ``relativedelta`` snaps to the last valid day per month — Jan 31
+    # → Feb 28 → Mar 28 → Apr 28 → May 28 (not May 31). The original
+    # May-31 doc still appears at the end.
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 31),
+        dt.datetime(2026, 2, 28),
+        dt.datetime(2026, 3, 28),
+        dt.datetime(2026, 4, 28),
+        dt.datetime(2026, 5, 28),
+        dt.datetime(2026, 5, 31),
+    ]
+
+
+def test_densify_date_unit_quarter_steps_three_months() -> None:
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2026, 1, 1)},
+        {"ts": dt.datetime(2027, 1, 1)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {"bounds": "full", "step": 1, "unit": "quarter"},
+                }
+            }
+        ],
+    )
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2026, 1, 1),
+        dt.datetime(2026, 4, 1),
+        dt.datetime(2026, 7, 1),
+        dt.datetime(2026, 10, 1),
+        dt.datetime(2027, 1, 1),
+    ]
+
+
+def test_densify_date_unit_year_walks_anniversaries() -> None:
+    import datetime as dt
+
+    docs = [
+        {"ts": dt.datetime(2024, 2, 29)},  # leap day
+        {"ts": dt.datetime(2028, 2, 29)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$densify": {
+                    "field": "ts",
+                    "range": {"bounds": "full", "step": 1, "unit": "year"},
+                }
+            }
+        ],
+    )
+    # relativedelta snaps Feb 29 → Feb 28 in non-leap years.
+    assert [d["ts"] for d in out] == [
+        dt.datetime(2024, 2, 29),
+        dt.datetime(2025, 2, 28),
+        dt.datetime(2026, 2, 28),
+        dt.datetime(2027, 2, 28),
+        dt.datetime(2028, 2, 29),
+    ]
 
 
 def test_densify_date_unrecognised_unit_rejected() -> None:

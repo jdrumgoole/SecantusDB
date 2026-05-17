@@ -227,6 +227,15 @@ _DENSIFY_UNIT_TO_TIMEDELTA: dict[str, str] = {
     "millisecond": "milliseconds",
 }
 
+# Variable-length units: each call needs ``dateutil.relativedelta``
+# because the step is not a fixed duration. ``quarter`` is canonically
+# 3 months, so it maps to ``months=3 * step``.
+_DENSIFY_UNIT_TO_RELATIVEDELTA: dict[str, tuple[str, int]] = {
+    "month": ("months", 1),
+    "quarter": ("months", 3),
+    "year": ("years", 1),
+}
+
 
 def _stage_densify(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
@@ -242,12 +251,23 @@ def _stage_densify(
     don't yet plumb a partition-wide range distinct from each
     partition's observed extremes.
 
-    Date densify is enabled by setting ``range.unit`` to one of
-    ``"week"`` / ``"day"`` / ``"hour"`` / ``"minute"`` / ``"second"`` /
-    ``"millisecond"`` — those are the units with a fixed duration so
-    a ``timedelta`` represents them exactly. ``"month"`` / ``"quarter"``
-    / ``"year"`` are rejected (variable-length, would need
-    ``relativedelta``-style arithmetic).
+    Date densify accepts every mongod unit:
+
+    * Fixed-duration: ``"week"`` / ``"day"`` / ``"hour"`` /
+      ``"minute"`` / ``"second"`` / ``"millisecond"`` — represented
+      via ``datetime.timedelta``.
+    * Variable-length: ``"month"`` / ``"quarter"`` / ``"year"`` —
+      represented via ``dateutil.relativedelta.relativedelta`` because
+      a month / year duration depends on the calendar date. ``quarter``
+      is canonically 3 months.
+
+    The 1M-filler safety cap only applies to numeric bounds (where
+    ``span / step`` is well-defined). Variable-length date densify
+    can in principle OOM on pathological inputs like ``[year 1, year
+    10_000_000]`` with ``step: 1 year`` — the per-partition loop will
+    eventually grow the result list to that size. Pragmatic non-goal:
+    densify is for filling sub-day gaps in time-series data, not for
+    enumerating millennia.
     """
     if not isinstance(spec, Mapping):
         raise AggregateError("$densify requires a document spec")
@@ -264,15 +284,17 @@ def _stage_densify(
     if unit is not None:
         if not isinstance(unit, str):
             raise AggregateError("$densify range.unit must be a string")
-        if unit in {"month", "quarter", "year"}:
-            raise AggregateError(
-                f"$densify range.unit={unit!r} is variable-length; "
-                "supported units are week / day / hour / minute / second / millisecond"
-            )
         td_kwarg = _DENSIFY_UNIT_TO_TIMEDELTA.get(unit)
-        if td_kwarg is None:
+        rd_pair = _DENSIFY_UNIT_TO_RELATIVEDELTA.get(unit)
+        if td_kwarg is not None:
+            step: Any = _dt.timedelta(**{td_kwarg: raw_step})
+        elif rd_pair is not None:
+            from dateutil.relativedelta import relativedelta
+
+            kw, multiplier = rd_pair
+            step = relativedelta(**{kw: int(raw_step) * multiplier})
+        else:
             raise AggregateError(f"$densify range.unit={unit!r} is not recognised")
-        step: Any = _dt.timedelta(**{td_kwarg: raw_step})
     else:
         step = raw_step
     bounds = range_spec.get("bounds")

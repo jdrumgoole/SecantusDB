@@ -21,6 +21,11 @@ dependencies = [
     # no PyPI dependency on the standalone wiredtiger package.
     "s2sphere>=0.2.5",
     "shapely>=2.0",
+    # python-dateutil powers variable-length date arithmetic in
+    # ``$densify`` (month / quarter / year units). Pure-Python, no
+    # native components; on virtually every box already as a
+    # transitive dep of botocore / pytest / etc.
+    "python-dateutil>=2.8",
 ]
 
 [project.optional-dependencies]
