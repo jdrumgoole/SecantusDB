@@ -65,7 +65,7 @@
           <td><code>{{ r.ns }}</code></td>
           <td class="num">{{ r.millis }}</td>
           <td>{% if r.user %}<code>{{ r.user }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
-          <td>{% if r.ok == 1.0 %}<span class="badge">ok</span>{% else %}<span class="badge" style="border-color: var(--error); color: var(--error)">err</span>{% endif %}</td>
+          <td>{% if r.ok == 1.0 %}<span class="badge">ok</span>{% else %}<span class="badge badge-error">err</span>{% endif %}</td>
         </tr>
         <tr>
           <td colspan="6"><pre class="doc-body">{{ r.json }}</pre></td>

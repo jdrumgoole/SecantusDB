@@ -4,6 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{{ title }} — SecantusDB admin</title>
+    {# Inline SVG data-URI favicon: matches the sidebar brand mark (filled
+       dot in --accent) and dodges the auth-middleware 401 a plain
+       ``/favicon.ico`` request would hit. #}
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Ccircle%20cx='16'%20cy='16'%20r='10'%20fill='%2363b3ff'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/static/css/admin.css" />
     <script src="/static/js/htmx.min.js" defer></script>
     <script src="/static/js/alpine.min.js" defer></script>
@@ -43,12 +47,12 @@
         {% if embedded_uri and embedded_uri == request.app.state.mongo_uri %}
           <a class="server-badge server-badge-embedded" href="/server"
              title="Embedded SecantusDB ({{ request.app.state.mongo_uri_display }})">
-            <span class="server-badge-dot">●</span>
+            <span class="server-badge-dot" aria-hidden="true"></span>
             <span>Embedded SecantusDB</span>
           </a>
         {% else %}
           <a class="server-badge" href="/server" title="Click to change target server">
-            <span class="server-badge-dot">●</span>
+            <span class="server-badge-dot" aria-hidden="true"></span>
             <code>{{ request.app.state.mongo_uri_display }}</code>
           </a>
         {% endif %}

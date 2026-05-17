@@ -12,6 +12,7 @@ enough to justify its own module.
 
 from __future__ import annotations
 
+import datetime as _dt
 from typing import Any
 
 from bson import json_util
@@ -92,11 +93,12 @@ def logs_partial(request: Request) -> HTMLResponse:
         total = int(out.get("totalLinesWritten", 0) or 0)
     except MongoError as exc:
         error = str(exc)
+    fetched_at = _dt.datetime.now().strftime("%H:%M:%S")
     templates = _templates(request)
     return templates.TemplateResponse(
         request,
         "partials/logs_lines.html",
-        {"lines": lines, "total": total, "error": error},
+        {"lines": lines, "total": total, "error": error, "fetched_at": fetched_at},
     )
 
 
@@ -128,19 +130,25 @@ def _extract_features(docs: list[dict[str, Any]], geo_field: str) -> list[dict[s
 @router.get("/db/{db}/{coll}/geo", response_class=HTMLResponse)
 def geo_page(request: Request, db: str, coll: str) -> HTMLResponse:
     sample_size = _clamp_size(request.query_params.get("sample_size"), default=200, lo=1, hi=1000)
+    requested_field = request.query_params.get("field") or None
     error: str | None = None
     geo_indexes: list[dict[str, Any]] = []
+    geo_fields: list[str] = []
     features_json = "[]"
     geo_field: str | None = None
     try:
         geo_indexes = request.app.state.mongo.geo_indexes(db, coll)
-        if geo_indexes:
-            # Pick the first 2dsphere/2d field as the geometry source.
-            ix = geo_indexes[0]
+        # Every distinct ``(name, "2dsphere" | "2d")`` pair the collection
+        # has; the page renders a ``<select>`` if there's more than one
+        # so users with multiple geo fields can pick which one to view.
+        for ix in geo_indexes:
             for k, v in (ix.get("key") or {}).items():
-                if v in ("2dsphere", "2d"):
-                    geo_field = k
-                    break
+                if v in ("2dsphere", "2d") and k not in geo_fields:
+                    geo_fields.append(k)
+        if requested_field and requested_field in geo_fields:
+            geo_field = requested_field
+        elif geo_fields:
+            geo_field = geo_fields[0]
         if geo_field is not None:
             docs = request.app.state.mongo.sample_collection(db, coll, size=sample_size)
             features = _extract_features(docs, geo_field)
@@ -157,6 +165,7 @@ def geo_page(request: Request, db: str, coll: str) -> HTMLResponse:
             "db_name": db,
             "coll_name": coll,
             "geo_indexes": geo_indexes,
+            "geo_fields": geo_fields,
             "geo_field": geo_field,
             "features_json": features_json,
             "sample_size": sample_size,

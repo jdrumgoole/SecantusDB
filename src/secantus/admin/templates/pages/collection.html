@@ -70,7 +70,11 @@
     </div>
   {% endif %}
 {% elif not errors %}
-  <p class="empty">No documents match.</p>
+  {% if raw_filter and raw_filter.strip() %}
+    <p class="empty">No documents in <code>{{ db_name }}.{{ coll_name }}</code> match the filter.</p>
+  {% else %}
+    <p class="empty">No documents in <code>{{ db_name }}.{{ coll_name }}</code>.</p>
+  {% endif %}
 {% endif %}
 
 <div id="modal"></div>
