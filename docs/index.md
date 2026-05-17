@@ -196,4 +196,5 @@ validation-report-node
 validation-report-java
 validation-report-ruby
 api
+changelog
 ```
