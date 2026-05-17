@@ -1314,6 +1314,102 @@ def test_aggregate_merge_scalar_overwrites_subdoc(client: MongoClient) -> None:
     assert doc == {"_id": 1, "addr": "just a string"}
 
 
+def test_aggregate_merge_when_matched_delete(client: MongoClient) -> None:
+    db = client["merge_delete_db"]
+    db["src"].insert_many([{"_id": 1}, {"_id": 2}])
+    db["dst"].insert_many([{"_id": 1, "tag": "x"}, {"_id": 3, "tag": "untouched"}])
+    list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": "delete"}}]))
+    remaining = sorted(db["dst"].find(), key=lambda d: d["_id"])
+    assert remaining == [{"_id": 3, "tag": "untouched"}]
+
+
+def test_aggregate_merge_when_matched_pipeline(client: MongoClient) -> None:
+    """Pipeline form runs per matched doc with $$new bound to the source."""
+    db = client["merge_pipeline_db"]
+    db["src"].insert_one({"_id": 1, "delta": 10})
+    db["dst"].insert_one({"_id": 1, "total": 5})
+    pipeline = [{"$addFields": {"total": {"$add": ["$total", "$$new.delta"]}}}]
+    list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": pipeline}}]))
+    [doc] = list(db["dst"].find())
+    assert doc == {"_id": 1, "total": 15}
+
+
+def test_aggregate_merge_pipeline_with_let_bindings(client: MongoClient) -> None:
+    """$merge let exposes user vars to the pipeline form."""
+    db = client["merge_let_db"]
+    db["src"].insert_one({"_id": 1, "qty": 3})
+    db["dst"].insert_one({"_id": 1, "price": 100})
+    list(
+        db["src"].aggregate(
+            [
+                {
+                    "$merge": {
+                        "into": "dst",
+                        "let": {"multiplier": "$qty"},
+                        "whenMatched": [
+                            {"$addFields": {"total": {"$multiply": ["$price", "$$multiplier"]}}}
+                        ],
+                    }
+                }
+            ]
+        )
+    )
+    [doc] = list(db["dst"].find())
+    assert doc == {"_id": 1, "price": 100, "total": 300}
+
+
+def test_aggregate_merge_when_not_matched_fail(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["merge_nm_fail_db"]
+    db["src"].insert_one({"_id": 1, "n": 7})
+    with pytest.raises(OperationFailure):
+        list(db["src"].aggregate([{"$merge": {"into": "dst", "whenNotMatched": "fail"}}]))
+
+
+def test_aggregate_merge_on_non_id_requires_unique_index(client: MongoClient) -> None:
+    """Without a unique index on the on field, $merge must refuse."""
+    from pymongo.errors import OperationFailure
+
+    db = client["merge_nounique_db"]
+    db["src"].insert_one({"_id": 1, "k": "alpha", "n": 1})
+    db["dst"].insert_one({"_id": 9, "k": "alpha", "n": 99})
+    with pytest.raises(OperationFailure):
+        list(db["src"].aggregate([{"$merge": {"into": "dst", "on": "k"}}]))
+
+
+def test_aggregate_merge_on_non_id_with_unique_index(client: MongoClient) -> None:
+    db = client["merge_unique_db"]
+    db["src"].insert_one({"_id": 1, "k": "alpha", "n": 1})
+    db["dst"].insert_one({"_id": 9, "k": "alpha", "n": 99})
+    db["dst"].create_index("k", unique=True)
+    list(db["src"].aggregate([{"$merge": {"into": "dst", "on": "k"}}]))
+    [doc] = list(db["dst"].find())
+    # Matched on k="alpha" → existing doc gets shallow-merged with source.
+    # _id of the matched doc is preserved.
+    assert doc == {"_id": 9, "k": "alpha", "n": 1}
+
+
+def test_aggregate_merge_cross_database(client: MongoClient) -> None:
+    src_db = client["merge_xdb_src"]
+    dst_db = client["merge_xdb_dst"]
+    src_db["coll"].insert_one({"_id": 1, "v": 42})
+    list(
+        src_db["coll"].aggregate([{"$merge": {"into": {"db": "merge_xdb_dst", "coll": "target"}}}])
+    )
+    [doc] = list(dst_db["target"].find())
+    assert doc == {"_id": 1, "v": 42}
+
+
+def test_aggregate_merge_rejects_unknown_when_matched(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["merge_bad_wm_db"]
+    db["src"].insert_one({"_id": 1})
+    with pytest.raises(OperationFailure):
+        list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": "nonsense"}}]))
+
+
 def test_positional_all_via_pymongo(coll) -> None:
     coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 2}, {"qty": 3}]})
     coll.update_one({"_id": 1}, {"$set": {"items.$[].qty": 0}})

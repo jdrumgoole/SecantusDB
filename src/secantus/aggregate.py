@@ -986,16 +986,50 @@ def _deep_merge_docs(existing: Mapping[str, Any], new: Mapping[str, Any]) -> dic
     return result
 
 
+_VALID_WHEN_MATCHED_STRINGS = frozenset(("merge", "replace", "keepExisting", "fail", "delete"))
+_VALID_WHEN_NOT_MATCHED = frozenset(("insert", "discard", "fail"))
+
+
+def _validate_on_field_index(
+    ctx: PipelineContext,
+    target_db: str,
+    target_coll: str,
+    on_fields: list[str],
+) -> None:
+    """``$merge`` requires a unique index on the ``on`` fields.
+
+    ``_id`` is implicitly unique and needs no explicit index. For any
+    other field combination, real mongod refuses the command unless
+    there's a ``unique: true`` index whose keys exactly match the
+    ``on`` field set. Mismatching this guard lets non-unique ``on``
+    fields silently collapse multiple targets onto one source doc.
+    """
+    if on_fields == ["_id"]:
+        return
+    assert ctx.storage is not None
+    target_set = set(on_fields)
+    for ix in ctx.storage.list_indexes(target_db, target_coll):
+        if not ix.get("unique"):
+            continue
+        key = ix.get("key") or {}
+        if set(key.keys()) == target_set:
+            return
+    raise AggregateError(
+        f"$merge requires a unique index covering {on_fields!r} on {target_db}.{target_coll}"
+    )
+
+
 def _stage_merge(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if ctx.storage is None:
         raise AggregateError("$merge requires storage context")
+    let_spec: Mapping[str, Any] = {}
     if isinstance(spec, str):
         target_db, target_coll = ctx.db_name, spec
         on_fields: list[str] = ["_id"]
-        when_matched = "merge"
-        when_not_matched = "insert"
+        when_matched: Any = "merge"
+        when_not_matched: str = "insert"
     elif isinstance(spec, Mapping):
         into = spec.get("into")
         if isinstance(into, str):
@@ -1011,13 +1045,31 @@ def _stage_merge(
         on_fields = [on] if isinstance(on, str) else list(on)
         when_matched = spec.get("whenMatched", "merge")
         when_not_matched = spec.get("whenNotMatched", "insert")
+        let_spec = spec.get("let") or {}
+        if not isinstance(let_spec, Mapping):
+            raise AggregateError("$merge let must be an object")
     else:
         raise AggregateError("$merge requires a string or document spec")
+
+    if isinstance(when_matched, str) and when_matched not in _VALID_WHEN_MATCHED_STRINGS:
+        raise AggregateError(
+            f"$merge whenMatched must be one of {sorted(_VALID_WHEN_MATCHED_STRINGS)} "
+            "or a pipeline array"
+        )
+    if not isinstance(when_matched, (str, list)):
+        raise AggregateError("$merge whenMatched must be a string or pipeline array")
+    if when_not_matched not in _VALID_WHEN_NOT_MATCHED:
+        raise AggregateError(
+            f"$merge whenNotMatched must be one of {sorted(_VALID_WHEN_NOT_MATCHED)}"
+        )
+
+    _validate_on_field_index(ctx, target_db, target_coll, on_fields)
 
     for doc in docs:
         match_filter = {f: get_path(doc, f) for f in on_fields}
         existing = ctx.storage.find_matching(target_db, target_coll, match_filter, limit=1)
         if existing:
+            existing_doc = existing[0]
             if when_matched == "fail":
                 # Real mongod raises a duplicate-key style error (code
                 # 11000) with ``keyPattern`` and ``keyValue`` so drivers
@@ -1035,19 +1087,47 @@ def _stage_merge(
                 )
             if when_matched == "keepExisting":
                 continue
+            if when_matched == "delete":
+                ctx.storage.delete_matching(
+                    target_db, target_coll, {"_id": existing_doc["_id"]}, limit=1
+                )
+                continue
             if when_matched == "replace":
                 ctx.storage.delete_matching(
-                    target_db, target_coll, {"_id": existing[0]["_id"]}, limit=1
+                    target_db, target_coll, {"_id": existing_doc["_id"]}, limit=1
                 )
                 new = copy.deepcopy(doc)
-                new.setdefault("_id", existing[0]["_id"])
+                new.setdefault("_id", existing_doc["_id"])
                 ctx.storage.insert(target_db, target_coll, [new])
-            else:  # default "merge"
-                merged = _deep_merge_docs(existing[0], doc)
-                merged["_id"] = existing[0]["_id"]
-                ctx.storage.update_matching(
-                    target_db, target_coll, {"_id": existing[0]["_id"]}, merged
+                continue
+            if isinstance(when_matched, list):
+                # Pipeline form: run the sub-pipeline against the matched
+                # doc with ``$$new`` bound to the source doc and any user
+                # ``let`` vars threaded through. The output's first doc
+                # replaces the target (preserving ``_id``); mongod
+                # requires the pipeline to yield exactly one doc.
+                bound: dict[str, Any] = {"new": copy.deepcopy(doc)}
+                for name, expr in let_spec.items():
+                    bound[name] = evaluate(expr, doc, ctx.vars)
+                sub_ctx = ctx.with_vars(bound)
+                result_docs = apply_pipeline(
+                    [copy.deepcopy(existing_doc)], list(when_matched), sub_ctx
                 )
+                if not result_docs:
+                    raise AggregateError("$merge whenMatched pipeline must yield a document")
+                replacement = result_docs[0]
+                replacement["_id"] = existing_doc["_id"]
+                ctx.storage.delete_matching(
+                    target_db, target_coll, {"_id": existing_doc["_id"]}, limit=1
+                )
+                ctx.storage.insert(target_db, target_coll, [replacement])
+                continue
+            # default: deep merge
+            merged = _deep_merge_docs(existing_doc, doc)
+            merged["_id"] = existing_doc["_id"]
+            ctx.storage.update_matching(
+                target_db, target_coll, {"_id": existing_doc["_id"]}, merged
+            )
         else:
             if when_not_matched == "fail":
                 raise AggregateError("$merge whenNotMatched=fail and no match exists")
