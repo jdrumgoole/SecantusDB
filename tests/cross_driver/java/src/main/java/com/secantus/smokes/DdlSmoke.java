@@ -42,7 +42,9 @@ public final class DdlSmoke {
             coll.drop();
             coll.insertOne(new Document("_id", 1));
 
-            ChangeStreamIterable<Document> stream = coll.watch().maxAwaitTime(2, TimeUnit.SECONDS);
+            ChangeStreamIterable<Document> stream = coll.watch()
+                .maxAwaitTime(2, TimeUnit.SECONDS)
+                .showExpandedEvents(true);
             List<String> events = new ArrayList<>();
 
             // Drain the change stream on a background thread; the main

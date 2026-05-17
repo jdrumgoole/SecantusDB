@@ -2996,6 +2996,7 @@ def _aggregate_change_stream(
                     storage=storage,
                     full_document_mode=cs_spec.full_document_mode,
                     full_document_before_change_mode=cs_spec.full_document_before_change_mode,
+                    show_expanded_events=cs_spec.show_expanded_events,
                     scope=scope,
                 )
             except changestreams.ChangeStreamFatalError as exc:

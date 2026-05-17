@@ -191,13 +191,23 @@ def project(
     full_document_mode: str = FULL_DOC_DEFAULT,
     full_document_before_change_mode: str = FULL_DOC_DEFAULT,
     scope: Mapping[str, Any],
+    show_expanded_events: bool = False,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Return ``(event, invalidates_after)`` for an oplog row.
 
     ``event`` is None if the row is not surfaced through change streams
-    (e.g. ``createIndexes``/``dropIndexes`` in v1, or scope mismatches).
-    ``invalidates_after`` is True if the cursor should produce one final
-    invalidate event after this one (drop on a watched collection, etc.).
+    (scope mismatch, or an "expanded" DDL event when the user did NOT
+    pass ``showExpandedEvents: true``). ``invalidates_after`` is True
+    if the cursor should produce one final invalidate event after this
+    one (drop on a watched collection, etc.).
+
+    ``show_expanded_events`` is a mongod 6.0+ opt-in: when False (the
+    default, matching mongod), ``createIndexes`` / ``dropIndexes`` /
+    ``modify`` / ``shardCollection`` / ``reshardCollection`` /
+    ``refineCollectionShardKey`` events are suppressed. Drop /
+    dropDatabase / rename surface unconditionally — they're the
+    invalidation triggers the v1 spec requires and have always been
+    "non-expanded" events.
     """
     op = str(oplog_entry.get("op", ""))
     ns = str(oplog_entry.get("ns", ""))
@@ -311,6 +321,8 @@ def project(
             invalidates = scope.get("kind") == "coll"
             return event, invalidates
         if "createIndexes" in cmd:
+            if not show_expanded_events:
+                return None, False
             affected_ns = f"{cmd_db}.{cmd['createIndexes']}"
             if not _scope_matches(affected_ns, scope):
                 return None, False
@@ -345,6 +357,8 @@ def project(
                 event["wallTime"] = wall
             return event, False
         if "dropIndexes" in cmd:
+            if not show_expanded_events:
+                return None, False
             affected_ns = f"{cmd_db}.{cmd['dropIndexes']}"
             if not _scope_matches(affected_ns, scope):
                 return None, False
@@ -399,6 +413,7 @@ class ChangeStreamSpec:
     start_after: dict[str, Any] | None = None
     start_at_operation_time: Timestamp | None = None
     split_large_events: bool = False
+    show_expanded_events: bool = False
 
 
 def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
@@ -417,6 +432,8 @@ def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
         out.start_at_operation_time = spec["startAtOperationTime"]
     if bool(spec.get("splitLargeChangeStreamEvents")):
         out.split_large_events = True
+    if bool(spec.get("showExpandedEvents")):
+        out.show_expanded_events = True
     return out
 
 

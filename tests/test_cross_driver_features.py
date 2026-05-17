@@ -545,7 +545,7 @@ const coll = db.getSiblingDB("ddl_xd").c;
 coll.drop();
 coll.insertOne({ _id: 1 });
 
-const cs = coll.watch([], { maxAwaitTimeMS: 2000 });
+const cs = coll.watch([], { maxAwaitTimeMS: 2000, showExpandedEvents: true });
 sleep(300);
 
 coll.createIndex({ x: 1 });
