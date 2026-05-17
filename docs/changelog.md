@@ -88,6 +88,12 @@ varied run-to-run.
   UI Kill button is functional.
 - Closes backlog entry `showExpandedEvents — accepted, ignored`.
 - Closes backlog entry `Admin UI /oplog page`.
+- `updateDescription.truncatedArrays` now emits for any array
+  shrink (not just strict head-prefix), with indexed ``updatedFields``
+  for kept-prefix changes — matches mongod's $v:2 in-place diff
+  rather than wholesale-replacing on any reshape. Same-length-with-
+  changes arrays also produce indexed ``arr.<i>`` updates now
+  (previously wholesale). Closes the §3.2 backlog entry.
 
 ## [0.5.1b17] — 2026-05-17
 
