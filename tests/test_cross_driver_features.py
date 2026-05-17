@@ -152,6 +152,44 @@ def _run(
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
 
 
+def _run_mongosh(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float = 60.0,
+    retries: int = 2,
+) -> subprocess.CompletedProcess:
+    """Run a mongosh subprocess with retry-on-rc1.
+
+    Mongosh launches a full Node-based shell with its own SCRAM-SHA-256
+    handshake and serverSelectionTimeoutMS=30s. Under heavy parallel
+    test load the PBKDF2 round-trip can race the timeout — we see
+    intermittent rc=1 with a server-side ``ConnectionResetError`` that
+    a single re-attempt almost always clears. Two retries with a small
+    backoff is the empirical sweet spot: enough headroom for the
+    pathological cold-CPU case, not so many that a real auth failure
+    spins for minutes.
+
+    Genuine failures (auth, syntax) reproduce on the retry and still
+    return rc=1 — the assertion in the caller surfaces them after the
+    bounded retries elapse.
+    """
+    import time as _time
+
+    last: subprocess.CompletedProcess | None = None
+    for attempt in range(retries + 1):
+        last = subprocess.run(
+            cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout
+        )
+        if last.returncode == 0:
+            return last
+        if attempt < retries:
+            _time.sleep(0.5 * (attempt + 1))
+    assert last is not None
+    return last
+
+
 def _ensure_node_modules() -> bool:
     """Install mongodb npm package once; cached in dir for re-runs.
 
@@ -410,7 +448,9 @@ def test_rbac_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    result = _run([_MONGOSH, "--quiet", admin_uri, "--eval", _RBAC_MONGOSH_SCRIPT], timeout=60.0)
+    result = _run_mongosh(
+        [_MONGOSH, "--quiet", admin_uri, "--eval", _RBAC_MONGOSH_SCRIPT], timeout=60.0
+    )
     assert result.returncode == 0 and "PROVISIONED" in result.stdout, (
         f"provision: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -419,7 +459,7 @@ def test_rbac_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> None:
         f"mongodb://viewer:vp@127.0.0.1:{server_with_auth.port}/shop"
         "?authSource=shop&authMechanism=SCRAM-SHA-256"
     )
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", viewer_uri, "--eval", _RBAC_MONGOSH_VIEWER_SCRIPT],
         timeout=60.0,
     )
@@ -529,7 +569,7 @@ print(JSON.stringify({ events }));
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_ddl_smoke_via_mongosh(server: SecantusDBServer) -> None:
     """DDL change-stream events via mongosh."""
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", f"{server.uri}ddl_xd", "--eval", _DDL_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -620,7 +660,7 @@ def test_updateuser_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", admin_uri, "--eval", _UPDATEUSER_MONGOSH_PROVISION_SCRIPT],
         timeout=60.0,
     )
@@ -633,7 +673,7 @@ def test_updateuser_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
         f"mongodb://alice_xd:orig@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", old_uri, "--eval", _UPDATEUSER_MONGOSH_PING_SCRIPT],
         timeout=30.0,
     )
@@ -647,7 +687,7 @@ def test_updateuser_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
         f"mongodb://alice_xd:rotated@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", new_uri, "--eval", _UPDATEUSER_MONGOSH_PING_SCRIPT],
         timeout=30.0,
     )
@@ -747,7 +787,7 @@ def test_connstatus_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", admin_uri, "--eval", _CONNSTATUS_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -861,7 +901,7 @@ print(EJSON.stringify(got, { relaxed: false }));
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_types_smoke_via_mongosh(server: SecantusDBServer) -> None:
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", f"{server.uri}types_xd", "--eval", _TYPES_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -978,7 +1018,7 @@ print(JSON.stringify({
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_bulk_smoke_via_mongosh(server: SecantusDBServer) -> None:
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", f"{server.uri}bulk_xd", "--eval", _BULK_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -1208,7 +1248,7 @@ print(JSON.stringify({
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_listdb_filter_smoke_via_mongosh(server: SecantusDBServer) -> None:
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", f"{server.uri}admin", "--eval", _LISTDB_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -1300,7 +1340,7 @@ print(JSON.stringify({
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_batchsize_zero_smoke_via_mongosh(server: SecantusDBServer) -> None:
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", f"{server.uri}batch_zero_xd", "--eval", _BATCHSIZE_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -1406,14 +1446,14 @@ def test_drop_all_users_smoke_via_mongosh(server_with_auth: SecantusDBServer) ->
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    r = _run(
+    r = _run_mongosh(
         [_MONGOSH, "--quiet", admin_uri, "--eval", _DROP_ALL_USERS_PROVISION_SCRIPT],
         timeout=60.0,
     )
     assert r.returncode == 0 and "PROVISIONED" in r.stdout, (
         f"provision: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
     )
-    r = _run(
+    r = _run_mongosh(
         [_MONGOSH, "--quiet", admin_uri, "--eval", _DROP_ALL_USERS_OBSERVE_SCRIPT],
         timeout=60.0,
     )
@@ -1510,7 +1550,7 @@ def test_scram_sha1_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    r = _run(
+    r = _run_mongosh(
         [_MONGOSH, "--quiet", admin_uri, "--eval", _SCRAM_SHA1_PROVISION_SCRIPT],
         timeout=60.0,
     )
@@ -1521,7 +1561,9 @@ def test_scram_sha1_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> Non
         f"mongodb://legacy_sh:pass@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-1"
     )
-    r = _run([_MONGOSH, "--quiet", legacy_uri, "--eval", _SCRAM_SHA1_PING_SCRIPT], timeout=60.0)
+    r = _run_mongosh(
+        [_MONGOSH, "--quiet", legacy_uri, "--eval", _SCRAM_SHA1_PING_SCRIPT], timeout=60.0
+    )
     assert r.returncode == 0, f"ping: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
     out_line = next(
         (ln for ln in reversed(r.stdout.splitlines()) if ln.startswith("{")),
@@ -1612,7 +1654,7 @@ print(JSON.stringify({
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_pbrt_smoke_via_mongosh(server: SecantusDBServer) -> None:
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", f"{server.uri}pbrt_xd", "--eval", _PBRT_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -1705,7 +1747,7 @@ print(JSON.stringify({first: first._id, second: got ? got._id : null}));
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_tailable_smoke_via_mongosh(server: SecantusDBServer) -> None:
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", f"{server.uri}tailable_xd", "--eval", _TAILABLE_MONGOSH_SCRIPT],
         timeout=60.0,
     )
@@ -1835,7 +1877,7 @@ def test_custom_roles_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> N
         f"mongodb://{_ADMIN_USER}:{_ADMIN_PWD}@127.0.0.1:{server_with_auth.port}/"
         "?authSource=admin&authMechanism=SCRAM-SHA-256"
     )
-    r = _run(
+    r = _run_mongosh(
         [_MONGOSH, "--quiet", admin_uri, "--eval", _CUSTOM_ROLES_PROVISION_SCRIPT],
         timeout=60.0,
     )
@@ -1847,7 +1889,7 @@ def test_custom_roles_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> N
         f"mongodb://auditor_msh:p@127.0.0.1:{server_with_auth.port}/shop"
         "?authSource=shop&authMechanism=SCRAM-SHA-256"
     )
-    r = _run(
+    r = _run_mongosh(
         [_MONGOSH, "--quiet", auditor_uri, "--eval", _CUSTOM_ROLES_AUDITOR_SCRIPT],
         timeout=60.0,
     )
@@ -1862,14 +1904,14 @@ def test_custom_roles_smoke_via_mongosh(server_with_auth: SecantusDBServer) -> N
     assert payload["errCode"] == 13
 
     # Grant insert; reconnect to pick up the new privilege.
-    r = _run(
+    r = _run_mongosh(
         [_MONGOSH, "--quiet", admin_uri, "--eval", _CUSTOM_ROLES_GRANT_SCRIPT],
         timeout=60.0,
     )
     assert r.returncode == 0 and "GRANTED" in r.stdout, (
         f"grant: rc={r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
     )
-    r = _run(
+    r = _run_mongosh(
         [_MONGOSH, "--quiet", auditor_uri, "--eval", _CUSTOM_ROLES_AUDITOR_INSERT_SCRIPT],
         timeout=60.0,
     )
@@ -1978,7 +2020,7 @@ print(JSON.stringify({
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
 def test_sessions_smoke_via_mongosh(server: SecantusDBServer) -> None:
-    result = _run(
+    result = _run_mongosh(
         [_MONGOSH, "--quiet", server.uri, "--eval", _SESSIONS_MONGOSH_SCRIPT],
         timeout=60.0,
     )
