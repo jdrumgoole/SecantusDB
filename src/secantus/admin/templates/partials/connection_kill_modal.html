@@ -1,0 +1,51 @@
+<div
+  class="modal-overlay"
+  x-data="{ confirm: '' }"
+  x-init="setupModal($el)"
+  @click.self="closeModal()"
+  @keydown.escape.window="closeModal()"
+>
+  <div class="modal modal-narrow" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <header class="modal-header">
+      <h2 id="modal-title">Kill connection</h2>
+      <button
+        type="button"
+        class="modal-close"
+        aria-label="Close"
+        @click="closeModal()"
+      >×</button>
+    </header>
+    <div class="modal-body">
+      <p>
+        About to kill connection <code>{{ conn_id }}</code> from
+        <code>{{ client }}</code>. SecantusDB shuts the connection's
+        socket — any in-flight command finishes, the thread exits,
+        and the row vanishes on the next refresh.
+      </p>
+      <p>Type the conn_id <code>{{ conn_id }}</code> to confirm:</p>
+      <input
+        type="text"
+        class="confirm-input"
+        x-model="confirm"
+        autocomplete="off"
+        autofocus
+      />
+      <div class="modal-actions">
+        <button
+          type="button"
+          class="btn-secondary"
+          @click="closeModal()"
+        >Cancel</button>
+        <button
+          type="button"
+          class="btn-danger"
+          x-bind:disabled="confirm !== '{{ conn_id }}'"
+          hx-delete="/connections/{{ conn_id }}"
+          hx-target="#connections-tbody"
+          hx-swap="none"
+          hx-on::after-request="if(event.detail.successful) closeModal()"
+        >Kill connection</button>
+      </div>
+    </div>
+  </div>
+</div>

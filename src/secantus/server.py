@@ -202,7 +202,9 @@ class SecantusDBServer:
             handler.start()
 
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
-        connection_id = self.connections.open((addr[0], addr[1]))
+        # Register the socket alongside the conn_id so killOp can
+        # shut it down from another thread.
+        connection_id = self.connections.open((addr[0], addr[1]), sock=conn)
         reply_ids = itertools.count(1)
         connection_auth = ConnectionAuth()
         self.metrics.connection_opened()

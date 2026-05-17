@@ -2091,3 +2091,53 @@ def test_oplog_rs_create_index_rejected(client: MongoClient) -> None:
 
     with pytest.raises(OperationFailure):
         client["local"]["oplog.rs"].create_index("ns")
+
+
+# --- killOp -----------------------------------------------------------------
+
+
+def test_killop_unknown_opid_returns_ok(client: MongoClient) -> None:
+    # mongod's killOp is fire-and-forget — returns ok=1 even when the
+    # opid is unknown. We mirror that, surfacing what happened via
+    # the ``info`` field so admin tooling can confirm.
+    res = client.admin.command("killOp", op=999_999)
+    assert res["ok"] == 1.0
+    assert "no operation" in res["info"]
+
+
+def test_killop_known_opid_closes_connection(server) -> None:
+    """``killOp`` against a real opid shuts the connection's socket."""
+    from pymongo import MongoClient
+    from pymongo.errors import AutoReconnect, ConnectionFailure
+
+    victim = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        victim.admin.command("hello")  # force the handshake to land
+        admin = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            inprog = admin.admin.command("currentOp").get("inprog", []) or []
+            admin_addr = admin.address
+            victim_id: int | None = None
+            for r in inprog:
+                if r.get("type") != "op":
+                    continue
+                if r.get("client") == f"{admin_addr[0]}:{admin_addr[1]}":
+                    continue
+                victim_id = int(r["opid"])
+                break
+            assert victim_id is not None, f"could not locate victim conn in {inprog!r}"
+
+            res = admin.admin.command("killOp", op=victim_id)
+            assert res["ok"] == 1.0
+            assert "killed" in res["info"]
+
+            # The victim's pool sees the socket close on next use and
+            # raises AutoReconnect / ConnectionFailure on the first
+            # follow-up command (pymongo reconnects after that).
+            with pytest.raises((AutoReconnect, ConnectionFailure)):
+                for _ in range(3):
+                    victim.admin.command("hello")
+        finally:
+            admin.close()
+    finally:
+        victim.close()

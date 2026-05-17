@@ -108,6 +108,7 @@ A_HOST_INFO = "hostInfo"
 A_GET_CMD_LINE_OPTS = "getCmdLineOpts"
 A_GET_LOG = "getLog"
 A_INPROG = "inprog"
+A_KILLOP = "killop"
 A_FSYNC = "fsync"
 A_ENABLE_PROFILER = "enableProfiler"
 
@@ -216,13 +217,14 @@ _CLUSTER_ADMIN_EXTRA_ACTIONS: frozenset[str] = frozenset(
     {
         A_FSYNC,
         A_DROP_DATABASE,
+        A_KILLOP,
     }
 )
 
 # Back-compat alias: pre-bundle code referenced ``_CLUSTER_ACTIONS`` as
 # the union granted only by ``root``. Keep the name for the ``root``
 # spec definition below.
-_CLUSTER_ACTIONS: frozenset[str] = _CLUSTER_MONITOR_ACTIONS | frozenset({A_FSYNC})
+_CLUSTER_ACTIONS: frozenset[str] = _CLUSTER_MONITOR_ACTIONS | frozenset({A_FSYNC, A_KILLOP})
 
 
 class _RoleSpec:
