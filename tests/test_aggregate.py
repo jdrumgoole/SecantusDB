@@ -1003,3 +1003,203 @@ def test_lookup_pipeline_form_uses_index_when_available(tmp_path) -> None:
                 assert o["active_user"] == []
     finally:
         storage.close()
+
+
+# ----------------------------------------------------------------------
+# $fill (5.3+): replace missing / null fields in-place. Three modes:
+# {value: <expr>}, {method: "locf"}, {method: "linear"}, optionally
+# partitioned and sorted.
+
+
+def test_fill_value_replaces_missing_field() -> None:
+    docs = [{"_id": 1, "n": 5}, {"_id": 2}, {"_id": 3, "n": None}]
+    out = apply_pipeline(docs, [{"$fill": {"output": {"n": {"value": 0}}}}])
+    assert [d["n"] for d in out] == [5, 0, 0]
+
+
+def test_fill_value_leaves_explicit_zero_alone() -> None:
+    """Only missing / null trigger the fill — explicit 0, False, "" are kept."""
+    docs = [{"_id": 1, "n": 0}, {"_id": 2, "n": False}, {"_id": 3, "n": ""}]
+    out = apply_pipeline(docs, [{"$fill": {"output": {"n": {"value": 99}}}}])
+    assert [d["n"] for d in out] == [0, False, ""]
+
+
+def test_fill_value_expression_evaluated_per_doc() -> None:
+    """value: <expr> can reference other fields of the current doc."""
+    docs = [{"_id": 1, "x": 10}, {"_id": 2, "x": 20}, {"_id": 3, "x": 30, "n": 7}]
+    out = apply_pipeline(docs, [{"$fill": {"output": {"n": {"value": "$x"}}}}])
+    assert [d["n"] for d in out] == [10, 20, 7]
+
+
+def test_fill_locf_carries_last_observation_forward() -> None:
+    docs = [
+        {"_id": 1, "t": 1, "v": 10},
+        {"_id": 2, "t": 2},
+        {"_id": 3, "t": 3, "v": None},
+        {"_id": 4, "t": 4, "v": 20},
+        {"_id": 5, "t": 5},
+    ]
+    out = apply_pipeline(
+        docs,
+        [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "locf"}}}}],
+    )
+    assert [d["v"] for d in out] == [10, 10, 10, 20, 20]
+
+
+def test_fill_locf_leading_nulls_stay_null() -> None:
+    """LOCF can't fill before the first observed value — leaves nulls."""
+    docs = [
+        {"_id": 1, "t": 1},
+        {"_id": 2, "t": 2},
+        {"_id": 3, "t": 3, "v": 100},
+        {"_id": 4, "t": 4},
+    ]
+    out = apply_pipeline(
+        docs,
+        [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "locf"}}}}],
+    )
+    assert [d.get("v") for d in out] == [None, None, 100, 100]
+
+
+def test_fill_linear_interpolates_between_anchors() -> None:
+    docs = [
+        {"_id": 1, "t": 0, "v": 10},
+        {"_id": 2, "t": 1},
+        {"_id": 3, "t": 2},
+        {"_id": 4, "t": 3, "v": 40},
+    ]
+    out = apply_pipeline(
+        docs,
+        [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}],
+    )
+    assert [d["v"] for d in out] == [10, 20, 30, 40]
+
+
+def test_fill_linear_leaves_trailing_nulls() -> None:
+    """Linear needs two anchors; trailing nulls after the last anchor stay null."""
+    docs = [
+        {"_id": 1, "t": 0, "v": 10},
+        {"_id": 2, "t": 1, "v": 20},
+        {"_id": 3, "t": 2},
+        {"_id": 4, "t": 3},
+    ]
+    out = apply_pipeline(
+        docs,
+        [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}],
+    )
+    assert out[0]["v"] == 10
+    assert out[1]["v"] == 20
+    assert out[2].get("v") is None
+    assert out[3].get("v") is None
+
+
+def test_fill_partition_keeps_groups_independent() -> None:
+    """LOCF inside one partition doesn't leak across partitions."""
+    docs = [
+        {"_id": 1, "p": "a", "t": 1, "v": 1},
+        {"_id": 2, "p": "a", "t": 2},
+        {"_id": 3, "p": "b", "t": 1, "v": 100},
+        {"_id": 4, "p": "b", "t": 2},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$fill": {
+                    "partitionByFields": ["p"],
+                    "sortBy": {"t": 1},
+                    "output": {"v": {"method": "locf"}},
+                }
+            }
+        ],
+    )
+    by_id = {d["_id"]: d for d in out}
+    assert by_id[1]["v"] == 1
+    assert by_id[2]["v"] == 1
+    assert by_id[3]["v"] == 100
+    assert by_id[4]["v"] == 100
+
+
+def test_fill_method_without_sortby_rejected() -> None:
+    docs = [{"_id": 1, "v": 1}, {"_id": 2}]
+    with pytest.raises(AggregateError):
+        apply_pipeline(docs, [{"$fill": {"output": {"v": {"method": "locf"}}}}])
+
+
+def test_fill_rejects_partitionby_and_partitionbyfields_together() -> None:
+    docs = [{"_id": 1, "v": 1}]
+    with pytest.raises(AggregateError):
+        apply_pipeline(
+            docs,
+            [
+                {
+                    "$fill": {
+                        "partitionBy": "$p",
+                        "partitionByFields": ["p"],
+                        "output": {"v": {"value": 0}},
+                    }
+                }
+            ],
+        )
+
+
+def test_fill_rejects_unknown_method() -> None:
+    docs = [{"_id": 1, "v": 1}]
+    with pytest.raises(AggregateError):
+        apply_pipeline(
+            docs,
+            [
+                {
+                    "$fill": {
+                        "sortBy": {"t": 1},
+                        "output": {"v": {"method": "bogus"}},
+                    }
+                }
+            ],
+        )
+
+
+def test_fill_value_and_method_combine_within_output() -> None:
+    """Multiple output fields can mix modes; locf needs sortBy, value doesn't."""
+    docs = [
+        {"_id": 1, "t": 1, "tag": "A", "n": 10},
+        {"_id": 2, "t": 2},
+        {"_id": 3, "t": 3, "tag": "C"},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$fill": {
+                    "sortBy": {"t": 1},
+                    "output": {
+                        "n": {"method": "locf"},
+                        "tag": {"value": "X"},
+                    },
+                }
+            }
+        ],
+    )
+    assert [(d["t"], d["n"], d["tag"]) for d in out] == [
+        (1, 10, "A"),
+        (2, 10, "X"),
+        (3, 10, "C"),
+    ]
+
+
+def test_fill_linear_dates_interpolate_via_timedelta() -> None:
+    """Date interpolation: timedelta arithmetic gives float / timedelta."""
+    import datetime as dt
+
+    base = dt.datetime(2026, 1, 1)
+    docs = [
+        {"_id": 1, "t": base, "v": 0},
+        {"_id": 2, "t": base + dt.timedelta(days=1)},
+        {"_id": 3, "t": base + dt.timedelta(days=2)},
+        {"_id": 4, "t": base + dt.timedelta(days=3), "v": 30},
+    ]
+    out = apply_pipeline(
+        docs,
+        [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}],
+    )
+    assert [d["v"] for d in out] == [0, 10, 20, 30]

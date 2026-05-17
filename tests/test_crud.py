@@ -1424,6 +1424,54 @@ def test_aggregate_merge_rejects_unknown_when_matched(client: MongoClient) -> No
         list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": "nonsense"}}]))
 
 
+def test_aggregate_fill_value_via_pymongo(client: MongoClient) -> None:
+    db = client["fill_value_xd"]
+    db["readings"].insert_many(
+        [{"_id": 1, "v": 10}, {"_id": 2}, {"_id": 3, "v": None}, {"_id": 4, "v": 30}]
+    )
+    out = sorted(
+        db["readings"].aggregate([{"$fill": {"output": {"v": {"value": 0}}}}]),
+        key=lambda d: d["_id"],
+    )
+    assert [d["v"] for d in out] == [10, 0, 0, 30]
+
+
+def test_aggregate_fill_locf_via_pymongo(client: MongoClient) -> None:
+    db = client["fill_locf_xd"]
+    db["readings"].insert_many(
+        [
+            {"_id": 1, "t": 1, "v": 10},
+            {"_id": 2, "t": 2},
+            {"_id": 3, "t": 3, "v": 30},
+            {"_id": 4, "t": 4},
+        ]
+    )
+    out = list(
+        db["readings"].aggregate(
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "locf"}}}}]
+        )
+    )
+    assert [(d["t"], d["v"]) for d in out] == [(1, 10), (2, 10), (3, 30), (4, 30)]
+
+
+def test_aggregate_fill_linear_via_pymongo(client: MongoClient) -> None:
+    db = client["fill_linear_xd"]
+    db["readings"].insert_many(
+        [
+            {"_id": 1, "t": 0, "v": 0},
+            {"_id": 2, "t": 1},
+            {"_id": 3, "t": 2},
+            {"_id": 4, "t": 4, "v": 40},
+        ]
+    )
+    out = list(
+        db["readings"].aggregate(
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}]
+        )
+    )
+    assert [(d["t"], d["v"]) for d in out] == [(0, 0), (1, 10), (2, 20), (4, 40)]
+
+
 def test_positional_all_via_pymongo(coll) -> None:
     coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 2}, {"qty": 3}]})
     coll.update_one({"_id": 1}, {"$set": {"items.$[].qty": 0}})

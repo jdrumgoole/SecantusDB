@@ -426,6 +426,167 @@ def _stage_unwind(
     return result
 
 
+def _field_is_filled(doc: Mapping[str, Any], path: str) -> bool:
+    """``$fill`` semantics for "this field already has a value": the path
+    resolves and the leaf is neither ``None`` nor a missing key. Matches
+    mongod's ``null``-vs-missing collapse — both count as "needs filling".
+    """
+    parts = path.split(".")
+    cur: Any = doc
+    for p in parts:
+        if not isinstance(cur, Mapping) or p not in cur:
+            return False
+        cur = cur[p]
+    return cur is not None
+
+
+def _apply_locf(part: list[dict[str, Any]], field: str) -> None:
+    """Last-observation-carried-forward within a single sorted partition.
+
+    Leading nulls before the first observed value stay null (mongod does
+    the same — there's nothing to carry forward from).
+    """
+    last: Any = None
+    have = False
+    for doc in part:
+        v = get_path(doc, field)
+        if v is not None:
+            last = v
+            have = True
+        elif have:
+            set_path(doc, field, copy.deepcopy(last))
+
+
+def _apply_linear(part: list[dict[str, Any]], field: str, sort_field: str) -> None:
+    """Linear interpolation along ``sort_field`` between non-null anchors.
+
+    Values strictly between two anchors get interpolated. Leading /
+    trailing nulls (before the first or after the last anchor) stay
+    null because there's nothing to bracket with. Works for numbers
+    and datetimes — date arithmetic gives ``timedelta`` which divides
+    cleanly to ``float`` and multiplies back to ``timedelta``.
+    """
+    anchor_indices = [i for i, d in enumerate(part) if get_path(d, field) is not None]
+    if len(anchor_indices) < 2:
+        return
+    for ai, bi in zip(anchor_indices, anchor_indices[1:], strict=True):
+        ya = get_path(part[ai], field)
+        yb = get_path(part[bi], field)
+        xa = get_path(part[ai], sort_field)
+        xb = get_path(part[bi], sort_field)
+        if xa is None or xb is None or xa == xb:
+            continue
+        span = xb - xa
+        for i in range(ai + 1, bi):
+            x = get_path(part[i], sort_field)
+            if x is None or get_path(part[i], field) is not None:
+                continue
+            frac = (x - xa) / span
+            set_path(part[i], field, ya + (yb - ya) * frac)
+
+
+def _stage_fill(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$fill`` (5.3+): fill missing / null fields by value, locf, or linear.
+
+    Per-partition (``partitionBy`` or ``partitionByFields``), optionally
+    sorted by ``sortBy``. ``output: {<field>: {value: <expr>} |
+    {method: "locf" | "linear"}}``. ``method`` requires ``sortBy``.
+    Documents are returned in partition-discovery order, with each
+    partition in its sortBy order (if any) — matches mongod.
+    """
+    from secantus.storage import sort_docs
+
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$fill requires a document spec")
+    output = spec.get("output")
+    if not isinstance(output, Mapping) or not output:
+        raise AggregateError("$fill requires a non-empty output object")
+
+    fillers: list[tuple[str, str, Any]] = []
+    for field, action in output.items():
+        if not isinstance(action, Mapping):
+            raise AggregateError(f"$fill output.{field} must be a document")
+        if "value" in action:
+            fillers.append(("value", field, action["value"]))
+        elif "method" in action:
+            method = action["method"]
+            if method not in ("locf", "linear"):
+                raise AggregateError(f"$fill output.{field}.method must be 'locf' or 'linear'")
+            fillers.append((method, field, None))
+        else:
+            raise AggregateError(f"$fill output.{field} requires value or method")
+
+    has_method = any(kind in ("locf", "linear") for kind, _, _ in fillers)
+    sort_by = spec.get("sortBy")
+    if has_method and not isinstance(sort_by, Mapping):
+        raise AggregateError("$fill requires sortBy when using method")
+    if sort_by is not None and not isinstance(sort_by, Mapping):
+        raise AggregateError("$fill sortBy must be a document")
+
+    partition_by_fields = spec.get("partitionByFields")
+    partition_by = spec.get("partitionBy")
+    if partition_by is not None and partition_by_fields is not None:
+        raise AggregateError("$fill cannot use both partitionBy and partitionByFields")
+
+    if partition_by_fields is not None:
+        if not isinstance(partition_by_fields, list):
+            raise AggregateError("$fill partitionByFields must be an array")
+        fields = list(partition_by_fields)
+
+        def part_key(d: Mapping[str, Any]) -> Any:
+            return tuple(get_path(d, f) for f in fields)
+    elif partition_by is not None:
+
+        def part_key(d: Mapping[str, Any]) -> Any:
+            v = evaluate(partition_by, d, ctx.vars)
+            try:
+                hash(v)
+                return v
+            except TypeError:
+                # Fall back to a JSON-stable repr for unhashable values
+                # (dicts / lists). Good enough for partition identity.
+                return repr(v)
+    else:
+
+        def part_key(d: Mapping[str, Any]) -> Any:
+            return None
+
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    group_order: list[Any] = []
+    for d in docs:
+        key = part_key(d)
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(d)
+
+    sort_field: str | None = None
+    if isinstance(sort_by, Mapping) and sort_by:
+        sort_field = next(iter(sort_by.keys()))
+        for key in groups:
+            groups[key] = sort_docs(groups[key], sort_by)
+
+    for key in groups:
+        part = groups[key]
+        for kind, field, payload in fillers:
+            if kind == "value":
+                for d in part:
+                    if not _field_is_filled(d, field):
+                        set_path(d, field, evaluate(payload, d, ctx.vars))
+            elif kind == "locf":
+                _apply_locf(part, field)
+            elif kind == "linear":
+                assert sort_field is not None  # guarded above
+                _apply_linear(part, field, sort_field)
+
+    out: list[dict[str, Any]] = []
+    for key in group_order:
+        out.extend(groups[key])
+    return out
+
+
 def _stage_replace_root(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1512,6 +1673,7 @@ _STAGES = {
     "$unset": _stage_unset,
     "$unwind": _stage_unwind,
     "$densify": _stage_densify,
+    "$fill": _stage_fill,
     "$replaceRoot": _stage_replace_root,
     "$replaceWith": _stage_replace_with,
     "$group": _stage_group,
