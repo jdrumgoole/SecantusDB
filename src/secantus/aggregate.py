@@ -469,7 +469,9 @@ def _apply_linear(part: list[dict[str, Any]], field: str, sort_field: str) -> No
     anchor_indices = [i for i, d in enumerate(part) if get_path(d, field) is not None]
     if len(anchor_indices) < 2:
         return
-    for ai, bi in zip(anchor_indices, anchor_indices[1:], strict=True):
+    # Adjacent-pairs zip — lengths intentionally differ by 1, hence
+    # ``strict=False``. Linter wants strict explicitly stated either way.
+    for ai, bi in zip(anchor_indices, anchor_indices[1:], strict=False):
         ya = get_path(part[ai], field)
         yb = get_path(part[bi], field)
         xa = get_path(part[ai], sort_field)
