@@ -127,9 +127,21 @@ body {
   padding-bottom: 0.5rem;
 }
 
-.sidebar nav li a.nav-disabled {
-  color: var(--muted);
-  pointer-events: none;
+/* Visual separator above the first item of the operational-state
+ * group (Change stream / Connections / Cursors / Profiler / Maintenance
+ * / Logs / Backup). Separates per-target data pages above from
+ * runtime / observability pages below. */
+.sidebar nav li.nav-ops-start {
+  border-top: 1px solid var(--border);
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+}
+
+/* Sub-nav indent for child pages reached via a parent (Roles under
+ * Users today). Keeps the parent/child relationship visible. */
+.sidebar nav li.nav-sub a {
+  padding-left: calc(1.25rem + 0.75rem);
+  font-size: 0.95em;
 }
 
 .content {
@@ -183,10 +195,18 @@ body {
   letter-spacing: 0.02em;
 }
 
+/* CSS-drawn status dot used by the server badge and the embedded-
+ * server "running" indicator. Drawn rather than typographic so it's
+ * visually distinct from the brand mark (which keeps the ``●`` glyph
+ * at 1.5rem). Empty span: the ``::before`` doesn't matter, the
+ * element itself is the dot. */
 .server-badge-dot {
-  color: var(--accent);
-  font-size: 0.7rem;
-  line-height: 1;
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: 0.05em;
 }
 
 .server-badge code {
@@ -230,8 +250,49 @@ body {
   color: var(--muted);
 }
 
-.loading {
-  color: var(--muted);
+/* Alpine.js ``x-cloak`` — hides elements until Alpine has bound them,
+ * so pre-init markup doesn't briefly flash on first paint. Used on
+ * spinner spans inside buttons that toggle via ``x-show``.
+ */
+[x-cloak] {
+  display: none !important;
+}
+
+/* HTMX request indicator. Pattern: drop a ``<span class="spinner
+ * htmx-indicator"></span>`` inside any button or next to any form that
+ * fires a request you want to signal. ``.htmx-indicator`` defaults to
+ * hidden; htmx flips ``opacity`` to 1 by toggling the ``htmx-request``
+ * class on the triggering element while the request is in flight.
+ *
+ * Co-locating the spinner inside the trigger means a button still
+ * works exactly the same (htmx auto-disables it during the request),
+ * but the user sees a moving dot rather than a frozen page.
+ */
+.spinner {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  vertical-align: -0.15em;
+  animation: spinner-rotate 0.8s linear infinite;
+}
+
+.htmx-indicator {
+  opacity: 0;
+  transition: opacity 120ms ease-in;
+}
+
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+}
+
+@keyframes spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .error {
@@ -294,11 +355,6 @@ body {
   text-decoration: underline;
 }
 
-.data-table a.nav-disabled {
-  color: var(--muted);
-  pointer-events: none;
-}
-
 /* Breadcrumb above tables */
 
 .breadcrumb {
@@ -336,6 +392,11 @@ body {
   color: var(--muted);
 }
 
+.badge-error {
+  border-color: var(--error);
+  color: var(--error);
+}
+
 /* Collection viewer — filter form, docs table, pager */
 
 .filter-form {
@@ -348,7 +409,8 @@ body {
   gap: 0.75rem;
 }
 
-.filter-form label {
+.filter-form label,
+.filter-label {
   display: block;
   font-size: 0.78rem;
   text-transform: uppercase;
@@ -441,6 +503,9 @@ body {
 .pager {
   margin-top: 1rem;
   text-align: center;
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
 }
 
 .pager a {

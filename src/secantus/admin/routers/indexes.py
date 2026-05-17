@@ -30,6 +30,24 @@ def _templates(request: Request) -> Jinja2Templates:
     return t
 
 
+def _index_rows(request: Request, db: str, coll: str) -> tuple[list[dict[str, Any]], str | None]:
+    rows: list[dict[str, Any]] = []
+    try:
+        for ix in request.app.state.mongo.list_indexes(db, coll):
+            rows.append(
+                {
+                    "name": ix.get("name", ""),
+                    "key_str": _format_key_spec(ix.get("key") or {}),
+                    "key_raw": json_util.dumps(ix.get("key") or {}),
+                    "badges": _index_badges(ix),
+                    "droppable": ix.get("name") != "_id_",
+                }
+            )
+    except MongoError as exc:
+        return rows, str(exc)
+    return rows, None
+
+
 def _index_badges(idx: dict[str, Any]) -> list[str]:
     """Render the small flag badges shown on each index row.
 
@@ -76,22 +94,7 @@ def _format_key_spec(key: dict[str, Any]) -> str:
 
 @router.get("/db/{db}/{coll}/indexes", response_class=HTMLResponse)
 def indexes_page(request: Request, db: str, coll: str) -> HTMLResponse:
-    mongo = request.app.state.mongo
-    error: str | None = None
-    rows: list[dict[str, Any]] = []
-    try:
-        for ix in mongo.list_indexes(db, coll):
-            rows.append(
-                {
-                    "name": ix.get("name", ""),
-                    "key_str": _format_key_spec(ix.get("key") or {}),
-                    "key_raw": json_util.dumps(ix.get("key") or {}),
-                    "badges": _index_badges(ix),
-                    "droppable": ix.get("name") != "_id_",
-                }
-            )
-    except MongoError as exc:
-        error = str(exc)
+    rows, error = _index_rows(request, db, coll)
     templates = _templates(request)
     return templates.TemplateResponse(
         request,
@@ -104,6 +107,17 @@ def indexes_page(request: Request, db: str, coll: str) -> HTMLResponse:
             "rows": rows,
             "error": error,
         },
+    )
+
+
+@router.get("/db/{db}/{coll}/indexes/_rows", response_class=HTMLResponse)
+def indexes_rows(request: Request, db: str, coll: str) -> HTMLResponse:
+    rows, _ = _index_rows(request, db, coll)
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "partials/indexes_rows.html",
+        {"db_name": db, "coll_name": coll, "rows": rows},
     )
 
 
@@ -174,13 +188,16 @@ def create_index(
         )
     except MongoError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # HX-Redirect makes HTMX-aware browsers reload the page; for non-HTMX
-    # form posts the next request still lands on the same URL.
+    # ``HX-Trigger: indexes-changed`` fires an event on ``body`` that the
+    # indexes-page tbody listens for via ``hx-trigger="indexes-changed
+    # from:body"`` and uses to swap its rows in place — keeps the
+    # scroll position on long lists. ``Location`` is still set so a
+    # non-HTMX submit (rare) round-trips back to the page.
     return HTMLResponse(
         "",
-        status_code=303,
+        status_code=200,
         headers={
-            "HX-Redirect": f"/db/{db}/{coll}/indexes",
+            "HX-Trigger": "indexes-changed",
             "Location": f"/db/{db}/{coll}/indexes",
         },
     )
@@ -211,7 +228,7 @@ def drop_index(request: Request, db: str, coll: str, name: str) -> HTMLResponse:
         request.app.state.mongo.drop_index(db, coll, name)
     except MongoError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return HTMLResponse("", headers={"HX-Trigger": "index-dropped"})
+    return HTMLResponse("", headers={"HX-Trigger": "indexes-changed"})
 
 
 # ---- explain visualizer ---------------------------------------------------

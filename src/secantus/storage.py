@@ -846,6 +846,17 @@ class Storage:
 
     def get_collection_options(self, db: str, coll: str) -> dict[str, Any]:
         """Return the collection's options blob, or ``{}`` if absent."""
+        if self.enable_oplog and db == "local" and coll == "oplog.rs":
+            # Synthetic ``local.oplog.rs``: report the capped-collection
+            # shape mongod uses so $collStats / listCollections options
+            # match. ``size`` is a notional byte cap derived from the
+            # entry cap × a conservative per-entry estimate; we don't
+            # track real byte usage, only entry count.
+            return {
+                "capped": True,
+                "size": self.oplog_max_entries * 16 * 1024,
+                "max": self.oplog_max_entries,
+            }
         self._refresh_read_snapshot()
         with self._lock:
             opts = self._coll_options(db, coll) or {}
@@ -857,6 +868,88 @@ class Storage:
                 else:
                     decoded[k] = v
             return decoded
+
+    def _is_oplog_rs(self, db: str, coll: str) -> bool:
+        """``(local, oplog.rs)`` is the synthetic oplog view."""
+        return self.enable_oplog and db == "local" and coll == "oplog.rs"
+
+    def _scan_oplog_entries(self) -> list[dict[str, Any]]:
+        """Walk every persisted oplog entry and return the decoded docs.
+
+        Uses a private short-lived session so the read view always
+        reflects rows committed by writer threads on other connections
+        (same pattern as ``read_oplog``).
+        """
+        rows: list[dict[str, Any]] = []
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_OPLOG_TABLE, None)
+                try:
+                    rc = c.next()
+                    while rc == 0:
+                        blob = bytes(c.get_value())
+                        if blob:
+                            rows.append(bson.decode(blob))
+                        rc = c.next()
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+        return rows
+
+    def _find_oplog_rs(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        skip: int,
+        limit: int,
+        sort: Mapping[str, Any] | None,
+        projection: Mapping[str, Any] | None,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]]:
+        """Read path for the synthetic ``local.oplog.rs`` view.
+
+        Entries are walked in seq order (== ts order). Filter / sort /
+        skip / limit / projection are all honoured against the decoded
+        entry docs via the existing pure-Python helpers.
+        """
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._scan_oplog_entries()
+        if filter:
+            rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
+        if sort:
+            rows = sort_docs(rows, sort)
+        if skip:
+            rows = rows[skip:]
+        if limit > 0:
+            rows = rows[:limit]
+        if projection:
+            rows = [apply_projection(r, projection) for r in rows]
+        return rows
+
+    def _count_oplog_rs(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        if not filter:
+            return len(self._scan_oplog_entries())
+        return sum(
+            1
+            for r in self._scan_oplog_entries()
+            if matches(r, filter, vars=let, collation=collation_obj)
+        )
 
     def _emit_oplog(
         self,
@@ -1909,6 +2002,16 @@ class Storage:
         let: dict[str, Any] | None = None,
         collation: Any = None,
     ) -> list[dict[str, Any]]:
+        if self._is_oplog_rs(db, coll):
+            return self._find_oplog_rs(
+                filter,
+                skip=skip,
+                limit=limit,
+                sort=sort,
+                projection=projection,
+                let=let,
+                collation=collation,
+            )
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -2346,6 +2449,8 @@ class Storage:
         let: dict[str, Any] | None = None,
         collation: Any = None,
     ) -> int:
+        if self._is_oplog_rs(db, coll):
+            return self._count_oplog_rs(filter, let=let, collation=collation)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -2865,19 +2970,25 @@ class Storage:
             c = self._cursor(_COLL_TABLE)
             c.set_key(db, "")
             rc = c.search_near()
-            if rc == wt.WT_NOTFOUND:
-                return []
-            if rc < 0 and c.next() != 0:
-                return []
-            out: list[str] = []
-            while True:
-                k = c.get_key()
-                if k[0] != db:
-                    break
-                out.append(k[1])
-                if c.next() != 0:
-                    break
-            return sorted(out)
+            if rc != wt.WT_NOTFOUND and not (rc < 0 and c.next() != 0):
+                out: list[str] = []
+                while True:
+                    k = c.get_key()
+                    if k[0] != db:
+                        break
+                    out.append(k[1])
+                    if c.next() != 0:
+                        break
+            else:
+                out = []
+        # Synthesise ``local.oplog.rs`` for the ``local`` db whenever the
+        # oplog is enabled. The collection isn't materialised in
+        # ``_COLL_TABLE`` — it's a view over the oplog WT table — but
+        # ``listCollections`` needs to surface it so pymongo clients can
+        # discover it before querying.
+        if self.enable_oplog and db == "local" and "oplog.rs" not in out:
+            out.append("oplog.rs")
+        return sorted(out)
 
     def list_databases(self) -> list[str]:
         self._refresh_read_snapshot()
@@ -2889,7 +3000,12 @@ class Storage:
                 k = c.get_key()
                 seen.add(k[0])
                 rc = c.next()
-            return sorted(seen)
+        # mongod always exposes the ``local`` database; mirror that
+        # when the oplog is enabled so listDatabases includes it even
+        # before any user-created collection lands in ``local``.
+        if self.enable_oplog:
+            seen.add("local")
+        return sorted(seen)
 
     def create_index(
         self,

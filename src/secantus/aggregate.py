@@ -426,6 +426,169 @@ def _stage_unwind(
     return result
 
 
+def _field_is_filled(doc: Mapping[str, Any], path: str) -> bool:
+    """``$fill`` semantics for "this field already has a value": the path
+    resolves and the leaf is neither ``None`` nor a missing key. Matches
+    mongod's ``null``-vs-missing collapse — both count as "needs filling".
+    """
+    parts = path.split(".")
+    cur: Any = doc
+    for p in parts:
+        if not isinstance(cur, Mapping) or p not in cur:
+            return False
+        cur = cur[p]
+    return cur is not None
+
+
+def _apply_locf(part: list[dict[str, Any]], field: str) -> None:
+    """Last-observation-carried-forward within a single sorted partition.
+
+    Leading nulls before the first observed value stay null (mongod does
+    the same — there's nothing to carry forward from).
+    """
+    last: Any = None
+    have = False
+    for doc in part:
+        v = get_path(doc, field)
+        if v is not None:
+            last = v
+            have = True
+        elif have:
+            set_path(doc, field, copy.deepcopy(last))
+
+
+def _apply_linear(part: list[dict[str, Any]], field: str, sort_field: str) -> None:
+    """Linear interpolation along ``sort_field`` between non-null anchors.
+
+    Values strictly between two anchors get interpolated. Leading /
+    trailing nulls (before the first or after the last anchor) stay
+    null because there's nothing to bracket with. Works for numbers
+    and datetimes — date arithmetic gives ``timedelta`` which divides
+    cleanly to ``float`` and multiplies back to ``timedelta``.
+    """
+    anchor_indices = [i for i, d in enumerate(part) if get_path(d, field) is not None]
+    if len(anchor_indices) < 2:
+        return
+    # Adjacent-pairs zip — lengths intentionally differ by 1, hence
+    # ``strict=False``. Linter wants strict explicitly stated either way.
+    for ai, bi in zip(anchor_indices, anchor_indices[1:], strict=False):
+        ya = get_path(part[ai], field)
+        yb = get_path(part[bi], field)
+        xa = get_path(part[ai], sort_field)
+        xb = get_path(part[bi], sort_field)
+        if xa is None or xb is None or xa == xb:
+            continue
+        span = xb - xa
+        for i in range(ai + 1, bi):
+            x = get_path(part[i], sort_field)
+            if x is None or get_path(part[i], field) is not None:
+                continue
+            frac = (x - xa) / span
+            set_path(part[i], field, ya + (yb - ya) * frac)
+
+
+def _stage_fill(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$fill`` (5.3+): fill missing / null fields by value, locf, or linear.
+
+    Per-partition (``partitionBy`` or ``partitionByFields``), optionally
+    sorted by ``sortBy``. ``output: {<field>: {value: <expr>} |
+    {method: "locf" | "linear"}}``. ``method`` requires ``sortBy``.
+    Documents are returned in partition-discovery order, with each
+    partition in its sortBy order (if any) — matches mongod.
+    """
+    from secantus.storage import sort_docs
+
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$fill requires a document spec")
+    output = spec.get("output")
+    if not isinstance(output, Mapping) or not output:
+        raise AggregateError("$fill requires a non-empty output object")
+
+    fillers: list[tuple[str, str, Any]] = []
+    for field, action in output.items():
+        if not isinstance(action, Mapping):
+            raise AggregateError(f"$fill output.{field} must be a document")
+        if "value" in action:
+            fillers.append(("value", field, action["value"]))
+        elif "method" in action:
+            method = action["method"]
+            if method not in ("locf", "linear"):
+                raise AggregateError(f"$fill output.{field}.method must be 'locf' or 'linear'")
+            fillers.append((method, field, None))
+        else:
+            raise AggregateError(f"$fill output.{field} requires value or method")
+
+    has_method = any(kind in ("locf", "linear") for kind, _, _ in fillers)
+    sort_by = spec.get("sortBy")
+    if has_method and not isinstance(sort_by, Mapping):
+        raise AggregateError("$fill requires sortBy when using method")
+    if sort_by is not None and not isinstance(sort_by, Mapping):
+        raise AggregateError("$fill sortBy must be a document")
+
+    partition_by_fields = spec.get("partitionByFields")
+    partition_by = spec.get("partitionBy")
+    if partition_by is not None and partition_by_fields is not None:
+        raise AggregateError("$fill cannot use both partitionBy and partitionByFields")
+
+    if partition_by_fields is not None:
+        if not isinstance(partition_by_fields, list):
+            raise AggregateError("$fill partitionByFields must be an array")
+        fields = list(partition_by_fields)
+
+        def part_key(d: Mapping[str, Any]) -> Any:
+            return tuple(get_path(d, f) for f in fields)
+    elif partition_by is not None:
+
+        def part_key(d: Mapping[str, Any]) -> Any:
+            v = evaluate(partition_by, d, ctx.vars)
+            try:
+                hash(v)
+                return v
+            except TypeError:
+                # Fall back to a JSON-stable repr for unhashable values
+                # (dicts / lists). Good enough for partition identity.
+                return repr(v)
+    else:
+
+        def part_key(d: Mapping[str, Any]) -> Any:
+            return None
+
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    group_order: list[Any] = []
+    for d in docs:
+        key = part_key(d)
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(d)
+
+    sort_field: str | None = None
+    if isinstance(sort_by, Mapping) and sort_by:
+        sort_field = next(iter(sort_by.keys()))
+        for key in groups:
+            groups[key] = sort_docs(groups[key], sort_by)
+
+    for key in groups:
+        part = groups[key]
+        for kind, field, payload in fillers:
+            if kind == "value":
+                for d in part:
+                    if not _field_is_filled(d, field):
+                        set_path(d, field, evaluate(payload, d, ctx.vars))
+            elif kind == "locf":
+                _apply_locf(part, field)
+            elif kind == "linear":
+                assert sort_field is not None  # guarded above
+                _apply_linear(part, field, sort_field)
+
+    out: list[dict[str, Any]] = []
+    for key in group_order:
+        out.extend(groups[key])
+    return out
+
+
 def _stage_replace_root(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -986,16 +1149,50 @@ def _deep_merge_docs(existing: Mapping[str, Any], new: Mapping[str, Any]) -> dic
     return result
 
 
+_VALID_WHEN_MATCHED_STRINGS = frozenset(("merge", "replace", "keepExisting", "fail", "delete"))
+_VALID_WHEN_NOT_MATCHED = frozenset(("insert", "discard", "fail"))
+
+
+def _validate_on_field_index(
+    ctx: PipelineContext,
+    target_db: str,
+    target_coll: str,
+    on_fields: list[str],
+) -> None:
+    """``$merge`` requires a unique index on the ``on`` fields.
+
+    ``_id`` is implicitly unique and needs no explicit index. For any
+    other field combination, real mongod refuses the command unless
+    there's a ``unique: true`` index whose keys exactly match the
+    ``on`` field set. Mismatching this guard lets non-unique ``on``
+    fields silently collapse multiple targets onto one source doc.
+    """
+    if on_fields == ["_id"]:
+        return
+    assert ctx.storage is not None
+    target_set = set(on_fields)
+    for ix in ctx.storage.list_indexes(target_db, target_coll):
+        if not ix.get("unique"):
+            continue
+        key = ix.get("key") or {}
+        if set(key.keys()) == target_set:
+            return
+    raise AggregateError(
+        f"$merge requires a unique index covering {on_fields!r} on {target_db}.{target_coll}"
+    )
+
+
 def _stage_merge(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if ctx.storage is None:
         raise AggregateError("$merge requires storage context")
+    let_spec: Mapping[str, Any] = {}
     if isinstance(spec, str):
         target_db, target_coll = ctx.db_name, spec
         on_fields: list[str] = ["_id"]
-        when_matched = "merge"
-        when_not_matched = "insert"
+        when_matched: Any = "merge"
+        when_not_matched: str = "insert"
     elif isinstance(spec, Mapping):
         into = spec.get("into")
         if isinstance(into, str):
@@ -1011,13 +1208,31 @@ def _stage_merge(
         on_fields = [on] if isinstance(on, str) else list(on)
         when_matched = spec.get("whenMatched", "merge")
         when_not_matched = spec.get("whenNotMatched", "insert")
+        let_spec = spec.get("let") or {}
+        if not isinstance(let_spec, Mapping):
+            raise AggregateError("$merge let must be an object")
     else:
         raise AggregateError("$merge requires a string or document spec")
+
+    if isinstance(when_matched, str) and when_matched not in _VALID_WHEN_MATCHED_STRINGS:
+        raise AggregateError(
+            f"$merge whenMatched must be one of {sorted(_VALID_WHEN_MATCHED_STRINGS)} "
+            "or a pipeline array"
+        )
+    if not isinstance(when_matched, (str, list)):
+        raise AggregateError("$merge whenMatched must be a string or pipeline array")
+    if when_not_matched not in _VALID_WHEN_NOT_MATCHED:
+        raise AggregateError(
+            f"$merge whenNotMatched must be one of {sorted(_VALID_WHEN_NOT_MATCHED)}"
+        )
+
+    _validate_on_field_index(ctx, target_db, target_coll, on_fields)
 
     for doc in docs:
         match_filter = {f: get_path(doc, f) for f in on_fields}
         existing = ctx.storage.find_matching(target_db, target_coll, match_filter, limit=1)
         if existing:
+            existing_doc = existing[0]
             if when_matched == "fail":
                 # Real mongod raises a duplicate-key style error (code
                 # 11000) with ``keyPattern`` and ``keyValue`` so drivers
@@ -1035,19 +1250,47 @@ def _stage_merge(
                 )
             if when_matched == "keepExisting":
                 continue
+            if when_matched == "delete":
+                ctx.storage.delete_matching(
+                    target_db, target_coll, {"_id": existing_doc["_id"]}, limit=1
+                )
+                continue
             if when_matched == "replace":
                 ctx.storage.delete_matching(
-                    target_db, target_coll, {"_id": existing[0]["_id"]}, limit=1
+                    target_db, target_coll, {"_id": existing_doc["_id"]}, limit=1
                 )
                 new = copy.deepcopy(doc)
-                new.setdefault("_id", existing[0]["_id"])
+                new.setdefault("_id", existing_doc["_id"])
                 ctx.storage.insert(target_db, target_coll, [new])
-            else:  # default "merge"
-                merged = _deep_merge_docs(existing[0], doc)
-                merged["_id"] = existing[0]["_id"]
-                ctx.storage.update_matching(
-                    target_db, target_coll, {"_id": existing[0]["_id"]}, merged
+                continue
+            if isinstance(when_matched, list):
+                # Pipeline form: run the sub-pipeline against the matched
+                # doc with ``$$new`` bound to the source doc and any user
+                # ``let`` vars threaded through. The output's first doc
+                # replaces the target (preserving ``_id``); mongod
+                # requires the pipeline to yield exactly one doc.
+                bound: dict[str, Any] = {"new": copy.deepcopy(doc)}
+                for name, expr in let_spec.items():
+                    bound[name] = evaluate(expr, doc, ctx.vars)
+                sub_ctx = ctx.with_vars(bound)
+                result_docs = apply_pipeline(
+                    [copy.deepcopy(existing_doc)], list(when_matched), sub_ctx
                 )
+                if not result_docs:
+                    raise AggregateError("$merge whenMatched pipeline must yield a document")
+                replacement = result_docs[0]
+                replacement["_id"] = existing_doc["_id"]
+                ctx.storage.delete_matching(
+                    target_db, target_coll, {"_id": existing_doc["_id"]}, limit=1
+                )
+                ctx.storage.insert(target_db, target_coll, [replacement])
+                continue
+            # default: deep merge
+            merged = _deep_merge_docs(existing_doc, doc)
+            merged["_id"] = existing_doc["_id"]
+            ctx.storage.update_matching(
+                target_db, target_coll, {"_id": existing_doc["_id"]}, merged
+            )
         else:
             if when_not_matched == "fail":
                 raise AggregateError("$merge whenNotMatched=fail and no match exists")
@@ -1432,6 +1675,7 @@ _STAGES = {
     "$unset": _stage_unset,
     "$unwind": _stage_unwind,
     "$densify": _stage_densify,
+    "$fill": _stage_fill,
     "$replaceRoot": _stage_replace_root,
     "$replaceWith": _stage_replace_with,
     "$group": _stage_group,

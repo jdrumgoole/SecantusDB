@@ -4,7 +4,11 @@
   x-data='changestreamPage({{ {"scope": scope, "db": db_name, "coll": coll_name} | tojson }})'
   x-init="init()"
 >
-  <form class="filter-form" method="get" action="/changestream">
+  {# Not a ``<form>`` on purpose — the Watch button doesn't submit, it
+     calls Alpine's ``reconnect()`` which rebuilds the WebSocket. A
+     wrapping ``<form method="get">`` would let Enter-in-any-field do a
+     page reload that drops in-flight events. #}
+  <div class="filter-form" @keydown.enter.prevent="reconnect()">
     <div class="filter-controls">
       <label>
         Scope
@@ -27,7 +31,7 @@
       </label>
       <button type="button" @click="reconnect()">Watch</button>
     </div>
-  </form>
+  </div>
 
   <p class="modal-meta">
     Status: <code x-text="status"></code>

@@ -4,11 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{{ title }} — SecantusDB admin</title>
+    {# Inline SVG data-URI favicon: matches the sidebar brand mark (filled
+       dot in --accent) and dodges the auth-middleware 401 a plain
+       ``/favicon.ico`` request would hit. #}
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Ccircle%20cx='16'%20cy='16'%20r='10'%20fill='%2363b3ff'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/static/css/admin.css" />
     <script src="/static/js/htmx.min.js" defer></script>
     <script src="/static/js/alpine.min.js" defer></script>
     <script src="/static/js/chart.umd.min.js" defer></script>
     <script src="/static/js/json-pretty.js" defer></script>
+    <script src="/static/js/modal-shell.js" defer></script>
   </head>
   <body>
     <aside class="sidebar">
@@ -24,7 +29,8 @@
           <li><a href="/insert" class="{% if active == 'insert' %}nav-current{% endif %}">Insert</a></li>
           <li><a href="/db" class="{% if active == 'databases' %}nav-current{% endif %}">Databases</a></li>
           <li><a href="/users" class="{% if active == 'users' %}nav-current{% endif %}">Users</a></li>
-          <li><a href="/changestream" class="{% if active == 'changestream' %}nav-current{% endif %}">Change stream</a></li>
+          <li class="nav-sub"><a href="/roles" class="{% if active == 'roles' %}nav-current{% endif %}">Roles</a></li>
+          <li class="nav-ops-start"><a href="/changestream" class="{% if active == 'changestream' %}nav-current{% endif %}">Change stream</a></li>
           <li><a href="/connections" class="{% if active == 'connections' %}nav-current{% endif %}">Connections</a></li>
           <li><a href="/cursors" class="{% if active == 'cursors' %}nav-current{% endif %}">Cursors</a></li>
           <li><a href="/profiler" class="{% if active == 'profiler' %}nav-current{% endif %}">Profiler</a></li>
@@ -41,12 +47,12 @@
         {% if embedded_uri and embedded_uri == request.app.state.mongo_uri %}
           <a class="server-badge server-badge-embedded" href="/server"
              title="Embedded SecantusDB ({{ request.app.state.mongo_uri_display }})">
-            <span class="server-badge-dot">●</span>
+            <span class="server-badge-dot" aria-hidden="true"></span>
             <span>Embedded SecantusDB</span>
           </a>
         {% else %}
           <a class="server-badge" href="/server" title="Click to change target server">
-            <span class="server-badge-dot">●</span>
+            <span class="server-badge-dot" aria-hidden="true"></span>
             <code>{{ request.app.state.mongo_uri_display }}</code>
           </a>
         {% endif %}

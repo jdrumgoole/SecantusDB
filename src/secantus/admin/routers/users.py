@@ -274,5 +274,5 @@ def roles_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "pages/roles.html",
-        {"title": "Roles", "active": "users", "rows": rows},
+        {"title": "Roles", "active": "roles", "rows": rows},
     )

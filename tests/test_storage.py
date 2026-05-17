@@ -89,7 +89,10 @@ def test_list_collections_and_databases(storage: Storage) -> None:
     storage.insert("db1", "c2", [{"x": 1}])
     storage.insert("db2", "c1", [{"x": 1}])
     assert storage.list_collections("db1") == ["c1", "c2"]
-    assert storage.list_databases() == ["db1", "db2"]
+    # ``local`` is synthesised when the oplog is enabled (mongod always
+    # exposes it); filter it out so this test focuses on user databases.
+    user_dbs = [db for db in storage.list_databases() if db != "local"]
+    assert user_dbs == ["db1", "db2"]
 
 
 def test_databases_are_isolated(storage: Storage) -> None:
@@ -416,5 +419,110 @@ def test_ensure_profile_collection_is_capped(tmp_path) -> None:
         # Idempotent.
         s.ensure_profile_collection("appdb")
         assert s.get_collection_options("appdb", "system.profile").get("capped") is True
+    finally:
+        s.close()
+
+
+# --- local.oplog.rs synthetic view ----------------------------------------
+
+
+def test_oplog_rs_appears_in_list_collections(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        # ``local`` is listed even when no user collection lives there,
+        # because mongod always exposes the local database when the
+        # oplog is enabled.
+        assert "local" in s.list_databases()
+        # ``oplog.rs`` is synthesised in ``local`` regardless of whether
+        # any other collection in ``local`` exists.
+        assert "oplog.rs" in s.list_collections("local")
+    finally:
+        s.close()
+
+
+def test_oplog_rs_get_collection_options_reports_capped(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        opts = s.get_collection_options("local", "oplog.rs")
+        assert opts == {
+            "capped": True,
+            "size": s.oplog_max_entries * 16 * 1024,
+            "max": s.oplog_max_entries,
+        }
+    finally:
+        s.close()
+
+
+def test_oplog_rs_find_returns_decoded_oplog_entries(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        s.insert("appdb", "things", [{"_id": 1, "v": "alpha"}])
+        s.insert("appdb", "things", [{"_id": 2, "v": "beta"}])
+        rows = s.find_matching("local", "oplog.rs", {})
+        # Two inserts → two ``op: "i"`` entries on appdb.things, in order.
+        i_rows = [r for r in rows if r.get("op") == "i"]
+        assert len(i_rows) == 2
+        assert i_rows[0]["ns"] == "appdb.things"
+        assert i_rows[0]["o"]["_id"] == 1
+        assert i_rows[1]["o"]["_id"] == 2
+        # Walked seq-order, which equals ts-order — first ts <= second.
+        assert i_rows[0]["ts"] <= i_rows[1]["ts"]
+    finally:
+        s.close()
+
+
+def test_oplog_rs_find_honours_filter_skip_limit(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        s.insert("appdb", "c", [{"_id": i} for i in range(5)])
+        i_rows = s.find_matching("local", "oplog.rs", {"op": "i"})
+        assert len(i_rows) == 5
+        page = s.find_matching("local", "oplog.rs", {"op": "i"}, skip=1, limit=2)
+        assert len(page) == 2
+        assert page[0]["o"]["_id"] == 1
+        assert page[1]["o"]["_id"] == 2
+    finally:
+        s.close()
+
+
+def test_oplog_rs_count_matching(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        s.insert("appdb", "c", [{"_id": i} for i in range(3)])
+        assert s.count_matching("local", "oplog.rs", {"op": "i"}) == 3
+        assert s.count_matching("local", "oplog.rs", {"op": "u"}) == 0
+    finally:
+        s.close()
+
+
+def test_oplog_rs_projection_strips_fields(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        s.insert("appdb", "c", [{"_id": 1}])
+        rows = s.find_matching(
+            "local", "oplog.rs", {"op": "i"}, projection={"_id": 0, "op": 1, "ns": 1}
+        )
+        assert rows == [{"op": "i", "ns": "appdb.c"}]
+    finally:
+        s.close()
+
+
+def test_oplog_rs_sort_descending_reverses_order(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        s.insert("appdb", "c", [{"_id": 1}])
+        s.insert("appdb", "c", [{"_id": 2}])
+        rows = s.find_matching("local", "oplog.rs", {"op": "i"}, sort={"ts": -1})
+        assert rows[0]["o"]["_id"] == 2
+        assert rows[1]["o"]["_id"] == 1
+    finally:
+        s.close()
+
+
+def test_oplog_rs_disabled_when_oplog_off(tmp_path) -> None:
+    s = Storage(str(tmp_path / "wt"), enable_oplog=False)
+    try:
+        assert "oplog.rs" not in s.list_collections("local")
+        assert "local" not in s.list_databases()
     finally:
         s.close()

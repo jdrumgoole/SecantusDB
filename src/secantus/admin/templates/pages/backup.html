@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "partials/_macros.html" import empty_row %}
 {% block content %}
 <p class="modal-meta">
   Backups land in <code>{{ backup_root }}</code>. The admin UI shells
@@ -16,12 +17,21 @@
 {% endif %}
 
 <h2 class="section-title">Run backup</h2>
-<form method="post" action="/backup/dump" class="inline-form">
+<form
+  method="post"
+  action="/backup/dump"
+  class="inline-form"
+  x-data="{ busy: false }"
+  @submit="busy = true"
+>
   <button
     type="submit"
     class="btn-secondary"
-    {% if not preflight_ok %}disabled{% endif %}
-  >Run mongodump now</button>
+    x-bind:disabled="busy{% if not preflight_ok %} || true{% endif %}"
+  >
+    <span x-show="!busy">Run mongodump now</span>
+    <span x-show="busy" x-cloak><span class="spinner"></span> Running mongodump…</span>
+  </button>
 </form>
 
 <h2 class="section-title">Existing backups</h2>
@@ -39,18 +49,27 @@
         <td><code>{{ r.name }}</code></td>
         <td class="num">{{ r.size }}</td>
         <td class="doc-actions">
-          <form method="post" action="/backup/restore" class="inline-form">
+          <form
+            method="post"
+            action="/backup/restore"
+            class="inline-form"
+            x-data="{ busy: false }"
+            @submit="busy = true"
+          >
             <input type="hidden" name="name" value="{{ r.name }}" />
             <button
               type="submit"
               class="btn-danger"
-              {% if not preflight_ok %}disabled{% endif %}
-            >Restore</button>
+              x-bind:disabled="busy{% if not preflight_ok %} || true{% endif %}"
+            >
+              <span x-show="!busy">Restore</span>
+              <span x-show="busy" x-cloak><span class="spinner"></span> Restoring…</span>
+            </button>
           </form>
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="3" class="empty">No backups yet.</td></tr>
+      {{ empty_row(3, "No backups yet.") }}
     {% endfor %}
   </tbody>
 </table>
@@ -59,7 +78,7 @@
   <h2 class="section-title">Last subprocess output</h2>
   <p class="modal-meta">
     Exit code <code>{{ last_result.returncode }}</code> ·
-    {% if last_result.ok %}<span class="badge">ok</span>{% else %}<span class="badge" style="border-color: var(--error); color: var(--error)">error</span>{% endif %}
+    {% if last_result.ok %}<span class="badge">ok</span>{% else %}<span class="badge badge-error">error</span>{% endif %}
   </p>
   {% if last_result.stdout %}
     <h3 class="section-title">stdout</h3>

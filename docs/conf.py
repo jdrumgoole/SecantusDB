@@ -75,3 +75,7 @@ intersphinx_mapping = {
 
 autodoc_member_order = "bysource"
 myst_enable_extensions = ["colon_fence", "deflist"]
+# Auto-generate slug-shaped anchors for ## / ### / #### headings so
+# cross-doc links like ``[Querying the oplog](change-streams.md#
+# querying-the-oplog-directly)`` resolve under ``-W``.
+myst_heading_anchors = 4

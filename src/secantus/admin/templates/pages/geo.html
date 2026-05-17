@@ -23,6 +23,21 @@
     to enable this view.
   </p>
 {% else %}
+  {% if geo_fields | length > 1 %}
+    <form class="filter-form" method="get" action="/db/{{ db_name }}/{{ coll_name }}/geo">
+      <div class="filter-controls">
+        <label>
+          Geometry field
+          <select name="field" onchange="this.form.submit()">
+            {% for f in geo_fields %}
+              <option value="{{ f }}" {% if f == geo_field %}selected{% endif %}>{{ f }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <input type="hidden" name="sample_size" value="{{ sample_size }}" />
+      </div>
+    </form>
+  {% endif %}
   <p class="modal-meta">
     Geometry field: <code>{{ geo_field }}</code> · sampled {{ sample_size }} docs.
     {% if geo_indexes %}

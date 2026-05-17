@@ -769,6 +769,83 @@ def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) ->
     assert "maxSize" not in cs[0]["storageStats"]
 
 
+def test_change_stream_rejected_on_standalone(tmp_path) -> None:
+    # When SecantusDB is booted in standalone mode (no replica-set
+    # advertisement in ``hello``), opening a change stream must
+    # fail with code 40573 — mongo-java-driver's ``change-streams-
+    # errors.yml`` single-topology test asserts exactly this. The
+    # default replica-set mode still permits change streams.
+    from pymongo.errors import OperationFailure
+
+    standalone_srv = SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "stand"), replica_set_name=None
+    )
+    standalone_srv.start()
+    try:
+        mc = MongoClient(standalone_srv.uri, serverSelectionTimeoutMS=2000, directConnection=True)
+        with pytest.raises(OperationFailure) as exc:
+            mc["db"]["c"].watch()
+        assert exc.value.code == 40573
+        assert "replica sets" in str(exc.value)
+        mc.close()
+    finally:
+        standalone_srv.stop()
+
+
+def test_configure_failpoint_block_connection(client: MongoClient) -> None:
+    # mongo-node-driver's ``explain with timeoutMS`` CSOT tests configure
+    # a ``failCommand`` with ``blockConnection: true, blockTimeMS: 500``
+    # so the client-side ``timeoutMS`` timer fires before the server
+    # responds. Verify the failpoint actually blocks before dispatching
+    # the matched command.
+    import time
+
+    db = client["block_db"]
+    db.create_collection("things")
+
+    # Install a 500 ms block on ``find``.
+    client.admin.command(
+        {
+            "configureFailPoint": "failCommand",
+            "mode": {"times": 1},
+            "data": {"failCommands": ["find"], "blockConnection": True, "blockTimeMS": 500},
+        }
+    )
+
+    # Find should block ~500 ms then return normally.
+    start = time.monotonic()
+    list(db["things"].find())
+    elapsed_ms = (time.monotonic() - start) * 1000
+    assert 400 <= elapsed_ms <= 1500, f"expected ~500ms block, got {elapsed_ms:.0f}ms"
+
+    # Second find — failpoint exhausted (``times: 1``), should be fast.
+    start = time.monotonic()
+    list(db["things"].find())
+    elapsed_ms = (time.monotonic() - start) * 1000
+    assert elapsed_ms < 200, f"second find should be unblocked, took {elapsed_ms:.0f}ms"
+
+
+def test_get_parameter_advertises_only_scram_auth_mechanism(client: MongoClient) -> None:
+    # Real mongod exposes enabled SASL mechanisms via
+    # ``getParameter authenticationMechanisms``. mongo-java-driver's
+    # unified ``RunOnRequirementsMatcher`` reads this to decide whether
+    # to skip a test gated on ``authMechanism: "MONGODB-OIDC"``. We
+    # support only SCRAM-SHA-256, so the array must list just that —
+    # listing OIDC would lie to the driver and unskip tests we can't
+    # actually pass.
+    reply = client.admin.command({"getParameter": 1, "authenticationMechanisms": 1})
+    assert reply["ok"] == 1.0
+    assert reply["authenticationMechanisms"] == ["SCRAM-SHA-256"]
+
+    # ``getParameter: "*"`` should also include it.
+    reply = client.admin.command({"getParameter": "*"})
+    assert "SCRAM-SHA-256" in reply["authenticationMechanisms"]
+    # We do NOT support OIDC / X509 / GSSAPI / PLAIN — those must
+    # stay out of the list so driver gauges self-skip correctly.
+    for unsupported in ("MONGODB-OIDC", "MONGODB-X509", "GSSAPI", "PLAIN"):
+        assert unsupported not in reply["authenticationMechanisms"]
+
+
 def test_snapshot_read_concern_rejected_on_standalone(client: MongoClient) -> None:
     # Snapshot read concern requires a real replica set with
     # majority-committed snapshots; mongod rejects with code 246
@@ -1235,6 +1312,164 @@ def test_aggregate_merge_scalar_overwrites_subdoc(client: MongoClient) -> None:
     list(db["src"].aggregate([{"$merge": "dst"}]))
     [doc] = list(db["dst"].find())
     assert doc == {"_id": 1, "addr": "just a string"}
+
+
+def test_aggregate_merge_when_matched_delete(client: MongoClient) -> None:
+    db = client["merge_delete_db"]
+    db["src"].insert_many([{"_id": 1}, {"_id": 2}])
+    db["dst"].insert_many([{"_id": 1, "tag": "x"}, {"_id": 3, "tag": "untouched"}])
+    # whenNotMatched=discard so the unmatched src doc (_id=2) doesn't
+    # land in dst — the assertion is purely about the delete path.
+    list(
+        db["src"].aggregate(
+            [
+                {
+                    "$merge": {
+                        "into": "dst",
+                        "whenMatched": "delete",
+                        "whenNotMatched": "discard",
+                    }
+                }
+            ]
+        )
+    )
+    remaining = sorted(db["dst"].find(), key=lambda d: d["_id"])
+    assert remaining == [{"_id": 3, "tag": "untouched"}]
+
+
+def test_aggregate_merge_when_matched_pipeline(client: MongoClient) -> None:
+    """Pipeline form runs per matched doc with $$new bound to the source."""
+    db = client["merge_pipeline_db"]
+    db["src"].insert_one({"_id": 1, "delta": 10})
+    db["dst"].insert_one({"_id": 1, "total": 5})
+    pipeline = [{"$addFields": {"total": {"$add": ["$total", "$$new.delta"]}}}]
+    list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": pipeline}}]))
+    [doc] = list(db["dst"].find())
+    assert doc == {"_id": 1, "total": 15}
+
+
+def test_aggregate_merge_pipeline_with_let_bindings(client: MongoClient) -> None:
+    """$merge let exposes user vars to the pipeline form."""
+    db = client["merge_let_db"]
+    db["src"].insert_one({"_id": 1, "qty": 3})
+    db["dst"].insert_one({"_id": 1, "price": 100})
+    list(
+        db["src"].aggregate(
+            [
+                {
+                    "$merge": {
+                        "into": "dst",
+                        "let": {"multiplier": "$qty"},
+                        "whenMatched": [
+                            {"$addFields": {"total": {"$multiply": ["$price", "$$multiplier"]}}}
+                        ],
+                    }
+                }
+            ]
+        )
+    )
+    [doc] = list(db["dst"].find())
+    assert doc == {"_id": 1, "price": 100, "total": 300}
+
+
+def test_aggregate_merge_when_not_matched_fail(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["merge_nm_fail_db"]
+    db["src"].insert_one({"_id": 1, "n": 7})
+    with pytest.raises(OperationFailure):
+        list(db["src"].aggregate([{"$merge": {"into": "dst", "whenNotMatched": "fail"}}]))
+
+
+def test_aggregate_merge_on_non_id_requires_unique_index(client: MongoClient) -> None:
+    """Without a unique index on the on field, $merge must refuse."""
+    from pymongo.errors import OperationFailure
+
+    db = client["merge_nounique_db"]
+    db["src"].insert_one({"_id": 1, "k": "alpha", "n": 1})
+    db["dst"].insert_one({"_id": 9, "k": "alpha", "n": 99})
+    with pytest.raises(OperationFailure):
+        list(db["src"].aggregate([{"$merge": {"into": "dst", "on": "k"}}]))
+
+
+def test_aggregate_merge_on_non_id_with_unique_index(client: MongoClient) -> None:
+    db = client["merge_unique_db"]
+    db["src"].insert_one({"_id": 1, "k": "alpha", "n": 1})
+    db["dst"].insert_one({"_id": 9, "k": "alpha", "n": 99})
+    db["dst"].create_index("k", unique=True)
+    list(db["src"].aggregate([{"$merge": {"into": "dst", "on": "k"}}]))
+    [doc] = list(db["dst"].find())
+    # Matched on k="alpha" → existing doc gets shallow-merged with source.
+    # _id of the matched doc is preserved.
+    assert doc == {"_id": 9, "k": "alpha", "n": 1}
+
+
+def test_aggregate_merge_cross_database(client: MongoClient) -> None:
+    src_db = client["merge_xdb_src"]
+    dst_db = client["merge_xdb_dst"]
+    src_db["coll"].insert_one({"_id": 1, "v": 42})
+    list(
+        src_db["coll"].aggregate([{"$merge": {"into": {"db": "merge_xdb_dst", "coll": "target"}}}])
+    )
+    [doc] = list(dst_db["target"].find())
+    assert doc == {"_id": 1, "v": 42}
+
+
+def test_aggregate_merge_rejects_unknown_when_matched(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["merge_bad_wm_db"]
+    db["src"].insert_one({"_id": 1})
+    with pytest.raises(OperationFailure):
+        list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": "nonsense"}}]))
+
+
+def test_aggregate_fill_value_via_pymongo(client: MongoClient) -> None:
+    db = client["fill_value_xd"]
+    db["readings"].insert_many(
+        [{"_id": 1, "v": 10}, {"_id": 2}, {"_id": 3, "v": None}, {"_id": 4, "v": 30}]
+    )
+    out = sorted(
+        db["readings"].aggregate([{"$fill": {"output": {"v": {"value": 0}}}}]),
+        key=lambda d: d["_id"],
+    )
+    assert [d["v"] for d in out] == [10, 0, 0, 30]
+
+
+def test_aggregate_fill_locf_via_pymongo(client: MongoClient) -> None:
+    db = client["fill_locf_xd"]
+    db["readings"].insert_many(
+        [
+            {"_id": 1, "t": 1, "v": 10},
+            {"_id": 2, "t": 2},
+            {"_id": 3, "t": 3, "v": 30},
+            {"_id": 4, "t": 4},
+        ]
+    )
+    out = list(
+        db["readings"].aggregate(
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "locf"}}}}]
+        )
+    )
+    assert [(d["t"], d["v"]) for d in out] == [(1, 10), (2, 10), (3, 30), (4, 30)]
+
+
+def test_aggregate_fill_linear_via_pymongo(client: MongoClient) -> None:
+    db = client["fill_linear_xd"]
+    db["readings"].insert_many(
+        [
+            {"_id": 1, "t": 0, "v": 0},
+            {"_id": 2, "t": 1},
+            {"_id": 3, "t": 2},
+            {"_id": 4, "t": 4, "v": 40},
+        ]
+    )
+    out = list(
+        db["readings"].aggregate(
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}]
+        )
+    )
+    assert [(d["t"], d["v"]) for d in out] == [(0, 0), (1, 10), (2, 20), (4, 40)]
 
 
 def test_positional_all_via_pymongo(coll) -> None:
@@ -1774,3 +2009,85 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
     )
     with contextlib.suppress(Exception):
         cur.close()
+
+
+# --- local.oplog.rs wire-surface (pymongo-driven) -------------------------
+
+
+def test_oplog_rs_listed_via_pymongo(client: MongoClient) -> None:
+    local = client["local"]
+    names = set(local.list_collection_names())
+    assert "oplog.rs" in names
+
+
+def test_oplog_rs_capped_options_via_pymongo(client: MongoClient) -> None:
+    local = client["local"]
+    [info] = list(local.list_collections(filter={"name": "oplog.rs"}))
+    opts = info.get("options") or {}
+    assert opts.get("capped") is True
+    assert isinstance(opts.get("size"), int) and opts["size"] > 0
+    assert isinstance(opts.get("max"), int) and opts["max"] > 0
+
+
+def test_oplog_rs_find_via_pymongo_sees_inserts(client: MongoClient) -> None:
+    db = client["oplog_rs_xd"]
+    db["things"].insert_many([{"_id": 1, "v": "alpha"}, {"_id": 2, "v": "beta"}])
+    oplog = client["local"]["oplog.rs"]
+    i_rows = list(oplog.find({"op": "i", "ns": "oplog_rs_xd.things"}))
+    assert len(i_rows) >= 2
+    ids = sorted(r["o"]["_id"] for r in i_rows)
+    assert ids == [1, 2]
+
+
+def test_oplog_rs_count_via_pymongo(client: MongoClient) -> None:
+    db = client["oplog_rs_count_xd"]
+    db["c"].insert_many([{"_id": i} for i in range(4)])
+    oplog = client["local"]["oplog.rs"]
+    n = oplog.count_documents({"op": "i", "ns": "oplog_rs_count_xd.c"})
+    assert n == 4
+
+
+def test_oplog_rs_sort_descending_via_pymongo(client: MongoClient) -> None:
+    db = client["oplog_rs_sort_xd"]
+    db["c"].insert_one({"_id": 1})
+    db["c"].insert_one({"_id": 2})
+    oplog = client["local"]["oplog.rs"]
+    rows = list(oplog.find({"op": "i", "ns": "oplog_rs_sort_xd.c"}).sort("ts", -1).limit(2))
+    assert rows[0]["o"]["_id"] == 2
+    assert rows[1]["o"]["_id"] == 1
+
+
+def test_oplog_rs_insert_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure) as exc_info:
+        client["local"]["oplog.rs"].insert_one({"forged": True})
+    assert exc_info.value.code == 13
+
+
+def test_oplog_rs_update_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"]["oplog.rs"].update_one({"op": "i"}, {"$set": {"x": 1}})
+
+
+def test_oplog_rs_delete_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"]["oplog.rs"].delete_many({})
+
+
+def test_oplog_rs_drop_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"].drop_collection("oplog.rs")
+
+
+def test_oplog_rs_create_index_rejected(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure):
+        client["local"]["oplog.rs"].create_index("ns")

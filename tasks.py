@@ -489,8 +489,27 @@ def validate_all(c: Context) -> None:
         )
         return name, result.returncode
 
-    print(f"validate-all: dispatching {len(GAUGES)} gauges in parallel\n", flush=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GAUGES)) as pool:
+    # Run gauges serially. Earlier attempts at 5-way and 3-way
+    # parallelism produced flaky failures specifically driven by
+    # OS-scheduler timing: Python's GIL pins the daemon's accept loop
+    # to one bytecode runner per process, so when N daemons + N
+    # driver test processes contend for CPU, individual ``hello``
+    # handshakes occasionally exceed the driver's
+    # ``serverSelectionTimeoutMS`` (30 s default). The Go gauge is
+    # the most sensitive (the gauge's
+    # ``TestIndexView/{drop_one,drop_all,create_many/*}`` subtests
+    # observe ``Type: Unknown`` topology and fail with
+    # ``context deadline exceeded``); the Java gauge's
+    # ``ContextProviderTest#contextShouldBeAvailableInCommandEvents``
+    # also flaked. Both pass cleanly when each gauge has the daemon's
+    # CPU to itself. Wall-clock cost: ~12 min serial vs ~7 min
+    # parallel — small enough to be worth the determinism.
+    max_workers = 1
+    print(
+        f"validate-all: dispatching {len(GAUGES)} gauges serially\n",
+        flush=True,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_run, ng): ng[0] for ng in GAUGES}
         results = {
             future.result()[0]: future.result()[1]

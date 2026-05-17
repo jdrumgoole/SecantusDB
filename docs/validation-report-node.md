@@ -1,6 +1,6 @@
 # mongo-node-driver Validation Report
 
-Generated 2026-05-11 — SecantusDB 0.5.0b12 vs mongo-node-driver 7e53685952f2 (`vendor/node-mongodb-native/`).
+Generated 2026-05-15 — SecantusDB 0.5.1b10 vs mongo-node-driver 7e53685952f2 (`vendor/node-mongodb-native/`).
 
 Run `uv run python -m invoke validate-node` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver gauges for the official Node.js driver — the same driver `mongosh` and the JavaScript ecosystem build on.
 
@@ -8,27 +8,14 @@ Run `uv run python -m invoke validate-node` to refresh. The pass rate is the ana
 
 | Category | Passed | Failed | Pending | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `integration` | 345 | 14 | 5 | 364 | 96.1% |
-| **Overall** | **345** | **14** | **5** | **364** | **96.1%** |
+| `integration` | 358 | 1 | 5 | 364 | 99.7% |
+| **Overall** | **358** | **1** | **5** | **364** | **99.7%** |
 
-## Failures (14)
+## Failures (1)
 
 First 30 failed test titles for triage:
 
 ```
-integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a cursor api is being explained when timeoutMS is provided the explain command times out after timeoutMS
-integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a cursor api is being explained when timeoutMS is provided the explain command has the calculated maxTimeMS value attached
-integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a cursor api is being explained when timeoutMS is provided the explained command does not have a maxTimeMS value attached
-integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a non-cursor api is being explained when timeoutMS is provided the explain command times out after timeoutMS
-integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a non-cursor api is being explained when timeoutMS is provided the explain command has the calculated maxTimeMS value attached
-integration :: CRUD API explain option explain with timeoutMS Explain helpers respect timeoutMS when a non-cursor api is being explained when timeoutMS is provided the explained command does not have a maxTimeMS value attached
-integration :: CRUD API explain option explain with timeoutMS fluent api timeoutMS precedence and inheritance find({}, { timeoutMS }).explain() respects the timeoutMS from the find options
-integration :: CRUD API explain option explain with timeoutMS fluent api timeoutMS precedence and inheritance find().explain({}, { timeoutMS }) respects the timeoutMS from the explain helper
-integration :: CRUD API explain option explain with timeoutMS fluent api timeoutMS precedence and inheritance find({}, { timeoutMS} ).explain({}, { timeoutMS }) the timeoutMS from the explain helper has precedence
-integration :: CRUD API explain option explain with timeoutMS fluent api timeoutMS precedence and inheritance aggregate([], { timeoutMS }).explain() respects the timeoutMS from the find options
-integration :: CRUD API explain option explain with timeoutMS fluent api timeoutMS precedence and inheritance aggregate([], { timeoutMS }) respects the timeoutMS from the explain helper
-integration :: CRUD API explain option explain with timeoutMS fluent api timeoutMS precedence and inheritance aggregate([], { timeoutMS} ).explain({}, { timeoutMS }) the timeoutMS from the explain helper has precedence
-integration :: Find should correctly return error from mongodb on findOneAndUpdate forced error
 integration :: Find should correctly sort using text search in find
 ```
 

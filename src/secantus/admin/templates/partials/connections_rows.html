@@ -1,0 +1,25 @@
+{% from "partials/_macros.html" import empty_row %}
+<tbody
+  id="connections-tbody"
+  hx-get="/connections/_rows"
+  hx-trigger="every 5s"
+  hx-swap="outerHTML"
+>
+  {% for r in rows %}
+    <tr>
+      <td><code>{{ r.conn_id }}</code></td>
+      <td><code>{{ r.client }}</code></td>
+      <td>
+        {% if r.user.user %}<code>{{ r.user.user }}@{{ r.user.db }}</code>{% else %}<span class="muted">—</span>{% endif %}
+      </td>
+      <td><code>{{ r.op or '—' }}</code></td>
+      <td>{% if r.active %}<span class="badge">active</span>{% else %}<span class="muted">idle</span>{% endif %}</td>
+      <td><code>{{ r.opened_at }}</code></td>
+      <td class="doc-actions">
+        <span class="muted" title="Connection-kill is deferred until SecantusDB grows killOp (see tasks/backlog.md §3).">—</span>
+      </td>
+    </tr>
+  {% else %}
+    {{ empty_row(7, "No connections.") }}
+  {% endfor %}
+</tbody>

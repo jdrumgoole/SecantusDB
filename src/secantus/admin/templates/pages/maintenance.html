@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "partials/_macros.html" import empty_row %}
 {% block content %}
 {% if error %}<div class="error">{{ error }}</div>{% endif %}
 {% if flash %}
@@ -56,39 +57,74 @@
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="3" class="empty">No databases.</td></tr>
+        {{ empty_row(3, "No databases.") }}
       {% endfor %}
     </tbody>
   </table>
 {% endif %}
 
 <h3 class="section-title">Drop collection</h3>
+
+<datalist id="maint-db-suggestions">
+  {% for db in databases %}
+    <option value="{{ db.name }}"></option>
+  {% endfor %}
+</datalist>
+<datalist id="maint-coll-suggestions">
+  <template x-for="c in collections" :key="c">
+    <option :value="c"></option>
+  </template>
+</datalist>
+
 <form
   class="filter-form"
-  hx-get="/maintenance/drop-collection-redirect"
-  hx-target="#modal"
-  hx-swap="innerHTML"
-  onsubmit="event.preventDefault(); openDropCollModal(event.target);"
+  x-data="dropCollForm()"
+  @submit.prevent="open($event.target)"
 >
   <div class="filter-controls">
-    <label>Database <input type="text" name="db" required autocomplete="off" /></label>
-    <label>Collection <input type="text" name="coll" required autocomplete="off" /></label>
+    <label>Database
+      <input type="text" name="db" required autocomplete="off"
+             list="maint-db-suggestions"
+             x-model="db" @change="onDbChange(db)" />
+    </label>
+    <label>Collection
+      <input type="text" name="coll" required autocomplete="off"
+             list="maint-coll-suggestions"
+             x-model="coll" />
+    </label>
   </div>
   <div class="modal-actions">
-    <button type="submit" class="btn-danger">Drop collection…</button>
+    <button type="submit" class="btn-danger" :disabled="!db.trim() || !coll.trim()">Drop collection…</button>
   </div>
 </form>
 
 <div id="modal"></div>
 
 <script>
-function openDropCollModal(form) {
-  const db = form.elements.namedItem("db").value.trim();
-  const coll = form.elements.namedItem("coll").value.trim();
-  if (!db || !coll) return;
-  fetch(`/maintenance/drop-collection/${encodeURIComponent(db)}/${encodeURIComponent(coll)}/confirm`)
-    .then(r => r.text())
-    .then(html => { document.getElementById("modal").innerHTML = html; htmx.process(document.getElementById("modal")); });
+function dropCollForm() {
+  return {
+    db: "",
+    coll: "",
+    collections: [],
+
+    async onDbChange(value) {
+      this.collections = [];
+      if (!value) return;
+      try {
+        const r = await fetch(`/query/_collections?db=${encodeURIComponent(value)}`);
+        if (!r.ok) return;
+        const payload = await r.json();
+        this.collections = payload.collections || [];
+      } catch (_) { /* leave datalist empty on network error */ }
+    },
+
+    open(form) {
+      const db = this.db.trim();
+      const coll = this.coll.trim();
+      if (!db || !coll) return;
+      openModal(`/maintenance/drop-collection/${encodeURIComponent(db)}/${encodeURIComponent(coll)}/confirm`);
+    },
+  };
 }
 </script>
 {% endblock %}

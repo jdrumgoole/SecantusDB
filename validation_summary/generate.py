@@ -24,15 +24,16 @@ import argparse
 import datetime as dt
 import json
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import secantus
+from validation_summary import expected_failures as ef_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-@dataclass(frozen=True)
+@dataclass
 class GaugeStats:
     """Normalized per-gauge stats. Every gauge contributes one of these."""
 
@@ -40,9 +41,19 @@ class GaugeStats:
     language: str  # display label, e.g. "Java"
     driver_version: str  # the upstream tag / SHA being tested against
     passed: int
-    failed: int
+    failed: int  # total failures observed by the gauge
     skipped: int
+    failure_descriptions: list[str]  # the raw failure descriptions, for matching
     note: str = ""  # optional scope note (e.g. "21 of 112 functional classes")
+
+    # Populated by ``_apply_expected_failures`` below.
+    expected_failures: int = 0
+    expected_failure_entries: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def actionable_failures(self) -> int:
+        """Failures not pre-declared in ``expected_failures.py``."""
+        return self.failed - self.expected_failures
 
     @property
     def total(self) -> int:
@@ -55,6 +66,17 @@ class GaugeStats:
     @property
     def pass_rate(self) -> str:
         return f"{(self.passed / self.ran * 100):.1f}%" if self.ran else "—"
+
+    @property
+    def adjusted_pass_rate(self) -> str:
+        """Pass rate counting expected failures as if they're not in the
+        denominator — measures "how much of the conformable surface
+        actually conforms."
+        """
+        adj_ran = self.ran - self.expected_failures
+        if adj_ran <= 0:
+            return "—"
+        return f"{(self.passed / adj_ran * 100):.1f}%"
 
 
 def _read_submodule_head(rel: str) -> str:
@@ -99,6 +121,9 @@ def _collect_pymongo(raw_dir: Path) -> GaugeStats | None:
     raw = json.loads(f.read_text())
     s = raw.get("summary", {})
     passed = s.get("passed", 0) + s.get("subtests passed", 0)
+    failure_descs = [
+        t["nodeid"] for t in raw.get("tests", []) if t.get("outcome") in ("failed", "error")
+    ]
     return GaugeStats(
         name="pymongo",
         language="Python",
@@ -106,6 +131,7 @@ def _collect_pymongo(raw_dir: Path) -> GaugeStats | None:
         passed=passed,
         failed=s.get("failed", 0) + s.get("error", 0),
         skipped=s.get("skipped", 0),
+        failure_descriptions=failure_descs,
         note="curated pytest paths under vendor/pymongo-tests/test/",
     )
 
@@ -116,6 +142,7 @@ def _collect_go(raw_dir: Path) -> GaugeStats | None:
     if not f.exists():
         return None
     passed = failed = skipped = 0
+    failure_descs: list[str] = []
     for line in f.read_text().splitlines():
         try:
             ev = json.loads(line)
@@ -128,6 +155,7 @@ def _collect_go(raw_dir: Path) -> GaugeStats | None:
             passed += 1
         elif action == "fail":
             failed += 1
+            failure_descs.append(ev["Test"])
         elif action == "skip":
             skipped += 1
     return GaugeStats(
@@ -137,6 +165,7 @@ def _collect_go(raw_dir: Path) -> GaugeStats | None:
         passed=passed,
         failed=failed,
         skipped=skipped,
+        failure_descriptions=failure_descs,
         note="vendor/mongo-go-driver/internal/integration/...",
     )
 
@@ -148,6 +177,7 @@ def _collect_node(raw_dir: Path) -> GaugeStats | None:
         return None
     raw = json.loads(f.read_text())
     s = raw.get("stats", {})
+    failure_descs = [t.get("fullTitle", "") for t in raw.get("failures", [])]
     return GaugeStats(
         name="mongo-node-driver",
         language="Node.js",
@@ -155,6 +185,7 @@ def _collect_node(raw_dir: Path) -> GaugeStats | None:
         passed=s.get("passes", 0),
         failed=s.get("failures", 0),
         skipped=s.get("pending", 0),
+        failure_descriptions=failure_descs,
         note="curated test/integration/ spec set",
     )
 
@@ -169,6 +200,11 @@ def _collect_ruby(raw_dir: Path) -> GaugeStats | None:
     failed = s.get("failure_count", 0)
     skipped = s.get("pending_count", 0)
     passed = s.get("example_count", 0) - failed - skipped
+    failure_descs = [
+        e.get("full_description", "")
+        for e in raw.get("examples", [])
+        if e.get("status") == "failed"
+    ]
     return GaugeStats(
         name="mongo-ruby-driver",
         language="Ruby",
@@ -176,6 +212,7 @@ def _collect_ruby(raw_dir: Path) -> GaugeStats | None:
         passed=passed,
         failed=failed,
         skipped=skipped,
+        failure_descriptions=failure_descs,
         note="curated spec/mongo/*.rb spec files",
     )
 
@@ -186,6 +223,7 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
     if not xml_dir.is_dir():
         return None
     passed = failed = skipped = 0
+    failure_descs: list[str] = []
     for xml in xml_dir.rglob("TEST-*.xml"):
         try:
             root = ET.parse(xml).getroot()
@@ -194,6 +232,7 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
         for case in root.iter("testcase"):
             if case.find("failure") is not None or case.find("error") is not None:
                 failed += 1
+                failure_descs.append(case.attrib.get("name", ""))
             elif case.find("skipped") is not None:
                 skipped += 1
             else:
@@ -230,6 +269,7 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
         passed=passed,
         failed=failed,
         skipped=skipped,
+        failure_descriptions=failure_descs,
         note=note,
     )
 
@@ -237,14 +277,45 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
 _COLLECTORS = (_collect_pymongo, _collect_java, _collect_go, _collect_node, _collect_ruby)
 
 
+# Map gauge ``name`` to the matching expected-failures list.
+_EXPECTED_FAILURES_BY_GAUGE: dict[str, list[ef_module.ExpectedFailure]] = {
+    "pymongo": ef_module.PYMONGO,
+    "mongo-java-driver": ef_module.JAVA,
+    "mongo-go-driver": ef_module.GO,
+    "mongo-node-driver": ef_module.NODE,
+    "mongo-ruby-driver": ef_module.RUBY,
+}
+
+
+def _apply_expected_failures(g: GaugeStats) -> None:
+    """Mark each failure that matches an expected-failure pattern.
+
+    Mutates ``g`` in place: bumps ``expected_failures`` count and
+    records the ``(description, rationale)`` pair so the report can
+    list them inline.
+    """
+    expected_list = _EXPECTED_FAILURES_BY_GAUGE.get(g.name, [])
+    for desc in g.failure_descriptions:
+        ef = ef_module.find_match(expected_list, desc)
+        if ef is not None:
+            g.expected_failures += 1
+            g.expected_failure_entries.append((desc, ef.rationale))
+
+
 def render(raw_dir: Path, out_path: Path) -> None:
     gauges = [g for g in (c(raw_dir) for c in _COLLECTORS) if g is not None]
+    for g in gauges:
+        _apply_expected_failures(g)
 
     total_passed = sum(g.passed for g in gauges)
     total_failed = sum(g.failed for g in gauges)
     total_skipped = sum(g.skipped for g in gauges)
+    total_expected = sum(g.expected_failures for g in gauges)
+    total_actionable = total_failed - total_expected
     total_ran = total_passed + total_failed
     grand_rate = f"{(total_passed / total_ran * 100):.1f}%" if total_ran else "—"
+    adj_ran = total_ran - total_expected
+    adj_rate = f"{(total_passed / adj_ran * 100):.1f}%" if adj_ran > 0 else "—"
 
     md: list[str] = []
     md.append("# Cross-Driver Conformance Summary")
@@ -259,21 +330,44 @@ def render(raw_dir: Path, out_path: Path) -> None:
         "a `go test` event, or a pytest collected item."
     )
     md.append("")
+    md.append(
+        "**Failures split into two columns**: *Failed* counts tests that "
+        "actually need a fix on SecantusDB; *Expected* counts tests with a "
+        "documented reason for failing (driver-side cascade, out-of-scope "
+        "feature, single-node-topology assumption, known intermittent flake). "
+        "The expected list lives in `validation_summary/expected_failures.py` "
+        "and each entry carries a rationale. Adjusted pass rate = passes ÷ "
+        "(passes + actual failures)."
+    )
+    md.append("")
     md.append("## Summary by driver")
     md.append("")
-    md.append(
-        "| Driver | Language | Driver version | Tests run | Passed | Failed | Skipped | Pass rate |"
-    )
-    md.append("|---|---|---|---:|---:|---:|---:|---:|")
+    header_cols = [
+        "Driver",
+        "Language",
+        "Driver version",
+        "Tests run",
+        "Passed",
+        "Failed",
+        "Expected",
+        "Skipped",
+        "Pass rate",
+        "Adjusted",
+    ]
+    md.append("| " + " | ".join(header_cols) + " |")
+    md.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
     for g in gauges:
         md.append(
             f"| `{g.name}` | {g.language} | `{g.driver_version}` | "
-            f"{g.total} | {g.passed} | {g.failed} | {g.skipped} | {g.pass_rate} |"
+            f"{g.total} | {g.passed} | {g.actionable_failures} | "
+            f"{g.expected_failures} | {g.skipped} | {g.pass_rate} | "
+            f"{g.adjusted_pass_rate} |"
         )
     overall_total = total_passed + total_failed + total_skipped
     md.append(
         f"| **All drivers** | — | — | **{overall_total}** | **{total_passed}** | "
-        f"**{total_failed}** | **{total_skipped}** | **{grand_rate}** |"
+        f"**{total_actionable}** | **{total_expected}** | **{total_skipped}** | "
+        f"**{grand_rate}** | **{adj_rate}** |"
     )
     md.append("")
     md.append("## Per-driver scope")
@@ -281,6 +375,26 @@ def render(raw_dir: Path, out_path: Path) -> None:
     for g in gauges:
         md.append(f"- **`{g.name}`** — {g.note}.")
     md.append("")
+    if total_expected > 0:
+        md.append("## Expected failures")
+        md.append("")
+        md.append(
+            "These tests fail for documented reasons that have no SecantusDB-"
+            "side fix (driver-internal behaviour we can't influence, features "
+            "intentionally out of scope, single-node topology assumptions in "
+            "tests that assume a 3-node replica set, etc.). Each entry has a "
+            "rationale in `validation_summary/expected_failures.py`. If you fix "
+            "one of these gaps, delete its entry there."
+        )
+        md.append("")
+        for g in gauges:
+            if not g.expected_failure_entries:
+                continue
+            md.append(f"### `{g.name}` ({len(g.expected_failure_entries)})")
+            md.append("")
+            for desc, rationale in g.expected_failure_entries:
+                md.append(f"- **{desc}** — {rationale}")
+            md.append("")
     md.append("## Per-driver reports")
     md.append("")
     md.append(

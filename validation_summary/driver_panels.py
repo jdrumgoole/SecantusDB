@@ -1,0 +1,317 @@
+"""Regenerate the secantusdb.com driver-panel grid from validation data.
+
+The marketing site's ``themes/secantus/templates/partials/drivers_grid.html``
+shows one panel per driver gauge: headline pass-rate + tests passed /
+failed counts + a short prose note + a link to the per-driver
+validation report. The numbers must match what shipped — until now
+they were hand-edited and drifted release to release.
+
+This module:
+
+- Reads the same ``.validation/`` raw artifacts the cross-driver
+  summary parses (via ``validation_summary.generate`` collectors).
+- Pulls the prose notes / labels / report URLs from the curated
+  ``PANEL_PROSE`` / ``SMOKE_PANELS`` constants below — those stay
+  human-edited because they describe *what we test*, not the numbers.
+- Emits the complete ``drivers_grid.html`` ready to drop into the
+  website worktree.
+
+Usage::
+
+    uv run --no-sync python -m validation_summary.driver_panels \\
+        --raw-dir .validation \\
+        --out ../SecantusDB-website/website/themes/secantus/\\
+              templates/partials/drivers_grid.html
+
+Run after ``invoke validate-all`` (which populates ``.validation/``)
+and before deploying the website — wired into the release pipeline
+via the secantusdb-release skill.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from html import escape
+from pathlib import Path
+
+from validation_summary.generate import (
+    GaugeStats,
+    _apply_expected_failures,
+    _collect_go,
+    _collect_java,
+    _collect_node,
+    _collect_pymongo,
+    _collect_ruby,
+)
+
+# Prose notes per validated driver. The numbers come from the
+# validation artifacts; only this dict is hand-curated. Order is the
+# display order on the home-page grid.
+PANEL_PROSE: dict[str, dict[str, str]] = {
+    "pymongo": {
+        "title": "pymongo",
+        "lang": "Python",
+        "note": (
+            "The official MongoDB Python driver. The pymongo conformance "
+            "suite is the primary gauge for SecantusDB &mdash; we run "
+            "pymongo's own tests, unmodified, against an embedded SecantusDB."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report.html"),
+    },
+    "mongo-java-driver": {
+        "title": "mongo-java-driver",
+        "lang": "Java",
+        "note": (
+            "The driver enterprise MongoDB consumers most often use, and the "
+            "foundation for many JVM-language wrappers. We run a curated "
+            "subset of <code>driver-sync/src/test/functional/</code> plus the "
+            "BSON unit tests against an embedded SecantusDB daemon. Type-strict "
+            "decoders catch wire-shape divergences pymongo's permissive client "
+            "accepts silently."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-java.html"),
+    },
+    "mongo-node-driver": {
+        "title": "mongo-node-driver",
+        "lang": "Node.js",
+        "note": (
+            "The official Node driver, and the same driver <code>mongosh</code> "
+            "and the JavaScript ecosystem build on. We run a curated "
+            "<code>test/integration/</code> spec set via "
+            "<code>mocha --config test/mocha_mongodb.js</code> &mdash; real "
+            "wire commands against an embedded SecantusDB daemon."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-node.html"),
+    },
+    "mongo-go-driver": {
+        "title": "mongo-go-driver",
+        "lang": "Go",
+        "note": (
+            "The same driver <code>mongodump</code> and <code>mongorestore</code> "
+            "are built on. We run <code>./internal/integration/...</code> &mdash; "
+            "the package that opens real <code>mongo.Client</code> instances "
+            "and exchanges wire commands. Type-strict (<code>int32</code> vs "
+            "<code>int64</code>) bugs that pymongo accepts silently fail "
+            "loudly here."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-go.html"),
+    },
+    "mongo-ruby-driver": {
+        "title": "mongo-ruby-driver",
+        "lang": "Ruby",
+        "note": (
+            "The official MongoDB Ruby driver (mongo + bson 5.x), the gem the "
+            "Rails / Sinatra ecosystem builds on. We run a curated set of "
+            "integration spec files end-to-end against an embedded SecantusDB "
+            "daemon &mdash; every test opens a real <code>Mongo::Client</code>, "
+            "SCRAM-authenticates as a pre-provisioned <code>root-user</code>, "
+            "and exchanges wire commands."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html"),
+    },
+}
+
+# Trailing panels that aren't backed by ``.validation/`` raw data —
+# feature-smoke or pending. Kept fully hand-edited.
+SMOKE_PANELS: list[dict[str, str | None]] = [
+    {
+        "title": "mongo-php-library",
+        "lang": "PHP",
+        "kind": "smoke",
+        "kind_label": "Feature smokes",
+        "rate_value": "6 / 6",
+        "rate_label": "features verified",
+        "note": (
+            "The official high-level PHP library, built on the C-based "
+            "<code>ext-mongodb</code> extension. Same six features as the Ruby "
+            "driver &mdash; type fidelity, RBAC, <code>bulkWrite</code>, "
+            "<code>listDatabases</code> filter, logical sessions, cluster-role "
+            "bundles &mdash; verified end-to-end via "
+            "<code>composer install</code> + "
+            "<code>php &lt;feature&gt;_smoke.php</code>."
+        ),
+        "report_url": None,
+    },
+    {
+        "title": "mongo-rust-driver",
+        "lang": "Rust",
+        "kind": "pending",
+        "kind_label": "Pending",
+        "rate_value": None,
+        "rate_label": None,
+        "note": (
+            "A type-fidelity smoke is staged in "
+            "<code>tests/cross_driver/rust/</code>. Activation is gated on "
+            "mongo-rust-driver upstream catching up with the current "
+            "<code>tokio</code> / Rust toolchain &mdash; the 2.x line doesn't "
+            "compile against tokio 1.40+ and 3.x trips on a "
+            "<code>Runtime</code> API change with Rust 1.95. The smoke will "
+            "flip on once a stable build path lands."
+        ),
+        "report_url": None,
+    },
+]
+
+
+_COLLECTORS = {
+    "pymongo": _collect_pymongo,
+    "mongo-java-driver": _collect_java,
+    "mongo-node-driver": _collect_node,
+    "mongo-go-driver": _collect_go,
+    "mongo-ruby-driver": _collect_ruby,
+}
+
+
+def _format_rate(stats: GaugeStats) -> str:
+    """Headline pass-rate string used in the panel.
+
+    Reports ``actionable`` failures only — the expected_failures
+    classification removes documented gaps from the denominator, so the
+    headline matches what we tell users about conformance.
+    """
+    adj_ran = stats.ran - stats.expected_failures
+    if adj_ran <= 0:
+        return "&mdash;"
+    pct = stats.passed / adj_ran * 100
+    return f"{pct:.1f}%"
+
+
+def _render_validation_panel(name: str, stats: GaugeStats) -> str:
+    prose = PANEL_PROSE[name]
+    rate = _format_rate(stats)
+    expected_note = ""
+    if stats.expected_failures > 0:
+        word = "failure" if stats.expected_failures == 1 else "failures"
+        expected_note = (
+            f" &middot; <strong>{stats.expected_failures}</strong> documented {word} (see report)"
+        )
+    return (
+        f'  <article class="driver">\n'
+        f"    <header>\n"
+        f"      <h3>{escape(prose['title'])}</h3>\n"
+        f'      <span class="lang">{escape(prose["lang"])}</span>\n'
+        f"    </header>\n"
+        f'    <div class="pass-rate">\n'
+        f'      <span class="rate">{rate}</span>\n'
+        f'      <span class="rate-label">pass rate</span>\n'
+        f"    </div>\n"
+        f'    <p class="counts">'
+        f"<strong>{stats.passed}</strong> tests passed &middot; "
+        f"<strong>{stats.actionable_failures}</strong> failed"
+        f"{expected_note}"
+        f"</p>\n"
+        f'    <p class="note">{prose["note"]}</p>\n'
+        f'    <a class="report" href="{prose["report_url"]}" rel="noopener">'
+        f"Read the report &rarr;</a>\n"
+        f"  </article>\n"
+    )
+
+
+def _render_smoke_panel(panel: dict[str, str | None]) -> str:
+    parts = [
+        '  <article class="driver">\n',
+        "    <header>\n",
+        f"      <h3>{escape(str(panel['title']))}</h3>\n",
+        f'      <span class="lang">{escape(str(panel["lang"]))}</span>\n',
+    ]
+    if panel.get("kind"):
+        parts.append(
+            f'      <span class="kind {escape(str(panel["kind"]))}">'
+            f"{escape(str(panel['kind_label']))}</span>\n"
+        )
+    parts.append("    </header>\n")
+    if panel.get("rate_value"):
+        parts.extend(
+            [
+                '    <div class="pass-rate">\n',
+                f'      <span class="rate">{escape(str(panel["rate_value"]))}</span>\n',
+                f'      <span class="rate-label">{escape(str(panel["rate_label"]))}</span>\n',
+                "    </div>\n",
+            ]
+        )
+    parts.append(f'    <p class="note">{panel["note"]}</p>\n')
+    if panel.get("report_url"):
+        parts.append(
+            f'    <a class="report" href="{panel["report_url"]}" rel="noopener">'
+            f"Read the report &rarr;</a>\n"
+        )
+    parts.append("  </article>\n")
+    return "".join(parts)
+
+
+_GRID_FOOT = """\
+<p class="drivers-foot">
+  Plus a <strong>cross-driver feature matrix</strong>: every shipped feature
+  (auth, change streams, custom roles, sessions, geo, bulk writes, type
+  fidelity&hellip;) is verified end-to-end through the Python / Java /
+  Node / Go / Ruby / PHP drivers via dedicated smoke tests &mdash; so a
+  wire-shape divergence that one driver is permissive about gets caught
+  by another.
+</p>
+"""
+
+
+def render(raw_dir: Path) -> str:
+    """Build the full ``drivers_grid.html`` text from ``.validation/``."""
+    panels: list[str] = []
+    for name, collector in _COLLECTORS.items():
+        stats = collector(raw_dir)
+        if stats is None:
+            raise SystemExit(
+                f"missing validation artifact for {name!r} under {raw_dir}; "
+                "run `invoke validate-all` first"
+            )
+        _apply_expected_failures(stats)
+        panels.append(_render_validation_panel(name, stats))
+    for s in SMOKE_PANELS:
+        panels.append(_render_smoke_panel(s))
+    return '<div class="drivers">\n' + "\n".join(panels) + "</div>\n\n" + _GRID_FOOT
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Regenerate secantusdb.com's driver-panel grid HTML from the "
+            "current .validation/ artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=Path(".validation"),
+        help="Directory holding the per-gauge raw artifacts (default: .validation).",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "Where to write drivers_grid.html (typically "
+            "<website-worktree>/website/themes/secantus/templates/"
+            "partials/drivers_grid.html). Required unless ``--print`` is set."
+        ),
+    )
+    parser.add_argument(
+        "--print",
+        dest="just_print",
+        action="store_true",
+        help="Print the rendered HTML to stdout instead of writing to disk.",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.just_print and args.out is None:
+        parser.error("--out is required unless --print is set")
+
+    html = render(args.raw_dir)
+    if args.just_print:
+        sys.stdout.write(html)
+        return 0
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(html, encoding="utf-8")
+    print(f"wrote {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

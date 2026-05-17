@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "partials/_macros.html" import empty_row %}
 {% block content %}
 <nav class="breadcrumb">
   <a href="/db">Databases</a> <span class="sep">/</span> <span>{{ db_name }}</span>
@@ -30,7 +31,7 @@
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="5" class="empty">No collections.</td></tr>
+        {{ empty_row(5, "No collections.") }}
       {% endfor %}
     </tbody>
   </table>

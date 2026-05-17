@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "partials/_macros.html" import empty_row %}
 {% block content %}
 {% if error %}
   <div class="error">Could not list databases: {{ error }}</div>
@@ -17,7 +18,7 @@
           <td class="num">{{ db.sizeOnDisk | humanize_bytes }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="2" class="empty">No databases.</td></tr>
+        {{ empty_row(2, "No databases.") }}
       {% endfor %}
     </tbody>
   </table>

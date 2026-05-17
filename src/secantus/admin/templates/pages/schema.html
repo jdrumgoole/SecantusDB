@@ -13,7 +13,7 @@
 <form class="filter-form" method="get" action="/db/{{ db_name }}/{{ coll_name }}/schema">
   <div class="filter-controls">
     <label>
-      Sample size
+      Sample size <span class="muted">(max 1000)</span>
       <input type="number" name="sample_size" min="1" max="1000" value="{{ sample_size }}" />
     </label>
     <button type="submit">Re-sample</button>

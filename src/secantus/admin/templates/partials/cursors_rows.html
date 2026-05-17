@@ -1,0 +1,33 @@
+{% from "partials/_macros.html" import empty_row %}
+<tbody
+  id="cursors-tbody"
+  hx-get="/cursors/_rows"
+  hx-trigger="every 5s"
+  hx-swap="outerHTML"
+>
+  {% for r in rows %}
+    <tr id="cursor-{{ r.cursor_id }}">
+      <td><code>{{ r.cursor_id }}</code></td>
+      <td><code>{{ r.ns or '—' }}</code></td>
+      <td>
+        {% if r.tailable %}<span class="badge">tailable</span>{% endif %}
+        {% if r.await_data %}<span class="badge">awaitData</span>{% endif %}
+      </td>
+      <td class="doc-actions">
+        {% if r.killable %}
+          <button
+            type="button"
+            class="btn-danger"
+            hx-get="/cursors/{{ r.cursor_id }}/kill-confirm?ns={{ r.ns | urlencode }}"
+            hx-target="#modal"
+            hx-swap="innerHTML"
+          >Kill</button>
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    {{ empty_row(4, "No cursors.") }}
+  {% endfor %}
+</tbody>

@@ -55,6 +55,16 @@ class _FailCommand:
     close_connection: bool = False
     """If True, drop the TCP connection abruptly when matched."""
 
+    block_connection: bool = False
+    """If True, sleep for ``block_time_ms`` before processing the command."""
+
+    block_time_ms: int = 0
+    """Duration of the block in milliseconds (only honoured when
+    ``block_connection`` is True). mongo-node-driver's CSOT explain
+    tests use ``blockTimeMS: 2000`` so the client-side ``timeoutMS:
+    1000`` timer fires first, surfacing as ``MongoOperationTimeoutError``.
+    """
+
     times_remaining: int | None = None
     """``None`` == ``alwaysOn``; an int counts down to zero."""
 
@@ -70,6 +80,8 @@ class FailPointMatch:
     error_labels: tuple[str, ...] = ()
     write_concern_error: dict[str, Any] | None = None
     close_connection: bool = False
+    block_connection: bool = False
+    block_time_ms: int = 0
 
 
 class CloseConnectionRequested(Exception):
@@ -134,6 +146,8 @@ class FailPointRegistry:
                 ),
                 error_labels=tuple(data.get("errorLabels") or ()),
                 close_connection=bool(data.get("closeConnection", False)),
+                block_connection=bool(data.get("blockConnection", False)),
+                block_time_ms=int(data.get("blockTimeMS", 0) or 0),
                 times_remaining=times,
                 skip_remaining=skip,
             )
@@ -161,5 +175,7 @@ class FailPointRegistry:
                     error_labels=fc.error_labels,
                     write_concern_error=fc.write_concern_error,
                     close_connection=fc.close_connection,
+                    block_connection=fc.block_connection,
+                    block_time_ms=fc.block_time_ms,
                 )
             return None
