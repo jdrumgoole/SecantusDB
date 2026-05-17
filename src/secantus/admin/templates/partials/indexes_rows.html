@@ -1,0 +1,34 @@
+{% from "partials/_macros.html" import empty_row %}
+<tbody
+  id="indexes-tbody"
+  hx-get="/db/{{ db_name }}/{{ coll_name }}/indexes/_rows"
+  hx-trigger="indexes-changed from:body"
+  hx-swap="outerHTML"
+>
+  {% for row in rows %}
+    <tr id="ix-{{ row.name }}">
+      <td><code>{{ row.name }}</code></td>
+      <td><code>{{ row.key_str }}</code></td>
+      <td>
+        {% for badge in row.badges %}
+          <span class="badge">{{ badge }}</span>
+        {% endfor %}
+      </td>
+      <td class="doc-actions">
+        {% if row.droppable %}
+          <button
+            type="button"
+            class="btn-danger"
+            hx-get="/db/{{ db_name }}/{{ coll_name }}/indexes/{{ row.name }}/drop-confirm"
+            hx-target="#modal"
+            hx-swap="innerHTML"
+          >Drop</button>
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    {{ empty_row(4, "No indexes (collection may not exist).") }}
+  {% endfor %}
+</tbody>

@@ -1,5 +1,4 @@
 {% extends "base.html" %}
-{% from "partials/_macros.html" import empty_row %}
 {% block content %}
 <nav class="breadcrumb">
   <a href="/db">Databases</a>
@@ -21,15 +20,27 @@
 {% endif %}
 
 <details class="create-form-shell" open>
-  <summary>Create index</summary>
+  <summary>+ New index</summary>
   <form
     class="filter-form"
     method="post"
     action="/db/{{ db_name }}/{{ coll_name }}/indexes"
     hx-post="/db/{{ db_name }}/{{ coll_name }}/indexes"
     hx-swap="none"
-    hx-on::after-request="if(event.detail.successful) window.location.reload()"
+    x-data="{ errorMsg: '' }"
+    hx-on::after-request="
+      if (event.detail.successful) {
+        errorMsg = '';
+        event.target.reset();
+      } else {
+        const xhr = event.detail.xhr;
+        let msg = (xhr.responseText || '').trim();
+        try { const j = JSON.parse(msg); if (j.detail) msg = j.detail; } catch (_) {}
+        errorMsg = msg || ('Create index failed (HTTP ' + xhr.status + ').');
+      }
+    "
   >
+    <div class="error" x-show="errorMsg" x-text="errorMsg" x-cloak></div>
     <label class="filter-label">
       Key spec (Extended JSON)
       <textarea name="key" rows="2" placeholder='e.g. {"name": 1} or {"loc": "2dsphere"}'></textarea>
@@ -69,34 +80,7 @@
       <th class="doc-actions-col">Actions</th>
     </tr>
   </thead>
-  <tbody>
-    {% for row in rows %}
-      <tr id="ix-{{ row.name }}">
-        <td><code>{{ row.name }}</code></td>
-        <td><code>{{ row.key_str }}</code></td>
-        <td>
-          {% for badge in row.badges %}
-            <span class="badge">{{ badge }}</span>
-          {% endfor %}
-        </td>
-        <td class="doc-actions">
-          {% if row.droppable %}
-            <button
-              type="button"
-              class="btn-danger"
-              hx-get="/db/{{ db_name }}/{{ coll_name }}/indexes/{{ row.name }}/drop-confirm"
-              hx-target="#modal"
-              hx-swap="innerHTML"
-            >Drop</button>
-          {% else %}
-            <span class="muted">—</span>
-          {% endif %}
-        </td>
-      </tr>
-    {% else %}
-      {{ empty_row(4, "No indexes (collection may not exist).") }}
-    {% endfor %}
-  </tbody>
+  {% include "partials/indexes_rows.html" %}
 </table>
 
 <div id="modal"></div>

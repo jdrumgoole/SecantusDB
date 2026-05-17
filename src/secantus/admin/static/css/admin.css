@@ -195,10 +195,18 @@ body {
   letter-spacing: 0.02em;
 }
 
+/* CSS-drawn status dot used by the server badge and the embedded-
+ * server "running" indicator. Drawn rather than typographic so it's
+ * visually distinct from the brand mark (which keeps the ``●`` glyph
+ * at 1.5rem). Empty span: the ``::before`` doesn't matter, the
+ * element itself is the dot. */
 .server-badge-dot {
-  color: var(--accent);
-  font-size: 0.7rem;
-  line-height: 1;
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: 0.05em;
 }
 
 .server-badge code {
@@ -384,6 +392,11 @@ body {
   color: var(--muted);
 }
 
+.badge-error {
+  border-color: var(--error);
+  color: var(--error);
+}
+
 /* Collection viewer — filter form, docs table, pager */
 
 .filter-form {
@@ -396,7 +409,8 @@ body {
   gap: 0.75rem;
 }
 
-.filter-form label {
+.filter-form label,
+.filter-label {
   display: block;
   font-size: 0.78rem;
   text-transform: uppercase;

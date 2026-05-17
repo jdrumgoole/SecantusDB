@@ -78,7 +78,7 @@
   <h2 class="section-title">Last subprocess output</h2>
   <p class="modal-meta">
     Exit code <code>{{ last_result.returncode }}</code> ·
-    {% if last_result.ok %}<span class="badge">ok</span>{% else %}<span class="badge" style="border-color: var(--error); color: var(--error)">error</span>{% endif %}
+    {% if last_result.ok %}<span class="badge">ok</span>{% else %}<span class="badge badge-error">error</span>{% endif %}
   </p>
   {% if last_result.stdout %}
     <h3 class="section-title">stdout</h3>
