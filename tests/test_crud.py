@@ -1318,7 +1318,21 @@ def test_aggregate_merge_when_matched_delete(client: MongoClient) -> None:
     db = client["merge_delete_db"]
     db["src"].insert_many([{"_id": 1}, {"_id": 2}])
     db["dst"].insert_many([{"_id": 1, "tag": "x"}, {"_id": 3, "tag": "untouched"}])
-    list(db["src"].aggregate([{"$merge": {"into": "dst", "whenMatched": "delete"}}]))
+    # whenNotMatched=discard so the unmatched src doc (_id=2) doesn't
+    # land in dst — the assertion is purely about the delete path.
+    list(
+        db["src"].aggregate(
+            [
+                {
+                    "$merge": {
+                        "into": "dst",
+                        "whenMatched": "delete",
+                        "whenNotMatched": "discard",
+                    }
+                }
+            ]
+        )
+    )
     remaining = sorted(db["dst"].find(), key=lambda d: d["_id"])
     assert remaining == [{"_id": 3, "tag": "untouched"}]
 

@@ -51,17 +51,29 @@ _REMOVE_SENTINEL: Any = object()
 
 
 def _resolve_var(name: str, ctx: _Ctx) -> Any:
-    if name in ctx.vars:
-        return ctx.vars[name]
-    if name in ("ROOT", "CURRENT"):
-        return ctx.doc
-    if name == "REMOVE":
+    # ``$$var.a.b`` means resolve ``var`` from system / user vars, then
+    # walk the dotted path into the result. Real mongod supports this
+    # everywhere (e.g. ``$$ROOT.field``, ``$$new.delta``); without it
+    # the only way to read a field of a var would be ``$$var`` whole-
+    # doc + downstream stage massage, which is awkward for $merge let.
+    base, _, rest = name.partition(".")
+    if base in ctx.vars:
+        value: Any = ctx.vars[base]
+    elif base in ("ROOT", "CURRENT"):
+        value = ctx.doc
+    elif base == "REMOVE":
         # MongoDB 5.0+ ``$$REMOVE`` is a sentinel that, when used as a
         # ``$setField`` / ``$addFields`` / ``$project`` value, deletes
         # the field instead of writing it. ``_op_set_field`` checks for
         # this identity to drop the key.
         return _REMOVE_SENTINEL
-    raise ExpressionError(f"system variable $${name} is not defined")
+    else:
+        raise ExpressionError(f"system variable $${base} is not defined")
+    if not rest:
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    return get_path(dict(value), rest, default=None)
 
 
 def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
