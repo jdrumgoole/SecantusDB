@@ -19,7 +19,12 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-### Admin UI `/oplog` page, change-stream `showExpandedEvents`, `killOp`, deterministic `$sample`
+(No entries yet — the next release will be cut from work landing on
+`main` after v0.5.1b18.)
+
+## [0.5.1b18] — 2026-05-18
+
+### Native WT-checkpoint backups, admin UI /oplog page, and change-stream fidelity wins
 
 The natural follow-on to v0.5.1b17's `local.oplog.rs` synthetic
 collection lands as the admin UI `/oplog` page: a paged entry
@@ -475,7 +480,8 @@ of record. See the [GitHub
 Releases](https://github.com/jdrumgoole/SecantusDB/releases) page for
 the auto-generated commit-list notes from those tags.
 
-[Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b17...HEAD
+[Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b18...HEAD
+[0.5.1b18]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b18
 [0.5.1b17]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b17
 [0.5.1b16]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b16
 [0.5.1b15]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b15
