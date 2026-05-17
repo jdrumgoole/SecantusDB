@@ -19,16 +19,32 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-### Aggregation: `$merge` pipeline form + `$fill` stage + `$$var.path` resolution
+### `local.oplog.rs` queryable from pymongo, `$merge` pipeline form + `$fill` stage + `$$var.path` resolution
+
+Real mongod exposes the oplog as a queryable collection at
+`local.oplog.rs` — pymongo clients can `db.oplog.rs.find()` against
+it the same way they would against any collection. Until this release,
+SecantusDB's oplog was internal only: `Storage.read_oplog` /
+`oplog_floor_seq` / `oplog_tail_seq` were Python methods but had no
+wire surface. Now `local.oplog.rs` is a synthetic read-only view —
+`list_collections("local")` surfaces it, `find` / `count` /
+`listCollections.options` route to a reader that walks the oplog WT
+table directly, and write attempts (`insert`, `update`, `delete`,
+`findAndModify`, `drop`, `create`, `createIndexes`) refuse with code
+13 (Unauthorized) like mongod does. The deferred admin UI `/oplog`
+page is unblocked as a follow-up; for now, debugging an in-flight
+change-stream pipeline is as simple as
+`client.local.oplog_rs.find({"op": "u"}).sort("ts", -1).limit(20)`.
 
 The aggregation expression library picks up two of the three remaining
-stages on most "more stages" wishlists. `$merge` was partly implemented;
-this batch fills in the rest: `whenMatched: [<pipeline>]` runs a
-sub-pipeline against the matched target doc with `$$new` bound to the
-source doc and any user `let` vars threaded through; `whenMatched:
-"delete"` (MongoDB 5.0+) removes the matched doc; a unique-index guard
-refuses non-`_id` `on` fields without a `unique: true` index covering
-them, matching mongod's rule against silent on-field collapse.
+stages on most "more stages" wishlists. `$merge` was partly
+implemented; this batch fills in the rest: `whenMatched: [<pipeline>]`
+runs a sub-pipeline against the matched target doc with `$$new` bound
+to the source doc and any user `let` vars threaded through;
+`whenMatched: "delete"` (MongoDB 5.0+) removes the matched doc; a
+unique-index guard refuses non-`_id` `on` fields without a `unique:
+true` index covering them, matching mongod's rule against silent
+on-field collapse.
 
 `$fill` lands fresh — the 5.3+ stage for filling missing/null fields.
 Three modes per output field: `{value: <expr>}` replaces with an
@@ -47,6 +63,10 @@ evaluator only did exact-name var lookup. Fixed in the same batch:
 across `$$ROOT.f` / `$$CURRENT.f` / user-let vars.
 
 #### Added
+- `local.oplog.rs` synthetic collection: queryable via `find` /
+  `count` / `listCollections`. Walks the existing oplog WT table via
+  a private session for cross-thread visibility. `list_databases`
+  surfaces `local` whenever the oplog is enabled.
 - `$merge whenMatched: [<pipeline>]` with `$$new` binding + `let` clause
   for user-defined vars (`aggregate._stage_merge`).
 - `$merge whenMatched: "delete"` (MongoDB 5.0+).
@@ -55,8 +75,13 @@ across `$$ROOT.f` / `$$CURRENT.f` / user-let vars.
   (`aggregate._stage_fill`).
 - `$$var.field.path` dotted-path resolution in
   `expressions._resolve_var`.
+- `docs/changelog.md` as the system of record (see the
+  [changelog](changelog) itself and the `changelog/` Python package
+  that generates blog posts from it).
 
 #### Changed
+- Writes to `local.oplog.rs` (insert / update / delete / findAndModify
+  / drop / create / createIndexes) refuse with code 13 (Unauthorized).
 - `$merge` validates `whenMatched` / `whenNotMatched` against the
   allowed string sets — typos surface as `AggregateError` instead of
   silently falling through to the default merge.

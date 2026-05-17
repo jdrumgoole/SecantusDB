@@ -89,7 +89,10 @@ def test_list_collections_and_databases(storage: Storage) -> None:
     storage.insert("db1", "c2", [{"x": 1}])
     storage.insert("db2", "c1", [{"x": 1}])
     assert storage.list_collections("db1") == ["c1", "c2"]
-    assert storage.list_databases() == ["db1", "db2"]
+    # ``local`` is synthesised when the oplog is enabled (mongod always
+    # exposes it); filter it out so this test focuses on user databases.
+    user_dbs = [db for db in storage.list_databases() if db != "local"]
+    assert user_dbs == ["db1", "db2"]
 
 
 def test_databases_are_isolated(storage: Storage) -> None:
