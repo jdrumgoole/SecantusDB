@@ -92,23 +92,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ### P1 — significant inconsistency / usability
 
-- [ ] **`/backup/dump` and `/backup/restore` block the request thread** — `routers/backup.py:91, 110` call `backup_lib.run_mongodump` / `run_mongorestore` synchronously. A 500MB collection dump hangs the page for tens of seconds, though it now shows a spinner + disabled button while running (admin-ui-polish, May 2026). Ideally wrap in a background task with poll status for tens-of-seconds workloads.
-
-- [ ] **`HX-Redirect` on indexes POST forces a full reload that loses scroll position** — `routers/indexes.py:179-186`. Long index lists drop the user back to the top. Switch to `HX-Trigger: indexes-changed` plus `hx-trigger="indexes-changed from:body"` on the table tbody to swap rows only.
+- [ ] **`/backup/dump` and `/backup/restore` long-task UX** — calls `backup_lib.run_mongodump` / `run_mongorestore` synchronously. Spinner + disabled button covers the visible UX gap for normal-sized dumps; the ideal version is a real background-task wrapper with poll status so the user can navigate away during multi-minute dumps of large collections. Not load-bearing — defer until someone actually hits a multi-minute dump.
 
 ### P2 — polish
 
-- [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code:
-  - **Undefined-but-used class**: `.filter-label` is used in 17 places but never defined in `admin.css`. Either define it (currently `.filter-form label` is the de-facto rule) or replace usages.
-  - **Inline error styling** in `pages/profiler.html:67` and `pages/backup.html:62` (`style="border-color: var(--error); color: var(--error)"`) — promote to `.badge-error` and use a class.
-  - **Brand-mark glyph reuse**: `●` is used as the brand glyph, the server-badge dot, and the embedded-server "running" indicator — three semantic uses of one character. Different glyphs or sizes for state-indicator vs brand-mark would help.
-  - **Opposite ordering conventions**: change-stream events are newest-first (`pages/changestream.html:114` `unshift`); logs are oldest-first (`partials/logs_lines.html:4`). Pick one.
-  - **Empty-state copy is uneven**: "No databases.", "No documents match.", "No fields seen — collection may be empty." Compute "0 of N documents match filter" vs "0 documents in <coll>" so users can tell empty-collection from no-match.
-  - **No favicon**: `<head>` in `base.html` has no `<link rel="icon">`; `/favicon.ico` requests will 401 through the auth middleware.
-  - **Logs page** has no last-updated timestamp despite polling every 2s — user can't tell if the poll is alive (`pages/logs.html:9`, `partials/logs_lines.html:4`).
-  - **Schema page** sample size silently caps at 1000 (`extras.py:35-42`); show "(max 1000)" in the label.
-  - **Geo page** always picks the first `2dsphere`/`2d` field (`extras.py:139-143`); collections with two geo fields can't see the second. Add a `<select>` populated from `geo_indexes`.
-  - **Index/user create forms** are wrapped in `<details><summary>Create X</summary>` with the same label on both summary and submit button; rename summary to "+ New X".
+- [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
 
 ---
 
