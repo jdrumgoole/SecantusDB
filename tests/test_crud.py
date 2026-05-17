@@ -2106,9 +2106,17 @@ def test_killop_unknown_opid_returns_ok(client: MongoClient) -> None:
 
 
 def test_killop_known_opid_closes_connection(server) -> None:
-    """``killOp`` against a real opid shuts the connection's socket."""
+    """``killOp`` against a real opid shuts the connection's socket.
+
+    Verifies via ``currentOp``: the victim's conn_id disappears from
+    the in-progress list after the kill. (pymongo's pool silently
+    reopens a new connection on the next command, so we can't rely on
+    the client-side surfacing an error — the server-side registry is
+    the ground truth.)
+    """
+    import time
+
     from pymongo import MongoClient
-    from pymongo.errors import AutoReconnect, ConnectionFailure
 
     victim = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
     try:
@@ -2131,12 +2139,19 @@ def test_killop_known_opid_closes_connection(server) -> None:
             assert res["ok"] == 1.0
             assert "killed" in res["info"]
 
-            # The victim's pool sees the socket close on next use and
-            # raises AutoReconnect / ConnectionFailure on the first
-            # follow-up command (pymongo reconnects after that).
-            with pytest.raises((AutoReconnect, ConnectionFailure)):
-                for _ in range(3):
-                    victim.admin.command("hello")
+            # Poll currentOp until the killed conn is gone — server-side
+            # registry is the ground truth (pymongo's pool transparently
+            # reconnects without surfacing an error on the client side).
+            deadline = time.monotonic() + 2.0
+            inprog = admin.admin.command("currentOp").get("inprog", []) or []
+            opids = {int(r["opid"]) for r in inprog if r.get("type") == "op"}
+            while victim_id in opids and time.monotonic() < deadline:
+                time.sleep(0.05)
+                inprog = admin.admin.command("currentOp").get("inprog", []) or []
+                opids = {int(r["opid"]) for r in inprog if r.get("type") == "op"}
+            assert victim_id not in opids, (
+                f"victim {victim_id} still in currentOp after killOp: {opids}"
+            )
         finally:
             admin.close()
     finally:

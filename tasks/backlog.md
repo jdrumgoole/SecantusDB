@@ -25,8 +25,6 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
-- [ ] **`killOp` / connection-close command**: real mongod exposes `db.killOp(opid)` to abort an in-flight op (which also reaps the connection's TCP socket). SecantusDB has no equivalent — the admin UI's `/connections` page (Slice 8) is read-only as a result. Implementation needs interruptible commands at the dispatch layer (a per-op cancel flag the long-running paths poll) plus a wire command that takes `opid` and either signals the flag or closes the per-connection socket directly. Until then, "kill this connection" is a TODO on the connections page.
-- [ ] **Admin UI `/oplog` page**: now that `local.oplog.rs` is queryable (May 2026), the deferred admin UI oplog page can land — paged entry browser with window selector (last 100, last 1000, custom ts range), filter by `op` and `ns`, expandable per-row JSON. Reuse the standard `_rows` partial pattern from `/connections` + `/cursors`; the data source is just `client.local.oplog_rs.find(filter).sort("ts", -1).limit(N)`.
 - [ ] **Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 - [ ] **Admin UI native WT-checkpoint backup**: Slice 12 ships a mongodump/mongorestore-driven `/backup` page; the originally-planned "WT checkpoint → tar" path is parked here. It would (1) call `Storage.checkpoint()` to flush, (2) tar the storage directory, (3) deliver the archive. The hard part is that the admin app talks to SecantusDB only over the wire — it doesn't know the server's `storage_path`. The cleanest implementation is a `secantusAdmin.backupArchive` wire command that takes a server-side output path, performs the checkpoint, and writes the tarball. Skipped from Slice 12 to keep that slice focused on the tools-on-PATH happy path.
 - [ ] **`$densify` variable-length date units** — numeric ranges and fixed-duration date units (`week` / `day` / `hour` / `minute` / `second` / `millisecond`) are implemented; `month` / `quarter` / `year` are rejected with a clear error. Supporting them needs `relativedelta`-style arithmetic which isn't worth a new dependency yet.
@@ -46,7 +44,6 @@ Single-node change streams are implemented and conformant for typical pymongo `w
 
 - [ ] **Multi-document transactions in change events** — `txnNumber` and `lsid` are never present on change events; SecantusDB has no real transaction state.
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
-- [ ] **`showExpandedEvents`** — accepted, ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 - [ ] **`updateDescription.truncatedArrays`** — emitted only when the post array is a strict head-prefix of the pre array. Other array reshapes produce a wholesale `updatedFields` entry rather than the in-place diff mongod would produce.
 
@@ -71,7 +68,6 @@ These are explicit non-goals. Don't add them without a reason.
 
 Subtler than the above; these may bite specific test suites.
 
-- [ ] **`$sample`** — uses `random.sample` without a fixed seed. Deterministic only if test does `random.seed(...)` first.
 - [ ] **`$type: "number"`** in queries — handles `int`, `float`, `Decimal128`, but the int32-vs-int64 distinction depends on Python value range, not the original BSON type tag (which we throw away on decode). A doc inserted as `Int64(5)` reads back as a small Python int and matches `$type: "int"`, not `"long"`.
 - [ ] **`$lookup` simple-form-plus-pipeline** — when both `localField`/`foreignField` and `pipeline` are present, we pre-filter by the simple form and then run the pipeline. Real MongoDB does this too in modern versions, but the documentation isn't crystal clear on the order. If a test breaks here, this is the place to look.
 - [ ] **Aggregation `$group` stable order** — group buckets are emitted in first-seen order, not sorted. Matches MongoDB for unsharded but might differ from sharded behavior (which we don't model).
