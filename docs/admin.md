@@ -11,11 +11,6 @@ It's **dev-tool shaped**, not a production console. The window connects
 over loopback to one target server per launch, gates HTTP access with a
 fixed local token, and never makes outbound network calls of its own.
 
-```{contents}
-:local:
-:depth: 2
-```
-
 ## Install
 
 The UI lives behind an optional extra so it doesn't pull a FastAPI /
