@@ -167,3 +167,22 @@ def test_list_backups_reports_size(tmp_path) -> None:
     [entry] = list_backups(tmp_path)
     assert entry.size_bytes == 1024
     assert entry.path == backup
+
+
+def test_list_backups_includes_native_tar_gz_archives(tmp_path) -> None:
+    """``archive-<stamp>.tar.gz`` from the native checkpoint backup
+    path shows up alongside mongodump directories."""
+    dump = tmp_path / "20260101T000000Z"
+    dump.mkdir()
+    (dump / "data.bson").write_bytes(b"x")
+    archive = tmp_path / "archive-20260101T000000.tar.gz"
+    archive.write_bytes(b"\x1f\x8b" + b"x" * 1024)  # arbitrary gz-shaped blob
+    names = sorted(e.name for e in list_backups(tmp_path))
+    assert names == sorted([archive.name, dump.name])
+
+
+def test_list_backups_ignores_unrelated_files(tmp_path) -> None:
+    """Files that aren't ``.tar.gz`` and aren't directories are skipped."""
+    (tmp_path / "readme.txt").write_text("ignore me")
+    (tmp_path / "scratch.bson").write_bytes(b"...")
+    assert list_backups(tmp_path) == []

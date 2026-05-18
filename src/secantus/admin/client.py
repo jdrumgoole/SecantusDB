@@ -632,6 +632,34 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(friendly_error(exc)) from exc
 
+    def restore_archive(
+        self,
+        archive_path: str,
+        target_dir: str,
+        *,
+        allow_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Issue ``secantusAdmin.restoreArchive`` against the target.
+
+        Server-side extracts the archive into ``target_dir``. The
+        caller then points a *new* SecantusDB process at that dir to
+        switch to the restored data — the currently-running server's
+        storage is not modified.
+        """
+        try:
+            return dict(
+                self._get_client().admin.command(
+                    "secantusAdmin.restoreArchive",
+                    archivePath=str(archive_path),
+                    targetDir=str(target_dir),
+                    allowExisting=bool(allow_existing),
+                )
+            )
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
     # ---- maintenance ---------------------------------------------------
 
     def fsync(self) -> dict[str, Any]:

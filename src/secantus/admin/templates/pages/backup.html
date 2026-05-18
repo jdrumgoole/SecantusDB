@@ -71,23 +71,51 @@
         <td><code>{{ r.name }}</code></td>
         <td class="num">{{ r.size }}</td>
         <td class="doc-actions">
-          <form
-            method="post"
-            action="/backup/restore"
-            class="inline-form"
-            x-data="{ busy: false }"
-            @submit="busy = true"
-          >
-            <input type="hidden" name="name" value="{{ r.name }}" />
-            <button
-              type="submit"
-              class="btn-danger"
-              x-bind:disabled="busy{% if not preflight_ok %} || true{% endif %}"
+          {% if r.name.endswith('.tar.gz') %}
+            <form
+              method="post"
+              action="/backup/restore-archive"
+              class="inline-form"
+              x-data="{ busy: false }"
+              @submit="busy = true"
             >
-              <span x-show="!busy">Restore</span>
-              <span x-show="busy" x-cloak><span class="spinner"></span> Restoring…</span>
-            </button>
-          </form>
+              <input type="hidden" name="name" value="{{ r.name }}" />
+              <input
+                type="text"
+                name="target_dir"
+                value="{{ backup_root }}/restored-{{ r.name[:-7] }}"
+                size="60"
+                title="Server-side directory to extract the archive into. Must be empty or non-existent."
+              />
+              <button
+                type="submit"
+                class="btn-danger"
+                x-bind:disabled="busy"
+                title="Extract this archive. Then restart SecantusDB with --storage-path pointing at the target directory."
+              >
+                <span x-show="!busy">Extract</span>
+                <span x-show="busy" x-cloak><span class="spinner"></span> Extracting…</span>
+              </button>
+            </form>
+          {% else %}
+            <form
+              method="post"
+              action="/backup/restore"
+              class="inline-form"
+              x-data="{ busy: false }"
+              @submit="busy = true"
+            >
+              <input type="hidden" name="name" value="{{ r.name }}" />
+              <button
+                type="submit"
+                class="btn-danger"
+                x-bind:disabled="busy{% if not preflight_ok %} || true{% endif %}"
+              >
+                <span x-show="!busy">Restore</span>
+                <span x-show="busy" x-cloak><span class="spinner"></span> Restoring…</span>
+              </button>
+            </form>
+          {% endif %}
         </td>
       </tr>
     {% else %}

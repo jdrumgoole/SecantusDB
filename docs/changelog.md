@@ -19,8 +19,68 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-(No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b18.)
+### Native checkpoint restore: wire command, admin UI Extract button, offline CLI
+
+Counterpart to v0.5.1b18's `secantusAdmin.backupArchive`. The new
+`secantusAdmin.restoreArchive` wire command extracts a backup
+`.tar.gz` into a server-side target directory the operator then
+points a fresh SecantusDB process at — same shape real mongod's
+"stop, swap dbpath, start" restore tooling already trains people
+for. The admin UI's per-row Restore button now adapts to backup
+type: mongodump directories still call `mongorestore`, while
+native `.tar.gz` archives surface an inline target-dir field plus
+an Extract action that hits the new endpoint.
+
+Restore intentionally doesn't try to swap the WT home under a
+running server. That mode would need a wholesale rework of how
+connection threads cache WT sessions lock-free — and even then
+the calling client would lose its session mid-response. The
+side-channel design ships clean today and matches the operational
+expectation set by mongorestore.
+
+A new offline CLI `secantusdb-restore-archive --archive PATH
+--target-dir PATH` exposes the same extraction with no wire round-
+trip, for when the source SecantusDB isn't currently running.
+The admin UI's "Existing backups" list now also includes
+`.tar.gz` files (previously only mongodump directories showed up
+— the native archives created by the b18 backup button were
+invisible).
+
+#### Added
+
+- `secantusAdmin.restoreArchive` wire command. Accepts
+  `archivePath` (server-side path to `.tar.gz`), `targetDir`
+  (extraction destination), and optional `allowExisting` (overlay
+  into a non-empty dir). Returns `{targetDir, fileCount, archive,
+  ok: 1}`. RBAC: `fsync` action, cluster scope.
+- `secantus.storage.extract_backup_archive(archive_path,
+  target_dir, *, allow_existing=False)` — module-level helper
+  shared by the wire command, the admin route, and the CLI.
+  Validates that the archive contains a `WiredTiger` metadata
+  file before unpacking, so a malformed tarball can't pollute the
+  target.
+- `secantusdb-restore-archive` console script (new `[project.scripts]`
+  entry). Same validation as the wire command, no server needed.
+- Admin UI per-row **Extract** action on `.tar.gz` rows, posting
+  to `POST /backup/restore-archive` with editable target-dir form
+  field; the existing `Restore` button still handles mongodump
+  directories.
+
+#### Changed
+
+- `secantus.admin.backup.list_backups()` now includes
+  `*.tar.gz` files alongside directories. Native-archive backups
+  produced by b18's backup button were previously invisible in
+  the admin UI's "Existing backups" list.
+- `MongoFacade.restore_archive(archive_path, target_dir, *,
+  allow_existing=False)` — new admin client facade method.
+
+#### Fixed
+
+- "Existing backups" table on `/backup` was silently dropping
+  every `.tar.gz` produced by the native checkpoint backup path
+  introduced in v0.5.1b18 (only dump *directories* were listed).
+  Both kinds now render with the correct per-row restore action.
 
 ## [0.5.1b18] — 2026-05-18
 
