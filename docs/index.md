@@ -180,6 +180,7 @@ SecantusDB is dual-licensed:
 installation
 quickstart
 examples
+configuration
 architecture
 indexes
 aggregation
