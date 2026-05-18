@@ -591,6 +591,9 @@ class Storage:
         enable_oplog: bool = True,
         ttl_sweep_seconds: float = 60.0,
         noop_heartbeat_seconds: float = 0.0,
+        cache_size: str = "1G",
+        session_max: int = 1000,
+        sync_on_commit: bool = False,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -621,12 +624,16 @@ class Storage:
         # mode (WT's in_memory backend rejects them with a noisy
         # ``__wt_inmem_unsupported_op`` log line on every call).
         self._in_memory = path == ":memory:"
+        # Stashed for reuse in restore-archive / explain output.
+        self.cache_size = cache_size
+        self.session_max = session_max
+        self.sync_on_commit = sync_on_commit
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
             # in_memory=true disables the journal entirely (no files);
             # ephemeral by definition, so durability isn't a concern.
-            config = "create,in_memory=true,session_max=1000,cache_size=1G"
+            config = f"create,in_memory=true,session_max={session_max},cache_size={cache_size}"
         else:
             os.makedirs(path, exist_ok=True)
             home = path
@@ -640,24 +647,33 @@ class Storage:
             # ``bench/chaos.py`` (3-min chaos run, 17 SIGKILLs:
             # 432,881 acked / 1 persisted).
             #
-            # ``transaction_sync=(enabled=false,method=fsync)`` is
-            # WT's default once logging is on: log records are written
-            # to the OS but not fsynced per commit. Result: SIGKILL
-            # of the process is durable (the OS still flushes its
-            # page cache), only true power-loss between commits and
-            # the next OS flush window can lose data. That matches
-            # mongod's default ``writeConcern: {w:1, j:false}``.
-            # Bumping to ``method=fsync,enabled=true`` would honour
-            # ``j:true`` durability but we don't yet plumb that
-            # write-concern down — backlog item.
+            # ``transaction_sync`` is the per-commit durability knob.
+            # Default ``enabled=false,method=fsync`` matches mongod's
+            # default ``writeConcern: {w:1, j:false}`` — log records
+            # land in the OS page cache, the OS flushes them on its
+            # own schedule, SIGKILL is durable, true power-loss
+            # between commits can lose data.
+            #
+            # ``sync_on_commit=True`` (config-file knob) bumps to
+            # ``enabled=true,method=fsync``: every commit fsyncs the
+            # log before returning, so the wire-protocol equivalent of
+            # ``writeConcern: {j: true}`` is effectively enforced for
+            # the whole connection. Throughput cost on small-doc
+            # inserts is significant (1-2 orders of magnitude),
+            # which is why it's opt-in.
             #
             # ``file_max=10MB`` bounds journal segment size; smaller
             # files churn the log more, larger files delay reclamation.
             # 10 MB matches mongod's WT default.
+            sync_part = (
+                "transaction_sync=(enabled=true,method=fsync)"
+                if sync_on_commit
+                else "transaction_sync=(enabled=false,method=fsync)"
+            )
             config = (
-                "create,session_max=1000,cache_size=1G,"
-                "log=(enabled=true,file_max=10MB),"
-                "transaction_sync=(enabled=false,method=fsync)"
+                f"create,session_max={session_max},cache_size={cache_size},"
+                f"log=(enabled=true,file_max=10MB),"
+                f"{sync_part}"
             )
         # The on-disk WT home is stashed so ``create_archive`` can tar
         # it after a checkpoint without re-deriving the path.

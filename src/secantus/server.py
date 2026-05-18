@@ -72,6 +72,11 @@ class SecantusDBServer:
         noop_heartbeat_seconds: float = 0.0,
         client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        oplog_retention_seconds: float = 3600.0,
+        oplog_max_entries: int = 100_000,
+        cache_size: str = "1G",
+        session_max: int = 1000,
+        sync_on_commit: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -96,6 +101,11 @@ class SecantusDBServer:
             enable_oplog=replica_set_name is not None,
             ttl_sweep_seconds=ttl_sweep_seconds,
             noop_heartbeat_seconds=noop_heartbeat_seconds,
+            oplog_retention_seconds=oplog_retention_seconds,
+            oplog_max_entries=oplog_max_entries,
+            cache_size=cache_size,
+            session_max=session_max,
+            sync_on_commit=sync_on_commit,
         )
         self.cursors = CursorRegistry()
         # Per-server counters surfaced through `serverStatus`. Started

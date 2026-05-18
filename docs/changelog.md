@@ -19,35 +19,60 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-### Native checkpoint restore: wire command, admin UI Extract button, offline CLI
+### `secantusdb.toml` config file, native checkpoint restore, j:true durability knob
 
-Counterpart to v0.5.1b18's `secantusAdmin.backupArchive`. The new
-`secantusAdmin.restoreArchive` wire command extracts a backup
-`.tar.gz` into a server-side target directory the operator then
-points a fresh SecantusDB process at — same shape real mongod's
-"stop, swap dbpath, start" restore tooling already trains people
-for. The admin UI's per-row Restore button now adapts to backup
-type: mongodump directories still call `mongorestore`, while
-native `.tar.gz` archives surface an inline target-dir field plus
-an Extract action that hits the new endpoint.
+Two production-shaping slices land together. A new
+`secantusdb.toml` configuration file exposes every CLI flag plus
+the WT and oplog knobs that were previously hard-coded — including
+`cache_size` (so you can size the engine for your dataset instead
+of running with the 1 GB test default) and a `sync_on_commit`
+switch that closes the long-standing `writeConcern: {j: true}`
+durability gap by enabling WT's per-commit fsync. The loader
+auto-discovers `./secantusdb.toml`, `~/.secantus/secantusdb.toml`,
+and `/etc/secantus/secantusdb.toml`; an explicit `--config PATH`
+overrides the search. CLI flags still win over file values, so the
+file is a deployment baseline rather than a lock-in.
 
-Restore intentionally doesn't try to swap the WT home under a
-running server. That mode would need a wholesale rework of how
-connection threads cache WT sessions lock-free — and even then
-the calling client would lose its session mid-response. The
-side-channel design ships clean today and matches the operational
-expectation set by mongorestore.
+A new `secantusAdmin.restoreArchive` wire command and matching
+`secantusdb-restore-archive` offline CLI close out the backup
+story started in b18 — extract a backup `.tar.gz` into a target
+directory the operator then points a fresh SecantusDB process at.
+The admin UI's per-row Restore button now adapts to backup type:
+mongodump directories still call `mongorestore`; native `.tar.gz`
+archives surface an inline target-dir field and an Extract action
+that hits the new endpoint. Restore intentionally doesn't try to
+swap the WT home under a running server (the connection-thread
+session-caching layer would need a wholesale rework first), and
+matches how real mongod restore tooling already trains operators.
 
-A new offline CLI `secantusdb-restore-archive --archive PATH
---target-dir PATH` exposes the same extraction with no wire round-
-trip, for when the source SecantusDB isn't currently running.
-The admin UI's "Existing backups" list now also includes
-`.tar.gz` files (previously only mongodump directories showed up
-— the native archives created by the b18 backup button were
-invisible).
+Drive-by fix: the admin UI's "Existing backups" list now also
+includes `.tar.gz` files. The native archives created by the b18
+backup button were previously invisible because `list_backups`
+only enumerated directories.
 
 #### Added
 
+- `secantusdb.toml` configuration file (see
+  [Configuration](configuration.md) for the full schema). Auto-
+  discovered from `./secantusdb.toml`,
+  `~/.secantus/secantusdb.toml`, `/etc/secantus/secantusdb.toml`;
+  `--config PATH` disables discovery and loads a specific file.
+  Unknown keys / unknown top-level tables fail loudly at startup
+  so typos can't silently leave the engine running on the
+  hard-coded default.
+- `secantus.config.SecantusConfig` dataclass + `load_config()` /
+  `apply_overrides()` helpers. CLI flags' argparse defaults are
+  now `None` (the "user did not pass this" sentinel) so the
+  precedence chain is `SecantusConfig defaults < secantusdb.toml
+  < explicit CLI flag` — file is a per-deployment baseline, the
+  CLI overrides for one-off runs.
+- New CLI flags exposing previously-hard-coded knobs:
+  `--cache-size`, `--session-max`, `--sync-on-commit`,
+  `--oplog-retention-seconds`, `--oplog-max-entries`. Each has a
+  matching `[storage]` / `[oplog]` key in the config file.
+- `Storage.__init__` accepts `cache_size`, `session_max`,
+  `sync_on_commit` kwargs. The WT engine config string is built
+  from these instead of being a hard-coded literal.
 - `secantusAdmin.restoreArchive` wire command. Accepts
   `archivePath` (server-side path to `.tar.gz`), `targetDir`
   (extraction destination), and optional `allowExisting` (overlay
@@ -68,6 +93,12 @@ invisible).
 
 #### Changed
 
+- `writeConcern: {j: true}` is now honourable end-to-end via
+  `[storage] sync_on_commit = true` (or `--sync-on-commit`),
+  which sets WT's `transaction_sync=(enabled=true,method=fsync)`.
+  Closes the long-standing durability gap previously documented
+  in the backlog. Off by default (matches mongod's default
+  `{w:1, j:false}`) since the throughput cost is significant.
 - `secantus.admin.backup.list_backups()` now includes
   `*.tar.gz` files alongside directories. Native-archive backups
   produced by b18's backup button were previously invisible in

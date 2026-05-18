@@ -1,0 +1,32 @@
+# Example secantusdb.toml.
+#
+# Copy to one of the auto-discovery paths and edit:
+#   ./secantusdb.toml                  (per-checkout / per-cwd)
+#   ~/.secantus/secantusdb.toml        (per-user)
+#   /etc/secantus/secantusdb.toml      (system-wide)
+#
+# Or pass it explicitly: secantusdb --config /path/to/secantusdb.toml
+#
+# Every key is optional. Missing keys use the SecantusConfig default
+# (printed in the comment after each line). Explicit CLI flags
+# override anything set here, so this file is the per-deployment
+# baseline.
+
+[server]
+host = "127.0.0.1"            # default: "127.0.0.1" (loopback only)
+port = 27017                  # default: 27017
+storage_path = "./secantus-data"  # default: "./secantus-data"
+log_level = "INFO"            # default: "INFO"; one of DEBUG / INFO / WARNING / ERROR
+auth = false                  # default: false; true requires SCRAM-SHA-256 on every non-handshake command
+standalone = false            # default: false (advertise as single-node "secantus" replica set so pymongo change streams work)
+
+[oplog]
+retention_seconds = 3600.0    # default: 3600 (1 hr); resume tokens minted before this fall outside the window
+max_entries = 100000          # default: 100000; whichever cap (this or retention) hits first prunes oldest
+noop_heartbeat_seconds = 0.0  # default: 0 (disabled); mongod's default is 10s — set to advance cluster time during idle stretches
+
+[storage]
+cache_size = "1G"             # default: "1G"; WT cache, unit-suffixed string ("256M", "1G", "8G")
+session_max = 1000            # default: 1000; concurrent WT sessions, one per client connection
+ttl_sweep_seconds = 60.0      # default: 60.0; background TTL pruning cadence (matches mongod)
+sync_on_commit = false        # default: false; true forces per-commit fsync (closes writeConcern j:true gap; 1-2 orders of magnitude throughput cost)
