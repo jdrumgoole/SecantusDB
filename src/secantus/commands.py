@@ -783,6 +783,60 @@ def _secantus_admin_backup_archive(doc: dict[str, Any], ctx: CommandContext) -> 
     return {"path": result["path"], "sizeBytes": result["sizeBytes"], "ok": 1.0}
 
 
+def _secantus_admin_restore_archive(
+    doc: dict[str, Any], _ctx: CommandContext
+) -> dict[str, Any]:
+    """SecantusDB extension: extract a backup archive into ``targetDir``.
+
+    Side-channel restore: the archive is unpacked into a fresh
+    directory that the operator then points a *new* SecantusDB process
+    at (``SecantusDBServer(storage_path=<targetDir>)`` /
+    ``secantusdb --storage-path <targetDir>``). The running server's
+    own storage is **not** touched — hot in-place restore over a live
+    WT connection would need a wholesale rework of how connection
+    threads cache WT sessions, and isn't a mode real mongod supports
+    either (real restores are "stop mongod, swap dbpath, start
+    mongod").
+
+    Required fields: ``archivePath`` (server-side path to the
+    ``.tar.gz`` produced by ``backupArchive``), ``targetDir``
+    (server-side path to extract into). Optional ``allowExisting``
+    (bool, default false) lets the caller overlay into a non-empty
+    target. Returns ``{targetDir, fileCount, archive, ok: 1}``.
+    """
+    from secantus.storage import extract_backup_archive
+
+    archive_path = doc.get("archivePath")
+    target_dir = doc.get("targetDir")
+    if not isinstance(archive_path, str) or not archive_path:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.restoreArchive requires archivePath: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if not isinstance(target_dir, str) or not target_dir:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.restoreArchive requires targetDir: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    allow_existing = bool(doc.get("allowExisting", False))
+    try:
+        result = extract_backup_archive(
+            archive_path, target_dir, allow_existing=allow_existing
+        )
+    except RuntimeError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {
+        "targetDir": result["targetDir"],
+        "fileCount": result["fileCount"],
+        "archive": result["archive"],
+        "ok": 1.0,
+    }
+
+
 def _profile(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Get / set per-database profiling level (mongod ``profile`` shape).
 
@@ -4149,6 +4203,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "secantusAdmin.pruneOplog": _secantus_admin_prune_oplog,
     "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
     "secantusAdmin.backupArchive": _secantus_admin_backup_archive,
+    "secantusAdmin.restoreArchive": _secantus_admin_restore_archive,
     "explain": _explain,
     "serverStatus": _server_status,
     "getCmdLineOpts": _get_cmd_line_opts,
@@ -4306,6 +4361,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "secantusAdmin.pruneOplog": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.backupArchive": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.restoreArchive": (A_FSYNC, SCOPE_CLUSTER),
 }
 
 

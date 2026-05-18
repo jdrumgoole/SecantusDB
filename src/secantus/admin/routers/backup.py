@@ -164,3 +164,47 @@ def post_restore(
         ),
     }
     return _render(request, flash=flash, last_result=result)
+
+
+@router.post("/backup/restore-archive", response_class=HTMLResponse)
+def post_restore_archive(
+    request: Request,
+    name: str = Form(...),
+    target_dir: str = Form(...),
+) -> HTMLResponse:
+    """Run the native ``secantusAdmin.restoreArchive`` wire command.
+
+    ``name`` is the archive filename under ``backup_root`` (typically
+    ``archive-<stamp>.tar.gz``). ``target_dir`` is the absolute path
+    the server should extract into — the operator then starts a new
+    SecantusDB process pointed at that dir to switch over.
+    """
+    if "/" in name or ".." in name or not name.strip():
+        return _render(
+            request,
+            flash={"kind": "err", "msg": f"invalid archive name: {name!r}"},
+        )
+    target = target_dir.strip()
+    if not target or ".." in target:
+        return _render(
+            request,
+            flash={
+                "kind": "err",
+                "msg": f"invalid target directory: {target_dir!r}",
+            },
+        )
+    archive = _backup_root(request) / name
+    try:
+        result = request.app.state.mongo.restore_archive(str(archive), target)
+    except MongoError as exc:
+        flash = {"kind": "err", "msg": f"restoreArchive failed: {exc}"}
+        return _render(request, flash=flash)
+    flash = {
+        "kind": "ok",
+        "msg": (
+            f"restoreArchive → {result['fileCount']} file(s) extracted to "
+            f"{result['targetDir']}. Restart SecantusDB with "
+            f"--storage-path {result['targetDir']} to switch."
+        ),
+    }
+    return _render(request, flash=flash)

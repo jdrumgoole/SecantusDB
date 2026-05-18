@@ -316,8 +316,10 @@ server-side ring buffer (`secantus.logbuf.LogBuffer`) holds the last
 
 ### Backup (`/backup`)
 
-Lists existing backups under `~/.secantus/backups/` and offers two
-backup paths plus per-row Restore.
+Lists existing backups under `~/.secantus/backups/` (both mongodump
+output directories and native `.tar.gz` archive files) and offers
+two backup paths plus a per-row restore action that adapts to the
+backup type.
 
 * **Run mongodump now** — shells out to the official `mongodump`
   binary. Portable BSON dump that any `mongod` can ingest. A
@@ -333,11 +335,33 @@ backup paths plus per-row Restore.
   + start a new SecantusDB pointing at the extracted dir" — fast
   + atomic vs mongodump, but SecantusDB-specific.
 
-Per-row Restore is wired to `mongorestore` (the native-archive
-restore path is a follow-on slice; today the user extracts the
-archive manually and starts a new SecantusDB pointed at it). The
-endpoint guards against directory traversal in the form value (`/`
-and `..` are rejected with an "invalid backup name" flash).
+Per-row restore picks the right action based on backup type:
+
+* **Restore** (mongodump directories) → runs `mongorestore` against
+  the named directory.
+* **Extract** (native `.tar.gz` archives) → issues
+  `secantusAdmin.restoreArchive` to extract the archive into a
+  server-side target directory shown in the form's editable text
+  field. The running server's own storage is **not** touched —
+  hot in-place restore can't be done safely over a live WT
+  connection without restructuring how connection threads cache
+  WT sessions, and isn't how real mongod's restore tooling works
+  either. After extraction completes, restart SecantusDB with
+  `--storage-path <target>` to switch to the restored data.
+
+Both restore endpoints guard against directory traversal in their
+form values (`/` and `..` are rejected with an "invalid backup
+name" / "invalid target directory" flash).
+
+For offline restore (when the source SecantusDB isn't running),
+use the bundled CLI:
+
+```bash
+secantusdb-restore-archive --archive PATH.tar.gz --target-dir PATH
+```
+
+Same validation, no wire-protocol round-trip. Pass
+`--allow-existing` to overlay into a non-empty target dir.
 
 ## Files written to disk
 
@@ -359,12 +383,12 @@ thing you need to remove if you want a clean slate (`rm
 These are the gaps a /CONNECTING_USER_NEEDS_TO_KNOW level. Full
 backlog at `tasks/backlog.md`.
 
-* **Native checkpoint restore** isn't exposed. The mongodump-driven
-  Restore button on `/backup` calls `mongorestore`; the native
-  `.tar.gz` archive (produced by "Run native checkpoint backup")
-  has no in-UI restore button yet — the user extracts the archive
-  manually and starts a new SecantusDB pointed at it. A future
-  slice will add a `secantusAdmin.restoreArchive` wire command.
+* **Hot in-place restore** isn't supported — restore extracts the
+  archive into a target directory the operator then points a *new*
+  SecantusDB process at. The running server's storage is never
+  modified. Real mongod restore tooling works the same way
+  ("stop mongod, swap dbpath, start mongod") so this matches what
+  ops scripts expect.
 * **Saved-connections / settings page** is deferred. The CLI takes a
   single `--uri` per launch, so saved bookmarks are low-value until
   the launcher gains hot-swap support.

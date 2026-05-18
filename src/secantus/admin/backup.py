@@ -179,23 +179,34 @@ def _du(path: Path) -> int:
 
 
 def list_backups(root: Path | str = DEFAULT_BACKUP_ROOT) -> list[BackupEntry]:
-    """Return existing backups under ``root``, newest-first."""
+    """Return existing backups under ``root``, newest-first.
+
+    Includes both mongodump-style directories and native checkpoint
+    archive files (``*.tar.gz`` produced by
+    ``secantusAdmin.backupArchive``) so both kinds show up in the
+    admin UI's "Existing backups" list with their respective restore
+    actions.
+    """
     root = Path(root)
     if not root.exists() or not root.is_dir():
         return []
     out: list[BackupEntry] = []
     for child in root.iterdir():
-        if not child.is_dir():
-            continue
         try:
             stat = child.stat()
         except OSError:
+            continue
+        if child.is_dir():
+            size = _du(child)
+        elif child.is_file() and child.name.endswith(".tar.gz"):
+            size = stat.st_size
+        else:
             continue
         out.append(
             BackupEntry(
                 name=child.name,
                 path=child,
-                size_bytes=_du(child),
+                size_bytes=size,
                 created_at=stat.st_mtime,
             )
         )

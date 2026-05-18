@@ -156,6 +156,72 @@ def _unpack_entry(packed: bytes) -> tuple[bytes, bytes]:
     return packed[:sep], packed[sep + 2 :]
 
 
+def extract_backup_archive(
+    archive_path: str,
+    target_dir: str,
+    *,
+    allow_existing: bool = False,
+) -> dict[str, int | str]:
+    """Extract a SecantusDB backup archive into ``target_dir``.
+
+    Side-channel restore: the archive is unpacked into a fresh
+    directory that the caller then points a new ``SecantusDBServer`` at
+    (``SecantusDBServer(storage_path=<target_dir>)``). The function
+    does **not** touch any running server's storage — that mode of
+    "hot restore over a live WT connection" can't be done safely
+    without restructuring how connection threads cache WT sessions,
+    and isn't what real mongod's restore tooling supports either.
+
+    Returns ``{"targetDir": <abs>, "fileCount": <int>, "archive": <abs>}``
+    on success. Raises ``RuntimeError`` if:
+
+    * the archive doesn't exist,
+    * the archive doesn't contain a ``WiredTiger`` metadata file
+      (so it's not a SecantusDB / WT backup at all),
+    * ``target_dir`` already exists, is non-empty, and ``allow_existing``
+      is False (default).
+
+    The WT metadata check runs **before** extraction so a malformed
+    archive can't pollute ``target_dir``.
+    """
+    import tarfile
+
+    abs_archive = os.path.abspath(archive_path)
+    abs_target = os.path.abspath(target_dir)
+    if not os.path.isfile(abs_archive):
+        raise RuntimeError(
+            f"extract_backup_archive: archive not found: {abs_archive}"
+        )
+    if os.path.exists(abs_target):
+        if not os.path.isdir(abs_target):
+            raise RuntimeError(
+                "extract_backup_archive: target exists and is not a "
+                f"directory: {abs_target}"
+            )
+        if os.listdir(abs_target) and not allow_existing:
+            raise RuntimeError(
+                "extract_backup_archive: target directory is not empty "
+                f"(pass allow_existing=True to overlay): {abs_target}"
+            )
+    else:
+        os.makedirs(abs_target)
+
+    with tarfile.open(abs_archive, "r:*") as tar:
+        names = tar.getnames()
+        if "WiredTiger" not in names:
+            raise RuntimeError(
+                f"extract_backup_archive: archive {abs_archive!r} is not "
+                "a SecantusDB backup (no WiredTiger metadata file inside)"
+            )
+        tar.extractall(abs_target, filter="data")
+
+    return {
+        "targetDir": abs_target,
+        "fileCount": len(names),
+        "archive": abs_archive,
+    }
+
+
 class DuplicateKeyError(Exception):
     def __init__(self, doc_id: Any) -> None:
         super().__init__(f"duplicate _id: {doc_id!r}")
