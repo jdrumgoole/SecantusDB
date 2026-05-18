@@ -1477,6 +1477,7 @@ async def test_backup_restore_archive_extracts_into_target(
     """End-to-end: archive a backup, post the restore-archive form,
     a new server reads the snapshot from the target dir."""
     from pymongo import MongoClient
+
     from secantus import SecantusDBServer
 
     backup_root = app.state.backup_root
