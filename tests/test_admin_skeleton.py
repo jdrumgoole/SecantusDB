@@ -1508,18 +1508,14 @@ async def test_backup_restore_archive_extracts_into_target(
     try:
         c2 = MongoClient(srv2.uri, serverSelectionTimeoutMS=2000)
         try:
-            assert list(c2["routedb"]["coll"].find()) == [
-                {"_id": 1, "v": "route-smoke"}
-            ]
+            assert list(c2["routedb"]["coll"].find()) == [{"_id": 1, "v": "route-smoke"}]
         finally:
             c2.close()
     finally:
         srv2.stop()
 
 
-async def test_backup_page_shows_extract_button_for_tar_gz(
-    server, app, http: AsyncClient
-) -> None:
+async def test_backup_page_shows_extract_button_for_tar_gz(server, app, http: AsyncClient) -> None:
     """The Existing backups table renders an Extract control for
     ``.tar.gz`` archives and a regular Restore button for directories."""
     backup_root = app.state.backup_root

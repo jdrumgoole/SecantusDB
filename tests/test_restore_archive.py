@@ -78,9 +78,7 @@ def test_extract_refuses_non_wt_archive(tmp_path) -> None:
 
 def test_extract_rejects_missing_archive(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="not found"):
-        extract_backup_archive(
-            str(tmp_path / "missing.tar.gz"), str(tmp_path / "restored")
-        )
+        extract_backup_archive(str(tmp_path / "missing.tar.gz"), str(tmp_path / "restored"))
 
 
 def test_extract_rejects_non_empty_target(tmp_path) -> None:
@@ -93,9 +91,7 @@ def test_extract_rejects_non_empty_target(tmp_path) -> None:
     # Pre-existing file untouched.
     assert (target / "junk.txt").read_text() == "existing file"
     # ``allow_existing=True`` overlays.
-    result = extract_backup_archive(
-        str(archive), str(target), allow_existing=True
-    )
+    result = extract_backup_archive(str(archive), str(target), allow_existing=True)
     assert result["fileCount"] > 0
     assert (target / "WiredTiger").is_file()
     assert (target / "junk.txt").read_text() == "existing file"
@@ -120,9 +116,7 @@ def test_wire_restore_archive_round_trip(tmp_path) -> None:
         client = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
         try:
             client["appdb"]["items"].insert_one({"_id": 7, "v": "wire-test"})
-            client.admin.command(
-                "secantusAdmin.backupArchive", outputPath=str(archive)
-            )
+            client.admin.command("secantusAdmin.backupArchive", outputPath=str(archive))
             result = client.admin.command(
                 "secantusAdmin.restoreArchive",
                 archivePath=str(archive),

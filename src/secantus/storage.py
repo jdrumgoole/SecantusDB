@@ -189,14 +189,11 @@ def extract_backup_archive(
     abs_archive = os.path.abspath(archive_path)
     abs_target = os.path.abspath(target_dir)
     if not os.path.isfile(abs_archive):
-        raise RuntimeError(
-            f"extract_backup_archive: archive not found: {abs_archive}"
-        )
+        raise RuntimeError(f"extract_backup_archive: archive not found: {abs_archive}")
     if os.path.exists(abs_target):
         if not os.path.isdir(abs_target):
             raise RuntimeError(
-                "extract_backup_archive: target exists and is not a "
-                f"directory: {abs_target}"
+                f"extract_backup_archive: target exists and is not a directory: {abs_target}"
             )
         if os.listdir(abs_target) and not allow_existing:
             raise RuntimeError(

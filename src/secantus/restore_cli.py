@@ -72,9 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Extracted {result['fileCount']} file(s) from {result['archive']} "
         f"into {result['targetDir']}"
     )
-    print(
-        f"Start the server with: secantusdb --storage-path {result['targetDir']}"
-    )
+    print(f"Start the server with: secantusdb --storage-path {result['targetDir']}")
     return 0
 
 

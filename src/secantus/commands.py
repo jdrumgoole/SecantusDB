@@ -783,9 +783,7 @@ def _secantus_admin_backup_archive(doc: dict[str, Any], ctx: CommandContext) -> 
     return {"path": result["path"], "sizeBytes": result["sizeBytes"], "ok": 1.0}
 
 
-def _secantus_admin_restore_archive(
-    doc: dict[str, Any], _ctx: CommandContext
-) -> dict[str, Any]:
+def _secantus_admin_restore_archive(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     """SecantusDB extension: extract a backup archive into ``targetDir``.
 
     Side-channel restore: the archive is unpacked into a fresh
@@ -824,9 +822,7 @@ def _secantus_admin_restore_archive(
         }
     allow_existing = bool(doc.get("allowExisting", False))
     try:
-        result = extract_backup_archive(
-            archive_path, target_dir, allow_existing=allow_existing
-        )
+        result = extract_backup_archive(archive_path, target_dir, allow_existing=allow_existing)
     except RuntimeError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
     return {
