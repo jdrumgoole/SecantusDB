@@ -194,11 +194,16 @@ See [`tasks/backlog.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/task
 "Change-stream limitations" for the canonical list. Highlights:
 
 - No transaction state on events (`txnNumber` / `lsid` never present).
-- No `splitLargeChangeStreamEvents`.
+- `splitLargeChangeStreamEvents` is honoured at the envelope level —
+  every event carries `{splitEvent: {fragment:1, of:1}}` when the
+  flag is set — but events never actually split (oplog entries cap
+  well below 16 MB in our test surrogate workloads).
 - No `noop` heartbeats — resume tokens advance only on real ops.
-- DDL `createIndexes` / `dropIndexes` events not surfaced.
-- `updateDescription.truncatedArrays` is emitted only for strict
-  head-prefix array shrinkage; other reshapes produce a wholesale
-  `updatedFields` entry.
+- DDL "expanded" events (`createIndexes` / `dropIndexes`) are
+  emitted only when the caller passes `show_expanded_events=True`
+  to `coll.watch()` (mongod-faithful default-off). Without the
+  opt-in, the v1 spec's stable event set
+  (insert / update / delete / replace / drop / dropDatabase /
+  rename / invalidate) is what surfaces.
 - Resume-token internals are not wire-compatible with real `mongod`
   keystring tokens (round-trip through `pymongo` is fine).

@@ -81,9 +81,6 @@ MongoDB's 10-minute cursor TTL). The clock is injectable via
 
 ## Deferred
 
-- `$densify` with `month` / `quarter` / `year` units — rejected;
-  numeric ranges and fixed-duration date units (`week` / `day` /
-  `hour` / `minute` / `second` / `millisecond`) are implemented.
 - Per-index collation — the per-query infrastructure honours
   `collation` for `find` / `count` / `distinct` / `findAndModify`,
   but index entries are written in BSON codepoint order; queries
@@ -133,8 +130,12 @@ detail.
 
 ## Known edge cases
 
-- **`$sample`** uses `random.sample` without a fixed seed. Deterministic
-  only if the test does `random.seed(...)` first.
+- **`$sample`** uses `random.sample` against fresh entropy per call
+  by default. For deterministic test results set
+  `SECANTUS_SAMPLE_SEED=<int_or_string>` in the environment — at
+  module-import time `$sample` then uses a dedicated
+  `random.Random(seed)` so the seed doesn't leak into the
+  process-shared `random` state.
 - **`$type: "number"`** in queries handles `int`, `float`, `Decimal128`,
   but the int32-vs-int64 distinction depends on the Python value range,
   not the original BSON type tag (which is dropped on decode). A doc
