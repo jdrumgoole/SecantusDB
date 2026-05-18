@@ -249,15 +249,36 @@ Target-switching plus the embedded server's lifecycle:
 
 ### Connections + cursors (`/connections`, `/cursors`)
 
-Both views read from `currentOp`'s `inprog` array.
+Both views read from `currentOp`'s `inprog` array and auto-refresh
+every 5 s.
 
-* `/connections` — read-only table (conn_id, client `host:port`,
-  user, last op, active flag, connected_at). Connection-kill is
-  deferred until SecantusDB grows a `killOp` command — see
-  [Compatibility](compatibility.md).
-* `/cursors` — table of live tailable / batched cursors with badges
-  for `tailable` and `awaitData`. Per-row Kill button gated by
-  typed-confirmation modal that issues `killCursors` over the wire.
+* `/connections` — conn_id, client `host:port`, user, last op,
+  active flag, connected_at. Per-row Kill button issues `killOp`
+  against the connection's `opid` (one-to-one with `conn_id`):
+  SecantusDB shuts the socket via `shutdown(SHUT_RDWR)`, any
+  in-flight command finishes, the thread exits, the row vanishes on
+  the next refresh.
+* `/cursors` — live tailable / batched cursors with badges for
+  `tailable` and `awaitData`. Per-row Kill button issues
+  `killCursors` over the wire.
+
+### Oplog (`/oplog`)
+
+Browses the synthetic [`local.oplog.rs`](change-streams.md#querying-the-oplog-directly)
+collection — paged entry viewer that auto-refreshes every 5 s. Three
+filter controls:
+
+* **Window** — last 50 / 500 / 5000 entries (`find().sort("ts",
+  -1).limit(N)`).
+* **op** — checkboxes for `i` / `u` / `d` / `c` / `n` (insert /
+  update / delete / command / noop).
+* **ns contains** — substring match on the namespace (regex-escaped
+  so dots stay literal).
+
+Each row collapses to ts / op badge / ns by default; an inline
+`<details>` toggle expands to the full Extended-JSON entry body
+(`o` for the operation payload, `o2` for the update predicate,
+`wall` for the wall-clock timestamp, etc.).
 
 ### Profiler (`/profiler`)
 
@@ -300,15 +321,28 @@ server-side ring buffer (`secantus.logbuf.LogBuffer`) holds the last
 
 ### Backup (`/backup`)
 
-Lists existing backups under `~/.secantus/backups/` and offers a "Run
-mongodump now" button plus per-row Restore. Both shell out to the
-official `mongodump` / `mongorestore` binaries — SecantusDB speaks
-the same wire protocol as `mongod`, so the same tools work
-unchanged. A preflight check looks for both binaries on PATH and
-disables the action buttons with an "install mongo-tools" hint when
-they're missing. The restore endpoint guards against directory
-traversal in the form value (`/` and `..` are rejected with an
-"invalid backup name" flash).
+Lists existing backups under `~/.secantus/backups/` and offers two
+backup paths plus per-row Restore.
+
+* **Run mongodump now** — shells out to the official `mongodump`
+  binary. Portable BSON dump that any `mongod` can ingest. A
+  preflight check looks for `mongodump` / `mongorestore` on PATH
+  and disables this path with an "install mongo-tools" hint when
+  they're missing.
+* **Run native checkpoint backup** — issues
+  `secantusAdmin.backupArchive` over the wire. The server forces a
+  WT checkpoint, opens a `backup:` cursor (so the data files stay
+  read-shareable for the cursor's lifetime — works cross-platform
+  including Windows), and tars the consistent file set into a
+  single `.tar.gz` under the same backup root. Restore is "extract
+  + start a new SecantusDB pointing at the extracted dir" — fast
+  + atomic vs mongodump, but SecantusDB-specific.
+
+Per-row Restore is wired to `mongorestore` (the native-archive
+restore path is a follow-on slice; today the user extracts the
+archive manually and starts a new SecantusDB pointed at it). The
+endpoint guards against directory traversal in the form value (`/`
+and `..` are rejected with an "invalid backup name" flash).
 
 ## Files written to disk
 
@@ -319,6 +353,7 @@ The UI persists three small artifacts in `~/.secantus/`:
 | `~/.secantus/admin-token` | UTF-8 string | URL-safe token, mode `0600`. Generated on first launch. |
 | `~/.secantus/admin.db` | SQLite | Console query history (per-URI ring, 50 entries each). |
 | `~/.secantus/backups/<UTC-stamp>/` | mongodump output | One directory per `mongodump` run. |
+| `~/.secantus/backups/archive-<UTC-stamp>.tar.gz` | gzipped tar | One archive per native-checkpoint-backup run. |
 
 Everything else lives in process memory. The token file is the only
 thing you need to remove if you want a clean slate (`rm
@@ -329,20 +364,12 @@ thing you need to remove if you want a clean slate (`rm
 These are the gaps a /CONNECTING_USER_NEEDS_TO_KNOW level. Full
 backlog at `tasks/backlog.md`.
 
-* **Connection-kill** isn't implemented — `/connections` is read-only.
-  Needs `killOp` (interruptible commands at the dispatch layer) on
-  the SecantusDB side.
-* **Oplog window inspector** is deferred. The data source is now in
-  place — `local.oplog.rs` queryable from any pymongo client (see
-  [Change streams → Querying the oplog directly](change-streams.md#querying-the-oplog-directly))
-  — so the admin UI page can land as a follow-up using the standard
-  collection-viewer pattern. Until then, `/changestream` shows events
-  from "now" and a pymongo shell against `client.local.oplog_rs.find()`
-  is the way to browse historical entries.
-* **Native WT-checkpoint backup** isn't exposed. Only mongodump-driven
-  backup ships today. The native path needs a server-side
-  `secantusAdmin.backupArchive` command (the admin app talks only over
-  the wire and doesn't know the server's `storage_path`).
+* **Native checkpoint restore** isn't exposed. The mongodump-driven
+  Restore button on `/backup` calls `mongorestore`; the native
+  `.tar.gz` archive (produced by "Run native checkpoint backup")
+  has no in-UI restore button yet — the user extracts the archive
+  manually and starts a new SecantusDB pointed at it. A future
+  slice will add a `secantusAdmin.restoreArchive` wire command.
 * **Saved-connections / settings page** is deferred. The CLI takes a
   single `--uri` per launch, so saved bookmarks are low-value until
   the launcher gains hot-swap support.

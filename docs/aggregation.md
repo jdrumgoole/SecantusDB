@@ -15,7 +15,7 @@ applied in order; each stage gets the documents emitted by the previous one.
 | `$addFields` / `$set` | Add / overwrite fields (computed via expressions) |
 | `$unset` | Remove paths (string or array) |
 | `$unwind` | Path string or doc form (`preserveNullAndEmptyArrays`, `includeArrayIndex`) |
-| `$densify` | Numeric ranges and fixed-duration date units (`week` / `day` / `hour` / `minute` / `second` / `millisecond`); variable-length `month` / `quarter` / `year` rejected (would need a `relativedelta` dep) |
+| `$densify` | Numeric ranges and all date units (`week` / `day` / `hour` / `minute` / `second` / `millisecond` via timedelta; `month` / `quarter` / `year` via `dateutil.relativedelta`, so day-snap on month/year roll-overs matches mongod) |
 | `$fill` | `{value: <expr>}` evaluates per-doc; `{method: "locf"}` carries last observation forward; `{method: "linear"}` interpolates between bracketing non-null anchors along `sortBy` (numbers + datetimes). Partition via `partitionBy` / `partitionByFields`; `sortBy` required when any output uses `method` |
 | `$replaceRoot` / `$replaceWith` | Replace the root with a sub-document |
 | `$group` | See accumulators below |
@@ -128,8 +128,6 @@ on decode).
   field" pattern is recognised and translated to an equivalent
   `$group` aggregation; non-canonical bodies return
   `{results: [], ok: 1}` so wire-shape probes pass.
-- `$densify` with `month` / `quarter` / `year` units — rejected; would
-  need `relativedelta`-style arithmetic and a new dependency.
 - Text search (`$text`, `$meta: "textScore"`) — would need a full-text
   index implementation.
 
@@ -143,3 +141,9 @@ on decode).
   runs the full collection then limit truncates. For test workloads this
   is fine; for large simulated datasets, prefer to sort by an indexed
   field so the sort itself is index-walked.
+- For deterministic `$sample` results in tests, set
+  `SECANTUS_SAMPLE_SEED=<int_or_string>` in the environment. The seed
+  is captured at module import; `$sample` then uses a dedicated
+  `random.Random(seed)` instead of the process-shared `random`
+  module, so seeding here doesn't leak into other code in the same
+  process.
