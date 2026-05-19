@@ -219,19 +219,15 @@ def planar_2d_index_for_point(x: float, y: float, options: Mapping[str, Any]) ->
 
 
 def planar_2d_covering(geom: BaseGeometry, options: Mapping[str, Any]) -> tuple[int, int]:
-    """Return a coarse ``(lo, hi)`` cell-ID range that contains every
-    bucket the geometry intersects.
+    """Return a single coarse ``(lo, hi)`` cell-ID range that contains
+    every bucket the geometry intersects.
 
-    The 2d index uses bit-interleaved geohashes, so the lex-byte range
-    between two corners *over-covers* (interleaving means cells outside
-    the bbox can sort between two cells inside it). That's intentional:
-    we hand the storage layer one wide range, which it walks linearly,
-    and the per-doc verifier (`geo.geo_within`) filters false positives.
-    A tight covering would need a quadtree-style decomposition with N
-    sub-ranges; the current approach trades scan width for simplicity.
-    For typical query polygons spanning a small fraction of the index
-    range, the scan is still O(M_intersecting) in the limit because WT
-    only returns rows whose key is in the range.
+    Kept as the single-range upper bound; the storage path now uses
+    :func:`planar_2d_covering_ranges` to get a tighter list of ranges.
+    The lex-byte range between the bbox corners over-covers (Z-order
+    interleaving means cells outside the bbox can sort between two
+    cells inside it), and the per-doc verifier (`geo.geo_within`)
+    filters false positives.
     """
     bits, lo_x, hi_x, lo_y, hi_y = _2d_params(options)
     min_x, min_y, max_x, max_y = geom.bounds
@@ -243,6 +239,125 @@ def planar_2d_covering(geom: BaseGeometry, options: Mapping[str, Any]) -> tuple[
         _interleave(bx_lo, by_lo, bits),
         _interleave(bx_hi, by_hi, bits),
     )
+
+
+def planar_2d_covering_ranges(
+    geom: BaseGeometry,
+    options: Mapping[str, Any],
+    *,
+    max_ranges: int = 32,
+) -> list[tuple[int, int]]:
+    """Tightly cover the geometry's bucket-space bbox with up to
+    ``max_ranges`` Z-order ranges.
+
+    Improves on the single-range :func:`planar_2d_covering` by walking
+    a quadtree of the bucket grid and emitting one ``(lo, hi)`` Z-range
+    per power-of-2-aligned quadtree cell that lands fully inside the
+    bbox. Key invariant: a 2^k × 2^k cell whose lower-left corner is
+    2^k-aligned has a **contiguous** Z-order range
+    (``[Z(x, y), Z(x+2^k-1, y+2^k-1)]`` with no holes), so each
+    "fully inside" cell maps to exactly one tight range.
+    Partial-overlap cells recurse; pure-outside cells are skipped.
+
+    Falls back to the single coarse range (matching
+    :func:`planar_2d_covering`'s historical behaviour) when the
+    quadtree decomposition would produce more than ``max_ranges``
+    ranges — for very tortuous bboxes the planning cost overruns the
+    I/O win. The verifier on the read path filters false positives
+    either way, so this is a perf-not-correctness fallback.
+    """
+    bits, lo_x, hi_x, lo_y, hi_y = _2d_params(options)
+    min_x, min_y, max_x, max_y = geom.bounds
+    bx_lo = max(0, _bucket(min_x, lo_x, hi_x, bits))
+    bx_hi = min((1 << bits) - 1, _bucket(max_x, lo_x, hi_x, bits))
+    by_lo = max(0, _bucket(min_y, lo_y, hi_y, bits))
+    by_hi = min((1 << bits) - 1, _bucket(max_y, lo_y, hi_y, bits))
+
+    ranges: list[tuple[int, int]] = []
+    overflowed = _quadtree_cover_2d(
+        0, 0, bits, bx_lo, bx_hi, by_lo, by_hi, bits, ranges, max_ranges
+    )
+    if overflowed or not ranges:
+        # Quadtree decomposition exceeded the cap, or the bbox was so
+        # degenerate that nothing landed. Fall back to one coarse
+        # range — better to over-scan than spend planning cost on a
+        # many-range decomposition the verifier still has to re-check.
+        return [
+            (
+                _interleave(bx_lo, by_lo, bits),
+                _interleave(bx_hi, by_hi, bits),
+            )
+        ]
+    # Coalesce adjacent / overlapping ranges so the scanner avoids
+    # redundant boundary-checks at each gap.
+    ranges.sort()
+    coalesced: list[tuple[int, int]] = []
+    for lo, hi in ranges:
+        if coalesced and lo <= coalesced[-1][1] + 1:
+            coalesced[-1] = (coalesced[-1][0], max(coalesced[-1][1], hi))
+        else:
+            coalesced.append((lo, hi))
+    return coalesced
+
+
+def _quadtree_cover_2d(
+    x_lo: int,
+    y_lo: int,
+    level: int,
+    bbox_x_lo: int,
+    bbox_x_hi: int,
+    bbox_y_lo: int,
+    bbox_y_hi: int,
+    total_bits: int,
+    out: list[tuple[int, int]],
+    max_out: int,
+) -> bool:
+    """Recursively quadtree-cover the bbox; append each fully-inside
+    quadtree cell's Z-range to ``out``. Returns True if the budget
+    ``max_out`` was exceeded so the caller can fall back to a single
+    coarse range.
+
+    Each quadtree cell is a 2^``level`` × 2^``level`` square anchored
+    at ``(x_lo, y_lo)`` with ``x_lo``/``y_lo`` multiples of
+    2^``level``. That alignment is what makes the cell's Z-range
+    contiguous — without it, interleaving creates holes.
+    """
+    cell_size = 1 << level
+    x_hi = x_lo + cell_size - 1
+    y_hi = y_lo + cell_size - 1
+    if x_hi < bbox_x_lo or x_lo > bbox_x_hi or y_hi < bbox_y_lo or y_lo > bbox_y_hi:
+        return False  # cell entirely outside bbox
+    if x_lo >= bbox_x_lo and x_hi <= bbox_x_hi and y_lo >= bbox_y_lo and y_hi <= bbox_y_hi:
+        # Cell entirely inside bbox — emit one range.
+        out.append(
+            (
+                _interleave(x_lo, y_lo, total_bits),
+                _interleave(x_hi, y_hi, total_bits),
+            )
+        )
+        return False
+    if level == 0:
+        # 1×1 cell is always entirely-inside or entirely-outside above;
+        # defensive return.
+        return False
+    if len(out) >= max_out:
+        return True
+    half = cell_size >> 1
+    for dx, dy in ((0, 0), (half, 0), (0, half), (half, half)):
+        if _quadtree_cover_2d(
+            x_lo + dx,
+            y_lo + dy,
+            level - 1,
+            bbox_x_lo,
+            bbox_x_hi,
+            bbox_y_lo,
+            bbox_y_hi,
+            total_bits,
+            out,
+            max_out,
+        ):
+            return True
+    return False
 
 
 def _2d_params(

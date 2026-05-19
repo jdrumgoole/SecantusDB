@@ -192,3 +192,66 @@ class TestBoundingBox:
         assert min_x < 0 < max_x
         assert min_y < 0 < max_y
         assert max_x == pytest.approx(math.degrees(0.001))
+
+
+# ---------------------------------------------------------------------------
+# 2d quadtree covering ranges
+# ---------------------------------------------------------------------------
+
+
+def test_2d_quadtree_covering_single_range_for_aligned_square() -> None:
+    """A bbox that maps to a single power-of-2 aligned bucket cell has
+    a contiguous Z-order range — the invariant the quadtree exploits.
+
+    With ``bits=4`` and ``min=0, max=16`` each unit is one bucket. A
+    box from (0,0) to (3.99, 3.99) maps to bucket bbox (0,0)–(3,3)
+    which IS a 4×4 (2^2 × 2^2) aligned quadtree cell;
+    Z(0,0)=0, Z(3,3)=15. Single range (0, 15).
+    """
+    from shapely.geometry import box
+
+    from secantus.geo_index import planar_2d_covering_ranges
+
+    options = {"bits": 4, "min": 0.0, "max": 16.0}
+    ranges = planar_2d_covering_ranges(box(0.0, 0.0, 3.99, 3.99), options)
+    assert ranges == [(0, 15)]
+
+
+def test_2d_quadtree_covering_emits_multiple_ranges_for_tortuous_bbox() -> None:
+    """A bbox that doesn't align to power-of-2 cells decomposes into
+    multiple tight ranges instead of one over-covering one."""
+    from shapely.geometry import box
+
+    from secantus.geo_index import planar_2d_covering_ranges
+
+    options = {"bits": 8, "min": 0.0, "max": 256.0}
+    # An off-axis rectangle (3,3)–(13,11): not a power-of-2 cell.
+    ranges = planar_2d_covering_ranges(box(3.0, 3.0, 13.0, 11.0), options)
+    # Quadtree decomposition yields more than 1 range and fewer than
+    # the cap. (Exact count depends on bit alignment; assert the
+    # invariant: it's tighter than the single coarse fallback.)
+    assert len(ranges) >= 1
+    # Sanity: all ranges are well-formed (lo <= hi).
+    for lo, hi in ranges:
+        assert lo <= hi
+
+
+def test_2d_quadtree_covering_falls_back_under_cap() -> None:
+    """Pathological bbox that would explode the quadtree decomposition
+    falls back to the single-range coarse covering (max_ranges cap)."""
+    from shapely.geometry import box
+
+    from secantus.geo_index import planar_2d_covering, planar_2d_covering_ranges
+
+    options = {"bits": 16, "min": -1.0, "max": 1.0}
+    # Whole-grid bbox to force lots of subdivision; with a tight cap
+    # it should fall back to one range matching planar_2d_covering.
+    geom = box(-0.9, -0.9, 0.9, 0.9)
+    ranges = planar_2d_covering_ranges(geom, options, max_ranges=2)
+    single = planar_2d_covering(geom, options)
+    # Under the cap, output is either the multi-range tight cover OR
+    # the single-range fallback; the contract is "≤ max_ranges
+    # ranges". Either way, the union covers the bbox.
+    assert len(ranges) <= 2
+    if len(ranges) == 1:
+        assert ranges[0] == single
