@@ -125,9 +125,30 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
 ]
 
 
+# Curated whitelist of driver-core functional test classes. These live
+# under driver-core's own test source set rather than driver-sync's but
+# exercise wire-level behaviour against a live mongod / SecantusDB the
+# same way. Two geo-filter specs are the natural fit — SecantusDB
+# ships full geo support (operators + 2d/2dsphere indexes + $geoNear),
+# so the upstream specs that drive $geoWithin / $geoIntersects /
+# $near / $nearSphere through the driver's Filters builder against a
+# real server should pass against us too.
+_DRIVER_CORE_FUNCTIONAL_INCLUDES: list[str] = [
+    # GeoJSON-style filters against a 2dsphere index.
+    "com.mongodb.client.model.GeoJsonFiltersFunctionalSpecification",
+    # Legacy [x, y] / $box / $polygon / $center filters against a 2d
+    # index — same four operators, different doc-side shape.
+    "com.mongodb.client.model.GeoFiltersFunctionalSpecification",
+]
+
+
 INCLUDE: list[ModuleSpec] = [
     ModuleSpec(
         task=":driver-sync:test",
         test_classes=list(_DRIVER_SYNC_FUNCTIONAL_INCLUDES),
+    ),
+    ModuleSpec(
+        task=":driver-core:test",
+        test_classes=list(_DRIVER_CORE_FUNCTIONAL_INCLUDES),
     ),
 ]

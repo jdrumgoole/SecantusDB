@@ -182,11 +182,30 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
     if isinstance(condition, Regex):
         return _op_regex(values, condition.pattern, condition.flags)
     if isinstance(condition, Mapping) and condition and all(k.startswith("$") for k in condition):
+        # Sibling-modifier ops: keys that aren't standalone operators but
+        # tune another operator in the same condition dict. ``$options``
+        # tunes ``$regex``; ``$maxDistance`` / ``$minDistance`` tune the
+        # legacy mongod 2d form of ``$near`` / ``$nearSphere`` where the
+        # bound lives at the sibling level (mongod's
+        # ``{geo: {$near: [x, y], $maxDistance: r}}``). Skip them when
+        # iterating; pull them in below when their parent op runs.
+        _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
+        has_near = "$near" in condition or "$nearSphere" in condition
         for op, arg in condition.items():
-            if op == "$options":
+            if op in _SIBLING_MODIFIERS:
                 continue
             if op == "$regex":
                 if not _op_regex(values, arg, condition.get("$options", "")):
+                    return False
+            elif op in ("$near", "$nearSphere") and has_near:
+                # Pass the WHOLE condition dict so the parser can read
+                # sibling ``$maxDistance`` / ``$minDistance``.
+                if not _op_geo_near(
+                    values,
+                    arg,
+                    default_spherical=(op == "$nearSphere"),
+                    siblings=condition,
+                ):
                     return False
             elif not _op_matches(values, op, arg, collation):
                 return False
@@ -323,7 +342,13 @@ def _op_geo_intersects(values: list[Any], arg: Any) -> bool:
     return False
 
 
-def _op_geo_near(values: list[Any], arg: Any, *, default_spherical: bool) -> bool:
+def _op_geo_near(
+    values: list[Any],
+    arg: Any,
+    *,
+    default_spherical: bool,
+    siblings: Mapping[str, Any] | None = None,
+) -> bool:
     """Match (without ranking) for ``$near`` / ``$nearSphere``.
 
     ``$near`` is a hybrid operator: real ``mongod`` *also* sorts results
@@ -331,14 +356,26 @@ def _op_geo_near(values: list[Any], arg: Any, *, default_spherical: bool) -> boo
     we treat it purely as a containment test (within ``$maxDistance``,
     outside ``$minDistance``). Sort-by-distance is the caller's
     responsibility — handled in :mod:`commands` for top-level ``find``.
+
+    ``siblings`` carries the parent condition dict so the legacy
+    mongod 2d form ``{geo: {$near: [x, y], $maxDistance: r,
+    $minDistance: r2}}`` works — the bound is at sibling level rather
+    than nested inside ``$near``.
     """
     from shapely.geometry import Point
 
-    from secantus.geo import distance, parse_doc_geometry
+    from secantus.geo import EARTH_RADIUS_METERS, distance, parse_doc_geometry
 
-    center, max_distance, min_distance, spherical = _parse_near_spec(
-        arg, default_spherical=default_spherical
+    center, max_distance, min_distance, spherical, legacy_form = _parse_near_spec(
+        arg, default_spherical=default_spherical, siblings=siblings
     )
+    # Legacy + spherical: spec gives bound in radians on the unit
+    # sphere; ``distance(spherical=True)`` returns meters. Convert.
+    if legacy_form and spherical:
+        if max_distance is not None:
+            max_distance = max_distance * EARTH_RADIUS_METERS
+        if min_distance is not None:
+            min_distance = min_distance * EARTH_RADIUS_METERS
     center_geom = Point(center[0], center[1])
     for v in values:
         if v is MISSING:
@@ -358,18 +395,34 @@ def _op_geo_near(values: list[Any], arg: Any, *, default_spherical: bool) -> boo
 
 
 def _parse_near_spec(
-    arg: Any, *, default_spherical: bool
-) -> tuple[tuple[float, float], float | None, float | None, bool]:
-    """Normalize ``$near`` arg into ``(center, max_distance, min_distance, spherical)``.
+    arg: Any,
+    *,
+    default_spherical: bool,
+    siblings: Mapping[str, Any] | None = None,
+) -> tuple[tuple[float, float], float | None, float | None, bool, bool]:
+    """Normalize ``$near`` arg into
+    ``(center, max_distance, min_distance, spherical, legacy_form)``.
 
     Three shapes are accepted:
 
     * GeoJSON: ``{$geometry: {type:"Point", coordinates:[lng,lat]},
       $maxDistance: meters, $minDistance: meters}`` — always spherical.
     * Legacy 2-element list: ``[x, y]`` — distances in input units
-      (planar for ``$near``, radians for ``$nearSphere``).
+      (planar for ``$near``, radians-on-unit-sphere for ``$nearSphere``).
     * Legacy 3-element list: ``[x, y, max]`` — same as above plus a
       max-distance bound.
+
+    ``legacy_form`` is True when the arg used the list shape (with or
+    without sibling ``$maxDistance`` / ``$minDistance``). Callers use
+    it to know what unit ``max_distance`` is in: legacy+spherical →
+    radians on unit sphere; legacy+planar → input units; GeoJSON →
+    meters (always).
+
+    When ``siblings`` is provided (the parent condition dict) and the
+    arg is the list form, sibling ``$maxDistance`` / ``$minDistance``
+    keys are pulled in — that's the mongod 2d legacy shape
+    ``{geo: {$near: [x, y], $maxDistance: 0.1}}`` the Java driver's
+    ``Filters.near(field, x, y, max, min)`` builds.
     """
     if isinstance(arg, Mapping):
         if "$geometry" in arg:
@@ -387,6 +440,7 @@ def _parse_near_spec(
                 _opt_number(arg.get("$maxDistance"), "$maxDistance"),
                 _opt_number(arg.get("$minDistance"), "$minDistance"),
                 True,
+                False,  # GeoJSON form — distances are already in meters
             )
         raise QueryError("$near requires $geometry or a coordinate pair")
     if isinstance(arg, list) and len(arg) in (2, 3):
@@ -395,7 +449,25 @@ def _parse_near_spec(
         except (TypeError, ValueError) as exc:
             raise QueryError("$near coordinate pair must be numeric") from exc
         max_d = float(arg[2]) if len(arg) == 3 else None
-        return ((cx, cy), max_d, None, default_spherical)
+        min_d: float | None = None
+        # Sibling-modifier overlay: legacy mongod 2d shape lifts
+        # ``$maxDistance`` / ``$minDistance`` to the parent condition
+        # level. List-form arg can't carry them itself, so pick them up
+        # from the siblings dict.
+        if siblings is not None:
+            if "$maxDistance" in siblings:
+                sibling_max = _opt_number(siblings["$maxDistance"], "$maxDistance")
+                if sibling_max is not None:
+                    max_d = sibling_max
+            if "$minDistance" in siblings:
+                min_d = _opt_number(siblings["$minDistance"], "$minDistance")
+        # Legacy spec keeps the bound in its raw unit (input units for
+        # ``$near``, radians-on-unit-sphere for ``$nearSphere``).
+        # Conversion to the comparison currency (meters for spherical,
+        # planar for 2d-index picker) happens at the consumer — see
+        # ``_op_geo_near`` for the matcher side and
+        # ``Storage._geo_query_cells`` for the index picker.
+        return ((cx, cy), max_d, min_d, default_spherical, True)
     raise QueryError("$near must be a GeoJSON-shaped doc or a coordinate pair")
 
 

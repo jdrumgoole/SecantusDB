@@ -38,7 +38,7 @@ from secantus.diff import compute_update_description
 from secantus.geo import GeoError, parse_doc_geometry, parse_query_geometry, validate_coordinates
 from secantus.geo_index import (
     encode_cell,
-    planar_2d_covering,
+    planar_2d_covering_ranges,
     planar_2d_index_for_point,
     s2_doc_covering,
     s2_query_covering,
@@ -3710,6 +3710,7 @@ class Storage:
         geo_field: str | None = None
         geo_op: str | None = None
         geo_arg: Any = None
+        geo_siblings: Mapping[str, Any] | None = None
         for field, value in filter.items():
             if not isinstance(value, dict):
                 continue
@@ -3718,6 +3719,12 @@ class Storage:
                     geo_field = field
                     geo_op = op
                     geo_arg = value[op]
+                    # Capture the whole condition so `$near` /
+                    # `$nearSphere` legacy 2d form (sibling
+                    # `$maxDistance` / `$minDistance`) can scope the
+                    # scan; without this the picker can't know the
+                    # distance bound and falls back to full-scan.
+                    geo_siblings = value
                     break
             if geo_field is not None:
                 break
@@ -3739,14 +3746,22 @@ class Storage:
         if chosen_name is None or chosen_type is None:
             return None
         # Build the query geometry from the operator arg.
-        cells = self._geo_query_cells(geo_op, geo_arg, chosen_type, chosen_opts)
+        cells = self._geo_query_cells(
+            geo_op, geo_arg, chosen_type, chosen_opts, siblings=geo_siblings
+        )
         if cells is None:
             # Couldn't compute a covering — defer to full scan.
             return None
         return self._collect_geo_candidates(db, coll, chosen_name, cells)
 
     def _geo_query_cells(
-        self, op: str, arg: Any, geo_type: str, options: Mapping[str, Any]
+        self,
+        op: str,
+        arg: Any,
+        geo_type: str,
+        options: Mapping[str, Any],
+        *,
+        siblings: Mapping[str, Any] | None = None,
     ) -> list[tuple[bytes, bytes]] | None:
         """Byte ranges covering the query geometry, one per covering cell.
 
@@ -3767,20 +3782,49 @@ class Storage:
                 # `$near` without a max distance: caller falls through to
                 # full scan (signal None). With a max, expand into a cap
                 # (2dsphere) or planar disk (2d).
-                center, max_d, _min_d, _spherical = self._near_query_geom(arg)
+                (
+                    center,
+                    max_d,
+                    _min_d,
+                    spherical,
+                    legacy_form,
+                ) = self._near_query_geom(
+                    arg,
+                    default_spherical=(op == "$nearSphere"),
+                    siblings=siblings,
+                )
                 if max_d is None:
                     return None
+                # Unit normalisation: legacy+spherical gives max in
+                # radians-on-unit-sphere; legacy+planar gives max in
+                # input units; GeoJSON gives max in meters. Index
+                # picker for 2dsphere wants radians (so / EARTH_R);
+                # picker for 2d wants planar (so leave alone for
+                # legacy+planar; convert rad→degrees for
+                # legacy+spherical via *180/π).
+                import math as _math
+
                 from shapely.geometry import Point as _Point
 
-                from secantus.geo import _SphericalCircle
+                from secantus.geo import EARTH_RADIUS_METERS, _SphericalCircle
 
                 if geo_type == _GEO_2DSPHERE:
-                    from secantus.geo import EARTH_RADIUS_METERS
-
-                    radius_rad = max_d / EARTH_RADIUS_METERS
+                    # legacy+spherical → max already radians; otherwise
+                    # → meters → divide by Earth radius for radians.
+                    radius_rad = (
+                        max_d if (legacy_form and spherical) else max_d / EARTH_RADIUS_METERS
+                    )
                     geom = _SphericalCircle(center[0], center[1], radius_rad)
                 else:  # 2d planar — circular disk
-                    geom = _Point(*center).buffer(max_d, quad_segs=16)
+                    # legacy+spherical → radians-on-unit-sphere → degrees
+                    # in planar input space (the conventional geographic
+                    # mapping that matches mongod's behaviour against a
+                    # 2d index). Otherwise the bound is already in input
+                    # units.
+                    planar_radius = (
+                        max_d * 180.0 / _math.pi if (legacy_form and spherical) else max_d
+                    )
+                    geom = _Point(*center).buffer(planar_radius, quad_segs=16)
             else:
                 return None
         except GeoError:
@@ -3791,26 +3835,48 @@ class Storage:
             # 2dsphere uniformly as a list-of-ranges keeps the storage
             # path single-shaped.
             return [(encode_cell(c), encode_cell(c)) for c in s2_query_covering(geom)]
-        # 2d: shape must be planar; convert to a single (lo, hi) range.
+        # 2d: shape must be planar; convert to a list of tight Z-order
+        # ranges via quadtree decomposition. For small bboxes this is
+        # one range, same as the single-range path; for wider bboxes
+        # the decomposition tightens the scan vs the old single coarse
+        # range.
         from shapely.geometry.base import BaseGeometry as _BG
 
         if not isinstance(geom, _BG):
             return None
-        lo, hi = planar_2d_covering(geom, options)
-        return [(encode_cell(lo), encode_cell(hi))]
+        return [
+            (encode_cell(lo), encode_cell(hi))
+            for lo, hi in planar_2d_covering_ranges(geom, options)
+        ]
 
     def _near_query_geom(
-        self, arg: Any
-    ) -> tuple[tuple[float, float], float | None, float | None, bool]:
+        self,
+        arg: Any,
+        *,
+        default_spherical: bool = False,
+        siblings: Mapping[str, Any] | None = None,
+    ) -> tuple[tuple[float, float], float | None, float | None, bool, bool]:
         """Reuse :mod:`secantus.query`'s ``$near`` parser for the picker.
 
-        Routing it through `_parse_near_spec` keeps the spec semantics in
+        Returns ``(center, max_d, min_d, spherical, legacy_form)`` —
+        legacy_form lets the picker pick the right unit conversion
+        (radians-on-unit-sphere vs meters vs input units) when building
+        the index-side geometry.
+
+        ``default_spherical`` must match the operator: ``$near`` →
+        False, ``$nearSphere`` → True. Without this, a legacy-form
+        ``$nearSphere`` would be misread as planar and the picker
+        would build the wrong geometry.
+
+        Routing through `_parse_near_spec` keeps the spec semantics in
         one place — the operator handler and the picker agree on what
-        a ``$near`` arg means.
+        a ``$near`` arg means. ``siblings`` carries the parent
+        condition dict so the legacy 2d shape ``{geo: {$near: [x, y],
+        $maxDistance: r}}`` works.
         """
         from secantus.query import _parse_near_spec  # type: ignore[attr-defined]
 
-        return _parse_near_spec(arg, default_spherical=False)
+        return _parse_near_spec(arg, default_spherical=default_spherical, siblings=siblings)
 
     def _collect_geo_candidates(
         self,

@@ -473,3 +473,67 @@ def test_geo_near_explicit_key_overrides_index_inference(
         )
     )
     assert docs[0]["d"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_near_legacy_sibling_max_distance(client: MongoClient) -> None:
+    """Mongod's legacy 2d shape lifts ``$maxDistance`` to the parent
+    condition (the Java driver's ``Filters.near(field, x, y, max, min)``
+    builds exactly this). SecantusDB must accept both the nested form
+    (above) and this sibling form."""
+    coll = client["geo"]["near_sibling_max"]
+    coll.insert_many(
+        [
+            {"_id": 1, "loc": [0.0, 0.0]},
+            {"_id": 2, "loc": [3.0, 4.0]},  # planar dist 5
+            {"_id": 3, "loc": [50.0, 50.0]},
+        ]
+    )
+    found = list(coll.find({"loc": {"$near": [0.0, 0.0], "$maxDistance": 6.0}}))
+    assert {d["_id"] for d in found} == {1, 2}
+
+
+def test_near_legacy_sibling_min_and_max(client: MongoClient) -> None:
+    """Both $maxDistance and $minDistance at sibling level — annulus
+    between the two."""
+    coll = client["geo"]["near_sibling_min_max"]
+    coll.insert_many(
+        [
+            {"_id": 1, "loc": [0.0, 0.0]},
+            {"_id": 2, "loc": [3.0, 4.0]},  # dist 5
+            {"_id": 3, "loc": [6.0, 8.0]},  # dist 10
+            {"_id": 4, "loc": [50.0, 50.0]},
+        ]
+    )
+    found = list(
+        coll.find(
+            {
+                "loc": {
+                    "$near": [0.0, 0.0],
+                    "$minDistance": 3.0,
+                    "$maxDistance": 9.0,
+                }
+            }
+        )
+    )
+    # Only _id 2 (dist 5) is inside the (3, 9) annulus.
+    assert {d["_id"] for d in found} == {2}
+
+
+def test_near_sphere_legacy_sibling_max(client: MongoClient) -> None:
+    """Same sibling-level shape, ``$nearSphere`` flavour. The Java
+    driver's ``Filters.nearSphere(field, x, y, max, min)`` against a
+    legacy 2d coordinate field generates this."""
+    coll = client["geo"]["near_sphere_sibling"]
+    coll.insert_many(
+        [
+            {"_id": 1, "loc": [0.0, 0.0]},
+            {"_id": 2, "loc": [0.01, 0.0]},  # ~1100 m in spherical
+            {"_id": 3, "loc": [50.0, 50.0]},
+        ]
+    )
+    # Mongod convention: $nearSphere with a legacy coord pair takes
+    # $maxDistance in RADIANS (unit-sphere measure), not meters.
+    # 0.0002 rad ≈ 1275 m on Earth — covers _id 1 (0 m) and _id 2
+    # (~1100 m). _id 3 way outside.
+    found = list(coll.find({"loc": {"$nearSphere": [0.0, 0.0], "$maxDistance": 0.0002}}))
+    assert {d["_id"] for d in found} == {1, 2}
