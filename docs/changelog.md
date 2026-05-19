@@ -19,6 +19,11 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+(No entries yet — the next release will be cut from work landing on
+`main` after v0.5.1b20.)
+
+## [0.5.1b20] — 2026-05-19
+
 ### `secantusdb.toml` config file, native checkpoint restore, j:true durability knob
 
 Two production-shaping slices land together. A new
@@ -588,6 +593,7 @@ Releases](https://github.com/jdrumgoole/SecantusDB/releases) page for
 the auto-generated commit-list notes from those tags.
 
 [Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b18...HEAD
+[0.5.1b20]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b20
 [0.5.1b18]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b18
 [0.5.1b17]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b17
 [0.5.1b16]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b16
