@@ -102,4 +102,10 @@ jobs:
         run: uv run ruff format --check src tests
 
       - name: Tests
-        run: uv run python -m pytest
+        # ``--timeout=120 --timeout-method=thread`` catches the rare
+        # hang at ~97% on Linux that's otherwise invisible — when a
+        # test exceeds 2 min, pytest-timeout dumps the thread stack
+        # trace and pytest reports the test as failed (with name).
+        # 120s is comfortably above the slowest legitimate test
+        # (~30s for some change-stream / WT-checkpoint tests).
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread
