@@ -40,3 +40,12 @@ sync_on_commit = false        # default: false; true forces per-commit fsync (cl
 # plaintext.
 # cert_file = "/etc/letsencrypt/live/db.example.com/fullchain.pem"
 # key_file  = "/etc/letsencrypt/live/db.example.com/privkey.pem"
+#
+# mTLS: when ca_file is set, the daemon asks connecting clients for
+# their own X.509 cert during the handshake and verifies it against
+# this CA bundle. Only meaningful when cert_file / key_file are also
+# set. require_client_cert=true rejects clients without a cert;
+# false (default) verifies a cert if presented, accepts clients
+# without one (CERT_OPTIONAL — useful for staged rollouts).
+# ca_file = "/etc/ssl/client-ca.crt"
+# require_client_cert = false

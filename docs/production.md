@@ -189,9 +189,14 @@ of the daemon. Bake `certbot renew --post-hook 'systemctl reload
 secantusdb'` (a full restart, despite the name) into your renewal
 cron so renewed certs take effect.
 
-mTLS (client certificate authentication, mongod's MONGODB-X509
-mechanism) is not yet supported — a follow-on slice. Until then,
-SCRAM-SHA-256 over TLS is the authentication+confidentiality story.
+For deployments that want stronger client-identity guarantees, add
+`[tls] ca_file` + `[tls] require_client_cert = true` for mTLS — the
+server will then refuse any client that doesn't present a cert
+signed by your configured CA. That's a transport-layer coarse
+gate ("you're someone we approved of"); SCRAM-SHA-256 still
+identifies the specific user on top. mongod's MONGODB-X509 auth
+mechanism (cert subject DN as the username, no SCRAM step) is a
+separate follow-on slice.
 
 ### Backups
 
