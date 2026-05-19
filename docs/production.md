@@ -34,7 +34,7 @@ doesn't pretend to compete in that space.
 | Full snapshot backup | `pg_basebackup` | `secantusAdmin.backupArchive` (`.tar.gz`) |
 | Restore | swap dbpath + start | `secantusdb-restore-archive` → start fresh server |
 | Point-in-time recovery | WAL archiving + `recovery_target_time` | not supported |
-| Native TLS | `ssl=on` | not supported (terminate at a reverse proxy) |
+| Native TLS | `ssl=on` | server-side TLS via `[tls] cert_file` / `key_file` |
 | Auth methods | md5 / scram / cert / peer / ldap / gss / pam | SCRAM-SHA-256 only |
 | Constraints / triggers / FKs / views | rich | none (document store) |
 | Replication | streaming + logical | none (single-node by design) |
@@ -42,13 +42,16 @@ doesn't pretend to compete in that space.
 | Profiling | `log_min_duration_statement` + `pg_stat_*` | `profile` command + admin UI |
 | Maturity | production-hardened | beta (b20 at time of writing) |
 
-The headline gaps you must accept up front are **no native TLS** (a
-reverse proxy in front is the workaround, but the proxy becomes part
-of your trust boundary), **no PITR** (your RPO is "however often
-your snapshot cron fires"), **no replication / failover** (a process
-crash without a hot standby is downtime), and **beta maturity** (the
-project has not yet been through a public production incident — the
-existence of unknown sharp edges has not been ruled out).
+The headline gaps you must accept up front are **no PITR** (your RPO
+is "however often your snapshot cron fires"), **no replication /
+failover** (a process crash without a hot standby is downtime), and
+**beta maturity** (the project has not yet been through a public
+production incident — the existence of unknown sharp edges has not
+been ruled out). Native TLS used to be on this list; it now isn't —
+`[tls] cert_file` / `key_file` in `secantusdb.toml` wraps every
+accepted socket in TLS before the wire protocol starts, so a reverse
+proxy is no longer required to put SecantusDB behind a stable
+hostname.
 
 If those are acceptable trade-offs for your application, the rest of
 this page describes a workable single-node deployment.
@@ -58,8 +61,8 @@ this page describes a workable single-node deployment.
 ### `systemd` service unit
 
 A minimal unit that survives crashes, runs as an unprivileged user,
-and pins the daemon to loopback (a reverse proxy fronts it for
-external traffic):
+and lets the daemon bind on the public interface (TLS terminates
+in-process — see [TLS](#tls) below):
 
 ```ini
 # /etc/systemd/system/secantusdb.service
@@ -98,11 +101,15 @@ roughly like this:
 ```toml
 # /etc/secantus/secantusdb.toml
 [server]
-host = "127.0.0.1"                  # loopback only; reverse proxy fronts it
+host = "0.0.0.0"                     # public bind; TLS terminates inside the daemon
 port = 27017
 storage_path = "/var/lib/secantus/data"
 log_level = "INFO"
 auth = true                          # SCRAM-SHA-256 enforced on every command
+
+[tls]
+cert_file = "/etc/letsencrypt/live/db.example.com/fullchain.pem"
+key_file  = "/etc/letsencrypt/live/db.example.com/privkey.pem"
 
 [storage]
 cache_size = "4G"                    # size to fit the hot doc subset
@@ -151,30 +158,40 @@ From there, application users get provisioned over the wire with
 [Authentication](authentication.md) for the full mechanism, role
 catalogue, and gotchas.
 
-### TLS termination
+### TLS
 
-SecantusDB does not speak TLS. Run a reverse proxy on the same host
-(nginx, HAProxy, Envoy, stunnel — any of them work; the wire
-protocol is plain TCP, no HTTP-specific handling needed) and forward
-to `127.0.0.1:27017`. nginx's stream module is the smallest example:
+Native TLS lives behind the `[tls]` table — when `cert_file` and
+`key_file` are both set, the daemon wraps every accepted socket
+with TLS before the wire protocol starts. No reverse proxy
+required.
 
-```nginx
-# /etc/nginx/conf.d/secantusdb.conf
-stream {
-    server {
-        listen 27018 ssl;
-        ssl_certificate     /etc/letsencrypt/live/db.example.com/fullchain.pem;
-        ssl_certificate_key /etc/letsencrypt/live/db.example.com/privkey.pem;
-        ssl_protocols       TLSv1.2 TLSv1.3;
-        proxy_pass          127.0.0.1:27017;
-    }
-}
+```toml
+[tls]
+cert_file = "/etc/letsencrypt/live/db.example.com/fullchain.pem"
+key_file  = "/etc/letsencrypt/live/db.example.com/privkey.pem"
 ```
 
-Clients then connect to `mongodb://db.example.com:27018/?tls=true`.
-The proxy is now part of your trust boundary; keep its certificate
-rotation and config audit on the same cadence as your other ingress
-infrastructure.
+Clients connect with `?tls=true`:
+
+```
+mongodb://admin:<pwd>@db.example.com:27017/?tls=true
+```
+
+Add `&tlsCAFile=/path/to/ca.pem` if the cert is signed by a CA the
+client doesn't already trust. Use Let's Encrypt for a public host
+or your internal CA for an intranet deployment; the daemon doesn't
+care which issued the cert — Python's `ssl` module loads any
+PEM-format chain.
+
+Cert rotation is hot-swap-friendly *only* across a restart — the
+SSLContext is built once at startup and cached for the lifetime
+of the daemon. Bake `certbot renew --post-hook 'systemctl reload
+secantusdb'` (a full restart, despite the name) into your renewal
+cron so renewed certs take effect.
+
+mTLS (client certificate authentication, mongod's MONGODB-X509
+mechanism) is not yet supported — a follow-on slice. Until then,
+SCRAM-SHA-256 over TLS is the authentication+confidentiality story.
 
 ### Backups
 
