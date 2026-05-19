@@ -241,6 +241,28 @@ def _id_key(doc_id: Any) -> bytes:
     return encode_value(doc_id)
 
 
+def _parse_index_collation(spec: Any) -> Any:
+    """Parse an index's stored ``collation`` option into a Collation.
+
+    Returns ``None`` for falsy / non-dict input, or for collations
+    that don't support index encoding (``numericOrdering``) — the
+    picker treats those as "index isn't usable for collation
+    lookups," falling back to COLLSCAN, while the write path writes
+    raw-codepoint entries unchanged.
+
+    Local import avoids the ``storage → collation → sortkey →
+    storage`` cycle that a top-level import would create.
+    """
+    if not isinstance(spec, dict) or not spec:
+        return None
+    from secantus.collation import parse as _parse_coll
+
+    coll = _parse_coll(spec)
+    if coll is None or not coll.supports_index_encoding:
+        return None
+    return coll
+
+
 def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:
     """True if any field in ``key_spec`` resolves to a list value in ``doc``.
 
@@ -252,7 +274,11 @@ def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> 
 
 
 def _index_key(
-    doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
+    doc: Mapping[str, Any],
+    key_spec: Mapping[str, Any],
+    *,
+    sparse: bool,
+    collation: Any = None,
 ) -> bytes | None:
     """Direction-aware byte-sortable encoding for an index ``key_spec``.
 
@@ -260,6 +286,13 @@ def _index_key(
     (descending) fields get bitwise-inverted bytes, making a forward
     B-tree walk yield values in descending order. Compound keys are
     joined with ``\\x00\\x00`` between components.
+
+    ``collation`` propagates to every string field — when set, string
+    values are normalised (accent-stripped / case-folded per the
+    collation strength) before encoding so the entries table sorts
+    by the collation's rules rather than raw codepoint. Must match
+    the index's stored ``collation`` option; the writers handle
+    that.
 
     For docs whose indexed field is array-valued, this returns the
     whole-array sortkey only — the single canonical "doc-shape" key
@@ -274,13 +307,20 @@ def _index_key(
     fields = list(key_spec)
     if len(fields) == 1:
         d = int(key_spec[fields[0]])
-        return encode_value_directed(get_path(dict(doc), fields[0]), d)
-    parts = [encode_value_directed(get_path(dict(doc), f), int(key_spec[f])) for f in fields]
+        return encode_value_directed(get_path(dict(doc), fields[0]), d, collation=collation)
+    parts = [
+        encode_value_directed(get_path(dict(doc), f), int(key_spec[f]), collation=collation)
+        for f in fields
+    ]
     return COMPOUND_SEP.join(parts)
 
 
 def _index_key_variants(
-    doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
+    doc: Mapping[str, Any],
+    key_spec: Mapping[str, Any],
+    *,
+    sparse: bool,
+    collation: Any = None,
 ) -> list[bytes]:
     """All byte-keys this doc contributes to an index under ``key_spec``.
 
@@ -326,7 +366,7 @@ def _index_key_variants(
             uniq: list[Any] = []
             d = int(key_spec[field])
             for elem in v:
-                eb = encode_value_directed(elem, d)
+                eb = encode_value_directed(elem, d, collation=collation)
                 if eb in seen:
                     continue
                 seen.add(eb)
@@ -343,7 +383,7 @@ def _index_key_variants(
         keys: list[bytes] = []
         seen_kb: set[bytes] = set()
         for val in per_field[0]:
-            kb = encode_value_directed(val, d)
+            kb = encode_value_directed(val, d, collation=collation)
             if kb in seen_kb:
                 continue
             seen_kb.add(kb)
@@ -357,7 +397,8 @@ def _index_key_variants(
     seen_kb = set()
     for combo in product(*per_field):
         parts = [
-            encode_value_directed(combo[i], int(key_spec[fields[i]])) for i in range(len(fields))
+            encode_value_directed(combo[i], int(key_spec[fields[i]]), collation=collation)
+            for i in range(len(fields))
         ]
         kb = COMPOUND_SEP.join(parts)
         if kb in seen_kb:
@@ -2193,18 +2234,21 @@ class Storage:
                     db, coll, resolved, sort_field, sort_dir
                 )
             elif collation_obj is not None:
-                # Index entries are byte-encoded under the default
-                # codepoint ordering — they don't carry the collation's
-                # case- or accent-folding. A case-insensitive equality
-                # like ``{x: "PING"}`` would miss an indexed doc with
-                # ``x: "ping"`` because the entries are stored under
-                # the literal bytes of the inserted value. Force a
-                # COLLSCAN so ``matches()`` does the comparison with
-                # the collation in hand. ``mongod`` only honours an
-                # index when its definition's collation matches the
-                # query's; we don't support per-index collation yet,
-                # so the safe path is always-COLLSCAN-when-collation.
-                raw_blobs = [b for _, b in self._scan_docs(db, coll)]
+                # Per-index collation: try the index path first — the
+                # gate matches only indexes whose stored ``collation``
+                # option equals ``collation_obj``. Entries on such
+                # indexes are byte-encoded using the same collation,
+                # so a case-insensitive equality like
+                # ``{x: "PING"}`` against an index with
+                # ``collation: {strength: 2}`` hits the same row a
+                # doc inserted with ``x: "ping"`` produced. When no
+                # matching index exists the picker returns None and
+                # we fall back to COLLSCAN — ``matches()`` then does
+                # the comparison with the collation in hand. Mirrors
+                # mongod's per-index collation rule.
+                candidates = self._try_index_lookup(db, coll, filter, collation=collation_obj)
+                if candidates is None:
+                    raw_blobs = [b for _, b in self._scan_docs(db, coll)]
             else:
                 candidates = self._try_index_lookup(db, coll, filter)
                 if candidates is not None and sort_field is not None:
@@ -2451,6 +2495,7 @@ class Storage:
         *,
         sort: Mapping[str, Any] | None = None,
         hint: str | Mapping[str, Any] | None = None,
+        collation: Any = None,
     ) -> dict[str, Any]:
         """Plan summary for what ``find_matching`` would do with these args.
 
@@ -2458,7 +2503,15 @@ class Storage:
         ``{"kind": "COLLSCAN"}`` or ``{"kind": "IXSCAN", "index_name",
         "key_pattern", "direction"}``. ``direction`` is ``"forward"``
         unless a sort spec inverts it relative to the chosen index.
+
+        ``collation``: mirrors the runtime gate — when set, only
+        indexes whose stored ``collation`` matches the query's are
+        considered for string-bearing predicates. Mismatched indexes
+        produce COLLSCAN, same as ``find_matching`` would.
         """
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
         filter = filter or {}
         with self._lock:
             sort_field, sort_dir = self._single_sort_spec(sort)
@@ -2483,7 +2536,7 @@ class Storage:
                 if key_spec is None:
                     return {"kind": "COLLSCAN"}
                 return self._make_ixscan_plan(resolved, key_spec, sort_field, sort_dir)
-            picked = self._pick_index_for_filter(db, coll, filter)
+            picked = self._pick_index_for_filter(db, coll, filter, collation=collation_obj)
             if picked is not None:
                 name, key_spec = picked
                 return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
@@ -2542,9 +2595,22 @@ class Storage:
         return None
 
     def _pick_index_for_filter(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
     ) -> tuple[str, dict[str, Any]] | None:
-        """Mirror ``_try_index_lookup``'s index-selection (no execution)."""
+        """Mirror ``_try_index_lookup``'s index-selection (no execution).
+
+        ``collation`` propagates from the query; when set, only
+        indexes with a matching stored ``collation`` option are
+        considered. Compound / range pickers don't yet support
+        collation, so they skip out when it's set (the caller falls
+        back to COLLSCAN, matching ``_try_index_id_keys``'s
+        contract).
+        """
         if not filter:
             return None
         if any(f.startswith("$") for f in filter):
@@ -2553,18 +2619,19 @@ class Storage:
         geo_pick = self._pick_geo_index_for_filter(db, coll, filter)
         if geo_pick is not None:
             return geo_pick
-        if all(not isinstance(v, dict) for v in filter.values()):
-            picked = self._pick_compound_eq_index(db, coll, filter)
-            if picked is not None:
-                return picked
-        if len(filter) >= 2:
-            picked = self._pick_compound_range_index(db, coll, filter)
-            if picked is not None:
-                return picked
+        if collation is None:
+            if all(not isinstance(v, dict) for v in filter.values()):
+                picked = self._pick_compound_eq_index(db, coll, filter)
+                if picked is not None:
+                    return picked
+            if len(filter) >= 2:
+                picked = self._pick_compound_range_index(db, coll, filter)
+                if picked is not None:
+                    return picked
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field, filter)
+        idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
         if idx_match is None:
             return None
         if isinstance(value, dict):
@@ -3260,6 +3327,7 @@ class Storage:
                 seen: dict[bytes, Any] | None = {} if unique else None
                 multikey = False
                 entries = []
+                coll_opt = _parse_index_collation(options.get("collation"))
                 for id_k, blob in self._scan_docs(db, coll):
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
@@ -3267,12 +3335,14 @@ class Storage:
                     if not multikey and _doc_makes_multikey(d, key_spec_dict):
                         multikey = True
                     if seen is not None:
-                        canonical = _index_key(d, key_spec_dict, sparse=sparse)
+                        canonical = _index_key(d, key_spec_dict, sparse=sparse, collation=coll_opt)
                         if canonical is not None:
                             if canonical in seen:
                                 raise IndexConflict(name, d.get("_id"))
                             seen[canonical] = d.get("_id")
-                    for kb in _index_key_variants(d, key_spec_dict, sparse=sparse):
+                    for kb in _index_key_variants(
+                        d, key_spec_dict, sparse=sparse, collation=coll_opt
+                    ):
                         entries.append((kb, id_k))
                 if multikey:
                     options["multikey"] = True
@@ -3484,7 +3554,8 @@ class Storage:
                     c.reset()
                     c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
                 continue
-            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+            coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c[db, coll, name, _pack_entry(kb, id_k)] = b""
 
@@ -3527,7 +3598,8 @@ class Storage:
                     if c.search() == 0:
                         c.remove()
                 continue
-            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+            coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c.set_key(db, coll, name, _pack_entry(kb, id_k))
                 if c.search() == 0:
@@ -3948,17 +4020,38 @@ class Storage:
                 return
 
     def _try_index_lookup(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
     ) -> list[dict[str, Any]] | None:
-        id_keys = self._try_index_id_keys(db, coll, filter)
+        id_keys = self._try_index_id_keys(db, coll, filter, collation=collation)
         if id_keys is None:
             return None
         return self._docs_by_id_keys(db, coll, id_keys)
 
-    def _try_index_id_keys(self, db: str, coll: str, filter: dict[str, Any]) -> list[bytes] | None:
+    def _try_index_id_keys(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
+    ) -> list[bytes] | None:
         """Same dispatch as ``_try_index_lookup`` but returns id_keys instead
         of materialised docs. Used by the write paths (update / delete) so
         only matching docs pay ``bson.decode``.
+
+        ``collation`` propagates from the query. When set, only indexes
+        whose stored ``collation`` option matches are considered for
+        string-bearing fields; non-matching indexes are skipped so the
+        caller falls back to COLLSCAN (the safe semantics). Today only
+        the single-field equality path threads collation through —
+        compound / range / $in pickers all return None when
+        ``collation`` is set, leaving the caller to scan. Worth
+        expanding case-by-case when a workload needs it.
         """
         if not filter:
             return None
@@ -3971,24 +4064,27 @@ class Storage:
         geo_ids = self._try_geo_index_id_keys(db, coll, filter)
         if geo_ids is not None:
             return geo_ids
-        # Bare-equality filters of any size can use a compound index whose
-        # leading fields cover the filter set.
-        if all(not isinstance(v, dict) for v in filter.values()):
-            result = self._try_compound_eq_id_keys(db, coll, filter)
-            if result is not None:
-                return result
-        # Compound prefix + trailing operator field (eq fields then range/in).
-        if len(filter) >= 2:
-            result = self._try_compound_range_id_keys(db, coll, filter)
-            if result is not None:
-                return result
+        if collation is None:
+            # Bare-equality filters of any size can use a compound index whose
+            # leading fields cover the filter set.
+            if all(not isinstance(v, dict) for v in filter.values()):
+                result = self._try_compound_eq_id_keys(db, coll, filter)
+                if result is not None:
+                    return result
+            # Compound prefix + trailing operator field (eq fields then range/in).
+            if len(filter) >= 2:
+                result = self._try_compound_range_id_keys(db, coll, filter)
+                if result is not None:
+                    return result
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field, filter)
+        idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
         if idx_match is None:
             return None
-        return self._lookup_id_keys_via_leading_field(db, coll, idx_match, value)
+        return self._lookup_id_keys_via_leading_field(
+            db, coll, idx_match, value, collation=collation
+        )
 
     def _candidates_iter(
         self, db: str, coll: str, filter: dict[str, Any] | None
@@ -4022,6 +4118,8 @@ class Storage:
         coll: str,
         field: str,
         query: Mapping[str, Any] | None = None,
+        *,
+        collation: Any = None,
     ) -> tuple[str, int, bool] | None:
         """Best index whose leading field is ``field``.
 
@@ -4035,8 +4133,16 @@ class Storage:
         the leading field hit at least all true matches. The geo
         ``2dsphere`` / ``2d`` indexes have non-numeric direction values
         and are excluded by the ASC/DESC check below.
+
+        ``collation``: when set, an index is only considered if its
+        stored ``collation`` option produces the same :class:`Collation`
+        as the query's (or both are None). Mismatched indexes are
+        skipped — the caller falls back to COLLSCAN, which uses
+        ``matches()`` with the query's collation. Matches mongod's
+        per-index collation semantics.
         """
         partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         query = query or {}
         compound_fallback: tuple[str, int, bool] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
@@ -4052,6 +4158,16 @@ class Storage:
             # 1 / -1.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
+            # Collation gate: the index's stored collation must equal
+            # the query's effective collation (both None counts as a
+            # match). Indexes with a collation that doesn't support
+            # byte encoding (numericOrdering) parse to None here, so
+            # they're treated as "no collation" — correct for queries
+            # that also don't carry collation, wrong for queries that
+            # do. Conservative: gate by None-vs-None or exact match.
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
+                continue
             d = int(key_spec[field])
             if len(idx_fields) == 1:
                 return name, d, False
@@ -4065,10 +4181,14 @@ class Storage:
         coll: str,
         idx_match: tuple[str, int, bool],
         value: Any,
+        *,
+        collation: Any = None,
     ) -> list[bytes] | None:
         name, direction, is_compound = idx_match
         if not isinstance(value, dict):
-            return self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, value)
+            return self._eq_id_keys_via_leading(
+                db, coll, name, direction, is_compound, value, collation=collation
+            )
         if not value or not all(k.startswith("$") for k in value):
             return None
         if not all(op in self._RANGE_OPS for op in value):
@@ -4081,7 +4201,9 @@ class Storage:
             for v in value["$in"]:
                 if isinstance(v, dict):
                     return None
-                for id_k in self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, v):
+                for id_k in self._eq_id_keys_via_leading(
+                    db, coll, name, direction, is_compound, v, collation=collation
+                ):
                     if id_k not in seen:
                         seen.add(id_k)
                         id_keys.append(id_k)
@@ -4094,8 +4216,10 @@ class Storage:
             if isinstance(bound, dict):
                 return None
             if op == "$eq":
-                return self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, bound)
-            kb = encode_value_directed(bound, direction)
+                return self._eq_id_keys_via_leading(
+                    db, coll, name, direction, is_compound, bound, collation=collation
+                )
+            kb = encode_value_directed(bound, direction, collation=collation)
             # Operator semantics flip when stored bytes are inverted: in a
             # DESC index, "x > 5" means we want stored bytes < enc_desc(5).
             effective_op = op
@@ -4125,8 +4249,10 @@ class Storage:
         direction: int,
         is_compound: bool,
         value: Any,
+        *,
+        collation: Any = None,
     ) -> list[bytes]:
-        kb = encode_value_directed(value, direction)
+        kb = encode_value_directed(value, direction, collation=collation)
         if is_compound:
             return self._scan_index_for_id_keys(db, coll, name, kb + COMPOUND_SEP, prefix=True)
         return self._scan_index_for_id_keys(db, coll, name, kb)
@@ -4144,6 +4270,7 @@ class Storage:
         """
         filter_fields = set(filter)
         partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             pf = partials.get(name)
@@ -4159,6 +4286,13 @@ class Storage:
             # Geo / hashed / text indexes (string direction values) can't
             # serve a bare-equality compound lookup.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
+                continue
+            # Compound picker doesn't yet thread collation through — skip
+            # indexes with a stored collation so a no-collation query
+            # doesn't accidentally hit a collation-normalised entries
+            # table. Single-field collation indexes are picked by
+            # ``_find_leading_field_index``, which DOES collation-match.
+            if _parse_index_collation(index_options.get(name, {}).get("collation")) is not None:
                 continue
             if len(idx_fields) < len(eff_fields):
                 continue
@@ -4236,6 +4370,7 @@ class Storage:
         eq_set = set(eq_fields)
         target_eq_count = len(eq_set)
         partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             pf = partials.get(name)
@@ -4245,6 +4380,11 @@ class Storage:
             # Geo / hashed / text indexes (string direction values) can't
             # serve a compound prefix + trailing-operator lookup.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
+                continue
+            # Compound-range picker doesn't yet thread collation through
+            # — skip collation-having indexes for the same reason as
+            # _pick_compound_eq_index above.
+            if _parse_index_collation(index_options.get(name, {}).get("collation")) is not None:
                 continue
             if len(idx_fields) <= target_eq_count:
                 continue

@@ -71,7 +71,7 @@ writers across processes. Tests are single-process so this is fine.
 | `sparse` | Honoured |
 | `expireAfterSeconds` | Honoured via `Storage.prune_ttl` (opt-in; no background sweeper) |
 | `partialFilterExpression` | Honoured at write time and at picker time |
-| `collation` | Accepted but ignored (Python compares with default locale) |
+| `collation` | Honoured at index-write and at picker time — strings are stored under collation-normalised bytes so a query carrying a matching `collation` lights up the index at IXSCAN. Strength 1/2/3 + `caseLevel` supported; `numericOrdering` not (needs a length-prefixed digit-run encoding — query falls back to COLLSCAN, results stay correct via `matches()`). See [Indexes](indexes.md) |
 
 ### Cursor TTL
 
@@ -81,10 +81,10 @@ MongoDB's 10-minute cursor TTL). The clock is injectable via
 
 ## Deferred
 
-- Per-index collation — the per-query infrastructure honours
-  `collation` for `find` / `count` / `distinct` / `findAndModify`,
-  but index entries are written in BSON codepoint order; queries
-  carrying `collation` fall through to COLLSCAN by design.
+(No entries — geo, native TLS / mTLS, MONGODB-X509, native checkpoint
+backups, configuration file, per-write `j:true` routing, and
+per-index collation all shipped in earlier slices. See the
+sub-pages for the detail.)
 
 ## Out of scope
 

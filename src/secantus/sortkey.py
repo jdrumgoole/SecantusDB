@@ -178,7 +178,30 @@ def _escape(data: bytes) -> bytes:
     return data.replace(b"\x00", b"\x00\xff")
 
 
-def _encode_string(s: str) -> bytes:
+def _encode_string(s: str, collation: Any = None) -> bytes:
+    """UTF-8 byte-sortable encoding for a string, optionally
+    collation-normalised.
+
+    When ``collation`` is set and supports index encoding, the string
+    is normalised (accents stripped / case-folded per the collation's
+    ``strength`` and ``case_level``) before encoding so the entries
+    table's lex byte order matches the collation's sort order. Index
+    entries are written with the SAME collation that queries use to
+    look them up, so two strings that compare-equal under the
+    collation produce the same key bytes and hit the same row.
+
+    ``numericOrdering`` is intentionally not supported at the index
+    level (would need a length-prefixed digit-run encoding for
+    sortability); queries that combine ``numericOrdering`` with an
+    index fall back to COLLSCAN per the picker's contract.
+    """
+    if collation is not None and getattr(collation, "supports_index_encoding", False):
+        # Local import — sortkey.py is on the import-cycle floor;
+        # collation.py imports sortkey via storage, so we can't
+        # top-import.
+        from secantus.collation import normalize_for_index_bytes
+
+        return _escape(normalize_for_index_bytes(s, collation))
     return _escape(s.encode("utf-8"))
 
 
@@ -228,8 +251,16 @@ def _encode_regex(r: Regex) -> bytes:
     return _escape(pattern) + b"\x00\x00" + _escape(flags)
 
 
-def encode_value(value: Any) -> bytes:
-    """Single-value byte-sortable BSON encoding."""
+def encode_value(value: Any, *, collation: Any = None) -> bytes:
+    """Single-value byte-sortable BSON encoding.
+
+    When ``collation`` is set and the value is a string, the string
+    is normalised via :func:`secantus.collation.normalize_for_index_bytes`
+    before encoding so the resulting bytes sort by the collation's
+    rules rather than raw codepoint. Non-string values pass through
+    unchanged. Used by index-write and index-lookup paths to keep
+    string entries collation-aware.
+    """
     rank = _rank(value)
     head = bytes([rank])
     if rank in (RANK_MINKEY, RANK_NULL, RANK_MAXKEY):
@@ -237,7 +268,7 @@ def encode_value(value: Any) -> bytes:
     if rank == RANK_NUMBER:
         return head + _encode_number(value)
     if rank == RANK_STRING:
-        return head + _encode_string(value)
+        return head + _encode_string(value, collation)
     if rank == RANK_DOCUMENT:
         return head + _encode_doc(value)
     if rank == RANK_ARRAY:
@@ -260,9 +291,13 @@ def encode_value(value: Any) -> bytes:
 COMPOUND_SEP = b"\x00\x00"
 
 
-def encode_compound(values: list[Any]) -> bytes:
-    """Compound key. Components are null-escaped; ``\\x00\\x00`` separates."""
-    return COMPOUND_SEP.join(encode_value(v) for v in values)
+def encode_compound(values: list[Any], *, collation: Any = None) -> bytes:
+    """Compound key. Components are null-escaped; ``\\x00\\x00`` separates.
+
+    ``collation`` applies uniformly to every string component (matches
+    mongod — a collation is a per-index property, not per-field).
+    """
+    return COMPOUND_SEP.join(encode_value(v, collation=collation) for v in values)
 
 
 def invert_bytes(b: bytes) -> bytes:
@@ -274,26 +309,26 @@ def invert_bytes(b: bytes) -> bytes:
     return bytes(x ^ 0xFF for x in b)
 
 
-def encode_value_directed(value: Any, direction: int = 1) -> bytes:
+def encode_value_directed(value: Any, direction: int = 1, *, collation: Any = None) -> bytes:
     """Like ``encode_value`` but inverts bytes when ``direction == -1``."""
-    e = encode_value(value)
+    e = encode_value(value, collation=collation)
     return invert_bytes(e) if direction == -1 else e
 
 
 # Range-query bound helpers. Bounds are returned as (key_bytes, inclusive)
 # tuples so the WT range scan can apply them with the right boundary
 # semantics. ``None`` for a bound means open-ended.
-def gt_bound(value: Any) -> tuple[bytes, bool]:
-    return encode_value(value), False
+def gt_bound(value: Any, *, collation: Any = None) -> tuple[bytes, bool]:
+    return encode_value(value, collation=collation), False
 
 
-def gte_bound(value: Any) -> tuple[bytes, bool]:
-    return encode_value(value), True
+def gte_bound(value: Any, *, collation: Any = None) -> tuple[bytes, bool]:
+    return encode_value(value, collation=collation), True
 
 
-def lt_bound(value: Any) -> tuple[bytes, bool]:
-    return encode_value(value), False
+def lt_bound(value: Any, *, collation: Any = None) -> tuple[bytes, bool]:
+    return encode_value(value, collation=collation), False
 
 
-def lte_bound(value: Any) -> tuple[bytes, bool]:
-    return encode_value(value), True
+def lte_bound(value: Any, *, collation: Any = None) -> tuple[bytes, bool]:
+    return encode_value(value, collation=collation), True
