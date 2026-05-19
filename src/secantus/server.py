@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from typing import Self
 
-from secantus.auth import ConnectionAuth
+from secantus.auth import ConnectionAuth, subject_dn_from_peercert
 from secantus.commands import CommandContext, dispatch
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorRegistry
@@ -285,6 +285,17 @@ class SecantusDBServer:
         connection_id = self.connections.open((addr[0], addr[1]), sock=conn)
         reply_ids = itertools.count(1)
         connection_auth = ConnectionAuth()
+        # Capture the verified client cert's subject DN once per
+        # connection — MONGODB-X509 needs it to look up the user.
+        # ``getpeercert()`` returns ``{}`` when the peer didn't present
+        # a cert (CERT_OPTIONAL mode with a plain client), or the
+        # parsed cert dict otherwise. ``getpeercert`` raises on
+        # non-SSL sockets; plain TCP connections bypass this branch.
+        peer_cert_dn: str | None = None
+        if isinstance(conn, ssl.SSLSocket):
+            with contextlib.suppress(ssl.SSLError, OSError, ValueError):
+                cert = conn.getpeercert()
+                peer_cert_dn = subject_dn_from_peercert(cert)
         self.metrics.connection_opened()
         logger.debug("client %d connected from %s", connection_id, addr)
         self.logs.append(
@@ -352,6 +363,7 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            peer_cert_dn=peer_cert_dn,
                         )
                         try:
                             response_doc = dispatch(body, ctx)
@@ -394,6 +406,7 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            peer_cert_dn=peer_cert_dn,
                         )
                         try:
                             response_doc = dispatch(op.query, ctx)

@@ -19,8 +19,71 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-(No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b24.)
+### MONGODB-X509 auth — cert subject DN as the username
+
+The natural sequel to the b22 mTLS slice. mTLS gives you a
+transport-layer "approved client" gate; MONGODB-X509 turns the
+client cert's subject DN into the user identity directly, no SCRAM
+step. Same flow MongoDB Atlas X509 deployments use: create the user
+on `$external` with `mechanisms: ["MONGODB-X509"]` and the cert DN
+as the username, connect with
+`?authMechanism=MONGODB-X509&authSource=$external`, the server
+matches the DN from the verified cert against the user record. No
+password to rotate, no SCRAM round-trip, no shared secret on disk.
+
+Mixed mechanisms work too — a user record can carry both
+`SCRAM-SHA-256` and `MONGODB-X509` in `mechanisms` for migration or
+to keep a SCRAM fallback. The driver picks per-connection from
+`saslSupportedMechs`.
+
+Closes the "transport-layer gate only" caveat the production +
+configuration docs called out when mTLS shipped; documentation
+updated to point at the worked X509 example as the alternative to
+SCRAM-on-top.
+
+#### Added
+
+- `secantus.auth.MONGODB_X509` constant, `X509_CREDENTIAL_MARKER`
+  for the user record's `credentials` doc (no password to hash —
+  the credential IS the cert), and
+  `secantus.auth.subject_dn_from_peercert()` which converts
+  Python's `ssl.SSLSocket.getpeercert()` tuple-of-tuples into the
+  mongod-style RFC 4514 DN string (short attribute names,
+  most-specific-first, special-char escaping).
+- `CommandContext.peer_cert_dn` — server captures the verified
+  client cert's DN once per connection (right after the TLS
+  handshake in `_handle_client`), replays it into every
+  `CommandContext` so the auth handlers can read it.
+- `_sasl_start_x509` and the legacy `authenticate` command handler
+  — pymongo / Java / Go / Node all use the legacy command path for
+  X509, not `saslStart`. Both are wired up and refuse cleanly on
+  plaintext connections / non-X509 users / payload-DN mismatch.
+- `createUser` accepts `mechanisms=["MONGODB-X509"]` with no
+  password (cert IS the credential). Mixed
+  `["SCRAM-SHA-256", "MONGODB-X509"]` works too — SCRAM creds are
+  derived from `pwd`, X509 marker is written alongside.
+- `tests/test_x509_auth.py` — 9 tests: DN extraction unit tests
+  (reversal, short names, escaping, empty), end-to-end happy path
+  via pymongo, refused-with-no-matching-user, refused-for-SCRAM-only
+  user, SCRAM still works on mTLS-required server, X509 refused on
+  plaintext connection.
+
+#### Changed
+
+- `saslSupportedMechs` now includes `MONGODB-X509` when a user has
+  that mechanism in its `credentials` doc. SCRAM is still listed
+  first when both are available (drivers pick the strongest).
+- `_PRE_AUTH_COMMANDS` includes `authenticate` so the legacy X509
+  command path bypasses the require-auth gate (same as
+  `saslStart` / `saslContinue` already did for SCRAM).
+- `docs/authentication.md` — new MONGODB-X509 section with the
+  provisioning + connection examples; the stale "what's not here
+  yet" list rewritten (RBAC, updateUser, grantRolesToUser, TLS,
+  SCRAM-SHA-1 all shipped slices ago and shouldn't have been
+  listed as gaps).
+- `docs/production.md` + `docs/configuration.md` — mTLS sections
+  now offer two routes (SCRAM-on-top vs MONGODB-X509) instead of
+  the "transport-layer only, MONGODB-X509 is a follow-on" caveat.
 
 ## [0.5.1b24] — 2026-05-19
 

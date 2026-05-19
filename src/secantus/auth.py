@@ -33,7 +33,20 @@ from typing import Any
 
 SCRAM_SHA_256 = "SCRAM-SHA-256"
 SCRAM_SHA_1 = "SCRAM-SHA-1"
-SUPPORTED_MECHS = (SCRAM_SHA_256, SCRAM_SHA_1)
+MONGODB_X509 = "MONGODB-X509"
+# Mechanisms the daemon knows about. SCRAM is the password story;
+# MONGODB-X509 is the TLS-cert-as-username story (a layer on top of
+# the mTLS transport-level gate). A user record carries one or more
+# of these in its ``credentials`` doc — see ``StoredCredentials`` for
+# SCRAM and ``X509_CREDENTIAL_MARKER`` for X509.
+SUPPORTED_MECHS = (SCRAM_SHA_256, SCRAM_SHA_1, MONGODB_X509)
+
+# X509 has no password to hash and no per-mechanism PBKDF2 parameters
+# to store — the credential IS the cert presented at the TLS handshake.
+# We still need *some* entry in the user record's ``credentials`` doc
+# so ``_mechs_for_principal`` can detect "this user can auth via
+# X509", so we write this sentinel.
+X509_CREDENTIAL_MARKER: dict[str, object] = {"MONGODB-X509": "external"}
 
 DEFAULT_ITERATIONS = 15000  # MongoDB default for SCRAM-SHA-256
 NONCE_BYTES = 24
@@ -473,3 +486,80 @@ class ConnectionAuth:
         self.effective_roles = [
             r for r in self.effective_roles if (r.get("role"), r.get("db")) not in to_remove
         ]
+
+
+# ---------------------------------------------------------------------------
+# MONGODB-X509: subject DN extraction
+# ---------------------------------------------------------------------------
+
+# Short OID-attribute names per RFC 4514 / 2253. Python's ssl module
+# returns the parsed DN with long names; mongod-style DNs use the
+# short forms ("CN", "O", "OU", "C", …). Anything not in this map
+# (e.g. emailAddress, domainComponent) falls back to the long name —
+# matches mongod's "use the standard short name when there is one,
+# otherwise the OID name" behaviour.
+_DN_SHORT_NAMES: dict[str, str] = {
+    "commonName": "CN",
+    "organizationName": "O",
+    "organizationalUnitName": "OU",
+    "localityName": "L",
+    "stateOrProvinceName": "ST",
+    "countryName": "C",
+    "streetAddress": "STREET",
+    "domainComponent": "DC",
+    "userId": "UID",
+    "serialNumber": "serialNumber",
+    "emailAddress": "emailAddress",
+}
+
+# Chars that need backslash-escaping in an RFC 4514 attribute value,
+# per the standard's grammar.
+_DN_SPECIAL_CHARS = frozenset(',+"\\<>;=#')
+
+
+def _escape_dn_value(value: str) -> str:
+    """Escape special characters in an attribute value per RFC 4514."""
+    out: list[str] = []
+    for i, ch in enumerate(value):
+        if ch in _DN_SPECIAL_CHARS or (i == 0 and ch == " ") or (i == len(value) - 1 and ch == " "):
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def subject_dn_from_peercert(cert: dict[str, Any] | None) -> str | None:
+    """Convert ``ssl.SSLSocket.getpeercert()`` output to a mongod-style DN.
+
+    Python's ``ssl`` module returns the subject as a tuple-of-RDNs in
+    *certificate order* (least-specific first: country, then state, …,
+    then commonName last). mongod's MONGODB-X509 mechanism uses the
+    RFC 4514 string representation, which is **reversed** (most-specific
+    first: CN, then OU, then O, …), comma-separated, with short OID
+    names where they exist.
+
+    Returns ``None`` when the peercert is missing or has no subject —
+    callers treat that as "client didn't present a usable cert" and
+    refuse the X509 auth.
+
+    Examples (cert tuple order → returned DN string):
+    * ``((('CN', 'alice'),),)`` → ``"CN=alice"``
+    * ``((('C', 'US'),), (('O', 'Acme'),), (('CN', 'alice'),))``
+        → ``"CN=alice,O=Acme,C=US"``
+    """
+    if not isinstance(cert, dict):
+        return None
+    subject = cert.get("subject")
+    if not subject:
+        return None
+    rdn_strs: list[str] = []
+    # Iterate in reverse so the resulting string is most-specific-first.
+    for rdn in reversed(subject):
+        # Each RDN is a tuple of ``(attribute_type, value)`` pairs.
+        # Multi-valued RDNs (rare) join with ``+`` per RFC 4514.
+        attrs: list[str] = []
+        for attr_type, value in rdn:
+            short = _DN_SHORT_NAMES.get(attr_type, attr_type)
+            attrs.append(f"{short}={_escape_dn_value(str(value))}")
+        rdn_strs.append("+".join(attrs))
+    return ",".join(rdn_strs)
