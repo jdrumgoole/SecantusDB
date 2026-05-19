@@ -19,6 +19,11 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+(No entries yet — the next release will be cut from work landing on
+`main` after v0.5.1b24.)
+
+## [0.5.1b24] — 2026-05-19
+
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
 
 Three geo improvements that close the long-standing tail of the
@@ -69,6 +74,16 @@ pymongo conformance gauge nor our in-tree pymongo tests reach.
   `java_validation/include_modules.py`: brings the two upstream
   geo functional specs into the java gauge as
   `:driver-core:test` filtered runs.
+- [`docs/geospatial.md`](geospatial.md) — dedicated reference
+  page: operator-by-operator, both index types, doc-side shapes
+  accepted, the legacy / GeoJSON / spherical distance-unit
+  conventions, a worked deployment example, validation surface
+  summary. Linked from the Highlights list and added to the
+  Sphinx toctree.
+- [`docs/indexes.md`](indexes.md) — new geospatial section
+  pointing at the dedicated page; the "Acceleration summary
+  across index types" table now covers `2d`, `2dsphere`, and
+  compound geo + scalar.
 
 #### Changed
 
@@ -79,6 +94,16 @@ pymongo conformance gauge nor our in-tree pymongo tests reach.
   GeoJSON → meters).
 - 2d-index picker uses the multi-range coverer; existing single-
   range `planar_2d_covering` kept as the coarse fallback.
+- [`docs/indexes.md`](indexes.md) — "What's still missing" list
+  rewritten. Multi-field sort acceleration, multikey indexing,
+  and basic collation all shipped long ago and shouldn't have
+  been on the gap list; the actual remaining gaps (per-index
+  collation, TTL background sweeper, text / hashed indexes)
+  replace the stale entries.
+- [`docs/production.md`](production.md) — added a paragraph on
+  per-write `writeConcern: {j: true}` routing as the
+  finer-grained alternative to the daemon-wide
+  `sync_on_commit = true` knob.
 
 #### Fixed
 
@@ -773,6 +798,7 @@ Releases](https://github.com/jdrumgoole/SecantusDB/releases) page for
 the auto-generated commit-list notes from those tags.
 
 [Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b18...HEAD
+[0.5.1b24]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b24
 [0.5.1b23]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b23
 [0.5.1b20]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b20
 [0.5.1b18]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b18

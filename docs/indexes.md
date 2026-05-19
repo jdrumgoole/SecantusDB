@@ -177,6 +177,23 @@ plan = coll.find({"n": 5}).explain()["queryPlanner"]["winningPlan"]
 `Storage.explain_plan(...)` mirrors `find_matching`'s routing decisions
 without executing them and is exposed on the public storage API.
 
+## Geospatial — `2d` and `2dsphere`
+
+Both index types ship and accelerate `$geoWithin` / `$geoIntersects`
+/ `$near` / `$nearSphere` plus the `$geoNear` aggregation stage.
+See the dedicated [Geospatial](geospatial.md) page for the
+operator-by-operator reference, doc-side shapes accepted,
+distance-unit conventions across the GeoJSON / legacy-planar /
+legacy-spherical spec forms, and the worked deployment example.
+
+Quick shapes:
+
+```python
+coll.create_index([("loc", "2dsphere")])               # GeoJSON, spherical
+coll.create_index([("loc", "2d")])                     # legacy [x, y] pairs, planar
+coll.create_index([("loc", "2dsphere"), ("cat", 1)])   # compound geo + scalar
+```
+
 ## Natural iteration order
 
 Walking the doc table in WT-key order yields docs in MongoDB's natural
@@ -199,14 +216,31 @@ without `sort` walk in this order, matching `mongod`.
 | Sort `{f: ±1}` aligned with an index leading field | B-tree walk in (reversed) order, no post-sort |
 | `hint` | Forces a specific index / `$natural` |
 
+## Acceleration summary across index types
+
+| Index type | Filter / sort shape | Path |
+|---|---|---|
+| Single-field B-tree | equality / `$in` / `$gt`/`$gte`/`$lt`/`$lte` / sort | IXSCAN |
+| Compound B-tree | bare-eq prefix; eq prefix + trailing operator on the next column; ASC/DESC mix; multi-field sort that matches or exactly inverts the key spec | IXSCAN, no post-sort |
+| Partial | when the user filter implies the partial expression | IXSCAN |
+| Multikey | equality / `$in` / range on the array column; whole-array equality goes through the canonical key entry | IXSCAN (sort-acceleration skipped — multikey doesn't preserve a single natural order) |
+| TTL | timestamp range + prune sweeper drives expiry | IXSCAN |
+| `2dsphere` | `$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere` / `$geoNear` via S2 cell-covering scan | IXSCAN — see [Geospatial](geospatial.md) |
+| `2d` | same operators via quadtree-decomposed Z-order range scan over a bit-interleaved geohash | IXSCAN — see [Geospatial](geospatial.md) |
+| Compound geo + scalar | geo column drives the cell scan; trailing scalar(s) filtered at the verifier step | IXSCAN |
+
 ## What's still missing
 
-- **Multi-field sort acceleration** — sort `{a: 1, b: 1}` matching a
-  compound `{a: 1, b: 1}` index would skip the post-sort entirely; today
-  only single-field sort is index-accelerated.
-- **Multikey indexing** — needed for fully-correct index lookups on
-  array-valued fields (currently we sticky-flag and fall back to scan).
-- **Collation** — accepted as an option but ignored (Python compares
-  with default locale).
+- **Per-index collation** — `createIndexes` stores the option on
+  the index spec, but entries are written in BSON codepoint order
+  (no collation-aware sort key). Queries that carry `collation`
+  fall through to COLLSCAN by design. The per-query collation
+  infrastructure does honour collation for `find` / `count` /
+  `distinct` / `findAndModify` — it's just the index-side enforcement
+  that's missing.
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
-  cadence sweeper.
+  cadence sweeper. Real mongod runs one; for an in-process test
+  surrogate the explicit-call ergonomics suit the audience better.
+- **Text / hashed indexes** — out of scope (no full-text engine; no
+  practical workload pulling hashed shard-key behaviour into an
+  in-process surrogate).
