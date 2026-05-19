@@ -214,6 +214,41 @@ def test_overrides_rejects_unknown_field() -> None:
         apply_overrides(SecantusConfig(), {"not_a_field": 42})
 
 
+def test_tls_table_uses_renamed_keys(tmp_path) -> None:
+    """``[tls] cert_file`` writes ``tls_cert_file`` at the dataclass
+    level — the TOML reads cleanly without an awkward prefix."""
+    p = tmp_path / "c.toml"
+    p.write_text(
+        """
+        [tls]
+        cert_file = "/etc/ssl/server.crt"
+        key_file = "/etc/ssl/server.key"
+        """
+    )
+    cfg, _ = load_config(p)
+    assert cfg.tls_cert_file == "/etc/ssl/server.crt"
+    assert cfg.tls_key_file == "/etc/ssl/server.key"
+
+
+def test_tls_cli_flag_overrides_toml(tmp_path) -> None:
+    p = tmp_path / "c.toml"
+    p.write_text(
+        """
+        [tls]
+        cert_file = "/etc/ssl/server.crt"
+        key_file = "/etc/ssl/server.key"
+        """
+    )
+    base, _ = load_config(p)
+    args = build_parser().parse_args(
+        ["--config", str(p), "--tls-cert-file", "/override/server.crt"]
+    )
+    cfg = apply_overrides(base, _overrides_from_args(args))
+    assert cfg.tls_cert_file == "/override/server.crt"
+    # TOML still wins where the CLI was silent.
+    assert cfg.tls_key_file == "/etc/ssl/server.key"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: config-driven server
 # ---------------------------------------------------------------------------

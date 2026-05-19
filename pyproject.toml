@@ -35,7 +35,7 @@ dev = [
     "pytest-json-report>=1.5",  # for pymongo-validation report generation
     "pytest-benchmark>=4.0",  # for tests/test_perf_regression.py
     "pytest-timeout>=2.4",  # per-test deadline; names hung tests instead of letting CI hang at 97%
-
+    "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "invoke>=2.2",
     "ruff>=0.6",
     "sphinx>=7.2",

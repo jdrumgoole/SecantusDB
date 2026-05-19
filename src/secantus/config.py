@@ -87,6 +87,17 @@ class SecantusConfig:
     # underlying disk, so leave False unless you actually need it.
     sync_on_commit: bool = False
 
+    # ---- [tls] ------------------------------------------------------
+    # Paths to a PEM-format certificate chain and private key. When
+    # both are set, the daemon wraps every accepted socket with TLS
+    # before passing it off to the connection thread. Clients then
+    # speak the mongo wire protocol over the encrypted channel; their
+    # URIs need ``?tls=true`` (and ``tlsCAFile=`` to verify the
+    # server cert against a CA they trust). When unset, the daemon
+    # stays plaintext.
+    tls_cert_file: str | None = None
+    tls_key_file: str | None = None
+
 
 class ConfigError(Exception):
     """Raised when a TOML config file is malformed or references
@@ -101,6 +112,7 @@ _TABLE_FIELDS: dict[str, frozenset[str]] = {
     "server": frozenset({"host", "port", "storage_path", "log_level", "auth", "standalone"}),
     "oplog": frozenset({"retention_seconds", "max_entries", "noop_heartbeat_seconds"}),
     "storage": frozenset({"cache_size", "session_max", "ttl_sweep_seconds", "sync_on_commit"}),
+    "tls": frozenset({"cert_file", "key_file"}),
 }
 
 # Some TOML keys are intentionally shorter than the dataclass field
@@ -110,6 +122,8 @@ _TABLE_FIELDS: dict[str, frozenset[str]] = {
 _RENAMES: dict[tuple[str, str], str] = {
     ("oplog", "retention_seconds"): "oplog_retention_seconds",
     ("oplog", "max_entries"): "oplog_max_entries",
+    ("tls", "cert_file"): "tls_cert_file",
+    ("tls", "key_file"): "tls_key_file",
 }
 
 

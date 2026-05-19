@@ -61,6 +61,10 @@ cache_size = "1G"               # WiredTiger cache; "256M", "1G", "8G"
 session_max = 1000              # WT session cap; one per client connection
 ttl_sweep_seconds = 60.0        # TTL pruner cadence (mongod default)
 sync_on_commit = false          # see "Durability" below
+
+[tls]
+cert_file = "/path/to/server.crt"   # PEM cert chain; both keys must be set together
+key_file  = "/path/to/server.key"   # matching PEM private key
 ```
 
 Every key is optional. Unknown keys (or unknown top-level tables)
@@ -110,6 +114,37 @@ Bigger cache = more of the working set lives in RAM = better hit
 rates = less disk I/O. There's no point sizing the cache larger
 than your dataset; WT won't fault more in than it has rows for.
 
+## TLS
+
+`[tls] cert_file` + `[tls] key_file` make the daemon speak TLS. The
+loader insists on both-or-neither — half-configured TLS is almost
+certainly a deployment mistake, so the server raises a clean
+`ValueError` at startup rather than silently falling back to
+plaintext.
+
+When TLS is on, every accepted socket goes through Python's
+`SSLContext.wrap_socket(server_side=True)` before the connection
+thread takes over. Clients connect with
+`mongodb://host:port/?tls=true&tlsCAFile=<ca>` — `tls=true` says
+"speak TLS"; `tlsCAFile` tells pymongo which CA cert to verify the
+server against. Drop `tlsCAFile` if the server uses a publicly
+trusted cert (e.g. Let's Encrypt).
+
+Defaults: Python's `PROTOCOL_TLS_SERVER` — TLS 1.2+ only, no
+SSLv2/3 fallback, default cipher list. Ciphers and protocol
+versions aren't currently configurable from the file; ship a
+follow-on slice if your deployment needs a custom suite.
+
+Hot cert rotation isn't supported: the `SSLContext` is built once
+at startup and cached. Restart the daemon after renewing the cert
+(e.g. wire `certbot renew --post-hook 'systemctl reload
+secantusdb'` into your renewal cron — a "reload" is a restart
+despite the name).
+
+mTLS (client cert auth, mongod's `MONGODB-X509` mechanism) is not
+yet wired up — a follow-on slice. Until then, SCRAM-SHA-256 over
+TLS is the auth + confidentiality story.
+
 ## Example
 
 A minimal production-shaped config:
@@ -153,6 +188,8 @@ overrides. The mapping:
 | `[storage] cache_size` | `--cache-size` |
 | `[storage] session_max` | `--session-max` |
 | `[storage] sync_on_commit` | `--sync-on-commit` |
+| `[tls] cert_file` | `--tls-cert-file` |
+| `[tls] key_file` | `--tls-key-file` |
 
 `[storage] ttl_sweep_seconds` is file-only — it's mostly relevant
 for tests that need deterministic TTL timing, which already drive

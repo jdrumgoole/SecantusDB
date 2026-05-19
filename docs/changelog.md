@@ -19,8 +19,67 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-(No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b20.)
+### Native TLS — drop the reverse proxy
+
+`[tls] cert_file` + `[tls] key_file` (in `secantusdb.toml`) or
+`--tls-cert-file` / `--tls-key-file` (CLI) makes the daemon wrap
+every accepted socket in TLS before the wire protocol starts.
+Clients connect with `mongodb://host:port/?tls=true&tlsCAFile=<ca>`
+and SecantusDB negotiates the TLS handshake itself; the
+connection thread then sees an encrypted socket-like object and
+serves mongo wire frames over it unchanged.
+
+This closes one of the biggest production-deployment gaps the new
+`docs/production.md` page called out — operators no longer need
+to terminate TLS at an nginx / HAProxy / stunnel reverse proxy
+that becomes part of the trust boundary. Server-side TLS only in
+this slice; mTLS (client cert auth, mongod's `MONGODB-X509`
+mechanism) is a separate follow-on. Without the cert / key kwargs
+the daemon stays plaintext exactly as before — no regression risk
+for the 1300+ existing tests.
+
+Python's `PROTOCOL_TLS_SERVER` (TLS 1.2+, no SSLv2/3 fallback,
+default cipher list) is the only protocol mode for now. The
+`SSLContext` is built once at startup and cached — hot cert
+rotation requires a daemon restart. `certbot renew --post-hook
+'systemctl reload secantusdb'` is the standard pattern.
+
+#### Added
+
+- `[tls]` table in `secantusdb.toml` (`cert_file`, `key_file`).
+  Half-configured TLS (only one of the two set) raises
+  `ValueError` at startup so deployment mistakes can't silently
+  fall back to plaintext.
+- `--tls-cert-file` / `--tls-key-file` CLI flags exposing the
+  same. Standard precedence: SecantusConfig defaults < TOML <
+  explicit CLI.
+- `SecantusDBServer(tls_cert_file=..., tls_key_file=...)` kwargs.
+  When set, an `ssl.SSLContext` is built in `__init__` and used to
+  wrap accepted sockets in `_serve_forever`.
+- `tests/test_tls.py`: 6 tests via `trustme` for the ephemeral CA
+  fixture. Covers end-to-end round-trip, non-TLS clients getting
+  cleanly rejected, the no-args plaintext path staying
+  unregressed, half-configured raises, missing-cert-file
+  startup error, and verification that failed handshakes don't
+  leak `active_conns` slots.
+
+#### Changed
+
+- TLS handshake errors are logged + the socket closed + the
+  active-connection slot released; the daemon keeps serving
+  everyone else.
+- `docs/production.md` updated: "Native TLS" is no longer in the
+  gaps list; the dedicated TLS section now shows the in-process
+  config instead of an nginx-stream-module example. The mTLS
+  follow-on is called out.
+- `docs/configuration.md` documents the `[tls]` schema, the
+  hot-rotation caveat, and the cipher-suite "out of scope for v1"
+  note.
+
+#### Dependencies
+
+- `trustme>=1.2` added to the `dev` extra for the test CA
+  fixture (transitively pulls `cryptography`).
 
 ## [0.5.1b20] — 2026-05-19
 
