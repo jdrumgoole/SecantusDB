@@ -19,7 +19,10 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-### Native TLS + mTLS — drop the reverse proxy, gate clients by cert
+### Native TLS + mTLS + per-write `j:true` — production gaps closed
+
+Three slices land together against the production-readiness gaps
+called out in the `docs/production.md` page.
 
 `[tls] cert_file` + `[tls] key_file` (in `secantusdb.toml`) or
 `--tls-cert-file` / `--tls-key-file` (CLI) makes the daemon wrap
@@ -53,6 +56,18 @@ secantusdb'` is the standard pattern. Without the cert / key
 kwargs the daemon stays plaintext exactly as before — no
 regression risk for the 1300+ existing tests.
 
+The b20 `sync_on_commit` knob enabled per-commit fsync at the
+*connection* level — every write on the daemon shared the same
+durability mode. The third slice finishes the story: the per-write
+`writeConcern.j` flag now threads from the wire layer through
+`Storage.insert` / `update_matching` / `delete_matching` (and all
+four `findAndModify` paths) into
+`_batch_transaction(sync=True)`, which calls
+`session.commit_transaction("sync=on")`. A client can now mix
+`j: true` and `j: false` writes against one daemon: the j:true
+subset pays the per-commit fsync cost (closes the durability gap),
+the rest stays fast.
+
 #### Added
 
 - `[tls]` table in `secantusdb.toml` (`cert_file`, `key_file`,
@@ -75,12 +90,30 @@ regression risk for the 1300+ existing tests.
   active_conns leak guard, and the four mTLS modes (required +
   valid cert / required + no cert / required + foreign-CA cert /
   optional + both modes).
+- `journal: bool = False` kwarg on `Storage.insert` /
+  `update_matching` / `delete_matching`. When True, the WT
+  transaction commits with `session.commit_transaction("sync=on")`
+  — forces a per-commit fsync of the log regardless of the
+  connection's `transaction_sync` config.
+- `_batch_transaction(*, sync: bool = False)` context-manager
+  kwarg. The per-commit-fsync escape hatch the new `journal` write
+  kwargs route through.
+- `tests/test_write_concern_journal.py`: 10 tests covering the
+  storage-layer kwarg threading (`_batch_transaction` is invoked
+  with `sync=True/False` appropriately), wire-level happy paths
+  on insert / update / delete / findAndModify, and the positive +
+  negative routing assertions.
 
 #### Changed
 
 - TLS / mTLS handshake errors are logged + the socket closed +
   the active-connection slot released; the daemon keeps serving
   everyone else.
+- `writeConcern: {j: true}` is now honoured per-write: the wire
+  layer extracts the flag and threads it through to
+  `_batch_transaction(sync=True)`. Previously the flag was
+  accepted on the wire but had no effect — only the daemon-wide
+  `sync_on_commit` knob (b20) could enable per-commit fsync.
 - `docs/production.md` updated: "Native TLS" is no longer in the
   gaps list; the dedicated TLS section now shows the in-process
   config plus the mTLS opt-in instead of an nginx-stream-module
