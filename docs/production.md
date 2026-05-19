@@ -202,11 +202,21 @@ cron so renewed certs take effect.
 For deployments that want stronger client-identity guarantees, add
 `[tls] ca_file` + `[tls] require_client_cert = true` for mTLS — the
 server will then refuse any client that doesn't present a cert
-signed by your configured CA. That's a transport-layer coarse
-gate ("you're someone we approved of"); SCRAM-SHA-256 still
-identifies the specific user on top. mongod's MONGODB-X509 auth
-mechanism (cert subject DN as the username, no SCRAM step) is a
-separate follow-on slice.
+signed by your configured CA. From there, two routes for naming
+which user is on the other side of the cert:
+
+* **SCRAM on top** — keep the SCRAM users you already have; the
+  cert proves "approved client", SCRAM proves "this specific user".
+  Useful for deployments where password rotation policy is
+  separate from cert rotation.
+* **MONGODB-X509** — the cert subject DN IS the username; no SCRAM
+  step. Create users on `$external` with `mechanisms:
+  ["MONGODB-X509"]` and the cert DN as the username, then connect
+  with `?authMechanism=MONGODB-X509&authSource=$external`. Removes
+  passwords from the workflow entirely; the same cert that gets you
+  through the mTLS handshake gets you logged in. See
+  [Authentication](authentication.md)
+  for the worked example.
 
 ### Backups
 

@@ -176,12 +176,13 @@ configured server-side via `[tls] ca_file`.
 `key_file` raises at startup — mTLS is a layer on top of
 server-side TLS, not a substitute for it.
 
-This slice is the **transport-layer gate only**. mongod's
-`MONGODB-X509` auth mechanism — where the client cert's subject DN
-serves as the username, no SCRAM step needed — is a separate
-follow-on. Today, an mTLS-protected SecantusDB still SCRAM-auths
-its users; the cert is "you're someone we approved of," the SCRAM
-is "you're specifically this user."
+mTLS gives you a transport-layer "approved client" gate; from there
+you have two choices for naming the user behind the cert. Keep using
+SCRAM (the cert is "approved client", SCRAM is "this specific
+user"), or skip the SCRAM step by enabling the `MONGODB-X509` auth
+mechanism — the cert's subject DN becomes the username directly. See
+[Authentication](authentication.md)
+for the worked example.
 
 ## Example
 

@@ -13,8 +13,10 @@ import bson
 
 from secantus.aggregate import AggregateError, PipelineContext, apply_pipeline
 from secantus.auth import (
+    MONGODB_X509,
     SCRAM_SHA_1,
     SCRAM_SHA_256,
+    X509_CREDENTIAL_MARKER,
     AuthError,
     ConnectionAuth,
     StoredCredentials,
@@ -339,6 +341,14 @@ class CommandContext:
     logs: LogBuffer | None = None
     sessions: SessionRegistry | None = None
     failpoints: FailPointRegistry | None = None
+    # MONGODB-X509: the subject DN of the verified client cert the
+    # connection's TLS handshake produced, in RFC 4514 string form
+    # (e.g. ``"CN=alice,O=Acme,C=US"``). None when the connection is
+    # plaintext, or TLS without ``[tls] ca_file`` configured, or the
+    # client didn't present a cert in CERT_OPTIONAL mode. Captured
+    # once at TLS handshake time, replayed into every CommandContext
+    # for the connection.
+    peer_cert_dn: str | None = None
 
 
 def _split_into_cursor(
@@ -3273,8 +3283,10 @@ def _mechs_for_principal(ctx: CommandContext, principal: str) -> list[str]:
     creds_doc = record.get("credentials")
     if not isinstance(creds_doc, dict):
         return [SCRAM_SHA_256]
-    # Order: modern first when both are present.
-    mechs = [m for m in (SCRAM_SHA_256, SCRAM_SHA_1) if m in creds_doc]
+    # Order: SCRAM modern first, legacy SHA-1 next, then X509. The
+    # driver picks the first one it supports; pymongo / Go / Java all
+    # default to SCRAM-SHA-256 when offered.
+    mechs = [m for m in (SCRAM_SHA_256, SCRAM_SHA_1, MONGODB_X509) if m in creds_doc]
     return mechs or [SCRAM_SHA_256]
 
 
@@ -3293,9 +3305,12 @@ def _lookup_creds(
 def _sasl_start(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     conn = _ensure_conn_auth(ctx)
     mechanism = doc.get("mechanism", "")
+    if mechanism == MONGODB_X509:
+        return _sasl_start_x509(doc, ctx, conn)
     if mechanism not in (SCRAM_SHA_256, SCRAM_SHA_1):
         return _auth_failure(
-            f"Unsupported SASL mechanism: {mechanism!r} (supported: {SCRAM_SHA_256}, {SCRAM_SHA_1})"
+            f"Unsupported SASL mechanism: {mechanism!r} "
+            f"(supported: {SCRAM_SHA_256}, {SCRAM_SHA_1}, {MONGODB_X509})"
         )
     payload = _payload_bytes(doc.get("payload"))
     db_name = ctx.db_name or "admin"
@@ -3317,6 +3332,162 @@ def _sasl_start(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "payload": _payload_binary(server_first),
         "ok": 1.0,
     }
+
+
+def _sasl_start_x509(
+    doc: dict[str, Any], ctx: CommandContext, conn: ConnectionAuth
+) -> dict[str, Any]:
+    """One-shot MONGODB-X509 auth.
+
+    Unlike SCRAM there's no challenge / response. The credential is the
+    TLS client cert the connection presented during the handshake; the
+    server reads the cert's subject DN, looks up a user record whose
+    username equals that DN AND whose ``credentials`` doc carries an
+    X509 entry, and marks the connection authenticated. ``done=True``
+    on the first reply — no ``_sasl_continue`` round-trip.
+
+    The optional ``payload`` in the request can carry the username
+    (some drivers send it as a sanity check); when present, it must
+    equal the cert DN exactly. Mismatch is an auth failure — the
+    driver claimed identity X but the cert says identity Y.
+
+    Refuses with ``AuthenticationFailed`` (code 18) when:
+
+    * The connection is plaintext or didn't verify a client cert
+      (``peer_cert_dn`` is None) — X509 needs mTLS.
+    * No user record exists for the cert DN on the auth db
+      (``$external`` by convention; per-driver-config db otherwise).
+    * The matched user record has no ``MONGODB-X509`` entry in its
+      ``credentials`` (so a SCRAM-only user can't be impersonated
+      via cert).
+    * The payload-claimed username doesn't match the cert DN.
+    """
+    if ctx.peer_cert_dn is None:
+        return _auth_failure(
+            "MONGODB-X509 requires the client to present a verified TLS cert "
+            "(connection is plaintext or no client cert was offered)"
+        )
+    db_name = ctx.db_name or "$external"
+    # MongoDB convention: X509 users live on the ``$external`` auth db,
+    # which is a virtual db (no real collections). We also accept the
+    # legacy ``admin`` placement to give operators flexibility.
+    claimed = _x509_payload_username(_payload_bytes(doc.get("payload")))
+    if claimed and claimed != ctx.peer_cert_dn:
+        return _auth_failure(
+            f"MONGODB-X509: payload username {claimed!r} doesn't match cert DN {ctx.peer_cert_dn!r}"
+        )
+    record = ctx.storage.get_user(db_name, ctx.peer_cert_dn)
+    if record is None and db_name == "$external":
+        # Fallback: also try `admin` so users created with the
+        # ``--db admin`` shorthand work too.
+        record = ctx.storage.get_user("admin", ctx.peer_cert_dn)
+        if record is not None:
+            db_name = "admin"
+    if record is None:
+        return _auth_failure(
+            f"MONGODB-X509: no user found with name {ctx.peer_cert_dn!r} on {db_name!r}"
+        )
+    creds_doc = record.get("credentials")
+    if not isinstance(creds_doc, dict) or MONGODB_X509 not in creds_doc:
+        return _auth_failure(
+            f"MONGODB-X509: user {ctx.peer_cert_dn!r} on {db_name!r} is not "
+            "configured for X509 auth (no MONGODB-X509 entry in credentials)"
+        )
+    # All checks passed. Mark authenticated, capture roles for RBAC,
+    # mirror SCRAM's reply shape with done=True.
+    conn.authenticated_principals.append((db_name, ctx.peer_cert_dn))
+    roles = record.get("roles") or []
+    if isinstance(roles, list):
+        conn.add_principal_roles(roles)
+    return {
+        "conversationId": conn.new_conversation_id(),
+        "done": True,
+        "payload": _payload_binary(b""),
+        "ok": 1.0,
+    }
+
+
+def _authenticate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Legacy ``authenticate`` command — pymongo's chosen path for
+    MONGODB-X509.
+
+    Modern drivers use ``saslStart`` for SCRAM, but for MONGODB-X509
+    pymongo still sends the legacy
+    ``{authenticate: 1, mechanism: "MONGODB-X509", user: <DN>}``
+    command (it's a one-shot with no challenge / response, so the
+    legacy single-command shape fits). The Java / Go / Node drivers
+    do the same for X509 backwards-compat.
+
+    Reuses :func:`_sasl_start_x509`'s logic via a synthetic SCRAM-less
+    code path — same user lookup, same DN comparison, same
+    role-binding side-effects on the connection.
+    """
+    conn = _ensure_conn_auth(ctx)
+    mechanism = doc.get("mechanism", SCRAM_SHA_256)
+    if mechanism != MONGODB_X509:
+        # Legacy ``authenticate`` for SCRAM is older than SecantusDB
+        # cares about — drivers ship the saslStart path for SCRAM. If
+        # somebody really needs it, raise a CommandNotFound-shaped
+        # error that points them at the right command.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"authenticate: only {MONGODB_X509!r} is supported on this "
+                f"command path; use saslStart for {SCRAM_SHA_256!r} / {SCRAM_SHA_1!r}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if ctx.peer_cert_dn is None:
+        return _auth_failure(
+            "MONGODB-X509 requires the client to present a verified TLS cert "
+            "(connection is plaintext or no client cert was offered)"
+        )
+    claimed = doc.get("user")
+    if isinstance(claimed, str) and claimed and claimed != ctx.peer_cert_dn:
+        return _auth_failure(
+            f"MONGODB-X509: claimed user {claimed!r} doesn't match cert DN {ctx.peer_cert_dn!r}"
+        )
+    db_name = ctx.db_name or "$external"
+    record = ctx.storage.get_user(db_name, ctx.peer_cert_dn)
+    if record is None and db_name == "$external":
+        record = ctx.storage.get_user("admin", ctx.peer_cert_dn)
+        if record is not None:
+            db_name = "admin"
+    if record is None:
+        return _auth_failure(
+            f"MONGODB-X509: no user found with name {ctx.peer_cert_dn!r} on {db_name!r}"
+        )
+    creds_doc = record.get("credentials")
+    if not isinstance(creds_doc, dict) or MONGODB_X509 not in creds_doc:
+        return _auth_failure(
+            f"MONGODB-X509: user {ctx.peer_cert_dn!r} on {db_name!r} is not "
+            "configured for X509 auth (no MONGODB-X509 entry in credentials)"
+        )
+    conn.authenticated_principals.append((db_name, ctx.peer_cert_dn))
+    roles = record.get("roles") or []
+    if isinstance(roles, list):
+        conn.add_principal_roles(roles)
+    # Legacy ``authenticate`` reply shape: {dbname, user, ok: 1}.
+    return {"dbname": db_name, "user": ctx.peer_cert_dn, "ok": 1.0}
+
+
+def _x509_payload_username(payload: bytes) -> str:
+    """Best-effort extraction of an optional username from the X509
+    SASL payload.
+
+    pymongo sends ``{payload: BinData(0, b"")}`` (empty) and trusts
+    the cert. Other drivers send the username as a UTF-8 string
+    (sometimes prefixed with the GS2 header marker). Strip the GS2
+    if present, decode, and let the caller compare.
+    """
+    if not payload:
+        return ""
+    # Some drivers prefix with the SASL GS2 header ``n,,`` like SCRAM
+    # does, even though X509 doesn't need one.
+    if payload.startswith(b"n,,"):
+        payload = payload[3:]
+    return payload.decode("utf-8", errors="replace")
 
 
 def _peek_scram_username(payload: bytes) -> str:
@@ -3386,10 +3557,38 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 2,
             "codeName": "BadValue",
         }
-    if not isinstance(pwd, str) or not pwd:
+    # `mechanisms` selects which auth mechanisms the user is enabled
+    # for. SCRAM-SHA-256 alone is the default — matches mongod's modern
+    # behaviour. MONGODB-X509 is a TLS-cert-as-username mechanism; when
+    # requested, the cert's subject DN must equal the username (so the
+    # caller is creating something like ``CN=alice,O=Acme,C=US``), and
+    # no password is required.
+    mechanisms_arg = doc.get("mechanisms")
+    if isinstance(mechanisms_arg, list) and mechanisms_arg:
+        requested = [m for m in mechanisms_arg if m in (SCRAM_SHA_256, SCRAM_SHA_1, MONGODB_X509)]
+    else:
+        requested = [SCRAM_SHA_256]
+    if not requested:
         return {
             "ok": 0.0,
-            "errmsg": "createUser: pwd (string) required",
+            "errmsg": (
+                "createUser: mechanisms must contain at least one of "
+                f"{SCRAM_SHA_256!r}, {SCRAM_SHA_1!r}, {MONGODB_X509!r}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    scram_requested = [m for m in requested if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
+    # Password is required when ANY SCRAM mechanism is requested.
+    # MONGODB-X509-only users have no password — the cert is the
+    # credential.
+    if scram_requested and (not isinstance(pwd, str) or not pwd):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "createUser: pwd (string) required when SCRAM mechanisms are requested "
+                f"(got mechanisms={requested!r})"
+            ),
             "code": 2,
             "codeName": "BadValue",
         }
@@ -3403,28 +3602,11 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 31,
             "codeName": "RoleNotFound",
         }
-    # `mechanisms` selects which SCRAM hashes to derive credentials
-    # for. Default to SCRAM-SHA-256 alone, matching mongod's modern
-    # default (post-3.6 the SHA-1 hashing isn't computed unless the
-    # request asks for it).
-    mechanisms_arg = doc.get("mechanisms")
-    if isinstance(mechanisms_arg, list) and mechanisms_arg:
-        requested = [m for m in mechanisms_arg if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
-    else:
-        requested = [SCRAM_SHA_256]
-    if not requested:
-        return {
-            "ok": 0.0,
-            "errmsg": (
-                "createUser: mechanisms must contain at least one of "
-                f"{SCRAM_SHA_256!r}, {SCRAM_SHA_1!r}"
-            ),
-            "code": 2,
-            "codeName": "BadValue",
-        }
     creds_doc: dict[str, object] = {}
-    for mech in requested:
+    for mech in scram_requested:
         creds_doc.update(derive_credentials(pwd, mechanism=mech, username=username).to_doc())
+    if MONGODB_X509 in requested:
+        creds_doc.update(X509_CREDENTIAL_MARKER)
     record = {
         "_id": f"{db_name}.{username}",
         "user": username,
@@ -4265,6 +4447,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "mapreduce": _map_reduce,
     "saslStart": _sasl_start,
     "saslContinue": _sasl_continue,
+    "authenticate": _authenticate,
     "configureFailPoint": _configure_fail_point,
     "createUser": _create_user,
     "updateUser": _update_user,
@@ -4303,6 +4486,10 @@ _PRE_AUTH_COMMANDS = frozenset(
         "buildinfo",
         "saslStart",
         "saslContinue",
+        # Legacy ``authenticate`` command — pymongo / Java / Go drivers
+        # all use it for MONGODB-X509 (one-shot, no challenge / response,
+        # the legacy single-command shape fits cleanly).
+        "authenticate",
         "endSessions",
         "whatsmyuri",
     }
