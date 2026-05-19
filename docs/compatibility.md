@@ -101,8 +101,13 @@ These are explicit non-goals:
 - **Authorization (RBAC)** — `createUser` accepts a `roles` array but
   no command consults it. An authenticated principal is treated as
   fully privileged.
-- **TLS / SSL.** SCRAM credentials therefore travel in plaintext —
-  use only on a trusted network.
+- **Native TLS + mTLS** are supported as of v0.5.1b21/b22.
+  Configure via `[tls] cert_file` / `key_file` (server-side TLS)
+  and optionally `[tls] ca_file` / `require_client_cert` (mTLS);
+  see [Configuration](configuration.md). The
+  `MONGODB-X509` cert-as-username auth mechanism is the one
+  remaining follow-on — until it lands, SCRAM-SHA-256 over TLS is
+  the auth + confidentiality story.
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told
   the server doesn't support compression.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes) —

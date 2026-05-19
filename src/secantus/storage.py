@@ -1778,7 +1778,7 @@ class Storage:
         return {"path": abs_out, "sizeBytes": os.path.getsize(abs_out)}
 
     @contextlib.contextmanager
-    def _batch_transaction(self) -> Any:
+    def _batch_transaction(self, *, sync: bool = False) -> Any:
         """Group multiple cursor writes into one WT transaction = one log record.
 
         WT auto-commits every individual ``cursor.insert()`` /
@@ -1788,6 +1788,16 @@ class Storage:
         record): on a typical bulk insert that's a 2-5x throughput
         win for ``--batch-size > 1`` on the wire side, with the same
         durability guarantee (all-or-nothing on commit).
+
+        ``sync=True`` overrides the connection-level
+        ``transaction_sync`` setting and forces this individual
+        commit to fsync the log to disk before returning — the
+        per-transaction equivalent of the server-wide
+        ``sync_on_commit`` knob. Used to honour
+        ``writeConcern: {j: true}`` on a single write even when the
+        daemon is otherwise running with ``sync_on_commit=false``.
+        ``sync=False`` (default) inherits the connection's
+        ``transaction_sync`` config.
 
         Caller must already hold ``self._lock``. Reads within the
         transaction observe the in-progress writes — fine for our
@@ -1814,7 +1824,7 @@ class Storage:
                 session.rollback_transaction()
             raise
         else:
-            session.commit_transaction()
+            session.commit_transaction("sync=on" if sync else None)
 
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
@@ -1973,14 +1983,20 @@ class Storage:
             return bool(opts.get("capped"))
 
     def insert(
-        self, db: str, coll: str, docs: Iterable[dict[str, Any]], *, ordered: bool = True
+        self,
+        db: str,
+        coll: str,
+        docs: Iterable[dict[str, Any]],
+        *,
+        ordered: bool = True,
+        journal: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
         fresh_id_keys: set[bytes] = set()
         oplog_on = self.enable_oplog
-        with self._coll_lock(db, coll), self._batch_transaction():
+        with self._coll_lock(db, coll), self._batch_transaction(sync=journal):
             # Per-collection lock (Phase 2.4): writes to other
             # collections proceed in parallel; same-collection writes
             # still serialise to keep the unique-index pre-check
@@ -2646,6 +2662,7 @@ class Storage:
         let: dict[str, Any] | None = None,
         collation: Any = None,
         validator: dict[str, Any] | None = None,
+        journal: bool = False,
     ) -> dict[str, Any]:
         from secantus.collation import parse as _parse_collation
 
@@ -2663,7 +2680,7 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
-        with self._coll_lock(db, coll), self._batch_transaction():
+        with self._coll_lock(db, coll), self._batch_transaction(sync=journal):
             # Per-collection lock + one WT transaction per call. Every
             # doc-table write + index-entry delete/insert + oplog write
             # that lands in this method shares a single commit. Phase
@@ -2804,6 +2821,7 @@ class Storage:
         limit: int = 0,
         let: dict[str, Any] | None = None,
         collation: Any = None,
+        journal: bool = False,
     ) -> int:
         from secantus.collation import parse as _parse_collation
 
@@ -2815,7 +2833,7 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
-        with self._coll_lock(db, coll), self._batch_transaction():
+        with self._coll_lock(db, coll), self._batch_transaction(sync=journal):
             # Per-collection lock (Phase 2.4) + one WT transaction.
             # Groups the per-doc removes + index-entry deletes + oplog
             # writes into one commit. Other collections delete in

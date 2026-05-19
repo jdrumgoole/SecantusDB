@@ -124,8 +124,7 @@ features tangential to single-node operation:
 - Authorization (RBAC) — `createUser` accepts a `roles` array but no
   command consults it; an authenticated principal is treated as fully
   privileged.
-- TLS / SSL.
-- Text search and geo indexes.
+- Text search (no full-text index).
 - `$where` (no JS runtime).
 - Real transaction rollback (we accept `commitTransaction` /
   `abortTransaction` but operations take effect immediately).

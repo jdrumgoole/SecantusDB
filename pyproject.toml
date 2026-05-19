@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.1b20"
+version = "0.5.1b23"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,7 +35,7 @@ dev = [
     "pytest-json-report>=1.5",  # for pymongo-validation report generation
     "pytest-benchmark>=4.0",  # for tests/test_perf_regression.py
     "pytest-timeout>=2.4",  # per-test deadline; names hung tests instead of letting CI hang at 97%
-
+    "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "invoke>=2.2",
     "ruff>=0.6",
     "sphinx>=7.2",

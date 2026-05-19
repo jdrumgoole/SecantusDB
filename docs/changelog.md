@@ -20,7 +20,117 @@ the API surface itself is shaped by Semantic Versioning intent.
 ## [Unreleased]
 
 (No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b20.)
+`main` after v0.5.1b23.)
+
+## [0.5.1b23] — 2026-05-19
+
+### Native TLS + mTLS + per-write `j:true` — production gaps closed
+
+Three slices land together against the production-readiness gaps
+called out in the `docs/production.md` page.
+
+`[tls] cert_file` + `[tls] key_file` (in `secantusdb.toml`) or
+`--tls-cert-file` / `--tls-key-file` (CLI) makes the daemon wrap
+every accepted socket in TLS before the wire protocol starts.
+Clients connect with `mongodb://host:port/?tls=true&tlsCAFile=<ca>`
+and SecantusDB negotiates the TLS handshake itself; the
+connection thread then sees an encrypted socket-like object and
+serves mongo wire frames over it unchanged. This closes one of
+the biggest production-deployment gaps the `docs/production.md`
+page called out — operators no longer need to terminate TLS at an
+nginx / HAProxy / stunnel reverse proxy that becomes part of the
+trust boundary.
+
+mTLS lands as a layer on top: set `[tls] ca_file` and the daemon
+asks connecting clients for their own X.509 cert during the TLS
+handshake, verifying it against the configured CA bundle. Set
+`[tls] require_client_cert = true` to reject clients that don't
+present a cert; the default (`false`, `CERT_OPTIONAL`) verifies a
+cert if presented and accepts clients without one — useful for
+staged rollouts. mTLS is a coarse-grained "you're someone we
+approved of" gate; SCRAM-SHA-256 still identifies the specific
+user on top. mongod's `MONGODB-X509` auth mechanism
+(cert-subject-DN as the username, no SCRAM step) is a separate
+follow-on slice.
+
+Python's `PROTOCOL_TLS_SERVER` (TLS 1.2+, no SSLv2/3 fallback,
+default cipher list) is the only protocol mode. The `SSLContext`
+is built once at startup and cached — hot cert rotation requires
+a daemon restart. `certbot renew --post-hook 'systemctl reload
+secantusdb'` is the standard pattern. Without the cert / key
+kwargs the daemon stays plaintext exactly as before — no
+regression risk for the 1300+ existing tests.
+
+The b20 `sync_on_commit` knob enabled per-commit fsync at the
+*connection* level — every write on the daemon shared the same
+durability mode. The third slice finishes the story: the per-write
+`writeConcern.j` flag now threads from the wire layer through
+`Storage.insert` / `update_matching` / `delete_matching` (and all
+four `findAndModify` paths) into
+`_batch_transaction(sync=True)`, which calls
+`session.commit_transaction("sync=on")`. A client can now mix
+`j: true` and `j: false` writes against one daemon: the j:true
+subset pays the per-commit fsync cost (closes the durability gap),
+the rest stays fast.
+
+#### Added
+
+- `[tls]` table in `secantusdb.toml` (`cert_file`, `key_file`,
+  `ca_file`, `require_client_cert`). Half-configured TLS (only one
+  of cert/key set) raises `ValueError` at startup so deployment
+  mistakes can't silently fall back to plaintext.
+- `--tls-cert-file` / `--tls-key-file` / `--tls-ca-file` /
+  `--tls-require-client-cert` CLI flags. Standard precedence:
+  SecantusConfig defaults < TOML < explicit CLI.
+- `SecantusDBServer(tls_cert_file=..., tls_key_file=...,
+  tls_ca_file=..., tls_require_client_cert=...)` kwargs. When
+  cert/key are set an `ssl.SSLContext` is built in `__init__` and
+  used to wrap accepted sockets in `_serve_forever`. When ca_file
+  is also set, the context asks clients for an X.509 cert during
+  the handshake and verifies it against that CA.
+- `tests/test_tls.py`: 12 tests via `trustme` for ephemeral CA +
+  client cert fixtures. Covers TLS round-trip, non-TLS-client
+  rejection, no-args plaintext path (no regression),
+  half-configured raises, missing-cert startup error,
+  active_conns leak guard, and the four mTLS modes (required +
+  valid cert / required + no cert / required + foreign-CA cert /
+  optional + both modes).
+- `journal: bool = False` kwarg on `Storage.insert` /
+  `update_matching` / `delete_matching`. When True, the WT
+  transaction commits with `session.commit_transaction("sync=on")`
+  — forces a per-commit fsync of the log regardless of the
+  connection's `transaction_sync` config.
+- `_batch_transaction(*, sync: bool = False)` context-manager
+  kwarg. The per-commit-fsync escape hatch the new `journal` write
+  kwargs route through.
+- `tests/test_write_concern_journal.py`: 10 tests covering the
+  storage-layer kwarg threading (`_batch_transaction` is invoked
+  with `sync=True/False` appropriately), wire-level happy paths
+  on insert / update / delete / findAndModify, and the positive +
+  negative routing assertions.
+
+#### Changed
+
+- TLS / mTLS handshake errors are logged + the socket closed +
+  the active-connection slot released; the daemon keeps serving
+  everyone else.
+- `writeConcern: {j: true}` is now honoured per-write: the wire
+  layer extracts the flag and threads it through to
+  `_batch_transaction(sync=True)`. Previously the flag was
+  accepted on the wire but had no effect — only the daemon-wide
+  `sync_on_commit` knob (b20) could enable per-commit fsync.
+- `docs/production.md` updated: "Native TLS" is no longer in the
+  gaps list; the dedicated TLS section now shows the in-process
+  config plus the mTLS opt-in instead of an nginx-stream-module
+  example.
+- `docs/configuration.md` documents the full `[tls]` schema
+  (cert / key / ca / require_client_cert), the hot-rotation
+  caveat, and the cipher-suite "out of scope for v1" note.
+
+#### Dependencies
+
+- `trustme>=1.2` added to the `dev` extra for the test CA
+  fixture (transitively pulls `cryptography`).
 
 ## [0.5.1b20] — 2026-05-19
 
@@ -593,6 +703,7 @@ Releases](https://github.com/jdrumgoole/SecantusDB/releases) page for
 the auto-generated commit-list notes from those tags.
 
 [Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b18...HEAD
+[0.5.1b23]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b23
 [0.5.1b20]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b20
 [0.5.1b18]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b18
 [0.5.1b17]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b17

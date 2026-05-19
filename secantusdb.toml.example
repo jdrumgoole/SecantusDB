@@ -30,3 +30,22 @@ cache_size = "1G"             # default: "1G"; WT cache, unit-suffixed string ("
 session_max = 1000            # default: 1000; concurrent WT sessions, one per client connection
 ttl_sweep_seconds = 60.0      # default: 60.0; background TTL pruning cadence (matches mongod)
 sync_on_commit = false        # default: false; true forces per-commit fsync (closes writeConcern j:true gap; 1-2 orders of magnitude throughput cost)
+
+# [tls]
+# Both keys are optional — but if you set one you must set both
+# (half-configured TLS would be a silent deployment mistake).
+# When both are set, the daemon wraps every accepted socket in TLS
+# before the wire protocol starts; clients connect with
+# ?tls=true&tlsCAFile=<ca>. Without this section the daemon stays
+# plaintext.
+# cert_file = "/etc/letsencrypt/live/db.example.com/fullchain.pem"
+# key_file  = "/etc/letsencrypt/live/db.example.com/privkey.pem"
+#
+# mTLS: when ca_file is set, the daemon asks connecting clients for
+# their own X.509 cert during the handshake and verifies it against
+# this CA bundle. Only meaningful when cert_file / key_file are also
+# set. require_client_cert=true rejects clients without a cert;
+# false (default) verifies a cert if presented, accepts clients
+# without one (CERT_OPTIONAL — useful for staged rollouts).
+# ca_file = "/etc/ssl/client-ca.crt"
+# require_client_cert = false

@@ -159,6 +159,49 @@ def build_parser() -> argparse.ArgumentParser:
             "hits first prunes the oldest entries. Default 100000."
         ),
     )
+    parser.add_argument(
+        "--tls-cert-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "PEM-format server certificate chain. When this and "
+            "--tls-key-file are both set, accept()ed sockets are TLS-"
+            "wrapped before the wire protocol starts; clients connect "
+            "with 'mongodb://host:port/?tls=true&tlsCAFile=<ca>'. "
+            "Without TLS the daemon stays plaintext (matches the "
+            "existing behaviour)."
+        ),
+    )
+    parser.add_argument(
+        "--tls-key-file",
+        default=None,
+        metavar="PATH",
+        help="PEM-format private key matching --tls-cert-file.",
+    )
+    parser.add_argument(
+        "--tls-ca-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "PEM-format CA bundle. When set (alongside --tls-cert-file / "
+            "--tls-key-file), the daemon asks connecting clients for an "
+            "X.509 cert during the TLS handshake and verifies it against "
+            "this CA. Required when --tls-require-client-cert is on."
+        ),
+    )
+    parser.add_argument(
+        "--tls-require-client-cert",
+        action="store_true",
+        default=None,
+        help=(
+            "Reject clients that don't present a valid X.509 cert "
+            "(mTLS). Off by default — verifies a cert if one is offered "
+            "but accepts clients without one (CERT_OPTIONAL). Requires "
+            "--tls-ca-file. mTLS cert-as-username auth (MONGODB-X509) "
+            "is a separate follow-on; this flag is the transport-layer "
+            "gate only."
+        ),
+    )
     return parser
 
 
@@ -178,6 +221,10 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
         "sync_on_commit": "sync_on_commit",
         "oplog_retention_seconds": "oplog_retention_seconds",
         "oplog_max_entries": "oplog_max_entries",
+        "tls_cert_file": "tls_cert_file",
+        "tls_key_file": "tls_key_file",
+        "tls_ca_file": "tls_ca_file",
+        "tls_require_client_cert": "tls_require_client_cert",
     }
     overrides: dict[str, object] = {}
     for arg_name, field_name in arg_to_field.items():
@@ -216,6 +263,10 @@ def main(argv: list[str] | None = None) -> int:
         cache_size=cfg.cache_size,
         session_max=cfg.session_max,
         sync_on_commit=cfg.sync_on_commit,
+        tls_cert_file=cfg.tls_cert_file,
+        tls_key_file=cfg.tls_key_file,
+        tls_ca_file=cfg.tls_ca_file,
+        tls_require_client_cert=cfg.tls_require_client_cert,
     )
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:

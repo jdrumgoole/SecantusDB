@@ -4,6 +4,7 @@ import contextlib
 import itertools
 import logging
 import socket
+import ssl
 import threading
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
@@ -77,6 +78,10 @@ class SecantusDBServer:
         cache_size: str = "1G",
         session_max: int = 1000,
         sync_on_commit: bool = False,
+        tls_cert_file: str | None = None,
+        tls_key_file: str | None = None,
+        tls_ca_file: str | None = None,
+        tls_require_client_cert: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -87,6 +92,54 @@ class SecantusDBServer:
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # TLS: when both cert + key files are provided, accept()ed sockets
+        # are wrapped with an SSLContext before being handed off to the
+        # connection thread. Clients then negotiate TLS first, and only
+        # then start sending mongo wire frames over the encrypted channel.
+        # Without TLS the daemon stays plaintext as it always has.
+        if (tls_cert_file is None) != (tls_key_file is None):
+            raise ValueError("tls_cert_file and tls_key_file must both be set or both be None")
+        # mTLS knobs (ca_file / require_client_cert) only make sense when
+        # server-side TLS is on — without it, there's no TLS handshake at
+        # which to verify a client cert. Reject the misconfiguration loudly
+        # rather than silently ignoring the mTLS settings.
+        if tls_cert_file is None and (tls_ca_file is not None or tls_require_client_cert):
+            raise ValueError(
+                "tls_ca_file / tls_require_client_cert require tls_cert_file "
+                "and tls_key_file (mTLS is a layer on top of server-side TLS)"
+            )
+        if tls_require_client_cert and tls_ca_file is None:
+            raise ValueError(
+                "tls_require_client_cert=True requires tls_ca_file so the "
+                "presented client cert can be verified"
+            )
+        self._ssl_context: ssl.SSLContext | None
+        if tls_cert_file is not None and tls_key_file is not None:
+            # PROTOCOL_TLS_SERVER picks the highest TLS version both ends
+            # support and refuses SSLv2/3 — Python's recommended preset
+            # for new server code. load_cert_chain raises FileNotFoundError
+            # or ssl.SSLError on bad inputs; we let those propagate so a
+            # misconfigured server fails loudly at startup rather than
+            # silently falling back to plaintext.
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=tls_cert_file, keyfile=tls_key_file)
+            # mTLS: if a CA bundle is configured, ask clients for a cert
+            # during the handshake. ``CERT_REQUIRED`` rejects clients
+            # without one; ``CERT_OPTIONAL`` accepts both — useful for
+            # staged rollouts where some clients are not yet
+            # cert-enabled.
+            if tls_ca_file is not None:
+                ctx.load_verify_locations(cafile=tls_ca_file)
+                ctx.verify_mode = (
+                    ssl.CERT_REQUIRED if tls_require_client_cert else ssl.CERT_OPTIONAL
+                )
+            self._ssl_context = ctx
+        else:
+            self._ssl_context = None
+        self.tls_cert_file = tls_cert_file
+        self.tls_key_file = tls_key_file
+        self.tls_ca_file = tls_ca_file
+        self.tls_require_client_cert = tls_require_client_cert
         # Active connection counter — incremented in _handle_client,
         # decremented on its way out. Read by _serve_forever to enforce
         # max_connections.
@@ -199,6 +252,21 @@ class SecantusDBServer:
                 with contextlib.suppress(OSError):
                     conn.close()
                 continue
+            # TLS handshake (when configured) happens here, on the accept
+            # thread, BEFORE _handle_client takes over. wrap_socket blocks
+            # on the handshake; a malformed / plaintext client surfaces
+            # as ssl.SSLError, which we log + close cleanly so a single
+            # bad client can't take the daemon down or stall the loop.
+            if self._ssl_context is not None:
+                try:
+                    conn = self._ssl_context.wrap_socket(conn, server_side=True)
+                except (ssl.SSLError, OSError) as exc:
+                    logger.warning("TLS handshake from %s failed: %s", addr, exc)
+                    with contextlib.suppress(OSError):
+                        conn.close()
+                    with self._active_conns_lock:
+                        self._active_conns -= 1
+                    continue
             # Set an idle timeout on the socket so a hostile or stuck
             # peer can't pin a thread forever. Applies to all socket
             # reads in _handle_client.
