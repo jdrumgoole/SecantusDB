@@ -1,0 +1,46 @@
+<div class="benefits features-grid">
+  <div class="benefit">
+    <h3><span class="pip"></span>Geospatial — <code>2d</code> &amp; <code>2dsphere</code></h3>
+    <p>
+      <code>$geoWithin</code>, <code>$geoIntersects</code>,
+      <code>$near</code>, <code>$nearSphere</code>, and
+      <code>$geoNear</code> all accelerated by either index type.
+      S2 cell coverings for GeoJSON; quadtree-decomposed Z-order
+      ranges for legacy <code>[x, y]</code> pairs. Compound geo+scalar
+      indexes work too.
+    </p>
+    <p class="benefit-cta">
+      <a href="{{ SECANTUS_DOCS_URL }}geospatial.html" rel="noopener">Geospatial reference &rarr;</a>
+    </p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Aggregation pipeline</h3>
+    <p>
+      Full pipeline: <code>$match</code>, <code>$group</code> (every
+      mongod accumulator), <code>$lookup</code> (with index-driven
+      foreign-key joins), <code>$facet</code>, <code>$bucket</code>,
+      <code>$densify</code>, <code>$fill</code>, <code>$merge</code>,
+      <code>$out</code>, <code>$graphLookup</code>,
+      <code>$geoNear</code>. Expression language matches mongod —
+      <code>$expr</code>, <code>$let</code>, dates, strings, arrays,
+      conditionals.
+    </p>
+    <p class="benefit-cta">
+      <a href="{{ SECANTUS_DOCS_URL }}aggregation.html" rel="noopener">Aggregation reference &rarr;</a>
+    </p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Native TLS &amp; mTLS</h3>
+    <p>
+      <code>[tls] cert_file</code> + <code>key_file</code> wraps
+      accepted sockets in TLS before the wire protocol starts &mdash;
+      no reverse proxy required. Add <code>ca_file</code> +
+      <code>require_client_cert</code> for mTLS (transport-layer
+      client-cert verification). SCRAM-SHA-256 still identifies the
+      user on top.
+    </p>
+    <p class="benefit-cta">
+      <a href="{{ SECANTUS_DOCS_URL }}configuration.html#tls" rel="noopener">Configure TLS &rarr;</a>
+    </p>
+  </div>
+</div>

@@ -273,6 +273,23 @@ pre code { background: transparent; padding: 0; }
   line-height: 1.55;
 }
 
+/* "What's in the box" focused-feature grid. Same card style as the
+   generic benefits, plus a trailing CTA link to the relevant docs
+   page so the panel reads as "summary → deep dive" rather than a
+   dead-end blurb. */
+.features-grid .benefit p + p.benefit-cta {
+  margin-top: 14px;
+  font-size: 14px;
+}
+.benefit-cta a {
+  color: var(--cyan-500);
+  font-weight: 500;
+  text-decoration: none;
+}
+.benefit-cta a:hover {
+  text-decoration: underline;
+}
+
 /* ---- Drivers section ---- */
 
 .drivers-section { background: white; }
