@@ -50,8 +50,24 @@ includes `.tar.gz` files. The native archives created by the b18
 backup button were previously invisible because `list_backups`
 only enumerated directories.
 
+The new [Running in production](production.md) doc page ties the
+config-file, native-backup, and restore work together — honest
+comparison vs single-node Postgres (the more useful framing than
+"SecantusDB vs mongod"), the gaps you have to accept, and a
+concrete `systemd` / TLS / backup / monitoring deployment shape.
+
 #### Added
 
+- [Running in production](production.md) docs page — honest
+  comparison vs single-node Postgres (the more useful framing than
+  "SecantusDB vs mongod-for-prod"), the gaps you must accept (no
+  native TLS, no PITR, no replication, beta maturity), and a
+  concrete deployment shape: `systemd` unit, `secantusdb.toml`
+  with `sync_on_commit = true`, SCRAM auth provisioning, nginx
+  stream TLS termination, hourly native checkpoint backups with
+  off-host sync, the restore drill, `serverStatus` scraping for
+  Prometheus / Datadog, and capacity sizing notes for
+  `cache_size`.
 - `secantusdb.toml` configuration file (see
   [Configuration](configuration.md) for the full schema). Auto-
   discovered from `./secantusdb.toml`,

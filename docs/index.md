@@ -154,6 +154,9 @@ clustering and infrastructure that `mongod` brings.
   `createUser` / `dropUser` / `usersInfo`.
 - [Admin web UI](admin.md) — `secantusdb-admin` console, page tour,
   security model, programmatic use.
+- [Running in production](production.md) — honest comparison vs
+  single-node Postgres, what's missing for production use, and a
+  concrete `systemd` / TLS / backup / monitoring deployment shape.
 - [Concurrency](concurrency.md) — what scales, what doesn't, and why
   multi-writer throughput is capped by WiredTiger.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
@@ -187,6 +190,7 @@ aggregation
 change-streams
 authentication
 admin
+production
 concurrency
 compatibility
 benchmark
