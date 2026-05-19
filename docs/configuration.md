@@ -65,6 +65,8 @@ sync_on_commit = false          # see "Durability" below
 [tls]
 cert_file = "/path/to/server.crt"   # PEM cert chain; both keys must be set together
 key_file  = "/path/to/server.key"   # matching PEM private key
+ca_file   = "/path/to/ca.crt"       # optional: enables mTLS (verifies client certs)
+require_client_cert = false         # optional: true rejects clients without a cert
 ```
 
 Every key is optional. Unknown keys (or unknown top-level tables)
@@ -141,9 +143,45 @@ at startup and cached. Restart the daemon after renewing the cert
 secantusdb'` into your renewal cron — a "reload" is a restart
 despite the name).
 
-mTLS (client cert auth, mongod's `MONGODB-X509` mechanism) is not
-yet wired up — a follow-on slice. Until then, SCRAM-SHA-256 over
-TLS is the auth + confidentiality story.
+### mTLS — verify client certs
+
+Add `[tls] ca_file` to make the daemon ask connecting clients for
+their own X.509 cert during the TLS handshake. The server verifies
+the client's cert against this CA bundle and refuses any cert that
+doesn't chain back to it.
+
+```toml
+[tls]
+cert_file = "/etc/ssl/server.crt"
+key_file  = "/etc/ssl/server.key"
+ca_file   = "/etc/ssl/client-ca.crt"
+require_client_cert = true          # reject clients without a cert
+```
+
+* **`require_client_cert = false`** (default) — verify a cert if a
+  client offers one, but accept clients without a cert too. Useful
+  for staged rollouts where some clients are not yet
+  cert-enabled.
+* **`require_client_cert = true`** — reject clients that don't
+  present a valid cert. The TLS handshake fails on the server side
+  and the connection is dropped.
+
+Clients connect with `?tls=true&tlsCAFile=<ca>&tlsCertificateKeyFile=<combined.pem>`
+where `combined.pem` is the client's cert chain concatenated with
+its private key (pymongo's expected format). The server's CA is in
+`tlsCAFile`; the client's CA (which the server verifies against) is
+configured server-side via `[tls] ca_file`.
+
+`tls_ca_file` / `tls_require_client_cert` without `cert_file` /
+`key_file` raises at startup — mTLS is a layer on top of
+server-side TLS, not a substitute for it.
+
+This slice is the **transport-layer gate only**. mongod's
+`MONGODB-X509` auth mechanism — where the client cert's subject DN
+serves as the username, no SCRAM step needed — is a separate
+follow-on. Today, an mTLS-protected SecantusDB still SCRAM-auths
+its users; the cert is "you're someone we approved of," the SCRAM
+is "you're specifically this user."
 
 ## Example
 
@@ -190,6 +228,8 @@ overrides. The mapping:
 | `[storage] sync_on_commit` | `--sync-on-commit` |
 | `[tls] cert_file` | `--tls-cert-file` |
 | `[tls] key_file` | `--tls-key-file` |
+| `[tls] ca_file` | `--tls-ca-file` |
+| `[tls] require_client_cert` | `--tls-require-client-cert` |
 
 `[storage] ttl_sweep_seconds` is file-only — it's mostly relevant
 for tests that need deterministic TTL timing, which already drive

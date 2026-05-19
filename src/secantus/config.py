@@ -97,6 +97,21 @@ class SecantusConfig:
     # stays plaintext.
     tls_cert_file: str | None = None
     tls_key_file: str | None = None
+    # mTLS (mutual TLS): when ``ca_file`` is set, the daemon asks
+    # connecting clients for an X.509 certificate during the TLS
+    # handshake and verifies it against this CA bundle. Only
+    # meaningful when ``cert_file`` / ``key_file`` are also set —
+    # configuring mTLS without server-side TLS is a deployment
+    # mistake and raises at startup.
+    #
+    # ``require_client_cert=True`` rejects clients that don't
+    # present a cert; ``False`` (default) verifies a cert if one is
+    # offered but accepts clients without one (useful for staged
+    # rollouts). MONGODB-X509 auth (cert-subject-as-username) is a
+    # separate follow-on; this slice is the transport-layer gate
+    # only.
+    tls_ca_file: str | None = None
+    tls_require_client_cert: bool = False
 
 
 class ConfigError(Exception):
@@ -112,7 +127,7 @@ _TABLE_FIELDS: dict[str, frozenset[str]] = {
     "server": frozenset({"host", "port", "storage_path", "log_level", "auth", "standalone"}),
     "oplog": frozenset({"retention_seconds", "max_entries", "noop_heartbeat_seconds"}),
     "storage": frozenset({"cache_size", "session_max", "ttl_sweep_seconds", "sync_on_commit"}),
-    "tls": frozenset({"cert_file", "key_file"}),
+    "tls": frozenset({"cert_file", "key_file", "ca_file", "require_client_cert"}),
 }
 
 # Some TOML keys are intentionally shorter than the dataclass field
@@ -124,6 +139,8 @@ _RENAMES: dict[tuple[str, str], str] = {
     ("oplog", "max_entries"): "oplog_max_entries",
     ("tls", "cert_file"): "tls_cert_file",
     ("tls", "key_file"): "tls_key_file",
+    ("tls", "ca_file"): "tls_ca_file",
+    ("tls", "require_client_cert"): "tls_require_client_cert",
 }
 
 

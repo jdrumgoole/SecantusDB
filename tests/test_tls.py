@@ -48,6 +48,33 @@ def tls_files(tmp_path: Path, cert_authority: trustme.CA) -> tuple[Path, Path, P
     return cert_path, key_path, ca_path
 
 
+@pytest.fixture
+def client_cert_combined(tmp_path: Path, cert_authority: trustme.CA) -> Path:
+    """A client cert + key written into a single combined PEM file —
+    pymongo's ``tlsCertificateKeyFile`` expects the combined form."""
+    client_cert = cert_authority.issue_cert("client.example")
+    combined = tmp_path / "client.pem"
+    with combined.open("wb") as f:
+        for blob in client_cert.cert_chain_pems:
+            f.write(blob.bytes())
+        f.write(client_cert.private_key_pem.bytes())
+    return combined
+
+
+@pytest.fixture
+def foreign_client_cert(tmp_path: Path) -> Path:
+    """A client cert signed by a *different* CA — server should reject
+    this even though it's a valid X.509 cert in its own right."""
+    foreign_ca = trustme.CA()
+    foreign_cert = foreign_ca.issue_cert("attacker.example")
+    combined = tmp_path / "foreign-client.pem"
+    with combined.open("wb") as f:
+        for blob in foreign_cert.cert_chain_pems:
+            f.write(blob.bytes())
+        f.write(foreign_cert.private_key_pem.bytes())
+    return combined
+
+
 def test_tls_round_trip_insert_find(tmp_path, tls_files) -> None:
     """End-to-end: pymongo connects with TLS, inserts a doc, reads it
     back. The default suite never hits this path because no fixture
@@ -193,6 +220,171 @@ def test_tls_handshake_failure_doesnt_consume_connection_slot(tmp_path, tls_file
             client.close()
     finally:
         srv.stop()
+
+
+# ----------------------------------------------------------------------
+# mTLS (mutual TLS): server requires a client cert signed by the CA.
+# Transport-layer auth only; MONGODB-X509 cert-as-username is a
+# separate follow-on slice.
+# ----------------------------------------------------------------------
+
+
+def test_mtls_required_accepts_client_with_valid_cert(
+    tmp_path, tls_files, client_cert_combined
+) -> None:
+    """Server with require_client_cert=True + CA configured accepts a
+    client presenting a cert signed by that CA, end-to-end."""
+    cert_path, key_path, ca_path = tls_files
+    srv = SecantusDBServer(
+        port=0,
+        storage_path=str(tmp_path / "data"),
+        tls_cert_file=str(cert_path),
+        tls_key_file=str(key_path),
+        tls_ca_file=str(ca_path),
+        tls_require_client_cert=True,
+    )
+    srv.start()
+    try:
+        uri = (
+            f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
+            f"&tlsCertificateKeyFile={client_cert_combined}"
+        )
+        client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+        try:
+            client["mtlsdb"]["coll"].insert_one({"_id": 1, "v": "mtls"})
+            assert list(client["mtlsdb"]["coll"].find()) == [{"_id": 1, "v": "mtls"}]
+        finally:
+            client.close()
+    finally:
+        srv.stop()
+
+
+def test_mtls_required_rejects_client_without_cert(tmp_path, tls_files) -> None:
+    """Same server, no client cert — TLS handshake fails, client gets
+    an error, daemon keeps serving."""
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    cert_path, key_path, ca_path = tls_files
+    srv = SecantusDBServer(
+        port=0,
+        storage_path=str(tmp_path / "data"),
+        tls_cert_file=str(cert_path),
+        tls_key_file=str(key_path),
+        tls_ca_file=str(ca_path),
+        tls_require_client_cert=True,
+    )
+    srv.start()
+    try:
+        # No tlsCertificateKeyFile — server should reject during handshake.
+        uri = f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
+        client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+        with pytest.raises((ServerSelectionTimeoutError, Exception)):
+            client.admin.command("ping")
+        client.close()
+    finally:
+        srv.stop()
+
+
+def test_mtls_required_rejects_foreign_ca_client(tmp_path, tls_files, foreign_client_cert) -> None:
+    """A client cert signed by a *different* CA must not authenticate
+    — that's the entire point of pinning the CA bundle."""
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    cert_path, key_path, ca_path = tls_files
+    srv = SecantusDBServer(
+        port=0,
+        storage_path=str(tmp_path / "data"),
+        tls_cert_file=str(cert_path),
+        tls_key_file=str(key_path),
+        tls_ca_file=str(ca_path),
+        tls_require_client_cert=True,
+    )
+    srv.start()
+    try:
+        uri = (
+            f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
+            f"&tlsCertificateKeyFile={foreign_client_cert}"
+        )
+        client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+        with pytest.raises((ServerSelectionTimeoutError, Exception)):
+            client.admin.command("ping")
+        client.close()
+    finally:
+        srv.stop()
+
+
+def test_mtls_optional_accepts_with_or_without_cert(
+    tmp_path, tls_files, client_cert_combined
+) -> None:
+    """``require_client_cert=False`` is the staged-rollout mode: a
+    cert is verified if presented, but clients without a cert still
+    connect. Verify both paths against the same server."""
+    cert_path, key_path, ca_path = tls_files
+    srv = SecantusDBServer(
+        port=0,
+        storage_path=str(tmp_path / "data"),
+        tls_cert_file=str(cert_path),
+        tls_key_file=str(key_path),
+        tls_ca_file=str(ca_path),
+        tls_require_client_cert=False,
+    )
+    srv.start()
+    try:
+        # 1. Client with cert: works.
+        uri_with = (
+            f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
+            f"&tlsCertificateKeyFile={client_cert_combined}"
+        )
+        c1 = MongoClient(uri_with, serverSelectionTimeoutMS=3000)
+        try:
+            c1.admin.command("ping")
+        finally:
+            c1.close()
+        # 2. Client without cert: also works (CERT_OPTIONAL).
+        uri_without = f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
+        c2 = MongoClient(uri_without, serverSelectionTimeoutMS=3000)
+        try:
+            c2.admin.command("ping")
+        finally:
+            c2.close()
+    finally:
+        srv.stop()
+
+
+def test_mtls_without_server_tls_raises(tmp_path) -> None:
+    """``tls_ca_file`` / ``tls_require_client_cert`` only make sense
+    when server-side TLS (cert + key) is also configured. Without it,
+    raise loudly at startup — the daemon would otherwise stay
+    plaintext while silently dropping the mTLS knobs on the floor."""
+    with pytest.raises(ValueError, match="require tls_cert_file"):
+        SecantusDBServer(
+            port=0,
+            storage_path=str(tmp_path / "data"),
+            tls_ca_file=str(tmp_path / "ca.crt"),  # no cert/key
+        )
+    with pytest.raises(ValueError, match="require tls_cert_file"):
+        SecantusDBServer(
+            port=0,
+            storage_path=str(tmp_path / "data"),
+            tls_require_client_cert=True,  # no cert/key
+        )
+
+
+def test_mtls_require_without_ca_raises(tmp_path, tls_files) -> None:
+    """``require_client_cert=True`` without a CA is a deployment
+    mistake — the server would have nothing to verify the cert
+    against. Raise at startup rather than letting the SSL handshake
+    later fail in confusing ways."""
+    cert_path, key_path, _ca_path = tls_files
+    with pytest.raises(ValueError, match="requires tls_ca_file"):
+        SecantusDBServer(
+            port=0,
+            storage_path=str(tmp_path / "data"),
+            tls_cert_file=str(cert_path),
+            tls_key_file=str(key_path),
+            tls_require_client_cert=True,
+            # no tls_ca_file
+        )
 
 
 # Stdlib contextlib.suppress, imported locally to keep the test

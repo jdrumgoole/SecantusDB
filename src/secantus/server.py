@@ -80,6 +80,8 @@ class SecantusDBServer:
         sync_on_commit: bool = False,
         tls_cert_file: str | None = None,
         tls_key_file: str | None = None,
+        tls_ca_file: str | None = None,
+        tls_require_client_cert: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -97,6 +99,20 @@ class SecantusDBServer:
         # Without TLS the daemon stays plaintext as it always has.
         if (tls_cert_file is None) != (tls_key_file is None):
             raise ValueError("tls_cert_file and tls_key_file must both be set or both be None")
+        # mTLS knobs (ca_file / require_client_cert) only make sense when
+        # server-side TLS is on — without it, there's no TLS handshake at
+        # which to verify a client cert. Reject the misconfiguration loudly
+        # rather than silently ignoring the mTLS settings.
+        if tls_cert_file is None and (tls_ca_file is not None or tls_require_client_cert):
+            raise ValueError(
+                "tls_ca_file / tls_require_client_cert require tls_cert_file "
+                "and tls_key_file (mTLS is a layer on top of server-side TLS)"
+            )
+        if tls_require_client_cert and tls_ca_file is None:
+            raise ValueError(
+                "tls_require_client_cert=True requires tls_ca_file so the "
+                "presented client cert can be verified"
+            )
         self._ssl_context: ssl.SSLContext | None
         if tls_cert_file is not None and tls_key_file is not None:
             # PROTOCOL_TLS_SERVER picks the highest TLS version both ends
@@ -107,11 +123,23 @@ class SecantusDBServer:
             # silently falling back to plaintext.
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(certfile=tls_cert_file, keyfile=tls_key_file)
+            # mTLS: if a CA bundle is configured, ask clients for a cert
+            # during the handshake. ``CERT_REQUIRED`` rejects clients
+            # without one; ``CERT_OPTIONAL`` accepts both — useful for
+            # staged rollouts where some clients are not yet
+            # cert-enabled.
+            if tls_ca_file is not None:
+                ctx.load_verify_locations(cafile=tls_ca_file)
+                ctx.verify_mode = (
+                    ssl.CERT_REQUIRED if tls_require_client_cert else ssl.CERT_OPTIONAL
+                )
             self._ssl_context = ctx
         else:
             self._ssl_context = None
         self.tls_cert_file = tls_cert_file
         self.tls_key_file = tls_key_file
+        self.tls_ca_file = tls_ca_file
+        self.tls_require_client_cert = tls_require_client_cert
         # Active connection counter — incremented in _handle_client,
         # decremented on its way out. Read by _serve_forever to enforce
         # max_connections.
