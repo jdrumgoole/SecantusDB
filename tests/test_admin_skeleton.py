@@ -1452,6 +1452,87 @@ async def test_backup_restore_rejects_traversal(http: AsyncClient) -> None:
     assert "invalid backup name" in r.text
 
 
+async def test_backup_restore_archive_rejects_traversal(http: AsyncClient) -> None:
+    """The native-archive restore form rejects path traversal in both
+    the archive name and the target dir."""
+    r = await http.post(
+        "/backup/restore-archive",
+        data={"name": "../etc.tar.gz", "target_dir": "/tmp/x"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "invalid archive name" in r.text
+    r = await http.post(
+        "/backup/restore-archive",
+        data={"name": "archive-x.tar.gz", "target_dir": "/etc/../etc"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "invalid target directory" in r.text
+
+
+async def test_backup_restore_archive_extracts_into_target(
+    server, app, http: AsyncClient, tmp_path
+) -> None:
+    """End-to-end: archive a backup, post the restore-archive form,
+    a new server reads the snapshot from the target dir."""
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    backup_root = app.state.backup_root
+    backup_root.mkdir(parents=True, exist_ok=True)
+    archive = backup_root / "archive-routesmoke.tar.gz"
+    target = tmp_path / "restored-from-route"
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["routedb"]["coll"].insert_one({"_id": 1, "v": "route-smoke"})
+        mc.admin.command("secantusAdmin.backupArchive", outputPath=str(archive))
+    finally:
+        mc.close()
+
+    r = await http.post(
+        "/backup/restore-archive",
+        data={"name": archive.name, "target_dir": str(target)},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "restoreArchive" in r.text
+    assert str(target) in r.text
+    assert target.is_dir()
+    assert (target / "WiredTiger").is_file()
+
+    srv2 = SecantusDBServer(port=0, storage_path=str(target))
+    srv2.start()
+    try:
+        c2 = MongoClient(srv2.uri, serverSelectionTimeoutMS=2000)
+        try:
+            assert list(c2["routedb"]["coll"].find()) == [{"_id": 1, "v": "route-smoke"}]
+        finally:
+            c2.close()
+    finally:
+        srv2.stop()
+
+
+async def test_backup_page_shows_extract_button_for_tar_gz(server, app, http: AsyncClient) -> None:
+    """The Existing backups table renders an Extract control for
+    ``.tar.gz`` archives and a regular Restore button for directories."""
+    backup_root = app.state.backup_root
+    backup_root.mkdir(parents=True, exist_ok=True)
+    (backup_root / "20260101T000000Z").mkdir()
+    (backup_root / "archive-uitest.tar.gz").write_bytes(b"\x1f\x8b" + b"x" * 16)
+    r = await http.get("/backup", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    body = r.text
+    assert "archive-uitest.tar.gz" in body
+    assert "20260101T000000Z" in body
+    # Extract control points at the new route; mongodump row keeps
+    # the old route.
+    assert "/backup/restore-archive" in body
+    assert "/backup/restore" in body  # still there for the dir row
+
+
 async def test_geo_page_renders_with_2dsphere_index(server, http: AsyncClient) -> None:
     from pymongo import MongoClient
 

@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.1b18"
+version = "0.5.1b20"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,8 @@ dev = [
     "pytest-xdist>=3.5",
     "pytest-json-report>=1.5",  # for pymongo-validation report generation
     "pytest-benchmark>=4.0",  # for tests/test_perf_regression.py
+    "pytest-timeout>=2.4",  # per-test deadline; names hung tests instead of letting CI hang at 97%
+
     "invoke>=2.2",
     "ruff>=0.6",
     "sphinx>=7.2",
@@ -70,6 +72,9 @@ admin = [
 secantusdb = "secantus.cli:main"
 secantus = "secantus.cli:main"
 secantusdb-admin = "secantus.admin.cli:main"
+# Offline restore tool: extract a SecantusDB backup archive into a
+# fresh directory the user then points a new `secantusdb` at.
+secantusdb-restore-archive = "secantus.restore_cli:main"
 
 [build-system]
 # SWIG is required at build time but pulled from the host (Homebrew /

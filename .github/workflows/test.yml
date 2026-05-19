@@ -102,4 +102,13 @@ jobs:
         run: uv run ruff format --check src tests
 
       - name: Tests
-        run: uv run python -m pytest
+        # ``--timeout=120 --timeout-method=thread`` catches deadline-
+        # exceeded hangs (test body busy-loops or blocks on a stuck
+        # producer). ``--max-worker-restart=0`` makes xdist fail
+        # immediately when a worker SUBPROCESS dies (native segfault,
+        # OOM, etc.) instead of silently entering a hung state where
+        # the parent waits forever for results from a dead worker —
+        # which is what was happening on the recent main runs that
+        # appeared to "hang at 97%". With this flag we get the
+        # crashed test's name in the pytest output instead.
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=0

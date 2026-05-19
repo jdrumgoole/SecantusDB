@@ -20,7 +20,119 @@ the API surface itself is shaped by Semantic Versioning intent.
 ## [Unreleased]
 
 (No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b18.)
+`main` after v0.5.1b20.)
+
+## [0.5.1b20] — 2026-05-19
+
+### `secantusdb.toml` config file, native checkpoint restore, j:true durability knob
+
+Two production-shaping slices land together. A new
+`secantusdb.toml` configuration file exposes every CLI flag plus
+the WT and oplog knobs that were previously hard-coded — including
+`cache_size` (so you can size the engine for your dataset instead
+of running with the 1 GB test default) and a `sync_on_commit`
+switch that closes the long-standing `writeConcern: {j: true}`
+durability gap by enabling WT's per-commit fsync. The loader
+auto-discovers `./secantusdb.toml`, `~/.secantus/secantusdb.toml`,
+and `/etc/secantus/secantusdb.toml`; an explicit `--config PATH`
+overrides the search. CLI flags still win over file values, so the
+file is a deployment baseline rather than a lock-in.
+
+A new `secantusAdmin.restoreArchive` wire command and matching
+`secantusdb-restore-archive` offline CLI close out the backup
+story started in b18 — extract a backup `.tar.gz` into a target
+directory the operator then points a fresh SecantusDB process at.
+The admin UI's per-row Restore button now adapts to backup type:
+mongodump directories still call `mongorestore`; native `.tar.gz`
+archives surface an inline target-dir field and an Extract action
+that hits the new endpoint. Restore intentionally doesn't try to
+swap the WT home under a running server (the connection-thread
+session-caching layer would need a wholesale rework first), and
+matches how real mongod restore tooling already trains operators.
+
+Drive-by fix: the admin UI's "Existing backups" list now also
+includes `.tar.gz` files. The native archives created by the b18
+backup button were previously invisible because `list_backups`
+only enumerated directories.
+
+The new [Running in production](production.md) doc page ties the
+config-file, native-backup, and restore work together — honest
+comparison vs single-node Postgres (the more useful framing than
+"SecantusDB vs mongod"), the gaps you have to accept, and a
+concrete `systemd` / TLS / backup / monitoring deployment shape.
+
+#### Added
+
+- [Running in production](production.md) docs page — honest
+  comparison vs single-node Postgres (the more useful framing than
+  "SecantusDB vs mongod-for-prod"), the gaps you must accept (no
+  native TLS, no PITR, no replication, beta maturity), and a
+  concrete deployment shape: `systemd` unit, `secantusdb.toml`
+  with `sync_on_commit = true`, SCRAM auth provisioning, nginx
+  stream TLS termination, hourly native checkpoint backups with
+  off-host sync, the restore drill, `serverStatus` scraping for
+  Prometheus / Datadog, and capacity sizing notes for
+  `cache_size`.
+- `secantusdb.toml` configuration file (see
+  [Configuration](configuration.md) for the full schema). Auto-
+  discovered from `./secantusdb.toml`,
+  `~/.secantus/secantusdb.toml`, `/etc/secantus/secantusdb.toml`;
+  `--config PATH` disables discovery and loads a specific file.
+  Unknown keys / unknown top-level tables fail loudly at startup
+  so typos can't silently leave the engine running on the
+  hard-coded default.
+- `secantus.config.SecantusConfig` dataclass + `load_config()` /
+  `apply_overrides()` helpers. CLI flags' argparse defaults are
+  now `None` (the "user did not pass this" sentinel) so the
+  precedence chain is `SecantusConfig defaults < secantusdb.toml
+  < explicit CLI flag` — file is a per-deployment baseline, the
+  CLI overrides for one-off runs.
+- New CLI flags exposing previously-hard-coded knobs:
+  `--cache-size`, `--session-max`, `--sync-on-commit`,
+  `--oplog-retention-seconds`, `--oplog-max-entries`. Each has a
+  matching `[storage]` / `[oplog]` key in the config file.
+- `Storage.__init__` accepts `cache_size`, `session_max`,
+  `sync_on_commit` kwargs. The WT engine config string is built
+  from these instead of being a hard-coded literal.
+- `secantusAdmin.restoreArchive` wire command. Accepts
+  `archivePath` (server-side path to `.tar.gz`), `targetDir`
+  (extraction destination), and optional `allowExisting` (overlay
+  into a non-empty dir). Returns `{targetDir, fileCount, archive,
+  ok: 1}`. RBAC: `fsync` action, cluster scope.
+- `secantus.storage.extract_backup_archive(archive_path,
+  target_dir, *, allow_existing=False)` — module-level helper
+  shared by the wire command, the admin route, and the CLI.
+  Validates that the archive contains a `WiredTiger` metadata
+  file before unpacking, so a malformed tarball can't pollute the
+  target.
+- `secantusdb-restore-archive` console script (new `[project.scripts]`
+  entry). Same validation as the wire command, no server needed.
+- Admin UI per-row **Extract** action on `.tar.gz` rows, posting
+  to `POST /backup/restore-archive` with editable target-dir form
+  field; the existing `Restore` button still handles mongodump
+  directories.
+
+#### Changed
+
+- `writeConcern: {j: true}` is now honourable end-to-end via
+  `[storage] sync_on_commit = true` (or `--sync-on-commit`),
+  which sets WT's `transaction_sync=(enabled=true,method=fsync)`.
+  Closes the long-standing durability gap previously documented
+  in the backlog. Off by default (matches mongod's default
+  `{w:1, j:false}`) since the throughput cost is significant.
+- `secantus.admin.backup.list_backups()` now includes
+  `*.tar.gz` files alongside directories. Native-archive backups
+  produced by b18's backup button were previously invisible in
+  the admin UI's "Existing backups" list.
+- `MongoFacade.restore_archive(archive_path, target_dir, *,
+  allow_existing=False)` — new admin client facade method.
+
+#### Fixed
+
+- "Existing backups" table on `/backup` was silently dropping
+  every `.tar.gz` produced by the native checkpoint backup path
+  introduced in v0.5.1b18 (only dump *directories* were listed).
+  Both kinds now render with the correct per-row restore action.
 
 ## [0.5.1b18] — 2026-05-18
 
@@ -481,6 +593,7 @@ Releases](https://github.com/jdrumgoole/SecantusDB/releases) page for
 the auto-generated commit-list notes from those tags.
 
 [Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b18...HEAD
+[0.5.1b20]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b20
 [0.5.1b18]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b18
 [0.5.1b17]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b17
 [0.5.1b16]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b16

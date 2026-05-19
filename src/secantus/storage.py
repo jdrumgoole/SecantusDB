@@ -156,6 +156,69 @@ def _unpack_entry(packed: bytes) -> tuple[bytes, bytes]:
     return packed[:sep], packed[sep + 2 :]
 
 
+def extract_backup_archive(
+    archive_path: str,
+    target_dir: str,
+    *,
+    allow_existing: bool = False,
+) -> dict[str, int | str]:
+    """Extract a SecantusDB backup archive into ``target_dir``.
+
+    Side-channel restore: the archive is unpacked into a fresh
+    directory that the caller then points a new ``SecantusDBServer`` at
+    (``SecantusDBServer(storage_path=<target_dir>)``). The function
+    does **not** touch any running server's storage — that mode of
+    "hot restore over a live WT connection" can't be done safely
+    without restructuring how connection threads cache WT sessions,
+    and isn't what real mongod's restore tooling supports either.
+
+    Returns ``{"targetDir": <abs>, "fileCount": <int>, "archive": <abs>}``
+    on success. Raises ``RuntimeError`` if:
+
+    * the archive doesn't exist,
+    * the archive doesn't contain a ``WiredTiger`` metadata file
+      (so it's not a SecantusDB / WT backup at all),
+    * ``target_dir`` already exists, is non-empty, and ``allow_existing``
+      is False (default).
+
+    The WT metadata check runs **before** extraction so a malformed
+    archive can't pollute ``target_dir``.
+    """
+    import tarfile
+
+    abs_archive = os.path.abspath(archive_path)
+    abs_target = os.path.abspath(target_dir)
+    if not os.path.isfile(abs_archive):
+        raise RuntimeError(f"extract_backup_archive: archive not found: {abs_archive}")
+    if os.path.exists(abs_target):
+        if not os.path.isdir(abs_target):
+            raise RuntimeError(
+                f"extract_backup_archive: target exists and is not a directory: {abs_target}"
+            )
+        if os.listdir(abs_target) and not allow_existing:
+            raise RuntimeError(
+                "extract_backup_archive: target directory is not empty "
+                f"(pass allow_existing=True to overlay): {abs_target}"
+            )
+    else:
+        os.makedirs(abs_target)
+
+    with tarfile.open(abs_archive, "r:*") as tar:
+        names = tar.getnames()
+        if "WiredTiger" not in names:
+            raise RuntimeError(
+                f"extract_backup_archive: archive {abs_archive!r} is not "
+                "a SecantusDB backup (no WiredTiger metadata file inside)"
+            )
+        tar.extractall(abs_target, filter="data")
+
+    return {
+        "targetDir": abs_target,
+        "fileCount": len(names),
+        "archive": abs_archive,
+    }
+
+
 class DuplicateKeyError(Exception):
     def __init__(self, doc_id: Any) -> None:
         super().__init__(f"duplicate _id: {doc_id!r}")
@@ -528,6 +591,9 @@ class Storage:
         enable_oplog: bool = True,
         ttl_sweep_seconds: float = 60.0,
         noop_heartbeat_seconds: float = 0.0,
+        cache_size: str = "1G",
+        session_max: int = 1000,
+        sync_on_commit: bool = False,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -558,12 +624,16 @@ class Storage:
         # mode (WT's in_memory backend rejects them with a noisy
         # ``__wt_inmem_unsupported_op`` log line on every call).
         self._in_memory = path == ":memory:"
+        # Stashed for reuse in restore-archive / explain output.
+        self.cache_size = cache_size
+        self.session_max = session_max
+        self.sync_on_commit = sync_on_commit
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
             # in_memory=true disables the journal entirely (no files);
             # ephemeral by definition, so durability isn't a concern.
-            config = "create,in_memory=true,session_max=1000,cache_size=1G"
+            config = f"create,in_memory=true,session_max={session_max},cache_size={cache_size}"
         else:
             os.makedirs(path, exist_ok=True)
             home = path
@@ -577,24 +647,33 @@ class Storage:
             # ``bench/chaos.py`` (3-min chaos run, 17 SIGKILLs:
             # 432,881 acked / 1 persisted).
             #
-            # ``transaction_sync=(enabled=false,method=fsync)`` is
-            # WT's default once logging is on: log records are written
-            # to the OS but not fsynced per commit. Result: SIGKILL
-            # of the process is durable (the OS still flushes its
-            # page cache), only true power-loss between commits and
-            # the next OS flush window can lose data. That matches
-            # mongod's default ``writeConcern: {w:1, j:false}``.
-            # Bumping to ``method=fsync,enabled=true`` would honour
-            # ``j:true`` durability but we don't yet plumb that
-            # write-concern down — backlog item.
+            # ``transaction_sync`` is the per-commit durability knob.
+            # Default ``enabled=false,method=fsync`` matches mongod's
+            # default ``writeConcern: {w:1, j:false}`` — log records
+            # land in the OS page cache, the OS flushes them on its
+            # own schedule, SIGKILL is durable, true power-loss
+            # between commits can lose data.
+            #
+            # ``sync_on_commit=True`` (config-file knob) bumps to
+            # ``enabled=true,method=fsync``: every commit fsyncs the
+            # log before returning, so the wire-protocol equivalent of
+            # ``writeConcern: {j: true}`` is effectively enforced for
+            # the whole connection. Throughput cost on small-doc
+            # inserts is significant (1-2 orders of magnitude),
+            # which is why it's opt-in.
             #
             # ``file_max=10MB`` bounds journal segment size; smaller
             # files churn the log more, larger files delay reclamation.
             # 10 MB matches mongod's WT default.
+            sync_part = (
+                "transaction_sync=(enabled=true,method=fsync)"
+                if sync_on_commit
+                else "transaction_sync=(enabled=false,method=fsync)"
+            )
             config = (
-                "create,session_max=1000,cache_size=1G,"
-                "log=(enabled=true,file_max=10MB),"
-                "transaction_sync=(enabled=false,method=fsync)"
+                f"create,session_max={session_max},cache_size={cache_size},"
+                f"log=(enabled=true,file_max=10MB),"
+                f"{sync_part}"
             )
         # The on-disk WT home is stashed so ``create_archive`` can tar
         # it after a checkpoint without re-deriving the path.
