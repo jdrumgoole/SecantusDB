@@ -131,6 +131,16 @@ which is why the default is off; turn it on for any deployment where
 a power loss losing the last few seconds of writes would be
 unacceptable.
 
+If you'd rather pay the fsync cost only on writes that ask for it
+(rather than the whole daemon), leave `sync_on_commit = false` and
+have your application send `writeConcern: {w: 1, j: true}` on the
+specific writes that need durability. SecantusDB routes the
+per-write flag through to a `commit_transaction("sync=on")` so the
+j:true subset pays the fsync cost while everything else stays
+fast. Most apps want one of the two extremes (everything durable
+or everything fast); the per-write route exists for mixed-criticality
+workloads.
+
 ### Provisioning authentication
 
 SCRAM users must exist before `--auth` / `[server] auth = true` is

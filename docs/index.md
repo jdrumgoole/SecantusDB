@@ -145,6 +145,9 @@ clustering and infrastructure that `mongod` brings.
   storage layers.
 - [Indexes](indexes.md) — single-field, compound, mixed-direction, partial,
   TTL, hint, sort acceleration, `explain`.
+- [Geospatial](geospatial.md) — `2d` and `2dsphere` indexes,
+  `$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`,
+  `$geoNear`, distance-unit conventions across spec forms.
 - [Aggregation](aggregation.md) — supported pipeline stages and expression
   operators.
 - [Change streams](change-streams.md) — `watch()` against SecantusDB,
@@ -185,6 +188,7 @@ examples
 configuration
 architecture
 indexes
+geospatial
 aggregation
 change-streams
 authentication

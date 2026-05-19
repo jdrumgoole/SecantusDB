@@ -20,7 +20,102 @@ the API surface itself is shaped by Semantic Versioning intent.
 ## [Unreleased]
 
 (No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b23.)
+`main` after v0.5.1b24.)
+
+## [0.5.1b24] — 2026-05-19
+
+### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
+
+Three geo improvements that close the long-standing tail of the
+phase 1/2 geo work and lift the mongo-java-driver gauge into the
+geo surface for the first time.
+
+Legacy mongod 2d shape — `{geo: {$near: [x, y], $maxDistance: r,
+$minDistance: r2}}` with the distance bounds at *sibling* level
+rather than nested inside `$near` — now matches end-to-end through
+both the operator matcher and the 2d-index picker. This is exactly
+what `mongo-java-driver`'s `Filters.near(field, x, y, max, min)`
+and `Filters.nearSphere(...)` build. Unit conventions match
+mongod: legacy `$near` takes the bound in input units (planar
+Pythagoras); legacy `$nearSphere` takes radians on the unit sphere
+(picker converts to meters for 2dsphere and to degrees for 2d).
+
+The 2d range scan picks tighter Z-order ranges via a quadtree
+decomposition of the bbox: each 2^k × 2^k power-of-2-aligned
+quadtree cell that lands fully inside the bbox emits one
+contiguous Z-range (the invariant that makes Z-order indexes
+work). Partial-overlap cells recurse; pure-outside cells are
+skipped. Falls back to the single coarse range if the
+decomposition would exceed `max_ranges=32`. Tightens the WT range
+scan on wider query polygons; correctness is unchanged
+(per-doc verifier filters false positives either way).
+
+`mongo-java-driver`'s `GeoJsonFiltersFunctionalSpecification` and
+`GeoFiltersFunctionalSpecification` (driver-core functional)
+joined the java gauge include list and both pass 10/10. They
+exercise `$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`
+through the driver's `Filters` builder against a real 2d and
+2dsphere index — the kind of integration coverage neither the
+pymongo conformance gauge nor our in-tree pymongo tests reach.
+
+#### Added
+
+- `secantus.geo_index.planar_2d_covering_ranges()` — quadtree
+  Z-order range decomposition for 2d index scans. Returns up to
+  32 tight `(lo, hi)` ranges; falls back to a single coarse range
+  on cap overflow.
+- 6 new tests in `tests/test_geo_query.py` /
+  `tests/test_geo.py`: sibling-form `$near` with `$maxDistance`,
+  sibling-form annulus (max+min), sibling-form `$nearSphere`
+  with radians convention, single-range quadtree for an aligned
+  bbox, multi-range quadtree for an off-axis bbox, fallback to
+  single range under cap.
+- `_DRIVER_CORE_FUNCTIONAL_INCLUDES` in
+  `java_validation/include_modules.py`: brings the two upstream
+  geo functional specs into the java gauge as
+  `:driver-core:test` filtered runs.
+- [`docs/geospatial.md`](geospatial.md) — dedicated reference
+  page: operator-by-operator, both index types, doc-side shapes
+  accepted, the legacy / GeoJSON / spherical distance-unit
+  conventions, a worked deployment example, validation surface
+  summary. Linked from the Highlights list and added to the
+  Sphinx toctree.
+- [`docs/indexes.md`](indexes.md) — new geospatial section
+  pointing at the dedicated page; the "Acceleration summary
+  across index types" table now covers `2d`, `2dsphere`, and
+  compound geo + scalar.
+
+#### Changed
+
+- `_parse_near_spec` now returns a 5-tuple
+  `(center, max_d, min_d, spherical, legacy_form)`; consumers use
+  the new `legacy_form` flag to pick the right unit conversion
+  (legacy+spherical → radians; legacy+planar → input units;
+  GeoJSON → meters).
+- 2d-index picker uses the multi-range coverer; existing single-
+  range `planar_2d_covering` kept as the coarse fallback.
+- [`docs/indexes.md`](indexes.md) — "What's still missing" list
+  rewritten. Multi-field sort acceleration, multikey indexing,
+  and basic collation all shipped long ago and shouldn't have
+  been on the gap list; the actual remaining gaps (per-index
+  collation, TTL background sweeper, text / hashed indexes)
+  replace the stale entries.
+- [`docs/production.md`](production.md) — added a paragraph on
+  per-write `writeConcern: {j: true}` routing as the
+  finer-grained alternative to the daemon-wide
+  `sync_on_commit = true` knob.
+
+#### Fixed
+
+- Legacy mongod `{geo: {$near: [x, y], $maxDistance: r}}`
+  previously raised `unsupported query operator: $maxDistance`
+  because the dispatcher treated the sibling bound as a
+  standalone operator. The matcher now skips the sibling keys
+  when iterating and passes them into `_op_geo_near`.
+- 2d-index picker no longer over-filters on `$nearSphere` legacy
+  form: the radians bound is converted to degrees before
+  building the planar disk, matching mongod's behaviour against
+  a 2d index.
 
 ## [0.5.1b23] — 2026-05-19
 
@@ -703,6 +798,7 @@ Releases](https://github.com/jdrumgoole/SecantusDB/releases) page for
 the auto-generated commit-list notes from those tags.
 
 [Unreleased]: https://github.com/jdrumgoole/SecantusDB/compare/v0.5.1b18...HEAD
+[0.5.1b24]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b24
 [0.5.1b23]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b23
 [0.5.1b20]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b20
 [0.5.1b18]: https://github.com/jdrumgoole/SecantusDB/releases/tag/v0.5.1b18
