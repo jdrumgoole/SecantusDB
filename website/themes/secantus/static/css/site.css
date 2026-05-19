@@ -273,11 +273,9 @@ pre code { background: transparent; padding: 0; }
   line-height: 1.55;
 }
 
-/* "What's in the box" focused-feature grid. Same card style as the
-   generic benefits, plus a trailing CTA link to the relevant docs
-   page so the panel reads as "summary → deep dive" rather than a
-   dead-end blurb. */
-.features-grid .benefit p + p.benefit-cta {
+/* Trailing CTA link in each benefit panel — reads as
+   "summary → deep dive" rather than a dead-end blurb. */
+.benefit p + p.benefit-cta {
   margin-top: 14px;
   font-size: 14px;
 }

@@ -2,25 +2,46 @@
   <div class="benefit">
     <h3><span class="pip"></span>Drop-in wire protocol</h3>
     <p>Speaks MongoDB OP_MSG / OP_QUERY on a real TCP socket. <code>pymongo</code>, the Go driver, <code>mongosh</code>, and <code>mongodump</code> all connect with no code changes.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}architecture.html" rel="noopener">Architecture &rarr;</a></p>
   </div>
   <div class="benefit">
     <h3><span class="pip"></span>Single-node by design</h3>
     <p>No replica sets, no sharding, no cluster topology to model. Within single-node scope SecantusDB is a faithful surrogate &mdash; same handshake, same error codes.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}compatibility.html" rel="noopener">Compatibility &rarr;</a></p>
   </div>
   <div class="benefit">
     <h3><span class="pip"></span>Python-native &amp; embeddable</h3>
     <p>Start a server in two lines from any test or app. No <code>mongod</code> to install, no port juggling, parallel-test friendly. Or run it as a standalone daemon (<code>secantusdb</code>).</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}quickstart.html" rel="noopener">Quickstart &rarr;</a></p>
   </div>
   <div class="benefit">
     <h3><span class="pip"></span>Real WiredTiger storage</h3>
     <p>The same C library MongoDB ships with, vendored and built into the wheel. B-trees, page eviction, write-ahead logging, durability &mdash; all real.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}architecture.html" rel="noopener">Storage architecture &rarr;</a></p>
   </div>
   <div class="benefit">
-    <h3><span class="pip"></span>CRUD, aggregation, change streams, indexes</h3>
-    <p>Not a mock. Full pipeline (<code>$match</code> through <code>$facet</code>), oplog-backed change streams with resume tokens, compound &amp; partial &amp; geo (<code>2d</code>/<code>2dsphere</code>) indexes.</p>
+    <h3><span class="pip"></span>Aggregation pipeline</h3>
+    <p>Full pipeline &mdash; <code>$match</code>, <code>$group</code> (every mongod accumulator), <code>$lookup</code> with index-driven joins, <code>$facet</code>, <code>$bucket</code>, <code>$densify</code>, <code>$fill</code>, <code>$merge</code>, <code>$out</code>, <code>$graphLookup</code>, <code>$geoNear</code>. Same expression language as mongod.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}aggregation.html" rel="noopener">Aggregation reference &rarr;</a></p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Geospatial &mdash; <code>2d</code> &amp; <code>2dsphere</code></h3>
+    <p><code>$geoWithin</code>, <code>$geoIntersects</code>, <code>$near</code>, <code>$nearSphere</code>, <code>$geoNear</code> all accelerated by either index type. S2 cell coverings for GeoJSON; quadtree-decomposed Z-order ranges for legacy <code>[x, y]</code> pairs. Compound geo+scalar indexes work too.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}geospatial.html" rel="noopener">Geospatial reference &rarr;</a></p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Native TLS &amp; mTLS</h3>
+    <p>Wraps accepted sockets in TLS before the wire protocol starts &mdash; no reverse proxy required. Add a CA bundle for mTLS (transport-layer client-cert verification). SCRAM-SHA-256 still identifies the user on top.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}configuration.html#tls" rel="noopener">Configure TLS &rarr;</a></p>
+  </div>
+  <div class="benefit">
+    <h3><span class="pip"></span>Change streams</h3>
+    <p>Oplog-backed, single-node. <code>watch()</code> at collection / db / cluster scope, resume tokens, <code>fullDocument: "updateLookup"</code>, pre-images via <code>changeStreamPreAndPostImages</code>, <code>awaitData</code> blocking.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}change-streams.html" rel="noopener">Change-streams reference &rarr;</a></p>
   </div>
   <div class="benefit">
     <h3><span class="pip"></span>Conformance-tested</h3>
-    <p>Validated against the unmodified pymongo, mongo-go-driver, mongo-node-driver, and mongo-java-driver test suites. The pass rates are the honest compatibility gauge.</p>
+    <p>Validated against the unmodified pymongo, mongo-go-driver, mongo-node-driver, mongo-ruby-driver, and mongo-java-driver test suites. The pass rates are the honest compatibility gauge.</p>
+    <p class="benefit-cta"><a href="{{ SECANTUS_DOCS_URL }}validation-summary.html" rel="noopener">Validation summary &rarr;</a></p>
   </div>
 </div>
