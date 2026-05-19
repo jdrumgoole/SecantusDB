@@ -229,18 +229,56 @@ without `sort` walk in this order, matching `mongod`.
 | `2d` | same operators via quadtree-decomposed Z-order range scan over a bit-interleaved geohash | IXSCAN — see [Geospatial](geospatial.md) |
 | Compound geo + scalar | geo column drives the cell scan; trailing scalar(s) filtered at the verifier step | IXSCAN |
 
+## Per-index collation
+
+A collation set at `createIndexes` time normalises string entries
+before they're written to the entries table — strings that
+collation-equal each other land at the same byte key, so a query
+carrying a matching `collation` hits the same row. Strength 1/2/3
+and `caseLevel` are supported; `numericOrdering` is not (would
+need a length-prefixed digit-run encoding to stay byte-sortable —
+queries combining it with an index fall back to COLLSCAN).
+
+```python
+coll.create_index("name", collation={"locale": "en", "strength": 2})
+
+# Case-insensitive equality lights up at IXSCAN.
+coll.find({"name": "alice"}, collation={"locale": "en", "strength": 2})
+# Same collation in both → IXSCAN; mismatch → COLLSCAN.
+```
+
+Two collation rules:
+
+* **Indexes are gated by exact-match.** An index with
+  `collation: {strength: 2}` is only picked when the query's
+  collation parses to the same dataclass. A no-collation query
+  against a strength-2 index → COLLSCAN. A strength-3 query
+  against a strength-2 index → COLLSCAN. Mongod follows the same
+  rule.
+* **Multiple indexes on the same field, different collations** are
+  fine — the picker walks every index and uses the one whose
+  collation matches. Useful for collections that mix
+  case-sensitive and case-insensitive lookups against the same
+  column.
+
+A `unique` index with a collation enforces uniqueness *under* the
+collation: two docs with `name: "Alice"` and `name: "alice"`
+collide against a `strength: 2` unique index.
+
+Only `_find_leading_field_index` (single-field equality / range /
+`$in`) currently threads collation through. Compound bare-eq and
+compound-prefix-plus-trailing-operator pickers skip collation-
+having indexes — queries combining a collation with a multi-field
+filter fall back to COLLSCAN. Worth widening case-by-case when a
+workload needs it.
+
 ## What's still missing
 
-- **Per-index collation** — `createIndexes` stores the option on
-  the index spec, but entries are written in BSON codepoint order
-  (no collation-aware sort key). Queries that carry `collation`
-  fall through to COLLSCAN by design. The per-query collation
-  infrastructure does honour collation for `find` / `count` /
-  `distinct` / `findAndModify` — it's just the index-side enforcement
-  that's missing.
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
   cadence sweeper. Real mongod runs one; for an in-process test
   surrogate the explicit-call ergonomics suit the audience better.
+- **Compound-index collation** — see above; single-field path
+  works, compound pickers skip collation-having indexes.
 - **Text / hashed indexes** — out of scope (no full-text engine; no
   practical workload pulling hashed shard-key behaviour into an
   in-process surrogate).

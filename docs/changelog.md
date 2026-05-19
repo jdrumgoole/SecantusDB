@@ -85,6 +85,95 @@ SCRAM-on-top.
   now offer two routes (SCRAM-on-top vs MONGODB-X509) instead of
   the "transport-layer only, MONGODB-X509 is a follow-on" caveat.
 
+### Per-index collation — case- and accent-insensitive lookups at IXSCAN
+
+The last entry on the compatibility doc's "Deferred" list is gone.
+Before this slice, the per-query collation infrastructure already
+honoured `collation` for `find` / `count` / `distinct` /
+`findAndModify` via `matches()` — but any query that carried a
+`collation` argument fell through to COLLSCAN by design, because
+index entries were written in raw BSON codepoint order. The
+storage-layer comment said as much: "we don't support per-index
+collation yet, so the safe path is always-COLLSCAN-when-collation."
+
+That comment is gone. `createIndexes` with a `collation` option
+now writes index entries under collation-normalised bytes —
+strings that compare-equal under the collation produce the same
+key, so a query carrying a matching `collation` hits the same row
+at IXSCAN. Strength 1/2/3 + `caseLevel` are supported;
+`numericOrdering` still falls back to COLLSCAN (would need a
+length-prefixed digit-run encoding to stay byte-sortable, deferred
+until a workload needs it).
+
+Two indexes on the same field with different collations are
+allowed — the picker walks every candidate and uses the one whose
+collation exactly matches the query's. Useful for collections that
+mix case-sensitive and case-insensitive lookups against the same
+column. Unique indexes with a collation enforce uniqueness
+*under* the collation: two docs differing only by case collide
+against a `strength: 2` unique index. Only the single-field
+equality / range / `$in` picker threads collation through today;
+multi-field filters combined with a collation still fall back to
+COLLSCAN. Worth widening case-by-case when a workload needs it.
+
+#### Added
+
+- `sortkey.encode_value(value, *, collation=None)`,
+  `encode_value_directed`, `encode_compound`, and the bound
+  helpers (`gt_bound` / `gte_bound` / `lt_bound` / `lte_bound`) all
+  take an optional `collation` kwarg. When set and the value is a
+  string, normalisation runs through
+  `secantus.collation.normalize_for_index_bytes` before encoding,
+  so equal-under-collation strings produce equal bytes.
+- `Collation.supports_index_encoding` — True for strength 1/2/3 +
+  `caseLevel`, False for `numericOrdering`. The picker treats
+  numericOrdering as "no index available for this collation."
+- `secantus.collation.normalize_for_index_bytes(s, collation)` —
+  bytes form of the collation-normalised string (strips accents
+  for strength 1, casefolds for strength ≤ 2, UTF-8 encodes).
+- `_parse_index_collation` helper in `storage.py` — reads an
+  index's stored collation option blob into a `Collation`,
+  returning `None` for collations that don't support index
+  encoding.
+- `tests/test_per_index_collation.py` — 11 tests covering routing
+  (matching collation → IXSCAN, mismatch → COLLSCAN, no-collation
+  query against collation-having index → COLLSCAN), correctness on
+  equality / range / `$in` / `update_one`, `numericOrdering`
+  fallback, unique-index-under-collation, and two indexes on the
+  same field with different collations.
+
+#### Changed
+
+- `_index_key` / `_index_key_variants` (the byte-key builders for
+  index writes) accept a `collation` kwarg; the storage writers
+  load it from the index's stored options and pass it through.
+- `_find_leading_field_index` + `_pick_index_for_filter` +
+  `_try_index_lookup` + `_try_index_id_keys` thread a `collation`
+  kwarg. Indexes whose stored collation doesn't exactly equal the
+  query's are skipped — the caller falls back to COLLSCAN, which
+  is the safe semantics. `_pick_compound_eq_index` /
+  `_pick_compound_range_index` skip collation-having indexes
+  entirely; compound pickers don't yet support collation, and
+  picking a collation-having index for a no-collation multi-field
+  filter would return wrong rows.
+- `explain_plan` takes a `collation` kwarg, and the `explain`
+  command extracts it from the wrapped command. Mismatched
+  collations report COLLSCAN in `winningPlan`; matched ones
+  report `IXSCAN` with the index name.
+- `find_matching`'s "if collation present, always COLLSCAN" gate
+  has been rewritten — now tries the collation-aware index path
+  first, falls back to COLLSCAN only when no matching index
+  exists.
+- `docs/compatibility.md` field-options table: `collation` is now
+  Honoured rather than Accepted-but-ignored. The Deferred list is
+  now empty.
+- `docs/indexes.md`: new "Per-index collation" section with
+  examples and rules; the "What's still missing" list updated to
+  call out compound-index collation as the next widening.
+- `tasks/backlog.md` §2: the per-index-collation stopgap entry is
+  struck through with a one-line summary of what shipped and the
+  remaining compound-index limitation.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge

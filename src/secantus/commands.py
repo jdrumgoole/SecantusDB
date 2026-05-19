@@ -1176,6 +1176,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     filter_: dict[str, Any] = {}
     sort = None
     hint = None
+    collation = None
     if isinstance(inner, dict):
         cmd_name = next(iter(inner), "")
         coll_value = inner.get(cmd_name)
@@ -1183,6 +1184,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         filter_ = inner.get("filter") or inner.get("query") or {}
         sort = inner.get("sort")
         hint = inner.get("hint")
+        collation = inner.get("collation")
     # MongoDB rejects ``explain`` paired with a journaled write concern
     # (``writeConcern: {j: true}`` or ``{w: "majority"}``). The explain
     # cycle is a no-op read; combining it with a write concern is
@@ -1244,7 +1246,9 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     namespace = _ns(ctx.db_name, coll) if coll else f"{ctx.db_name}.$cmd"
     if coll:
-        plan = ctx.storage.explain_plan(ctx.db_name, coll, filter_, sort=sort, hint=hint)
+        plan = ctx.storage.explain_plan(
+            ctx.db_name, coll, filter_, sort=sort, hint=hint, collation=collation
+        )
     else:
         plan = {"kind": "COLLSCAN"}
     if plan["kind"] == "IXSCAN":

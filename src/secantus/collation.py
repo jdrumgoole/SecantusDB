@@ -67,6 +67,23 @@ class Collation:
     def accent_insensitive(self) -> bool:
         return self.strength <= 1
 
+    @property
+    def supports_index_encoding(self) -> bool:
+        """Can this collation be baked into byte-sortable index entries?
+
+        Strength 1/2/3 + ``caseLevel`` work — the normalisation is a
+        deterministic string → string transformation that preserves
+        sort order under byte comparison.
+
+        ``numericOrdering`` does not. It needs a length-prefixed
+        digit-run encoding to keep ``"a10" > "a2"`` correct under
+        lex-byte ordering; we don't ship that v1, so queries that
+        combine ``numericOrdering`` with a string-bearing index
+        fall through to COLLSCAN. The default (no numericOrdering)
+        covers the vast majority of case-insensitive use cases.
+        """
+        return not self.numeric_ordering
+
 
 def parse(spec: Any) -> Collation | None:
     """Build a :class:`Collation` from the user's ``collation`` map.
@@ -111,6 +128,35 @@ def _normalize_string(s: str, collation: Collation) -> Any:
         parts = _NUMERIC_SPLIT.split(out)
         return tuple((int(p) if p.isdigit() else p) for p in parts if p != "")
     return out
+
+
+def normalize_for_index_bytes(s: str, collation: Collation) -> bytes:
+    """Normalised UTF-8 bytes for ``s`` under ``collation``, suitable
+    for sortkey index encoding.
+
+    Only valid when ``collation.supports_index_encoding`` is True.
+    Applies ``_strip_accents`` (strength 1) and ``casefold``
+    (case-insensitive) in the same order as :func:`_normalize_string`,
+    so two strings that compare-equal under ``equal()`` produce the
+    same bytes here — which is the invariant index lookups rely on.
+
+    NOT a replacement for :func:`_normalize_string`. That helper
+    returns Python values for in-memory comparison (and a tuple form
+    for ``numericOrdering``); this returns bytes for on-disk index
+    keys and intentionally skips ``numericOrdering`` (the caller has
+    pre-checked ``supports_index_encoding``).
+    """
+    if not collation.supports_index_encoding:
+        raise ValueError(
+            "normalize_for_index_bytes: collation has numericOrdering, "
+            "which can't be baked into byte-sortable index entries"
+        )
+    out = s
+    if collation.accent_insensitive:
+        out = _strip_accents(out)
+    if collation.case_insensitive:
+        out = out.casefold()
+    return out.encode("utf-8")
 
 
 def cmp_key(value: Any, collation: Collation | None) -> Any:
