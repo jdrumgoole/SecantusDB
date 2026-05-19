@@ -198,6 +198,26 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _wants_journal(doc: Mapping[str, Any]) -> bool:
+    """Extract the per-write ``writeConcern.j`` flag.
+
+    Returns ``True`` when the request asks for journal-durable
+    semantics (``j: true`` or any truthy integer). Real mongod treats
+    ``j: 1``/``j: true`` identically — the type check in
+    ``_validate_write_concern`` already vets the field's wire shape.
+
+    When ``True`` flows through to storage, the per-write WT
+    transaction commits with ``sync=on`` (per-commit fsync) regardless
+    of the connection's ``transaction_sync`` setting. Closes the
+    long-standing gap where ``j: true`` was silently dropped because
+    the server-wide ``sync_on_commit`` knob was the only lever.
+    """
+    wc = doc.get("writeConcern")
+    if not isinstance(wc, Mapping):
+        return False
+    return bool(wc.get("j"))
+
+
 def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict[str, Any] | None:
     """Refuse any write to the synthetic ``local.oplog.rs`` view.
 
@@ -1400,7 +1420,9 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return {"n": 0, "ok": 1.0, "writeErrors": pre_errors}
     if not surviving:
         return {"n": 0, "ok": 1.0, "writeErrors": pre_errors}
-    inserted, errors = ctx.storage.insert(ctx.db_name, coll, surviving, ordered=ordered)
+    inserted, errors = ctx.storage.insert(
+        ctx.db_name, coll, surviving, ordered=ordered, journal=_wants_journal(doc)
+    )
     reply: dict[str, Any] = {"n": inserted, "ok": 1.0}
     if pre_errors or errors:
         # ``writeErrors`` index refers to the position in the
@@ -1666,6 +1688,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 let=let,
                 collation=spec.get("collation"),
                 validator=validator_spec if validator_active else None,
+                journal=_wants_journal(doc),
             )
         except DocumentValidationError as exc:
             write_errors.append(
@@ -1764,6 +1787,7 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 limit=int(spec.get("limit", 0)),
                 let=let,
                 collation=spec.get("collation"),
+                journal=_wants_journal(doc),
             )
         except QueryError as exc:
             # Same per-delete writeError shape as ``_update`` — the
@@ -1958,6 +1982,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                     array_filters=array_filters,
                     collation=collation,
                     validator=validator_up,
+                    journal=_wants_journal(doc),
                 )
             except DocumentValidationError as exc:
                 return {
@@ -2016,7 +2041,13 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     matched_id = matched_doc["_id"]
 
     if is_remove:
-        ctx.storage.delete_matching(ctx.db_name, coll, {"_id": matched_id}, limit=1)
+        ctx.storage.delete_matching(
+            ctx.db_name,
+            coll,
+            {"_id": matched_id},
+            limit=1,
+            journal=_wants_journal(doc),
+        )
         value = matched_doc
         if fields:
             value = apply_projection(value, fields)
@@ -2064,6 +2095,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             multi=False,
             array_filters=array_filters,
             let=let,
+            journal=_wants_journal(doc),
         )
     except IndexConflict as exc:
         reply2: dict[str, Any] = {
