@@ -76,6 +76,50 @@ same as the accumulator functions.
   `test_unsupported_time_series_function_raises`, which now probes
   with `$derivative` to keep the deferred-surface guard alive.
 
+### `apiStrict: true` rejects `distinct` (narrow command-name gate)
+
+The Stable API v1 contract rejects a list of commands when
+`apiStrict: true` is set. SecantusDB already rejected non-v1
+aggregation **stages** inside `aggregate` pipelines (lights up
+mongo-java-driver's `versioned-api/aggregate on database` test
+that probes with `$listLocalSessions`). The matching command-name
+gate had been intentionally left off in a previous attempt: a
+broader whitelist invert reportedly caused 6 cascade failures via
+`MongoConnectionPoolClearedException`.
+
+A focused Java-gauge run with a narrow gate
+(`_API_V1_REJECTED_BY_NAME = {"distinct"}`) tells a different
+story. Rejecting only `distinct` produces **+1 pass** for the
+canary `crud-api-version-1-strict.yml` `distinct appends declared
+API version` test and **zero** new failures across the 900-test
+mongo-java-driver suite — no pool-clear symptoms anywhere in the
+JUnit XML. The cascade the previous attempt observed was not
+pool-clear semantics; it was the broader invert also rejecting
+`count` (used internally by `estimatedDocumentCount`) and other
+handshake-adjacent internal commands. The narrow gate sidesteps
+that mechanism entirely.
+
+#### Added
+
+- `src/secantus/commands.py`: `_API_V1_REJECTED_BY_NAME`
+  frozenset (one entry: `distinct`); the `dispatch` apiStrict
+  block grew a command-name check that runs before the
+  aggregation-stage check. The rejection's `errmsg` matches
+  mongod's `"Provided command distinct is not in API Version 1"`
+  so the unified test runner's `errorContains` assertion fires
+  cleanly.
+- `tests/test_api_strict.py` (5 new tests): `distinct` rejected
+  under `apiStrict: true` with code 323; `distinct` allowed
+  without `apiStrict`; `count` still allowed under `apiStrict`
+  (the cascade-avoidance check); `find` still allowed; `aggregate`
+  with a v1 stage still allowed (gates compose).
+
+#### Changed
+
+- Backlog §5 entry on `apiStrict` pool-clear struck through with
+  the empirical resolution path. The previous theory turned out
+  to be wrong about the mechanism — narrow rejection works.
+
 ## [0.5.2b1] — 2026-05-20
 
 ### MONGODB-X509 auth — cert subject DN as the username
