@@ -1592,6 +1592,54 @@ def _stage_documents(
     return out
 
 
+def _stage_union_with(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$unionWith`` — concatenate docs from another collection after
+    optionally running them through a sub-pipeline.
+
+    Two spec shapes (per mongod):
+
+    * Shorthand: ``{$unionWith: "<coll>"}`` — equivalent to
+      ``{$unionWith: {coll: "<coll>"}}``, no sub-pipeline.
+    * Full form: ``{$unionWith: {coll: "<coll>", pipeline: [...]}}``.
+
+    The sub-pipeline runs in a *fresh* :class:`PipelineContext` — outer
+    ``let`` / ``vars`` are not visible inside, matching mongod's
+    semantics (``$unionWith`` does not accept a ``let`` field). Outer
+    docs come first, then the union docs in the order the sub-pipeline
+    produced them; mongod imposes no ordering guarantee between the
+    two sets, but appending the union docs is the documented
+    implementation. No deduplication — duplicates across the boundary
+    survive.
+    """
+    if isinstance(spec, str):
+        from_coll = spec
+        sub_pipeline: list[dict[str, Any]] | None = None
+    elif isinstance(spec, Mapping):
+        from_coll = spec.get("coll")
+        sub_pipeline = spec.get("pipeline")
+        if not isinstance(from_coll, str):
+            raise AggregateError("$unionWith requires 'coll' (string)")
+        if sub_pipeline is not None and not isinstance(sub_pipeline, list):
+            raise AggregateError("$unionWith 'pipeline' must be an array")
+    else:
+        raise AggregateError("$unionWith requires a collection name or {coll, pipeline} doc")
+    if ctx.storage is None:
+        raise AggregateError("$unionWith requires storage context")
+
+    foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
+    if sub_pipeline:
+        sub_ctx = PipelineContext(
+            storage=ctx.storage,
+            db_name=ctx.db_name,
+            coll_name=from_coll,
+            collation=ctx.collation,
+        )
+        foreign_docs = apply_pipeline(foreign_docs, sub_pipeline, sub_ctx)
+    return list(docs) + list(foreign_docs)
+
+
 def _stage_geo_near(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1747,4 +1795,5 @@ _STAGES = {
     "$documents": _stage_documents,
     "$changeStream": _stage_change_stream,
     "$geoNear": _stage_geo_near,
+    "$unionWith": _stage_union_with,
 }

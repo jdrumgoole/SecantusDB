@@ -332,6 +332,43 @@ downstream `$match`. Now wraps the result in `Int64` for code 18
   either; `$convert: {to: "long"}` output matches `$type: "long"`;
   `$convert: {to: "int"}` output matches `$type: "int"`.
 
+### `$unionWith` aggregation stage
+
+A v1 stable-API stage that wasn't yet wired up. `$unionWith`
+concatenates docs from a second collection — optionally filtered
+through a sub-pipeline — onto the current pipeline's input. Driver
+test suites probe it routinely; the prior wire-level response was
+a generic "unsupported aggregation stage" error.
+
+Both spec shapes ship:
+
+* Shorthand: `{$unionWith: "<coll>"}`
+* Full form: `{$unionWith: {coll: "<coll>", pipeline: [...]}}`
+
+Outer docs land first, then the union docs in the order the
+sub-pipeline produced them. No deduplication — duplicates across
+the boundary survive, matching mongod. The sub-pipeline runs in a
+fresh :class:`PipelineContext`; outer `$lookup let` variables are
+deliberately not visible (mongod doesn't accept a `let` field on
+`$unionWith`). Chained `$unionWith` stages accumulate; downstream
+`$sort` / `$group` / `$count` / `$limit` see the combined set.
+
+A non-existent target collection is treated as empty (mongod's
+behaviour). Bad specs (non-string shorthand, missing `coll`,
+non-array `pipeline`) surface as `AggregateError` to the client.
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_stage_union_with` handler;
+  wired into `_STAGES` next to `$geoNear`. ~30 LOC + docstring.
+- `tests/test_union_with.py` (11 new tests): shorthand form;
+  full form with and without sub-pipeline; outer-first ordering;
+  no-dedup across boundary; chained `$unionWith`; downstream
+  `$group` / `$sort+$limit`; missing collection treated as empty;
+  empty outer + non-empty union; bad-spec rejection (numeric
+  spec, missing `coll`, non-array `pipeline`).
+- `docs/aggregation.md` stages table grows a row.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
