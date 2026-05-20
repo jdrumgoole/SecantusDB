@@ -265,20 +265,31 @@ A `unique` index with a collation enforces uniqueness *under* the
 collation: two docs with `name: "Alice"` and `name: "alice"`
 collide against a `strength: 2` unique index.
 
-Only `_find_leading_field_index` (single-field equality / range /
-`$in`) currently threads collation through. Compound bare-eq and
-compound-prefix-plus-trailing-operator pickers skip collation-
-having indexes — queries combining a collation with a multi-field
-filter fall back to COLLSCAN. Worth widening case-by-case when a
-workload needs it.
+Both single-field and compound pickers thread collation through:
+
+```python
+coll.create_index([("a", 1), ("b", 1)], collation={"locale": "en", "strength": 2})
+
+# Compound bare-equality on the full key (or any leading prefix).
+coll.find({"a": "alice", "b": "BOSTON"}, collation={"locale": "en", "strength": 2})
+
+# Compound prefix + trailing operator on the next field
+# ($gt / $gte / $lt / $lte / $in / $eq).
+coll.find({"a": "alice", "b": {"$gt": "k"}}, collation={"locale": "en", "strength": 2})
+```
+
+Same exact-collation-match gate as the single-field path — a
+no-collation query against a collation-having compound index, or a
+collation-mismatched query, falls back to COLLSCAN. Unique
+compound indexes with a collation enforce uniqueness under the
+collation (two compound keys that compare-equal under the
+collation collide on the second insert).
 
 ## What's still missing
 
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
   cadence sweeper. Real mongod runs one; for an in-process test
   surrogate the explicit-call ergonomics suit the audience better.
-- **Compound-index collation** — see above; single-field path
-  works, compound pickers skip collation-having indexes.
 - **Text / hashed indexes** — out of scope (no full-text engine; no
   practical workload pulling hashed shard-key behaviour into an
   in-process surrogate).

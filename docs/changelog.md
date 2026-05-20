@@ -174,6 +174,63 @@ COLLSCAN. Worth widening case-by-case when a workload needs it.
   struck through with a one-line summary of what shipped and the
   remaining compound-index limitation.
 
+### Compound-index collation — multi-field filters light up under matching collation
+
+The b25 per-index collation slice closed the single-field path
+but left the compound pickers
+(`_pick_compound_eq_index` / `_pick_compound_range_index`) skipping
+any collation-having index — a multi-field filter combined with a
+`collation` argument fell back to COLLSCAN even when a compound
+collation index could have served it. This slice closes that gap.
+
+Both compound pickers now thread `collation` through and gate by
+exact match against each index's stored collation, the same rule
+the single-field path already used. The lookup builders thread
+collation into every `encode_value_directed` call (leading-equality
+prefix bytes and the trailing operator's bound bytes), so the
+lookup hits the same byte rows the index-write path produced.
+Strength 1/2/3 + `caseLevel` apply uniformly across single- and
+compound-field indexes; `numericOrdering` still falls back to
+COLLSCAN at every level. The unique-probe path now reads the
+index's stored collation too, so a unique compound index with
+`{strength: 2}` correctly rejects a second insert whose values
+collide under the collation.
+
+After this slice, every CRUD pattern that the single-field
+collation path covers — equality / range / `$in` / `update` /
+unique enforcement — covers under compound indexes too.
+
+#### Changed
+
+- `_pick_compound_eq_index` + `_try_compound_eq_id_keys` thread
+  `collation` through; the compound-eq lookup builds the prefix
+  bytes under the same collation as the index.
+- `_pick_compound_range_index` + `_try_compound_range_id_keys`
+  thread `collation` through; the trailing operator's `$eq` /
+  `$in` / `$gt` / `$gte` / `$lt` / `$lte` bounds are all encoded
+  under the collation.
+- `_try_index_id_keys` no longer short-circuits compound pickers
+  when `collation` is set — they're called with the collation kwarg
+  and use the exact-match gate.
+- `_pick_index_for_filter` (the explain planner) mirrors the same
+  threading, so `explain` reports `IXSCAN` for collation-matching
+  multi-field queries.
+- `_unique_conflict` reads each index's stored collation via
+  `_parse_index_collation` and threads it to `_index_key`, so the
+  unique probe collides on byte-equal canonical keys (the bug
+  that let `("Alice","Boston")` and `("ALICE","BOSTON")` both land
+  in a unique strength-2 compound index).
+- `docs/indexes.md` "Per-index collation" section rewritten to
+  cover the compound case with examples; "What's still missing"
+  drops the compound-collation entry.
+- `tests/test_compound_index_collation.py` (10 new tests): compound
+  bare-eq IXSCAN under matching collation, leading-prefix-only
+  scan, mismatch → COLLSCAN, no-collation-vs-collation index
+  selection across two indexes on the same fields, compound
+  prefix + trailing-operator (`$gt`, `$in`) under collation,
+  update via compound collation index, unique compound collation
+  enforcement, `numericOrdering` fallback.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
