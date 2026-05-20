@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-05-19 — SecantusDB 0.5.1b20 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-05-20 — SecantusDB 0.5.2b3 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -14,8 +14,10 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
 | `test_change_stream.py` | 1 | 0 | 0 | 154 | 155 | 100.0% |
 | `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
+| `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 86 | 0 | 0 | 5 | 91 | 100.0% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
+| `test_command_logging.py` | 20 | 0 | 0 | 16 | 36 | 100.0% |
 | `test_command_monitoring.py` | 32 | 0 | 0 | 6 | 38 | 100.0% |
 | `test_comment.py` | 1 | 0 | 0 | 2 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
@@ -30,6 +32,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_errors.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_examples.py` | 14 | 0 | 0 | 6 | 20 | 100.0% |
 | `test_json_util.py` | 24 | 0 | 0 | 0 | 24 | 100.0% |
+| `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
 | `test_objectid.py` | 15 | 0 | 0 | 0 | 15 | 100.0% |
 | `test_operations.py` | 2 | 0 | 0 | 0 | 2 | 100.0% |
 | `test_raw_bson.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
@@ -39,8 +42,10 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_run_command.py` | 14 | 0 | 0 | 7 | 21 | 100.0% |
 | `test_son.py` | 11 | 0 | 0 | 0 | 11 | 100.0% |
 | `test_timestamp.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
+| `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
+| `test_versioned_api_integration.py` | 36 | 0 | 0 | 7 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **959** | **0** | **0** | **382** | **1341** | **100.0%** |
+| **Overall** | **1039** | **0** | **0** | **407** | **1446** | **100.0%** |
 
 ## How this is generated
 

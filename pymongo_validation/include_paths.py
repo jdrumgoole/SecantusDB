@@ -74,6 +74,22 @@ INCLUDE: list[str] = [
     # require multi-node oplog semantics (e.g. mongos cluster-wide
     # change streams) self-skip via pymongo's topology decorators.
     "vendor/pymongo-tests/test/test_change_stream.py",
+    # Collation. Wire-side ``collation`` echo + per-index collation
+    # (single-field, compound, sort acceleration) all ship as of
+    # 0.5.2b1 — see `docs/indexes.md` "Per-index collation". Pymongo's
+    # built-in collation suite runs cleanly.
+    "vendor/pymongo-tests/test/test_collation.py",
+    # Stable API v1. ``apiVersion`` echo, ``apiStrict`` aggregation-
+    # stage gate (b25-era), and the ``distinct`` command-name gate
+    # (0.5.2b3) cover the surface these tests exercise.
+    "vendor/pymongo-tests/test/test_versioned_api.py",
+    "vendor/pymongo-tests/test/test_versioned_api_integration.py",
+    # Command monitoring + logging. We emit the started / succeeded /
+    # failed events the driver gates on; the logging-suite tests
+    # exercise format-string conformance and don't depend on any
+    # SecantusDB-specific behaviour past that.
+    "vendor/pymongo-tests/test/test_command_logging.py",
+    "vendor/pymongo-tests/test/test_logger.py",
     # Explicitly EXCLUDED (out of scope per CLAUDE.md):
     #   test_index_management.py     — Atlas search indexes, integration only
     #   test_transactions*           — real transaction rollback
