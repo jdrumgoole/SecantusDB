@@ -231,6 +231,69 @@ unique enforcement — covers under compound indexes too.
   update via compound collation index, unique compound collation
   enforcement, `numericOrdering` fallback.
 
+### Sort acceleration with collation — index walk replaces Python sort
+
+The third collation slice closes a quieter gap left by the
+preceding two. The b25 + b27 slices wired up filter-side
+collation routing — equality / range / `$in` / compound bare-eq /
+compound prefix + trailing-operator all light up at IXSCAN when
+the query's `collation` matches an index's stored collation. But
+the sort path stayed on COLLSCAN + Python `sort_docs`: any query
+carrying a `collation` argument fell into a single branch that
+never tried sort acceleration, even when an index whose collation
+matched the query's would have given the requested order for free
+just by walking it.
+
+That branch is gone. The collation and non-collation paths through
+`find_matching` are now unified, and every sort-picker call
+(`_find_leading_field_index` for single-field sorts,
+`_compound_index_for_sort` for multi-field) threads
+`collation_obj` through with the same exact-match gate as the
+filter side. A `find().sort("name", 1).collation({strength: 2})`
+walks a `{name: 1}` strength-2 collation index forward; `-1` walks
+it backward; multi-field sorts that exactly match (or fully
+invert) a compound collation index's key spec walk it forward or
+backward respectively, and no Python sort runs in either case.
+The same gate keeps no-collation sorts off collation indexes
+(walking would give the wrong order) and vice versa.
+
+After this slice the collation domain is structurally complete:
+every CRUD pattern that hits an index without collation — filter
+lookup, range, `$in`, multi-field filter, sort, compound sort,
+unique enforcement — hits the index when a matching collation is
+in play, and falls back to COLLSCAN + `matches()` + `sort_docs`
+when no matching index exists.
+
+#### Changed
+
+- `find_matching`'s `elif collation_obj is not None: ...` branch
+  removed; the no-collation branch's sort logic now runs for both
+  cases, with `collation=collation_obj` (which is `None` when no
+  collation set) threaded through every picker call. Single-field
+  sort + filter on the sort field, single-field sort with empty
+  filter, and multi-field sort (compound key match) all
+  collation-gate.
+- `_compound_index_for_sort` takes an optional `collation` kwarg
+  and gates by exact match against each index's stored collation
+  (same rule as `_find_leading_field_index` and the compound
+  filter pickers). Multikey indexes are still excluded from
+  sort acceleration regardless of collation.
+- `explain_plan` mirrors the threading: `_find_leading_field_index`
+  and `_compound_index_for_sort` both receive `collation=collation_obj`,
+  so `explain` reports IXSCAN with the right direction for
+  collation-matching sort queries and COLLSCAN otherwise.
+- `docs/indexes.md` "Per-index collation" section grows a "sort
+  acceleration honours the same gate" subsection with worked
+  forward / backward / mismatch examples.
+- `tests/test_sort_with_collation.py` (8 new tests): single-field
+  ASC + DESC sort with matching collation walks index forward /
+  backward; no-collation sort against collation index → COLLSCAN;
+  strength-2 index + strength-3 query → COLLSCAN; filter on sort
+  field with matching collation hits index in order; multi-field
+  sort that matches a compound collation index walks forward; the
+  full-inverse sort walks backward; multi-field mismatch falls
+  back to Python sort.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge

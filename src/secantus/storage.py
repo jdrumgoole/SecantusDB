@@ -2233,24 +2233,17 @@ class Storage:
                 candidates, in_sort_order = self._candidates_from_hint(
                     db, coll, resolved, sort_field, sort_dir
                 )
-            elif collation_obj is not None:
-                # Per-index collation: try the index path first — the
-                # gate matches only indexes whose stored ``collation``
-                # option equals ``collation_obj``. Entries on such
-                # indexes are byte-encoded using the same collation,
-                # so a case-insensitive equality like
-                # ``{x: "PING"}`` against an index with
-                # ``collation: {strength: 2}`` hits the same row a
-                # doc inserted with ``x: "ping"`` produced. When no
-                # matching index exists the picker returns None and
-                # we fall back to COLLSCAN — ``matches()`` then does
-                # the comparison with the collation in hand. Mirrors
-                # mongod's per-index collation rule.
-                candidates = self._try_index_lookup(db, coll, filter, collation=collation_obj)
-                if candidates is None:
-                    raw_blobs = [b for _, b in self._scan_docs(db, coll)]
             else:
-                candidates = self._try_index_lookup(db, coll, filter)
+                # Per-index collation: ``_try_index_lookup`` gates indexes
+                # by exact match against ``collation_obj`` (None counts as
+                # "no collation"), so the same code path covers both the
+                # plain and the collation-bearing cases. Same applies to
+                # the sort-acceleration pickers below — they all thread
+                # ``collation_obj`` through so a sort on a collation-
+                # indexed string field walks the index when the query's
+                # collation matches and falls back to a Python sort
+                # otherwise.
+                candidates = self._try_index_lookup(db, coll, filter, collation=collation_obj)
                 if candidates is not None and sort_field is not None:
                     if (
                         len(filter) == 1
@@ -2258,12 +2251,16 @@ class Storage:
                         and next(iter(filter)) == sort_field
                     ):
                         in_sort_order = True
-                        idx = self._find_leading_field_index(db, coll, sort_field, filter)
+                        idx = self._find_leading_field_index(
+                            db, coll, sort_field, filter, collation=collation_obj
+                        )
                         idx_dir = idx[1] if idx else 1
                         if sort_dir != idx_dir:
                             candidates = list(reversed(candidates))
                 elif candidates is None and not filter and sort_field is not None:
-                    idx = self._find_leading_field_index(db, coll, sort_field, filter)
+                    idx = self._find_leading_field_index(
+                        db, coll, sort_field, filter, collation=collation_obj
+                    )
                     if idx is not None:
                         idx_name, idx_dir, _is_compound = idx
                         # If the index direction matches the sort direction,
@@ -2279,7 +2276,9 @@ class Storage:
                 if candidates is None and not filter and sort_field is None and sort:
                     multi_spec = self._multi_sort_spec(sort)
                     if multi_spec is not None and len(multi_spec) > 1:
-                        match = self._compound_index_for_sort(db, coll, multi_spec)
+                        match = self._compound_index_for_sort(
+                            db, coll, multi_spec, collation=collation_obj
+                        )
                         if match is not None:
                             idx_name, reverse = match
                             candidates = self._walk_index_in_order(
@@ -2414,7 +2413,12 @@ class Storage:
         return out
 
     def _compound_index_for_sort(
-        self, db: str, coll: str, sort_fields: list[tuple[str, int]]
+        self,
+        db: str,
+        coll: str,
+        sort_fields: list[tuple[str, int]],
+        *,
+        collation: Any = None,
     ) -> tuple[str, bool] | None:
         """Find a compound index that satisfies ``sort_fields`` end-to-end.
 
@@ -2433,8 +2437,17 @@ class Storage:
         fields, index has 2) aren't accelerated; the savings on the
         leading prefix are usually less than the cost of the trailing
         Python sort over the materialised set.
+
+        ``collation``: same exact-match gate as the filter pickers — an
+        index is only considered if its stored collation parses to the
+        same :class:`Collation` as the query's (or both None). A
+        no-collation sort against a collation-having index would walk
+        the index in collation order rather than codepoint order, which
+        is wrong for the user; the reverse is also wrong. So mismatched
+        indexes are skipped and the caller falls back to a Python sort.
         """
         multikey = self._multikey_index_names(db, coll)
+        index_options = self._index_options_map(db, coll)
         target = list(sort_fields)
         inverted = [(f, -d) for f, d in target]
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
@@ -2445,6 +2458,9 @@ class Storage:
             except (TypeError, ValueError):
                 continue
             if any(d not in (-1, 1) for _, d in idx_pairs):
+                continue
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
                 continue
             if idx_pairs == target:
                 return name, False
@@ -2541,7 +2557,9 @@ class Storage:
                 name, key_spec = picked
                 return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
             if not filter and sort_field is not None:
-                idx = self._find_leading_field_index(db, coll, sort_field, filter)
+                idx = self._find_leading_field_index(
+                    db, coll, sort_field, filter, collation=collation_obj
+                )
                 if idx is not None:
                     name, _idx_dir, _is_compound = idx
                     key_spec = self._key_spec_for(db, coll, name)
@@ -2553,7 +2571,9 @@ class Storage:
             if not filter and sort_field is None and sort:
                 multi_spec = self._multi_sort_spec(sort)
                 if multi_spec is not None and len(multi_spec) > 1:
-                    match = self._compound_index_for_sort(db, coll, multi_spec)
+                    match = self._compound_index_for_sort(
+                        db, coll, multi_spec, collation=collation_obj
+                    )
                     if match is not None:
                         name, reverse = match
                         key_spec = self._key_spec_for(db, coll, name)
