@@ -285,6 +285,28 @@ compound indexes with a collation enforce uniqueness under the
 collation (two compound keys that compare-equal under the
 collation collide on the second insert).
 
+Sort acceleration honours the same gate. A sort on a string field
+whose only matching index has a stored `collation` walks the index
+in order when the query carries a matching `collation`, and falls
+back to a Python sort otherwise (the index's byte order is
+collation-normalised, so walking it for a codepoint-sort query
+would give the wrong order). Both single-field sorts and
+multi-field sorts that exactly match (or fully invert) a compound
+collation index's key spec are accelerated:
+
+```python
+coll.create_index("name", collation={"locale": "en", "strength": 2})
+
+# Walks the index forward — explain reports IXSCAN, direction=forward.
+list(coll.find().sort("name", 1).collation({"locale": "en", "strength": 2}))
+
+# Walks the same index backward — direction=backward.
+list(coll.find().sort("name", -1).collation({"locale": "en", "strength": 2}))
+
+# Sort without a matching collation falls back to Python sort.
+list(coll.find().sort("name", 1))   # COLLSCAN
+```
+
 ## What's still missing
 
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
