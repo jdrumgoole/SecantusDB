@@ -1056,6 +1056,87 @@ class Storage:
             rows = [apply_projection(r, projection) for r in rows]
         return rows
 
+    def _is_system_users(self, db: str, coll: str) -> bool:
+        """``admin.system.users`` is the synthetic view onto the user
+        store. Mongod surfaces user records there regardless of which
+        database the user was created against — the per-user ``db``
+        field of each record names the authentication database. Other
+        databases' ``system.users`` namespace exists but is empty (also
+        matches mongod)."""
+        return db == "admin" and coll == "system.users"
+
+    def _scan_user_records(self) -> list[dict[str, Any]]:
+        """Walk every persisted user record across all databases and
+        return the decoded docs. Uses a private short-lived session for
+        the same cross-thread visibility reason as
+        :meth:`_scan_oplog_entries`."""
+        rows: list[dict[str, Any]] = []
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_USERS_TABLE, None)
+                try:
+                    rc = c.next()
+                    while rc == 0:
+                        blob = bytes(c.get_value())
+                        if blob:
+                            rows.append(bson.decode(blob))
+                        rc = c.next()
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+        return rows
+
+    def _find_system_users(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        skip: int,
+        limit: int,
+        sort: Mapping[str, Any] | None,
+        projection: Mapping[str, Any] | None,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]]:
+        """Read path for ``admin.system.users``. The user records
+        themselves already carry the mongod-shaped fields (``_id`` =
+        ``<db>.<user>``, ``user``, ``db``, ``credentials``, ``roles``,
+        ``mechanisms``), so the view is the row set unchanged plus the
+        usual filter / sort / skip / limit / projection pipeline."""
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._scan_user_records()
+        if filter:
+            rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
+        if sort:
+            rows = sort_docs(rows, sort)
+        if skip:
+            rows = rows[skip:]
+        if limit > 0:
+            rows = rows[:limit]
+        if projection:
+            rows = [apply_projection(r, projection) for r in rows]
+        return rows
+
+    def _count_system_users(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._scan_user_records()
+        if not filter:
+            return len(rows)
+        return sum(1 for r in rows if matches(r, filter, vars=let, collation=collation_obj))
+
     def _count_oplog_rs(
         self,
         filter: dict[str, Any] | None,
@@ -2210,6 +2291,16 @@ class Storage:
                 let=let,
                 collation=collation,
             )
+        if self._is_system_users(db, coll):
+            return self._find_system_users(
+                filter,
+                skip=skip,
+                limit=limit,
+                sort=sort,
+                projection=projection,
+                let=let,
+                collation=collation,
+            )
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -2693,6 +2784,8 @@ class Storage:
     ) -> int:
         if self._is_oplog_rs(db, coll):
             return self._count_oplog_rs(filter, let=let, collation=collation)
+        if self._is_system_users(db, coll):
+            return self._count_system_users(filter, let=let, collation=collation)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
