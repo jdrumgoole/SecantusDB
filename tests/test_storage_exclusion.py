@@ -40,11 +40,13 @@ def test_second_storage_open_on_same_path_fails(tmp_path) -> None:
         # Second open on the same path must fail.
         with pytest.raises(Exception) as exc_info:
             Storage(path=path)
-        # The exception message contains "busy" — WT's diagnostic from
-        # ``__conn_single``. We match on the substring rather than the
-        # exact type so the test survives a binding-level refactor of
-        # how the WT error class is surfaced.
-        assert "busy" in str(exc_info.value).lower()
+        # WT's ``__conn_single`` raises a platform-translated ``WT_ERROR``;
+        # the visible message differs per OS — macOS / Linux say
+        # ``"Resource busy"``, Windows says ``"Resource device"`` — both
+        # surface the same underlying second-open rejection. Match on
+        # ``"resource"`` (common to every platform's translation) rather
+        # than picking one side and breaking the matrix.
+        assert "resource" in str(exc_info.value).lower()
 
         # The first instance is unaffected — still readable and writable.
         s1.insert("db", "coll", [{"_id": 2, "v": 20}])
