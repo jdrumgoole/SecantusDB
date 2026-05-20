@@ -305,10 +305,12 @@ def test_partition_sort_changes_running_total_order(client) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unsupported_rank_function_raises(client) -> None:
-    """Rank functions are deferred — raise so the gap is visible."""
-    coll = client["swf_db"]["rank"]
-    coll.insert_one({"_id": 1, "v": 1})
+def test_unsupported_time_series_function_raises(client) -> None:
+    """Time-series functions are still deferred — raise so the gap is
+    visible. (Rank functions shipped separately — see
+    ``tests/test_window_rank_functions.py`` for their semantics.)"""
+    coll = client["swf_db"]["timeseries"]
+    coll.insert_one({"_id": 1, "v": 1, "ts": 1})
 
     with pytest.raises(OperationFailure):
         list(
@@ -316,8 +318,8 @@ def test_unsupported_rank_function_raises(client) -> None:
                 [
                     {
                         "$setWindowFields": {
-                            "sortBy": {"v": 1},
-                            "output": {"rk": {"$rank": {}}},
+                            "sortBy": {"ts": 1},
+                            "output": {"d": {"$derivative": {"input": "$v"}}},
                         }
                     }
                 ]
