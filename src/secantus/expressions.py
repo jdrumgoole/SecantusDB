@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from bson import Decimal128
+from bson import Decimal128, Int64
 
 from secantus.paths import get_path
 
@@ -1314,16 +1314,23 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, (int, float)):
             return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.timezone.utc)
     elif code in (16, 18):
+        # 16 = int32, 18 = int64. Wrap as ``Int64`` for code 18 so the
+        # result matches ``$type: "long"`` downstream — the bson decoder
+        # preserves the int32/int64 distinction by type, and ``$convert``
+        # must respect the requested target type.
+        def _wrap(n: int) -> int:
+            return Int64(n) if code == 18 else int(n)
+
         if isinstance(value, bool):
-            return 1 if value else 0
+            return _wrap(1 if value else 0)
         if isinstance(value, int):
-            return value
+            return _wrap(int(value))
         if isinstance(value, float):
-            return int(value)
+            return _wrap(int(value))
         if isinstance(value, Decimal128):
-            return int(value.to_decimal())
+            return _wrap(int(value.to_decimal()))
         if isinstance(value, str):
-            return _safe_int_from_str(value, "$convert (int/long)")
+            return _wrap(_safe_int_from_str(value, "$convert (int/long)"))
     elif code == 19:
         if isinstance(value, Decimal128):
             return value
