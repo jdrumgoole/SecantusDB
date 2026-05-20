@@ -19,6 +19,8 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.2b5] — 2026-05-21
+
 ### `$setWindowFields` rank functions — `$rank` / `$denseRank` / `$documentNumber`
 
 Closes one of the explicit deferred surfaces from the b35
