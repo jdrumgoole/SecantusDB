@@ -1592,6 +1592,157 @@ def _stage_documents(
     return out
 
 
+def _stage_set_window_fields(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$setWindowFields`` — partition + sort + per-row windowed accumulators.
+
+    Spec shape::
+
+        {
+            partitionBy: <expression>,      # optional; missing = single partition
+            sortBy: <sort spec>,            # optional; missing = input order
+            output: {
+                <field>: {
+                    <$accumulator>: <expr>,
+                    window: {documents: [<lower>, <upper>]},  # optional
+                }
+            },
+        }
+
+    For each output field, the accumulator runs over the rows inside
+    that row's window (within the row's partition, in the partition's
+    sorted order). Window bounds are integer offsets relative to the
+    current row, or the strings ``"current"`` / ``"unbounded"``.
+    Missing ``window`` defaults to the whole partition. Original input
+    order is preserved in the result — the partition / sort dance
+    happens only to compute the new fields.
+
+    First-cut subset (matches the common driver-test surface): the
+    nine ``$group`` accumulators (``$sum`` / ``$avg`` / ``$min`` /
+    ``$max`` / ``$first`` / ``$last`` / ``$push`` / ``$addToSet`` /
+    ``$count``) plus the position-based ``documents`` window form.
+    Range-based windows (``window: {range: [...]}``, optionally with
+    ``unit``), the time-series functions (``$derivative`` /
+    ``$integral`` / ``$linearFill`` / ``$locf`` / ``$shift`` /
+    ``$expMovingAvg``), and the rank functions (``$rank`` /
+    ``$denseRank`` / ``$documentNumber``) raise ``AggregateError``
+    so the gap is visible rather than silently wrong.
+    """
+    from secantus.storage import sort_docs as _sort_docs
+
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$setWindowFields requires a doc spec")
+    partition_by = spec.get("partitionBy")
+    sort_by = spec.get("sortBy")
+    output = spec.get("output")
+    if not isinstance(output, Mapping) or not output:
+        raise AggregateError("$setWindowFields requires a non-empty output doc")
+
+    compiled: list[tuple[str, str, Any, Mapping[str, Any] | None]] = []
+    for field, field_spec in output.items():
+        if not isinstance(field_spec, Mapping):
+            raise AggregateError(f"$setWindowFields output[{field!r}] must be a doc")
+        op_keys = [k for k in field_spec if k.startswith("$")]
+        if len(op_keys) != 1:
+            raise AggregateError(
+                f"$setWindowFields output[{field!r}] requires exactly one accumulator"
+            )
+        op = op_keys[0]
+        arg = field_spec[op]
+        window = field_spec.get("window")
+        if window is not None and not isinstance(window, Mapping):
+            raise AggregateError(f"$setWindowFields output[{field!r}].window must be a doc")
+        if op not in _ACC_DISPATCH:
+            raise AggregateError(
+                f"$setWindowFields: unsupported function {op!r} "
+                "(rank functions and time-series operators are not yet implemented)"
+            )
+        compiled.append((field, op, arg, window))
+
+    docs_list = list(docs)
+    partitions: dict[Any, list[tuple[int, dict[str, Any]]]] = {}
+    partition_order: list[Any] = []
+    for i, doc in enumerate(docs_list):
+        key = None if partition_by is None else evaluate(partition_by, doc, ctx.vars)
+        hkey = _hashable(key)
+        if hkey not in partitions:
+            partitions[hkey] = []
+            partition_order.append(hkey)
+        partitions[hkey].append((i, doc))
+
+    out_docs: list[dict[str, Any]] = [dict(d) for d in docs_list]
+
+    for pkey in partition_order:
+        members = partitions[pkey]
+        if sort_by:
+            sorted_docs = _sort_docs([doc for _, doc in members], sort_by)
+            idx_lookup = {id(doc): orig_i for orig_i, doc in members}
+            members = [(idx_lookup[id(doc)], doc) for doc in sorted_docs]
+        partition_docs = [doc for _, doc in members]
+        n = len(partition_docs)
+        for slot, (orig_i, _) in enumerate(members):
+            target = out_docs[orig_i]
+            for field, op, arg, window in compiled:
+                low, high = _window_bounds(slot, n, window)
+                if high < low:
+                    target[field] = _empty_window_value(op)
+                    continue
+                window_docs = partition_docs[low : high + 1]
+                bucket: dict[str, Any] = {}
+                handler = _ACC_DISPATCH[op]
+                for wdoc in window_docs:
+                    handler(bucket, field, arg, wdoc, ctx.vars)
+                _finalize(bucket)
+                target[field] = bucket.get(field, _empty_window_value(op))
+    return out_docs
+
+
+def _window_bounds(slot: int, n: int, window: Mapping[str, Any] | None) -> tuple[int, int]:
+    """Resolve a window spec for a given row position.
+
+    Returns inclusive ``(lower, upper)`` indices into the partition.
+    ``window=None`` or missing ``documents`` → the whole partition
+    (matches mongod's default window).
+    """
+    if window is None or "documents" not in window:
+        if window is not None and "range" in window:
+            raise AggregateError("$setWindowFields range-based windows are not yet implemented")
+        return 0, n - 1
+    bounds = window["documents"]
+    if not isinstance(bounds, list) or len(bounds) != 2:
+        raise AggregateError("$setWindowFields window.documents must be a [lower, upper] pair")
+
+    def resolve(b: Any, is_lower: bool) -> int:
+        if b == "unbounded":
+            return 0 if is_lower else n - 1
+        if b == "current":
+            return slot
+        if isinstance(b, bool) or not isinstance(b, int):
+            raise AggregateError(
+                f"$setWindowFields window.documents bound {b!r} must be an int "
+                "or 'unbounded' / 'current'"
+            )
+        return slot + b
+
+    low = max(0, resolve(bounds[0], is_lower=True))
+    high = min(n - 1, resolve(bounds[1], is_lower=False))
+    return low, high
+
+
+def _empty_window_value(op: str) -> Any:
+    """The value to use when the window is empty for this row.
+
+    Matches mongod: ``$sum`` / ``$count`` → 0, ``$push`` /
+    ``$addToSet`` → [], everything else → null.
+    """
+    if op in ("$sum", "$count"):
+        return 0
+    if op in ("$push", "$addToSet"):
+        return []
+    return None
+
+
 def _stage_redact(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1868,4 +2019,5 @@ _STAGES = {
     "$geoNear": _stage_geo_near,
     "$unionWith": _stage_union_with,
     "$redact": _stage_redact,
+    "$setWindowFields": _stage_set_window_fields,
 }
