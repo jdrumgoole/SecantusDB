@@ -525,6 +525,30 @@ via the same `_reject_oplog_rs_write` helper that gates
   returns empty; other-db `system.version` is empty; write
   rejection on insert / update / delete / drop with code 13.
 
+### `renameCollection` cross-process safety — pinned by `WiredTiger.lock`
+
+A backlog item ("renameCollection: atomic per the storage RLock,
+but no protection against concurrent writers across worktrees")
+turns out to be structurally addressed by WiredTiger itself.
+`wiredtiger_open` takes an exclusive lock on the data directory at
+open time; a second open on the same path fails with
+``WT_ERROR Resource busy`` before any state is touched, so the
+"concurrent writers across processes" scenario can't exist in the
+first place.
+
+Within-process atomicity is the storage `RLock`. Cross-process
+exclusion is `WiredTiger.lock`. The two layers compose: rename is
+safe under both. The backlog entry is struck through.
+
+#### Added
+
+- `tests/test_storage_exclusion.py` (2 new tests) pinning the
+  guarantee: a second `Storage(path=...)` on the same on-disk
+  directory raises a `WiredTigerError` whose message contains
+  `"busy"`; the first instance keeps working unaffected.
+  `rename_collection` survives a close + reopen round-trip — the
+  renamed namespace is visible to a fresh `Storage` instance.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
