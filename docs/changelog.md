@@ -120,6 +120,38 @@ that mechanism entirely.
   the empirical resolution path. The previous theory turned out
   to be wrong about the mechanism — narrow rejection works.
 
+### Pymongo gauge: +80 passing tests from five newly-includable files
+
+Cross-gauge audit of currently-excluded test files against the work
+shipped in this development cycle (0.5.2b1 + the rank-functions
+and apiStrict slices above) identified five pymongo test files
+that pass cleanly now and had been excluded purely because the
+supporting features hadn't shipped. Adding them to
+`pymongo_validation/include_paths.py` bumps the gauge from **959 →
+1039 passing** with zero new failures, +25 new skips (genuine
+feature gaps the suite self-skips on), overall pass rate stays at
+100%.
+
+* `test_collation.py` (16 new tests) — unlocked by per-index
+  collation work (single-field, compound, sort acceleration).
+* `test_versioned_api.py` (4 tests) + `test_versioned_api_integration.py`
+  (36 tests) — unlocked by the apiStrict aggregation-stage gate
+  and the new `distinct` command-name gate.
+* `test_command_logging.py` (20 tests) + `test_logger.py` (4 tests)
+  — command monitoring / logging format conformance; no
+  SecantusDB-specific blocker.
+
+The audit also confirmed no flip-worthy candidates in the go /
+node / java / ruby gauges — every remaining exclusion in those
+gauges is a feature genuinely out of scope (replica sets,
+transactions, encryption, text indexes, GridFS, time-series,
+etc.).
+
+#### Changed
+
+- `pymongo_validation/include_paths.py` — five test files added
+  to `INCLUDE`. Inline comments name the slice that unlocked each.
+
 ## [0.5.2b1] — 2026-05-20
 
 ### MONGODB-X509 auth — cert subject DN as the username
