@@ -549,6 +549,80 @@ safe under both. The backlog entry is struck through.
   `rename_collection` survives a close + reopen round-trip — the
   renamed namespace is visible to a fresh `Storage` instance.
 
+### `$setWindowFields` aggregation stage — minimum viable subset
+
+The largest v1 stable-API stage that wasn't yet wired up.
+`$setWindowFields` is mongod's windowed-analytics surface — running
+totals, rolling averages, per-partition rankings — all expressed
+as a partition + sort + per-row windowed accumulator over the
+input. Driver test suites probe it heavily.
+
+Spec shape::
+
+    {
+        partitionBy: <expression>,         # optional; default = single partition
+        sortBy: <sort spec>,               # optional; default = input order
+        output: {
+            <field>: {
+                <$accumulator>: <expr>,
+                window: {documents: [<lower>, <upper>]},  # optional
+            },
+        },
+    }
+
+For each output field, the accumulator runs over the rows inside
+that row's window — within the row's partition, in the partition's
+sorted order. Original input order is preserved in the result; the
+partition / sort dance is purely internal to compute the new
+fields.
+
+#### Shipped (first-cut subset)
+
+* The nine `$group` accumulators: `$sum`, `$avg`, `$min`, `$max`,
+  `$first`, `$last`, `$push`, `$addToSet`, `$count`. The dispatch
+  reuses `_ACC_DISPATCH` from `$group` — same per-doc accumulator
+  semantics, just applied over a per-row windowed subset.
+* Position-based windows via `window: {documents: [<lower>, <upper>]}`.
+  Bound forms: integer offsets relative to the current row,
+  `"current"` (= 0), and `"unbounded"` (partition edge).
+* Default window (omit `window`) covers the whole partition.
+  `[unbounded, current]` gives running-total semantics;
+  `[-1, 1]` gives a 3-doc rolling window; etc.
+* Empty-window output values: 0 for `$sum`/`$count`, [] for
+  `$push`/`$addToSet`, null for the rest (matches mongod).
+
+#### Deferred (raise `AggregateError` with a clear message)
+
+* Range-based windows (`window: {range: [...]}`, optionally with
+  `unit:` for date ranges). Needs value-based bounds + date
+  arithmetic; out of scope for the first cut.
+* Time-series functions: `$derivative`, `$integral`, `$linearFill`,
+  `$locf`, `$shift`, `$expMovingAvg`. Each is its own slice and
+  not in the common driver-test surface.
+* Rank functions: `$rank`, `$denseRank`, `$documentNumber`. These
+  need sort-key equality detection (tied rows get the same rank).
+  Worth a dedicated slice when a workload needs them.
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_stage_set_window_fields` handler
+  + helpers `_window_bounds` (resolves
+  `documents: [<lower>, <upper>]` to inclusive partition indices,
+  with clamping to partition edges) and `_empty_window_value`
+  (mongod-matching defaults). Wired into `_STAGES`. Reuses
+  `_ACC_DISPATCH` + `_finalize` from `$group` so the accumulator
+  semantics stay aligned across the two stages.
+- `tests/test_set_window_fields.py` (15 new tests): no-partition
+  totals; partitionBy splits totals correctly; rolling 3-doc sum
+  with edge clamping; `[unbounded, current]` running total;
+  `[unbounded, unbounded]` per-partition total; `$avg` / `$min` /
+  `$max` / `$first` / `$last` over `[-1, 1]`; `$count` over
+  `[-1, 1]`; `$push` / `$addToSet` accumulating across rows;
+  sortBy controls running-total order independently of input
+  order; original input order preserved on output; rank function
+  raises; range window raises; missing output rejected; multiple
+  accumulators in one output rejected; empty input → empty out.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
