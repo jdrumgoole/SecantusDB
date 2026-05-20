@@ -19,6 +19,65 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$setWindowFields` rank functions — `$rank` / `$denseRank` / `$documentNumber`
+
+Closes one of the explicit deferred surfaces from the b35
+`$setWindowFields` minimum-viable subset. Driver test suites probe
+all three regularly; the previous wire-level response was an
+explicit "rank functions and time-series operators are not yet
+implemented" `AggregateError`.
+
+The three functions share one linear walk per partition. They sit
+in `output: {<field>: {$rank: {}}}` alongside the accumulator
+functions but evaluate differently — no window argument (mongod
+rejects it), no function argument (the spec is just `{$rank: {}}`),
+and the value is computed once per partition slot rather than
+rolled up over a windowed subset.
+
+* `$documentNumber` — 1-indexed position within the partition.
+  Independent of ties; happy with or without `sortBy`.
+* `$rank` — 1-indexed position with **gaps** after ties: tied rows
+  share the lower rank, next non-tied row jumps by the number of
+  ties (`[10, 20, 20, 30]` → `[1, 2, 2, 4]`). Requires `sortBy`.
+* `$denseRank` — 1-indexed position **without gaps**: tied rows
+  share, next row is +1 (`[10, 20, 20, 30]` → `[1, 2, 2, 3]`).
+  Requires `sortBy`.
+
+Tie detection is sort-key tuple equality: compound `sortBy` specs
+work uniformly. Rank counters reset at every partition boundary,
+same as the accumulator functions.
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_RANK_FUNCS` frozenset; the
+  validation branch in `_stage_set_window_fields` recognises the
+  three rank ops, rejects `window` / non-empty arg, and requires
+  `sortBy` for `$rank` / `$denseRank`. The per-row loop branches:
+  rank functions look up a precomputed array, accumulators take
+  the existing windowed path.
+- `_compute_rank_state` helper does one linear walk over each
+  partition's sort-key tuples and emits per-slot vectors for
+  whichever of the three functions are referenced. `_sort_key_values`
+  extracts the tuple the tie comparison runs on.
+- `tests/test_window_rank_functions.py` (13 new tests) — covers
+  `$documentNumber` with and without sort, per-partition reset,
+  `$rank` gaps with ties, `$rank == $documentNumber` without ties,
+  compound sort tie detection, `$denseRank` no-gap semantics, all
+  three together in one stage, partition-resets, plus four
+  validation tests (window rejected, sortBy required for `$rank` /
+  `$denseRank`, non-empty arg rejected).
+
+#### Changed
+
+- `_stage_set_window_fields` docstring rewritten to document the
+  rank-function surface.
+- `tests/test_set_window_fields.py`: the b35 placeholder test
+  `test_unsupported_rank_function_raises` is replaced by
+  `test_unsupported_time_series_function_raises`, which now probes
+  with `$derivative` to keep the deferred-surface guard alive.
+
+## [0.5.2b1] — 2026-05-20
+
 ### MONGODB-X509 auth — cert subject DN as the username
 
 The natural sequel to the b22 mTLS slice. mTLS gives you a

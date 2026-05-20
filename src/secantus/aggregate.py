@@ -1592,6 +1592,9 @@ def _stage_documents(
     return out
 
 
+_RANK_FUNCS = frozenset({"$rank", "$denseRank", "$documentNumber"})
+
+
 def _stage_set_window_fields(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1600,8 +1603,8 @@ def _stage_set_window_fields(
     Spec shape::
 
         {
-            partitionBy: <expression>,      # optional; missing = single partition
-            sortBy: <sort spec>,            # optional; missing = input order
+            partitionBy: <expression>,  # optional; missing = single partition
+            sortBy: <sort spec>,        # optional for accumulators; required for $rank/$denseRank
             output: {
                 <field>: {
                     <$accumulator>: <expr>,
@@ -1610,7 +1613,7 @@ def _stage_set_window_fields(
             },
         }
 
-    For each output field, the accumulator runs over the rows inside
+    For accumulator output fields, the op runs over the rows inside
     that row's window (within the row's partition, in the partition's
     sorted order). Window bounds are integer offsets relative to the
     current row, or the strings ``"current"`` / ``"unbounded"``.
@@ -1618,16 +1621,22 @@ def _stage_set_window_fields(
     order is preserved in the result — the partition / sort dance
     happens only to compute the new fields.
 
-    First-cut subset (matches the common driver-test surface): the
-    nine ``$group`` accumulators (``$sum`` / ``$avg`` / ``$min`` /
-    ``$max`` / ``$first`` / ``$last`` / ``$push`` / ``$addToSet`` /
-    ``$count``) plus the position-based ``documents`` window form.
+    Supported output functions:
+
+    * The nine ``$group`` accumulators (``$sum`` / ``$avg`` / ``$min``
+      / ``$max`` / ``$first`` / ``$last`` / ``$push`` / ``$addToSet``
+      / ``$count``) over the position-based ``documents`` window.
+    * The three rank functions (``$rank`` / ``$denseRank`` /
+      ``$documentNumber``), evaluated per-row across the whole sorted
+      partition. They take an empty ``{}`` arg and reject ``window``
+      (mongod's rule); ``$rank`` and ``$denseRank`` require
+      ``sortBy``.
+
     Range-based windows (``window: {range: [...]}``, optionally with
-    ``unit``), the time-series functions (``$derivative`` /
+    ``unit``) and the time-series functions (``$derivative`` /
     ``$integral`` / ``$linearFill`` / ``$locf`` / ``$shift`` /
-    ``$expMovingAvg``), and the rank functions (``$rank`` /
-    ``$denseRank`` / ``$documentNumber``) raise ``AggregateError``
-    so the gap is visible rather than silently wrong.
+    ``$expMovingAvg``) raise ``AggregateError`` so the gap is visible
+    rather than silently wrong.
     """
     from secantus.storage import sort_docs as _sort_docs
 
@@ -1653,10 +1662,21 @@ def _stage_set_window_fields(
         window = field_spec.get("window")
         if window is not None and not isinstance(window, Mapping):
             raise AggregateError(f"$setWindowFields output[{field!r}].window must be a doc")
+        if op in _RANK_FUNCS:
+            # Rank functions take no arg and don't accept a window. Mongod
+            # surfaces both violations as parse errors; mirror.
+            if arg not in ({}, None):
+                raise AggregateError(f"$setWindowFields {op} takes no argument (got {arg!r})")
+            if window is not None:
+                raise AggregateError(f"$setWindowFields {op} does not accept a window")
+            if op in ("$rank", "$denseRank") and not sort_by:
+                raise AggregateError(f"$setWindowFields {op} requires sortBy")
+            compiled.append((field, op, arg, window))
+            continue
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
-                "(rank functions and time-series operators are not yet implemented)"
+                "(time-series operators are not yet implemented)"
             )
         compiled.append((field, op, arg, window))
 
@@ -1681,9 +1701,15 @@ def _stage_set_window_fields(
             members = [(idx_lookup[id(doc)], doc) for doc in sorted_docs]
         partition_docs = [doc for _, doc in members]
         n = len(partition_docs)
+        # Precompute per-partition rank vectors only when a rank function
+        # is referenced. One linear walk covers all three.
+        rank_state = _compute_rank_state(partition_docs, sort_by, compiled)
         for slot, (orig_i, _) in enumerate(members):
             target = out_docs[orig_i]
             for field, op, arg, window in compiled:
+                if op in _RANK_FUNCS:
+                    target[field] = rank_state[op][slot]
+                    continue
                 low, high = _window_bounds(slot, n, window)
                 if high < low:
                     target[field] = _empty_window_value(op)
@@ -1696,6 +1722,68 @@ def _stage_set_window_fields(
                 _finalize(bucket)
                 target[field] = bucket.get(field, _empty_window_value(op))
     return out_docs
+
+
+def _compute_rank_state(
+    partition_docs: list[dict[str, Any]],
+    sort_by: Mapping[str, Any] | None,
+    compiled: list[tuple[str, str, Any, Mapping[str, Any] | None]],
+) -> dict[str, list[int]]:
+    """Per-partition rank vectors for whichever rank functions appear
+    in ``compiled``. Returns ``{op: [per-slot value]}``; empty dict
+    when no rank function is referenced.
+
+    All three computations share one linear walk:
+
+    * ``$documentNumber`` — 1-indexed slot position. Independent of
+      ties; ignores sortBy comparisons.
+    * ``$rank`` — 1-indexed position with **gaps** after ties: tied
+      rows share the lower rank; the next non-tied row jumps by the
+      number of ties (``[10, 20, 20, 30]`` → ``[1, 2, 2, 4]``).
+    * ``$denseRank`` — 1-indexed position **without gaps**: tied rows
+      share, next row is +1 (``[10, 20, 20, 30]`` → ``[1, 2, 2, 3]``).
+
+    Ties are detected by sort-key tuple equality. Without ``sortBy``
+    only ``$documentNumber`` is allowed (validated at the compile
+    step), so the no-sort branch never needs key comparisons.
+    """
+    needed = {op for _f, op, _a, _w in compiled if op in _RANK_FUNCS}
+    if not needed:
+        return {}
+    n = len(partition_docs)
+    state: dict[str, list[int]] = {op: [0] * n for op in needed}
+    if n == 0:
+        return state
+    keys = [_sort_key_values(doc, sort_by) for doc in partition_docs] if sort_by else [None] * n
+
+    rank = 1
+    dense = 1
+    if "$documentNumber" in needed:
+        state["$documentNumber"][0] = 1
+    if "$rank" in needed:
+        state["$rank"][0] = 1
+    if "$denseRank" in needed:
+        state["$denseRank"][0] = 1
+    for i in range(1, n):
+        if "$documentNumber" in needed:
+            state["$documentNumber"][i] = i + 1
+        tied = sort_by is not None and keys[i] == keys[i - 1]
+        if not tied:
+            rank = i + 1
+            dense += 1
+        if "$rank" in needed:
+            state["$rank"][i] = rank
+        if "$denseRank" in needed:
+            state["$denseRank"][i] = dense
+    return state
+
+
+def _sort_key_values(doc: Mapping[str, Any], sort_by: Mapping[str, Any]) -> tuple:
+    """Tuple of raw sort-by field values, in spec order. Used for
+    tie detection in rank computation — equal tuples → tied rows."""
+    from secantus.paths import get_path
+
+    return tuple(get_path(dict(doc), field, default=None) for field in sort_by)
 
 
 def _window_bounds(slot: int, n: int, window: Mapping[str, Any] | None) -> tuple[int, int]:
