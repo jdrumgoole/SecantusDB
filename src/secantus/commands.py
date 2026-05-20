@@ -221,15 +221,16 @@ def _wants_journal(doc: Mapping[str, Any]) -> bool:
 
 
 def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict[str, Any] | None:
-    """Refuse any write to the synthetic ``local.oplog.rs`` view.
+    """Refuse any write to a synthetic read-only view.
 
-    Returns a mongod-shaped error doc (caller short-circuits with it)
-    when the target is ``(local, oplog.rs)``. ``None`` otherwise. Mongod
-    refuses arbitrary writes to ``oplog.rs`` — only the internal
-    replication system writes there — and surfaces it as an
-    ``Unauthorized`` (code 13). SecantusDB's oplog is a read-only
-    synthetic view, so we mirror the rejection with the same code +
-    a clear errmsg so debuggers know what they hit.
+    Covers ``local.oplog.rs`` and ``admin.system.users`` — both are
+    read-only projections over dedicated WT tables that own their own
+    write paths (oplog emission via writes elsewhere; ``createUser`` /
+    ``updateUser`` / ``dropUser`` for users). Direct writes through
+    ``insert`` / ``update`` / ``delete`` would either land in the wrong
+    table or corrupt the view's invariants, so we reject with code 13
+    (Unauthorized) — the same code mongod returns when RBAC denies the
+    write — and a clear errmsg so debuggers know what they hit.
     """
     if ctx.db_name == "local" and coll == "oplog.rs":
         return {
@@ -237,6 +238,17 @@ def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict
             "errmsg": (
                 f"not authorized for {op_name} on local.oplog.rs "
                 "(synthetic read-only view of the SecantusDB oplog)"
+            ),
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    if ctx.db_name == "admin" and coll == "system.users":
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"not authorized for {op_name} on admin.system.users "
+                "(synthetic read-only view — use createUser / updateUser / "
+                "dropUser instead)"
             ),
             "code": 13,
             "codeName": "Unauthorized",

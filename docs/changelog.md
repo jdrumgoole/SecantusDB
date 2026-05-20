@@ -369,6 +369,65 @@ non-array `pipeline`) surface as `AggregateError` to the client.
   spec, missing `coll`, non-array `pipeline`).
 - `docs/aggregation.md` stages table grows a row.
 
+### `admin.system.users` is a synthetic read-only view onto the user store
+
+Credentials live in a dedicated WT table (`secantus_users`) that
+`createUser` / `updateUser` / `dropUser` / `usersInfo` own. But
+`find` / `aggregate` / `count` against `admin.system.users` —
+mongod's canonical user-storage namespace — searched the empty
+regular doc table and returned nothing. Tools and a few driver
+tests that introspect the user list via `db.system.users.find()`
+saw an empty collection on SecantusDB even after a `createUser`
+landed.
+
+This slice mirrors the oplog pattern (`local.oplog.rs` is a
+synthetic view onto `secantus_oplog`). `admin.system.users` is now
+read-only-surfaced: `find` / `aggregate` / `count` route through
+`_find_system_users` / `_count_system_users`, which scan the user
+table on a fresh WT session for cross-thread visibility and apply
+the standard filter / sort / skip / limit / projection /
+collation pipeline against the decoded records.
+
+The stored records already carry the mongod-shaped fields
+(`_id` = `<db>.<user>`, `user`, `db`, `credentials`, `roles`,
+`mechanisms`), so the view requires no schema synthesis. Users
+created against any database all surface under
+`admin.system.users` (matching mongod — every user record lives
+in `admin.system.users` regardless of its auth db, and the
+per-record `db` field names the auth database). Querying any
+other db's `system.users` returns empty rows (also mongod's
+behaviour).
+
+Writes are rejected with code 13 (`Unauthorized`) and a clear
+errmsg pointing users at `createUser` / `updateUser` / `dropUser`.
+The existing `_reject_oplog_rs_write` helper grew a clause for
+`admin.system.users` — it was already wired into every write
+command (`insert` / `update` / `delete` / `findAndModify` / `drop`
+/ `create` / `createIndexes`) so the rejection lands everywhere
+implicitly. Function name kept (`_reject_oplog_rs_write`) for
+churn reasons, with the docstring updated to cover both views.
+
+#### Added
+
+- `storage._is_system_users` / `_scan_user_records` /
+  `_find_system_users` / `_count_system_users` — the synthetic
+  view helpers, modelled directly on the oplog view's pattern.
+- `storage.find_matching` + `count_matching` route through the
+  new helpers when `(db, coll) == ("admin", "system.users")`.
+- `tests/test_system_users_view.py` (13 new tests): find /
+  count / projection / aggregate against the view; users created
+  across multiple databases all visible; filter on `db` field;
+  other-db `system.users` is empty; write rejection on insert /
+  update / delete / drop with code 13; `dropUser` /
+  `updateUser` mutations reflected in the view.
+
+#### Changed
+
+- `commands._reject_oplog_rs_write` grew a second case for
+  `admin.system.users`. Docstring rewritten to cover both views.
+  Existing call sites pick up the new behaviour with no further
+  edits.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
