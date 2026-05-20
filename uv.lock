@@ -1747,7 +1747,7 @@ wheels = [
 
 [[package]]
 name = "secantusdb"
-version = "0.5.1b28"
+version = "0.5.1b29"
 source = { editable = "." }
 dependencies = [
     { name = "pymongo" },
