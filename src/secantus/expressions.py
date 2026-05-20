@@ -67,6 +67,12 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
         # the field instead of writing it. ``_op_set_field`` checks for
         # this identity to drop the key.
         return _REMOVE_SENTINEL
+    elif base in ("KEEP", "PRUNE", "DESCEND"):
+        # ``$redact`` sentinels. The expression evaluator returns the
+        # ``"$$NAME"`` string literal so the stage handler can dispatch
+        # on equality. Real mongod's ``$redact`` docs show these as the
+        # only legal return values from the stage's expression.
+        value = f"$${base}"
     else:
         raise ExpressionError(f"system variable $${base} is not defined")
     if not rest:
