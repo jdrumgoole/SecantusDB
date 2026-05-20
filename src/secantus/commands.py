@@ -253,6 +253,16 @@ def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict
             "code": 13,
             "codeName": "Unauthorized",
         }
+    if ctx.db_name == "admin" and coll == "system.version":
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"not authorized for {op_name} on admin.system.version "
+                "(synthetic read-only view of the auth schema version)"
+            ),
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
     return None
 
 

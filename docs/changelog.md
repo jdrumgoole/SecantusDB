@@ -487,6 +487,44 @@ provides, so the typical pipeline shape works straight out:
   expression rejected; array-element KEEP preserves nested
   sub-docs unchanged.
 
+### `admin.system.version` returns the auth-schema doc
+
+The companion to the b31 `admin.system.users` view. Some
+user-management tools (and a handful of driver tests) read
+`admin.system.version.find({_id: "authSchema"})` on startup to gate
+which user-management features they offer; pre-slice that namespace
+was empty and tools either skipped features or assumed the lowest
+schema version.
+
+The view returns one hard-coded doc:
+
+```python
+{"_id": "authSchema", "currentVersion": 5}
+```
+
+`currentVersion: 5` is the SCRAM-SHA-256 baseline (MongoDB 4.0+),
+which is what SecantusDB actually implements — so the answer is
+honest, not just placating. Other databases' `system.version` still
+returns empty. Writes are rejected with code 13 (`Unauthorized`)
+via the same `_reject_oplog_rs_write` helper that gates
+`admin.system.users` and `local.oplog.rs`.
+
+#### Added
+
+- `storage._is_system_version` / `_system_version_docs` /
+  `_find_system_version` / `_count_system_version` — same pattern
+  as the b31 `admin.system.users` view; the doc set is fixed at
+  one entry rather than scanned from a table.
+- `storage.find_matching` + `count_matching` route through the
+  new helpers when `(db, coll) == ("admin", "system.version")`.
+- `commands._reject_oplog_rs_write` grew a third case for
+  `admin.system.version`; existing call sites pick up the
+  rejection with no further edits.
+- `tests/test_system_version_view.py` (10 new tests): find /
+  find_one / count / aggregate read paths; non-matching filter
+  returns empty; other-db `system.version` is empty; write
+  rejection on insert / update / delete / drop with code 13.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge

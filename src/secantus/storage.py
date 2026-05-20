@@ -1137,6 +1137,71 @@ class Storage:
             return len(rows)
         return sum(1 for r in rows if matches(r, filter, vars=let, collation=collation_obj))
 
+    def _is_system_version(self, db: str, coll: str) -> bool:
+        """``admin.system.version`` is the synthetic view that surfaces
+        the user-management auth-schema doc. Mongod stores other
+        cluster-state docs here too (e.g. the version-2-to-3 schema
+        upgrade snapshot from MongoDB 2.6 → 3.0), but in modern
+        deployments the only doc that tooling cares about is
+        ``{_id: "authSchema", currentVersion: 5}`` — the version SCRAM
+        introduced. Surfacing just that doc is what driver tools
+        actually check on startup before issuing user-management
+        commands."""
+        return db == "admin" and coll == "system.version"
+
+    def _system_version_docs(self) -> list[dict[str, Any]]:
+        """The fixed contents of ``admin.system.version``.
+
+        Mongod's ``authSchema`` currentVersion is ``5`` as of MongoDB
+        4.0 — the SCRAM-SHA-256 baseline. We advertise the same number
+        so tools that gate user-management on the schema version
+        proceed (we implement SCRAM-SHA-256 natively, so 5 is honest).
+        """
+        return [{"_id": "authSchema", "currentVersion": 5}]
+
+    def _find_system_version(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        skip: int,
+        limit: int,
+        sort: Mapping[str, Any] | None,
+        projection: Mapping[str, Any] | None,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]]:
+        """Read path for ``admin.system.version`` — synthetic fixed-doc view."""
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._system_version_docs()
+        if filter:
+            rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
+        if sort:
+            rows = sort_docs(rows, sort)
+        if skip:
+            rows = rows[skip:]
+        if limit > 0:
+            rows = rows[:limit]
+        if projection:
+            rows = [apply_projection(r, projection) for r in rows]
+        return rows
+
+    def _count_system_version(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._system_version_docs()
+        if not filter:
+            return len(rows)
+        return sum(1 for r in rows if matches(r, filter, vars=let, collation=collation_obj))
+
     def _count_oplog_rs(
         self,
         filter: dict[str, Any] | None,
@@ -2301,6 +2366,16 @@ class Storage:
                 let=let,
                 collation=collation,
             )
+        if self._is_system_version(db, coll):
+            return self._find_system_version(
+                filter,
+                skip=skip,
+                limit=limit,
+                sort=sort,
+                projection=projection,
+                let=let,
+                collation=collation,
+            )
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -2786,6 +2861,8 @@ class Storage:
             return self._count_oplog_rs(filter, let=let, collation=collation)
         if self._is_system_users(db, coll):
             return self._count_system_users(filter, let=let, collation=collation)
+        if self._is_system_version(db, coll):
+            return self._count_system_version(filter, let=let, collation=collation)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
