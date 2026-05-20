@@ -294,6 +294,44 @@ when no matching index exists.
   full-inverse sort walks backward; multi-field mismatch falls
   back to Python sort.
 
+### `$type: "int"` / `"long"` distinguishes by BSON type tag, not value range
+
+A quieter long-standing bug in the `$type` query operator. The
+`_TYPE_PREDS` table used a Python value-range check
+(`-2**31 <= v <= 2**31 - 1`) to distinguish int32 from int64. A
+doc inserted as `Int64(5)` — value fits in int32 numerically, but
+its BSON tag is int64 — was matched by `$type: "int"` instead of
+`$type: "long"`, contradicting mongod.
+
+pymongo's BSON decoder already preserves the int32/int64
+distinction by class: int32 round-trips as plain `int`, int64
+round-trips as `bson.Int64` (a subclass of `int`). The fix keys
+on `isinstance(v, bson.Int64)` for "long" and
+`isinstance(v, int) and not isinstance(v, (bool, Int64))` for
+"int" — type-tag-faithful, no value-range arithmetic.
+
+`$convert: {to: "long"}` had a paired bug: it returned a plain
+`int` so its output couldn't be matched by `$type: "long"` on a
+downstream `$match`. Now wraps the result in `Int64` for code 18
+(int64); `to: "int"` (code 16) still returns plain `int`.
+
+#### Changed
+
+- `src/secantus/query.py`: replaced `_is_bson_int(... ranged=...)`
+  + `_INT32_RANGE` with three named predicates (`_is_int32`,
+  `_is_int64`, `_is_bson_number`). `_TYPE_PREDS` entries for
+  `int` / `16` / `long` / `18` / `number` now route through them.
+- `src/secantus/expressions.py`: `_convert_value` code 18 path
+  wraps its result in `Int64` (codes 16 and 18 share the input
+  coercion logic but the wrapper diverges).
+- `tests/test_type_int32_int64.py` (8 new tests): `Int64(5)` →
+  `$type: "long"` (not `int`); plain `int(5)` → `$type: "int"`;
+  large int (`2**40`) round-trips as Int64 → `long`;
+  `$type: "number"` accepts both; numeric `$type` codes (16, 18)
+  agree with their string aliases; array-form `$type` matches
+  either; `$convert: {to: "long"}` output matches `$type: "long"`;
+  `$convert: {to: "int"}` output matches `$type: "int"`.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge
