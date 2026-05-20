@@ -4957,6 +4957,21 @@ _API_V1_COMMANDS = frozenset(
 )
 
 # Aggregation stages allowed under ``apiVersion: 1, apiStrict: true``.
+# Commands explicitly rejected when ``apiStrict: true`` is set. Narrow
+# set — only the ones the spec's unified test runners actively probe.
+# ``distinct`` is the canary (mongo-java-driver's
+# ``crud-api-version-1-strict.yml`` test ``distinct appends declared
+# API version`` asserts ``errorCodeName: APIStrictError``).
+#
+# Intentionally NOT inverting ``_API_V1_COMMANDS``: that broader set
+# would reject ``count`` (used internally by
+# ``estimatedDocumentCount``), ``buildInfo`` / ``serverStatus`` /
+# ``listLocalSessions`` (handshake-adjacent admin commands drivers
+# call on startup), and other internal-but-non-v1 names that aren't
+# the spec's target.
+_API_V1_REJECTED_BY_NAME = frozenset({"distinct"})
+
+
 # Driver tests probe with ``$listLocalSessions`` / ``$listSessions``
 # (deliberately excluded) because they're the cheapest way to land an
 # ``APIStrictError`` from inside a known-allowed command (``aggregate``).
@@ -5041,33 +5056,42 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "APIVersionError",
         }
     # ``apiStrict: true`` narrows the allowed surface to the Stable API
-    # contract. Aggregation stages outside ``_API_V1_AGG_STAGES`` are
-    # rejected with ``APIStrictError`` (code 323) — lights up
-    # mongo-java-driver's ``versioned-api/aggregate on database
-    # appends declared API version`` test (which probes with
-    # ``$listLocalSessions``) without triggering the connection-pool
-    # cascade the **command-level** gate caused (rejecting ``distinct``
-    # at the command-name level made the Java driver pause its pool on
-    # the resulting expected error, failing 6 subsequent tests with
-    # ``MongoConnectionPoolClearedException``). The command-name gate
-    # is intentionally left out — see the ``_API_V1_COMMANDS`` set
-    # below for what a future attempt would enable.
-    if doc.get("apiStrict") and name == "aggregate":
-        pipeline = doc.get("pipeline") or []
-        if isinstance(pipeline, list):
-            for stage in pipeline:
-                if isinstance(stage, Mapping):
-                    stage_name = next(iter(stage), "")
-                    if stage_name and stage_name not in _API_V1_AGG_STAGES:
-                        return {
-                            "ok": 0.0,
-                            "errmsg": (
-                                f"Provided aggregation pipeline stage "
-                                f"{stage_name} is not in API Version 1"
-                            ),
-                            "code": 323,
-                            "codeName": "APIStrictError",
-                        }
+    # contract. Two gates:
+    #
+    # * Command-name gate (narrow): reject only the small set in
+    #   ``_API_V1_REJECTED_BY_NAME`` (currently ``distinct``). The
+    #   spec's ``crud-api-version-1-strict.yml`` asserts this rejection
+    #   for ``distinct``; mirroring it makes the test pass. The full
+    #   whitelist invert is intentionally NOT enabled — it'd reject
+    #   ``count`` (used internally by ``estimatedDocumentCount``) and
+    #   a handful of internal admin commands.
+    # * Aggregation-stage gate: reject pipeline stages outside
+    #   ``_API_V1_AGG_STAGES``. Lights up ``versioned-api/aggregate on
+    #   database`` (probes with ``$listLocalSessions``).
+    if doc.get("apiStrict"):
+        if name in _API_V1_REJECTED_BY_NAME:
+            return {
+                "ok": 0.0,
+                "errmsg": f"Provided command {name} is not in API Version 1",
+                "code": 323,
+                "codeName": "APIStrictError",
+            }
+        if name == "aggregate":
+            pipeline = doc.get("pipeline") or []
+            if isinstance(pipeline, list):
+                for stage in pipeline:
+                    if isinstance(stage, Mapping):
+                        stage_name = next(iter(stage), "")
+                        if stage_name and stage_name not in _API_V1_AGG_STAGES:
+                            return {
+                                "ok": 0.0,
+                                "errmsg": (
+                                    f"Provided aggregation pipeline stage "
+                                    f"{stage_name} is not in API Version 1"
+                                ),
+                                "code": 323,
+                                "codeName": "APIStrictError",
+                            }
     # Count every dispatched command — even unknown / unauth-rejected
     # ones — so serverStatus.network.numRequests reflects raw wire
     # traffic, not just the successful subset. Mongod's accounting is
