@@ -2606,10 +2606,9 @@ class Storage:
 
         ``collation`` propagates from the query; when set, only
         indexes with a matching stored ``collation`` option are
-        considered. Compound / range pickers don't yet support
-        collation, so they skip out when it's set (the caller falls
-        back to COLLSCAN, matching ``_try_index_id_keys``'s
-        contract).
+        considered. Single-field, compound bare-eq, and compound
+        prefix + trailing-operator pickers all collation-match;
+        ``numericOrdering`` queries fall through to COLLSCAN.
         """
         if not filter:
             return None
@@ -2619,15 +2618,14 @@ class Storage:
         geo_pick = self._pick_geo_index_for_filter(db, coll, filter)
         if geo_pick is not None:
             return geo_pick
-        if collation is None:
-            if all(not isinstance(v, dict) for v in filter.values()):
-                picked = self._pick_compound_eq_index(db, coll, filter)
-                if picked is not None:
-                    return picked
-            if len(filter) >= 2:
-                picked = self._pick_compound_range_index(db, coll, filter)
-                if picked is not None:
-                    return picked
+        if all(not isinstance(v, dict) for v in filter.values()):
+            picked = self._pick_compound_eq_index(db, coll, filter, collation=collation)
+            if picked is not None:
+                return picked
+        if len(filter) >= 2:
+            picked = self._pick_compound_range_index(db, coll, filter, collation=collation)
+            if picked is not None:
+                return picked
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
@@ -3669,13 +3667,15 @@ class Storage:
         c = self._cursor(_IDX_ENTRIES_TABLE)
         if partials is None:
             partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         for name, key_spec, sparse, unique in indexes:
             if not unique:
                 continue
             pf = partials.get(name)
             if pf is not None and not matches(candidate_doc, pf):
                 continue
-            kb = _index_key(candidate_doc, key_spec, sparse=sparse)
+            coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            kb = _index_key(candidate_doc, key_spec, sparse=sparse, collation=coll_opt)
             if kb is None:
                 continue
             esc_kb = _escape_kb(kb)
@@ -4045,13 +4045,13 @@ class Storage:
         only matching docs pay ``bson.decode``.
 
         ``collation`` propagates from the query. When set, only indexes
-        whose stored ``collation`` option matches are considered for
-        string-bearing fields; non-matching indexes are skipped so the
-        caller falls back to COLLSCAN (the safe semantics). Today only
-        the single-field equality path threads collation through —
-        compound / range / $in pickers all return None when
-        ``collation`` is set, leaving the caller to scan. Worth
-        expanding case-by-case when a workload needs it.
+        whose stored ``collation`` option matches are considered;
+        non-matching indexes are skipped so the caller falls back to
+        COLLSCAN (the safe semantics). Single-field equality / range /
+        ``$in`` and compound bare-eq / compound prefix + trailing
+        operator all thread collation through. ``numericOrdering``
+        collations never match any index (parse to None at the gate)
+        and fall through to COLLSCAN.
         """
         if not filter:
             return None
@@ -4064,18 +4064,17 @@ class Storage:
         geo_ids = self._try_geo_index_id_keys(db, coll, filter)
         if geo_ids is not None:
             return geo_ids
-        if collation is None:
-            # Bare-equality filters of any size can use a compound index whose
-            # leading fields cover the filter set.
-            if all(not isinstance(v, dict) for v in filter.values()):
-                result = self._try_compound_eq_id_keys(db, coll, filter)
-                if result is not None:
-                    return result
-            # Compound prefix + trailing operator field (eq fields then range/in).
-            if len(filter) >= 2:
-                result = self._try_compound_range_id_keys(db, coll, filter)
-                if result is not None:
-                    return result
+        # Bare-equality filters of any size can use a compound index whose
+        # leading fields cover the filter set.
+        if all(not isinstance(v, dict) for v in filter.values()):
+            result = self._try_compound_eq_id_keys(db, coll, filter, collation=collation)
+            if result is not None:
+                return result
+        # Compound prefix + trailing operator field (eq fields then range/in).
+        if len(filter) >= 2:
+            result = self._try_compound_range_id_keys(db, coll, filter, collation=collation)
+            if result is not None:
+                return result
         if len(filter) != 1:
             return None
         field, value = next(iter(filter.items()))
@@ -4258,7 +4257,7 @@ class Storage:
         return self._scan_index_for_id_keys(db, coll, name, kb)
 
     def _pick_compound_eq_index(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> tuple[str, dict[str, Any]] | None:
         """Find the index that ``_try_compound_eq_id_keys`` would walk for ``filter``.
 
@@ -4267,6 +4266,15 @@ class Storage:
         not scan. Multikey indexes are eligible (per-element entries
         cover equality lookups); the ASC/DESC direction check excludes
         geo indexes.
+
+        ``collation``: an index is only considered if its stored
+        ``collation`` parses to the same :class:`Collation` as the
+        query's (or both None). Same exact-match gate as
+        ``_find_leading_field_index``. Indexes whose stored collation
+        is ``numericOrdering`` parse to None here, so they look like
+        no-collation indexes — correct for no-collation queries,
+        wrong for numericOrdering queries; the latter fall through to
+        COLLSCAN regardless.
         """
         filter_fields = set(filter)
         partials = self._partial_filters(db, coll)
@@ -4287,12 +4295,8 @@ class Storage:
             # serve a bare-equality compound lookup.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
-            # Compound picker doesn't yet thread collation through — skip
-            # indexes with a stored collation so a no-collation query
-            # doesn't accidentally hit a collation-normalised entries
-            # table. Single-field collation indexes are picked by
-            # ``_find_leading_field_index``, which DOES collation-match.
-            if _parse_index_collation(index_options.get(name, {}).get("collation")) is not None:
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
                 continue
             if len(idx_fields) < len(eff_fields):
                 continue
@@ -4305,7 +4309,7 @@ class Storage:
         return best
 
     def _try_compound_eq_id_keys(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> list[bytes] | None:
         """Bare-equality filter against a compound (or single-field) index prefix.
 
@@ -4313,8 +4317,12 @@ class Storage:
         fields, and runs an equality (full-cover) or prefix
         (strict-leading-prefix) scan against it. Per-field index direction
         is honoured by encoding each value with ``encode_value_directed``.
+
+        ``collation`` propagates from the query: only collation-matching
+        indexes are picked, and the lookup bytes are built under the same
+        collation so they hit the same row as the index-write side.
         """
-        picked = self._pick_compound_eq_index(db, coll, filter)
+        picked = self._pick_compound_eq_index(db, coll, filter, collation=collation)
         if picked is None:
             return None
         name, key_spec = picked
@@ -4322,7 +4330,10 @@ class Storage:
         # Build kb from the filter fields that are in the index (partial-filter
         # clauses live outside the key and are guaranteed by index population).
         prefix_fields = [f for f in idx_fields if f in filter]
-        parts = [encode_value_directed(filter[f], int(key_spec[f])) for f in prefix_fields]
+        parts = [
+            encode_value_directed(filter[f], int(key_spec[f]), collation=collation)
+            for f in prefix_fields
+        ]
         kb = COMPOUND_SEP.join(parts) if len(parts) > 1 else parts[0]
         if len(prefix_fields) == len(idx_fields):
             return self._scan_index_for_id_keys(db, coll, name, kb)
@@ -4360,9 +4371,15 @@ class Storage:
         return eq_fields, operator_field, operator_ops or {}
 
     def _pick_compound_range_index(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> tuple[str, dict[str, Any]] | None:
-        """Find the index that ``_try_compound_range_id_keys`` would walk."""
+        """Find the index that ``_try_compound_range_id_keys`` would walk.
+
+        ``collation``: an index is only considered if its stored
+        collation parses to the same :class:`Collation` as the query's
+        (or both None). Same exact-match gate as
+        ``_pick_compound_eq_index`` and ``_find_leading_field_index``.
+        """
         parts = self._partition_compound_range_filter(filter)
         if parts is None:
             return None
@@ -4381,10 +4398,8 @@ class Storage:
             # serve a compound prefix + trailing-operator lookup.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
-            # Compound-range picker doesn't yet thread collation through
-            # — skip collation-having indexes for the same reason as
-            # _pick_compound_eq_index above.
-            if _parse_index_collation(index_options.get(name, {}).get("collation")) is not None:
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
                 continue
             if len(idx_fields) <= target_eq_count:
                 continue
@@ -4399,7 +4414,7 @@ class Storage:
         return best
 
     def _try_compound_range_id_keys(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> list[bytes] | None:
         """Compound-prefix lookup with a trailing operator field.
 
@@ -4407,12 +4422,16 @@ class Storage:
         leading bare-equality fields followed by exactly one operator-form
         field) walk the compound index by pinning the prefix from the
         equalities and applying the operator's bounds to the next field.
+
+        ``collation`` propagates from the query: only collation-matching
+        indexes are picked, and every encoded value (prefix equalities
+        and trailing-operator bound) is built under the same collation.
         """
         parts = self._partition_compound_range_filter(filter)
         if parts is None:
             return None
         eq_fields, operator_field, operator_ops = parts
-        picked = self._pick_compound_range_index(db, coll, filter)
+        picked = self._pick_compound_range_index(db, coll, filter, collation=collation)
         if picked is None:
             return None
         name, key_spec = picked
@@ -4420,7 +4439,10 @@ class Storage:
         target_eq_count = len(eq_fields)
         eq_field_names = idx_fields[:target_eq_count]
         op_dir = int(key_spec[operator_field])
-        eq_parts = [encode_value_directed(eq_fields[f], int(key_spec[f])) for f in eq_field_names]
+        eq_parts = [
+            encode_value_directed(eq_fields[f], int(key_spec[f]), collation=collation)
+            for f in eq_field_names
+        ]
         prefix_kb = COMPOUND_SEP.join(eq_parts) if len(eq_parts) > 1 else eq_parts[0]
         prefix_with_sep = prefix_kb + COMPOUND_SEP
         if "$in" in operator_ops:
@@ -4431,7 +4453,7 @@ class Storage:
             for v in operator_ops["$in"]:
                 if isinstance(v, dict):
                     return None
-                kb = prefix_with_sep + encode_value_directed(v, op_dir)
+                kb = prefix_with_sep + encode_value_directed(v, op_dir, collation=collation)
                 use_prefix = len(idx_fields) > target_eq_count + 1
                 inner_kb = kb + COMPOUND_SEP if use_prefix else kb
                 for id_k in self._scan_index_for_id_keys(
@@ -4444,7 +4466,9 @@ class Storage:
         if "$eq" in operator_ops:
             if len(operator_ops) != 1:
                 return None
-            kb = prefix_with_sep + encode_value_directed(operator_ops["$eq"], op_dir)
+            kb = prefix_with_sep + encode_value_directed(
+                operator_ops["$eq"], op_dir, collation=collation
+            )
             use_prefix = len(idx_fields) > target_eq_count + 1
             inner_kb = kb + COMPOUND_SEP if use_prefix else kb
             return self._scan_index_for_id_keys(db, coll, name, inner_kb, prefix=use_prefix)
@@ -4455,7 +4479,7 @@ class Storage:
         for op, bound in operator_ops.items():
             if isinstance(bound, dict):
                 return None
-            full = prefix_with_sep + encode_value_directed(bound, op_dir)
+            full = prefix_with_sep + encode_value_directed(bound, op_dir, collation=collation)
             effective_op = op
             if op_dir == -1:
                 effective_op = {"$gt": "$lt", "$gte": "$lte", "$lt": "$gt", "$lte": "$gte"}[op]
