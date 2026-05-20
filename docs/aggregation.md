@@ -33,6 +33,7 @@ applied in order; each stage gets the documents emitted by the previous one.
 | `$documents` | Inline document source (5.1+) |
 | `$changeStream` | Pipeline-form change-stream entry point |
 | `$unionWith` | Concatenate docs from another collection. Shorthand `{$unionWith: "coll"}` or full form `{$unionWith: {coll, pipeline}}` with an optional sub-pipeline that runs in a fresh context (outer `let`/vars are not visible). Outer docs first, then union docs; no deduplication |
+| `$redact` | Content-based document / sub-document pruning. Expression must return `"$$KEEP"`, `"$$PRUNE"`, or `"$$DESCEND"`. Top-level `$$PRUNE` drops the doc; `$$DESCEND` recurses into every dict-valued field and every dict-valued list element; `$$KEEP` short-circuits descent. Non-sentinel return raises `AggregateError` |
 
 ### `$group` accumulators
 

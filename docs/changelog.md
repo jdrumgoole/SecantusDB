@@ -428,6 +428,65 @@ churn reasons, with the docstring updated to cover both views.
   Existing call sites pick up the new behaviour with no further
   edits.
 
+### `$redact` aggregation stage
+
+The largest v1 stable-API aggregation stage still missing. `$redact`
+implements content-based document and sub-document pruning — the
+pipeline analogue of mongod's field-level access control. The
+stage's expression evaluates against each (sub-)doc and returns one
+of three sentinel strings; the result drives include / exclude /
+recurse behaviour. Driver test suites probe it routinely.
+
+* `"$$KEEP"` — include the sub-doc as-is, no recursion into nested
+  sub-docs. Useful for "trusted" sub-docs whose interior shouldn't
+  be re-evaluated.
+* `"$$PRUNE"` — drop the sub-doc. At the top level the doc leaves
+  the pipeline entirely; in a nested context the sub-doc is removed
+  from its parent field, or from its array element slot (with the
+  surrounding array preserved).
+* `"$$DESCEND"` — recurse into every dict-valued field and every
+  dict-valued list element. Non-dict scalars and non-dict list
+  elements pass through unchanged.
+
+The three sentinels are wired into the expression evaluator as
+system variables (alongside `$$ROOT`, `$$CURRENT`, `$$REMOVE`);
+their resolved value is the literal `"$$NAME"` string the stage
+handler dispatches on. Returning anything else from the expression
+raises `AggregateError` — matches mongod.
+
+The stage uses the standard `$cond` / `$switch` / `$let` /
+`$ifNull` plumbing that the rest of the expression engine already
+provides, so the typical pipeline shape works straight out:
+
+```python
+[{"$redact": {
+    "$cond": {
+        "if": {"$eq": [{"$ifNull": ["$classified", False]}, True]},
+        "then": "$$PRUNE",
+        "else": "$$DESCEND",
+    },
+}}]
+```
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_stage_redact` handler + private
+  `_redact_subdoc` / `_redact_descend` recursive helpers, wired
+  into `_STAGES` next to `$unionWith`. The `_redact_descend` walker
+  preserves non-dict scalars and non-dict list elements; pruned
+  sub-docs are dropped from their parent field or array.
+- `src/secantus/expressions.py`: `_resolve_var` recognises
+  `$$KEEP` / `$$PRUNE` / `$$DESCEND` and returns the literal
+  `"$$NAME"` string — same pattern as `$$REMOVE` for `$setField`.
+- `tests/test_redact.py` (11 new tests): unconditional KEEP and
+  PRUNE; conditional KEEP-vs-PRUNE access-control canon; DESCEND
+  with nested sub-doc pruning; DESCEND into arrays of sub-docs
+  with non-dict elements preserved; multi-level deep recursion;
+  KEEP short-circuits descent (nested PRUNE never fires); chained
+  with `$match`; non-sentinel return rejected; null / empty
+  expression rejected; array-element KEEP preserves nested
+  sub-docs unchanged.
+
 ## [0.5.1b24] — 2026-05-19
 
 ### Geo: legacy `$near` sibling form, 2d quadtree covering, java gauge

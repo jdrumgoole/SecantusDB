@@ -1592,6 +1592,77 @@ def _stage_documents(
     return out
 
 
+def _stage_redact(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$redact`` — content-based document / sub-document pruning.
+
+    The expression is evaluated against each (sub-)document, with the
+    current sub-doc bound as ``$$CURRENT``. It must return one of
+    three sentinel strings — ``"$$KEEP"`` (include the sub-doc as-is,
+    no recursion), ``"$$PRUNE"`` (drop the sub-doc), or
+    ``"$$DESCEND"`` (recurse into nested sub-docs and arrays-of-
+    sub-docs). The sentinels are returned by the expression evaluator
+    when the user writes ``"$$KEEP"`` / ``"$$PRUNE"`` / ``"$$DESCEND"``
+    inside a ``$cond`` / ``$switch`` / ``$let`` etc.
+
+    Behaviour follows mongod:
+
+    * Top-level ``$$PRUNE`` drops the doc from the pipeline.
+    * ``$$DESCEND`` recurses into every dict-valued field and every
+      list-element that is a dict; scalar and non-dict-list values
+      pass through unchanged. Pruned sub-docs are removed from their
+      arrays (the array stays, the element disappears).
+    * Empty list spec, missing expression, or a non-sentinel result
+      raises ``AggregateError``.
+    """
+    if spec is None or (isinstance(spec, Mapping) and not spec):
+        raise AggregateError("$redact requires an expression")
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        result = _redact_subdoc(doc, spec, ctx)
+        if result is not None:
+            out.append(result)
+    return out
+
+
+def _redact_subdoc(
+    doc: Mapping[str, Any], spec: Any, ctx: PipelineContext
+) -> dict[str, Any] | None:
+    decision = evaluate(spec, dict(doc), ctx.vars)
+    if decision == "$$KEEP":
+        return dict(doc)
+    if decision == "$$PRUNE":
+        return None
+    if decision == "$$DESCEND":
+        return _redact_descend(doc, spec, ctx)
+    raise AggregateError(
+        f"$redact expression must return $$KEEP, $$PRUNE, or $$DESCEND, got {decision!r}"
+    )
+
+
+def _redact_descend(doc: Mapping[str, Any], spec: Any, ctx: PipelineContext) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in doc.items():
+        if isinstance(v, Mapping):
+            sub = _redact_subdoc(v, spec, ctx)
+            if sub is not None:
+                out[k] = sub
+        elif isinstance(v, list):
+            new_list: list[Any] = []
+            for elem in v:
+                if isinstance(elem, Mapping):
+                    redacted = _redact_subdoc(elem, spec, ctx)
+                    if redacted is not None:
+                        new_list.append(redacted)
+                else:
+                    new_list.append(elem)
+            out[k] = new_list
+        else:
+            out[k] = v
+    return out
+
+
 def _stage_union_with(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1796,4 +1867,5 @@ _STAGES = {
     "$changeStream": _stage_change_stream,
     "$geoNear": _stage_geo_near,
     "$unionWith": _stage_union_with,
+    "$redact": _stage_redact,
 }
