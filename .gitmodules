@@ -16,3 +16,6 @@
 [submodule "vendor/mongo-ruby-driver"]
 	path = vendor/mongo-ruby-driver
 	url = https://github.com/mongodb/mongo-ruby-driver.git
+[submodule "vendor/mongo-rust-driver"]
+	path = vendor/mongo-rust-driver
+	url = https://github.com/mongodb/mongo-rust-driver.git

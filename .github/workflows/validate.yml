@@ -1,10 +1,10 @@
 name: Validate (driver conformance)
 
-# Runs the vendored driver test suites (pymongo, go, node, java, ruby)
-# against SecantusDB and regenerates the per-driver `docs/validation-
-# report*.md` files. Slow (~10–15 min per driver on a fresh WT build)
-# so this is NOT on every push — it runs weekly on Monday and can be
-# triggered manually.
+# Runs the vendored driver test suites (pymongo, go, node, java,
+# ruby, rust) against SecantusDB and regenerates the per-driver
+# `docs/validation-report*.md` files. Slow (~10–15 min per driver on
+# a fresh WT build) so this is NOT on every push — it runs weekly on
+# Monday and can be triggered manually.
 #
 # Layout: each driver gauge runs as its own matrix entry on a fresh
 # runner with only the toolchain it needs. The `aggregate` job that
@@ -32,6 +32,7 @@ jobs:
           - { name: node,    task: validate-node, report: docs/validation-report-node.md }
           - { name: java,    task: validate-java, report: docs/validation-report-java.md }
           - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
+          - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,6 +129,26 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-ruby-bundle-
 
+      - name: Set up Rust
+        if: matrix.driver.name == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # mongo-rust-driver's MSRV is 1.88; stable on Actions is
+          # ahead of that as of writing.
+          toolchain: stable
+
+      - name: Cache cargo registry + target
+        if: matrix.driver.name == 'rust'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/mongo-rust-driver/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('vendor/mongo-rust-driver/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: Run ${{ matrix.driver.name }} validation
         run: uv run python -m invoke ${{ matrix.driver.task }}
 
@@ -185,8 +206,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md
-          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby)"
+          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test output."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test output."

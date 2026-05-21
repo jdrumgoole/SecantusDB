@@ -274,7 +274,37 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-_COLLECTORS = (_collect_pymongo, _collect_java, _collect_go, _collect_node, _collect_ruby)
+def _collect_rust(raw_dir: Path) -> GaugeStats | None:
+    """Read the rust gauge's parsed cargo output (``.validation/rust-raw.json``)."""
+    f = raw_dir / "rust-raw.json"
+    if not f.exists():
+        return None
+    raw = json.loads(f.read_text())
+    s = raw.get("summary", {})
+    failed = s.get("failed", 0)
+    skipped = s.get("ignored", 0)
+    passed = s.get("passed", 0)
+    failure_descs = [t.get("name", "") for t in raw.get("failures", [])]
+    return GaugeStats(
+        name="mongo-rust-driver",
+        language="Rust",
+        driver_version=_read_submodule_head("mongo-rust-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated driver/src/test/ in-tree tests",
+    )
+
+
+_COLLECTORS = (
+    _collect_pymongo,
+    _collect_java,
+    _collect_go,
+    _collect_node,
+    _collect_ruby,
+    _collect_rust,
+)
 
 
 # Map gauge ``name`` to the matching expected-failures list.
