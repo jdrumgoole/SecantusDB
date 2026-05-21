@@ -19,6 +19,77 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust driver gauge — 6th conformance gauge alongside the rest
+
+mongo-rust-driver is now the 6th driver gauge alongside pymongo / go
+/ node / java / ruby. The runner spawns SecantusDB on an ephemeral
+port and runs ``cargo test --lib -p mongodb`` against a curated
+include set with ``MONGODB_URI`` explicitly overridden in the
+subprocess env — the rust driver's fallback chain
+(``$MONGODB_URI`` → ``~/.mongodb_uri`` → ``localhost:27017``) is
+short-circuited at the first step so a stray ambient URI in the
+user's shell can't route the gauge at a real mongod. A
+belt-and-braces ``hello.setName == "secantus"`` probe at runner
+start adds a second layer of confirmation.
+
+Initial baseline: 12 curated handshake + single-collection CRUD
+filters expand to 24 actual test runs (libtest substring matching
+fans ``test::coll::find`` out across ``find_allow_disk_use`` etc.).
+The first cut surfaced two real conformance gaps; both fixed in the
+same release:
+
+* ``listDatabases`` now populates ``sizeOnDisk`` per database (sum
+  of bson-encoded doc bytes across the db's collections — same
+  accounting ``collStats`` / ``dbStats`` use). ``empty`` is derived
+  from the size (``size == 0``). ``totalSize`` reports the actual
+  sum across all dbs. Previously every entry carried a placeholder
+  ``sizeOnDisk: 0`` and ``empty: false``.
+* ``hello.client`` subdoc captured per connection in the registry
+  and surfaced back via ``currentOp`` as ``clientMetadata``. Drivers
+  use it to identify their own connections in admin tooling — they
+  send the subdoc on handshake and expect to read it back. Previously
+  we threw the subdoc away on hello and ``currentOp`` emitted no
+  ``clientMetadata`` field.
+
+After the fixes the rust gauge runs **24/24 (100%)**.
+
+#### Added
+
+- ``rust_validation/`` package — ``__init__.py`` /
+  ``include_paths.py`` / ``runner.py`` / ``generate_report.py``,
+  mirrors the ``ruby_validation/`` shape.
+- ``vendor/mongo-rust-driver`` submodule (7th vendored driver).
+- ``invoke validate-rust`` task; ``validate-all`` GAUGES extended
+  with the 6th entry.
+- ``.github/workflows/validate.yml`` matrix entry for rust;
+  toolchain via ``dtolnay/rust-toolchain@stable``; cargo cache key
+  on ``vendor/mongo-rust-driver/Cargo.lock``.
+- ``validation_summary`` integration — ``_collect_rust``,
+  ``PANEL_PROSE`` entry, stale "pending" marker removed.
+- ``docs/validation-report-rust.md`` (new) + toctree entry +
+  index.md prose update referencing all six drivers.
+- ``tests/test_list_databases_size.py`` (4 tests): populated db
+  has non-zero ``sizeOnDisk`` + ``empty: false``; ``totalSize``
+  sums per-db sizes; ``nameOnly`` skips the size walk; ``filter``
+  scopes against the full descriptor.
+- ``tests/test_hello_client_metadata.py`` (2 tests): pymongo's
+  driver / OS / appname metadata round-trips through hello →
+  currentOp; clientMetadata is a dict shape when present.
+
+#### Changed
+
+- ``commands._list_databases``: computes ``sizeOnDisk`` per db as
+  ``sum(collection_data_size(...) for coll in list_collections)``;
+  ``empty`` derived from size; ``totalSize`` is real.
+- ``commands._hello``: captures ``doc.get("client")`` and stashes
+  via ``ctx.connections.set_client_metadata(...)``.
+- ``commands._current_op``: emits ``clientMetadata`` on each
+  in-progress op when the connection's registry entry has it.
+- ``connreg.ConnInfo`` grows ``client_metadata: dict | None``;
+  ``ConnectionRegistry.set_client_metadata(conn_id, metadata)``
+  added; ``get()`` and ``snapshot()`` thread the new field
+  through their fresh-copy semantics.
+
 ## [0.5.2b5] — 2026-05-21
 
 ### `$setWindowFields` rank functions — `$rank` / `$denseRank` / `$documentNumber`

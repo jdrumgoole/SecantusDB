@@ -39,6 +39,16 @@ class ConnInfo:
     op_count: int = 0
     user: str | None = None
     last_command_name: str | None = None
+    # Driver self-identification sent in the ``hello`` handshake's
+    # ``client`` subdoc (per the MongoDB Handshake spec): driver
+    # name + version, OS info, platform string, application name.
+    # ``currentOp`` surfaces this as ``clientMetadata`` on each
+    # in-progress op — that's how drivers identify their own
+    # connections in admin tooling. mongo-rust-driver's
+    # ``test::client::metadata_sent_in_handshake`` reads this
+    # subdoc back via ``currentOp``. Stored verbatim; the emit
+    # path doesn't reshape it.
+    client_metadata: dict | None = None
 
 
 class ConnectionRegistry:
@@ -124,6 +134,23 @@ class ConnectionRegistry:
                 return
             info.user = user
 
+    def set_client_metadata(self, conn_id: int, metadata: dict) -> None:
+        """Stash the ``hello.client`` subdoc the driver sent.
+
+        Per the MongoDB Handshake spec, drivers send their
+        self-identification once per connection on the first
+        ``hello`` / ``isMaster`` command. We stash it on the
+        registry so ``currentOp`` can echo it back as
+        ``clientMetadata`` on the corresponding in-progress op.
+        Idempotent — drivers MAY re-send on a later ``hello`` for
+        speculative-auth refresh; we just replace.
+        """
+        with self._lock:
+            info = self._conns.get(conn_id)
+            if info is None:
+                return
+            info.client_metadata = dict(metadata)
+
     def get(self, conn_id: int) -> ConnInfo | None:
         """Return a fresh copy of the ``ConnInfo`` for ``conn_id`` or ``None``.
 
@@ -143,6 +170,9 @@ class ConnectionRegistry:
                 op_count=info.op_count,
                 user=info.user,
                 last_command_name=info.last_command_name,
+                client_metadata=dict(info.client_metadata)
+                if info.client_metadata is not None
+                else None,
             )
 
     def snapshot(self) -> list[ConnInfo]:
@@ -157,6 +187,9 @@ class ConnectionRegistry:
                     op_count=info.op_count,
                     user=info.user,
                     last_command_name=info.last_command_name,
+                    client_metadata=dict(info.client_metadata)
+                    if info.client_metadata is not None
+                    else None,
                 )
                 for info in sorted(self._conns.values(), key=lambda i: i.conn_id)
             ]

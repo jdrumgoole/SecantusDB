@@ -397,6 +397,16 @@ CommandHandler = Callable[[dict[str, Any], CommandContext], dict[str, Any]]
 
 
 def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # Per the MongoDB Handshake spec, drivers send their
+    # self-identification (name, version, OS, platform) in the
+    # ``client`` subdoc on the first ``hello`` / ``isMaster`` of
+    # a connection. We stash it on the registry so ``currentOp``
+    # can surface it back as ``clientMetadata`` — that's how
+    # mongo-rust-driver's
+    # ``test::client::metadata_sent_in_handshake`` reads it back.
+    client_meta = doc.get("client")
+    if isinstance(client_meta, Mapping) and ctx.connections is not None:
+        ctx.connections.set_client_metadata(ctx.connection_id, dict(client_meta))
     # `topologyVersion.counter` and `connectionId` MUST be int64 on the wire.
     # pymongo accepts either, but the official Go driver (mongodump/restore,
     # mongo-go-driver) refuses the handshake with "expected 'counter' to be
@@ -651,35 +661,44 @@ def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         for conn in ctx.connections.snapshot():
             host_port = f"{conn.peer_addr[0]}:{conn.peer_addr[1]}"
             opened_iso = _dt.datetime.fromtimestamp(conn.opened_at, tz=_dt.timezone.utc).isoformat()
-            inprog.append(
-                {
-                    "type": "op",
-                    "desc": f"conn{conn.conn_id}",
-                    "connectionId": bson.Int64(conn.conn_id),
-                    "client": host_port,
-                    "opid": bson.Int64(conn.conn_id),
-                    "active": conn.last_command_name is not None,
-                    "op": conn.last_command_name or "none",
-                    "ns": "",
-                    # ``command`` is the body of the last operation
-                    # on this connection. Real mongod always populates
-                    # it (even if the op already completed) — drivers
-                    # iterating ``inprog`` filter on ``command.<name>``
-                    # to find specific ops. Mongo-node-driver's
-                    # ``Aggregation should ... $currentOp`` test does
-                    # exactly that; without the field it crashes with
-                    # ``Cannot read properties of undefined``.
-                    "command": ({conn.last_command_name: 1} if conn.last_command_name else {}),
-                    "currentOpTime": opened_iso,
-                    "secs_running": 0,
-                    "microsecs_running": 0,
-                    "effectiveUsers": (
-                        [{"user": conn.user.split("@", 1)[0], "db": conn.user.split("@", 1)[1]}]
-                        if conn.user and "@" in conn.user
-                        else []
-                    ),
-                }
-            )
+            op_entry: dict[str, Any] = {
+                "type": "op",
+                "desc": f"conn{conn.conn_id}",
+                "connectionId": bson.Int64(conn.conn_id),
+                "client": host_port,
+                "opid": bson.Int64(conn.conn_id),
+                "active": conn.last_command_name is not None,
+                "op": conn.last_command_name or "none",
+                "ns": "",
+                # ``command`` is the body of the last operation
+                # on this connection. Real mongod always populates
+                # it (even if the op already completed) — drivers
+                # iterating ``inprog`` filter on ``command.<name>``
+                # to find specific ops. Mongo-node-driver's
+                # ``Aggregation should ... $currentOp`` test does
+                # exactly that; without the field it crashes with
+                # ``Cannot read properties of undefined``.
+                "command": ({conn.last_command_name: 1} if conn.last_command_name else {}),
+                "currentOpTime": opened_iso,
+                "secs_running": 0,
+                "microsecs_running": 0,
+                "effectiveUsers": (
+                    [{"user": conn.user.split("@", 1)[0], "db": conn.user.split("@", 1)[1]}]
+                    if conn.user and "@" in conn.user
+                    else []
+                ),
+            }
+            # ``clientMetadata`` mirrors the ``hello.client`` subdoc
+            # the driver sent on handshake. mongo-rust-driver's
+            # ``test::client::metadata_sent_in_handshake`` reads it
+            # back via ``currentOp`` to verify the driver / OS /
+            # platform fields round-trip. Only present when the
+            # driver actually sent a ``client`` subdoc on hello
+            # (every modern driver does; ``mongo --eval`` shells
+            # don't).
+            if conn.client_metadata is not None:
+                op_entry["clientMetadata"] = conn.client_metadata
+            inprog.append(op_entry)
     if ctx.cursors is not None:
         for snap in ctx.cursors.snapshot():
             inprog.append(
@@ -2453,24 +2472,41 @@ def _list_databases(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     ``authorizedDatabases`` is accepted for wire compatibility but
     has no effect (we don't gate listing by per-db privileges in the
     initial RBAC slice).
+
+    ``sizeOnDisk`` per database is the sum of bson-encoded doc
+    bytes across all collections in that database (same accounting
+    ``collStats`` / ``dbStats`` use for ``dataSize``).
+    mongo-rust-driver's ``test::client::list_databases`` asserts
+    ``size_on_disk > 0`` on every entry it gets back from a
+    populated db; returning 0 unconditionally — as we did before —
+    failed the test even when the db actually had data. ``empty``
+    is derived from the size: an empty database has 0 bytes; a
+    populated one doesn't.
     """
     names = ctx.storage.list_databases()
     name_only = bool(doc.get("nameOnly", False))
     filter_doc = doc.get("filter")
 
-    descriptors: list[dict[str, Any]] = [
-        {"name": n, "sizeOnDisk": 0, "empty": False} for n in names
-    ]
+    descriptors: list[dict[str, Any]] = []
+    total_size = 0
+    for n in names:
+        if name_only:
+            # Skip the per-collection scan when the driver doesn't
+            # need the size — same shortcut mongod takes.
+            descriptors.append({"name": n})
+            continue
+        size = 0
+        for coll in ctx.storage.list_collections(n):
+            size += ctx.storage.collection_data_size(n, coll)
+        descriptors.append({"name": n, "sizeOnDisk": size, "empty": size == 0})
+        total_size += size
 
     if isinstance(filter_doc, dict) and filter_doc:
         descriptors = [d for d in descriptors if matches(d, filter_doc)]
 
-    if name_only:
-        descriptors = [{"name": d["name"]} for d in descriptors]
-
     return {
         "databases": descriptors,
-        "totalSize": 0,
+        "totalSize": total_size,
         "ok": 1.0,
     }
 
