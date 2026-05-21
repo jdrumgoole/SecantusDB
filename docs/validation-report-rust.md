@@ -1,6 +1,6 @@
 # mongo-rust-driver Validation Report
 
-Generated 2026-05-21 — SecantusDB 0.5.2b6 vs mongo-rust-driver 12dd49bf (`vendor/mongo-rust-driver/`).
+Generated 2026-05-21 — SecantusDB 0.5.2b7 vs mongo-rust-driver 12dd49bf (`vendor/mongo-rust-driver/`).
 
 Run `uv run python -m invoke validate-rust` to refresh. The Rust-driver analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges — the language MongoDB consumers reach for when they want native performance + async.
 
@@ -8,10 +8,12 @@ Run `uv run python -m invoke validate-rust` to refresh. The Rust-driver analogue
 
 | Module | Passed | Failed | Ignored | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `client` | 3 | 0 | 0 | 3 | 100.0% |
-| `coll` | 17 | 0 | 0 | 17 | 100.0% |
-| `db` | 4 | 0 | 0 | 4 | 100.0% |
-| **Overall** | **24** | **0** | **0** | **24** | **100.0%** |
+| `client` | 6 | 0 | 0 | 6 | 100.0% |
+| `coll` | 34 | 0 | 0 | 34 | 100.0% |
+| `cursor` | 6 | 0 | 0 | 6 | 100.0% |
+| `db` | 13 | 0 | 0 | 13 | 100.0% |
+| `index_management` | 7 | 0 | 0 | 7 | 100.0% |
+| **Overall** | **66** | **0** | **0** | **66** | **100.0%** |
 
 ## How this is generated
 
