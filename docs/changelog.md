@@ -19,6 +19,76 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Change-stream split-event implementation: real `{fragment: N, of: M}`
+
+The `splitLargeChangeStreamEvents` opt-in previously stamped every
+event with `{fragment: 1, of: 1}` regardless of size — correct from
+the driver's reassembly perspective for events under 16 MB, but
+wrong for events that genuinely exceed the BSON wire limit (the
+typical case being an `update` with `fullDocumentBeforeChange:
+required` where the pre-image plus a large `$set` value together
+push the projected event past 16 MB).
+
+This slice ships real splitting. When an event's BSON-encoded size
+exceeds 16 MB, `stamp_split_event` distributes any top-level field
+larger than 1 MB into its own fragment; light metadata (resume
+token, operationType, clusterTime, ns, documentKey, wallTime, …)
+is copied verbatim into every fragment so each is a valid change
+event the driver can process independently. Fragments share the
+same `_id` resume token; drivers reassemble by combining fields
+across fragments with matching `_id`. The split is size-based, not
+field-name-based: any heavy field qualifies (in practice
+`fullDocument`, `fullDocumentBeforeChange`, and
+`updateDescription.updatedFields` are the candidates).
+
+Two opt-in paths now both light up the producer flag: the original
+`$changeStream: {splitLargeChangeStreamEvents: true}` spec field
+plus the pipeline-stage form `[{$changeStreamSplitLargeEvent: {}}]`
+that the rust / node / java drivers use from their high-level
+`watch()` APIs. Either signals to the producer that fragmentation
+should run.
+
+mongo-rust-driver's `test::change_stream::split_large_event` —
+which constructs a 10 MB pre-image + 10 MB update value and
+asserts `events[0].splitEvent == {fragment: 1, of: 2}` and
+`events[1].splitEvent == {fragment: 2, of: 2}` — now passes end-
+to-end. The rust gauge moves from 92 → 93 (still 100%).
+
+#### Added
+
+- `src/secantus/aggregate.py`: `$changeStreamSplitLargeEvent`
+  registered in `_STAGES` as a pass-through marker. The stage
+  itself is a no-op in the pipeline (real splitting happens
+  upstream at event-projection time); accepted spec is `{}`.
+- `src/secantus/changestreams.py`:
+  - `_HEAVY_FIELD_BYTES = 1 MB` and `_SPLIT_THRESHOLD_BYTES = 16 MB`.
+  - `stamp_split_event(event) -> list[dict]` rewritten to compute
+    the event's BSON size, identify heavy top-level fields by
+    per-field encoding, and emit one fragment per heavy field
+    with light metadata duplicated. Returns one event (no split)
+    when the original is under 16 MB.
+- `src/secantus/commands.py`: change-stream aggregate handler
+  detects the `$changeStreamSplitLargeEvent` pipeline stage and
+  sets `cs_spec.split_large_events = True` so the producer
+  fragments on that opt-in path too. Producer call sites
+  changed from `events.append(stamp_split_event(ev))` to
+  `events.extend(stamp_split_event(ev))`.
+- `tests/test_change_stream_split_stage.py` (5 tests):
+  pipeline parses cleanly; bad-spec rejected standalone; stage
+  works outside change-stream context (no-op pass-through);
+  10 MB pre-image + 10 MB `$set` value produces two fragments
+  with correct `{fragment: N, of: 2}` envelopes and shared
+  resume token, heavy fields distributed one per fragment;
+  small event with opt-in still produces single
+  `{fragment: 1, of: 1}` fragment.
+
+#### Changed
+
+- `rust_validation/include_paths.py` adds
+  `test::change_stream::split_large_event` to `INCLUDE` (rust
+  gauge 92 → 93). The previous EXCLUDED entry's rationale is
+  removed.
+
 ## [0.5.2b7] — 2026-05-21
 
 ### Rust driver gauge — 6th conformance gauge alongside the rest

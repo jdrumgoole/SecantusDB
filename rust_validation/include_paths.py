@@ -131,6 +131,7 @@ INCLUDE: list[str] = [
     "test::change_stream::resume_kill_cursor_error_suppressed",
     "test::change_stream::create_coll_pre_post",
     "test::change_stream::resumes_on_error",
+    "test::change_stream::split_large_event",
     # ----- SCRAM authentication -----
     # SecantusDB ships SCRAM-SHA-256 end-to-end. The rust driver's
     # ``scram_sha256`` / ``scram_both`` tests exercise the full
@@ -194,14 +195,6 @@ INCLUDE: list[str] = [
 #   add the 8 filters individually, but they don't actually test
 #   wire-protocol behaviour (driver-side env-var inspection), so
 #   the conformance value is low.
-# * test::change_stream::split_large_event  — needs the
-#   ``$changeStreamSplitLargeEvent`` pipeline stage. SecantusDB
-#   supports the change-stream split envelope (every fragment
-#   carries ``{fragment: 1, of: 1}``) via the
-#   ``splitLargeChangeStreamEvents`` opt-in, but doesn't recognise
-#   the ``$changeStreamSplitLargeEvent`` aggregation stage the rust
-#   driver inserts. Wiring the stage as a pass-through is a small
-#   slice; deferred.
 # * test::spec::command_monitoring::command_monitoring_unified
 #   — the full unified-test spec runner for command monitoring;
 #   the panic at ``operation.rs:202`` is the unified runner's
