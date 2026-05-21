@@ -1578,6 +1578,35 @@ def _stage_change_stream(
     return []
 
 
+def _stage_change_stream_split_large_event(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$changeStreamSplitLargeEvent`` — pass-through marker.
+
+    Drivers (mongo-rust-driver, mongo-node-driver, …) insert this
+    stage into the change-stream pipeline when the user opts into
+    ``splitLargeChangeStreamEvents``. SecantusDB already handles
+    the split envelope at projection time: every event the
+    change-stream producer emits with ``splitLargeChangeStreamEvents``
+    set carries a ``splitEvent: {fragment: 1, of: 1}`` sub-doc
+    (events are never large enough to actually need splitting in
+    our single-node surrogate, but the field is present when the
+    user opts in — per ``CLAUDE.md``).
+
+    Because the split envelope is applied during event projection
+    upstream, the pipeline stage itself is a no-op: it accepts an
+    empty doc spec and passes docs through unchanged. Mongod's
+    real implementation also passes events through unchanged
+    unless an event genuinely exceeds the 16 MB BSON limit, which
+    our oplog projection never produces.
+    """
+    if spec is not None and not isinstance(spec, Mapping):
+        raise AggregateError(
+            "$changeStreamSplitLargeEvent spec must be a document or {}"
+        )
+    return docs
+
+
 def _stage_documents(
     spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -2104,6 +2133,7 @@ _STAGES = {
     "$graphLookup": _stage_graph_lookup,
     "$documents": _stage_documents,
     "$changeStream": _stage_change_stream,
+    "$changeStreamSplitLargeEvent": _stage_change_stream_split_large_event,
     "$geoNear": _stage_geo_near,
     "$unionWith": _stage_union_with,
     "$redact": _stage_redact,

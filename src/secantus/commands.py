@@ -3181,6 +3181,19 @@ def _aggregate_change_stream(
         return False
 
     pipeline_after_cs = list(pipeline[1:])
+    # ``$changeStreamSplitLargeEvent`` in the pipeline is a second opt-in
+    # path for event-splitting (alongside
+    # ``$changeStream: {splitLargeChangeStreamEvents: true}``). The
+    # rust driver / node driver / java driver use the pipeline-stage
+    # form when the user opts into split via the high-level cursor
+    # API (``coll.watch().pipeline([{$changeStreamSplitLargeEvent: {}}])``).
+    # When either path is taken, set the producer-side flag so
+    # ``stamp_split_event`` actually splits.
+    if any(
+        isinstance(stage, Mapping) and "$changeStreamSplitLargeEvent" in stage
+        for stage in pipeline_after_cs
+    ):
+        cs_spec.split_large_events = True
     pipeline_ctx = PipelineContext(
         storage=storage, db_name=ctx.db_name, coll_name=coll_name, change_stream=cs_spec
     )
@@ -3235,8 +3248,9 @@ def _aggregate_change_stream(
                 continue
             if ev is not None:
                 if cs_spec.split_large_events:
-                    changestreams.stamp_split_event(ev)
-                events.append(ev)
+                    events.extend(changestreams.stamp_split_event(ev))
+                else:
+                    events.append(ev)
             last_seen = seq
             ts_field = oplog_entry.get("ts")
             if ts_field is not None:
@@ -3247,8 +3261,9 @@ def _aggregate_change_stream(
             if invalidates:
                 inv = changestreams.invalidate_event(seq, oplog_entry)
                 if cs_spec.split_large_events:
-                    changestreams.stamp_split_event(inv)
-                events.append(inv)
+                    events.extend(changestreams.stamp_split_event(inv))
+                else:
+                    events.append(inv)
                 entry.invalidated = True
                 entry.final_event_pending = True
                 break
