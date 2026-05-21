@@ -8,7 +8,7 @@
       <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>959</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="counts"><strong>1039</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The official MongoDB Python driver. The pymongo conformance suite is the primary gauge for SecantusDB &mdash; we run pymongo's own tests, unmodified, against an embedded SecantusDB.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -22,7 +22,7 @@
       <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>4245</strong> tests passed &middot; <strong>0</strong> failed &middot; <strong>1</strong> documented failure (see report)</p>
+    <p class="counts"><strong>4256</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run a curated subset of <code>driver-sync/src/test/functional/</code> plus the BSON unit tests against an embedded SecantusDB daemon. Type-strict decoders catch wire-shape divergences pymongo's permissive client accepts silently.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -71,6 +71,20 @@
 
   <article class="driver">
     <header>
+      <h3>mongo-rust-driver</h3>
+      <span class="lang">Rust</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>24</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The official MongoDB Rust driver &mdash; the basis for Tokio-async MongoDB consumers in Rust. We run a curated set of <code>driver/src/test/</code> in-tree tests via <code>cargo test --lib -p mongodb</code> with <code>MONGODB_URI</code> explicitly overridden in the subprocess env, so the rust driver's fallback chain (<code>$MONGODB_URI</code> &rarr; <code>~/.mongodb_uri</code> &rarr; <code>localhost:27017</code>) can't accidentally route to a real mongod.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-rust.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
       <h3>mongo-php-library</h3>
       <span class="lang">PHP</span>
       <span class="kind smoke">Feature smokes</span>
@@ -80,15 +94,6 @@
       <span class="rate-label">features verified</span>
     </div>
     <p class="note">The official high-level PHP library, built on the C-based <code>ext-mongodb</code> extension. Same six features as the Ruby driver &mdash; type fidelity, RBAC, <code>bulkWrite</code>, <code>listDatabases</code> filter, logical sessions, cluster-role bundles &mdash; verified end-to-end via <code>composer install</code> + <code>php &lt;feature&gt;_smoke.php</code>.</p>
-  </article>
-
-  <article class="driver">
-    <header>
-      <h3>mongo-rust-driver</h3>
-      <span class="lang">Rust</span>
-      <span class="kind pending">Pending</span>
-    </header>
-    <p class="note">A type-fidelity smoke is staged in <code>tests/cross_driver/rust/</code>. Activation is gated on mongo-rust-driver upstream catching up with the current <code>tokio</code> / Rust toolchain &mdash; the 2.x line doesn't compile against tokio 1.40+ and 3.x trips on a <code>Runtime</code> API change with Rust 1.95. The smoke will flip on once a stable build path lands.</p>
   </article>
 </div>
 
