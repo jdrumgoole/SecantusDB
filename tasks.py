@@ -451,15 +451,47 @@ def validate_java(c: Context) -> None:
     print("\nWrote docs/validation-report-java.md")
 
 
+@task(name="validate-rust")
+def validate_rust(c: Context) -> None:
+    """Run mongo-rust-driver's tests against an embedded SecantusDB.
+
+    Generates docs/validation-report-rust.md with a per-module pass /
+    fail / ignored / pass-rate breakdown — the Rust-driver analogue of
+    the pymongo / Go / Node / Java / Ruby gauges. Requires Rust
+    (>= 1.88) on PATH (``brew install rust`` on macOS; ``rustup`` on
+    linux). First run does a one-time cargo build (~1-2 min) inside
+    vendor/mongo-rust-driver/; subsequent runs reuse ``target/`` and
+    complete in seconds for the curated include set.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/mongo-rust-driver/Cargo.toml").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m rust_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m rust_validation.generate_report "
+        ".validation/rust-raw.json docs/validation-report-rust.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-rust.md")
+
+
 @task(name="validate-all")
 def validate_all(c: Context) -> None:
-    """Run all five driver gauges in parallel.
+    """Run all six driver gauges in parallel.
 
     Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
     fans out ``invoke validate / validate-go / validate-node /
-    validate-java / validate-ruby`` across a 5-wide thread pool. Each
-    gauge spawns its own SecantusDB daemon on a kernel-assigned
-    ephemeral port + its own tempdir, so they don't collide.
+    validate-java / validate-ruby / validate-rust`` across a 6-wide
+    thread pool. Each gauge spawns its own SecantusDB daemon on a
+    kernel-assigned ephemeral port + its own tempdir, so they don't
+    collide.
 
     Wall-clock is the slowest single gauge (usually node or java); on
     a dev laptop ~5x faster than the previous serial run. Output from
@@ -477,6 +509,7 @@ def validate_all(c: Context) -> None:
         ("node", "validate-node"),
         ("java", "validate-java"),
         ("ruby", "validate-ruby"),
+        ("rust", "validate-rust"),
     ]
 
     def _run(name_task: tuple[str, str]) -> tuple[str, int]:

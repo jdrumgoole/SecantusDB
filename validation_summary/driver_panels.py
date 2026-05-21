@@ -43,6 +43,7 @@ from validation_summary.generate import (
     _collect_node,
     _collect_pymongo,
     _collect_ruby,
+    _collect_rust,
 )
 
 # Prose notes per validated driver. The numbers come from the
@@ -110,6 +111,21 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
         ),
         "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html"),
     },
+    "mongo-rust-driver": {
+        "title": "mongo-rust-driver",
+        "lang": "Rust",
+        "note": (
+            "The official MongoDB Rust driver &mdash; the basis for "
+            "Tokio-async MongoDB consumers in Rust. We run a curated set of "
+            "<code>driver/src/test/</code> in-tree tests via <code>cargo "
+            "test --lib -p mongodb</code> with <code>MONGODB_URI</code> "
+            "explicitly overridden in the subprocess env, so the rust "
+            "driver's fallback chain (<code>$MONGODB_URI</code> &rarr; "
+            "<code>~/.mongodb_uri</code> &rarr; <code>localhost:27017</code>) "
+            "can't accidentally route to a real mongod."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-rust.html"),
+    },
 }
 
 # Trailing panels that aren't backed by ``.validation/`` raw data —
@@ -133,24 +149,6 @@ SMOKE_PANELS: list[dict[str, str | None]] = [
         ),
         "report_url": None,
     },
-    {
-        "title": "mongo-rust-driver",
-        "lang": "Rust",
-        "kind": "pending",
-        "kind_label": "Pending",
-        "rate_value": None,
-        "rate_label": None,
-        "note": (
-            "A type-fidelity smoke is staged in "
-            "<code>tests/cross_driver/rust/</code>. Activation is gated on "
-            "mongo-rust-driver upstream catching up with the current "
-            "<code>tokio</code> / Rust toolchain &mdash; the 2.x line doesn't "
-            "compile against tokio 1.40+ and 3.x trips on a "
-            "<code>Runtime</code> API change with Rust 1.95. The smoke will "
-            "flip on once a stable build path lands."
-        ),
-        "report_url": None,
-    },
 ]
 
 
@@ -160,6 +158,7 @@ _COLLECTORS = {
     "mongo-node-driver": _collect_node,
     "mongo-go-driver": _collect_go,
     "mongo-ruby-driver": _collect_ruby,
+    "mongo-rust-driver": _collect_rust,
 }
 
 
