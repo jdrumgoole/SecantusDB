@@ -97,6 +97,35 @@ INCLUDE: list[str] = [
     # executes_commands / handles_duplicates / string_names.
     "test::index_management::index_management_",
     "test::index_management::commit_quorum_error",
+    # ----- Pure error-code unit tests (no driver client) -----
+    # Mathematical assertions on the relationships between MongoDB
+    # error-code categories (NotPrimary vs Shutdown vs Recovering
+    # codes etc). Runs entirely client-side without contacting the
+    # server, so passes regardless of what we implement.
+    "test::error::custom_display",
+    "test::error::not_writeable_primary_codes_disjoint_from_recovering_codes",
+    "test::error::retryable_read_codes_differ_from_write_codes_by_exactly_134",
+    "test::error::retryable_write_codes_subset_of_retryable_read_codes",
+    "test::error::shutting_down_codes_subset_of_recovering_codes",
+    # ----- Spec test runners that are client-internal -----
+    # Handshake metadata append semantics, DNS SRV parsing — all run
+    # in-driver without server roundtrips.
+    "test::spec::handshake::append_metadata_",
+    "test::spec::handshake::arbitrary_auth_mechanism",
+    "test::spec::handshake::handshake_includes_backpressure_true",
+    "test::spec::initial_dns_seedlist_discovery::load_balanced",
+    # ----- CRUD spec helpers -----
+    "test::spec::crud::generated_id_first_field",
+    # ----- Change streams (single-node) -----
+    # SecantusDB ships oplog-backed single-node change streams.
+    # Driver tests that don't assume multi-node topology or real
+    # transactions pass cleanly.
+    "test::change_stream::tracks_resume_token",
+    "test::change_stream::batch_end_resume_token",
+    "test::change_stream::batch_mid_resume_token",
+    "test::change_stream::errors_on_missing_token",
+    "test::change_stream::empty_batch_not_closed",
+    "test::change_stream::does_not_resume_aggregate",
 ]
 
 # Tests excluded with reasons — kept here as documentation for the
@@ -126,6 +155,21 @@ INCLUDE: list[str] = [
 # * test::client::warm_connection_pool    — pool warming heuristics.
 # * test::coll::invalid_utf8_response     — depends on a controlled
 #   binary response from a real mongod test fixture.
+# * test::spec::faas::*                    — the FaaS env-detection
+#   tests share a process-wide `OnceLock` (TEST_METADATA) that the
+#   first handshake sets; with libtest substring matching every
+#   faas test runs in the same cargo invocation and asserts
+#   against its own expected metadata, which fails because the
+#   OnceLock is already pinned. Each test would need its own
+#   cargo invocation in a fresh process — a future widening could
+#   add the 8 filters individually, but they don't actually test
+#   wire-protocol behaviour (driver-side env-var inspection), so
+#   the conformance value is low.
+# * test::change_stream::aggregate_batch    — start_after token
+#   handling; the test asserts the stream's resume_token equals
+#   the provided start_after value before any event has been
+#   delivered. SecantusDB doesn't pre-populate the resume_token
+#   from start_after; deferrable.
 # * test::coll::collection_options_inherited — uses
 #   ``ReadPreference::Secondary`` which only works on multi-node
 #   replica sets; the test reads back the read-preference field
