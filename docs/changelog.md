@@ -19,6 +19,8 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.2b7] — 2026-05-21
+
 ### Rust driver gauge — 6th conformance gauge alongside the rest
 
 mongo-rust-driver is now the 6th driver gauge alongside pymongo / go
