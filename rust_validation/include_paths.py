@@ -126,6 +126,35 @@ INCLUDE: list[str] = [
     "test::change_stream::errors_on_missing_token",
     "test::change_stream::empty_batch_not_closed",
     "test::change_stream::does_not_resume_aggregate",
+    "test::change_stream::resume_uses_resume_after",
+    "test::change_stream::resume_uses_start_after",
+    "test::change_stream::resume_kill_cursor_error_suppressed",
+    "test::change_stream::create_coll_pre_post",
+    "test::change_stream::resumes_on_error",
+    # ----- SCRAM authentication -----
+    # SecantusDB ships SCRAM-SHA-256 end-to-end. The rust driver's
+    # ``scram_sha256`` / ``scram_both`` tests exercise the full
+    # round-trip against a daemon with auth on.
+    "test::client::scram_sha256",
+    "test::client::scram_both",
+    # ----- Bulk write -----
+    # Only ``unsupported_server_client_error`` actually exercises
+    # wire behaviour against SecantusDB — it asserts that a server
+    # reporting maxWireVersion below the bulkWrite threshold (which
+    # we do) causes the driver to return its client-side
+    # ``UnsupportedServer`` error. The other bulk_write tests gate
+    # on ``server_version_lt(8, 0)`` and self-skip against
+    # SecantusDB's ``buildInfo.version: "7.0.0"`` — they "pass"
+    # without exercising anything, and the skip message line that
+    # libtest emits separates the outcome onto its own line in a
+    # way our pretty-format parser doesn't currently capture.
+    # Bumping our reported version to 8.0 wouldn't help: the
+    # ``bulkWrite`` command itself is a MongoDB 8.0 addition we
+    # don't implement, so those tests would fail anyway.
+    "test::bulk_write::unsupported_server_client_error",
+    # ----- Spec runners: DNS SRV all topologies -----
+    "test::spec::initial_dns_seedlist_discovery::replica_set",
+    "test::spec::initial_dns_seedlist_discovery::sharded",
 ]
 
 # Tests excluded with reasons — kept here as documentation for the
@@ -165,6 +194,21 @@ INCLUDE: list[str] = [
 #   add the 8 filters individually, but they don't actually test
 #   wire-protocol behaviour (driver-side env-var inspection), so
 #   the conformance value is low.
+# * test::change_stream::split_large_event  — needs the
+#   ``$changeStreamSplitLargeEvent`` pipeline stage. SecantusDB
+#   supports the change-stream split envelope (every fragment
+#   carries ``{fragment: 1, of: 1}``) via the
+#   ``splitLargeChangeStreamEvents`` opt-in, but doesn't recognise
+#   the ``$changeStreamSplitLargeEvent`` aggregation stage the rust
+#   driver inserts. Wiring the stage as a pass-through is a small
+#   slice; deferred.
+# * test::spec::command_monitoring::command_monitoring_unified
+#   — the full unified-test spec runner for command monitoring;
+#   the panic at ``operation.rs:202`` is the unified runner's
+#   "operation type unsupported" path. Many subtests need
+#   driver-specific operation handlers (``aggregate``,
+#   ``listIndexes`` shapes, etc.) we'd want to verify case-by-case;
+#   deferred.
 # * test::change_stream::aggregate_batch    — start_after token
 #   handling; the test asserts the stream's resume_token equals
 #   the provided start_after value before any event has been
