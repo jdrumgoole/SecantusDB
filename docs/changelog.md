@@ -19,6 +19,8 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.2b14] — 2026-05-22
+
 ### Change-stream split-event implementation: real `{fragment: N, of: M}`
 
 The `splitLargeChangeStreamEvents` opt-in previously stamped every
