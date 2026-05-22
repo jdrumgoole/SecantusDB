@@ -19,6 +19,50 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.2b15] — 2026-05-22
+
+### WT session leak fix unblocks the rust crud unified runner
+
+SecantusDB cached a WiredTiger session per connection thread in
+`threading.local()` but never released it when the thread died.
+Aggressive driver pools (mongo-rust-driver's spec runners are
+the canonical case) opened thousands of short-lived connections;
+once cumulative connections crossed WT's 1024-session pool limit,
+`hello` started failing mid-handshake with `WT_ERROR: out of
+sessions`, which downstream surfaced as a checkpoint stat-error
+on `WiredTigerHS.wt`. This release calls
+`Storage._reset_thread_session()` in `SecantusDBServer._handle_client`'s
+`finally` block, releasing the session/cursors on disconnect so
+the pool stays bounded by the live connection count.
+
+The fix also closes a small `aggregate` validation gap: `$out`
+and `$merge` under `readConcern: "linearizable"` now return
+`InvalidOptions (72)` to match mongod's invariant (the
+`aggregate-out-readConcern` unified spec asserts the rejection).
+
+Together these unblock `test::spec::crud::run_unified` in the
+rust gauge — ~80 subtests across find / insert / update / delete
+/ aggregate / countDocuments / distinct / findOne\* / replaceOne
+/ bypassDocumentValidation / collation / hints / comments / let
+bindings / readConcern levels / dots-and-dollars keys, running
+end-to-end in ~75s. Rust gauge moves from 100 → 101 filters
+passing.
+
+#### Fixed
+- WT session pool exhaustion under high connection churn: per-
+  connection-thread WT session is now released on disconnect
+  instead of leaking until the engine's 1024-session pool fills.
+- `aggregate` with `$out` / `$merge` under `readConcern:
+  "linearizable"` now errors with `InvalidOptions (72)` instead
+  of silently returning an empty array.
+
+#### Changed
+- Rust conformance gauge: `test::spec::crud::run_unified` is now
+  in the include list. `test::spec::collection_management::run_unified`
+  and `test::spec::sessions::run_unified` remain deferred for
+  separate gaps (time-series collections, snapshot read concern
+  under fake replica-set topology).
+
 ## [0.5.2b14] — 2026-05-22
 
 ### Change-stream split-event implementation: real `{fragment: N, of: M}`
