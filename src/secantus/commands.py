@@ -3003,6 +3003,26 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         return _aggregate_change_stream(doc, ctx, coll, pipeline, batch_size)
 
+    # Linearizable read concern is incompatible with write stages.
+    # mongod rejects with InvalidOptions (72): the aggregate-out-readConcern
+    # unified spec test asserts the operation errors when ``$out`` runs
+    # under ``readConcern: linearizable``; ``$merge`` carries the same
+    # restriction.
+    rc = doc.get("readConcern")
+    if isinstance(rc, Mapping) and rc.get("level") == "linearizable":
+        for stage in pipeline:
+            if isinstance(stage, Mapping):
+                bad = "$out" if "$out" in stage else ("$merge" if "$merge" in stage else None)
+                if bad is not None:
+                    return {
+                        "ok": 0.0,
+                        "errmsg": (
+                            f"{bad} cannot be used with a 'linearizable' read concern level"
+                        ),
+                        "code": 72,
+                        "codeName": "InvalidOptions",
+                    }
+
     if isinstance(coll, str):
         coll_name = coll
         if isinstance(first_stage, Mapping) and (

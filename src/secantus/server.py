@@ -436,6 +436,15 @@ class SecantusDBServer:
             self.connections.close(connection_id)
             with self._active_conns_lock:
                 self._active_conns -= 1
+            # Release the WT session cached on this connection thread so
+            # the engine's session pool (default 1024) isn't leaked when
+            # client churn opens many short-lived connections. Without
+            # this, an aggressive driver pool (mongo-rust-driver's spec
+            # runners are the canonical case) saturates the pool after
+            # ~1k connections and every subsequent ``hello`` errors with
+            # ``WT_ERROR: out of sessions`` mid-handshake.
+            with contextlib.suppress(Exception):
+                self.storage._reset_thread_session()
             logger.debug("client %d disconnected", connection_id)
 
     def __enter__(self) -> Self:

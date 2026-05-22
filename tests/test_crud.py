@@ -872,6 +872,43 @@ def test_snapshot_read_concern_rejected_on_standalone(client: MongoClient) -> No
     assert reply["ok"] == 1.0
 
 
+def test_aggregate_linearizable_rc_rejects_write_stage(client: MongoClient) -> None:
+    # mongod rejects aggregate with `$out` or `$merge` under
+    # `readConcern: linearizable` with InvalidOptions (72). The
+    # mongo-rust-driver `aggregate-out-readConcern` unified spec
+    # asserts the operation errors. SecantusDB pretends to be a
+    # replica-set primary so the unified runner doesn't skip the
+    # test on topology; we must mirror mongod's rejection.
+    from pymongo.errors import OperationFailure
+
+    db = client["agg_lin_rc_db"]
+    db.create_collection("src")
+    db["src"].insert_many([{"_id": 1, "x": 11}, {"_id": 2, "x": 22}])
+
+    for stage in ({"$out": "dst"}, {"$merge": {"into": "dst"}}):
+        with pytest.raises(OperationFailure) as exc:
+            db.command(
+                {
+                    "aggregate": "src",
+                    "pipeline": [stage],
+                    "cursor": {},
+                    "readConcern": {"level": "linearizable"},
+                }
+            )
+        assert exc.value.code == 72
+        assert "linearizable" in str(exc.value).lower()
+
+    # Same pipelines run cleanly under non-linearizable readConcern.
+    db.command(
+        {
+            "aggregate": "src",
+            "pipeline": [{"$out": "dst"}],
+            "cursor": {},
+            "readConcern": {"level": "majority"},
+        }
+    )
+
+
 def test_list_indexes_rejects_negative_batch_size(client: MongoClient) -> None:
     # Real mongod rejects negative batchSize with BadValue.
     # mongo-ruby-driver's `failed_operation using a session` shared

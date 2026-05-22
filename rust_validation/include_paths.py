@@ -116,6 +116,13 @@ INCLUDE: list[str] = [
     "test::spec::initial_dns_seedlist_discovery::load_balanced",
     # ----- CRUD spec helpers -----
     "test::spec::crud::generated_id_first_field",
+    # The crud unified-spec runner drives ~80 subtests against the
+    # full CRUD surface (find / insert / update / delete / aggregate
+    # / countDocuments / distinct / findOne* / replaceOne /
+    # bypassDocumentValidation / collation / hints / comments / let
+    # bindings / readConcern levels / dots-and-dollars keys). Runs
+    # end-to-end in ~75s.
+    "test::spec::crud::run_unified",
     # ----- Change streams (single-node) -----
     # SecantusDB ships oplog-backed single-node change streams.
     # Driver tests that don't assume multi-node topology or real
@@ -217,19 +224,21 @@ INCLUDE: list[str] = [
 #   add the 8 filters individually, but they don't actually test
 #   wire-protocol behaviour (driver-side env-var inspection), so
 #   the conformance value is low.
-# * test::spec::crud::run_unified
-#   test::spec::collection_management::run_unified
-#   test::spec::sessions::run_unified
-#                                         — the unified spec runners
-#   each drive 30–100 subtests rapidly across many databases / collections.
-#   Running them against SecantusDB triggers a WT_PANIC: during a
-#   concurrent checkpoint WiredTiger reports ``WiredTigerHS.wt:
-#   stat: No such file or directory``. The HS file shouldn't ever
-#   be deleted by SecantusDB's normal operations (``dropDatabase``
-#   only deletes rows, not files), so this is a real bug somewhere
-#   in the heavy-concurrent-writes-during-checkpoint path. Worth a
-#   dedicated investigation — for now they're deferred so the gauge
-#   stays green.
+# * test::spec::collection_management::run_unified — the second
+#   subtest (`timeseries-collection.json::insertMany with duplicate
+#   ids`) requires real time-series collections (bucket-based
+#   storage that doesn't enforce ``_id`` uniqueness). SecantusDB
+#   doesn't ship time-series; bringing it in is a multi-slice
+#   feature, deferred.
+# * test::spec::sessions::run_unified — the ``implicit-sessions-
+#   default-causal-consistency`` test expects ``readConcern.level:
+#   "snapshot"`` to succeed on a "replica set" topology. SecantusDB
+#   advertises as a single-node replica set primary (so change
+#   streams light up) but rejects snapshot RC with ``246
+#   SnapshotUnavailable`` because we don't implement majority-
+#   committed snapshots. Either supporting snapshot RC (large
+#   feature) or stopping the replica-set advert (breaks change
+#   streams) would unblock; deferred.
 # * test::spec::command_monitoring::command_monitoring_unified
 #   — the full unified-test spec runner for command monitoring;
 #   the panic at ``operation.rs:202`` is the unified runner's
