@@ -209,6 +209,55 @@ def concurrency(
 
 
 @task(
+    name="rw-harness",
+    help={
+        "workers": "Number of independent reader/writer processes (default: 4).",
+        "count": "Documents each worker writes then stops (default: 1000).",
+        "duration": "Run each worker N seconds instead of a fixed count (overrides --count).",
+        "server": "Server hosting: daemon (default) | embedded | external.",
+        "uri": "Server URI when --server external (default: mongodb://127.0.0.1:27018/).",
+        "payload-bytes": "Random payload size per document (default: 256).",
+        "sync-on-commit": "Start the server with --sync-on-commit (fsync every commit).",
+    },
+)
+def rw_harness(
+    c: Context,
+    workers: int = 4,
+    count: int = 1000,
+    duration: float = 0.0,
+    server: str = "daemon",
+    uri: str = "mongodb://127.0.0.1:27018/",
+    payload_bytes: int = 256,
+    sync_on_commit: bool = False,
+) -> None:
+    """Concurrent read/write validation harness.
+
+    Spawns ``--workers`` independent processes that simultaneously read
+    and write a shared collection with the highest write/read safety
+    (w:majority, j:true, readConcern:majority, retryWrites/Reads). Every
+    read is checksum-validated in flight; a final paginated sweep
+    re-verifies every document and reconciles per-worker counts. The
+    server can be hosted as a daemon subprocess (default), embedded
+    in-process, or pointed at an external URI for differential testing.
+    """
+    cmd = (
+        "uv run --no-sync python -m bench.rw_harness"
+        f" --workers {int(workers)}"
+        f" --server {shlex.quote(server)}"
+        f" --payload-bytes {int(payload_bytes)}"
+    )
+    if duration > 0:
+        cmd += f" --duration {float(duration)}"
+    else:
+        cmd += f" --count {int(count)}"
+    if server == "external":
+        cmd += f" --uri {shlex.quote(uri)}"
+    if sync_on_commit:
+        cmd += " --sync-on-commit"
+    c.run(cmd, pty=True)
+
+
+@task(
     help={
         "uri": "MongoDB URI to administer.",
         "port": "Local HTTP port (0 = pick a free one).",
