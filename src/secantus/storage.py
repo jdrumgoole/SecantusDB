@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -239,6 +240,51 @@ def _id_key(doc_id: Any) -> bytes:
       MongoDB calls "natural order" for non-capped collections.
     """
     return encode_value(doc_id)
+
+
+def _is_regex_value(v: Any) -> bool:
+    return isinstance(v, (re.Pattern, bson.Regex))
+
+
+def _id_point_lookup_keys(spec: Any) -> list[bytes] | None:
+    """id_keys for an ``{_id: <spec>}`` equality predicate, or ``None``.
+
+    The documents table is keyed by ``(db, coll, encode_value(_id))``, so
+    an ``_id`` equality is a direct primary-key point lookup rather than a
+    COLLSCAN. This returns the WT key bytes to fetch for:
+
+    * a scalar bare equality (``{_id: 5}``),
+    * ``{_id: {$eq: scalar}}``,
+    * ``{_id: {$in: [scalars]}}``.
+
+    Returns ``None`` (caller falls back to its normal routing / COLLSCAN)
+    for range operators, regex, subdocument or operator-valued equalities,
+    or anything else that isn't a pure point lookup. ``$in`` keys come back
+    deduplicated and in ascending byte (== ``_id``) order so the caller's
+    sort-acceleration can treat the result as already sorted on ``_id``.
+    An empty ``$in`` yields ``[]`` — a valid no-match point lookup.
+    """
+    if isinstance(spec, Mapping):
+        keys = list(spec.keys())
+        if not keys or not all(isinstance(k, str) and k.startswith("$") for k in keys):
+            # Literal subdocument _id — leave to the normal path.
+            return None
+        if keys == ["$eq"]:
+            v = spec["$eq"]
+            if isinstance(v, Mapping) or _is_regex_value(v):
+                return None
+            return [_id_key(v)]
+        if keys == ["$in"]:
+            vals = spec["$in"]
+            if not isinstance(vals, (list, tuple)):
+                return None
+            if any(isinstance(v, Mapping) or _is_regex_value(v) for v in vals):
+                return None
+            return sorted({_id_key(v) for v in vals})
+        return None
+    if _is_regex_value(spec):
+        return None
+    return [_id_key(spec)]
 
 
 def _parse_index_collation(spec: Any) -> Any:
@@ -2800,6 +2846,14 @@ class Storage:
             return None
         if any(f.startswith("$") for f in filter):
             return None
+        # Mirror the _id point-lookup fast path: report it as an IXSCAN on
+        # the virtual _id_ index (key pattern {_id: 1}), matching mongod.
+        if (
+            len(filter) == 1
+            and "_id" in filter
+            and _id_point_lookup_keys(filter["_id"]) is not None
+        ):
+            return _ID_INDEX_NAME, {"_id": 1}
         # Mirror `_try_index_id_keys`: geo dispatch first.
         geo_pick = self._pick_geo_index_for_filter(db, coll, filter)
         if geo_pick is not None:
@@ -4247,6 +4301,14 @@ class Storage:
             return None
         if any(f.startswith("$") for f in filter):
             return None
+        # Fast path: equality on _id alone is a direct primary-key point
+        # lookup on the documents table (keyed by encode_value(_id)), not a
+        # COLLSCAN — the _id_ index is virtual (no entries table), so the
+        # generic pickers below never match it.
+        if len(filter) == 1 and "_id" in filter:
+            id_keys = _id_point_lookup_keys(filter["_id"])
+            if id_keys is not None:
+                return id_keys
         # Geo dispatch first — a $geoWithin / $geoIntersects / $near clause
         # on a field with a 2dsphere or 2d index uses the cell-covering
         # path. The picker returns None if no geo index covers the query,

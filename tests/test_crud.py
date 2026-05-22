@@ -1079,6 +1079,31 @@ def test_explain_find_ixscan_with_compound_index(coll) -> None:
     assert plan["inputStage"]["keyPattern"] == {"a": 1, "b": 1}
 
 
+def test_explain_find_id_equality_uses_id_index(coll) -> None:
+    # Regression: `find({_id: x})` must be a primary-key point lookup
+    # (IXSCAN on the implicit _id_ index), not a COLLSCAN.
+    coll.insert_many([{"_id": i, "n": i} for i in range(20)])
+    plan = coll.find({"_id": 7}).explain()["queryPlanner"]["winningPlan"]
+    assert plan["stage"] == "FETCH"
+    inner = plan["inputStage"]
+    assert inner["stage"] == "IXSCAN"
+    assert inner["indexName"] == "_id_"
+    assert inner["keyPattern"] == {"_id": 1}
+
+
+def test_find_by_id_returns_correct_doc(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i * 2} for i in range(20)])
+    assert coll.find_one({"_id": 5}) == {"_id": 5, "n": 10}
+    assert coll.find_one({"_id": {"$eq": 5}}) == {"_id": 5, "n": 10}
+    # $in by _id: results in ascending _id order, missing ids dropped.
+    assert list(coll.find({"_id": {"$in": [5, 1, 99, 3]}})) == [
+        {"_id": 1, "n": 2},
+        {"_id": 3, "n": 6},
+        {"_id": 5, "n": 10},
+    ]
+    assert coll.find_one({"_id": 12345}) is None
+
+
 def test_explain_find_with_hint_uses_hinted_index(coll) -> None:
     coll.create_index("n")
     coll.insert_many([{"_id": i, "n": i} for i in range(5)])
