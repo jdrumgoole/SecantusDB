@@ -290,6 +290,77 @@ def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
             mc.close()
 
 
+def test_id_equality_uses_index_not_collscan(storage: Storage) -> None:
+    """`{_id: value}` is a primary-key point lookup, reported as IXSCAN.
+
+    The documents table is keyed by encode_value(_id), so an _id-equality
+    filter must not fall back to a COLLSCAN. Regression for the bug where
+    the virtual `_id_` index was invisible to the planner.
+    """
+    storage.insert("db", "c", [{"_id": i, "x": i * 10} for i in range(50)])
+
+    for filt in ({"_id": 7}, {"_id": {"$eq": 7}}, {"_id": {"$in": [7, 3, 1]}}):
+        plan = storage.explain_plan("db", "c", filt)
+        assert plan["kind"] == "IXSCAN", filt
+        assert plan["index_name"] == "_id_"
+        assert plan["key_pattern"] == {"_id": 1}
+
+    assert storage.find_matching("db", "c", {"_id": 7}) == [{"_id": 7, "x": 70}]
+    assert storage.find_matching("db", "c", {"_id": {"$eq": 7}}) == [{"_id": 7, "x": 70}]
+    # $in comes back in ascending _id order, missing ids dropped.
+    assert storage.find_matching("db", "c", {"_id": {"$in": [7, 3, 99, 1]}}) == [
+        {"_id": 1, "x": 10},
+        {"_id": 3, "x": 30},
+        {"_id": 7, "x": 70},
+    ]
+    assert storage.find_matching("db", "c", {"_id": {"$in": []}}) == []
+    assert storage.find_matching("db", "c", {"_id": 12345}) == []
+
+
+def test_id_non_point_lookups_stay_collscan(storage: Storage) -> None:
+    """Range / regex / compound / subdocument _id filters are not point lookups.
+
+    They must keep their existing (correct) routing rather than being
+    mis-served by the equality fast path.
+    """
+    from bson import Regex
+
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+
+    # Range operator on _id: COLLSCAN (no _id entries table to range-scan).
+    plan = storage.explain_plan("db", "c", {"_id": {"$gt": 5}})
+    assert plan["kind"] == "COLLSCAN"
+    assert storage.count_matching("db", "c", {"_id": {"$gt": 5}}) == 4
+
+    # Multi-field filter that happens to include _id: not a single-field
+    # point lookup, so it stays COLLSCAN — but still returns correctly.
+    plan = storage.explain_plan("db", "c", {"_id": 4, "x": 4})
+    assert plan["kind"] == "COLLSCAN"
+    assert storage.find_matching("db", "c", {"_id": 4, "x": 4}) == [{"_id": 4, "x": 4}]
+
+    # A regex _id is a pattern match, never an equality point lookup
+    # (pymongo delivers regex query values as bson.Regex).
+    storage.insert("db", "c2", [{"_id": "alpha"}, {"_id": "beta"}])
+    plan = storage.explain_plan("db", "c2", {"_id": Regex("^al")})
+    assert plan["kind"] == "COLLSCAN"
+    assert storage.find_matching("db", "c2", {"_id": Regex("^al")}) == [{"_id": "alpha"}]
+
+
+def test_id_point_lookup_cross_numeric_collision(storage: Storage) -> None:
+    """An int _id is found by a float / Decimal128 equality (and vice versa).
+
+    The fast path encodes the query value with the same `encode_value`
+    used as the primary key, so the documented cross-numeric collision
+    (1 == 1.0 == Decimal128("1")) holds for point lookups too.
+    """
+    from bson import Decimal128
+
+    storage.insert("db", "c", [{"_id": 1, "v": "a"}])
+    assert storage.find_matching("db", "c", {"_id": 1.0}) == [{"_id": 1, "v": "a"}]
+    assert storage.find_matching("db", "c", {"_id": Decimal128("1")}) == [{"_id": 1, "v": "a"}]
+    assert storage.explain_plan("db", "c", {"_id": 1.0})["kind"] == "IXSCAN"
+
+
 def test_checkpoint_persists_inserts(tmp_path) -> None:
     """Forcing a checkpoint flushes pending writes; subsequent close+reopen sees them."""
     storage = Storage(str(tmp_path))

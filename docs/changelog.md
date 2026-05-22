@@ -89,6 +89,38 @@ to-end. The rust gauge moves from 92 → 93 (still 100%).
   gauge 92 → 93). The previous EXCLUDED entry's rationale is
   removed.
 
+### Point lookups by `_id` stop scanning the whole collection
+
+Every MongoDB collection has an `_id` index, and looking a document up
+by its `_id` is the single most common read an application makes. In
+SecantusDB that lookup was quietly walking the entire collection: the
+`_id_` index is virtual — the documents table is itself keyed by the
+encoded `_id`, so there's no separate entries table for it — and the
+query planner's index pickers only ever consulted the stored secondary
+indexes. With nothing matching `_id`, every `find({_id: …})` fell back
+to a COLLSCAN that got linearly slower as the collection grew.
+
+`find`, `findOne`, `updateOne`, and `deleteOne` filtered on `_id` now
+take a direct primary-key point lookup on the documents table instead.
+On a 5,000-document collection that turns a 45 ms read into a 0.6 ms
+read — about 74× faster — and the gap widens with collection size.
+`explain` reports the lookup honestly as an `IXSCAN` on the `_id_`
+index. Equality (`{_id: x}`), `{_id: {$eq: x}}`, and `{_id: {$in: […]}}`
+are all accelerated; range, regex, and multi-field filters keep their
+existing routing. The cross-numeric `_id` collision (`1 == 1.0 ==
+Decimal128("1")`) is preserved because the fast path encodes the query
+value with the same `encode_value` used for the stored key.
+
+#### Fixed
+
+- `find` / `findAndModify` / single-document `update` / `delete`
+  filtered on `_id` equality (`{_id: v}`, `{_id: {$eq: v}}`,
+  `{_id: {$in: [...]}}`) now do an O(1) primary-key point lookup on the
+  documents table instead of a COLLSCAN, and `explain` reports `IXSCAN`
+  on the `_id_` index. Discovered with the new `bench/rw_harness.py`
+  concurrent read/write validator, whose interleaved `_id` read-backs
+  collapsed throughput on growing collections.
+
 ## [0.5.2b7] — 2026-05-21
 
 ### Rust driver gauge — 6th conformance gauge alongside the rest
