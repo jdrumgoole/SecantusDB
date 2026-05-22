@@ -218,20 +218,33 @@ def _run_cargo_tests(uri: str) -> tuple[int, str]:
 
 
 _TEST_LINE = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\b")
+_FAILURE_BLOCK = re.compile(r"^---- (\S.+) stdout ----$")
 
 
 def _parse_cargo_output(raw: str) -> dict:
     """Walk cargo test's plain-text output and extract per-test
     pass/fail/ignored outcomes plus the failure-line annotations.
 
-    Cargo's text output is line-oriented; the per-test result lines
-    look like ``test test::client::list_databases ... ok`` or
-    ``... FAILED``. We don't use ``cargo test -- --format json``
-    because the JSON format is unstable nightly-only.
+    Cargo's text output is line-oriented; clean per-test result
+    lines look like ``test test::client::list_databases ... ok``
+    or ``... FAILED``. Tests that print to stdout during running
+    (e.g. unified-spec runners that log per-subtest progress)
+    break the simple matcher because cargo flushes the test's
+    stdout between the ``...`` and the outcome — the outcome may
+    end up on its own line. Cargo also emits a
+    ``---- <name> stdout ----`` block for every FAILED test,
+    which is the authoritative source of truth: we use both, the
+    test-line regex catches the clean cases and the failure-block
+    matcher catches the noisy ones (de-duping by test name so a
+    failure isn't double-counted when both forms appear).
+
+    JSON output (``cargo test -- --format json``) is unstable
+    nightly-only.
     """
     tests: list[dict] = []
     failures: list[dict] = []
     summary = {"passed": 0, "failed": 0, "ignored": 0}
+    seen_names: set[str] = set()
     current_failure: dict | None = None
     in_failure_block = False
     for line in raw.splitlines():
@@ -243,18 +256,24 @@ def _parse_cargo_output(raw: str) -> dict:
                 "FAILED": "failed",
                 "ignored": "ignored",
             }[outcome]
-            tests.append({"name": name, "outcome": outcome_norm})
-            summary[outcome_norm] += 1
+            if name not in seen_names:
+                seen_names.add(name)
+                tests.append({"name": name, "outcome": outcome_norm})
+                summary[outcome_norm] += 1
             continue
-        # Cargo prints a "---- <test_name> stdout ----" header for
-        # each failed test followed by the panic message; capture the
-        # first non-empty line after the header as the failure
-        # summary.
-        if line.startswith("---- ") and line.endswith(" stdout ----"):
+        # ``---- <test_name> stdout ----`` only appears for FAILED
+        # tests. Authoritative for failure detection — counted here
+        # if the inline outcome line was split or missed.
+        fb = _FAILURE_BLOCK.match(line)
+        if fb:
             in_failure_block = True
-            name = line[len("---- ") : -len(" stdout ----")]
+            name = fb.group(1)
             current_failure = {"name": name, "message": ""}
             failures.append(current_failure)
+            if name not in seen_names:
+                seen_names.add(name)
+                tests.append({"name": name, "outcome": "failed"})
+                summary["failed"] += 1
             continue
         if in_failure_block and current_failure is not None:
             stripped = line.strip()
