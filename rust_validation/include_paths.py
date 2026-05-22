@@ -156,6 +156,24 @@ INCLUDE: list[str] = [
     # ----- Spec runners: DNS SRV all topologies -----
     "test::spec::initial_dns_seedlist_discovery::replica_set",
     "test::spec::initial_dns_seedlist_discovery::sharded",
+    # DNS SRV short-domain validation — all pure URI parsing,
+    # client-side only.
+    "test::spec::initial_dns_seedlist_discovery::short_srv_domains_invalid_end",
+    "test::spec::initial_dns_seedlist_discovery::short_srv_domains_invalid_identical",
+    "test::spec::initial_dns_seedlist_discovery::short_srv_domains_invalid_no_dot",
+    "test::spec::initial_dns_seedlist_discovery::short_srv_domains_valid",
+    # ----- Sessions spec -----
+    # SecantusDB tracks logical sessions end-to-end (see
+    # ``SessionRegistry``); the session-spec tests that don't gate
+    # on multi-node topology / transactions pass against our
+    # single-node deployment.
+    "test::spec::sessions::implicit_session_after_connection",
+    "test::spec::sessions::no_cluster_time_in_sdam",
+    "test::spec::sessions::cannot_call_snapshot_time_on_non_snapshot_session",
+    "test::spec::sessions::snapshot_and_causal_consistency_are_mutually_exclusive",
+    "test::spec::sessions::snapshot_time_and_snapshot_false_disallowed",
+    # ----- Handshake unified runner -----
+    "test::spec::handshake::run_unified",
 ]
 
 # Tests excluded with reasons — kept here as documentation for the
