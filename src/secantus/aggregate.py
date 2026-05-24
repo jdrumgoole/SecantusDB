@@ -1601,9 +1601,7 @@ def _stage_change_stream_split_large_event(
     our oplog projection never produces.
     """
     if spec is not None and not isinstance(spec, Mapping):
-        raise AggregateError(
-            "$changeStreamSplitLargeEvent spec must be a document or {}"
-        )
+        raise AggregateError("$changeStreamSplitLargeEvent spec must be a document or {}")
     return docs
 
 

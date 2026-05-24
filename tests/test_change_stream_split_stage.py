@@ -71,9 +71,7 @@ def test_split_stage_pipeline_parses(client) -> None:
     assert resp["cursor"]["firstBatch"] == []
     # Cleanly kill the cursor so the test doesn't leak it.
     if cursor_id != 0:
-        client["css_db"].command(
-            "killCursors", "pipeline_parses", cursors=[cursor_id]
-        )
+        client["css_db"].command("killCursors", "pipeline_parses", cursors=[cursor_id])
 
 
 def test_split_stage_bad_spec_rejected_standalone(client) -> None:
@@ -113,9 +111,7 @@ def test_large_event_actually_splits_into_fragments(client, server) -> None:
     tagged ``{fragment: 1, of: 2}`` and ``{fragment: 2, of: 2}``.
     """
     db = client["split_db"]
-    db.command(
-        "create", "coll", changeStreamPreAndPostImages={"enabled": True}
-    )
+    db.command("create", "coll", changeStreamPreAndPostImages={"enabled": True})
     coll = db["coll"]
     big_pre = "q" * (10 * 1024 * 1024)
     big_post = "z" * (10 * 1024 * 1024)
