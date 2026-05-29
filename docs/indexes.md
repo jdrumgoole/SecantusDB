@@ -86,6 +86,42 @@ correctly uses the index.
 Conservative: operator-form clauses or document-level operators (`$or`,
 `$expr`, ...) in the partial filter aren't recognised as implied.
 
+### Sparse indexes and `$exists`
+
+`sparse=True` is honoured at write time: a doc that is **missing** the
+indexed field contributes no entry. A field that is present but `null`
+still gets one — sparse keys on field *presence*, not value, matching
+`mongod`.
+
+```python
+coll.create_index("phone", sparse=True)   # only docs with a `phone` get an entry
+```
+
+The semantics that matter at query time — and where the engines diverge:
+
+- **MongoDB** can serve `{field: {$exists: true}}` from a **sparse** index
+  (or, equivalently in modern MongoDB, a partial index whose filter is
+  `{field: {$exists: true}}`) at IXSCAN — the sparse index *is* exactly the
+  set of docs that have the field. A **non-sparse** index, or no index at
+  all, forces a COLLSCAN for `$exists: true`: a normal index carries an
+  entry for every doc, so it can't separate "has the field" from "doesn't".
+  `{field: {$exists: false}}` **never** uses a sparse index (the matching
+  docs are precisely the ones a sparse index omits) — always a COLLSCAN.
+- **Other DocumentDB-compatible engines** (Amazon DocumentDB and similar)
+  are stricter: a sparse index is the *only* way to get index acceleration
+  for `$exists: true`, and `$exists` belongs to a family of operators
+  (`$ne` / `$nin` / `$nor` / `$not` / `$exists` / `$elemMatch`) that
+  otherwise never use an index at all. Drop the `$exists` clause and the
+  sparse index goes unused even for queries on the same field.
+
+**SecantusDB today:** sparse entries are written and pruned correctly, but
+the query planner does not yet route `$exists: true` through a sparse index
+— it falls back to a COLLSCAN + `matches()`. Results are correct; the
+IXSCAN fast-path is the gap (see [What's still missing](#whats-still-missing)).
+
+> Background: Franck Pachot, ["`$exists` and non-sparse indexes in MongoDB
+> and in other DocumentDB"](https://dev.to/franckpachot/exists-and-non-sparse-indexes-in-mongodb-and-in-other-documentdb-19e3).
+
 ### Multikey fallback
 
 SecantusDB doesn't yet support per-element multikey indexing. Instead,
@@ -312,6 +348,13 @@ list(coll.find().sort("name", 1))   # COLLSCAN
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
   cadence sweeper. Real mongod runs one; for an in-process test
   surrogate the explicit-call ergonomics suit the audience better.
+- **`$exists: true` IXSCAN via a sparse index** — `mongod` serves
+  `{f: {$exists: true}}` from a sparse (or `$exists`-partial) index;
+  SecantusDB writes the sparse entries but the planner doesn't yet pick
+  the index for `$exists`, so it COLLSCANs. Correct results, missing
+  fast-path. (DocumentDB-style engines make the sparse index the *only*
+  index path for `$exists: true` — see [Sparse indexes and
+  `$exists`](#sparse-indexes-and-exists).)
 - **Text / hashed indexes** — out of scope (no full-text engine; no
   practical workload pulling hashed shard-key behaviour into an
   in-process surrogate).
