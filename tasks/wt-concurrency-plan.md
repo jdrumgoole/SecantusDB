@@ -240,6 +240,84 @@ For SecantusDB's "single-process embeddable test surrogate" niche, option 1 (wai
 
 **Spike artefact kept**: `bench/profile_insert.py` is now a permanent diagnostic. Re-run it whenever someone asks "why isn't this faster?" — the answer will almost certainly still be in `wiredtiger/packing.py`.
 
+#### Phase 2.7 spike (planned) — free-threaded Python feasibility
+
+**Question this spike answers:** is free-threaded CPython (3.13t / 3.14t) a viable
+path to lifting the GIL ceiling for SecantusDB, or is the vendored WiredTiger SWIG
+binding a hard blocker? Answer with *measurements*, not speculation, before anyone
+commits to the multi-week binding work in Phase 2.6 option 2.
+
+**Why this is newly attractive (and why the Phase 2.4 pessimism was overstated).**
+The Phase 2.6 profile shows the insert hot path is dominated by **pure-Python** code:
+~30% `wiredtiger/packing.py:unpack`, ~26% the bson decode wrapper, ~24%+~21% SWIG
+`get_keys`/`get_values`. Under the GIL that Python time is unparallelizable — the
+reason Phase 2.4 concluded "don't bother." Under a *free-threaded* build the same
+pure-Python time runs on multiple cores. So the very property that makes us slow
+today (most of the hot path is Python, not GIL-released C) is what makes us a
+*good* free-threading candidate — **if** the GIL actually stays off at runtime.
+
+**The blocker, stated precisely.** In free-threaded CPython, importing any C
+extension that does not declare `Py_MOD_GIL_NOT_USED` causes the interpreter to
+**silently re-enable the GIL at import time**. Our import graph pulls in several
+native modules, each of which must be free-threading-aware or the whole effort is
+a no-op:
+
+- **Vendored WiredTiger SWIG binding** (`vendor/wiredtiger/lang/python`,
+  mongodb-7.0.33) — the load-bearing unknown. SWIG-generated modules don't emit the
+  GIL-not-required slot unless built for it, and the binding needs a thread-safety
+  audit (our per-thread `threading.local()` WT sessions help; SWIG module-global
+  state needs checking). The slot, once we decide it's safe, would be injected the
+  same way every other WT build fix is — a new idempotent patcher alongside
+  `cmake/patch_wt_python.py` (which already rewrites the SWIG `CMakeLists.txt` at
+  `PATCH_COMMAND` time), **not** by editing the submodule.
+- **bson / pymongo `_cbson`**, **shapely**, **s2sphere** — need free-threaded wheels
+  (or sdists that build ft-aware). shapely/s2sphere are geo-path only but still
+  imported at startup, so they count.
+
+**Spike steps (timeboxed, ~2 days, no production change):**
+
+- [ ] **Measure the GIL state, don't assume it.** Add a throwaway
+  `bench/check_freethread.py` that asserts `sys._is_gil_enabled() is False` after
+  `import secantus` (and after importing the WT binding directly). This is the
+  single most important output — it's easy to *think* you're free-threaded while a
+  stray import flipped the GIL back on.
+- [ ] **Does the binding even build for cp313t?** Add `cp313t-*` (and `cp314t-*`
+  once available) to a *scratch* `tool.cibuildwheel` `build` matrix (today it's
+  `cp310-* cp311-* cp312-* cp313-*` — no free-threaded targets) and run the WT
+  CMake/SWIG build under a free-threaded interpreter locally first. Capture whether
+  SWIG + scikit-build-core produce a loadable `_wiredtiger` against the `t` ABI.
+- [ ] **Inspect the slot.** Check whether the built `_wiredtiger` extension declares
+  free-threading support (it almost certainly won't). If not, prototype the
+  `Py_MOD_GIL_NOT_USED` patch in a `cmake/patch_wt_freethread.py` and re-measure
+  `sys._is_gil_enabled()`. Treat a passing assertion here as the spike's go/no-go.
+- [ ] **Re-run `bench/concurrency.py` under the ft build** (N=1,2,4,8). If the GIL is
+  genuinely off and the binding is stable, the pure-Python hot path should finally
+  parallelize — this is the number that decides whether Phase 2.6 option 2 is worth
+  funding. If the binding silently re-enables the GIL, the ratio stays flat and the
+  spike has cheaply proven the blocker is real.
+- [ ] **Smoke the native stack for crashes.** Run the existing pymongo smoke +
+  `tests/test_geo*.py` under the ft build to surface thread-safety faults in bson /
+  shapely / s2sphere (segfaults, not just slowness).
+
+**Dependency on Phase 2.** This spike is only meaningful *after* (or alongside) the
+Phase 2 lock decomposition — while `Storage._lock` still serialises every public
+method, Python-level serialisation masks any GIL win. Order: shrink/decompose the
+lock first, then measure free-threading. The lock work has standalone value (cleaner
+architecture, kills the WT-rollback storm) and is the prerequisite that makes the
+no-GIL measurement honest.
+
+**Exit criterion / decision:** a committed `bench/check_freethread.py` + concurrency
+numbers under cp313t, and a one-paragraph verdict appended here: either "free-threading
+lifts the ceiling, fund the binding audit" or "WT binding re-enables the GIL, free-threading
+is blocked until upstream/WT ships ft-aware bindings." Either outcome retires the open
+question cheaply.
+
+**Note on plain newer CPython.** A stock, GIL-enabled 3.13/3.14 is explicitly *not*
+this spike — it cannot help (the ceiling is the GIL itself, not interpreter speed).
+Only the free-threaded build changes the physics. Bumping `.python-version` /
+`requires-python` without the `t` ABI and the binding work buys nothing for write
+concurrency.
+
 ### Phase 3 — WT explicit transactions per write batch (already done)
 
 The `Storage._batch_transaction()` context manager from a prior commit is already in place around `insert`/`update_matching`/`delete_matching`. Phase 2 keeps it; no new work here. Listing it for completeness in the plan.
