@@ -12,8 +12,10 @@
 //! flow (`$cond`/`$ifNull`/`$switch`); arithmetic (`$add`/`$subtract`/
 //! `$multiply`/`$divide`/`$mod`); array ops (`$size`/`$arrayElemAt`/`$first`/
 //! `$last`/`$concatArrays`/`$reverseArray`/`$in`/`$slice`/`$indexOfArray`);
-//! ASCII string ops (`$concat`/`$toLower`/`$toUpper`/`$strLenCP`/`$split`/
-//! `$substrCP`); object ops (`$mergeObjects`/`$objectToArray`); the
+//! string ops (`$concat`/`$toLower`/`$toUpper`/`$strLenCP`/`$strLenBytes`/
+//! `$split`/`$substrCP`/`$substrBytes`/`$indexOfCP`/`$indexOfBytes`/`$trim`/
+//! `$ltrim`/`$rtrim` — ASCII case only, explicit-chars trim only); object ops
+//! (`$mergeObjects`/`$objectToArray`); the
 //! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; UTC date component
 //! extractors (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/
 //! `$dayOfWeek`) + `$dateToParts`; a safe subset of conversions (`$toInt`/
@@ -176,6 +178,12 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$strLenCP" => op_str_len_cp(arg, ctx),
         "$split" => op_split(arg, ctx),
         "$substrCP" | "$substr" => op_substr_cp(arg, ctx),
+        "$substrBytes" => op_substr_bytes(arg, ctx),
+        "$indexOfCP" => op_index_of(arg, ctx, false),
+        "$indexOfBytes" => op_index_of(arg, ctx, true),
+        "$trim" => op_trim(arg, ctx, TrimSide::Both),
+        "$ltrim" => op_trim(arg, ctx, TrimSide::Left),
+        "$rtrim" => op_trim(arg, ctx, TrimSide::Right),
         // objects
         "$mergeObjects" => op_merge_objects(arg, ctx),
         "$objectToArray" => op_object_to_array(arg, ctx),
@@ -1164,6 +1172,154 @@ fn op_str_len_bytes(arg: &Bson, ctx: &Ctx) -> R {
         Bson::String(s) => Ok(Bson::Int32(s.len() as i32)), // UTF-8 byte length
         _ => Err(Fallback),
     }
+}
+
+// --- string index / substr / trim --------------------------------------
+
+fn find_slice<T: PartialEq>(hay: &[T], needle: &[T]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()] == *needle)
+}
+
+/// Emulate Python `str.find(sub, start, end)` (or `bytes.find`). CPython's
+/// `adjust_indices` clamps `end` to `[0, len]` but only floors `start` at 0 —
+/// it is NOT capped at `len` (unlike slice indexing), so `start > end` (incl.
+/// `start > len`) yields -1 even for an empty needle. The match must lie within
+/// `[start, end)`; the result is an index in the original sequence (or -1).
+fn index_of_window<T: PartialEq>(hay: &[T], needle: &[T], start: i64, end: i64) -> i32 {
+    let n = hay.len() as i64;
+    let e = if end > n {
+        n
+    } else if end < 0 {
+        (end + n).max(0)
+    } else {
+        end
+    };
+    let s = if start < 0 { (start + n).max(0) } else { start };
+    if s > e {
+        return -1; // empty/invalid window -> not found (matches CPython)
+    }
+    match find_slice(&hay[s as usize..e as usize], needle) {
+        Some(r) => (s + r as i64) as i32,
+        None => -1,
+    }
+}
+
+fn op_index_of(arg: &Bson, ctx: &Ctx, bytes: bool) -> R {
+    let Bson::Array(a) = arg else {
+        return Err(Fallback);
+    };
+    if !(2..=4).contains(&a.len()) {
+        return Err(Fallback);
+    }
+    let s = eval(&a[0], ctx)?;
+    if is_null(&s) {
+        return Ok(Bson::Null);
+    }
+    let (Bson::String(s), Bson::String(needle)) = (s, eval(&a[1], ctx)?) else {
+        return Err(Fallback); // non-string operands -> Python raises
+    };
+    let len = if bytes { s.len() } else { s.chars().count() } as i64;
+    // start/end: Python isinstance(int) (incl bool); non-int -> -1.
+    let bound = |idx: usize, default: i64, ctx: &Ctx| -> Result<Option<i64>, Fallback> {
+        if a.len() <= idx {
+            return Ok(Some(default));
+        }
+        Ok(slice_int(&eval(&a[idx], ctx)?))
+    };
+    let (Some(start), Some(end)) = (bound(2, 0, ctx)?, bound(3, len, ctx)?) else {
+        return Ok(Bson::Int32(-1));
+    };
+    let idx = if bytes {
+        index_of_window(s.as_bytes(), needle.as_bytes(), start, end)
+    } else {
+        let hay: Vec<char> = s.chars().collect();
+        let nd: Vec<char> = needle.chars().collect();
+        index_of_window(&hay, &nd, start, end)
+    };
+    Ok(Bson::Int32(idx))
+}
+
+fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Array(a) = arg else {
+        return Err(Fallback);
+    };
+    if a.len() != 3 {
+        return Err(Fallback);
+    }
+    let s = eval(&a[0], ctx)?;
+    if is_null(&s) {
+        return Ok(Bson::String(String::new()));
+    }
+    let Bson::String(s) = s else {
+        return Err(Fallback);
+    };
+    let (Some(start), Some(length)) =
+        (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
+    else {
+        return Err(Fallback);
+    };
+    let bytes = s.as_bytes();
+    let blen = bytes.len() as i64;
+    let stop = if length < 0 {
+        blen
+    } else {
+        start.saturating_add(length)
+    };
+    let (s_i, e_i) = (norm_index(start, blen), norm_index(stop, blen));
+    let slice: &[u8] = if s_i >= e_i {
+        &[]
+    } else {
+        &bytes[s_i as usize..e_i as usize]
+    };
+    // Python decodes with errors='replace'; we only handle clean UTF-8 and defer
+    // on a broken boundary (replacement granularity can differ from Python's).
+    match std::str::from_utf8(slice) {
+        Ok(st) => Ok(Bson::String(st.to_string())),
+        Err(_) => Err(Fallback),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TrimSide {
+    Both,
+    Left,
+    Right,
+}
+
+fn op_trim(arg: &Bson, ctx: &Ctx, side: TrimSide) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let input = eval_opt(d.get("input"), ctx)?;
+    if is_null(&input) {
+        return Ok(Bson::Null);
+    }
+    let Bson::String(s) = input else {
+        return Err(Fallback); // non-string input -> Python raises
+    };
+    // Only the explicit `chars`-string form is reproduced; the default
+    // whitespace strip (Python `str.strip()`) defers — Python's whitespace set
+    // differs from Rust's at the edges (e.g. U+001C..U+001F).
+    let chars = match d.get("chars") {
+        Some(e) => eval(e, ctx)?,
+        None => return Err(Fallback),
+    };
+    let Bson::String(chars) = chars else {
+        return Err(Fallback);
+    };
+    let pat = |c: char| chars.contains(c);
+    let trimmed = match side {
+        TrimSide::Both => s.trim_matches(pat),
+        TrimSide::Left => s.trim_start_matches(pat),
+        TrimSide::Right => s.trim_end_matches(pat),
+    };
+    Ok(Bson::String(trimmed.to_string()))
 }
 
 fn op_array_to_object(arg: &Bson, ctx: &Ctx) -> R {

@@ -202,6 +202,23 @@ CURATED = [
     ({"$arrayToObject": [["x", 1], ["y", 2]]}, {}),
     ({"$arrayToObject": "$pairs"}, {"pairs": [{"k": "n", "v": 9}]}),
     ({"$arrayToObject": [{"k": 1, "v": 2}]}, {}),  # non-string key -> defer
+    # String index / substr / trim.
+    ({"$indexOfCP": ["abcabc", "bc"]}, {}),
+    ({"$indexOfCP": ["abcabc", "bc", 2]}, {}),
+    ({"$indexOfCP": ["abc", "x"]}, {}),
+    ({"$indexOfCP": ["héllo", "llo"]}, {}),  # codepoint index 2
+    ({"$indexOfCP": ["$s", "x"]}, {}),  # missing -> null
+    ({"$indexOfBytes": ["héllo", "llo"]}, {}),  # byte index 3 (é is 2 bytes)
+    ({"$indexOfBytes": ["abcabc", "c", 3, 6]}, {}),
+    ({"$substrBytes": ["hello", 1, 3]}, {}),
+    ({"$substrBytes": ["héllo", 0, 1]}, {}),  # "h"
+    ({"$substrBytes": ["héllo", 1, 1]}, {}),  # splits é -> invalid utf8 -> defer
+    ({"$trim": {"input": "  xx  ", "chars": " "}}, {}),
+    ({"$trim": {"input": "xxhixx", "chars": "x"}}, {}),
+    ({"$ltrim": {"input": "xxhi", "chars": "x"}}, {}),
+    ({"$rtrim": {"input": "hixx", "chars": "x"}}, {}),
+    ({"$trim": {"input": "$s"}}, {"s": "  hi  "}),  # default whitespace -> defer
+    ({"$trim": {"input": "$s", "chars": " "}}, {"s": None}),  # null input -> null
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
@@ -308,6 +325,36 @@ def test_date_extractor_fuzz():
                 continue
             py = _pure.evaluate(expr, doc)
             assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+
+
+def test_string_index_fuzz():
+    """$indexOfCP / $indexOfBytes / $substrBytes / $substrCP over random strings
+    (incl. multibyte) and random start/end/length, against Python where the Rust
+    path doesn't defer (broken-UTF-8 substrBytes boundaries defer)."""
+    rng = random.Random(0x57B1)
+    alphabet = "abcé😀z "
+    for _ in range(6000):
+        s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
+        needle = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 2)))
+        lo, hi = rng.randint(-6, 10), rng.randint(-6, 10)
+        expr = rng.choice([
+            {"$indexOfCP": [s, needle]},
+            {"$indexOfCP": [s, needle, lo]},
+            {"$indexOfCP": [s, needle, lo, hi]},
+            {"$indexOfBytes": [s, needle]},
+            {"$indexOfBytes": [s, needle, lo, hi]},
+            {"$substrBytes": [s, lo, hi]},
+            {"$substrCP": [s, lo, hi]},
+        ])
+        expr = bson.decode(bson.encode({"e": expr}))["e"]
+        rust = _rust_eval(expr, {})
+        if rust is None:
+            continue
+        try:
+            py = _pure.evaluate(expr, {})
+        except Exception:
+            pytest.fail(f"rust={rust!r} but pure raised; expr={expr}")
+        assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
 
 
 def test_math_and_range_fuzz():

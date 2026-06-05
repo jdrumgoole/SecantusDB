@@ -208,11 +208,12 @@ never "remove Python."
   arithmetic); `$round`/`$pow`/`$trunc` (rounding mode) and transcendental math
   (`$exp`/`$ln`/`$log`/`$log10` — last-ULP divergence risk vs Python's libm);
   the conversion edges deferred above (Decimal128, string→number parsing, float
-  `str()`, `$convert`/`$toDecimal`); byte/CP string index ops
-  (`$indexOfBytes`/`$indexOfCP`/`$substrBytes`); `$trim*`; `$getField`/
-  `$setField`; `$zip`/`$sortArray`; and non-ASCII case (`$toLower`/`$toUpper`
-  defer on non-ASCII for Unicode-fidelity safety). Regex ops (`$regexMatch`/…)
-  need Python `re`.
+  `str()`, `$convert`/`$toDecimal`); `$getField`/`$setField`; `$zip`/
+  `$sortArray` (sortArray uses Python `sorted()` ordering/stability + raises on
+  mixed types); and non-ASCII case / default-whitespace `$trim` (defer for
+  Unicode-fidelity safety). Regex ops (`$regexMatch`/…) need Python `re`. Done
+  this round: `$indexOfCP`/`$indexOfBytes`/`$substrBytes`/`$strLenBytes`/
+  `$trim`/`$ltrim`/`$rtrim` (explicit-chars).
 - [x] **Phase 1, leaf engine #5: `projection.apply_projection`** — inclusion /
   exclusion / `$slice` / `$elemMatch` projection shapes ported to Rust
   (`crates/secantus-core/src/projection.rs`). `secantus.projection` delegates
