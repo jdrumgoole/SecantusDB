@@ -194,7 +194,24 @@ never "remove Python."
   **This also unlocked `$expr` in the Rust query matcher** (it now calls the Rust
   evaluator directly, Rust->Rust) — `query_matches` gained a `vars` arg threaded
   through `$expr`.
-- [ ] **Widen the Rust expression evaluator** — now also handled:
+- [x] **Date arithmetic** — `$dateAdd`/`$dateSubtract`/`$dateDiff`/`$dateTrunc`
+  ported via dependency-free civil-date math (`days_from_civil` inverse +
+  `days_in_month`), UTC, bounded to Python's datetime range (out-of-range
+  defers). The 8000-case date fuzz caught two real Python-semantics quirks:
+  `$dateDiff second` truncates toward zero (`int(total_seconds())`) while
+  hour/minute floor (`// n`), and `$dateTrunc` truncates the *field* (keeping
+  higher fields) not the total-since-midnight.
+- [ ] **Remaining expression operators are principled defers** (cannot be
+  reproduced without a fidelity risk; all run pure-Python): regex
+  (`$regexMatch`/`$regexFind`/`$regexFindAll` — Python `re`);
+  `$dateToString`/`$dateFromString` (`strftime`/`strptime` + timezones);
+  `$convert`/`$toDecimal` and float-`str()` / string→number / Decimal128
+  conversion edges; `$round`/`$pow`/`$trunc` (rounding mode) and the
+  transcendentals `$exp`/`$ln`/`$log`/`$log10` (last-ULP vs Python's libm);
+  `$sortArray` (Python `sorted()` ordering/stability, raises on mixed types);
+  `$rand` (non-deterministic); non-ASCII `$toLower`/`$toUpper` and
+  default-whitespace `$trim`. Each is a deliberate fallback, not a gap.
+- [x] **Widen the Rust expression evaluator** — now also handled:
   `$slice`/`$indexOfArray`; ASCII `$concat`/`$toLower`/`$toUpper`/`$strLenCP`/
   `$split`/`$substrCP`; `$mergeObjects`/`$objectToArray`; the scope-introducing
   `$let`/`$map`/`$filter`/`$reduce`; and UTC date component extractors

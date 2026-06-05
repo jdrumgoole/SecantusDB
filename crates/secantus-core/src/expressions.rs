@@ -18,12 +18,21 @@
 //! (`$mergeObjects`/`$objectToArray`/`$getField`/`$setField`); `$zip`; the
 //! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; UTC date component
 //! extractors (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/
-//! `$dayOfWeek`) + `$dateToParts`; a safe subset of conversions (`$toInt`/
-//! `$toDouble`/`$toBool`/`$toString` for numbers/bools/strings); exactly-
-//! deterministic math (`$abs`/`$floor`/`$ceil`/`$sqrt`); and `$range`/
-//! `$strLenBytes`/`$arrayToObject`. Everything else (heavier date ops, regex,
-//! `$convert`/`$toDecimal`, `$round`/`$pow`/transcendental math, Decimal128 /
-//! string-parse / float-str() conversion edges, non-ASCII case) -> Python.
+//! `$dayOfWeek`) + `$dateToParts`; date arithmetic (`$dateAdd`/`$dateSubtract`/
+//! `$dateDiff`/`$dateTrunc` — UTC, dependency-free calendar math); a safe subset
+//! of conversions (`$toInt`/`$toDouble`/`$toBool`/`$toString` for numbers/bools/
+//! strings); exactly-deterministic math (`$abs`/`$floor`/`$ceil`/`$sqrt`); and
+//! `$range`/`$strLenBytes`/`$arrayToObject`.
+//!
+//! The remaining operators are *principled* defers — they can't be reproduced
+//! without a fidelity risk: regex (`$regexMatch`/…) needs Python's `re`;
+//! `$dateToString`/`$dateFromString` need `strftime`/`strptime` + timezones;
+//! `$convert`/`$toDecimal` + float-`str()` / string-parse / Decimal128
+//! conversions; `$round`/`$pow`/`$trunc` (rounding mode) and transcendentals
+//! (`$exp`/`$ln`/`$log`/`$log10` — last-ULP) risk float divergence; `$sortArray`
+//! depends on Python's `sorted()` ordering/stability; `$rand` is
+//! non-deterministic; and non-ASCII case / default-whitespace trim. All defer
+//! to the authoritative pure-Python evaluator.
 
 use std::cmp::Ordering;
 
@@ -203,6 +212,11 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$minute" => date_part(arg, ctx, DatePart::Minute),
         "$second" => date_part(arg, ctx, DatePart::Second),
         "$dayOfWeek" => date_part(arg, ctx, DatePart::DayOfWeek),
+        // date arithmetic (UTC; no timezone arg form)
+        "$dateAdd" => op_date_add(arg, ctx, 1),
+        "$dateSubtract" => op_date_add(arg, ctx, -1),
+        "$dateDiff" => op_date_diff(arg, ctx),
+        "$dateTrunc" => op_date_trunc(arg, ctx),
         // type conversions (safe subset; Decimal128 / string-parse / float
         // str() defer to Python)
         "$toInt" => op_to_int(arg, ctx),
@@ -1100,6 +1114,226 @@ fn date_part(arg: &Bson, ctx: &Ctx, part: DatePart) -> R {
         }
     };
     Ok(Bson::Int32(value as i32))
+}
+
+// --- date arithmetic ($dateAdd / $dateSubtract / $dateDiff / $dateTrunc) -
+
+/// Inverse of `civil_from_days` (Howard Hinnant): days since 1970-01-01 for a
+/// proleptic-Gregorian (year, month, day).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap(y) => 29,
+        _ => 28,
+    }
+}
+
+// Python `datetime` range in BSON milliseconds: [0001-01-01, 9999-12-31
+// 23:59:59.999]. Date arithmetic landing outside defers to Python (which raises
+// OverflowError / ValueError).
+const DATETIME_MIN_MS: i64 = -62_135_596_800_000;
+const DATETIME_MAX_MS: i64 = 253_402_300_799_999;
+
+fn bounded_datetime(millis: i128) -> R {
+    if (DATETIME_MIN_MS as i128..=DATETIME_MAX_MS as i128).contains(&millis) {
+        Ok(Bson::DateTime(bson::DateTime::from_millis(millis as i64)))
+    } else {
+        Err(Fallback)
+    }
+}
+
+fn shift_ms(start: i64, amount: i128, unit_ms: i128) -> R {
+    bounded_datetime(start as i128 + amount * unit_ms)
+}
+
+fn add_months(start: i64, months: i128) -> R {
+    let days = start.div_euclid(86_400_000);
+    let ms_of_day = start.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    let total = (m - 1) as i128 + months;
+    let new_year = y as i128 + total.div_euclid(12);
+    let new_month = total.rem_euclid(12) + 1; // [1, 12]
+    if !(1..=9999).contains(&new_year) {
+        return Err(Fallback); // Python datetime year out of range
+    }
+    let last = days_in_month(new_year as i64, new_month as i64);
+    let new_day = d.min(last);
+    let new_days = days_from_civil(new_year as i64, new_month as i64, new_day);
+    bounded_datetime(new_days as i128 * 86_400_000 + ms_of_day as i128)
+}
+
+/// `_shift_date`: positive `amount` adds; an unsupported unit defers.
+fn shift_date(start: i64, unit: &str, amount: i128) -> R {
+    match unit {
+        "year" => add_months(start, amount * 12),
+        "quarter" => add_months(start, amount * 3),
+        "month" => add_months(start, amount),
+        "week" => shift_ms(start, amount, 604_800_000),
+        "day" => shift_ms(start, amount, 86_400_000),
+        "hour" => shift_ms(start, amount, 3_600_000),
+        "minute" => shift_ms(start, amount, 60_000),
+        "second" => shift_ms(start, amount, 1000),
+        "millisecond" => shift_ms(start, amount, 1),
+        _ => Err(Fallback),
+    }
+}
+
+/// `$dateAdd` (sign +1) / `$dateSubtract` (sign -1).
+fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let start = eval_opt(d.get("startDate"), ctx)?;
+    let amount_v = eval_opt(d.get("amount"), ctx)?;
+    if is_null(&start) || is_null(&amount_v) {
+        return Ok(Bson::Null);
+    }
+    let Bson::DateTime(start_dt) = start else {
+        return Err(Fallback); // not a datetime -> Python raises
+    };
+    let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
+        return Err(Fallback); // unit must be a string
+    };
+    let Some(amount) = as_int_like(&amount_v) else {
+        return Err(Fallback); // amount must be an integer
+    };
+    shift_date(start_dt.timestamp_millis(), &unit, sign * amount)
+}
+
+fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let start = eval_opt(d.get("startDate"), ctx)?;
+    let end = eval_opt(d.get("endDate"), ctx)?;
+    if is_null(&start) || is_null(&end) {
+        return Ok(Bson::Null);
+    }
+    let (Bson::DateTime(s), Bson::DateTime(e)) = (start, end) else {
+        return Err(Fallback);
+    };
+    let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
+        return Err(Fallback);
+    };
+    let (sm, em) = (s.timestamp_millis(), e.timestamp_millis());
+    let (sy, smo, sd) = civil_from_days(sm.div_euclid(86_400_000));
+    let (ey, emo, ed) = civil_from_days(em.div_euclid(86_400_000));
+    let dms = (em - sm) as i128;
+    let value: i128 = match unit.as_str() {
+        "year" => (ey - sy - i64::from((emo, ed) < (smo, sd))) as i128,
+        "quarter" => {
+            let (sq, eq) = ((smo - 1) / 3, (emo - 1) / 3);
+            ((ey - sy) * 4 + (eq - sq)) as i128
+        }
+        "month" => ((ey - sy) * 12 + (emo - smo) - i64::from(ed < sd)) as i128,
+        // Python uses `delta.days` / `total_seconds() // n` (floor) for
+        // day/week/hour/minute, but `int(total_seconds())` (truncate toward
+        // zero) for second and `int(total_seconds()*1000)` (== dms) for ms.
+        "day" => dms.div_euclid(86_400_000),
+        "week" => dms.div_euclid(86_400_000).div_euclid(7),
+        "hour" => dms.div_euclid(3_600_000),
+        "minute" => dms.div_euclid(60_000),
+        "second" => dms / 1000, // truncate toward zero
+        "millisecond" => dms,
+        _ => return Err(Fallback),
+    };
+    int_to_bson(value).ok_or(Fallback)
+}
+
+fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let date = eval_opt(d.get("date"), ctx)?;
+    if is_null(&date) {
+        return Ok(Bson::Null);
+    }
+    let Bson::DateTime(dt) = date else {
+        return Err(Fallback);
+    };
+    let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
+        return Err(Fallback);
+    };
+    let bin: i64 = match d.get("binSize") {
+        Some(e) => match as_int_like(&eval(e, ctx)?) {
+            Some(n) if n >= 1 => n as i64,
+            _ => return Err(Fallback), // binSize must be a positive integer
+        },
+        None => 1,
+    };
+    let millis = dt.timestamp_millis();
+    let days = millis.div_euclid(86_400_000);
+    let ms_of_day = millis.rem_euclid(86_400_000);
+    let (y, m, _d) = civil_from_days(days);
+    let result: i128 = match unit.as_str() {
+        "year" => {
+            let ny = y - (y - 1).rem_euclid(bin);
+            days_from_civil(ny, 1, 1) as i128 * 86_400_000
+        }
+        "quarter" => {
+            let qi = (m - 1) / 3;
+            let qi = qi - qi.rem_euclid(bin);
+            days_from_civil(y, qi * 3 + 1, 1) as i128 * 86_400_000
+        }
+        "month" => {
+            let nm = m - (m - 1).rem_euclid(bin);
+            days_from_civil(y, nm, 1) as i128 * 86_400_000
+        }
+        "week" => {
+            let epoch = days_from_civil(1970, 1, 5); // a Monday
+            let wd = (days - epoch).div_euclid(7);
+            let wd = wd - wd.rem_euclid(bin);
+            (epoch as i128 + wd as i128 * 7) * 86_400_000
+        }
+        "day" => {
+            let dd = days - days.rem_euclid(bin);
+            dd as i128 * 86_400_000
+        }
+        // Python truncates the *field* (keeping the higher fields) via
+        // date.replace, not the total count since midnight.
+        "hour" => {
+            let hf = ms_of_day / 3_600_000;
+            let nh = hf - hf % bin;
+            days as i128 * 86_400_000 + nh as i128 * 3_600_000
+        }
+        "minute" => {
+            let hf = ms_of_day / 3_600_000;
+            let mf = (ms_of_day / 60_000) % 60;
+            let nm = mf - mf % bin;
+            days as i128 * 86_400_000 + hf as i128 * 3_600_000 + nm as i128 * 60_000
+        }
+        "second" => {
+            let hf = ms_of_day / 3_600_000;
+            let mf = (ms_of_day / 60_000) % 60;
+            let sf = (ms_of_day / 1000) % 60;
+            let ns = sf - sf % bin;
+            days as i128 * 86_400_000
+                + hf as i128 * 3_600_000
+                + mf as i128 * 60_000
+                + ns as i128 * 1000
+        }
+        "millisecond" => {
+            let sub = ms_of_day % 1000;
+            (millis - (sub % bin)) as i128
+        }
+        _ => return Err(Fallback),
+    };
+    bounded_datetime(result)
 }
 
 // --- type conversions ---------------------------------------------------

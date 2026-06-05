@@ -61,6 +61,11 @@ def _rust_eval(expr, doc, vars=None):
 
 
 _DT = datetime.datetime(2026, 6, 5, 12, 34, 56, tzinfo=datetime.timezone.utc)
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _mkdate(ms):
+    return _EPOCH + datetime.timedelta(milliseconds=ms)
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
@@ -236,6 +241,27 @@ CURATED = [
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True,
                "defaults": [0, 0]}}, {}),
     ({"$zip": {"inputs": "$x"}}, {}),  # missing -> null inputs -> null
+    # Date arithmetic.
+    ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 5}}, {"d": _DT}),
+    ({"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}}, {"d": _DT}),
+    ({"$dateAdd": {"startDate": "$d", "unit": "year", "amount": 1}}, {"d": _DT}),
+    # Jan 31 + 1 month clamps to Feb 28
+    ({"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}},
+     {"d": datetime.datetime(2026, 1, 31, tzinfo=datetime.timezone.utc)}),
+    ({"$dateAdd": {"startDate": "$x", "unit": "day", "amount": 5}}, {}),  # null -> null
+    ({"$dateSubtract": {"startDate": "$d", "unit": "hour", "amount": 3}}, {"d": _DT}),
+    ({"$dateSubtract": {"startDate": "$d", "unit": "month", "amount": 2}}, {"d": _DT}),
+    ({"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "day"}},
+     {"a": _DT, "b": _mkdate(_DT.timestamp() * 1000 + 3 * 86_400_000)}),
+    ({"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "year"}},
+     {"a": datetime.datetime(2020, 6, 5, tzinfo=datetime.timezone.utc), "b": _DT}),
+    ({"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "month"}},
+     {"a": datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc), "b": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "hour"}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "month"}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "week"}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "year", "binSize": 5}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "minute", "binSize": 15}}, {"d": _DT}),
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
@@ -342,6 +368,40 @@ def test_date_extractor_fuzz():
                 continue
             py = _pure.evaluate(expr, doc)
             assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+
+
+def test_date_arithmetic_fuzz():
+    """$dateAdd/$dateSubtract/$dateDiff/$dateTrunc over random instants, units,
+    amounts and binSizes, against Python (calendar + delta arithmetic)."""
+    rng = random.Random(0xDA7EA)
+    units = ["year", "quarter", "month", "week", "day", "hour", "minute",
+             "second", "millisecond"]
+    # ~ year 1950..2200, so add/subtract stays well within datetime range.
+    lo, hi = -631_152_000_000, 7_258_118_400_000
+    for _ in range(8000):
+        d1 = _mkdate(rng.randint(lo, hi))
+        d2 = _mkdate(rng.randint(lo, hi))
+        unit = rng.choice(units)
+        kind = rng.choice(["add", "sub", "diff", "trunc"])
+        amt = rng.randint(-500, 500)
+        if kind == "add":
+            expr = {"$dateAdd": {"startDate": "$a", "unit": unit, "amount": amt}}
+        elif kind == "sub":
+            expr = {"$dateSubtract": {"startDate": "$a", "unit": unit, "amount": amt}}
+        elif kind == "diff":
+            expr = {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": unit}}
+        else:
+            expr = {"$dateTrunc": {"date": "$a", "unit": unit, "binSize": rng.randint(1, 7)}}
+        doc = bson.decode(bson.encode({"a": d1, "b": d2}))
+        expr = bson.decode(bson.encode({"e": expr}))["e"]
+        rust = _rust_eval(expr, doc)
+        if rust is None:
+            continue
+        try:
+            py = _pure.evaluate(expr, doc)
+        except Exception:
+            pytest.fail(f"rust={rust!r} but pure raised; expr={expr} a={d1} b={d2}")
+        assert rust == py, f"rust={rust!r} pure={py!r} expr={expr} a={d1} b={d2}"
 
 
 def test_zip_fuzz():
