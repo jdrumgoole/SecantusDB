@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import copy
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import bson
 
+from secantus import engine
 from secantus.paths import get_path, has_path, set_path, unset_path
 from secantus.query import matches
 
@@ -17,12 +17,12 @@ class ProjectionError(Exception):
     pass
 
 
-# Phase 1 of the Python -> Rust rewrite: the Rust core ports the common
-# projection shapes behind the byte seam (doc + spec cross as BSON bytes). The
-# Rust path returns None to defer to pure Python for: mixed inclusion/exclusion
-# (which Python raises on), nested-document specs, unusual $slice arg types, and
-# $elemMatch sub-filters the matcher defers. Opt-in via
-# SECANTUS_RUST_PROJECTION=1; parity pinned by tests/test_rust_projection_parity.py.
+# The Rust core ports the common projection shapes behind the byte seam (doc +
+# spec cross as BSON bytes). The Rust path returns None to defer to pure Python
+# for: mixed inclusion/exclusion (which Python raises on), nested-document
+# specs, unusual $slice arg types, and $elemMatch sub-filters the matcher
+# defers. Both engines are supported; selection is process-wide via
+# ``secantus.engine``. Parity pinned by tests/test_rust_projection_parity.py.
 try:
     import _secantus_core as _rust
 except ImportError:
@@ -30,7 +30,7 @@ except ImportError:
 
 
 def _rust_projection_enabled() -> bool:
-    return _rust is not None and os.environ.get("SECANTUS_RUST_PROJECTION") == "1"
+    return _rust is not None and engine.enabled("projection")
 
 
 def _is_elem_match_spec(value: Any) -> bool:

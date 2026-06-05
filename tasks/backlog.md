@@ -100,17 +100,31 @@ spike results: `tasks/rust-rewrite-spike-findings.md`). The Rust core lives at
 `crates/secantus-core` and builds as an abi3 extension `_secantus_core` via
 maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
 
+**Both engines are permanent (not a replacement).** The pure-Python engines are
+always present and the default; the Rust core is an optional accelerator.
+Selection is process-wide via `secantus.engine` (the `SECANTUS_ENGINE` env var
+/ `SecantusDBServer(engine=...)` / `--engine`), with per-component overrides
+(`SECANTUS_RUST_<COMPONENT>`). So the old "flip the default to Rust" items below
+mean "make Rust the *recommended* default for users who install the extension,"
+never "remove Python."
+
+- [x] **Engine selection** — `secantus.engine` is the single source of truth
+  (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six
+  shims consult it; `SecantusDBServer(engine=)` + `--engine` set it. Unit-tested
+  by `tests/test_engine.py` (WT-independent).
 - [x] **Phase 0 spikes** — BSON fidelity, WiredTiger FFI, sortkey golden
   vectors all green (`rust/`, `rust/run_spikes.sh`).
 - [x] **Phase 1, leaf engine #1: `sortkey`** — ported to Rust behind the fat
   byte seam; pure-Python `secantus.sortkey` delegates when
   `SECANTUS_RUST_SORTKEY=1`. Parity pinned by `tests/test_rust_sortkey_parity.py`
   (curated + 2000-case fuzz, byte-identical).
-- [ ] **Flip `sortkey` default to Rust.** Currently opt-in via env flag so the
-  port can't regress anything. Flipping requires: (a) the extension shipped in
-  the wheel (Phase 6 packaging — two native build systems to merge), and (b) a
-  decision on the byte seam's per-call `bson.encode({"v": value})` overhead vs
-  passing values without re-encoding. Until then Python stays the default.
+- [ ] **Make Rust the *recommended* default (Python stays available).**
+  Currently every component defaults to Python; `SECANTUS_ENGINE=rust` opts in.
+  Recommending Rust by default for extension-having installs requires: (a) the
+  extension shipped in the wheel (Phase 6 packaging — two native build systems
+  to merge), and (b) a decision on the byte seam's per-call
+  `bson.encode({"v": value})` overhead vs passing values without re-encoding.
+  The Python engine remains a permanent, selectable mode regardless.
 - [ ] **Collation-aware sortkey in Rust.** The Rust port does not implement
   `collation.normalize_for_index_bytes`; the shim only delegates when
   `collation is None` and uses pure Python otherwise. Port when `collation`

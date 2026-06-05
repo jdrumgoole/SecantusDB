@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime as _dt
-import os
 import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -11,6 +10,7 @@ from typing import Any
 import bson
 from bson import Decimal128, Int64
 
+from secantus import engine
 from secantus.paths import get_path
 
 
@@ -18,13 +18,13 @@ class ExpressionError(Exception):
     pass
 
 
-# Phase 1 of the Python -> Rust rewrite: the Rust core ports a high-value core
-# of the aggregation expression language behind the byte seam (expr + doc + vars
-# cross as BSON bytes). Because expressions are recursive, the Rust evaluator
-# returns None (whole-call fallback) if ANY operator/value in the tree isn't
-# ported yet (strings, dates, regex, conversions, $map/$filter/$reduce/$let,
-# object ops, Decimal128 semantics). Opt-in via SECANTUS_RUST_EXPR=1; parity
-# pinned by tests/test_rust_expressions_parity.py.
+# The Rust core ports a high-value core of the aggregation expression language
+# behind the byte seam (expr + doc + vars cross as BSON bytes). Because
+# expressions are recursive, the Rust evaluator returns None (whole-call
+# fallback) if ANY operator/value in the tree isn't ported yet (dates, regex,
+# conversions, $map/$filter/$reduce/$let, non-ASCII case, Decimal128
+# semantics). Both engines are supported; selection is process-wide via
+# ``secantus.engine``. Parity pinned by tests/test_rust_expressions_parity.py.
 try:
     import _secantus_core as _rust
 except ImportError:
@@ -32,7 +32,7 @@ except ImportError:
 
 
 def _rust_expr_enabled() -> bool:
-    return _rust is not None and os.environ.get("SECANTUS_RUST_EXPR") == "1"
+    return _rust is not None and engine.enabled("expressions")
 
 
 @dataclass

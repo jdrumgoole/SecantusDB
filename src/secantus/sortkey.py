@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
-import os
 import re as _re
 import struct
 from collections.abc import Mapping
@@ -38,14 +37,14 @@ from typing import Any
 import bson
 from bson import Binary, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
-# Phase 1 of the Python -> Rust rewrite (tasks/rust-rewrite-plan.md): the Rust
-# core ports this module behind the "fat byte seam" — values cross the boundary
-# as the BSON bytes of a one-key wrapper ``{"v": value}``. Delegation is
-# opt-in via ``SECANTUS_RUST_SORTKEY=1`` while the port is validated; the
-# pure-Python implementation below stays authoritative and is the fallback
-# (and the only path when a collation is supplied — collation-aware index
-# encoding is not yet ported). The default will flip to Rust once the suite is
-# green against it on every platform.
+from secantus import engine
+
+# The Rust core ports this module behind the "fat byte seam" — values cross the
+# boundary as the BSON bytes of a one-key wrapper ``{"v": value}``. Both engines
+# are supported; selection is process-wide via ``secantus.engine`` (see that
+# module / the ``SECANTUS_ENGINE`` env var). The pure-Python implementation
+# below is the default and the fallback — and the only path when a collation is
+# supplied (collation-aware index encoding isn't ported to Rust yet).
 try:
     import _secantus_core as _rust
 except ImportError:  # extension not built (e.g. pure-Python install)
@@ -53,7 +52,7 @@ except ImportError:  # extension not built (e.g. pure-Python install)
 
 
 def _rust_enabled() -> bool:
-    return _rust is not None and os.environ.get("SECANTUS_RUST_SORTKEY") == "1"
+    return _rust is not None and engine.enabled("sortkey")
 
 # Type ranks — must match storage._bson_type_rank.
 RANK_MINKEY = 1

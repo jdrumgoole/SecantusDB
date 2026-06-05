@@ -27,16 +27,18 @@ emits only that leaf rather than the whole sub-document.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import bson
 
-# Phase 1 of the Python -> Rust rewrite: the Rust core ports this diff behind the
-# byte seam (pre + post cross as BSON bytes). The Rust path returns None to defer
-# to pure Python for Decimal128 / exotic values (uncertain `==` semantics).
-# Opt-in via SECANTUS_RUST_DIFF=1; parity pinned by tests/test_rust_diff_parity.py.
+from secantus import engine
+
+# The Rust core ports this diff behind the byte seam (pre + post cross as BSON
+# bytes). The Rust path returns None to defer to pure Python for Decimal128 /
+# exotic values (uncertain `==` semantics). Both engines are supported;
+# selection is process-wide via ``secantus.engine``. Parity pinned by
+# tests/test_rust_diff_parity.py.
 try:
     import _secantus_core as _rust
 except ImportError:
@@ -44,7 +46,7 @@ except ImportError:
 
 
 def _rust_diff_enabled() -> bool:
-    return _rust is not None and os.environ.get("SECANTUS_RUST_DIFF") == "1"
+    return _rust is not None and engine.enabled("diff")
 
 
 def _walk(

@@ -12,6 +12,8 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import random
+import sys
+import types
 
 import bson
 import pytest
@@ -19,8 +21,14 @@ from bson import ObjectId
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
-_DIFF_PATH = pathlib.Path(__file__).resolve().parents[1] / "src" / "secantus" / "diff.py"
-_spec = importlib.util.spec_from_file_location("secantus_diff_pure", _DIFF_PATH)
+# Stub `secantus` package (with __path__) so diff.py's `from secantus import
+# engine` auto-resolves without the server -> WiredTiger import chain.
+_ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "secantus"
+if "secantus" not in sys.modules:
+    _pkg = types.ModuleType("secantus")
+    _pkg.__path__ = [str(_ROOT)]
+    sys.modules["secantus"] = _pkg
+_spec = importlib.util.spec_from_file_location("secantus_diff_pure", _ROOT / "diff.py")
 _pure = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pure)
 

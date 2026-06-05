@@ -18,6 +18,8 @@ import datetime
 import importlib.util
 import pathlib
 import random
+import sys
+import types
 
 import bson
 import pytest
@@ -26,10 +28,16 @@ from bson.timestamp import Timestamp
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
-# Load the pure-Python encoder directly by path (avoid secantus/__init__ ->
-# server -> WiredTiger import chain; the encoder only needs bson).
-_SORTKEY_PATH = pathlib.Path(__file__).resolve().parents[1] / "src" / "secantus" / "sortkey.py"
-_spec = importlib.util.spec_from_file_location("secantus_sortkey_pure", _SORTKEY_PATH)
+# Load the pure-Python encoder by path (avoid secantus/__init__ -> server ->
+# WiredTiger import chain). A stub `secantus` package with __path__ lets the
+# module's `from secantus import engine` auto-resolve engine.py without the
+# heavy server imports.
+_ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "secantus"
+if "secantus" not in sys.modules:
+    _pkg = types.ModuleType("secantus")
+    _pkg.__path__ = [str(_ROOT)]
+    sys.modules["secantus"] = _pkg
+_spec = importlib.util.spec_from_file_location("secantus_sortkey_pure", _ROOT / "sortkey.py")
 _pure = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pure)
 

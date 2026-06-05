@@ -202,6 +202,19 @@ def build_parser() -> argparse.ArgumentParser:
             "gate only."
         ),
     )
+    parser.add_argument(
+        "--engine",
+        choices=["python", "rust", "auto"],
+        default=None,
+        help=(
+            "Operator-engine implementation. 'python' (default) uses the "
+            "original pure-Python engines; 'rust' uses the optional compiled "
+            "core where a component is ported, falling back to Python "
+            "otherwise; 'auto' uses Rust if the extension is installed. Both "
+            "engines are permanently supported. Also settable via the "
+            "SECANTUS_ENGINE environment variable."
+        ),
+    )
     return parser
 
 
@@ -267,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         tls_key_file=cfg.tls_key_file,
         tls_ca_file=cfg.tls_ca_file,
         tls_require_client_cert=cfg.tls_require_client_cert,
+        engine=args.engine,
     )
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:

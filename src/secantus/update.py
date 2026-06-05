@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import bson
 
+from secantus import engine
 from secantus.paths import get_path, has_path, set_path, unset_path
 
 
@@ -15,13 +15,14 @@ class UpdateError(Exception):
     pass
 
 
-# Phase 1 of the Python -> Rust rewrite: the Rust core ports the common,
-# deterministic update operators behind the byte seam (doc + update cross as
-# BSON bytes). The Rust path returns None to defer to pure Python for: pipeline
-# (array) updates, positional operators / array filters, $currentDate
-# (non-deterministic), $min/$max/$pull/$addToSet/$bit, Decimal128 arithmetic,
-# and every error condition (so the exact UpdateError is raised here). Opt-in
-# via SECANTUS_RUST_UPDATE=1; parity pinned by tests/test_rust_update_parity.py.
+# The Rust core ports the common, deterministic update operators behind the
+# byte seam (doc + update cross as BSON bytes). The Rust path returns None to
+# defer to pure Python for: pipeline (array) updates, positional operators /
+# array filters, $currentDate (non-deterministic), $min/$max/$pull/$addToSet/
+# $bit, Decimal128 arithmetic, and every error condition (so the exact
+# UpdateError is raised here). Both engines are supported; selection is
+# process-wide via ``secantus.engine``. Parity pinned by
+# tests/test_rust_update_parity.py.
 try:
     import _secantus_core as _rust
 except ImportError:
@@ -29,7 +30,7 @@ except ImportError:
 
 
 def _rust_update_enabled() -> bool:
-    return _rust is not None and os.environ.get("SECANTUS_RUST_UPDATE") == "1"
+    return _rust is not None and engine.enabled("update")
 
 
 def apply_update(

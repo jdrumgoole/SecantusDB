@@ -281,3 +281,24 @@ All six pure leaf engines are now ported, opt-in, and parity-pinned:
 Phase-1 work: `collation` (to retire the collation fallbacks), and widening the
 already-ported engines' operator coverage. Then Phase 2+ (aggregate, storage,
 wire/dispatch) and the eventual default-flip + packaging (Phase 6).
+
+---
+
+## Engine selection — both engines are permanent
+
+**Decision: SecantusDB keeps both the pure-Python engines and the Rust core as
+first-class, permanently-supported implementations.** The Rust rewrite is an
+*accelerator*, not a replacement — Python is never removed.
+
+`secantus.engine` is the single source of truth: `available()` (is the Rust
+extension importable), `selected()` (`python`/`rust`/`auto`), `set_engine()`,
+and `enabled(component)`. All six shims call `engine.enabled(<component>)`
+instead of reading their own env var. Selection is process-wide:
+
+- `SECANTUS_ENGINE=python` (default) / `rust` / `auto`
+- `SecantusDBServer(engine="rust")` and `secantusdb --engine rust`
+- per-component overrides `SECANTUS_RUST_<COMPONENT>=1/0` (debugging) win
+
+`python` is the default; `rust` transparently falls back to Python for any
+component not ported (and warns once if the extension is missing). Unit-tested
+WT-independently by `tests/test_engine.py`.
