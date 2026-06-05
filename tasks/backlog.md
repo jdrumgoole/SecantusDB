@@ -183,14 +183,17 @@ never "remove Python."
   evaluator directly, Rust->Rust) — `query_matches` gained a `vars` arg threaded
   through `$expr`.
 - [ ] **Widen the Rust expression evaluator** — now also handled:
-  `$slice`/`$indexOfArray`, ASCII `$concat`/`$toLower`/`$toUpper`/`$strLenCP`/
-  `$split`/`$substrCP`, and `$mergeObjects`/`$objectToArray`. Remaining
-  whole-call fallbacks to widen where faithful: dates (`$year`…/`$dateToString`/
-  `$dateAdd`/…), conversions (`$toInt`/`$convert`/…), `$trim*`, `$getField`/
-  `$setField`, and the scope-introducing `$let`/`$map`/`$filter`/`$reduce`. Each
-  has Python-specific semantics (float `str()`, **non-ASCII Unicode case** which
-  is why `$toLower`/`$toUpper` defer on non-ASCII, `strptime`/`strftime`,
-  Decimal128, timezones). Regex ops (`$regexMatch`/…) need Python `re`.
+  `$slice`/`$indexOfArray`; ASCII `$concat`/`$toLower`/`$toUpper`/`$strLenCP`/
+  `$split`/`$substrCP`; `$mergeObjects`/`$objectToArray`; the scope-introducing
+  `$let`/`$map`/`$filter`/`$reduce`; and UTC date component extractors
+  (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/`$dayOfWeek`, via a
+  dependency-free civil-date algorithm). Remaining whole-call fallbacks to widen
+  where faithful: the heavier date ops (`$dateToString`/`$dateAdd`/`$dateDiff`/
+  `$dateTrunc`/`$dateFromString` — timezones, `strftime`, month arithmetic),
+  conversions (`$toInt`/`$convert`/`$toString` — float `str()`, Decimal128),
+  `$trim*`, `$getField`/`$setField`, and non-ASCII case (`$toLower`/`$toUpper`
+  defer on non-ASCII for Unicode-fidelity safety). Regex ops (`$regexMatch`/…)
+  need Python `re`.
 - [x] **Phase 1, leaf engine #5: `projection.apply_projection`** — inclusion /
   exclusion / `$slice` / `$elemMatch` projection shapes ported to Rust
   (`crates/secantus-core/src/projection.rs`). `secantus.projection` delegates

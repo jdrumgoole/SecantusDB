@@ -14,6 +14,7 @@ arithmetic, common array ops) so the pure path never needs the lazily-imported
 """
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import pathlib
 import random
@@ -57,6 +58,8 @@ def _rust_eval(expr, doc, vars=None):
     )
     return None if res is None else bson.decode(res)["r"]
 
+
+_DT = datetime.datetime(2026, 6, 5, 12, 34, 56, tzinfo=datetime.timezone.utc)
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
@@ -128,6 +131,25 @@ CURATED = [
     ({"$mergeObjects": [{"a": 1}, {"b": 2}, {"a": 9}]}, {}),
     ({"$mergeObjects": [{"a": 1}, None, {"b": 2}]}, {}),
     ({"$objectToArray": "$o"}, {"o": {"x": 1, "y": 2}}),
+    # Scope-introducing ops.
+    ({"$map": {"input": [1, 2, 3], "in": {"$add": ["$$this", 10]}}}, {}),
+    ({"$map": {"input": "$xs", "as": "n", "in": {"$multiply": ["$$n", 2]}}}, {"xs": [1, 2, 3]}),
+    ({"$filter": {"input": [1, 2, 3, 4], "as": "n", "cond": {"$gt": ["$$n", 2]}}}, {}),
+    ({"$filter": {"input": [1, 2, 3, 4, 5], "cond": {"$lt": ["$$this", 5]}, "limit": 2}}, {}),
+    ({"$reduce": {"input": [1, 2, 3, 4], "initialValue": 0,
+                  "in": {"$add": ["$$value", "$$this"]}}}, {}),
+    ({"$reduce": {"input": "$xs", "initialValue": "", "in": {"$concat": ["$$value", "$$this"]}}},
+     {"xs": ["a", "b", "c"]}),
+    ({"$let": {"vars": {"d": {"$add": ["$x", 1]}}, "in": {"$multiply": ["$$d", 2]}}}, {"x": 5}),
+    # $map referencing a ROOT field path inside `in` ($$CURRENT stays ROOT).
+    ({"$map": {"input": [1, 2], "in": {"$add": ["$$this", "$base"]}}}, {"base": 100}),
+    # Date component extractors.
+    ({"$year": "$d"}, {"d": _DT}),
+    ({"$month": "$d"}, {"d": _DT}),
+    ({"$dayOfMonth": "$d"}, {"d": _DT}),
+    ({"$hour": "$d"}, {"d": _DT}),
+    ({"$dayOfWeek": "$d"}, {"d": _DT}),
+    ({"$year": "$d"}, {"d": "not a date"}),  # non-date -> null
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
@@ -213,6 +235,27 @@ def test_index_math_fuzz():
         py = _pure.evaluate(expr, {})
         assert rust == py, f"divergence: rust={rust!r} pure={py!r} expr={expr}"
     assert handled > 2000, f"expected many handled cases, only {handled}"
+
+
+def test_date_extractor_fuzz():
+    """Validate civil-date arithmetic ($year/$month/$dayOfMonth/$hour/$minute/
+    $second/$dayOfWeek) across a wide instant range — including pre-epoch
+    (negative millis) — against Python's datetime."""
+    rng = random.Random(0xDA7E)
+    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    ops = ["$year", "$month", "$dayOfMonth", "$hour", "$minute", "$second", "$dayOfWeek"]
+    for _ in range(4000):
+        # ~ year 1900 .. 2400 (spans negative/positive millis)
+        ms = rng.randint(-2_200_000_000_000, 13_600_000_000_000)
+        dt = epoch + datetime.timedelta(milliseconds=ms)
+        doc = bson.decode(bson.encode({"d": dt}))
+        for op in ops:
+            expr = {op: "$d"}
+            rust = _rust_eval(expr, doc)
+            if rust is None:
+                continue
+            py = _pure.evaluate(expr, doc)
+            assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
 
 
 def test_randomised_fuzz_parity():

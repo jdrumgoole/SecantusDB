@@ -13,9 +13,11 @@
 //! `$multiply`/`$divide`/`$mod`); array ops (`$size`/`$arrayElemAt`/`$first`/
 //! `$last`/`$concatArrays`/`$reverseArray`/`$in`/`$slice`/`$indexOfArray`);
 //! ASCII string ops (`$concat`/`$toLower`/`$toUpper`/`$strLenCP`/`$split`/
-//! `$substrCP`); and object ops (`$mergeObjects`/`$objectToArray`). Everything
-//! else (dates, regex, conversions, `$map`/`$filter`/`$reduce`/`$let`, non-ASCII
-//! case) -> Python.
+//! `$substrCP`); object ops (`$mergeObjects`/`$objectToArray`); the
+//! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; and UTC date component
+//! extractors (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/
+//! `$dayOfWeek`). Everything else (other date ops, regex, conversions,
+//! non-ASCII case) -> Python.
 
 use std::cmp::Ordering;
 
@@ -173,6 +175,19 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // objects
         "$mergeObjects" => op_merge_objects(arg, ctx),
         "$objectToArray" => op_object_to_array(arg, ctx),
+        // scope-introducing
+        "$let" => op_let(arg, ctx),
+        "$map" => op_map(arg, ctx),
+        "$filter" => op_filter(arg, ctx),
+        "$reduce" => op_reduce(arg, ctx),
+        // date component extractors (UTC; no timezone arg form)
+        "$year" => date_part(arg, ctx, DatePart::Year),
+        "$month" => date_part(arg, ctx, DatePart::Month),
+        "$dayOfMonth" => date_part(arg, ctx, DatePart::Day),
+        "$hour" => date_part(arg, ctx, DatePart::Hour),
+        "$minute" => date_part(arg, ctx, DatePart::Minute),
+        "$second" => date_part(arg, ctx, DatePart::Second),
+        "$dayOfWeek" => date_part(arg, ctx, DatePart::DayOfWeek),
         _ => Err(Fallback),
     }
 }
@@ -756,6 +771,183 @@ fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
+// --- scope-introducing ops ($let / $map / $filter / $reduce) ------------
+
+/// Evaluate `expr` with extra `(name, value)` variable bindings layered on top
+/// of `ctx`'s scope (mirrors `_Ctx.with_var`). The document (so `$$ROOT` and
+/// bare `$field` paths) is unchanged — only the var scope grows.
+fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
+    let mut vars = ctx.vars.clone();
+    for (name, value) in extra {
+        vars.insert((*name).to_string(), value.clone());
+    }
+    eval(
+        expr,
+        &Ctx {
+            doc: ctx.doc,
+            vars: &vars,
+        },
+    )
+}
+
+/// The `as` variable name for `$map`/`$filter` (default `"this"`); a non-string
+/// `as` defers.
+fn as_var_name(spec: Option<&Bson>) -> Result<String, Fallback> {
+    match spec {
+        None => Ok("this".to_string()),
+        Some(Bson::String(s)) => Ok(s.clone()),
+        Some(_) => Err(Fallback),
+    }
+}
+
+fn op_let(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let (Some(Bson::Document(bindings)), Some(in_expr)) = (d.get("vars"), d.get("in")) else {
+        return Err(Fallback); // Python requires {vars, in} with vars a document
+    };
+    // Each binding is evaluated against the *original* scope (bindings don't see
+    // each other), then all are layered for the `in` expression.
+    let mut vars = ctx.vars.clone();
+    for (name, vexpr) in bindings {
+        let v = eval(vexpr, ctx)?;
+        vars.insert(name.clone(), v);
+    }
+    eval(
+        in_expr,
+        &Ctx {
+            doc: ctx.doc,
+            vars: &vars,
+        },
+    )
+}
+
+fn op_map(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
+        return Ok(Bson::Null); // non-array input -> null
+    };
+    let var = as_var_name(d.get("as"))?;
+    let null = Bson::Null;
+    let in_expr = d.get("in").unwrap_or(&null);
+    let mut out = Vec::with_capacity(arr.len());
+    for elem in arr {
+        out.push(eval_with_vars(in_expr, ctx, &[(&var, elem)])?);
+    }
+    Ok(Bson::Array(out))
+}
+
+fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
+        return Ok(Bson::Null);
+    };
+    let var = as_var_name(d.get("as"))?;
+    let null = Bson::Null;
+    let cond = d.get("cond").unwrap_or(&null);
+    // `limit` only bounds the output when it evaluates to an integer.
+    let limit = match d.get("limit") {
+        Some(e) => as_int_like(&eval(e, ctx)?),
+        None => None,
+    };
+    let mut out: Vec<Bson> = Vec::new();
+    for elem in arr {
+        if truthy(&eval_with_vars(cond, ctx, &[(&var, elem.clone())])?) {
+            out.push(elem);
+            if let Some(lim) = limit {
+                if out.len() as i128 >= lim {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(Bson::Array(out))
+}
+
+fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
+        return Ok(Bson::Null);
+    };
+    let mut acc = eval_opt(d.get("initialValue"), ctx)?;
+    let null = Bson::Null;
+    let in_expr = d.get("in").unwrap_or(&null);
+    for elem in arr {
+        acc = eval_with_vars(in_expr, ctx, &[("value", acc), ("this", elem)])?;
+    }
+    Ok(acc)
+}
+
+/// Evaluate an optional sub-expression; a missing key behaves like Python's
+/// `_eval(None)` (yields null).
+fn eval_opt(expr: Option<&Bson>, ctx: &Ctx) -> R {
+    match expr {
+        Some(e) => eval(e, ctx),
+        None => Ok(Bson::Null),
+    }
+}
+
+// --- date component extractors (UTC) ------------------------------------
+
+#[derive(Clone, Copy)]
+enum DatePart {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    DayOfWeek,
+}
+
+/// Civil (year, month, day) from a count of days since 1970-01-01 (Howard
+/// Hinnant's algorithm), valid for the full BSON date range.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + i64::from(m <= 2), m, d)
+}
+
+fn date_part(arg: &Bson, ctx: &Ctx, part: DatePart) -> R {
+    let Bson::DateTime(dt) = eval(arg, ctx)? else {
+        return Ok(Bson::Null); // Python returns None for non-datetime
+    };
+    let millis = dt.timestamp_millis();
+    let days = millis.div_euclid(86_400_000);
+    let ms_of_day = millis.rem_euclid(86_400_000);
+    let value = match part {
+        DatePart::Hour => ms_of_day / 3_600_000,
+        DatePart::Minute => (ms_of_day / 60_000) % 60,
+        DatePart::Second => (ms_of_day / 1000) % 60,
+        // mongod $dayOfWeek: Sunday=1 .. Saturday=7 (1970-01-01 was Thursday=5).
+        DatePart::DayOfWeek => (days + 4).rem_euclid(7) + 1,
+        _ => {
+            let (y, m, d) = civil_from_days(days);
+            match part {
+                DatePart::Year => y,
+                DatePart::Month => m,
+                DatePart::Day => d,
+                _ => unreachable!(),
+            }
+        }
+    };
+    Ok(Bson::Int32(value as i32))
+}
+
 /// Python `==` (used by `$in` membership and `$eq` element semantics, and by
 /// the diff engine): numbers bridge with bool-as-int, strings/null/oid/date/etc.
 /// by type, arrays/docs structurally. `Err(Fallback)` for Decimal128
@@ -959,5 +1151,66 @@ mod tests {
             ),
             Bson::Document(doc! {"a": 1, "b": 2})
         );
+    }
+
+    #[test]
+    fn scope_ops() {
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$map": {"input": [1, 2, 3], "in": {"$add": ["$$this", 10]}}})
+            ),
+            Bson::Array(vec![Bson::Int32(11), Bson::Int32(12), Bson::Int32(13)])
+        );
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$filter": {"input": [1, 2, 3, 4], "as": "n",
+                    "cond": {"$gt": ["$$n", 2]}}})
+            ),
+            Bson::Array(vec![Bson::Int32(3), Bson::Int32(4)])
+        );
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$reduce": {"input": [1, 2, 3], "initialValue": 0,
+                    "in": {"$add": ["$$value", "$$this"]}}})
+            ),
+            Bson::Int32(6)
+        );
+        assert_eq!(
+            ev(
+                doc! {"x": 5},
+                bson::bson!({"$let": {"vars": {"d": {"$add": ["$x", 1]}},
+                    "in": {"$multiply": ["$$d", 2]}}})
+            ),
+            Bson::Int32(12)
+        );
+    }
+
+    #[test]
+    fn date_extractors() {
+        // 2026-06-05T12:34:56Z (a Friday)
+        let dt = Bson::DateTime(bson::DateTime::from_millis(1_780_662_896_000));
+        let d = doc! {"d": dt};
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$year": "$d"})),
+            Bson::Int32(2026)
+        );
+        assert_eq!(ev(d.clone(), bson::bson!({"$month": "$d"})), Bson::Int32(6));
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$dayOfMonth": "$d"})),
+            Bson::Int32(5)
+        );
+        assert_eq!(ev(d.clone(), bson::bson!({"$hour": "$d"})), Bson::Int32(12));
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$minute": "$d"})),
+            Bson::Int32(34)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$second": "$d"})),
+            Bson::Int32(56)
+        );
+        assert_eq!(ev(d, bson::bson!({"$dayOfWeek": "$d"})), Bson::Int32(6)); // Friday
     }
 }
