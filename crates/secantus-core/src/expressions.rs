@@ -15,7 +15,7 @@
 //! string ops (`$concat`/`$toLower`/`$toUpper`/`$strLenCP`/`$strLenBytes`/
 //! `$split`/`$substrCP`/`$substrBytes`/`$indexOfCP`/`$indexOfBytes`/`$trim`/
 //! `$ltrim`/`$rtrim` — ASCII case only, explicit-chars trim only); object ops
-//! (`$mergeObjects`/`$objectToArray`); the
+//! (`$mergeObjects`/`$objectToArray`/`$getField`/`$setField`); `$zip`; the
 //! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; UTC date component
 //! extractors (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/
 //! `$dayOfWeek`) + `$dateToParts`; a safe subset of conversions (`$toInt`/
@@ -187,6 +187,9 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // objects
         "$mergeObjects" => op_merge_objects(arg, ctx),
         "$objectToArray" => op_object_to_array(arg, ctx),
+        "$getField" => op_get_field(arg, ctx),
+        "$setField" => op_set_field(arg, ctx),
+        "$zip" => op_zip(arg, ctx),
         // scope-introducing
         "$let" => op_let(arg, ctx),
         "$map" => op_map(arg, ctx),
@@ -780,6 +783,127 @@ fn op_merge_objects(arg: &Bson, ctx: &Ctx) -> R {
         }
     }
     Ok(Bson::Document(result))
+}
+
+/// Python `bool()` of a *literal* spec value (not evaluated): empty
+/// collections / strings, zero, false, null, and a missing key are all falsy.
+fn py_bool_literal(v: Option<&Bson>) -> bool {
+    match v {
+        None | Some(Bson::Null) => false,
+        Some(Bson::Boolean(b)) => *b,
+        Some(Bson::Int32(n)) => *n != 0,
+        Some(Bson::Int64(n)) => *n != 0,
+        Some(Bson::Double(d)) => *d != 0.0,
+        Some(Bson::String(s)) => !s.is_empty(),
+        Some(Bson::Array(a)) => !a.is_empty(),
+        Some(Bson::Document(d)) => !d.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
+    // `field` is taken literally (the whole point of $getField vs `$path` is
+    // dotted/dollared field names); `input` defaults to $$CURRENT (the doc).
+    let (field, input) = match arg {
+        Bson::String(s) => (s.clone(), Bson::Document(ctx.doc.clone())),
+        Bson::Document(d) => {
+            let Some(fe) = d.get("field") else {
+                return Err(Fallback); // Python raises when field is absent
+            };
+            let Bson::String(field) = eval(fe, ctx)? else {
+                return Err(Fallback); // field must evaluate to a string
+            };
+            let input = match d.get("input") {
+                Some(e) => eval(e, ctx)?,
+                None => Bson::Document(ctx.doc.clone()),
+            };
+            (field, input)
+        }
+        _ => return Err(Fallback),
+    };
+    Ok(match input {
+        Bson::Document(doc) => doc.get(&field).cloned().unwrap_or(Bson::Null),
+        _ => Bson::Null, // null / non-document input -> None
+    })
+}
+
+fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let (Some(fe), Some(ie), Some(ve)) = (d.get("field"), d.get("input"), d.get("value")) else {
+        return Err(Fallback); // field/input/value all required
+    };
+    let Bson::String(field) = eval(fe, ctx)? else {
+        return Err(Fallback);
+    };
+    let input = eval(ie, ctx)?;
+    if is_null(&input) {
+        return Ok(Bson::Null);
+    }
+    let Bson::Document(mut doc) = input else {
+        return Err(Fallback); // non-document input -> Python raises
+    };
+    // value $$REMOVE makes eval defer (resolve_var returns Fallback), so the
+    // field-drop case is handled by the pure-Python path.
+    let value = eval(ve, ctx)?;
+    doc.insert(field, value);
+    Ok(Bson::Document(doc))
+}
+
+fn op_zip(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let Some(inputs_expr) = d.get("inputs") else {
+        return Err(Fallback);
+    };
+    let inputs_val = eval(inputs_expr, ctx)?;
+    if is_null(&inputs_val) {
+        return Ok(Bson::Null);
+    }
+    let Bson::Array(inputs) = inputs_val else {
+        return Err(Fallback);
+    };
+    let mut arrs: Vec<&Vec<Bson>> = Vec::with_capacity(inputs.len());
+    for a in &inputs {
+        match a {
+            Bson::Array(v) => arrs.push(v),
+            _ => return Err(Fallback), // inputs must be an array of arrays
+        }
+    }
+    let n_inputs = arrs.len();
+    // useLongestLength / defaults are read as *literals* (Python doesn't eval).
+    let use_longest = py_bool_literal(d.get("useLongestLength"));
+    let defaults: Vec<Bson> = match d.get("defaults") {
+        Some(dv) if py_bool_literal(Some(dv)) => match dv {
+            Bson::Array(dl) => dl.clone(),
+            _ => return Err(Fallback), // truthy non-list -> Python raises
+        },
+        _ => vec![Bson::Null; n_inputs],
+    };
+    let mut out: Vec<Bson> = Vec::new();
+    if use_longest {
+        let n = arrs.iter().map(|a| a.len()).max().unwrap_or(0);
+        for i in 0..n {
+            let row: Vec<Bson> = arrs
+                .iter()
+                .enumerate()
+                .map(|(j, a)| {
+                    a.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| defaults.get(j).cloned().unwrap_or(Bson::Null))
+                })
+                .collect();
+            out.push(Bson::Array(row));
+        }
+    } else {
+        let n = arrs.iter().map(|a| a.len()).min().unwrap_or(0);
+        for i in 0..n {
+            out.push(Bson::Array(arrs.iter().map(|a| a[i].clone()).collect()));
+        }
+    }
+    Ok(Bson::Array(out))
 }
 
 fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {

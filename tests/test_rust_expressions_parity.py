@@ -219,6 +219,23 @@ CURATED = [
     ({"$rtrim": {"input": "hixx", "chars": "x"}}, {}),
     ({"$trim": {"input": "$s"}}, {"s": "  hi  "}),  # default whitespace -> defer
     ({"$trim": {"input": "$s", "chars": " "}}, {"s": None}),  # null input -> null
+    # $getField / $setField / $zip.
+    ({"$getField": "x"}, {"x": 5}),
+    ({"$getField": "missing"}, {}),  # absent -> null
+    ({"$getField": {"field": "a.b", "input": "$o"}}, {"o": {"a.b": 9, "c": 1}}),
+    ({"$getField": {"field": "$fname", "input": "$o"}}, {"fname": "k", "o": {"k": 7}}),
+    ({"$getField": {"field": "k", "input": "$o"}}, {"o": None}),  # null input -> null
+    ({"$setField": {"field": "y", "input": "$o", "value": 10}}, {"o": {"x": 1}}),
+    ({"$setField": {"field": "x", "input": "$o", "value": 9}}, {"o": {"x": 1}}),  # replace
+    ({"$setField": {"field": "f", "input": "$o", "value": 1}}, {"o": None}),  # null -> null
+    ({"$setField": {"field": "f", "input": "$o", "value": "$$REMOVE"}}, {"o": {"f": 1}}),  # defer
+    ({"$zip": {"inputs": [[1, 2], [3, 4]]}}, {}),
+    ({"$zip": {"inputs": [[1, 2, 3], [4, 5]]}}, {}),  # min length
+    ({"$zip": {"inputs": "$xs"}}, {"xs": [["a", "b"], ["c", "d"]]}),
+    ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True}}, {}),
+    ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True,
+               "defaults": [0, 0]}}, {}),
+    ({"$zip": {"inputs": "$x"}}, {}),  # missing -> null inputs -> null
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
@@ -325,6 +342,31 @@ def test_date_extractor_fuzz():
                 continue
             py = _pure.evaluate(expr, doc)
             assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+
+
+def test_zip_fuzz():
+    """$zip over random ragged arrays, with useLongestLength on/off and random
+    defaults, against Python."""
+    rng = random.Random(0x21B)
+    for _ in range(3000):
+        inputs = [
+            [rng.randint(0, 9) for _ in range(rng.randint(0, 4))]
+            for _ in range(rng.randint(0, 3))
+        ]
+        spec = {"inputs": inputs}
+        if rng.random() < 0.5:
+            spec["useLongestLength"] = rng.choice([True, False])
+        if rng.random() < 0.4:
+            spec["defaults"] = [rng.randint(-1, -1) for _ in inputs]
+        expr = bson.decode(bson.encode({"e": {"$zip": spec}}))["e"]
+        rust = _rust_eval(expr, {})
+        if rust is None:
+            continue
+        try:
+            py = _pure.evaluate(expr, {})
+        except Exception:
+            pytest.fail(f"rust={rust!r} but pure raised; expr={expr}")
+        assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
 
 
 def test_string_index_fuzz():
