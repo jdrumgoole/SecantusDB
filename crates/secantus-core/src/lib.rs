@@ -21,6 +21,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod numeric;
+mod query;
 mod sortkey;
 
 /// Decode the one-key wrapper document and hand back the wrapped value.
@@ -57,10 +59,27 @@ fn sortkey_encode_value_directed(
     Ok(to_pybytes(py, out))
 }
 
+/// `query.matches(doc, query)` over BSON bytes. Returns `None` to signal the
+/// caller should fall back to the pure-Python matcher (the query uses a feature
+/// not ported yet: collation, `$expr`, `$jsonSchema`, geo, regex, `$all`, …).
+#[pyfunction]
+fn query_matches(doc_bytes: &[u8], query_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let doc: Document = bson::from_slice(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    let query: Document = bson::from_slice(query_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
+    // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
+    Ok(query::matches(&doc, &query).ok())
+}
+
 #[pymodule]
 fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__doc__", "Rust core for SecantusDB (Phase 1: sortkey).")?;
+    m.add(
+        "__doc__",
+        "Rust core for SecantusDB (Phase 1: sortkey, query).",
+    )?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
+    m.add_function(wrap_pyfunction!(query_matches, m)?)?;
     Ok(())
 }

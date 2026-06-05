@@ -1,0 +1,226 @@
+"""Parity: Rust `_secantus_core.query_matches` vs pure-Python `query.matches`.
+
+Phase 1 net for the second ported leaf engine. For each (doc, query) the Rust
+matcher is run over BSON bytes; when it returns a concrete bool (i.e. it didn't
+defer), that bool must equal the authoritative pure-Python `matches`. When it
+returns None (fallback — collation/$expr/$jsonSchema/geo/regex/$all/compound/…)
+there is nothing to assert: the shim would run pure Python anyway.
+
+Import-light: prefers the real `secantus.query`, but if the package can't be
+imported (no WiredTiger extension built, as in a spike environment) it loads
+`query.py` + `collation.py` by path under a stub `secantus` package. The corpus
+deliberately avoids `$expr`/geo so the pure path never needs the not-yet-loaded
+`secantus.expressions` / `secantus.geo` modules.
+"""
+from __future__ import annotations
+
+import datetime
+import importlib.util
+import pathlib
+import random
+import sys
+import types
+
+import bson
+import pytest
+from bson import Decimal128, Int64, ObjectId
+
+_rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
+
+
+def _load_pure_query():
+    try:  # real package (full install / CI with the WiredTiger extension)
+        from secantus import query as q
+
+        return q
+    except Exception:
+        pass
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "secantus"
+    if "secantus" not in sys.modules:
+        pkg = types.ModuleType("secantus")
+        pkg.__path__ = [str(root)]
+        sys.modules["secantus"] = pkg
+    for name in ("collation", "query"):
+        full = f"secantus.{name}"
+        if full not in sys.modules:
+            spec = importlib.util.spec_from_file_location(full, root / f"{name}.py")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[full] = mod
+            spec.loader.exec_module(mod)
+    return sys.modules["secantus.query"]
+
+
+_pure = _load_pure_query()
+
+
+def _rust_match(doc, query):
+    return _rust.query_matches(bson.encode(doc), bson.encode(query))
+
+
+def _rt(value):
+    return bson.decode(bson.encode({"v": value}))["v"]
+
+
+# (doc, query) pairs mirroring tests/test_query.py for the operators the Rust
+# matcher handles, plus numeric-bridge and bool-distinctness cases.
+CURATED = [
+    ({"a": 1}, {}),
+    ({"a": 1}, {"a": 1}),
+    ({"a": 1}, {"a": 2}),
+    ({"a": {"b": {"c": 5}}}, {"a.b.c": 5}),
+    ({"a": {"b": {"c": 5}}}, {"a.b.c": 6}),
+    ({"tags": ["red", "blue", "green"]}, {"tags": "red"}),
+    ({"tags": ["red", "blue"]}, {"tags": "yellow"}),
+    ({"items": [{"sku": "a"}, {"sku": "b"}]}, {"items.sku": "b"}),
+    ({"items": [{"sku": "a"}, {"sku": "b"}]}, {"items.sku": "c"}),
+    ({"vals": [10, 20, 30]}, {"vals.1": 20}),
+    ({"vals": [10, 20, 30]}, {"vals.1": 10}),
+    ({"age": 30}, {"age": {"$gt": 20}}),
+    ({"age": 30}, {"age": {"$gte": 30}}),
+    ({"age": 30}, {"age": {"$lt": 31}}),
+    ({"age": 30}, {"age": {"$lt": 30}}),
+    ({"a": 2}, {"a": {"$in": [1, 2, 3]}}),
+    ({"a": 4}, {"a": {"$in": [1, 2, 3]}}),
+    ({"a": 4}, {"a": {"$nin": [1, 2, 3]}}),
+    ({"a": None}, {"a": {"$exists": True}}),
+    ({}, {"a": {"$exists": False}}),
+    ({}, {"a": {"$exists": True}}),
+    ({}, {"a": None}),
+    ({"a": None}, {"a": None}),
+    ({"a": 1, "b": 2}, {"$and": [{"a": 1}, {"b": 2}]}),
+    ({"a": 1, "b": 2}, {"$and": [{"a": 1}, {"b": 3}]}),
+    ({"a": 1, "b": 2}, {"$or": [{"a": 99}, {"b": 2}]}),
+    ({"a": 1, "b": 2}, {"$nor": [{"a": 99}, {"b": 99}]}),
+    ({"a": 5}, {"a": {"$not": {"$gt": 10}}}),
+    ({"a": 50}, {"a": {"$not": {"$gt": 10}}}),
+    ({"a": "hi"}, {"a": {"$type": "string"}}),
+    ({"a": 1}, {"a": {"$type": "string"}}),
+    ({"a": 1.5}, {"a": {"$type": "double"}}),
+    ({"a": 1}, {"a": {"$type": "number"}}),
+    ({"a": Decimal128("1.5")}, {"a": {"$type": "number"}}),
+    ({"a": "x"}, {"a": {"$type": "number"}}),
+    ({"a": "hi"}, {"a": {"$type": ["string", "int"]}}),
+    ({"a": 1.5}, {"a": {"$type": ["string", "int"]}}),
+    ({"a": Int64(5)}, {"a": {"$type": "long"}}),
+    ({"a": 5}, {"a": {"$type": "int"}}),
+    ({"tags": [1, 2, 3]}, {"tags": {"$size": 3}}),
+    ({"tags": [1, 2]}, {"tags": {"$size": 3}}),
+    ({"tags": "abc"}, {"tags": {"$size": 3}}),
+    ({"n": 12}, {"n": {"$mod": [4, 0]}}),
+    ({"n": 13}, {"n": {"$mod": [4, 1]}}),
+    ({"n": 13}, {"n": {"$mod": [4, 0]}}),
+    ({"vals": [3, 7, 12]}, {"vals": {"$mod": [4, 0]}}),
+    ({"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
+     {"items": {"$elemMatch": {"sku": "b", "qty": {"$gte": 5}}}}),
+    ({"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
+     {"items": {"$elemMatch": {"sku": "b", "qty": {"$gt": 5}}}}),
+    ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 3, "$lt": 7}}}),
+    ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 11}}}),
+    ({"a": 1}, {"a": 1, "$comment": "hi"}),
+    ({"a": 2}, {"a": 1, "$comment": "hi"}),
+    ({"flags": 0b1011}, {"flags": {"$bitsAllSet": 0b1010}}),
+    ({"flags": 0b1001}, {"flags": {"$bitsAllSet": 0b1010}}),
+    ({"flags": 0b1011}, {"flags": {"$bitsAllSet": [0, 1, 3]}}),
+    ({"flags": 0b0010}, {"flags": {"$bitsAnySet": 0b1010}}),
+    ({"flags": 0b0001}, {"flags": {"$bitsAllClear": 0b1010}}),
+    ({"flags": 0b1010}, {"flags": {"$bitsAnyClear": 0b1011}}),
+    ({"flags": "abc"}, {"flags": {"$bitsAllSet": 0b1}}),
+    ({"flags": True}, {"flags": {"$bitsAllSet": 0b1}}),
+    ({"x": Decimal128("5")}, {"x": 5}),
+    ({"x": 5}, {"x": Decimal128("5")}),
+    ({"x": Decimal128("3.5")}, {"x": 3.5}),
+    ({"x": Decimal128("5")}, {"x": 6}),
+    ({"x": [Decimal128("5"), Decimal128("6")]}, {"x": 6}),
+    ({"x": Decimal128("5")}, {"x": {"$in": [3, 5, 7]}}),
+    ({"x": True}, {"x": 1}),
+    ({"x": 1}, {"x": True}),
+    ({"x": False}, {"x": 0}),
+    ({"x": Decimal128("3.5")}, {"x": {"$gt": 2}}),
+    ({"x": 3.5}, {"x": {"$gt": Decimal128("2")}}),
+    ({"x": Decimal128("1.5")}, {"x": {"$gt": 2}}),
+    ({"x": Decimal128("3.5")}, {"x": {"$lte": 4.0}}),
+    ({"x": "banana"}, {"x": {"$gt": "apple"}}),
+    ({"x": "apple"}, {"x": {"$gte": "banana"}}),
+    ({"d": datetime.datetime(2026, 1, 1)}, {"d": {"$lt": datetime.datetime(2027, 1, 1)}}),
+    ({"a": 1}, {"a": {"$ne": 2}}),
+    ({"a": 1}, {"a": {"$ne": 1}}),
+    ({"a": None}, {"a": {"$ne": None}}),
+    ({}, {"a": {"$ne": None}}),
+]
+
+
+@pytest.mark.parametrize("doc,query", CURATED)
+def test_curated_parity(doc, query):
+    doc = bson.decode(bson.encode(doc))
+    query = bson.decode(bson.encode(query))
+    rust = _rust_match(doc, query)
+    py = _pure.matches(doc, query)
+    if rust is not None:
+        assert rust == py, f"rust={rust} pure={py} for query={query} doc={doc}"
+
+
+def _rand_scalar(rng):
+    return rng.choice(
+        [
+            rng.randint(-50, 50),
+            Int64(rng.randint(-50, 50)),
+            round(rng.uniform(-50, 50), 2),
+            Decimal128(str(rng.randint(-50, 50))),
+            rng.choice(["a", "bb", "ccc", "apple", "banana"]),
+            rng.choice([True, False]),
+            None,
+            ObjectId(),
+        ]
+    )
+
+
+def _rand_doc(rng):
+    d = {}
+    for f in ("a", "b", "c"):
+        r = rng.random()
+        if r < 0.15:
+            continue  # missing field
+        elif r < 0.35:
+            d[f] = [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]
+        elif r < 0.45:
+            d[f] = {"n": _rand_scalar(rng)}
+        else:
+            d[f] = _rand_scalar(rng)
+    return d
+
+
+def _rand_query(rng):
+    field = rng.choice(["a", "b", "c", "a.n", "a.0"])
+    op = rng.choice(
+        ["eq", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$ne",
+         "$exists", "$type", "$size", "$mod"]
+    )
+    if op == "eq":
+        return {field: _rand_scalar(rng)}
+    if op in ("$in", "$nin"):
+        return {field: {op: [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]}}
+    if op == "$exists":
+        return {field: {op: rng.choice([True, False])}}
+    if op == "$type":
+        types = ["string", "int", "double", "number", "bool", "null", "array"]
+        return {field: {op: rng.choice(types)}}
+    if op == "$size":
+        return {field: {op: rng.randint(0, 3)}}
+    if op == "$mod":
+        return {field: {op: [rng.randint(1, 5), rng.randint(0, 4)]}}
+    return {field: {op: _rand_scalar(rng)}}
+
+
+def test_randomised_fuzz_parity():
+    rng = random.Random(0x5EC0)
+    handled = 0
+    for _ in range(6000):
+        doc = bson.decode(bson.encode(_rand_doc(rng)))
+        query = bson.decode(bson.encode(_rand_query(rng)))
+        rust = _rust_match(doc, query)
+        if rust is None:
+            continue  # fallback case — shim would use pure Python
+        handled += 1
+        py = _pure.matches(doc, query)
+        assert rust == py, f"divergence: rust={rust} pure={py} query={query} doc={doc}"
+    assert handled > 1000, f"expected the Rust matcher to handle many cases, only {handled}"

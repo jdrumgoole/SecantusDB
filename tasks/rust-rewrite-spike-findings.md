@@ -140,3 +140,37 @@ so no regression is expected.
 Next: port `query.matches` behind the same seam, then decide on flipping the
 `sortkey` default to Rust (gated on Phase 6 packaging — merging the maturin and
 scikit-build wheels — and the per-call re-encode overhead question).
+
+---
+
+## Phase 1 — `query.matches` ported (common operators): **DONE**
+
+Second leaf engine. `crates/secantus-core/src/query.rs` (+ `numeric.rs` for the
+int32/int64/double/Decimal128 bridge) ports the field- and document-level
+matchers behind the byte seam (doc + query cross as BSON bytes). The key design
+choice is **graceful fallback**: the Rust matcher returns `None` for anything it
+can't reproduce byte-for-byte, and `secantus.query.matches` (when
+`SECANTUS_RUST_QUERY=1`, no collation) uses that to defer to the pure-Python
+matcher. So the port is always correct — the operators it *does* handle match
+Python exactly, and everything else runs the existing code.
+
+Handled in Rust: `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`, `$in`/`$nin`, `$exists`,
+`$not`, `$type`, `$size`, `$elemMatch`, `$mod`, `$bits*`, `$and`/`$or`/`$nor`,
+`$comment`, bare-value equality with dotted-path + array fan-out, and the
+numeric cross-type bridge / bool-distinctness. Deferred to Python (fallback):
+collation, `$expr`, `$jsonSchema`, geo, **any regex** (Python `re` semantics),
+`$all`, structural/compound (array/doc) equality, bool-as-int comparison, and
+exotic BSON types.
+
+Validation: `cargo test` green; `tests/test_rust_query_parity.py` — a curated
+corpus mirroring `tests/test_query.py` plus a **6000-case randomised fuzz** —
+green, with the fuzz asserting the Rust matcher actually handled >1000 cases
+(not just falling back). Two faithful-semantics bugs were caught and fixed
+during the port (both in `$mod`): Python computes `bool % div` (bool is an int
+subclass) so a bool value participates, and the remainder is compared literally
+(`-26 % 2 == 2` is `0 == 2` → False, not normalised). No changes to the Python
+side were needed this time — the Rust port matched the existing pure-Python
+behaviour once those two were right.
+
+Next leaf engine: `update.apply_update` (or `expressions`, which would unlock
+`$expr` in the matcher and remove that fallback).

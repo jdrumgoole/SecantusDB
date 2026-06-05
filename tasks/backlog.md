@@ -115,8 +115,27 @@ maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
   `collation.normalize_for_index_bytes`; the shim only delegates when
   `collation is None` and uses pure Python otherwise. Port when `collation`
   lands in the Rust core.
-- [ ] **Remaining Phase 1 leaf engines** — `query.matches`, `update`,
-  `projection`, `expressions`, `diff`, `paths`. Next up: `query.matches`.
+- [x] **Phase 1, leaf engine #2: `query.matches`** — common operators ported
+  to Rust (`crates/secantus-core/src/query.rs` + `numeric.rs`) behind the byte
+  seam; `secantus.query.matches` delegates when `SECANTUS_RUST_QUERY=1` and no
+  collation. The Rust matcher returns `None` (→ pure-Python fallback) for
+  anything not reproduced faithfully: collation, `$expr`, `$jsonSchema`, geo,
+  **any regex**, `$all`, structural/compound equality (array/doc operands),
+  bool-as-int comparison, exotic BSON types. Parity pinned by
+  `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).
+- [ ] **Widen the Rust query matcher** to cover the current fallbacks where
+  faithful: `$all` (needs Python-`==` element semantics incl. regex elements),
+  bool-as-int `$gt`/`$lt` comparison, structural array/doc equality. Each needs
+  care to match Python's exact (sometimes quirky) semantics; left as fallback
+  until then.
+- [ ] **Flip `query.matches` default to Rust** — same gating as sortkey
+  (Phase 6 packaging + the per-call `bson.encode` overhead question). Note the
+  matcher re-encodes doc+query per call at the seam; the real win needs the doc
+  to already be bytes at the call site (it is, in storage — wire that through
+  when the boundary moves outward).
+- [ ] **Remaining Phase 1 leaf engines** — `update`, `projection`,
+  `expressions`, `diff`, `paths`. (`expressions` unlocks `$expr` in the
+  matcher; `collation` unlocks the collation fallbacks.)
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 

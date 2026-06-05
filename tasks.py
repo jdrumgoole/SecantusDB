@@ -96,13 +96,16 @@ def rust_build(c: Context) -> None:
 
 @task(name="rust-parity")
 def rust_parity(c: Context) -> None:
-    """Build the Rust core and run the sortkey parity suite against it.
+    """Build the Rust core and run the leaf-engine parity suites against it.
 
-    Builds the extension, then runs tests/test_rust_sortkey_parity.py in an
-    isolated interpreter (pymongo + the freshly built wheel) so it does not
+    Builds the extension, then runs the parity tests (sortkey + query) in an
+    isolated interpreter (pymongo + the freshly built wheel) so they do not
     require the WiredTiger C extension to be installed. This mirrors how the
-    parity gate runs in a WiredTiger-less environment; full CI also runs it
+    parity gate runs in a WiredTiger-less environment; full CI also runs them
     via the normal pytest suite once the project wheel is built.
+
+    ``--reinstall-package`` busts uv's cache: the wheel keeps the same
+    name/version across rebuilds, so without it a stale build would be reused.
     """
     import glob
 
@@ -111,8 +114,10 @@ def rust_parity(c: Context) -> None:
     if not wheels:
         raise SystemExit("no wheel produced by maturin")
     c.run(
-        f"uv run --no-project --with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
-        "python -m pytest tests/test_rust_sortkey_parity.py -o addopts= -p no:cacheprovider -q",
+        "uv run --no-project --reinstall-package secantus-core "
+        f"--with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
+        "python -m pytest tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py "
+        "-o addopts= -p no:cacheprovider -q",
         pty=True,
     )
 

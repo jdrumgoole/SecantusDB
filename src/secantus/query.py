@@ -1,17 +1,36 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import re
 from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
+import bson
 from bson import Binary, Decimal128, Int64, ObjectId, Regex
 
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
 from secantus.collation import equal as _coll_equal
+
+# Phase 1 of the Python -> Rust rewrite: the Rust core ports the common query
+# operators behind the byte seam (doc + query cross as BSON bytes). The Rust
+# matcher returns None for anything it can't reproduce faithfully (collation,
+# $expr, $jsonSchema, geo, any regex, $all, structural/compound equality,
+# exotic BSON types), in which case we fall through to the pure-Python matcher
+# below. Opt-in via SECANTUS_RUST_QUERY=1 while the port is validated; pure
+# Python stays authoritative and is the only path when a collation is in
+# effect. Parity is pinned by tests/test_rust_query_parity.py.
+try:
+    import _secantus_core as _rust
+except ImportError:
+    _rust = None
+
+
+def _rust_query_enabled() -> bool:
+    return _rust is not None and os.environ.get("SECANTUS_RUST_QUERY") == "1"
 
 
 class _Missing:
@@ -42,6 +61,15 @@ def matches(
 ) -> bool:
     if not query:
         return True
+    if collation is None and _rust_query_enabled():
+        try:
+            result = _rust.query_matches(bson.encode(dict(doc)), bson.encode(dict(query)))
+        except Exception:
+            # Any encode/decode hiccup: fall through to the pure-Python path
+            # rather than surfacing a Rust-side error.
+            result = None
+        if result is not None:
+            return result
     return all(_match_clause(doc, k, v, vars, collation) for k, v in query.items())
 
 
