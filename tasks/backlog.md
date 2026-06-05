@@ -96,7 +96,8 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 ## 7. Python → Rust rewrite (in progress)
 
 Tracking the incremental rewrite (plan: `tasks/rust-rewrite-plan.md`; Phase 0
-spike results: `tasks/rust-rewrite-spike-findings.md`). The Rust core lives at
+spike results: `tasks/rust-rewrite-spike-findings.md`; Phase 3+4 scoping:
+`tasks/rust-rewrite-phase3-scoping.md`). The Rust core lives at
 `crates/secantus-core` and builds as an abi3 extension `_secantus_core` via
 maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
 
