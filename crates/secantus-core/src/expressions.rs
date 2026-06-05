@@ -16,10 +16,12 @@
 //! `$substrCP`); object ops (`$mergeObjects`/`$objectToArray`); the
 //! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; UTC date component
 //! extractors (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/
-//! `$dayOfWeek`); and a safe subset of conversions (`$toInt`/`$toDouble`/
-//! `$toBool`/`$toString` for numbers/bools/strings). Everything else (other
-//! date ops, regex, `$convert`/`$toDecimal`, Decimal128 / string-parse / float
-//! str() conversion edges, non-ASCII case) -> Python.
+//! `$dayOfWeek`) + `$dateToParts`; a safe subset of conversions (`$toInt`/
+//! `$toDouble`/`$toBool`/`$toString` for numbers/bools/strings); exactly-
+//! deterministic math (`$abs`/`$floor`/`$ceil`/`$sqrt`); and `$range`/
+//! `$strLenBytes`/`$arrayToObject`. Everything else (heavier date ops, regex,
+//! `$convert`/`$toDecimal`, `$round`/`$pow`/transcendental math, Decimal128 /
+//! string-parse / float-str() conversion edges, non-ASCII case) -> Python.
 
 use std::cmp::Ordering;
 
@@ -196,6 +198,18 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$toDouble" => op_to_double(arg, ctx),
         "$toBool" => op_to_bool(arg, ctx),
         "$toString" => op_to_string(arg, ctx),
+        // math (exactly-deterministic only; $round/$pow/$trunc and the
+        // transcendentals — exp/ln/log/log10 — are deferred for rounding / ULP
+        // fidelity, $sqrt is IEEE exactly-rounded so it's safe)
+        "$abs" => op_abs(arg, ctx),
+        "$floor" => op_floor_ceil(arg, ctx, false),
+        "$ceil" => op_floor_ceil(arg, ctx, true),
+        "$sqrt" => op_sqrt(arg, ctx),
+        // misc structural / deterministic
+        "$dateToParts" => op_date_to_parts(arg, ctx),
+        "$range" => op_range(arg, ctx),
+        "$strLenBytes" => op_str_len_bytes(arg, ctx),
+        "$arrayToObject" => op_array_to_object(arg, ctx),
         _ => Err(Fallback),
     }
 }
@@ -1017,6 +1031,166 @@ fn op_to_string(arg: &Bson, ctx: &Ctx) -> R {
         // float str() / Decimal128 / datetime isoformat / ObjectId etc. -> Python.
         _ => return Err(Fallback),
     })
+}
+
+// --- math ---------------------------------------------------------------
+
+fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Int32(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
+        Bson::Int64(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
+        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
+        Bson::Double(d) => Ok(Bson::Double(d.abs())),
+        _ => Err(Fallback), // Decimal128 / non-numeric: Python abs() raises
+    }
+}
+
+fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        // math.floor/ceil of an int returns it unchanged.
+        v @ (Bson::Int32(_) | Bson::Int64(_)) => Ok(v),
+        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
+        Bson::Double(d) => {
+            if !d.is_finite() {
+                return Err(Fallback); // math.floor(nan/inf) raises
+            }
+            let r = if ceil { d.ceil() } else { d.floor() };
+            if r < i64::MIN as f64 || r > i64::MAX as f64 {
+                return Err(Fallback);
+            }
+            int_to_bson(r as i128).ok_or(Fallback)
+        }
+        _ => Err(Fallback),
+    }
+}
+
+fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        v => {
+            let Some(f) = as_float_like(&v) else {
+                return Err(Fallback); // Decimal128 / non-numeric -> Python
+            };
+            // Python: math.sqrt(v) if v >= 0 else None. NaN >= 0 is false -> None.
+            if f >= 0.0 {
+                Ok(Bson::Double(f.sqrt()))
+            } else {
+                Ok(Bson::Null)
+            }
+        }
+    }
+}
+
+// --- $dateToParts (UTC; ignores timezone/iso8601 like the Python impl) ---
+
+fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    match eval_opt(d.get("date"), ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        Bson::DateTime(dt) => {
+            let millis = dt.timestamp_millis();
+            let days = millis.div_euclid(86_400_000);
+            let ms = millis.rem_euclid(86_400_000);
+            let (y, m, dy) = civil_from_days(days);
+            let mut out = Document::new();
+            out.insert("year".to_string(), Bson::Int32(y as i32));
+            out.insert("month".to_string(), Bson::Int32(m as i32));
+            out.insert("day".to_string(), Bson::Int32(dy as i32));
+            out.insert("hour".to_string(), Bson::Int32((ms / 3_600_000) as i32));
+            out.insert(
+                "minute".to_string(),
+                Bson::Int32(((ms / 60_000) % 60) as i32),
+            );
+            out.insert("second".to_string(), Bson::Int32(((ms / 1000) % 60) as i32));
+            out.insert("millisecond".to_string(), Bson::Int32((ms % 1000) as i32));
+            Ok(Bson::Document(out))
+        }
+        _ => Err(Fallback),
+    }
+}
+
+// --- $range -------------------------------------------------------------
+
+const MAX_RANGE_SIZE: i128 = 100_000;
+
+fn range_int(b: &Bson) -> Result<i64, Fallback> {
+    // Python requires int and not bool.
+    match b {
+        Bson::Int32(n) => Ok(*n as i64),
+        Bson::Int64(n) => Ok(*n),
+        _ => Err(Fallback),
+    }
+}
+
+fn op_range(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Array(a) = arg else {
+        return Err(Fallback);
+    };
+    if !(2..=3).contains(&a.len()) {
+        return Err(Fallback);
+    }
+    let start = range_int(&eval(&a[0], ctx)?)? as i128;
+    let end = range_int(&eval(&a[1], ctx)?)? as i128;
+    let step = if a.len() == 3 {
+        range_int(&eval(&a[2], ctx)?)? as i128
+    } else {
+        1
+    };
+    if step == 0 {
+        return Err(Fallback);
+    }
+    let delta = end - start;
+    if (delta > 0) == (step > 0) && delta != 0 {
+        let size = (delta.abs() + step.abs() - 1) / step.abs();
+        if size > MAX_RANGE_SIZE {
+            return Err(Fallback); // Python raises past the cap
+        }
+    }
+    let mut out = Vec::new();
+    let mut i = start;
+    while (step > 0 && i < end) || (step < 0 && i > end) {
+        out.push(int_to_bson(i).ok_or(Fallback)?);
+        i += step;
+    }
+    Ok(Bson::Array(out))
+}
+
+fn op_str_len_bytes(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::String(s) => Ok(Bson::Int32(s.len() as i32)), // UTF-8 byte length
+        _ => Err(Fallback),
+    }
+}
+
+fn op_array_to_object(arg: &Bson, ctx: &Ctx) -> R {
+    let entries = match eval(arg, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Array(a) => a,
+        _ => return Err(Fallback),
+    };
+    let mut out = Document::new();
+    for e in entries {
+        match e {
+            Bson::Document(d) => {
+                let (Some(Bson::String(k)), Some(v)) = (d.get("k"), d.get("v")) else {
+                    return Err(Fallback); // missing k/v or non-string key -> Python
+                };
+                out.insert(k.clone(), v.clone());
+            }
+            Bson::Array(pair) if pair.len() == 2 => {
+                let Bson::String(k) = &pair[0] else {
+                    return Err(Fallback);
+                };
+                out.insert(k.clone(), pair[1].clone());
+            }
+            _ => return Err(Fallback),
+        }
+    }
+    Ok(Bson::Document(out))
 }
 
 /// Python `==` (used by `$in` membership and `$eq` element semantics, and by

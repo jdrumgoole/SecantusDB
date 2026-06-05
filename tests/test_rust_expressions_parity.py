@@ -171,6 +171,37 @@ CURATED = [
     ({"$toString": "$s"}, {"s": "hi"}),
     ({"$toInt": "12"}, {}),  # string parse -> defer
     ({"$toString": 3.14}, {}),  # float str() -> defer
+    # Math (deterministic subset).
+    ({"$abs": -5}, {}),
+    ({"$abs": "$n"}, {"n": -5.5}),
+    ({"$abs": -(2**31)}, {}),  # -> int64
+    ({"$abs": "$x"}, {}),  # missing -> null
+    ({"$floor": 3.7}, {}),
+    ({"$floor": -3.2}, {}),
+    ({"$floor": 5}, {}),
+    ({"$ceil": 3.2}, {}),
+    ({"$ceil": -3.7}, {}),
+    ({"$sqrt": 16}, {}),
+    ({"$sqrt": 2}, {}),
+    ({"$sqrt": "$n"}, {"n": -1}),  # negative -> null
+    ({"$sqrt": 0}, {}),
+    # $dateToParts (UTC).
+    ({"$dateToParts": {"date": "$d"}}, {"d": _DT}),
+    ({"$dateToParts": {"date": "$x"}}, {}),  # missing -> null
+    # $range.
+    ({"$range": [0, 5]}, {}),
+    ({"$range": [0, 10, 2]}, {}),
+    ({"$range": [5, 0, -1]}, {}),
+    ({"$range": [0, 0]}, {}),
+    ({"$range": [0, 3, 0]}, {}),  # step 0 -> defer (Python raises)
+    # $strLenBytes.
+    ({"$strLenBytes": "héllo"}, {}),  # é is 2 UTF-8 bytes -> 6
+    ({"$strLenBytes": "abc"}, {}),
+    # $arrayToObject.
+    ({"$arrayToObject": [{"k": "a", "v": 1}, {"k": "b", "v": 2}]}, {}),
+    ({"$arrayToObject": [["x", 1], ["y", 2]]}, {}),
+    ({"$arrayToObject": "$pairs"}, {"pairs": [{"k": "n", "v": 9}]}),
+    ({"$arrayToObject": [{"k": 1, "v": 2}]}, {}),  # non-string key -> defer
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
@@ -277,6 +308,35 @@ def test_date_extractor_fuzz():
                 continue
             py = _pure.evaluate(expr, doc)
             assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+
+
+def test_math_and_range_fuzz():
+    """$abs/$floor/$ceil/$sqrt over random ints & floats, and $range over random
+    small bounds, against Python wherever the Rust path doesn't defer."""
+    rng = random.Random(0x4A7B)
+    for _ in range(5000):
+        v = rng.choice([
+            rng.randint(-10000, 10000),
+            round(rng.uniform(-1000, 1000), 3),
+            rng.choice([0, 0.0, -0.0, 2**40, -(2**31)]),
+        ])
+        for op in ("$abs", "$floor", "$ceil", "$sqrt"):
+            expr = {op: v}
+            rust = _rust_eval(expr, {})
+            if rust is None:
+                continue
+            try:
+                py = _pure.evaluate(expr, {})
+            except Exception:
+                pytest.fail(f"{op}: rust={rust!r} but pure raised; v={v!r}")
+            assert rust == py, f"{op}: rust={rust!r} pure={py!r} v={v!r}"
+        # $range
+        lo, hi = rng.randint(-20, 20), rng.randint(-20, 20)
+        step = rng.choice([1, 2, 3, -1, -2])
+        expr = {"$range": [lo, hi, step]}
+        rust = _rust_eval(expr, {})
+        if rust is not None:
+            assert rust == _pure.evaluate(expr, {}), f"$range lo={lo} hi={hi} step={step}"
 
 
 def test_conversion_fuzz():
