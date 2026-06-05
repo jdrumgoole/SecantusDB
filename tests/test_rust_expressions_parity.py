@@ -23,6 +23,7 @@ import types
 
 import bson
 import pytest
+from bson import Int64, ObjectId
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -150,6 +151,26 @@ CURATED = [
     ({"$hour": "$d"}, {"d": _DT}),
     ({"$dayOfWeek": "$d"}, {"d": _DT}),
     ({"$year": "$d"}, {"d": "not a date"}),  # non-date -> null
+    # Type conversions (safe subset).
+    ({"$toInt": 3.9}, {}),
+    ({"$toInt": "$n"}, {"n": -3.9}),
+    ({"$toInt": True}, {}),
+    ({"$toInt": "$n"}, {"n": Int64(5)}),  # int64 returned unchanged
+    ({"$toInt": "$x"}, {}),  # missing -> null
+    ({"$toDouble": 5}, {}),
+    ({"$toDouble": False}, {}),
+    ({"$toDouble": "$n"}, {"n": Int64(7)}),
+    ({"$toBool": 0}, {}),
+    ({"$toBool": 5}, {}),
+    ({"$toBool": ""}, {}),
+    ({"$toBool": "x"}, {}),
+    ({"$toBool": "$d"}, {"d": _DT}),  # datetime -> True
+    ({"$toString": 42}, {}),
+    ({"$toString": "$n"}, {"n": Int64(-9)}),
+    ({"$toString": True}, {}),
+    ({"$toString": "$s"}, {"s": "hi"}),
+    ({"$toInt": "12"}, {}),  # string parse -> defer
+    ({"$toString": 3.14}, {}),  # float str() -> defer
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
@@ -256,6 +277,28 @@ def test_date_extractor_fuzz():
                 continue
             py = _pure.evaluate(expr, doc)
             assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+
+
+def test_conversion_fuzz():
+    """$toInt / $toDouble / $toBool / $toString over a mix of scalar types,
+    checked against Python wherever the Rust path doesn't defer."""
+    values = [
+        0, 1, -7, 2**40, Int64(5), Int64(-3),
+        0.0, 3.9, -3.9, 1e10, 2.5,
+        True, False, None, "", "abc", "12", ObjectId(),
+    ]
+    for v in values:
+        doc = bson.decode(bson.encode({"v": v}))
+        for op in ("$toInt", "$toDouble", "$toBool", "$toString"):
+            expr = {op: "$v"}
+            rust = _rust_eval(expr, doc)
+            if rust is None:
+                continue
+            try:
+                py = _pure.evaluate(expr, doc)
+            except Exception:
+                pytest.fail(f"{op}: rust={rust!r} but pure raised; v={v!r}")
+            assert rust == py, f"{op}: rust={rust!r} pure={py!r} v={v!r}"
 
 
 def test_randomised_fuzz_parity():

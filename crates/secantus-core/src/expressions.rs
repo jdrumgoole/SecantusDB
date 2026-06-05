@@ -14,10 +14,12 @@
 //! `$last`/`$concatArrays`/`$reverseArray`/`$in`/`$slice`/`$indexOfArray`);
 //! ASCII string ops (`$concat`/`$toLower`/`$toUpper`/`$strLenCP`/`$split`/
 //! `$substrCP`); object ops (`$mergeObjects`/`$objectToArray`); the
-//! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; and UTC date component
+//! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; UTC date component
 //! extractors (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/
-//! `$dayOfWeek`). Everything else (other date ops, regex, conversions,
-//! non-ASCII case) -> Python.
+//! `$dayOfWeek`); and a safe subset of conversions (`$toInt`/`$toDouble`/
+//! `$toBool`/`$toString` for numbers/bools/strings). Everything else (other
+//! date ops, regex, `$convert`/`$toDecimal`, Decimal128 / string-parse / float
+//! str() conversion edges, non-ASCII case) -> Python.
 
 use std::cmp::Ordering;
 
@@ -188,6 +190,12 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$minute" => date_part(arg, ctx, DatePart::Minute),
         "$second" => date_part(arg, ctx, DatePart::Second),
         "$dayOfWeek" => date_part(arg, ctx, DatePart::DayOfWeek),
+        // type conversions (safe subset; Decimal128 / string-parse / float
+        // str() defer to Python)
+        "$toInt" => op_to_int(arg, ctx),
+        "$toDouble" => op_to_double(arg, ctx),
+        "$toBool" => op_to_bool(arg, ctx),
+        "$toString" => op_to_string(arg, ctx),
         _ => Err(Fallback),
     }
 }
@@ -946,6 +954,69 @@ fn date_part(arg: &Bson, ctx: &Ctx, part: DatePart) -> R {
         }
     };
     Ok(Bson::Int32(value as i32))
+}
+
+// --- type conversions ---------------------------------------------------
+
+fn op_to_int(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        // Python returns an already-int value unchanged (preserving int32 vs
+        // int64), rather than re-widening.
+        v @ (Bson::Int32(_) | Bson::Int64(_)) => Ok(v),
+        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
+        Bson::Double(d) => {
+            if !d.is_finite() {
+                return Err(Fallback); // Python int(nan/inf) raises
+            }
+            let t = d.trunc();
+            if t < i64::MIN as f64 || t > i64::MAX as f64 {
+                return Err(Fallback);
+            }
+            int_to_bson(t as i128).ok_or(Fallback)
+        }
+        // Decimal128 / string parsing -> Python (edge-case-prone).
+        _ => Err(Fallback),
+    }
+}
+
+fn op_to_double(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Boolean(b) => Ok(Bson::Double(if b { 1.0 } else { 0.0 })),
+        Bson::Int32(n) => Ok(Bson::Double(n as f64)),
+        Bson::Int64(n) => Ok(Bson::Double(n as f64)),
+        v @ Bson::Double(_) => Ok(v),
+        _ => Err(Fallback), // Decimal128 / string parsing -> Python
+    }
+}
+
+fn op_to_bool(arg: &Bson, ctx: &Ctx) -> R {
+    Ok(match eval(arg, ctx)? {
+        Bson::Null => Bson::Null,
+        Bson::Boolean(b) => Bson::Boolean(b),
+        Bson::Int32(n) => Bson::Boolean(n != 0),
+        Bson::Int64(n) => Bson::Boolean(n != 0),
+        Bson::Double(d) => Bson::Boolean(d != 0.0), // NaN -> true
+        Bson::String(s) => Bson::Boolean(!s.is_empty()),
+        Bson::Decimal128(_) => return Err(Fallback),
+        // Python: every other type is truthy.
+        _ => Bson::Boolean(true),
+    })
+}
+
+fn op_to_string(arg: &Bson, ctx: &Ctx) -> R {
+    Ok(match eval(arg, ctx)? {
+        Bson::Null => Bson::Null,
+        Bson::Int32(n) => Bson::String(n.to_string()),
+        Bson::Int64(n) => Bson::String(n.to_string()),
+        // Python str(True) == "True" (capitalised — this impl uses str(), not
+        // mongod's lowercase). Reproduce that exactly.
+        Bson::Boolean(b) => Bson::String(if b { "True" } else { "False" }.to_string()),
+        v @ Bson::String(_) => v,
+        // float str() / Decimal128 / datetime isoformat / ObjectId etc. -> Python.
+        _ => return Err(Fallback),
+    })
 }
 
 /// Python `==` (used by `$in` membership and `$eq` element semantics, and by

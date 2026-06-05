@@ -187,11 +187,13 @@ never "remove Python."
   `$split`/`$substrCP`; `$mergeObjects`/`$objectToArray`; the scope-introducing
   `$let`/`$map`/`$filter`/`$reduce`; and UTC date component extractors
   (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/`$dayOfWeek`, via a
-  dependency-free civil-date algorithm). Remaining whole-call fallbacks to widen
-  where faithful: the heavier date ops (`$dateToString`/`$dateAdd`/`$dateDiff`/
-  `$dateTrunc`/`$dateFromString` — timezones, `strftime`, month arithmetic),
-  conversions (`$toInt`/`$convert`/`$toString` — float `str()`, Decimal128),
-  `$trim*`, `$getField`/`$setField`, and non-ASCII case (`$toLower`/`$toUpper`
+  dependency-free civil-date algorithm); and a safe subset of conversions
+  (`$toInt`/`$toDouble`/`$toBool`/`$toString` for numbers/bools/strings).
+  Remaining whole-call fallbacks to widen where faithful: the heavier date ops
+  (`$dateToString`/`$dateAdd`/`$dateDiff`/`$dateTrunc`/`$dateFromString` —
+  timezones, `strftime`, month arithmetic); the conversion edges deferred above
+  (Decimal128, string→number parsing, float `str()`, `$convert`/`$toDecimal`);
+  `$trim*`; `$getField`/`$setField`; and non-ASCII case (`$toLower`/`$toUpper`
   defer on non-ASCII for Unicode-fidelity safety). Regex ops (`$regexMatch`/…)
   need Python `re`.
 - [x] **Phase 1, leaf engine #5: `projection.apply_projection`** — inclusion /
