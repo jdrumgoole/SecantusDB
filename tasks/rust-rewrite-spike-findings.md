@@ -413,3 +413,35 @@ the rest. (A fuzz seed shift surfaced this as a real `False`-vs-`0` divergence.)
 Validation: `cargo test` (57) + `tests/test_rust_aggregate_parity.py` (curated +
 5-seed fuzz) green, plus 8 extra local seeds with ~1,650-1,730 group/sortByCount
 pipelines handled each and zero mismatches; full Rust parity sweep **501 cases**.
+
+### Pipeline widening: `$bucket` + `$facet`
+
+`$bucket` (`group::bucket_stage`) reuses the `$group` accumulator machinery: it
+places each doc into the half-open range `boundaries[i] <= value <
+boundaries[i+1]` via `expressions::py_order` (Python's native `<=`/`<`, so
+cross-type / Decimal128 / array-doc boundaries defer rather than guess; NaN and
+TypeError fall through to `default`), then runs the `output` accumulators per
+bucket through a shared `accumulate_into` helper. The pure quirks are
+reproduced: an empty bucket emits only `{_id}` (the accumulator fields are never
+created, because the inner per-doc loop never runs), an explicit `null` default
+counts as absent, a missing/empty `output` falls back to `{count: {$sum: 1}}`,
+and pathological Python-equal bucket keys (which the pure dict would collapse)
+defer.
+
+`$facet` (`aggregate::facet_stage`) is structurally trivial — it runs each named
+sub-pipeline over a clone of the input through the recursive `apply_pipeline`
+and gathers the results into one output doc; any deferring sub-pipeline defers
+the whole stage.
+
+Validation: `cargo test` (57) + `tests/test_rust_aggregate_parity.py` (curated +
+5-seed fuzz, now generating `$bucket`/`$facet` with non-recursive facet
+sub-pipelines) green, plus 8 extra local seeds (~500-580 `$bucket`, ~370-410
+`$facet` pipelines handled per 5000, zero mismatches). Full Rust parity sweep
+**508 cases**.
+
+The pure-Python pipeline stages now ported to Rust: `$match`, `$limit`, `$skip`,
+`$count`, `$project`, `$addFields`/`$set`, `$unset`, `$replaceRoot`/
+`$replaceWith`, `$sort`, `$unwind`, `$group`, `$sortByCount`, `$bucket`,
+`$facet`. Remaining: `$densify` and the storage-backed stages
+(`$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge`/`$sample`), which wait for
+the storage layer to move into Rust (Phase 3+).

@@ -6,16 +6,16 @@
 //!
 //! Graceful whole-pipeline fallback: if any stage isn't ported (storage-backed
 //! `$lookup`/`$geoNear`/`$out`/`$merge`, non-deterministic `$sample`, or the
-//! still-unported `$bucket`/`$facet`/`$densify`) or any inner expression defers,
-//! the entire `apply_pipeline` returns `Fallback` and the pure-Python pipeline
-//! runs instead.
+//! still-unported `$densify`) or any inner expression defers, the entire
+//! `apply_pipeline` returns `Fallback` and the pure-Python pipeline runs
+//! instead.
 //!
 //! Handled stages: `$match`, `$limit`, `$skip`, `$count`, `$project`,
 //! `$addFields`/`$set`, `$unset`, `$replaceRoot`/`$replaceWith`, `$sort`
 //! (cross-type BSON ordering via `order::cmp`, deferring Decimal128 / exotic
-//! sort keys), `$unwind`, `$group`/`$sortByCount` (see `group.rs` — defers on
-//! the cross-type key / accumulator cases Python can't reproduce without
-//! raising).
+//! sort keys), `$unwind`, `$group`/`$sortByCount`/`$bucket` (see `group.rs` —
+//! defers on the cross-type key / accumulator cases Python can't reproduce
+//! without raising), and `$facet` (recursive sub-pipelines).
 
 use bson::{Bson, Document};
 
@@ -123,9 +123,36 @@ fn apply_stage(
         "$unwind" => unwind_stage(docs, spec),
         "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback),
-        // $bucket / $facet / $densify / storage-backed / $sample / … -> Python.
+        "$bucket" => group::bucket_stage(spec, &docs, vars).map_err(|_| Fallback),
+        "$facet" => facet_stage(spec, docs, vars, coll),
+        // $densify / storage-backed / $sample / … -> Python.
         _ => Err(Fallback),
     }
+}
+
+/// `$facet` — run each named sub-pipeline over a copy of the same input docs and
+/// collect the results into one output doc. Defers if any sub-pipeline defers.
+fn facet_stage(
+    spec: &Bson,
+    docs: Vec<Document>,
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R<Vec<Document>> {
+    let Bson::Document(s) = spec else {
+        return Err(Fallback);
+    };
+    let mut out = Document::new();
+    for (name, sub) in s {
+        let Bson::Array(sub_pipeline) = sub else {
+            return Err(Fallback); // Python raises (entry must be a pipeline array)
+        };
+        let result = apply_pipeline(docs.clone(), sub_pipeline, vars, coll)?;
+        out.insert(
+            name.clone(),
+            Bson::Array(result.into_iter().map(Bson::Document).collect()),
+        );
+    }
+    Ok(vec![out])
 }
 
 // --- $sort (mirrors storage.sort_docs / _SortKey) -----------------------
@@ -484,7 +511,7 @@ mod tests {
     fn unported_stage_defers() {
         assert!(apply_pipeline(
             vec![doc! {"a": 1}],
-            &[bson::bson!({"$bucket": {"groupBy": "$a", "boundaries": [0, 10]}})],
+            &[bson::bson!({"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}})],
             &Document::new(),
             None
         )

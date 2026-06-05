@@ -364,6 +364,131 @@ pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R
     Ok(grouped)
 }
 
+/// Accumulate `output_spec` over `docs` into a single bucket with a fixed
+/// `_id` (shared by `$bucket`). Mirrors the per-bucket `_accumulate` /
+/// `_finalize` loop in `_stage_bucket`. Caller guarantees `docs` is non-empty
+/// (an empty `$bucket` bucket emits only `{_id}` — the accumulator fields are
+/// never created, matching the pure code).
+fn accumulate_into(
+    id: Bson,
+    output_spec: &Document,
+    docs: &[&Document],
+    vars: &Document,
+) -> R<Document> {
+    let mut compiled: Vec<(&str, &Bson, Acc)> = Vec::with_capacity(output_spec.len());
+    for (field, spec) in output_spec {
+        let Bson::Document(d) = spec else {
+            return Err(()); // Python raises (accumulator must be a doc)
+        };
+        if d.len() != 1 {
+            return Err(());
+        }
+        let (op, arg) = d.iter().next().unwrap();
+        compiled.push((field.as_str(), arg, new_acc(op)?));
+    }
+    for d in docs {
+        for (_field, arg, acc) in compiled.iter_mut() {
+            apply_acc(acc, arg, d, vars)?;
+        }
+    }
+    let paired: Vec<(&str, Acc)> = compiled.into_iter().map(|(f, _a, acc)| (f, acc)).collect();
+    finalize(id, paired)
+}
+
+/// `$bucket` — place each doc into the half-open boundary range
+/// `boundaries[i] <= value < boundaries[i+1]` (Python's native `<=`/`<` via
+/// `expressions::py_order`, so cross-type / Decimal128 / array-doc boundaries
+/// defer rather than guess), falling to `default` when unplaced, then run the
+/// `output` accumulators per bucket.
+pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+    let Bson::Document(s) = spec else {
+        return Err(());
+    };
+    let group_by = s.get("groupBy").cloned().unwrap_or(Bson::Null);
+    let Some(Bson::Array(boundaries)) = s.get("boundaries") else {
+        return Err(()); // missing / non-array boundaries -> Python raises
+    };
+    if boundaries.len() < 2 {
+        return Err(());
+    }
+    // `default is not None` — an explicit null default counts as absent.
+    let default = match s.get("default") {
+        None | Some(Bson::Null) => None,
+        Some(v) => Some(v.clone()),
+    };
+    let default_output = bson::doc! {"count": {"$sum": 1i32}};
+    let output_spec: &Document = match s.get("output") {
+        Some(Bson::Document(d)) if !d.is_empty() => d,
+        None | Some(Bson::Document(_)) => &default_output, // absent / empty -> default
+        Some(_) => return Err(()), // truthy non-doc -> Python `.items()` raises
+    };
+
+    // Bucket keys = boundaries[..-1] then `default`. Python keys them in a dict,
+    // so equal keys would collapse / reset — defer those pathological collisions.
+    let nb = boundaries.len();
+    let mut seen: Vec<GKey> = Vec::new();
+    let mut keys: Vec<Bson> = Vec::new();
+    for b in &boundaries[..nb - 1] {
+        let gk = gkey(b)?;
+        if seen.contains(&gk) {
+            return Err(());
+        }
+        seen.push(gk);
+        keys.push(b.clone());
+    }
+    let default_idx = if let Some(dv) = &default {
+        let gk = gkey(dv)?;
+        if seen.contains(&gk) {
+            return Err(());
+        }
+        keys.push(dv.clone());
+        Some(keys.len() - 1)
+    } else {
+        None
+    };
+
+    let mut placed: Vec<Vec<&Document>> = vec![Vec::new(); keys.len()];
+    for d in docs {
+        let v = eval(&group_by, d, vars)?;
+        let mut put = false;
+        for i in 0..nb - 1 {
+            // `boundaries[i] <= v` (skip this bucket on TypeError / NaN-False).
+            match expressions::py_order(&boundaries[i], &v).map_err(|_| ())? {
+                None => continue,
+                Some(Ordering::Greater) => continue, // lo > v
+                Some(_) => {}
+            }
+            // `v < boundaries[i+1]`.
+            match expressions::py_order(&v, &boundaries[i + 1]).map_err(|_| ())? {
+                Some(Ordering::Less) => {
+                    placed[i].push(d);
+                    put = true;
+                    break;
+                }
+                _ => continue, // >= hi, or TypeError/NaN -> not this bucket
+            }
+        }
+        if !put {
+            if let Some(di) = default_idx {
+                placed[di].push(d);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(keys.len());
+    for (key, bucket_docs) in keys.into_iter().zip(placed.into_iter()) {
+        if bucket_docs.is_empty() {
+            // Empty bucket: only `_id` (accumulator fields are never created).
+            let mut doc = Document::new();
+            doc.insert("_id".to_string(), key);
+            out.push(doc);
+        } else {
+            out.push(accumulate_into(key, output_spec, &bucket_docs, vars)?);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

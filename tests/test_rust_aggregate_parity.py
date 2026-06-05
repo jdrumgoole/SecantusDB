@@ -120,8 +120,30 @@ CURATED = [
     [{"$group": {"_id": "$nested.k", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
     [{"$sortByCount": "$b"}],
     [{"$unwind": "$tags"}, {"$group": {"_id": "$tags", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
+    # $bucket — default, custom output, empty buckets
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 20, 30]}}],
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 20], "default": "other"}}],
+    [
+        {
+            "$bucket": {
+                "groupBy": "$a",
+                "boundaries": [0, 20],
+                "default": "x",
+                "output": {"n": {"$sum": 1}, "av": {"$avg": "$a"}, "mx": {"$max": "$a"}},
+            }
+        }
+    ],
+    # $facet — multiple sub-pipelines over the same input
+    [
+        {
+            "$facet": {
+                "byB": [{"$group": {"_id": "$b", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
+                "top": [{"$sort": {"a": -1}}, {"$limit": 1}, {"$project": {"a": 1, "_id": 0}}],
+                "n": [{"$count": "total"}],
+            }
+        }
+    ],
     # stages that still defer (rust None -> skipped)
-    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 30]}}],
     [{"$sample": {"size": 2}}],
 ]
 
@@ -195,12 +217,27 @@ def _rand_doc(rng):
     return d
 
 
+def _rand_simple_stage(rng):
+    """A non-recursive stage for $facet sub-pipelines (no $facet/$bucket)."""
+    field = rng.choice(["a", "b", "c"])
+    return rng.choice([
+        {"$match": {field: {rng.choice(["$gt", "$lt", "$eq"]): rng.randint(0, 50)}}},
+        {"$limit": rng.randint(0, 3)},
+        {"$skip": rng.randint(0, 2)},
+        {"$count": "n"},
+        {"$group": {"_id": "$" + field, "c": {"$sum": 1}}},
+        {"$sort": {field: rng.choice([1, -1]), "_id": 1}},
+        {"$sortByCount": "$" + field},
+    ])
+
+
 def _rand_stage(rng):
     kind = rng.choice(
         ["match", "limit", "skip", "count", "project_in", "project_ex",
          "project_comp", "addfields", "unset", "replacewith", "sort",
          "sort_multi", "unwind", "unwind_idx", "group_count", "group_sum",
-         "group_minmax", "group_push", "group_set", "sortbycount"]
+         "group_minmax", "group_push", "group_set", "sortbycount",
+         "bucket", "bucket_default", "facet"]
     )
     field = rng.choice(["a", "b", "c"])
     f2 = rng.choice(["a", "b", "c"])
@@ -250,6 +287,21 @@ def _rand_stage(rng):
         return {"$group": {"_id": "$" + field, "set": {"$addToSet": "$" + f2}}}
     if kind == "sortbycount":
         return {"$sortByCount": "$" + field}
+    if kind in ("bucket", "bucket_default"):
+        # sorted, distinct numeric boundaries
+        cuts = sorted(rng.sample([0, 5, 10, 15, 20, 30, 50], rng.randint(2, 4)))
+        b = {"groupBy": "$" + field, "boundaries": cuts}
+        if kind == "bucket_default":
+            b["default"] = "other"
+            b["output"] = {"n": {"$sum": 1}, "av": {"$avg": "$" + f2}}
+        return {"$bucket": b}
+    if kind == "facet":
+        return {
+            "$facet": {
+                "x": [_rand_simple_stage(rng) for _ in range(rng.randint(1, 2))],
+                "y": [_rand_simple_stage(rng) for _ in range(rng.randint(0, 2))],
+            }
+        }
     return {"$replaceWith": {"only": "$" + field}}
 
 

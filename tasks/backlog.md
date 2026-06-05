@@ -309,14 +309,29 @@ never "remove Python."
   extra local seeds (~1,650–1,730 group/sortByCount pipelines handled per 4000,
   zero mismatches). `numeric::NumVal` gained `Eq + Hash`; `expressions::py_order`
   /`py_eq` are now `pub`.
-- [ ] **Widen the pipeline further** — still deferring to Python: `$bucket`
-  (boundary placement + per-bucket accumulators), `$facet` (sub-pipelines),
-  `$densify`. Storage-backed stages (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/
-  `$merge`) and non-deterministic `$sample` defer until the storage layer moves
-  into Rust (Phase 3+). Also: `$sort` currently defers on bool / NaN sort keys
-  (the non-transitive `_SortKey` cases above) — reproducing Python's exact
-  Timsort comparison sequence for those would widen it, but the risk/reward is
-  poor. After widening: Phase 3+ (storage, wire/dispatch) per
+- [x] **Widen the pipeline: `$bucket` + `$facet`.** `$bucket`
+  (`group::bucket_stage`) places each doc into the half-open boundary range
+  `boundaries[i] <= value < boundaries[i+1]` using `expressions::py_order`
+  (Python's native `<=`/`<`, so cross-type / Decimal128 / array-doc boundaries
+  defer rather than guess; NaN / TypeError fall through to `default`), then runs
+  the `output` accumulators per bucket (reusing the `$group` accumulator
+  machinery via `accumulate_into`). Reproduces the pure quirks: empty buckets
+  emit only `{_id}` (accumulator fields are never created), an explicit `null`
+  default counts as absent, missing/empty `output` falls back to
+  `{count: {$sum: 1}}`, and pathological Python-equal bucket keys defer (the dict
+  would collapse them). `$facet` (`aggregate::facet_stage`) runs each named
+  sub-pipeline over a clone of the input via the recursive `apply_pipeline` and
+  collects the results — any sub-pipeline that defers defers the whole stage.
+  Validated across curated cases + the 5-seed in-repo fuzz **and** 8 extra local
+  seeds (~500–580 `$bucket` and ~370–410 `$facet` pipelines handled per 5000,
+  zero mismatches).
+- [ ] **Widen the pipeline further** — still deferring to Python: `$densify`.
+  Storage-backed stages (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge`) and
+  non-deterministic `$sample` defer until the storage layer moves into Rust
+  (Phase 3+). Also: `$sort` currently defers on bool / NaN sort keys (the
+  non-transitive `_SortKey` cases above) — reproducing Python's exact Timsort
+  comparison sequence for those would widen it, but the risk/reward is poor.
+  After widening: Phase 3+ (storage, wire/dispatch) per
   tasks/rust-rewrite-plan.md.
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
