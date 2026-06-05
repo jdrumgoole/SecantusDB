@@ -164,3 +164,32 @@ def test_randomised_fuzz_parity():
             f"divergence: rust={bson.decode(rust)} pure={py} update={update} doc={doc}"
         )
     assert handled > 1000, f"expected many handled cases, only {handled}"
+
+
+def _rust_apply_batch(docs, update, is_upsert=False):
+    res = _rust.apply_update_batch(
+        bson.encode({"d": list(docs)}), bson.encode(update), is_upsert
+    )
+    return None if res is None else bson.decode(res)["d"]
+
+
+def test_batch_apply_parity():
+    """The batched seam applies one update to N docs, matching per-doc results,
+    and defers the whole batch iff any single doc would defer."""
+    assert _rust_apply_batch([], {"$set": {"a": 1}}) == []
+
+    rng = random.Random(0x09DA_BA7)
+    handled = 0
+    for _ in range(3000):
+        docs = [bson.decode(bson.encode(_rand_doc(rng))) for _ in range(rng.randint(0, 6))]
+        update = bson.decode(bson.encode(_rand_update(rng)))
+        upsert = rng.random() < 0.5
+        rust = _rust_apply_batch(docs, update, upsert)
+        per_doc = [_rust_apply(d, update, upsert) for d in docs]
+        if rust is None:
+            assert any(r is None for r in per_doc) or not docs
+            continue
+        handled += 1
+        py = [_pure.apply_update(d, update, is_upsert=upsert) for d in docs]
+        assert rust == py, f"batch divergence: rust={rust} pure={py} update={update}"
+    assert handled > 500, f"expected many handled batches, only {handled}"

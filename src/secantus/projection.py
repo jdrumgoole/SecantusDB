@@ -75,6 +75,31 @@ def _apply_slice(arr: Any, slice_arg: Any) -> Any:
     return arr
 
 
+def apply_projection_batch(
+    docs: list[dict[str, Any]], spec: Mapping[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Project every doc in ``docs`` against ``spec`` in one shot.
+
+    Every ``find`` result is projected; with the Rust engine on this crosses the
+    byte seam once for the whole list (one GIL release covers all N) rather than
+    per doc — see ``benchmarks/``. Falls back to the per-doc pure-Python path
+    when Rust isn't enabled or any doc defers; an empty spec is a no-op copy.
+    """
+    if not spec:
+        return [copy.deepcopy(d) for d in docs]
+    if _rust_projection_enabled():
+        try:
+            res = _rust.apply_projection_batch(
+                bson.encode({"d": [dict(d) for d in docs]}),
+                bson.encode(dict(spec)),
+            )
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)["d"]
+    return [apply_projection(d, spec) for d in docs]
+
+
 def apply_projection(doc: dict[str, Any], spec: Mapping[str, Any] | None) -> dict[str, Any]:
     if not spec:
         return copy.deepcopy(doc)

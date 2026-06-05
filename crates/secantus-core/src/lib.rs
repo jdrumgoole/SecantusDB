@@ -237,7 +237,47 @@ fn apply_update(
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
-/// `projection.apply_projection(doc, spec)` over BSON bytes. Returns the
+/// Batched `update.apply_update`: apply one update spec to a whole matched list
+/// in one call (the multi-update hot path), one GIL release for all N. Mirrors
+/// `query_matches_batch`'s seam: `{"d": [doc, ...]}` in, `{"d": [new, ...]}` out,
+/// whole-batch fallback (`None`) if any doc defers.
+#[pyfunction]
+fn apply_update_batch(
+    py: Python<'_>,
+    docs_bytes: &[u8],
+    update_bytes: &[u8],
+    is_upsert: bool,
+) -> PyResult<Option<Py<PyBytes>>> {
+    let docs_wrap: Document = bson::from_slice(docs_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
+    let update: Document = bson::from_slice(update_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
+    let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
+        return Err(PyValueError::new_err("docs wrapper missing array 'd'"));
+    };
+    let mut docs: Vec<Document> = Vec::with_capacity(arr.len());
+    for d in arr {
+        match d {
+            Bson::Document(doc) => docs.push(doc.clone()),
+            _ => return Ok(None),
+        }
+    }
+    let out = py
+        .allow_threads(move || {
+            let mut results: Vec<Bson> = Vec::with_capacity(docs.len());
+            for doc in &docs {
+                match update::apply_update(doc, &update, is_upsert) {
+                    Ok(new) => results.push(Bson::Document(new)),
+                    Err(update::Fallback) => return Ok(None),
+                }
+            }
+            let mut wrap = Document::new();
+            wrap.insert("d".to_string(), Bson::Array(results));
+            encode_doc(&wrap).map(Some)
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
+}
 /// projected document's bytes, or `None` to fall back to pure Python (mixed
 /// inclusion/exclusion which Python raises on, nested-document specs, unusual
 /// `$slice` args, or a `$elemMatch` sub-filter the matcher defers).
@@ -255,6 +295,46 @@ fn apply_projection(
         .allow_threads(|| match projection::apply_projection(&doc, &spec) {
             Ok(out) => encode_doc(&out).map(Some),
             Err(projection::Fallback) => Ok(None),
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
+}
+
+/// Batched `projection.apply_projection`: project a whole result list in one
+/// call (every `find` doc), one GIL release for all N. `{"d": [doc, ...]}` in,
+/// `{"d": [projected, ...]}` out, whole-batch fallback (`None`) if any defers.
+#[pyfunction]
+fn apply_projection_batch(
+    py: Python<'_>,
+    docs_bytes: &[u8],
+    spec_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let docs_wrap: Document = bson::from_slice(docs_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
+    let spec: Document = bson::from_slice(spec_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
+        return Err(PyValueError::new_err("docs wrapper missing array 'd'"));
+    };
+    let mut docs: Vec<Document> = Vec::with_capacity(arr.len());
+    for d in arr {
+        match d {
+            Bson::Document(doc) => docs.push(doc.clone()),
+            _ => return Ok(None),
+        }
+    }
+    let out = py
+        .allow_threads(move || {
+            let mut results: Vec<Bson> = Vec::with_capacity(docs.len());
+            for doc in &docs {
+                match projection::apply_projection(doc, &spec) {
+                    Ok(p) => results.push(Bson::Document(p)),
+                    Err(projection::Fallback) => return Ok(None),
+                }
+            }
+            let mut wrap = Document::new();
+            wrap.insert("d".to_string(), Bson::Array(results));
+            encode_doc(&wrap).map(Some)
         })
         .map_err(PyValueError::new_err)?;
     Ok(out.map(|b| to_pybytes(py, b)))
@@ -350,8 +430,10 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches_batch, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_update_batch, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_projection_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_update_description, m)?)?;
     m.add_function(wrap_pyfunction!(apply_pipeline, m)?)?;
     Ok(())

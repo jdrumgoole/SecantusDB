@@ -132,3 +132,29 @@ def test_randomised_fuzz_parity():
         py = _pure.apply_projection(doc, spec)
         assert rust == py, f"divergence: rust={rust} pure={py} spec={spec} doc={doc}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
+
+
+def _rust_proj_batch(docs, spec):
+    res = _rust.apply_projection_batch(bson.encode({"d": list(docs)}), bson.encode(spec))
+    return None if res is None else bson.decode(res)["d"]
+
+
+def test_batch_projection_parity():
+    """The batched seam projects N docs, matching per-doc results, and defers the
+    whole batch iff any single doc would defer."""
+    assert _rust_proj_batch([], {"a": 1}) == []
+
+    rng = random.Random(0x9809_BA7)
+    handled = 0
+    for _ in range(3000):
+        docs = [bson.decode(bson.encode(_rand_doc(rng))) for _ in range(rng.randint(0, 6))]
+        spec = bson.decode(bson.encode(_rand_spec(rng)))
+        rust = _rust_proj_batch(docs, spec)
+        per_doc = [_rust_proj(d, spec) for d in docs]
+        if rust is None:
+            assert any(r is None for r in per_doc) or not docs
+            continue
+        handled += 1
+        py = [_pure.apply_projection(d, spec) for d in docs]
+        assert rust == py, f"batch divergence: rust={rust} pure={py} spec={spec}"
+    assert handled > 500, f"expected many handled batches, only {handled}"

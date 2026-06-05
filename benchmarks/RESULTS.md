@@ -53,28 +53,32 @@ lesson is clear and matches the plan's "move the loop outward":
 > `apply_pipeline` already does. Per-doc calls across the seam are GIL-bound by
 > their Python encode/decode.
 
-## Batched seam — the fix, prototyped
+## Batched seam — the fix, prototyped across all three CRUD engines
 
-`query_matches_batch` filters a whole candidate list in **one** call (one
-`bson.encode` of the doc array, one GIL release covering all N matches) instead
-of one seam crossing per doc. Filtering 200 docs per call:
+A batched call does the whole list in **one** crossing (one `bson.encode` of the
+doc array, one GIL release covering all N) instead of one seam crossing per doc.
+Implemented for `query_matches_batch`, `apply_update_batch`,
+`apply_projection_batch` (+ the matching shims). 200 docs per call, docs/s:
 
-| mode    | docs/s (1 thr) | 2 thr | 4 thr |
-|---------|---------------:|------:|------:|
-| per-doc |        204,000 | 0.66x | 0.16x |
-| batched |        259,000 | 1.62x | 1.51x |
+| engine                | 1 thr (batched speedup) | per-doc @4 thr | batched @4 thr |
+|-----------------------|------------------------:|---------------:|---------------:|
+| `query.matches`       |       264,000 (1.23×)   |  30,700 (0.15×)| 380,000 (1.44×)|
+| `update.apply_update` |       228,000 (1.20×)   |  28,400 (0.15×)| 278,000 (1.22×)|
+| `projection.apply`    |       280,000 (1.06×)   |  26,900 (0.10×)| 312,000 (1.11×)|
 
-**Batching converts the per-doc anti-scaling into real parallelism.** Single-
-threaded it's already 1.26× faster (one encode/decode + one GIL release instead
-of 200). Under 4 threads it does ~391k docs/s vs the per-doc path's ~33k — a
-~12× throughput difference — because one coarse GIL release per call lets the
-threads' Rust compute actually overlap, while the per-doc path thrashes the GIL.
-(The 4-thread batched figure dips below 2-thread because the GIL-held decode of
-the 200-doc array / encode of the result becomes the cap; bigger batches and
-returning *filtered* docs rather than a bool list would push it further.)
+**Batching converts the per-doc anti-scaling into real parallelism, uniformly.**
+Single-threaded it's already faster (one encode/decode + one GIL release instead
+of N). Under 4 threads each engine does **~10–12× more docs/s batched than
+per-doc** (e.g. query 380k vs 31k) — the coarse GIL release lets the threads'
+Rust compute overlap, while the per-doc path thrashes the GIL. (The 4-thread
+batched figure dips slightly below 2-thread because the GIL-held decode of the
+200-doc array / encode of the result becomes the cap; bigger batches and passing
+*raw doc bytes* / returning *filtered bytes* would push it further — see step 2
+of the batching task in `tasks/rust-rewrite-phase3-scoping.md` §4.)
 
-This is the prototype for the production direction: storage's scan loop should
-call `query.matches_batch(candidates, filter)` once, not `matches` per doc.
+This is the prototype for the production direction: storage's scan / multi-update
+/ projection paths should call the `*_batch` shims once over a candidate list,
+not the per-doc function in a loop.
 
 ## Takeaways
 
@@ -82,10 +86,12 @@ call `query.matches_batch(candidates, filter)` once, not `matches` per doc.
   is intact; it's correct for the server-concurrency goal and clearly helps the
   coarse pipeline path today.
 - **Batching the leaf-engine seams is the real throughput lever, and it works**
-  (see above) — not more operator coverage. `query_matches_batch` /
-  `query.matches_batch` is the prototype; the remaining work is to wire the
-  storage scan loop to call it, and to add `apply_update_batch` / a batched
-  projection on the same pattern. Track regressions with this benchmark.
+  (see above) — not more operator coverage. All three CRUD-path engines now have
+  batch primitives (`query_matches_batch` / `apply_update_batch` /
+  `apply_projection_batch` + shims), each ~10–12× faster under 4-thread
+  concurrency. The remaining work is to **wire storage** (scan / multi-update /
+  projection paths) to call the `*_batch` shims, which needs WiredTiger to land +
+  measure. Track regressions with this benchmark.
 - Validate under a real concurrent-connection server load (needs WiredTiger / the
   full server) before drawing production conclusions — these are operator-core
   micro-numbers.
