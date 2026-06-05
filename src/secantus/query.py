@@ -93,6 +93,38 @@ def matches(
     return all(_match_clause(doc, k, v, vars, collation) for k, v in query.items())
 
 
+def matches_batch(
+    docs: list[Mapping[str, Any]],
+    query: Mapping[str, Any],
+    *,
+    vars: dict[str, Any] | None = None,
+    collation: Collation | None = None,
+) -> list[bool]:
+    """Filter ``docs`` against ``query`` in one shot.
+
+    When the Rust engine is enabled this crosses the byte seam **once** for the
+    whole list (a single GIL release covers every doc), instead of paying the
+    per-call seam + GIL handoff per document — which is what makes per-doc
+    matching scale poorly under concurrency (see ``benchmarks/``). Falls back to
+    the per-doc pure-Python matcher when Rust isn't enabled or the query defers.
+    """
+    if not query:
+        return [True] * len(docs)
+    if _rust_query_enabled():
+        try:
+            res = _rust.query_matches_batch(
+                bson.encode({"d": [dict(d) for d in docs]}),
+                bson.encode(dict(query)),
+                bson.encode(dict(vars) if vars else {}),
+                _collation_to_bson(collation),
+            )
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)["m"]
+    return [matches(d, query, vars=vars, collation=collation) for d in docs]
+
+
 def _match_clause(
     doc: Mapping[str, Any],
     key: str,

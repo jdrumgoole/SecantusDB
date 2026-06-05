@@ -128,6 +128,56 @@ fn query_matches(
     Ok(py.allow_threads(|| query::matches(&doc, &query, &vars, coll.as_ref()).ok()))
 }
 
+/// Batched `query.matches`: one call filters a whole candidate list under a
+/// single GIL release, amortising the per-call seam + GIL handoff that makes
+/// per-doc matching scale poorly under concurrency (see `benchmarks/`).
+///
+/// `docs_bytes` is `bson.encode({"d": [doc, ...]})`; the result is
+/// `bson.encode({"m": [bool, ...]})`, one flag per input doc. Returns `None`
+/// (whole-batch fallback) if any doc's match defers — the caller then runs the
+/// pure-Python matcher per doc.
+#[pyfunction]
+fn query_matches_batch(
+    py: Python<'_>,
+    docs_bytes: &[u8],
+    query_bytes: &[u8],
+    vars_bytes: &[u8],
+    collation_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let docs_wrap: Document = bson::from_slice(docs_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
+    let query: Document = bson::from_slice(query_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
+    let vars: Document = bson::from_slice(vars_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
+    let coll = parse_collation(collation_bytes)?;
+    let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
+        return Err(PyValueError::new_err("docs wrapper missing array 'd'"));
+    };
+    let mut docs: Vec<Document> = Vec::with_capacity(arr.len());
+    for d in arr {
+        match d {
+            Bson::Document(doc) => docs.push(doc.clone()),
+            _ => return Ok(None), // non-document element -> defer the batch
+        }
+    }
+    let out = py
+        .allow_threads(move || {
+            let mut flags: Vec<Bson> = Vec::with_capacity(docs.len());
+            for doc in &docs {
+                match query::matches(doc, &query, &vars, coll.as_ref()) {
+                    Ok(b) => flags.push(Bson::Boolean(b)),
+                    Err(_) => return Ok(None), // any defer -> whole batch falls back
+                }
+            }
+            let mut wrap = Document::new();
+            wrap.insert("m".to_string(), Bson::Array(flags));
+            encode_doc(&wrap).map(Some)
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
+}
+
 /// `expressions.evaluate(expr, doc, vars)` over BSON bytes. `expr` and the
 /// result are wrapped as `{"e": ...}` / `{"r": ...}` (BSON needs a document
 /// envelope for non-document values). Returns the `{"r": ...}` bytes, or `None`
@@ -298,6 +348,7 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
+    m.add_function(wrap_pyfunction!(query_matches_batch, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection, m)?)?;

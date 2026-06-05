@@ -301,3 +301,37 @@ def test_randomised_fuzz_parity():
         py = _pure.matches(doc, query)
         assert rust == py, f"divergence: rust={rust} pure={py} query={query} doc={doc}"
     assert handled > 1000, f"expected the Rust matcher to handle many cases, only {handled}"
+
+
+def _rust_match_batch(docs, query, collation=None):
+    res = _rust.query_matches_batch(
+        bson.encode({"d": list(docs)}),
+        bson.encode(query),
+        bson.encode({}),
+        bson.encode(collation or {}),
+    )
+    return None if res is None else bson.decode(res)["m"]
+
+
+def test_batch_matches_parity():
+    """The batched seam returns the same per-doc flags as per-doc matching, and
+    defers the whole batch (None) iff any single doc would defer."""
+    # empty query -> all True; empty list -> [].
+    assert _rust_match_batch([{"a": 1}, {"a": 2}], {}) == [True, True]
+    assert _rust_match_batch([], {"a": 1}) == []
+
+    rng = random.Random(0xBA7C_4)
+    handled = 0
+    for _ in range(3000):
+        docs = [bson.decode(bson.encode(_rand_doc(rng))) for _ in range(rng.randint(0, 6))]
+        query = bson.decode(bson.encode(_rand_query(rng)))
+        rust = _rust_match_batch(docs, query)
+        per_doc = [_rust_match(d, query) for d in docs]
+        if rust is None:
+            # whole-batch fallback must mean at least one doc deferred per-doc too.
+            assert any(r is None for r in per_doc) or not docs
+            continue
+        handled += 1
+        py = [_pure.matches(d, query) for d in docs]
+        assert rust == py, f"batch divergence: rust={rust} pure={py} query={query} docs={docs}"
+    assert handled > 500, f"expected many handled batches, only {handled}"

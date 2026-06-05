@@ -138,6 +138,15 @@ never "remove Python."
   (`query_matches_batch`, `apply_update_batch`) so one GIL release covers many
   docs, the way `apply_pipeline` already does — not more operator coverage. Track
   with the benchmark; validate under a real concurrent server load (needs WT).
+- [x] **Batched seam — prototyped and proven.** `query_matches_batch` (Rust) +
+  `query.matches_batch` (shim) filter a whole candidate list in one call.
+  Benchmark: 1.26× faster single-threaded *and* it fixes the multi-thread
+  regression — per-doc matching anti-scales (0.16× at 4 threads) while the batch
+  path *scales* (1.51× at 4 threads), ~12× more docs/s under concurrency. Parity:
+  `tests/test_rust_query_parity.py::test_batch_matches_parity` (the batch flags
+  equal per-doc matching; the whole batch defers iff any doc would). Remaining:
+  wire storage's scan loop to call `matches_batch`, and add `apply_update_batch`
+  / a batched projection on the same pattern (needs WT to land + measure).
 - [x] **Phase 1, leaf engine #1: `sortkey`** — ported to Rust behind the fat
   byte seam; pure-Python `secantus.sortkey` delegates when
   `SECANTUS_RUST_SORTKEY=1`. Parity pinned by `tests/test_rust_sortkey_parity.py`

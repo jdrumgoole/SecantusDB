@@ -53,13 +53,39 @@ lesson is clear and matches the plan's "move the loop outward":
 > `apply_pipeline` already does. Per-doc calls across the seam are GIL-bound by
 > their Python encode/decode.
 
+## Batched seam — the fix, prototyped
+
+`query_matches_batch` filters a whole candidate list in **one** call (one
+`bson.encode` of the doc array, one GIL release covering all N matches) instead
+of one seam crossing per doc. Filtering 200 docs per call:
+
+| mode    | docs/s (1 thr) | 2 thr | 4 thr |
+|---------|---------------:|------:|------:|
+| per-doc |        204,000 | 0.66x | 0.16x |
+| batched |        259,000 | 1.62x | 1.51x |
+
+**Batching converts the per-doc anti-scaling into real parallelism.** Single-
+threaded it's already 1.26× faster (one encode/decode + one GIL release instead
+of 200). Under 4 threads it does ~391k docs/s vs the per-doc path's ~33k — a
+~12× throughput difference — because one coarse GIL release per call lets the
+threads' Rust compute actually overlap, while the per-doc path thrashes the GIL.
+(The 4-thread batched figure dips below 2-thread because the GIL-held decode of
+the 200-doc array / encode of the result becomes the cap; bigger batches and
+returning *filtered* docs rather than a bool list would push it further.)
+
+This is the prototype for the production direction: storage's scan loop should
+call `query.matches_batch(candidates, filter)` once, not `matches` per doc.
+
 ## Takeaways
 
 - Keep `allow_threads` everywhere: single-threaded cost is negligible and the win
   is intact; it's correct for the server-concurrency goal and clearly helps the
   coarse pipeline path today.
-- The next real throughput lever is **batching the leaf-engine seams**, not more
-  operator coverage. Track it with this benchmark.
+- **Batching the leaf-engine seams is the real throughput lever, and it works**
+  (see above) — not more operator coverage. `query_matches_batch` /
+  `query.matches_batch` is the prototype; the remaining work is to wire the
+  storage scan loop to call it, and to add `apply_update_batch` / a batched
+  projection on the same pattern. Track regressions with this benchmark.
 - Validate under a real concurrent-connection server load (needs WiredTiger / the
   full server) before drawing production conclusions — these are operator-core
   micro-numbers.
