@@ -13,6 +13,8 @@
 
 use bson::{Bson, Document};
 
+use crate::collation::{self, Collation};
+
 // Type ranks — must match secantus.sortkey.
 const RANK_MINKEY: u8 = 1;
 const RANK_NULL: u8 = 2;
@@ -222,8 +224,11 @@ fn doc_to_escaped_bytes(doc: &Document) -> Result<Vec<u8>, UnsupportedValue> {
 }
 
 /// Byte-sortable encoding of a single BSON value. Byte-exact counterpart of
-/// `secantus.sortkey.encode_value` (sans collation, handled by the shim).
-pub fn encode_value(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
+/// `secantus.sortkey.encode_value`. `coll` is the index's collation (or `None`);
+/// it applies only to top-level string values — strings nested inside documents
+/// / arrays are encoded as raw BSON, matching Python's `_encode_doc` /
+/// `_encode_array` (which don't thread collation).
+pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, UnsupportedValue> {
     let mut out = Vec::new();
     match v {
         Bson::MinKey => out.push(RANK_MINKEY),
@@ -235,7 +240,12 @@ pub fn encode_value(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
         }
         Bson::String(s) => {
             out.push(RANK_STRING);
-            out.extend(escape(s.as_bytes()));
+            let bytes = match coll {
+                Some(c) => collation::normalize_index_bytes(s, c)
+                    .ok_or_else(|| UnsupportedValue("collation defers to Python".into()))?,
+                None => s.as_bytes().to_vec(),
+            };
+            out.extend(escape(&bytes));
         }
         Bson::Document(d) => {
             out.push(RANK_DOCUMENT);
@@ -284,8 +294,12 @@ pub fn invert_bytes(b: &[u8]) -> Vec<u8> {
 }
 
 /// `encode_value`, bytes inverted when `direction == -1`.
-pub fn encode_value_directed(v: &Bson, direction: i32) -> Result<Vec<u8>, UnsupportedValue> {
-    let e = encode_value(v)?;
+pub fn encode_value_directed(
+    v: &Bson,
+    direction: i32,
+    coll: Option<&Collation>,
+) -> Result<Vec<u8>, UnsupportedValue> {
+    let e = encode_value(v, coll)?;
     Ok(if direction == -1 { invert_bytes(&e) } else { e })
 }
 
@@ -295,7 +309,7 @@ mod tests {
     use bson::Bson;
 
     fn ev(v: Bson) -> Vec<u8> {
-        encode_value(&v).unwrap()
+        encode_value(&v, None).unwrap()
     }
 
     #[test]
@@ -339,7 +353,7 @@ mod tests {
     #[test]
     fn directed_inverts_for_descending() {
         let asc = ev(Bson::Int32(5));
-        let desc = encode_value_directed(&Bson::Int32(5), -1).unwrap();
+        let desc = encode_value_directed(&Bson::Int32(5), -1, None).unwrap();
         assert_eq!(desc, invert_bytes(&asc));
     }
 }

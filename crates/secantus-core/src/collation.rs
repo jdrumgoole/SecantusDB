@@ -91,6 +91,29 @@ pub fn compare(a: &str, b: &str, c: &Collation) -> Option<Ordering> {
     Some(normalize(a, c)?.cmp(&normalize(b, c)?))
 }
 
+/// Normalised UTF-8 bytes for index-key encoding (`normalize_for_index_bytes`),
+/// or `None` to defer. Differs from `normalize` in one way: a `numericOrdering`
+/// collation has `supports_index_encoding == false`, so Python's `_encode_string`
+/// skips normalisation and emits the **raw** UTF-8 — i.e. numericOrdering is an
+/// identity transform here (not a defer, as it is for query comparison).
+pub fn normalize_index_bytes(s: &str, c: &Collation) -> Option<Vec<u8>> {
+    if c.numeric_ordering {
+        return Some(s.as_bytes().to_vec()); // !supports_index_encoding -> raw
+    }
+    let (accent, case) = (c.accent_insensitive(), c.case_insensitive());
+    if !accent && !case {
+        return Some(s.as_bytes().to_vec()); // identity
+    }
+    if !s.is_ascii() {
+        return None; // accent/case transform on non-ASCII -> defer
+    }
+    Some(if case {
+        s.to_ascii_lowercase().into_bytes()
+    } else {
+        s.as_bytes().to_vec()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

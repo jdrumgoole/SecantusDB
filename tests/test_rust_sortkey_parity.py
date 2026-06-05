@@ -41,13 +41,23 @@ _spec = importlib.util.spec_from_file_location("secantus_sortkey_pure", _ROOT / 
 _pure = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pure)
 
+# Load collation.py too (for building Collation objects to pass to the pure
+# encoder); the pure sortkey only imports it lazily when a collation is given.
+_cspec = importlib.util.spec_from_file_location("secantus.collation", _ROOT / "collation.py")
+_collation_mod = importlib.util.module_from_spec(_cspec)
+sys.modules["secantus.collation"] = _collation_mod
+_cspec.loader.exec_module(_collation_mod)
+_Collation = _collation_mod.Collation
 
-def _rust_encode(value):
-    return _rust.sortkey_encode_value(bson.encode({"v": value}))
+
+def _rust_encode(value, collation_wire=None):
+    return _rust.sortkey_encode_value(bson.encode({"v": value}), bson.encode(collation_wire or {}))
 
 
-def _rust_encode_directed(value, direction):
-    return _rust.sortkey_encode_value_directed(bson.encode({"v": value}), direction)
+def _rust_encode_directed(value, direction, collation_wire=None):
+    return _rust.sortkey_encode_value_directed(
+        bson.encode({"v": value}), direction, bson.encode(collation_wire or {})
+    )
 
 
 def _roundtrip(value):
@@ -120,6 +130,26 @@ def test_curated_directed_parity(value):
     v = _roundtrip(value)
     for direction in (1, -1):
         assert _rust_encode_directed(v, direction) == _pure.encode_value_directed(v, direction)
+
+
+@pytest.mark.parametrize(
+    "s,strength,case_level,numeric_ordering",
+    [
+        ("PING", 2, False, False),  # case-insensitive -> "ping"
+        ("Hello World", 2, False, False),
+        ("abc", 3, False, False),  # strength 3 identity
+        ("ABC", 1, True, False),  # accent-insensitive, case kept (ASCII identity)
+        ("a10", 3, False, True),  # numericOrdering -> raw bytes (identity)
+        ("café", 2, False, False),  # non-ASCII under case-insensitive -> defer
+    ],
+)
+def test_collation_encoding_parity(s, strength, case_level, numeric_ordering):
+    wire = {"strength": strength, "caseLevel": case_level, "numericOrdering": numeric_ordering}
+    obj = _Collation(strength=strength, case_level=case_level, numeric_ordering=numeric_ordering)
+    rust = _rust_encode(s, wire)
+    if rust is None:
+        return  # rust deferred (non-ASCII transform) -> pure Python
+    assert rust == _pure.encode_value(s, collation=obj), f"s={s!r} wire={wire}"
 
 
 def test_cross_type_numeric_collision_matches_python():

@@ -44,25 +44,45 @@ fn to_pybytes(py: Python<'_>, bytes: Vec<u8>) -> Py<PyBytes> {
     PyBytes::new_bound(py, &bytes).unbind()
 }
 
-/// `sortkey.encode_value(value)` — input is `bson.encode({"v": value})`.
+/// `sortkey.encode_value(value, collation=)` — `doc_bytes` is
+/// `bson.encode({"v": value})`, `collation_bytes` the `{strength, caseLevel,
+/// numericOrdering}` doc (or `{}`). Returns `None` to defer to Python (a value
+/// the encoder doesn't handle, or a collation that needs non-ASCII / Unicode
+/// normalisation).
 #[pyfunction]
-fn sortkey_encode_value(py: Python<'_>, doc_bytes: &[u8]) -> PyResult<Py<PyBytes>> {
+fn sortkey_encode_value(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    collation_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
     let value = unwrap_value(doc_bytes)?;
-    let out = sortkey::encode_value(&value).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(to_pybytes(py, out))
+    let coll = parse_collation(collation_bytes)?;
+    Ok(sortkey::encode_value(&value, coll.as_ref())
+        .ok()
+        .map(|out| to_pybytes(py, out)))
 }
 
-/// `sortkey.encode_value_directed(value, direction)`.
+/// `sortkey.encode_value_directed(value, direction, collation=)`.
 #[pyfunction]
 fn sortkey_encode_value_directed(
     py: Python<'_>,
     doc_bytes: &[u8],
     direction: i32,
-) -> PyResult<Py<PyBytes>> {
+    collation_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
     let value = unwrap_value(doc_bytes)?;
-    let out = sortkey::encode_value_directed(&value, direction)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(to_pybytes(py, out))
+    let coll = parse_collation(collation_bytes)?;
+    Ok(
+        sortkey::encode_value_directed(&value, direction, coll.as_ref())
+            .ok()
+            .map(|out| to_pybytes(py, out)),
+    )
+}
+
+fn parse_collation(bytes: &[u8]) -> PyResult<Option<collation::Collation>> {
+    let doc: Document = bson::from_slice(bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid collation BSON: {e}")))?;
+    Ok(collation::parse(&doc))
 }
 
 /// `query.matches(doc, query)` over BSON bytes. Returns `None` to signal the
@@ -81,10 +101,7 @@ fn query_matches(
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
     let vars: Document = bson::from_slice(vars_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
-    // collation is a {strength, caseLevel, numericOrdering} doc, or {} for none.
-    let coll_doc: Document = bson::from_slice(collation_bytes)
-        .map_err(|e| PyValueError::new_err(format!("invalid collation BSON: {e}")))?;
-    let coll = collation::parse(&coll_doc);
+    let coll = parse_collation(collation_bytes)?;
     // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
     Ok(query::matches(&doc, &query, &vars, coll.as_ref()).ok())
 }

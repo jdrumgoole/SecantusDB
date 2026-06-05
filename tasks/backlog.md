@@ -133,11 +133,13 @@ never "remove Python."
   Rust *with* a collation, which defers to Python for non-ASCII-under-transform
   and `numericOrdering`. Parity: `tests/test_rust_query_parity.py` collation
   cases + 4000-case fuzz.
-- [ ] **Collation-aware sortkey in Rust.** `sortkey.encode_value(collation=)` /
-  `normalize_for_index_bytes` still run pure Python — the sortkey shim only
-  delegates when `collation is None`. Thread the collation (same ASCII-safe
-  `collation.rs` normalize, defer otherwise) through the Rust sortkey encoder so
-  index-key encoding under a collation is also Rust-accelerated.
+- [x] **Collation-aware sortkey in Rust.** `sortkey.encode_value` /
+  `encode_value_directed` thread a collation through to the Rust encoder
+  (`collation::normalize_index_bytes`, where `numericOrdering` is the raw-bytes
+  identity — matching Python's `_encode_string` skipping normalisation when
+  `supports_index_encoding` is false). ASCII normalisation is reproduced;
+  non-ASCII transforms defer to Python. Parity:
+  `tests/test_rust_sortkey_parity.py` collation cases.
 - [x] **Phase 1, leaf engine #2: `query.matches`** — common operators ported
   to Rust (`crates/secantus-core/src/query.rs` + `numeric.rs`) behind the byte
   seam; `secantus.query.matches` delegates when `SECANTUS_RUST_QUERY=1` (now
