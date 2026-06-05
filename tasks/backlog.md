@@ -125,15 +125,25 @@ never "remove Python."
   to merge), and (b) a decision on the byte seam's per-call
   `bson.encode({"v": value})` overhead vs passing values without re-encoding.
   The Python engine remains a permanent, selectable mode regardless.
-- [ ] **Collation-aware sortkey in Rust.** The Rust port does not implement
-  `collation.normalize_for_index_bytes`; the shim only delegates when
-  `collation is None` and uses pure Python otherwise. Port when `collation`
-  lands in the Rust core.
+- [x] **Collation (query matcher).** `crates/secantus-core/src/collation.rs`
+  implements the ASCII-safe, Unicode-version-independent cases (case-insensitive
+  ASCII = ASCII-lowercase; accent-strip is a no-op on ASCII; strength-3 identity
+  handles any string); threaded through the Rust query matcher's string `$eq`/
+  `$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`. `query.matches` now delegates to
+  Rust *with* a collation, which defers to Python for non-ASCII-under-transform
+  and `numericOrdering`. Parity: `tests/test_rust_query_parity.py` collation
+  cases + 4000-case fuzz.
+- [ ] **Collation-aware sortkey in Rust.** `sortkey.encode_value(collation=)` /
+  `normalize_for_index_bytes` still run pure Python — the sortkey shim only
+  delegates when `collation is None`. Thread the collation (same ASCII-safe
+  `collation.rs` normalize, defer otherwise) through the Rust sortkey encoder so
+  index-key encoding under a collation is also Rust-accelerated.
 - [x] **Phase 1, leaf engine #2: `query.matches`** — common operators ported
   to Rust (`crates/secantus-core/src/query.rs` + `numeric.rs`) behind the byte
-  seam; `secantus.query.matches` delegates when `SECANTUS_RUST_QUERY=1` and no
-  collation. The Rust matcher returns `None` (→ pure-Python fallback) for
-  anything not reproduced faithfully: collation, `$expr`, `$jsonSchema`, geo,
+  seam; `secantus.query.matches` delegates when `SECANTUS_RUST_QUERY=1` (now
+  including collation — see the collation item above). The Rust matcher returns
+  `None` (→ pure-Python fallback) for anything not reproduced faithfully:
+  `$jsonSchema`, geo,
   **any regex**, `$all`, structural/compound equality (array/doc operands),
   bool-as-int comparison, exotic BSON types. Parity pinned by
   `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).

@@ -21,6 +21,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod collation;
 mod diff;
 mod expressions;
 mod numeric;
@@ -72,6 +73,7 @@ fn query_matches(
     doc_bytes: &[u8],
     query_bytes: &[u8],
     vars_bytes: &[u8],
+    collation_bytes: &[u8],
 ) -> PyResult<Option<bool>> {
     let doc: Document = bson::from_slice(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
@@ -79,8 +81,12 @@ fn query_matches(
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
     let vars: Document = bson::from_slice(vars_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
+    // collation is a {strength, caseLevel, numericOrdering} doc, or {} for none.
+    let coll_doc: Document = bson::from_slice(collation_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid collation BSON: {e}")))?;
+    let coll = collation::parse(&coll_doc);
     // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
-    Ok(query::matches(&doc, &query, &vars).ok())
+    Ok(query::matches(&doc, &query, &vars, coll.as_ref()).ok())
 }
 
 /// `expressions.evaluate(expr, doc, vars)` over BSON bytes. `expr` and the

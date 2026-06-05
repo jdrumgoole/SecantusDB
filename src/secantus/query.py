@@ -33,6 +33,21 @@ def _rust_query_enabled() -> bool:
     return _rust is not None and engine.enabled("query")
 
 
+def _collation_to_bson(collation: Collation | None) -> bytes:
+    # Wire form for the Rust core: {strength, caseLevel, numericOrdering}, or an
+    # empty doc for "no collation". The Rust side handles the ASCII-safe cases
+    # and returns None (-> pure-Python fallback) for non-ASCII / numericOrdering.
+    if collation is None:
+        return bson.encode({})
+    return bson.encode(
+        {
+            "strength": int(collation.strength),
+            "caseLevel": bool(collation.case_level),
+            "numericOrdering": bool(collation.numeric_ordering),
+        }
+    )
+
+
 class _Missing:
     _instance: _Missing | None = None
 
@@ -61,12 +76,13 @@ def matches(
 ) -> bool:
     if not query:
         return True
-    if collation is None and _rust_query_enabled():
+    if _rust_query_enabled():
         try:
             result = _rust.query_matches(
                 bson.encode(dict(doc)),
                 bson.encode(dict(query)),
                 bson.encode(dict(vars) if vars else {}),
+                _collation_to_bson(collation),
             )
         except Exception:
             # Any encode/decode hiccup: fall through to the pure-Python path

@@ -111,14 +111,16 @@ fn first_match(doc: &Document, path: &str, sub_filter: &Document) -> R<Option<Bs
     let empty = Document::new();
     for elem in arr {
         let hit = match elem {
-            Bson::Document(ed) => query::matches(ed, sub_filter, &empty).map_err(|_| Fallback)?,
+            Bson::Document(ed) => {
+                query::matches(ed, sub_filter, &empty, None).map_err(|_| Fallback)?
+            }
             scalar => {
                 // matches({"_": elem}, {"_": sub_filter})
                 let mut wrapper = Document::new();
                 wrapper.insert("_".to_string(), scalar.clone());
                 let mut q = Document::new();
                 q.insert("_".to_string(), Bson::Document(sub_filter.clone()));
-                query::matches(&wrapper, &q, &empty).map_err(|_| Fallback)?
+                query::matches(&wrapper, &q, &empty, None).map_err(|_| Fallback)?
             }
         };
         if hit {

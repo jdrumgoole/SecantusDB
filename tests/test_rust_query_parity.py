@@ -53,8 +53,70 @@ def _load_pure_query():
 _pure = _load_pure_query()
 
 
-def _rust_match(doc, query):
-    return _rust.query_matches(bson.encode(doc), bson.encode(query), bson.encode({}))
+def _rust_match(doc, query, collation=None):
+    return _rust.query_matches(
+        bson.encode(doc), bson.encode(query), bson.encode({}), bson.encode(collation or {})
+    )
+
+
+_Collation = sys.modules["secantus.collation"].Collation
+
+
+def _coll(strength=3, case_level=False, numeric_ordering=False):
+    """(wire dict for Rust, Collation object for pure Python)."""
+    wire = {"strength": strength, "caseLevel": case_level, "numericOrdering": numeric_ordering}
+    obj = _Collation(strength=strength, case_level=case_level, numeric_ordering=numeric_ordering)
+    return wire, obj
+
+
+# (doc, query, strength, case_level, numeric_ordering)
+COLLATION_CASES = [
+    ({"n": "PING"}, {"n": "ping"}, 2, False, False),  # case-insensitive match
+    ({"n": "ping"}, {"n": "ping"}, 3, False, False),  # strength 3 identity
+    ({"n": "PING"}, {"n": "ping"}, 3, False, False),  # case-sensitive -> no match
+    ({"n": "PING"}, {"n": "ping"}, 1, True, False),  # caseLevel keeps case
+    ({"n": "apple"}, {"n": {"$gte": "APPLE"}}, 2, False, False),
+    ({"n": "Banana"}, {"n": {"$lt": "cherry"}}, 2, False, False),
+    ({"n": "B"}, {"n": {"$in": ["a", "b", "c"]}}, 2, False, False),
+    ({"n": "B"}, {"n": {"$nin": ["a", "b", "c"]}}, 2, False, False),
+    ({"n": "x", "m": 5}, {"n": "X", "m": {"$gt": 3}}, 2, False, False),
+    ({"n": "café"}, {"n": "CAFÉ"}, 2, False, False),  # non-ASCII -> rust defers
+    ({"n": "a10"}, {"n": {"$gt": "a2"}}, 3, False, True),  # numericOrdering -> defers
+]
+
+
+@pytest.mark.parametrize("doc,query,strength,cl,no", COLLATION_CASES)
+def test_collation_parity(doc, query, strength, cl, no):
+    doc = bson.decode(bson.encode(doc))
+    query = bson.decode(bson.encode(query))
+    wire, obj = _coll(strength, cl, no)
+    rust = _rust_match(doc, query, wire)
+    if rust is None:
+        return  # rust deferred (non-ASCII / numericOrdering) -> shim uses Python
+    py = _pure.matches(doc, query, collation=obj)
+    assert rust == py, f"rust={rust} pure={py} q={query} strength={strength}"
+
+
+def test_collation_fuzz():
+    rng = random.Random(0xC0_11A)
+    words = ["apple", "Apple", "APPLE", "banana", "BANANA", "Cherry", "date", "a1", "B"]
+    for _ in range(4000):
+        doc = {"n": rng.choice(words)}
+        target = rng.choice(words)
+        op = rng.choice(["eq", "$gt", "$gte", "$lt", "$lte", "$ne", "$in"])
+        if op == "eq":
+            query = {"n": target}
+        elif op == "$in":
+            query = {"n": {"$in": rng.sample(words, rng.randint(1, 3))}}
+        else:
+            query = {"n": {op: target}}
+        wire, obj = _coll(strength=rng.choice([1, 2, 3]), case_level=rng.random() < 0.3)
+        d = bson.decode(bson.encode(doc))
+        q = bson.decode(bson.encode(query))
+        rust = _rust_match(d, q, wire)
+        if rust is None:
+            continue
+        assert rust == _pure.matches(d, q, collation=obj), f"q={q} wire={wire} doc={d}"
 
 
 def _rt(value):

@@ -6,14 +6,17 @@
 //! which the Python shim turns into "run the pure-Python matcher instead". That
 //! keeps the port strictly correct: the operators handled here match the Python
 //! implementation exactly (pinned by `tests/test_rust_query_parity.py`), and
-//! everything else (collation, `$jsonSchema`, geo, any regex,
-//! structural/compound equality, exotic BSON types) defers to Python. `$expr`
-//! is handled via the Rust expression evaluator; `$all` via its Python-`==`.
+//! everything else (`$jsonSchema`, geo, any regex, structural/compound
+//! equality, exotic BSON types) defers to Python. `$expr` is handled via the
+//! Rust expression evaluator; `$all` via its Python-`==`. A `collation` is
+//! threaded through string comparisons and handled for the ASCII-safe cases
+//! (see `crate::collation`), deferring non-ASCII / `numericOrdering` to Python.
 
 use std::cmp::Ordering;
 
 use bson::{Bson, Document};
 
+use crate::collation::{self, Collation};
 use crate::{expressions, numeric};
 
 /// Signal that the pure-Python matcher must handle this query/value.
@@ -24,10 +27,10 @@ type R = Result<bool, Fallback>;
 
 /// Entry point. `Ok(b)` is the match result; `Err(Fallback)` means defer to
 /// Python (the query uses something not ported yet). `vars` carries user vars
-/// for `$expr` (`$$name` / `$$ROOT`).
-pub fn matches(doc: &Document, query: &Document, vars: &Document) -> R {
+/// for `$expr`; `coll` is the active collation (or `None`).
+pub fn matches(doc: &Document, query: &Document, vars: &Document, coll: Option<&Collation>) -> R {
     for (k, v) in query.iter() {
-        if !match_clause(doc, k, v, vars)? {
+        if !match_clause(doc, k, v, vars, coll)? {
             return Ok(false);
         }
     }
@@ -41,12 +44,18 @@ fn as_doc(b: &Bson) -> Result<&Document, Fallback> {
     }
 }
 
-fn match_clause(doc: &Document, key: &str, cond: &Bson, vars: &Document) -> R {
+fn match_clause(
+    doc: &Document,
+    key: &str,
+    cond: &Bson,
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R {
     match key {
         "$and" => {
             let arr = cond.as_array().ok_or(Fallback)?;
             for c in arr {
-                if !matches(doc, as_doc(c)?, vars)? {
+                if !matches(doc, as_doc(c)?, vars, coll)? {
                     return Ok(false);
                 }
             }
@@ -55,7 +64,7 @@ fn match_clause(doc: &Document, key: &str, cond: &Bson, vars: &Document) -> R {
         "$or" => {
             let arr = cond.as_array().ok_or(Fallback)?;
             for c in arr {
-                if matches(doc, as_doc(c)?, vars)? {
+                if matches(doc, as_doc(c)?, vars, coll)? {
                     return Ok(true);
                 }
             }
@@ -64,7 +73,7 @@ fn match_clause(doc: &Document, key: &str, cond: &Bson, vars: &Document) -> R {
         "$nor" => {
             let arr = cond.as_array().ok_or(Fallback)?;
             for c in arr {
-                if matches(doc, as_doc(c)?, vars)? {
+                if matches(doc, as_doc(c)?, vars, coll)? {
                     return Ok(false);
                 }
             }
@@ -79,7 +88,7 @@ fn match_clause(doc: &Document, key: &str, cond: &Bson, vars: &Document) -> R {
         }
         // $jsonSchema, $where, $text, ... -> Python.
         _ if key.starts_with('$') => Err(Fallback),
-        _ => field_matches(&resolve_path(doc, key), cond),
+        _ => field_matches(&resolve_path(doc, key), cond, coll),
     }
 }
 
@@ -117,33 +126,33 @@ fn is_operator_dict(d: &Document) -> bool {
     !d.is_empty() && d.keys().all(|k| k.starts_with('$'))
 }
 
-fn field_matches(values: &[Option<Bson>], cond: &Bson) -> R {
+fn field_matches(values: &[Option<Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
     match cond {
         Bson::RegularExpression(_) => Err(Fallback), // regex semantics -> Python `re`
         Bson::Document(d) if is_operator_dict(d) => {
             for (op, arg) in d.iter() {
-                if !op_matches(values, op, arg)? {
+                if !op_matches(values, op, arg, coll)? {
                     return Ok(false);
                 }
             }
             Ok(true)
         }
-        _ => eq_with_array(values, cond),
+        _ => eq_with_array(values, cond, coll),
     }
 }
 
-fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson) -> R {
+fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson, coll: Option<&Collation>) -> R {
     match op {
-        "$eq" => eq_with_array(values, arg),
-        "$ne" => Ok(!eq_with_array(values, arg)?),
-        "$gt" => cmp_op(values, arg, |o| o == Ordering::Greater),
-        "$gte" => cmp_op(values, arg, |o| o != Ordering::Less),
-        "$lt" => cmp_op(values, arg, |o| o == Ordering::Less),
-        "$lte" => cmp_op(values, arg, |o| o != Ordering::Greater),
+        "$eq" => eq_with_array(values, arg, coll),
+        "$ne" => Ok(!eq_with_array(values, arg, coll)?),
+        "$gt" => cmp_op(values, arg, coll, |o| o == Ordering::Greater),
+        "$gte" => cmp_op(values, arg, coll, |o| o != Ordering::Less),
+        "$lt" => cmp_op(values, arg, coll, |o| o == Ordering::Less),
+        "$lte" => cmp_op(values, arg, coll, |o| o != Ordering::Greater),
         "$in" => {
             let arr = arg.as_array().ok_or(Fallback)?;
             for cand in arr {
-                if eq_with_array(values, cand)? {
+                if eq_with_array(values, cand, coll)? {
                     return Ok(true);
                 }
             }
@@ -152,7 +161,7 @@ fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson) -> R {
         "$nin" => {
             let arr = arg.as_array().ok_or(Fallback)?;
             for cand in arr {
-                if eq_with_array(values, cand)? {
+                if eq_with_array(values, cand, coll)? {
                     return Ok(false);
                 }
             }
@@ -162,7 +171,7 @@ fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson) -> R {
             let present = values.iter().any(|v| v.is_some());
             Ok(present == truthy(arg)?)
         }
-        "$not" => Ok(!field_matches(values, arg)?),
+        "$not" => Ok(!field_matches(values, arg, coll)?),
         "$type" => op_type(values, arg),
         "$size" => op_size(values, arg),
         "$all" => op_all(values, arg),
@@ -191,7 +200,7 @@ fn is_exotic(b: &Bson) -> bool {
     )
 }
 
-fn eq_with_array(values: &[Option<Bson>], expected: &Bson) -> R {
+fn eq_with_array(values: &[Option<Bson>], expected: &Bson, coll: Option<&Collation>) -> R {
     for v in values {
         match v {
             None => {
@@ -200,12 +209,12 @@ fn eq_with_array(values: &[Option<Bson>], expected: &Bson) -> R {
                 }
             }
             Some(val) => {
-                if eq_scalar(val, expected)? {
+                if eq_scalar(val, expected, coll)? {
                     return Ok(true);
                 }
                 if let Bson::Array(arr) = val {
                     for e in arr {
-                        if eq_scalar(e, expected)? {
+                        if eq_scalar(e, expected, coll)? {
                             return Ok(true);
                         }
                     }
@@ -216,7 +225,7 @@ fn eq_with_array(values: &[Option<Bson>], expected: &Bson) -> R {
     Ok(false)
 }
 
-fn eq_scalar(v: &Bson, expected: &Bson) -> R {
+fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
     // Compound / regex / exotic expected -> structural or special semantics we
     // don't reproduce: defer to Python.
     if matches!(
@@ -237,9 +246,16 @@ fn eq_scalar(v: &Bson, expected: &Bson) -> R {
     if let (Some(na), Some(nb)) = (numeric::classify(v), numeric::classify(expected)) {
         return Ok(numeric::eq(&na, &nb));
     }
+    // Collation-aware string equality (defers to Python on non-ASCII /
+    // numericOrdering); without a collation, plain byte equality.
+    if let (Bson::String(a), Bson::String(b)) = (v, expected) {
+        return match coll {
+            Some(c) => collation::equal(a, b, c).ok_or(Fallback),
+            None => Ok(a == b),
+        };
+    }
     Ok(match (v, expected) {
         (Bson::Null, Bson::Null) => true,
-        (Bson::String(a), Bson::String(b)) => a == b,
         (Bson::ObjectId(a), Bson::ObjectId(b)) => a == b,
         (Bson::DateTime(a), Bson::DateTime(b)) => a == b,
         (Bson::Timestamp(a), Bson::Timestamp(b)) => a == b,
@@ -252,17 +268,22 @@ fn eq_scalar(v: &Bson, expected: &Bson) -> R {
 
 // --- comparison ---------------------------------------------------------
 
-fn cmp_op(values: &[Option<Bson>], target: &Bson, pred: fn(Ordering) -> bool) -> R {
+fn cmp_op(
+    values: &[Option<Bson>],
+    target: &Bson,
+    coll: Option<&Collation>,
+    pred: fn(Ordering) -> bool,
+) -> R {
     for v in values {
         let Some(val) = v else { continue };
-        if let Some(o) = compare_values(val, target)? {
+        if let Some(o) = compare_values(val, target, coll)? {
             if pred(o) {
                 return Ok(true);
             }
         }
         if let Bson::Array(arr) = val {
             for e in arr {
-                if let Some(o) = compare_values(e, target)? {
+                if let Some(o) = compare_values(e, target, coll)? {
                     if pred(o) {
                         return Ok(true);
                     }
@@ -277,7 +298,11 @@ fn cmp_op(values: &[Option<Bson>], target: &Bson, pred: fn(Ordering) -> bool) ->
 /// comparison raises `TypeError`, which the matcher treats as no-match).
 /// `Err(Fallback)` for cases whose Python semantics we don't reproduce (bool
 /// participating as int, structural array/doc ordering, exotic types).
-fn compare_values(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
+fn compare_values(
+    a: &Bson,
+    b: &Bson,
+    coll: Option<&Collation>,
+) -> Result<Option<Ordering>, Fallback> {
     // Python compares bool as int (bool is an int subclass) for $gt/$lt; rather
     // than reproduce that quirk, defer any bool operand to Python.
     if matches!(a, Bson::Boolean(_)) || matches!(b, Bson::Boolean(_)) {
@@ -285,6 +310,10 @@ fn compare_values(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
     }
     if let (Some(na), Some(nb)) = (numeric::classify(a), numeric::classify(b)) {
         return Ok(numeric::cmp(&na, &nb));
+    }
+    // Collation-aware string ordering (defers on non-ASCII / numericOrdering).
+    if let (Some(c), Bson::String(x), Bson::String(y)) = (coll, a, b) {
+        return Ok(Some(collation::compare(x, y, c).ok_or(Fallback)?));
     }
     if matches!(a, Bson::Array(_) | Bson::Document(_))
         || matches!(b, Bson::Array(_) | Bson::Document(_))
@@ -464,12 +493,13 @@ fn op_elem_match(values: &[Option<Bson>], cond: &Bson) -> R {
         let Some(Bson::Array(arr)) = v else { continue };
         for elem in arr {
             if scalar_form {
-                if field_matches(&[Some(elem.clone())], cond)? {
+                // Python's $elemMatch passes no collation to the inner match.
+                if field_matches(&[Some(elem.clone())], cond, None)? {
                     return Ok(true);
                 }
             } else if let Bson::Document(ed) = elem {
-                // Python's $elemMatch recurses with no vars (empty scope).
-                if matches(ed, condd, &Document::new())? {
+                // Python's $elemMatch recurses with no vars and no collation.
+                if matches(ed, condd, &Document::new(), None)? {
                     return Ok(true);
                 }
             }
@@ -576,7 +606,7 @@ mod tests {
     use bson::doc;
 
     fn m(doc: Document, query: Document) -> bool {
-        matches(&doc, &query, &Document::new()).expect("should not fall back")
+        matches(&doc, &query, &Document::new(), None).expect("should not fall back")
     }
 
     #[test]
@@ -628,7 +658,32 @@ mod tests {
             &doc! {"n": "x"},
             &doc! {"n": Bson::RegularExpression(bson::Regex {
             pattern: "x".into(), options: "".into() })},
-            &Document::new()
+            &Document::new(),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collation_ascii_case_insensitive() {
+        let coll = Collation {
+            strength: 2,
+            case_level: false,
+            numeric_ordering: false,
+        };
+        assert!(matches(
+            &doc! {"n": "PING"},
+            &doc! {"n": "ping"},
+            &Document::new(),
+            Some(&coll)
+        )
+        .unwrap());
+        // non-ASCII under a case-insensitive collation defers to Python
+        assert!(matches(
+            &doc! {"n": "café"},
+            &doc! {"n": "CAFÉ"},
+            &Document::new(),
+            Some(&coll)
         )
         .is_err());
     }
