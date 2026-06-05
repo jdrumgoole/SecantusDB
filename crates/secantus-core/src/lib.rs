@@ -1,15 +1,25 @@
 //! `_secantus_core` — the Rust core of SecantusDB, exposed to Python via PyO3.
 //!
-//! Phase 1 of the rewrite (tasks/rust-rewrite-plan.md): the first leaf engine,
-//! `sortkey`, behind the **fat byte seam** described in §3 — values cross the
-//! Python/Rust boundary as BSON bytes (a one-key document `{"v": <value>}`),
+//! Everything crosses the Python/Rust boundary through the **fat byte seam**
+//! (tasks/rust-rewrite-plan.md §3): values and documents travel as BSON bytes
+//! (a one-key envelope like `{"v": <value>}` / `{"e": <expr>}` / `{"d": [docs]}`),
 //! never as marshalled per-field Python objects. This keeps the seam aligned
-//! with SecantusDB's "documents are opaque BSON blobs" design and avoids the
-//! type-fidelity and per-call-conversion costs of value-by-value marshalling.
+//! with SecantusDB's "documents are opaque BSON blobs" design and avoids
+//! per-field conversion costs.
 //!
-//! The Python side (`secantus.sortkey`) is a shim that delegates here when
-//! enabled (`SECANTUS_RUST_SORTKEY=1`) and otherwise runs the pure-Python
-//! implementation, so this module is purely additive until we flip the default.
+//! Ported so far: the six leaf engines (`sortkey`, `query.matches`,
+//! `update.apply_update`, `expressions.evaluate`, `projection.apply_projection`,
+//! `diff.compute_update_description`) plus the storage-independent aggregation
+//! pipeline (`apply_pipeline`). Each Python module is a shim that delegates here
+//! when its component is enabled (via `secantus.engine`) and otherwise runs the
+//! pure-Python path — the two implementations are permanent and parity-pinned.
+//!
+//! **GIL discipline:** each `#[pyfunction]` decodes its BSON arguments while
+//! holding the GIL (the byte slices borrow Python buffers), then runs the pure
+//! Rust compute inside `Python::allow_threads` so concurrent callers don't
+//! serialise on it. See `benchmarks/` for the throughput characterisation (the
+//! win is large single-threaded; multi-core scaling needs the per-doc seams
+//! batched — coarse calls like `apply_pipeline` already benefit).
 
 // PyO3 0.22's #[pyfunction] expansion inserts an identity `.into()` on the
 // return type that clippy flags as a useless conversion; it's a macro artifact,
@@ -48,6 +58,15 @@ fn to_pybytes(py: Python<'_>, bytes: Vec<u8>) -> Py<PyBytes> {
     PyBytes::new_bound(py, &bytes).unbind()
 }
 
+/// Encode a document to BSON bytes inside a GIL-released closure (returns a
+/// `String` error rather than a GIL-bound `PyErr` so it satisfies `Ungil`).
+fn encode_doc(doc: &Document) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    doc.to_writer(&mut buf)
+        .map_err(|e| format!("encode failed: {e}"))?;
+    Ok(buf)
+}
+
 /// `sortkey.encode_value(value, collation=)` — `doc_bytes` is
 /// `bson.encode({"v": value})`, `collation_bytes` the `{strength, caseLevel,
 /// numericOrdering}` doc (or `{}`). Returns `None` to defer to Python (a value
@@ -61,9 +80,8 @@ fn sortkey_encode_value(
 ) -> PyResult<Option<Py<PyBytes>>> {
     let value = unwrap_value(doc_bytes)?;
     let coll = parse_collation(collation_bytes)?;
-    Ok(sortkey::encode_value(&value, coll.as_ref())
-        .ok()
-        .map(|out| to_pybytes(py, out)))
+    let out = py.allow_threads(|| sortkey::encode_value(&value, coll.as_ref()).ok());
+    Ok(out.map(|b| to_pybytes(py, b)))
 }
 
 /// `sortkey.encode_value_directed(value, direction, collation=)`.
@@ -76,11 +94,9 @@ fn sortkey_encode_value_directed(
 ) -> PyResult<Option<Py<PyBytes>>> {
     let value = unwrap_value(doc_bytes)?;
     let coll = parse_collation(collation_bytes)?;
-    Ok(
-        sortkey::encode_value_directed(&value, direction, coll.as_ref())
-            .ok()
-            .map(|out| to_pybytes(py, out)),
-    )
+    let out =
+        py.allow_threads(|| sortkey::encode_value_directed(&value, direction, coll.as_ref()).ok());
+    Ok(out.map(|b| to_pybytes(py, b)))
 }
 
 fn parse_collation(bytes: &[u8]) -> PyResult<Option<collation::Collation>> {
@@ -94,6 +110,7 @@ fn parse_collation(bytes: &[u8]) -> PyResult<Option<collation::Collation>> {
 /// not ported yet: collation, `$expr`, `$jsonSchema`, geo, regex, `$all`, …).
 #[pyfunction]
 fn query_matches(
+    py: Python<'_>,
     doc_bytes: &[u8],
     query_bytes: &[u8],
     vars_bytes: &[u8],
@@ -107,7 +124,8 @@ fn query_matches(
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
     // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
-    Ok(query::matches(&doc, &query, &vars, coll.as_ref()).ok())
+    // The match runs with the GIL released so concurrent callers parallelise.
+    Ok(py.allow_threads(|| query::matches(&doc, &query, &vars, coll.as_ref()).ok()))
 }
 
 /// `expressions.evaluate(expr, doc, vars)` over BSON bytes. `expr` and the
@@ -130,17 +148,17 @@ fn evaluate(
     let expr = expr_wrap
         .get("e")
         .ok_or_else(|| PyValueError::new_err("expr wrapper missing key 'e'"))?;
-    match expressions::evaluate(&doc, expr, &vars) {
-        Ok(value) => {
-            let mut wrap = Document::new();
-            wrap.insert("r".to_string(), value);
-            let mut buf = Vec::new();
-            wrap.to_writer(&mut buf)
-                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
-            Ok(Some(to_pybytes(py, buf)))
-        }
-        Err(expressions::Fallback) => Ok(None),
-    }
+    let out = py
+        .allow_threads(|| match expressions::evaluate(&doc, expr, &vars) {
+            Ok(value) => {
+                let mut wrap = Document::new();
+                wrap.insert("r".to_string(), value);
+                encode_doc(&wrap).map(Some)
+            }
+            Err(expressions::Fallback) => Ok(None),
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
 }
 
 /// `update.apply_update(doc, update, is_upsert=...)` over BSON bytes (update is
@@ -160,15 +178,13 @@ fn apply_update(
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
     let update: Document = bson::from_slice(update_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
-    match update::apply_update(&doc, &update, is_upsert) {
-        Ok(new) => {
-            let mut buf = Vec::new();
-            new.to_writer(&mut buf)
-                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
-            Ok(Some(to_pybytes(py, buf)))
-        }
-        Err(update::Fallback) => Ok(None),
-    }
+    let out = py
+        .allow_threads(|| match update::apply_update(&doc, &update, is_upsert) {
+            Ok(new) => encode_doc(&new).map(Some),
+            Err(update::Fallback) => Ok(None),
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
 }
 
 /// `projection.apply_projection(doc, spec)` over BSON bytes. Returns the
@@ -185,15 +201,13 @@ fn apply_projection(
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
     let spec: Document = bson::from_slice(spec_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
-    match projection::apply_projection(&doc, &spec) {
-        Ok(out) => {
-            let mut buf = Vec::new();
-            out.to_writer(&mut buf)
-                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
-            Ok(Some(to_pybytes(py, buf)))
-        }
-        Err(projection::Fallback) => Ok(None),
-    }
+    let out = py
+        .allow_threads(|| match projection::apply_projection(&doc, &spec) {
+            Ok(out) => encode_doc(&out).map(Some),
+            Err(projection::Fallback) => Ok(None),
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
 }
 
 /// `diff.compute_update_description(pre, post)` over BSON bytes. Returns the
@@ -209,15 +223,13 @@ fn compute_update_description(
         .map_err(|e| PyValueError::new_err(format!("invalid pre BSON: {e}")))?;
     let post: Document = bson::from_slice(post_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid post BSON: {e}")))?;
-    match diff::compute_update_description(&pre, &post) {
-        Ok(out) => {
-            let mut buf = Vec::new();
-            out.to_writer(&mut buf)
-                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
-            Ok(Some(to_pybytes(py, buf)))
-        }
-        Err(diff::Fallback) => Ok(None),
-    }
+    let out = py
+        .allow_threads(|| match diff::compute_update_description(&pre, &post) {
+            Ok(out) => encode_doc(&out).map(Some),
+            Err(diff::Fallback) => Ok(None),
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
 }
 
 /// `aggregate.apply_pipeline(docs, pipeline, vars, collation)` over BSON bytes.
@@ -255,28 +267,33 @@ fn apply_pipeline(
         return Err(PyValueError::new_err("pipeline wrapper missing array 'p'"));
     };
 
-    match aggregate::apply_pipeline(docs, pipeline, &vars, coll.as_ref()) {
-        Ok(out) => {
-            let mut wrap = Document::new();
-            wrap.insert(
-                "d".to_string(),
-                Bson::Array(out.into_iter().map(Bson::Document).collect()),
-            );
-            let mut buf = Vec::new();
-            wrap.to_writer(&mut buf)
-                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
-            Ok(Some(to_pybytes(py, buf)))
-        }
-        Err(aggregate::Fallback) => Ok(None),
-    }
+    // The whole pipeline runs with the GIL released; only the BSON decode above
+    // and the PyBytes build below need it.
+    let out = py
+        .allow_threads(move || {
+            match aggregate::apply_pipeline(docs, pipeline, &vars, coll.as_ref()) {
+                Ok(out) => {
+                    let mut wrap = Document::new();
+                    wrap.insert(
+                        "d".to_string(),
+                        Bson::Array(out.into_iter().map(Bson::Document).collect()),
+                    );
+                    encode_doc(&wrap).map(Some)
+                }
+                Err(aggregate::Fallback) => Ok(None),
+            }
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
 }
 
 #[pymodule]
 fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "__doc__",
-        "Rust core for SecantusDB (Phase 1: sortkey, query, update, \
-         expressions, projection, diff).",
+        "Rust core for SecantusDB: the six leaf engines (sortkey, query, update, \
+         expressions, projection, diff) plus the storage-independent aggregation \
+         pipeline, behind the BSON byte seam.",
     )?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;

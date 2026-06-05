@@ -124,6 +124,20 @@ never "remove Python."
   first run (the YAML couldn't be exercised in the WT-less dev sandbox).
 - [x] **Phase 0 spikes** — BSON fidelity, WiredTiger FFI, sortkey golden
   vectors all green (`rust/`, `rust/run_spikes.sh`).
+- [x] **GIL release + benchmark** — every `#[pyfunction]` now wraps its pure-Rust
+  compute in `Python::allow_threads` (BSON decode stays GIL-held since it borrows
+  the Python buffers; the work runs GIL-free). `benchmarks/engine_bench.py` +
+  `benchmarks/RESULTS.md` quantify it. **Findings:** (1) the byte seam does *not*
+  eat the win — even paying `bson.encode`/`decode` per call, the Rust path is
+  ~2× faster on the leaf ops and ~8× on the pipeline single-threaded; (2) GIL
+  release parallelises only *coarse* calls — the pipeline scales ~1.5× on 2
+  threads, but cheap per-op leaf calls regress under concurrency (per-call
+  GIL release/re-acquire + GIL-held encode/decode dominate the tiny compute and
+  ping-pong the GIL). **Implication:** the next real throughput lever for CRUD is
+  **coarsening the seam** — batch the per-doc hot loops into one Rust call
+  (`query_matches_batch`, `apply_update_batch`) so one GIL release covers many
+  docs, the way `apply_pipeline` already does — not more operator coverage. Track
+  with the benchmark; validate under a real concurrent server load (needs WT).
 - [x] **Phase 1, leaf engine #1: `sortkey`** — ported to Rust behind the fat
   byte seam; pure-Python `secantus.sortkey` delegates when
   `SECANTUS_RUST_SORTKEY=1`. Parity pinned by `tests/test_rust_sortkey_parity.py`
