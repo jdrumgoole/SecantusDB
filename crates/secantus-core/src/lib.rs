@@ -21,9 +21,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod diff;
 mod expressions;
 mod numeric;
 mod paths;
+mod projection;
 mod query;
 mod sortkey;
 mod update;
@@ -142,16 +144,68 @@ fn apply_update(
     }
 }
 
+/// `projection.apply_projection(doc, spec)` over BSON bytes. Returns the
+/// projected document's bytes, or `None` to fall back to pure Python (mixed
+/// inclusion/exclusion which Python raises on, nested-document specs, unusual
+/// `$slice` args, or a `$elemMatch` sub-filter the matcher defers).
+#[pyfunction]
+fn apply_projection(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    spec_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let doc: Document = bson::from_slice(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    let spec: Document = bson::from_slice(spec_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    match projection::apply_projection(&doc, &spec) {
+        Ok(out) => {
+            let mut buf = Vec::new();
+            out.to_writer(&mut buf)
+                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
+            Ok(Some(to_pybytes(py, buf)))
+        }
+        Err(projection::Fallback) => Ok(None),
+    }
+}
+
+/// `diff.compute_update_description(pre, post)` over BSON bytes. Returns the
+/// `{updatedFields, removedFields, truncatedArrays}` document's bytes, or `None`
+/// to fall back to pure Python (Decimal128 / exotic values).
+#[pyfunction]
+fn compute_update_description(
+    py: Python<'_>,
+    pre_bytes: &[u8],
+    post_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let pre: Document = bson::from_slice(pre_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid pre BSON: {e}")))?;
+    let post: Document = bson::from_slice(post_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid post BSON: {e}")))?;
+    match diff::compute_update_description(&pre, &post) {
+        Ok(out) => {
+            let mut buf = Vec::new();
+            out.to_writer(&mut buf)
+                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
+            Ok(Some(to_pybytes(py, buf)))
+        }
+        Err(diff::Fallback) => Ok(None),
+    }
+}
+
 #[pymodule]
 fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "__doc__",
-        "Rust core for SecantusDB (Phase 1: sortkey, query, update, expressions).",
+        "Rust core for SecantusDB (Phase 1: sortkey, query, update, \
+         expressions, projection, diff).",
     )?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_projection, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_update_description, m)?)?;
     Ok(())
 }

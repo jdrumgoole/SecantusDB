@@ -248,3 +248,36 @@ shipped. Validation: `cargo test` (22) + `tests/test_rust_expressions_parity.py`
 Next leaf engines: `projection` and `diff` (smaller); or widen the expression
 evaluator's operator coverage (strings/dates/conversions) to shrink its
 fallback surface.
+
+---
+
+## Phase 1 — `projection` and `diff` ported: **DONE** (all six leaf engines)
+
+Fifth and sixth leaf engines, finishing the Phase-1 leaf set.
+
+`projection.apply_projection` (`projection.rs`): inclusion / exclusion / `$slice`
+/ `$elemMatch` shapes behind the byte seam (doc + spec cross as BSON bytes).
+Defers to Python for mixed inclusion/exclusion (Python raises), nested-document
+specs, unusual `$slice` argument types, and `$elemMatch` sub-filters the matcher
+defers (it reuses the Rust query matcher). `SECANTUS_RUST_PROJECTION=1`.
+
+`diff.compute_update_description` (`diff.rs`): the change-stream `$v: 2` update
+diff — `{updatedFields, removedFields, truncatedArrays}` for a pre->post image —
+reusing the expression engine's Python-`==` value equality (now `pub`), so the
+numeric/bool bridging that decides "did this leaf change?" matches Python
+exactly. Defers on Decimal128 / exotic values. `SECANTUS_RUST_DIFF=1`.
+
+A shared-code cleanup landed too: the dotted-path **write** helpers
+(`set_path`/`unset_path`) moved into `paths.rs` next to the read helpers, shared
+by the update and projection engines (`update.rs` keeps a thin error-mapping
+wrapper).
+
+Validation: `cargo test` (32) + both new parity suites (curated + 6000-case
+fuzz each) green; all **six** leaf-engine parity suites total **298 cases**.
+
+All six pure leaf engines are now ported, opt-in, and parity-pinned:
+`sortkey`, `query.matches`, `update.apply_update`, `expressions.evaluate`,
+`projection.apply_projection`, `diff.compute_update_description`. Remaining
+Phase-1 work: `collation` (to retire the collation fallbacks), and widening the
+already-ported engines' operator coverage. Then Phase 2+ (aggregate, storage,
+wire/dispatch) and the eventual default-flip + packaging (Phase 6).

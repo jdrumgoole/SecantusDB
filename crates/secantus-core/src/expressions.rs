@@ -507,10 +507,11 @@ fn op_in(arg: &Bson, ctx: &Ctx) -> R {
     Ok(Bson::Boolean(false))
 }
 
-/// Python `==` (used by `$in` membership and `$eq` element semantics): numbers
-/// bridge with bool-as-int, strings/null/oid/date/etc. by type, arrays/docs
-/// structurally. `Err(Fallback)` for Decimal128 (uncertain) and exotic types.
-fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
+/// Python `==` (used by `$in` membership and `$eq` element semantics, and by
+/// the diff engine): numbers bridge with bool-as-int, strings/null/oid/date/etc.
+/// by type, arrays/docs structurally. `Err(Fallback)` for Decimal128
+/// (uncertain) and exotic types.
+pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     if matches!(a, Bson::Decimal128(_))
         || matches!(b, Bson::Decimal128(_))
         || is_exotic(a)

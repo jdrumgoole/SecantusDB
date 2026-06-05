@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Mapping
 from typing import Any
+
+import bson
 
 from secantus.paths import get_path, has_path, set_path, unset_path
 from secantus.query import matches
@@ -12,6 +15,22 @@ _MISSING = object()
 
 class ProjectionError(Exception):
     pass
+
+
+# Phase 1 of the Python -> Rust rewrite: the Rust core ports the common
+# projection shapes behind the byte seam (doc + spec cross as BSON bytes). The
+# Rust path returns None to defer to pure Python for: mixed inclusion/exclusion
+# (which Python raises on), nested-document specs, unusual $slice arg types, and
+# $elemMatch sub-filters the matcher defers. Opt-in via
+# SECANTUS_RUST_PROJECTION=1; parity pinned by tests/test_rust_projection_parity.py.
+try:
+    import _secantus_core as _rust
+except ImportError:
+    _rust = None
+
+
+def _rust_projection_enabled() -> bool:
+    return _rust is not None and os.environ.get("SECANTUS_RUST_PROJECTION") == "1"
 
 
 def _is_elem_match_spec(value: Any) -> bool:
@@ -59,6 +78,14 @@ def _apply_slice(arr: Any, slice_arg: Any) -> Any:
 def apply_projection(doc: dict[str, Any], spec: Mapping[str, Any] | None) -> dict[str, Any]:
     if not spec:
         return copy.deepcopy(doc)
+
+    if _rust_projection_enabled():
+        try:
+            res = _rust.apply_projection(bson.encode(dict(doc)), bson.encode(dict(spec)))
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)
 
     # Separate ``$slice`` projections — they don't participate in
     # inclusion / exclusion mode detection (mongod treats them as

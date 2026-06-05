@@ -15,14 +15,12 @@
 use bson::{Bson, Document};
 
 use crate::numeric::{as_float_like, as_int_like, int_to_bson};
-use crate::paths::{get_path, has_path, is_digits};
+use crate::paths::{self, get_path, has_path};
 
 #[derive(Debug)]
 pub struct Fallback;
 
 type R<T> = Result<T, Fallback>;
-
-const MAX_LIST_GROW_INDEX: usize = 100_000;
 
 fn is_positional_token(part: &str) -> bool {
     part == "$" || part == "$[]" || (part.starts_with("$[") && part.ends_with("]"))
@@ -32,92 +30,14 @@ fn has_positional(path: &str) -> bool {
     path.split('.').any(is_positional_token)
 }
 
-// --- path write helpers (read helpers live in crate::paths) -------------
+// --- path write helpers (shared impl in crate::paths) -------------------
 
+/// `paths::set_path` with its list-growth-cap error mapped to our `Fallback`.
 fn set_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
-    let parts: Vec<&str> = path.split('.').collect();
-    set_in_doc(doc, &parts, value)
+    paths::set_path(doc, path, value).map_err(|_| Fallback)
 }
 
-fn set_in_doc(d: &mut Document, parts: &[&str], value: Bson) -> R<()> {
-    let head = parts[0];
-    if parts.len() == 1 {
-        d.insert(head.to_string(), value);
-        return Ok(());
-    }
-    if !d.contains_key(head) {
-        d.insert(head.to_string(), Bson::Document(Document::new()));
-    }
-    set_in_bson(d.get_mut(head).unwrap(), &parts[1..], value)
-}
-
-fn set_in_bson(cur: &mut Bson, parts: &[&str], value: Bson) -> R<()> {
-    match cur {
-        Bson::Document(d) => set_in_doc(d, parts, value),
-        Bson::Array(arr) => set_in_array(arr, parts, value),
-        _ => Ok(()), // non-container intermediate -> Python walk returns None -> no-op
-    }
-}
-
-fn set_in_array(arr: &mut Vec<Bson>, parts: &[&str], value: Bson) -> R<()> {
-    let head = parts[0];
-    if !is_digits(head) {
-        return Ok(()); // non-digit into list -> no-op
-    }
-    let idx: usize = head.parse().map_err(|_| Fallback)?;
-    if parts.len() == 1 {
-        if idx > MAX_LIST_GROW_INDEX {
-            return Err(Fallback); // Python raises PathError -> let Python do it
-        }
-        while arr.len() <= idx {
-            arr.push(Bson::Null);
-        }
-        arr[idx] = value;
-        Ok(())
-    } else if idx < arr.len() {
-        set_in_bson(&mut arr[idx], &parts[1..], value)
-    } else {
-        Ok(()) // intermediate index out of range -> no-op
-    }
-}
-
-fn unset_path(doc: &mut Document, path: &str) {
-    let parts: Vec<&str> = path.split('.').collect();
-    unset_in_doc(doc, &parts);
-}
-
-fn unset_in_doc(d: &mut Document, parts: &[&str]) {
-    let head = parts[0];
-    if parts.len() == 1 {
-        d.remove(head);
-        return;
-    }
-    if let Some(child) = d.get_mut(head) {
-        unset_in_bson(child, &parts[1..]);
-    }
-}
-
-fn unset_in_bson(cur: &mut Bson, parts: &[&str]) {
-    match cur {
-        Bson::Document(d) => unset_in_doc(d, parts),
-        Bson::Array(arr) => {
-            if !is_digits(parts[0]) {
-                return;
-            }
-            let Ok(idx) = parts[0].parse::<usize>() else {
-                return;
-            };
-            if parts.len() == 1 {
-                if idx < arr.len() {
-                    arr[idx] = Bson::Null; // Python sets the slot to None, doesn't remove
-                }
-            } else if idx < arr.len() {
-                unset_in_bson(&mut arr[idx], &parts[1..]);
-            }
-        }
-        _ => {}
-    }
-}
+use crate::paths::unset_path;
 
 // --- arithmetic ($inc / $mul) -------------------------------------------
 

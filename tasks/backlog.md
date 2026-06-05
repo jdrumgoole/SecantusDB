@@ -177,8 +177,27 @@ maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
   scope-introducing `$let`/`$map`/`$filter`/`$reduce`. Each has Python-specific
   semantics (float `str()`, Unicode case, `strptime`/`strftime`, Decimal128,
   timezones) that need care. Regex ops (`$regexMatch`/…) need Python `re`.
-- [ ] **Remaining Phase 1 leaf engines** — `projection`, `diff`. (`collation`
-  unlocks the collation fallbacks across sortkey/query.)
+- [x] **Phase 1, leaf engine #5: `projection.apply_projection`** — inclusion /
+  exclusion / `$slice` / `$elemMatch` projection shapes ported to Rust
+  (`crates/secantus-core/src/projection.rs`). `secantus.projection` delegates
+  when `SECANTUS_RUST_PROJECTION=1`; returns `None` for mixed inclusion/exclusion
+  (Python raises), nested-document specs, unusual `$slice` arg types, and
+  `$elemMatch` sub-filters the matcher defers. Parity:
+  `tests/test_rust_projection_parity.py` (curated + 6000-case fuzz).
+- [x] **Phase 1, leaf engine #6: `diff.compute_update_description`** — the
+  change-stream `$v: 2` update diff ported to Rust
+  (`crates/secantus-core/src/diff.rs`), reusing the expression engine's Python-`==`
+  semantics. `secantus.diff` delegates when `SECANTUS_RUST_DIFF=1`; defers on
+  Decimal128 / exotic values. Parity: `tests/test_rust_diff_parity.py` (curated +
+  6000-case fuzz).
+- [ ] **Shared path write helpers** (`set_path`/`unset_path`) now live in
+  `paths.rs` alongside the read helpers; `update.rs` keeps a thin `Fallback`-
+  mapping wrapper. (Note for the eventual default-flip: same `bson::Document`
+  field-order question as the update engine applies to projection/diff outputs.)
+- [ ] **All six leaf engines are ported.** Remaining Phase-1 work is `collation`
+  (unlocks the collation fallbacks across sortkey/query) and *widening* the
+  already-ported engines (see the per-engine "widen" items above). After that,
+  Phase 2+ (aggregate, storage, wire/dispatch) per tasks/rust-rewrite-plan.md.
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 
