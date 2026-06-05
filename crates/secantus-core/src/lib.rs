@@ -21,7 +21,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod expressions;
 mod numeric;
+mod paths;
 mod query;
 mod sortkey;
 mod update;
@@ -64,13 +66,52 @@ fn sortkey_encode_value_directed(
 /// caller should fall back to the pure-Python matcher (the query uses a feature
 /// not ported yet: collation, `$expr`, `$jsonSchema`, geo, regex, `$all`, …).
 #[pyfunction]
-fn query_matches(doc_bytes: &[u8], query_bytes: &[u8]) -> PyResult<Option<bool>> {
+fn query_matches(
+    doc_bytes: &[u8],
+    query_bytes: &[u8],
+    vars_bytes: &[u8],
+) -> PyResult<Option<bool>> {
     let doc: Document = bson::from_slice(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
     let query: Document = bson::from_slice(query_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
+    let vars: Document = bson::from_slice(vars_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
-    Ok(query::matches(&doc, &query).ok())
+    Ok(query::matches(&doc, &query, &vars).ok())
+}
+
+/// `expressions.evaluate(expr, doc, vars)` over BSON bytes. `expr` and the
+/// result are wrapped as `{"e": ...}` / `{"r": ...}` (BSON needs a document
+/// envelope for non-document values). Returns the `{"r": ...}` bytes, or `None`
+/// to fall back to the pure-Python evaluator (any operator/value not ported).
+#[pyfunction]
+fn evaluate(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    expr_bytes: &[u8],
+    vars_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let doc: Document = bson::from_slice(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    let expr_wrap: Document = bson::from_slice(expr_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid expr BSON: {e}")))?;
+    let vars: Document = bson::from_slice(vars_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
+    let expr = expr_wrap
+        .get("e")
+        .ok_or_else(|| PyValueError::new_err("expr wrapper missing key 'e'"))?;
+    match expressions::evaluate(&doc, expr, &vars) {
+        Ok(value) => {
+            let mut wrap = Document::new();
+            wrap.insert("r".to_string(), value);
+            let mut buf = Vec::new();
+            wrap.to_writer(&mut buf)
+                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
+            Ok(Some(to_pybytes(py, buf)))
+        }
+        Err(expressions::Fallback) => Ok(None),
+    }
 }
 
 /// `update.apply_update(doc, update, is_upsert=...)` over BSON bytes (update is
@@ -105,11 +146,12 @@ fn apply_update(
 fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "__doc__",
-        "Rust core for SecantusDB (Phase 1: sortkey, query, update).",
+        "Rust core for SecantusDB (Phase 1: sortkey, query, update, expressions).",
     )?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate, m)?)?;
     Ok(())
 }

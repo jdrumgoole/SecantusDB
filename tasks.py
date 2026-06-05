@@ -117,7 +117,8 @@ def rust_parity(c: Context) -> None:
         "uv run --no-project --reinstall-package secantus-core "
         f"--with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
         "python -m pytest tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py "
-        "tests/test_rust_update_parity.py -o addopts= -p no:cacheprovider -q",
+        "tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py "
+        "-o addopts= -p no:cacheprovider -q",
         pty=True,
     )
 

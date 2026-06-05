@@ -54,7 +54,7 @@ _pure = _load_pure_query()
 
 
 def _rust_match(doc, query):
-    return _rust.query_matches(bson.encode(doc), bson.encode(query))
+    return _rust.query_matches(bson.encode(doc), bson.encode(query), bson.encode({}))
 
 
 def _rt(value):
@@ -146,6 +146,15 @@ CURATED = [
     ({"a": 1}, {"a": {"$ne": 1}}),
     ({"a": None}, {"a": {"$ne": None}}),
     ({}, {"a": {"$ne": None}}),
+    # $expr — now handled in Rust via the expression evaluator.
+    ({"a": 5, "b": 3}, {"$expr": {"$gt": ["$a", "$b"]}}),
+    ({"a": 1, "b": 3}, {"$expr": {"$gt": ["$a", "$b"]}}),
+    ({"price": 100, "discount": 30},
+     {"$expr": {"$lt": [{"$subtract": ["$price", "$discount"]}, 80]}}),
+    ({"a": 5, "b": 3, "name": "x"}, {"name": "x", "$expr": {"$gt": ["$a", "$b"]}}),
+    ({}, {"$expr": "$missing"}),  # falsy
+    ({"x": None}, {"$expr": "$x"}),  # falsy
+    ({"a": 5}, {"$expr": {"$dateToString": {"date": "$a"}}}),  # unported op -> defer
 ]
 
 

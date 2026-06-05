@@ -63,7 +63,11 @@ def matches(
         return True
     if collation is None and _rust_query_enabled():
         try:
-            result = _rust.query_matches(bson.encode(dict(doc)), bson.encode(dict(query)))
+            result = _rust.query_matches(
+                bson.encode(dict(doc)),
+                bson.encode(dict(query)),
+                bson.encode(dict(vars) if vars else {}),
+            )
         except Exception:
             # Any encode/decode hiccup: fall through to the pure-Python path
             # rather than surfacing a Rust-side error.

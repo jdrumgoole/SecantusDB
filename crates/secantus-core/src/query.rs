@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 
 use bson::{Bson, Document};
 
-use crate::numeric;
+use crate::{expressions, numeric};
 
 /// Signal that the pure-Python matcher must handle this query/value.
 #[derive(Debug)]
@@ -22,10 +22,11 @@ pub struct Fallback;
 type R = Result<bool, Fallback>;
 
 /// Entry point. `Ok(b)` is the match result; `Err(Fallback)` means defer to
-/// Python (the query uses something not ported yet).
-pub fn matches(doc: &Document, query: &Document) -> R {
+/// Python (the query uses something not ported yet). `vars` carries user vars
+/// for `$expr` (`$$name` / `$$ROOT`).
+pub fn matches(doc: &Document, query: &Document, vars: &Document) -> R {
     for (k, v) in query.iter() {
-        if !match_clause(doc, k, v)? {
+        if !match_clause(doc, k, v, vars)? {
             return Ok(false);
         }
     }
@@ -39,12 +40,12 @@ fn as_doc(b: &Bson) -> Result<&Document, Fallback> {
     }
 }
 
-fn match_clause(doc: &Document, key: &str, cond: &Bson) -> R {
+fn match_clause(doc: &Document, key: &str, cond: &Bson, vars: &Document) -> R {
     match key {
         "$and" => {
             let arr = cond.as_array().ok_or(Fallback)?;
             for c in arr {
-                if !matches(doc, as_doc(c)?)? {
+                if !matches(doc, as_doc(c)?, vars)? {
                     return Ok(false);
                 }
             }
@@ -53,7 +54,7 @@ fn match_clause(doc: &Document, key: &str, cond: &Bson) -> R {
         "$or" => {
             let arr = cond.as_array().ok_or(Fallback)?;
             for c in arr {
-                if matches(doc, as_doc(c)?)? {
+                if matches(doc, as_doc(c)?, vars)? {
                     return Ok(true);
                 }
             }
@@ -62,14 +63,20 @@ fn match_clause(doc: &Document, key: &str, cond: &Bson) -> R {
         "$nor" => {
             let arr = cond.as_array().ok_or(Fallback)?;
             for c in arr {
-                if matches(doc, as_doc(c)?)? {
+                if matches(doc, as_doc(c)?, vars)? {
                     return Ok(false);
                 }
             }
             Ok(true)
         }
         "$comment" => Ok(true),
-        // $expr, $jsonSchema, $where, $text, ... -> Python.
+        "$expr" => {
+            // _truthy(evaluate(cond, doc, vars)); the evaluator defers (and so
+            // do we) for any expression operator it doesn't yet handle.
+            let value = expressions::evaluate(doc, cond, vars).map_err(|_| Fallback)?;
+            Ok(expressions::truthy(&value))
+        }
+        // $jsonSchema, $where, $text, ... -> Python.
         _ if key.starts_with('$') => Err(Fallback),
         _ => field_matches(&resolve_path(doc, key), cond),
     }
@@ -422,7 +429,8 @@ fn op_elem_match(values: &[Option<Bson>], cond: &Bson) -> R {
                     return Ok(true);
                 }
             } else if let Bson::Document(ed) = elem {
-                if matches(ed, condd)? {
+                // Python's $elemMatch recurses with no vars (empty scope).
+                if matches(ed, condd, &Document::new())? {
                     return Ok(true);
                 }
             }
@@ -529,7 +537,7 @@ mod tests {
     use bson::doc;
 
     fn m(doc: Document, query: Document) -> bool {
-        matches(&doc, &query).expect("should not fall back")
+        matches(&doc, &query, &Document::new()).expect("should not fall back")
     }
 
     #[test]
@@ -563,12 +571,25 @@ mod tests {
     }
 
     #[test]
-    fn regex_and_expr_fall_back() {
-        assert!(matches(&doc! {"a": 1}, &doc! {"$expr": {"$gt": ["$a", 0]}}).is_err());
+    fn expr_now_handled() {
+        // $expr with supported operators is handled in Rust now (was a fallback).
+        assert!(m(
+            doc! {"a": 5, "b": 3},
+            doc! {"$expr": {"$gt": ["$a", "$b"]}}
+        ));
+        assert!(!m(
+            doc! {"a": 1, "b": 3},
+            doc! {"$expr": {"$gt": ["$a", "$b"]}}
+        ));
+    }
+
+    #[test]
+    fn regex_falls_back() {
         assert!(matches(
             &doc! {"n": "x"},
             &doc! {"n": Bson::RegularExpression(bson::Regex {
-            pattern: "x".into(), options: "".into() })}
+            pattern: "x".into(), options: "".into() })},
+            &Document::new()
         )
         .is_err());
     }

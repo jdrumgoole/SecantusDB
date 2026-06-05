@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import bson
 from bson import Decimal128, Int64
 
 from secantus.paths import get_path
@@ -14,6 +16,23 @@ from secantus.paths import get_path
 
 class ExpressionError(Exception):
     pass
+
+
+# Phase 1 of the Python -> Rust rewrite: the Rust core ports a high-value core
+# of the aggregation expression language behind the byte seam (expr + doc + vars
+# cross as BSON bytes). Because expressions are recursive, the Rust evaluator
+# returns None (whole-call fallback) if ANY operator/value in the tree isn't
+# ported yet (strings, dates, regex, conversions, $map/$filter/$reduce/$let,
+# object ops, Decimal128 semantics). Opt-in via SECANTUS_RUST_EXPR=1; parity
+# pinned by tests/test_rust_expressions_parity.py.
+try:
+    import _secantus_core as _rust
+except ImportError:
+    _rust = None
+
+
+def _rust_expr_enabled() -> bool:
+    return _rust is not None and os.environ.get("SECANTUS_RUST_EXPR") == "1"
 
 
 @dataclass
@@ -26,6 +45,17 @@ class _Ctx:
 
 
 def evaluate(expr: Any, doc: Mapping[str, Any], vars: dict[str, Any] | None = None) -> Any:
+    if _rust_expr_enabled():
+        try:
+            res = _rust.evaluate(
+                bson.encode(dict(doc)),
+                bson.encode({"e": expr}),
+                bson.encode(dict(vars) if vars else {}),
+            )
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)["r"]
     return _eval(expr, _Ctx(doc=doc, vars=dict(vars) if vars else {}))
 
 

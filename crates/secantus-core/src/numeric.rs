@@ -33,6 +33,41 @@ pub fn classify(b: &Bson) -> Option<NumVal> {
     }
 }
 
+/// Integer value of an int32/int64/bool (bool as 0/1, since Python's `int` is a
+/// superclass of `bool`). `None` for non-integer-like BSON.
+pub fn as_int_like(b: &Bson) -> Option<i128> {
+    match b {
+        Bson::Int32(n) => Some(*n as i128),
+        Bson::Int64(n) => Some(*n as i128),
+        Bson::Boolean(v) => Some(i128::from(*v)),
+        _ => None,
+    }
+}
+
+/// Float value of any numberish BSON (double/int/bool). `None` otherwise.
+pub fn as_float_like(b: &Bson) -> Option<f64> {
+    match b {
+        Bson::Double(d) => Some(*d),
+        Bson::Int32(n) => Some(*n as f64),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Boolean(v) => Some(if *v { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// Encode an integer result with the BSON width pymongo would pick by
+/// magnitude: int32 if it fits, else int64. `None` for > int64 (Python keeps a
+/// big int that pymongo can't encode — caller should defer to Python).
+pub fn int_to_bson(r: i128) -> Option<Bson> {
+    if (i32::MIN as i128..=i32::MAX as i128).contains(&r) {
+        Some(Bson::Int32(r as i32))
+    } else if (i64::MIN as i128..=i64::MAX as i128).contains(&r) {
+        Some(Bson::Int64(r as i64))
+    } else {
+        None
+    }
+}
+
 fn normalize(digits: &mut Vec<u8>, exp: &mut i64) {
     while digits.first() == Some(&0) {
         digits.remove(0);

@@ -155,8 +155,29 @@ maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
   flipped default would reorder fields vs mongod. (Parity test uses dict `==`,
   which is order-insensitive, so it wouldn't catch this; the full WiredTiger
   conformance suite would.)
-- [ ] **Remaining Phase 1 leaf engines** — `projection`, `expressions`, `diff`.
-  (`expressions` unlocks `$expr` in the matcher and pipeline updates; `collation`
+- [x] **Phase 1, leaf engine #4: `expressions.evaluate`** — a high-value core of
+  the aggregation expression language ported to Rust
+  (`crates/secantus-core/src/expressions.rs`): field paths / `$$var` / `$$ROOT` /
+  `$literal`; comparison (`$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`); logic
+  (`$and`/`$or`/`$not`); control flow (`$cond`/`$ifNull`/`$switch`); arithmetic
+  (`$add`/`$subtract`/`$multiply`/`$divide`/`$mod`); and common array ops
+  (`$size`/`$arrayElemAt`/`$first`/`$last`/`$concatArrays`/`$reverseArray`/`$in`).
+  `secantus.expressions.evaluate` delegates when `SECANTUS_RUST_EXPR=1`. Because
+  expressions are recursive, the evaluator returns `None` (whole-call fallback)
+  if ANY operator/value in the tree isn't ported. Parity pinned by
+  `tests/test_rust_expressions_parity.py` (curated + 8000-case nested fuzz).
+  **This also unlocked `$expr` in the Rust query matcher** (it now calls the Rust
+  evaluator directly, Rust->Rust) — `query_matches` gained a `vars` arg threaded
+  through `$expr`.
+- [ ] **Widen the Rust expression evaluator** to cover current whole-call
+  fallbacks where faithful: strings (`$concat`/`$toLower`/`$toUpper`/`$substr*`/
+  `$trim*`/`$split`/`$strLen*`/`$indexOf*`), dates (`$year`…/`$dateToString`/
+  `$dateAdd`/…), conversions (`$toInt`/`$convert`/…), object ops
+  (`$mergeObjects`/`$objectToArray`/`$getField`/`$setField`), and the
+  scope-introducing `$let`/`$map`/`$filter`/`$reduce`. Each has Python-specific
+  semantics (float `str()`, Unicode case, `strptime`/`strftime`, Decimal128,
+  timezones) that need care. Regex ops (`$regexMatch`/…) need Python `re`.
+- [ ] **Remaining Phase 1 leaf engines** — `projection`, `diff`. (`collation`
   unlocks the collation fallbacks across sortkey/query.)
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)

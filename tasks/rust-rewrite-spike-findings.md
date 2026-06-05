@@ -211,3 +211,40 @@ conformance suite would.
 
 Next leaf engine: `expressions.evaluate` — the aggregation expression language,
 which would also unlock `$expr` in the matcher and pipeline updates.
+
+---
+
+## Phase 1 — `expressions.evaluate` core ported: **DONE**
+
+Fourth and largest leaf (~80 operators in Python). `crates/secantus-core/src/
+expressions.rs` ports a **coherent high-value core** behind the byte seam (expr
++ doc + vars cross as BSON bytes, result wrapped as `{"r": ...}`): field paths /
+`$$var` / `$$ROOT` / `$literal`; comparison; logic; control flow (`$cond` /
+`$ifNull` / `$switch`); arithmetic; and common array ops. Because expressions
+are recursive, the evaluator returns `Fallback` (whole-call) the moment it hits
+any operator/value it doesn't yet handle — strings, dates, regex, conversions,
+`$map`/`$filter`/`$reduce`/`$let`, object ops — so the entire call defers to
+Python. `secantus.expressions.evaluate` delegates when `SECANTUS_RUST_EXPR=1`.
+
+This also **unlocked `$expr` in the Rust query matcher**: the matcher now calls
+the Rust evaluator directly (Rust->Rust, no re-encode), so `query.matches`
+delegated `$expr` clauses no longer fall back when the expression is in the
+supported core. `query_matches` gained a `vars` argument threaded through.
+
+Shared-code cleanup landed alongside: dotted-path *read* helpers moved to a new
+`paths.rs` and numeric conversion helpers (`as_int_like`/`as_float_like`/
+`int_to_bson`) to `numeric.rs`, both now shared by the update and expression
+engines instead of duplicated.
+
+The careful parts were Python's two different comparison semantics — `$eq`/`$ne`
+use total `==` (where `null == null` is true and unlike types are simply
+unequal), while `$gt`/`$lt`/… use `<`/`>` (which raise on incomparable operands,
+incl. `null` vs `null`, caught as false) — and `$add`'s identity quirks (empty
+`$add` raises; single-element `$add` returns the value unchanged, preserving
+bool/string). The 8000-case nested fuzz caught the null-ordering bug before it
+shipped. Validation: `cargo test` (22) + `tests/test_rust_expressions_parity.py`
+(curated + fuzz) green; all four leaf-engine parity suites total 264 cases.
+
+Next leaf engines: `projection` and `diff` (smaller); or widen the expression
+evaluator's operator coverage (strings/dates/conversions) to shrink its
+fallback surface.

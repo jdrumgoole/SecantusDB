@@ -14,16 +14,15 @@
 
 use bson::{Bson, Document};
 
+use crate::numeric::{as_float_like, as_int_like, int_to_bson};
+use crate::paths::{get_path, has_path, is_digits};
+
 #[derive(Debug)]
 pub struct Fallback;
 
 type R<T> = Result<T, Fallback>;
 
 const MAX_LIST_GROW_INDEX: usize = 100_000;
-
-fn is_digits(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
 
 fn is_positional_token(part: &str) -> bool {
     part == "$" || part == "$[]" || (part.starts_with("$[") && part.ends_with("]"))
@@ -33,44 +32,7 @@ fn has_positional(path: &str) -> bool {
     path.split('.').any(is_positional_token)
 }
 
-// --- path helpers (mirror secantus.paths) -------------------------------
-
-fn get_path<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
-    let parts: Vec<&str> = path.split('.').collect();
-    get_in_doc(doc, &parts)
-}
-
-fn get_in_doc<'a>(d: &'a Document, parts: &[&str]) -> Option<&'a Bson> {
-    let child = d.get(parts[0])?;
-    if parts.len() == 1 {
-        Some(child)
-    } else {
-        get_in_bson(child, &parts[1..])
-    }
-}
-
-fn get_in_bson<'a>(cur: &'a Bson, parts: &[&str]) -> Option<&'a Bson> {
-    match cur {
-        Bson::Document(d) => get_in_doc(d, parts),
-        Bson::Array(arr) => {
-            if !is_digits(parts[0]) {
-                return None;
-            }
-            let idx: usize = parts[0].parse().ok()?;
-            let child = arr.get(idx)?;
-            if parts.len() == 1 {
-                Some(child)
-            } else {
-                get_in_bson(child, &parts[1..])
-            }
-        }
-        _ => None,
-    }
-}
-
-fn has_path(doc: &Document, path: &str) -> bool {
-    get_path(doc, path).is_some()
-}
+// --- path write helpers (read helpers live in crate::paths) -------------
 
 fn set_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
     let parts: Vec<&str> = path.split('.').collect();
@@ -159,35 +121,6 @@ fn unset_in_bson(cur: &mut Bson, parts: &[&str]) {
 
 // --- arithmetic ($inc / $mul) -------------------------------------------
 
-fn as_int_like(b: &Bson) -> Option<i128> {
-    match b {
-        Bson::Int32(n) => Some(*n as i128),
-        Bson::Int64(n) => Some(*n as i128),
-        Bson::Boolean(v) => Some(i128::from(*v)), // Python: bool is an int subclass
-        _ => None,
-    }
-}
-
-fn as_float_like(b: &Bson) -> Option<f64> {
-    match b {
-        Bson::Double(d) => Some(*d),
-        Bson::Int32(n) => Some(*n as f64),
-        Bson::Int64(n) => Some(*n as f64),
-        Bson::Boolean(v) => Some(if *v { 1.0 } else { 0.0 }),
-        _ => None,
-    }
-}
-
-fn int_to_bson(r: i128) -> R<Bson> {
-    if (i32::MIN as i128..=i32::MAX as i128).contains(&r) {
-        Ok(Bson::Int32(r as i32))
-    } else if (i64::MIN as i128..=i64::MAX as i128).contains(&r) {
-        Ok(Bson::Int64(r as i64))
-    } else {
-        Err(Fallback) // > int64: Python keeps a big int; pymongo can't encode -> Python
-    }
-}
-
 /// `current <op> operand` with Python's numeric semantics. `mul=false` adds.
 fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
     // Decimal128 has no Python arithmetic support (raises) -> defer.
@@ -200,7 +133,7 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
         } else {
             a.checked_add(b)
         };
-        return int_to_bson(r.ok_or(Fallback)?);
+        return int_to_bson(r.ok_or(Fallback)?).ok_or(Fallback);
     }
     // Float path: any non-numeric operand (current/operand) makes Python raise.
     let a = as_float_like(current).ok_or(Fallback)?;
