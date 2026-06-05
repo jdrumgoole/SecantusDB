@@ -112,10 +112,61 @@ The plan's §4.1/§4.2/§5 already cover the big decisions; the refinements:
   wheel matrix (cp310–313 × manylinux/musllinux/macos-arm64/windows). If it
   doesn't, that's the trigger to reconsider option B.
 
-## 4. Recommended next action
+## 4. Batching the leaf-engine seams — the throughput lever (spans Phase 4)
 
-Phase 3a (resume-token codec) is the only Phase-3/4 unit that is both *runnable*
-and *low-risk* in this sandbox; everything past it (3b mock-only, all of Phase 4)
-needs WiredTiger + CI to validate honestly. The decision of where to point next
-(small runnable slice now vs. designing/prototyping the storage keystone that
-can't be tested here vs. consolidating) is the user's — see the chat.
+`benchmarks/RESULTS.md` established that the multi-core win for CRUD comes from
+**coarsening the seam**, not from more operator coverage. With the GIL released,
+*per-doc* calls anti-scale under concurrency (GIL ping-pong on tiny ops: 0.16×
+at 4 threads), while a *batched* call scales (1.51× at 4 threads, ~12× more
+docs/s). `query_matches_batch` (Rust) + `query.matches_batch` (shim) prototype
+this and are parity-pinned. The remaining work — all of it needs WiredTiger to
+land + measure, so it sits in / alongside Phase 4:
+
+1. **Wire storage's scan loop to the batch primitive.** Today the `COLLSCAN`
+   path in `find_matching` (and `update_matching` / `delete_matching`) calls
+   `query.matches` per candidate doc. Switch it to gather a candidate batch and
+   call `query.matches_batch` once. Decide a chunk size (e.g. 1k docs) to bound
+   peak memory / latency rather than materialising an unbounded candidate list.
+   Gate: `test_crud.py` / `test_indexes.py` unchanged and green under
+   `SECANTUS_ENGINE=rust`.
+
+2. **Return shape: bool-list now, filtered-bytes next.** The prototype returns a
+   bool per doc (caller selects from its own decoded list). The bigger win is a
+   variant that takes the candidate docs **as raw BSON bytes** (which is how they
+   come off the WT cursor) and returns the *matched subset as bytes* — skipping
+   the per-doc Python decode entirely. That only pays off once the docs aren't
+   already Python objects, i.e. once storage reads them as bytes.
+
+3. **Extend the pattern to the other leaf engines.** `apply_update_batch` (one
+   update spec applied to N matched docs — the multi-update path) and a batched
+   projection (`find` projecting N docs in one call). Same whole-batch-fallback
+   contract: any doc that defers falls the batch back to per-doc Python.
+
+4. **The endgame folds this into the storage port.** The batch seam is the
+   *transitional* form. Once `Storage` itself is Rust (Phase 4), the
+   scan → filter → project pipeline runs entirely in Rust over WT cursors under
+   one GIL release and never crosses into Python per doc at all — the batch
+   primitives are the bridge that proves the shape and de-risks it before the
+   storage cutover. (This is the same "close the byte path" idea as the plan's
+   Phase 5, pulled earlier for the hot read path.)
+
+**Measurement:** keep `benchmarks/engine_bench.py` as the micro-gate; the real
+proof is a **concurrent-connection server benchmark** (many pymongo clients vs
+one `SecantusDBServer`, throughput under `python` vs `rust`), which needs WT and
+should become a perf gauge. Caveat to watch: batch size trades latency for
+throughput, and the GIL-held encode/decode is the residual cap until step 2.
+
+## 5. Recommended next action
+
+The runnable, WT-free work has now been done: the GIL is released across the
+seam (`Python::allow_threads`), the accelerator is benchmarked
+(`benchmarks/`), and the batched seam is prototyped + parity-pinned
+(`query_matches_batch`). What remains is all WiredTiger-gated and so must land /
+be measured in CI or on a WT machine:
+
+- **Highest value:** wire the batch seam into storage's scan loop (§4.1) and
+  extend it to update/projection — this is where the proven multi-core win
+  becomes real on the CRUD hot path.
+- **Largest:** the storage keystone itself (§3 / Phase 4), the WT-FFI cutover.
+- **Low-risk filler:** Phase 3a resume-token codec, Phase 3b projection (mock
+  parity only here).
