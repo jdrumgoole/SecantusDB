@@ -23,7 +23,7 @@ import types
 
 import bson
 import pytest
-from bson import Decimal128, Int64, ObjectId
+from bson import Decimal128, Int64, ObjectId, Regex
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -155,6 +155,12 @@ CURATED = [
     ({}, {"$expr": "$missing"}),  # falsy
     ({"x": None}, {"$expr": "$x"}),  # falsy
     ({"a": 5}, {"$expr": {"$dateToString": {"date": "$a"}}}),  # unported op -> defer
+    # $all — now handled in Rust (element equality via Python ==).
+    ({"tags": ["a", "b", "c"]}, {"tags": {"$all": ["a", "b"]}}),
+    ({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}}),
+    ({"tags": [1, 2, 3]}, {"tags": {"$all": [1.0, 2.0]}}),  # numeric bridge
+    ({"tags": []}, {"tags": {"$all": []}}),
+    ({"tags": ["a", "b"]}, {"tags": {"$all": [Regex("^a")]}}),  # regex elem -> defer
 ]
 
 
@@ -202,11 +208,11 @@ def _rand_query(rng):
     field = rng.choice(["a", "b", "c", "a.n", "a.0"])
     op = rng.choice(
         ["eq", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$ne",
-         "$exists", "$type", "$size", "$mod"]
+         "$exists", "$type", "$size", "$mod", "$all"]
     )
     if op == "eq":
         return {field: _rand_scalar(rng)}
-    if op in ("$in", "$nin"):
+    if op in ("$in", "$nin", "$all"):
         return {field: {op: [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]}}
     if op == "$exists":
         return {field: {op: rng.choice([True, False])}}

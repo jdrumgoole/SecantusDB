@@ -105,9 +105,31 @@ CURATED = [
     ({"$in": [9, [1, 2, 3]]}, {}),
     # Nested
     ({"$cond": [{"$lt": [{"$add": ["$p", "$q"]}, 100]}, "cheap", "dear"]}, {"p": 30, "q": 40}),
-    # Cases that should defer (rust None -> skipped):
+    # String / array / object ops (now handled).
+    ({"$concat": ["a", "b", "c"]}, {}),
+    ({"$concat": ["x", "$a", "y"]}, {"a": "MID"}),
+    ({"$concat": ["a", None, "b"]}, {}),  # None -> ""
     ({"$toUpper": "$a"}, {"a": "hi"}),
-    ({"$concat": ["a", "b"]}, {}),
+    ({"$toLower": "HELLO"}, {}),
+    ({"$toUpper": "$a"}, {"a": 123}),  # non-string passes through
+    ({"$strLenCP": "hello"}, {}),
+    ({"$split": ["a,b,c", ","]}, {}),
+    ({"$split": ["$a", "-"]}, {"a": "1-2-3"}),
+    ({"$substrCP": ["hello", 1, 3]}, {}),
+    ({"$substrCP": ["hello", 2, -1]}, {}),  # negative length -> to end
+    ({"$substrCP": ["hello", 10, 2]}, {}),  # start past end -> ""
+    ({"$slice": [[1, 2, 3, 4], 2]}, {}),
+    ({"$slice": [[1, 2, 3, 4], -2]}, {}),
+    ({"$slice": [[1, 2, 3, 4, 5], 1, 2]}, {}),
+    ({"$slice": [[1, 2, 3, 4, 5], -3, 2]}, {}),
+    ({"$indexOfArray": [[1, 2, 3, 2], 2]}, {}),
+    ({"$indexOfArray": [[1, 2, 3, 2], 2, 2]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 9]}, {}),
+    ({"$mergeObjects": [{"a": 1}, {"b": 2}, {"a": 9}]}, {}),
+    ({"$mergeObjects": [{"a": 1}, None, {"b": 2}]}, {}),
+    ({"$objectToArray": "$o"}, {"o": {"x": 1, "y": 2}}),
+    # Cases that should defer (rust None -> skipped):
+    ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
 ]
 
@@ -164,6 +186,33 @@ def _rand_expr(rng, depth):
         return {op: [_rand_operand(rng, depth) for _ in range(rng.randint(1, 3))]}
     # binary ops
     return {op: [_rand_operand(rng, depth), _rand_operand(rng, depth)]}
+
+
+def test_index_math_fuzz():
+    """Stress $slice / $substrCP / $indexOfArray index arithmetic (the riskiest
+    part — negative indices, out-of-range, clamping) against pure Python."""
+    rng = random.Random(0x51CE)
+    handled = 0
+    for _ in range(6000):
+        arr = [rng.randint(0, 4) for _ in range(rng.randint(0, 6))]
+        s = "".join(rng.choice("abcde") for _ in range(rng.randint(0, 6)))
+        lo, hi = rng.randint(-8, 8), rng.randint(-8, 8)
+        expr = rng.choice([
+            {"$slice": [arr, lo]},
+            {"$slice": [arr, lo, hi]},
+            {"$substrCP": [s, lo, hi]},
+            {"$indexOfArray": [arr, rng.randint(0, 4)]},
+            {"$indexOfArray": [arr, rng.randint(0, 4), lo]},
+            {"$indexOfArray": [arr, rng.randint(0, 4), lo, hi]},
+        ])
+        expr = bson.decode(bson.encode({"e": expr}))["e"]
+        rust = _rust_eval(expr, {})
+        if rust is None:
+            continue
+        handled += 1
+        py = _pure.evaluate(expr, {})
+        assert rust == py, f"divergence: rust={rust!r} pure={py!r} expr={expr}"
+    assert handled > 2000, f"expected many handled cases, only {handled}"
 
 
 def test_randomised_fuzz_parity():

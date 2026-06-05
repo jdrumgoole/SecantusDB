@@ -10,10 +10,12 @@
 //! Handled: field paths, `$$var`/`$$ROOT`/`$$CURRENT`, `$literal`; comparison
 //! (`$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`); logic (`$and`/`$or`/`$not`); control
 //! flow (`$cond`/`$ifNull`/`$switch`); arithmetic (`$add`/`$subtract`/
-//! `$multiply`/`$divide`/`$mod`); and common array ops (`$size`/`$arrayElemAt`/
-//! `$first`/`$last`/`$concatArrays`/`$reverseArray`/`$in`). Everything else
-//! (strings, dates, regex, conversions, `$map`/`$filter`/`$reduce`/`$let`,
-//! object ops) -> Python.
+//! `$multiply`/`$divide`/`$mod`); array ops (`$size`/`$arrayElemAt`/`$first`/
+//! `$last`/`$concatArrays`/`$reverseArray`/`$in`/`$slice`/`$indexOfArray`);
+//! ASCII string ops (`$concat`/`$toLower`/`$toUpper`/`$strLenCP`/`$split`/
+//! `$substrCP`); and object ops (`$mergeObjects`/`$objectToArray`). Everything
+//! else (dates, regex, conversions, `$map`/`$filter`/`$reduce`/`$let`, non-ASCII
+//! case) -> Python.
 
 use std::cmp::Ordering;
 
@@ -159,6 +161,18 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$concatArrays" => op_concat_arrays(arg, ctx),
         "$reverseArray" => op_reverse_array(arg, ctx),
         "$in" => op_in(arg, ctx),
+        "$slice" => op_slice(arg, ctx),
+        "$indexOfArray" => op_index_of_array(arg, ctx),
+        // strings
+        "$concat" => op_concat(arg, ctx),
+        "$toLower" => op_to_case(arg, ctx, false),
+        "$toUpper" => op_to_case(arg, ctx, true),
+        "$strLenCP" => op_str_len_cp(arg, ctx),
+        "$split" => op_split(arg, ctx),
+        "$substrCP" | "$substr" => op_substr_cp(arg, ctx),
+        // objects
+        "$mergeObjects" => op_merge_objects(arg, ctx),
+        "$objectToArray" => op_object_to_array(arg, ctx),
         _ => Err(Fallback),
     }
 }
@@ -507,6 +521,241 @@ fn op_in(arg: &Bson, ctx: &Ctx) -> R {
     Ok(Bson::Boolean(false))
 }
 
+// --- more array ops -----------------------------------------------------
+
+/// Python slice index normalisation: negatives count from the end, clamped to
+/// `[0, len]`.
+fn norm_index(i: i64, len: i64) -> i64 {
+    if i < 0 {
+        (len + i).max(0)
+    } else {
+        i.min(len)
+    }
+}
+
+fn slice_int(b: &Bson) -> Option<i64> {
+    as_int_like(b).map(|x| x as i64)
+}
+
+fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Array(a) = arg else {
+        return Err(Fallback);
+    };
+    if a.len() != 2 && a.len() != 3 {
+        return Err(Fallback);
+    }
+    let Bson::Array(arr) = eval(&a[0], ctx)? else {
+        return Ok(Bson::Null); // non-array input -> null
+    };
+    let len = arr.len() as i64;
+    let (start, stop) = if a.len() == 2 {
+        let Some(n) = slice_int(&eval(&a[1], ctx)?) else {
+            return Ok(Bson::Null);
+        };
+        if n >= 0 {
+            (0, n)
+        } else {
+            (n, len)
+        }
+    } else {
+        let (Some(pos), Some(n)) = (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
+        else {
+            return Ok(Bson::Null);
+        };
+        (pos, pos.saturating_add(n))
+    };
+    let (s, e) = (norm_index(start, len), norm_index(stop, len));
+    Ok(Bson::Array(if s >= e {
+        Vec::new()
+    } else {
+        arr[s as usize..e as usize].to_vec()
+    }))
+}
+
+fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Array(a) = arg else {
+        return Err(Fallback);
+    };
+    if !(2..=4).contains(&a.len()) {
+        return Err(Fallback);
+    }
+    let arr_v = eval(&a[0], ctx)?;
+    if is_null(&arr_v) {
+        return Ok(Bson::Null);
+    }
+    let Bson::Array(arr) = arr_v else {
+        return Err(Fallback); // non-array (non-null) -> Python raises
+    };
+    let needle = eval(&a[1], ctx)?;
+    let len = arr.len() as i64;
+    let start = if a.len() >= 3 {
+        match slice_int(&eval(&a[2], ctx)?) {
+            Some(x) => x,
+            None => return Ok(Bson::Int32(-1)),
+        }
+    } else {
+        0
+    };
+    let end = if a.len() >= 4 {
+        match slice_int(&eval(&a[3], ctx)?) {
+            Some(x) => x,
+            None => return Ok(Bson::Int32(-1)),
+        }
+    } else {
+        len
+    };
+    let mut i = start.max(0);
+    let hi = end.min(len);
+    while i < hi {
+        if py_eq(&arr[i as usize], &needle)? {
+            return Ok(Bson::Int32(i as i32));
+        }
+        i += 1;
+    }
+    Ok(Bson::Int32(-1))
+}
+
+// --- strings ------------------------------------------------------------
+
+fn op_concat(arg: &Bson, ctx: &Ctx) -> R {
+    let mut out = String::new();
+    for p in eval_args(arg, ctx)? {
+        match p {
+            Bson::Null => {}
+            Bson::String(s) => out.push_str(&s),
+            // Python str()-coerces non-strings; the formatting (esp. floats)
+            // is risky to reproduce, so defer.
+            _ => return Err(Fallback),
+        }
+    }
+    Ok(Bson::String(out))
+}
+
+fn op_to_case(arg: &Bson, ctx: &Ctx, upper: bool) -> R {
+    match eval(arg, ctx)? {
+        Bson::String(s) => {
+            if s.is_ascii() {
+                Ok(Bson::String(if upper {
+                    s.to_ascii_uppercase()
+                } else {
+                    s.to_ascii_lowercase()
+                }))
+            } else {
+                Err(Fallback) // Unicode case mapping may differ from Python -> defer
+            }
+        }
+        other => Ok(other), // non-string passes through unchanged (matches Python)
+    }
+}
+
+fn op_str_len_cp(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::String(s) => Ok(Bson::Int32(s.chars().count() as i32)),
+        _ => Err(Fallback), // Python raises on non-string
+    }
+}
+
+fn op_split(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Array(a) = arg else {
+        return Err(Fallback);
+    };
+    if a.len() != 2 {
+        return Err(Fallback);
+    }
+    let s = eval(&a[0], ctx)?;
+    let sep = eval(&a[1], ctx)?;
+    if is_null(&s) || is_null(&sep) {
+        return Ok(Bson::Null);
+    }
+    let (Bson::String(s), Bson::String(sep)) = (s, sep) else {
+        return Err(Fallback);
+    };
+    if sep.is_empty() {
+        return Err(Fallback); // Python "".split with empty sep raises
+    }
+    Ok(Bson::Array(
+        s.split(sep.as_str())
+            .map(|p| Bson::String(p.to_string()))
+            .collect(),
+    ))
+}
+
+fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Array(a) = arg else {
+        return Err(Fallback);
+    };
+    if a.len() != 3 {
+        return Err(Fallback);
+    }
+    let s = eval(&a[0], ctx)?;
+    if is_null(&s) {
+        return Ok(Bson::String(String::new())); // Python returns "" for null input
+    }
+    let Bson::String(s) = s else {
+        return Err(Fallback);
+    };
+    let (Some(start), Some(length)) =
+        (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
+    else {
+        return Err(Fallback);
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let clen = chars.len() as i64;
+    let stop = if length < 0 {
+        clen
+    } else {
+        start.saturating_add(length)
+    };
+    let (s_i, e_i) = (norm_index(start, clen), norm_index(stop, clen));
+    let out: String = if s_i >= e_i {
+        String::new()
+    } else {
+        chars[s_i as usize..e_i as usize].iter().collect()
+    };
+    Ok(Bson::String(out))
+}
+
+// --- objects ------------------------------------------------------------
+
+fn op_merge_objects(arg: &Bson, ctx: &Ctx) -> R {
+    let items: Vec<&Bson> = match arg {
+        Bson::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    let mut result = Document::new();
+    for item in items {
+        match eval(item, ctx)? {
+            Bson::Null => {}
+            Bson::Document(d) => {
+                for (k, v) in d {
+                    result.insert(k, v);
+                }
+            }
+            _ => return Err(Fallback), // Python raises on non-document arg
+        }
+    }
+    Ok(Bson::Document(result))
+}
+
+fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Document(d) => {
+            let arr = d
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut e = Document::new();
+                    e.insert("k".to_string(), Bson::String(k));
+                    e.insert("v".to_string(), v);
+                    Bson::Document(e)
+                })
+                .collect();
+            Ok(Bson::Array(arr))
+        }
+        _ => Err(Fallback), // Python raises on non-document
+    }
+}
+
 /// Python `==` (used by `$in` membership and `$eq` element semantics, and by
 /// the diff engine): numbers bridge with bool-as-int, strings/null/oid/date/etc.
 /// by type, arrays/docs structurally. `Err(Fallback)` for Decimal128
@@ -652,12 +901,63 @@ mod tests {
 
     #[test]
     fn unsupported_falls_back() {
-        assert!(evaluate(&doc! {}, &bson::bson!({"$toUpper": "x"}), &Document::new()).is_err());
+        // Still-unported op, non-ASCII $toUpper, and string $add all defer.
+        assert!(evaluate(
+            &doc! {},
+            &bson::bson!({"$dateToString": {"date": "$d"}}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(
+            &doc! {},
+            &bson::bson!({"$toUpper": "café"}),
+            &Document::new()
+        )
+        .is_err());
         assert!(evaluate(
             &doc! {},
             &bson::bson!({"$add": ["a", "b"]}),
             &Document::new()
         )
         .is_err());
+    }
+
+    #[test]
+    fn string_and_object_ops() {
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$concat": ["a", "b", "c"]})),
+            Bson::String("abc".into())
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$toUpper": "abc"})),
+            Bson::String("ABC".into())
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$strLenCP": "hello"})),
+            Bson::Int32(5)
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$split": ["a,b,c", ","]})),
+            Bson::Array(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$substrCP": ["hello", 1, 3]})),
+            Bson::String("ell".into())
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$slice": [[1, 2, 3, 4], 2]})),
+            Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$indexOfArray": [[1, 2, 3], 2]})),
+            Bson::Int32(1)
+        );
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$mergeObjects": [{"a": 1}, {"b": 2}]})
+            ),
+            Bson::Document(doc! {"a": 1, "b": 2})
+        );
     }
 }

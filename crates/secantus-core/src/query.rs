@@ -6,8 +6,9 @@
 //! which the Python shim turns into "run the pure-Python matcher instead". That
 //! keeps the port strictly correct: the operators handled here match the Python
 //! implementation exactly (pinned by `tests/test_rust_query_parity.py`), and
-//! everything else (collation, `$expr`, `$jsonSchema`, geo, any regex, `$all`,
-//! structural/compound equality, exotic BSON types) defers to Python.
+//! everything else (collation, `$jsonSchema`, geo, any regex,
+//! structural/compound equality, exotic BSON types) defers to Python. `$expr`
+//! is handled via the Rust expression evaluator; `$all` via its Python-`==`.
 
 use std::cmp::Ordering;
 
@@ -164,14 +165,15 @@ fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson) -> R {
         "$not" => Ok(!field_matches(values, arg)?),
         "$type" => op_type(values, arg),
         "$size" => op_size(values, arg),
+        "$all" => op_all(values, arg),
         "$elemMatch" => op_elem_match(values, arg),
         "$mod" => op_mod(values, arg),
         "$bitsAllSet" => op_bits(values, arg, |v, m| v & m == m),
         "$bitsAnySet" => op_bits(values, arg, |v, m| v & m != 0),
         "$bitsAllClear" => op_bits(values, arg, |v, m| v & m == 0),
         "$bitsAnyClear" => op_bits(values, arg, |v, m| v & m != m),
-        // $all, $regex/$options, geo, and anything unknown -> Python (Python
-        // raises QueryError for genuinely-unknown operators, preserved).
+        // $regex/$options, geo, and anything unknown -> Python (Python raises
+        // QueryError for genuinely-unknown operators, preserved).
         _ => Err(Fallback),
     }
 }
@@ -393,6 +395,43 @@ fn op_type(values: &[Option<Bson>], spec: &Bson) -> R {
 }
 
 // --- $size --------------------------------------------------------------
+
+/// `$all`: some array value contains, for every required element, a matching
+/// element. Element equality uses Python `==` (`expressions::py_eq` — numeric
+/// bridge + bool-as-int), matching `secantus.query._op_all`. Regex elements
+/// (which Python matches as patterns) defer to Python.
+fn op_all(values: &[Option<Bson>], required: &Bson) -> R {
+    let Bson::Array(required) = required else {
+        return Err(Fallback); // Python raises QueryError on a non-array $all
+    };
+    if required
+        .iter()
+        .any(|r| matches!(r, Bson::RegularExpression(_)))
+    {
+        return Err(Fallback);
+    }
+    for v in values {
+        let Some(Bson::Array(arr)) = v else { continue };
+        let mut all_present = true;
+        for r in required {
+            let mut found = false;
+            for e in arr {
+                if expressions::py_eq(e, r).map_err(|_| Fallback)? {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                all_present = false;
+                break;
+            }
+        }
+        if all_present {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 fn op_size(values: &[Option<Bson>], size: &Bson) -> R {
     let n = match size {

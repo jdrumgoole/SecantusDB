@@ -123,11 +123,10 @@ maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
   **any regex**, `$all`, structural/compound equality (array/doc operands),
   bool-as-int comparison, exotic BSON types. Parity pinned by
   `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).
-- [ ] **Widen the Rust query matcher** to cover the current fallbacks where
-  faithful: `$all` (needs Python-`==` element semantics incl. regex elements),
-  bool-as-int `$gt`/`$lt` comparison, structural array/doc equality. Each needs
-  care to match Python's exact (sometimes quirky) semantics; left as fallback
-  until then.
+- [ ] **Widen the Rust query matcher** — `$all` is now handled (element
+  equality via `expressions::py_eq`; regex elements still defer). Remaining
+  fallbacks to widen where faithful: bool-as-int `$gt`/`$lt` comparison and
+  structural array/doc equality (both need Python's exact quirky semantics).
 - [ ] **Flip `query.matches` default to Rust** — same gating as sortkey
   (Phase 6 packaging + the per-call `bson.encode` overhead question). Note the
   matcher re-encodes doc+query per call at the seam; the real win needs the doc
@@ -169,14 +168,15 @@ maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
   **This also unlocked `$expr` in the Rust query matcher** (it now calls the Rust
   evaluator directly, Rust->Rust) — `query_matches` gained a `vars` arg threaded
   through `$expr`.
-- [ ] **Widen the Rust expression evaluator** to cover current whole-call
-  fallbacks where faithful: strings (`$concat`/`$toLower`/`$toUpper`/`$substr*`/
-  `$trim*`/`$split`/`$strLen*`/`$indexOf*`), dates (`$year`…/`$dateToString`/
-  `$dateAdd`/…), conversions (`$toInt`/`$convert`/…), object ops
-  (`$mergeObjects`/`$objectToArray`/`$getField`/`$setField`), and the
-  scope-introducing `$let`/`$map`/`$filter`/`$reduce`. Each has Python-specific
-  semantics (float `str()`, Unicode case, `strptime`/`strftime`, Decimal128,
-  timezones) that need care. Regex ops (`$regexMatch`/…) need Python `re`.
+- [ ] **Widen the Rust expression evaluator** — now also handled:
+  `$slice`/`$indexOfArray`, ASCII `$concat`/`$toLower`/`$toUpper`/`$strLenCP`/
+  `$split`/`$substrCP`, and `$mergeObjects`/`$objectToArray`. Remaining
+  whole-call fallbacks to widen where faithful: dates (`$year`…/`$dateToString`/
+  `$dateAdd`/…), conversions (`$toInt`/`$convert`/…), `$trim*`, `$getField`/
+  `$setField`, and the scope-introducing `$let`/`$map`/`$filter`/`$reduce`. Each
+  has Python-specific semantics (float `str()`, **non-ASCII Unicode case** which
+  is why `$toLower`/`$toUpper` defer on non-ASCII, `strptime`/`strftime`,
+  Decimal128, timezones). Regex ops (`$regexMatch`/…) need Python `re`.
 - [x] **Phase 1, leaf engine #5: `projection.apply_projection`** — inclusion /
   exclusion / `$slice` / `$elemMatch` projection shapes ported to Rust
   (`crates/secantus-core/src/projection.rs`). `secantus.projection` delegates
