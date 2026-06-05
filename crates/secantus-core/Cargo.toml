@@ -1,0 +1,16 @@
+[package]
+name = "secantus-core"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Rust core for SecantusDB (Phase 1 of the Python -> Rust rewrite)"
+
+[lib]
+name = "_secantus_core"
+# cdylib -> the Python extension module; rlib -> so cargo can run unit tests
+# and so future binaries / crates can link the core directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bson = "2"
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }

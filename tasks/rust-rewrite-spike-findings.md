@@ -102,3 +102,41 @@ Recommended next step: a small **Phase 1 starter** — stand up the real
 `crates/secantus-core` with maturin, and port the first leaf engine
 (`sortkey`, then `query.matches`) behind the byte seam with the existing
 `tests/test_query.py` / `test_indexes.py` as the net.
+
+---
+
+## Phase 1 starter — `sortkey` ported: **DONE**
+
+Stood up `crates/secantus-core` (PyO3 + maturin, abi3 wheel valid for CPython
+3.10+) and ported `sortkey` as the first leaf engine, behind the fat byte seam:
+values cross as `bson.encode({"v": value})` and the Rust side returns the key
+bytes. `secantus.sortkey` is now a shim that delegates to `_secantus_core` when
+`SECANTUS_RUST_SORTKEY=1` and is pure-Python otherwise (and always when a
+collation is supplied — collation-aware encoding isn't ported yet).
+
+Validation (runs without WiredTiger — `invoke rust-test` + `invoke rust-parity`):
+`cargo test` green; `tests/test_rust_sortkey_parity.py` green — a curated corpus
+plus a **2000-case randomised fuzz**, all byte-identical between the Rust port
+and the authoritative pure-Python encoder.
+
+**The port surfaced two latent bugs in the pure-Python `sortkey`** (the Rust
+port matched mongod; the Python encoder didn't), now fixed so all three agree:
+
+1. *Date keys* were computed via a float `total_seconds() * 1000`, rounding
+   sub-second values off by up to 1ms vs the integer millis BSON stores → now
+   integer-exact.
+2. *Regex keys* did `bytes(r.flags)`, which on a BSON-round-tripped regex (where
+   `flags` is an int) emitted N NUL bytes instead of the option string → now
+   reconstructs option chars in pymongo's on-wire order (`ilmsux`).
+
+Caveat worth flagging to a maintainer: both fixes change the on-disk
+index-key bytes for the affected values. That's immaterial for SecantusDB's
+ephemeral test data, but the full WiredTiger-backed suite (`test_indexes.py`,
+`test_sort_*`) should be run in CI to confirm no ordering regression — it
+couldn't be run in the spike environment (no SWIG → the WT Python extension
+doesn't build there). The changes only make ordering *more* faithful to mongod,
+so no regression is expected.
+
+Next: port `query.matches` behind the same seam, then decide on flipping the
+`sortkey` default to Rust (gated on Phase 6 packaging — merging the maturin and
+scikit-build wheels — and the per-call re-encode overhead question).

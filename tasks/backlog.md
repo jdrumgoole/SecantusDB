@@ -93,6 +93,44 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
 
+## 7. Python → Rust rewrite (in progress)
+
+Tracking the incremental rewrite (plan: `tasks/rust-rewrite-plan.md`; Phase 0
+spike results: `tasks/rust-rewrite-spike-findings.md`). The Rust core lives at
+`crates/secantus-core` and builds as an abi3 extension `_secantus_core` via
+maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
+
+- [x] **Phase 0 spikes** — BSON fidelity, WiredTiger FFI, sortkey golden
+  vectors all green (`rust/`, `rust/run_spikes.sh`).
+- [x] **Phase 1, leaf engine #1: `sortkey`** — ported to Rust behind the fat
+  byte seam; pure-Python `secantus.sortkey` delegates when
+  `SECANTUS_RUST_SORTKEY=1`. Parity pinned by `tests/test_rust_sortkey_parity.py`
+  (curated + 2000-case fuzz, byte-identical).
+- [ ] **Flip `sortkey` default to Rust.** Currently opt-in via env flag so the
+  port can't regress anything. Flipping requires: (a) the extension shipped in
+  the wheel (Phase 6 packaging — two native build systems to merge), and (b) a
+  decision on the byte seam's per-call `bson.encode({"v": value})` overhead vs
+  passing values without re-encoding. Until then Python stays the default.
+- [ ] **Collation-aware sortkey in Rust.** The Rust port does not implement
+  `collation.normalize_for_index_bytes`; the shim only delegates when
+  `collation is None` and uses pure Python otherwise. Port when `collation`
+  lands in the Rust core.
+- [ ] **Remaining Phase 1 leaf engines** — `query.matches`, `update`,
+  `projection`, `expressions`, `diff`, `paths`. Next up: `query.matches`.
+
+### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
+
+Found by the parity test; both changed the **on-disk index-key bytes** for the
+affected values (immaterial for ephemeral test data, but note it):
+
+- **Date keys** used `int(total_seconds() * 1000)`, a float path that rounded
+  sub-second values off by up to 1ms vs the integer millis BSON actually stores
+  (and mongod sorts by). Now integer-exact.
+- **Regex keys** did `bytes(r.flags)`, which — because a BSON-round-tripped
+  `Regex.flags` is an *int* — produced N NUL bytes instead of the option string
+  (e.g. flags=10 → ten NULs instead of `"im"`). Now reconstructs the option
+  chars in pymongo's on-wire order (`ilmsux`).
+
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.

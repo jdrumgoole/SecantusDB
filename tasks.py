@@ -71,6 +71,52 @@ def fmt(c: Context) -> None:
     c.run("uv run ruff check --fix src tests", pty=True)
 
 
+# --- Rust core (Phase 1 of the Python -> Rust rewrite) --------------------
+# The Rust core lives at crates/secantus-core and is built as an abi3 Python
+# extension (`_secantus_core`) via maturin. It is currently additive: the
+# `secantus.sortkey` shim delegates to it only when SECANTUS_RUST_SORTKEY=1.
+# See tasks/rust-rewrite-plan.md and tasks/rust-rewrite-spike-findings.md.
+
+_RUST_CORE_DIR = "crates/secantus-core"
+
+
+@task(name="rust-test")
+def rust_test(c: Context) -> None:
+    """cargo fmt --check, clippy (warnings-as-errors), and unit tests."""
+    c.run(f"cd {_RUST_CORE_DIR} && cargo fmt --check", pty=True)
+    c.run(f"cd {_RUST_CORE_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
+    c.run(f"cd {_RUST_CORE_DIR} && cargo test", pty=True)
+
+
+@task(name="rust-build")
+def rust_build(c: Context) -> None:
+    """Build the abi3 wheel for the Rust core into target/wheels/."""
+    c.run("uv tool run maturin build --release", pty=True, env={"VIRTUAL_ENV": ""})
+
+
+@task(name="rust-parity")
+def rust_parity(c: Context) -> None:
+    """Build the Rust core and run the sortkey parity suite against it.
+
+    Builds the extension, then runs tests/test_rust_sortkey_parity.py in an
+    isolated interpreter (pymongo + the freshly built wheel) so it does not
+    require the WiredTiger C extension to be installed. This mirrors how the
+    parity gate runs in a WiredTiger-less environment; full CI also runs it
+    via the normal pytest suite once the project wheel is built.
+    """
+    import glob
+
+    c.run(f"cd {_RUST_CORE_DIR} && uv tool run maturin build --release", pty=True)
+    wheels = sorted(glob.glob(f"{_RUST_CORE_DIR}/target/wheels/*.whl"))
+    if not wheels:
+        raise SystemExit("no wheel produced by maturin")
+    c.run(
+        f"uv run --no-project --with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
+        "python -m pytest tests/test_rust_sortkey_parity.py -o addopts= -p no:cacheprovider -q",
+        pty=True,
+    )
+
+
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(
