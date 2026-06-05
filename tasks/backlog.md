@@ -271,25 +271,53 @@ never "remove Python."
 - [x] **Widen the pipeline: `$sort` + `$unwind`.** `$sort` ported via a faithful
   cross-type BSON comparator (`crates/secantus-core/src/order.rs`, mirroring
   `_bson_lt` / `_bson_type_rank` — type ranks, doc/array recursion, the unified
-  numeric type incl. NaN-is-equal). To stay strictly faithful the stage first
-  runs `order::is_sortable` over every sort-key value and defers the whole
-  pipeline to Python on Decimal128 (Python's Decimal-widening path) or exotic /
-  uncomparable BSON types (Python's `TypeError` → type-name fallback). Single +
-  multi-field, both directions, stable. `$unwind` ported (string + doc spec,
-  `includeArrayIndex`, `preserveNullAndEmptyArrays`, missing/null/non-array/empty
-  edges). **Refactor:** the pure comparator moved out of `storage.py` into a new
-  I/O-free `secantus.ordering` module (`sort_docs`/`_bson_lt`/`_bson_type_rank`/
-  `_SortKey`/`_to_decimal`; `storage` re-exports them) so `sort_docs` is
-  importable without the WiredTiger extension — matching the pure-operator-engine
-  layering. Parity: `tests/test_rust_aggregate_parity.py` (mixed-type sort corpus
-  + 4000-case fuzz with arrays / mixed-type fields).
-- [ ] **Widen the pipeline further** — the equality/hashing-heavy stages still
-  defer to Python: `$group`/`$sortByCount`/`$bucket` (group-key hashing where
-  `1 == 1.0 == True` collide + the accumulators, several of which use Python's
-  raise-on-mixed-type `<`/`+`), `$facet`, `$densify`. Storage-backed stages
-  (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge`) and non-deterministic
-  `$sample` defer until the storage layer moves into Rust (Phase 3+). After
-  widening: Phase 3+ (storage, wire/dispatch) per tasks/rust-rewrite-plan.md.
+  numeric type incl. NaN-is-equal). **Subtlety that drives the fidelity gate:**
+  `sort_docs` wraps keys in `_SortKey` whose `__eq__` is Python `==` (so
+  `False == 0`, `True == 1`, `1 == 1.0`) but whose `__lt__` is rank-based
+  `_bson_lt`; a tuple sort advances to the next field only when `==` is True, so
+  the comparator is *non-transitive* whenever `bool`/`NaN` mix with numbers (or
+  the `==`-False-but-`<`-both-False types — Binary-with-subtype / Timestamp /
+  Regex / Min/MaxKey appear). `order::is_sortable` therefore only green-lights
+  the types where Python `==` agrees with `cmp == Equal` (null / non-NaN numbers
+  / string / datetime / ObjectId / docs+arrays thereof) and defers the rest
+  (bool, NaN, Decimal128, Binary, Timestamp, Regex, Min/MaxKey, exotic) to
+  Python's Timsort. Single + multi-field, both directions, stable. `$unwind`
+  ported (string + doc spec, `includeArrayIndex`, `preserveNullAndEmptyArrays`,
+  missing/null/non-array/empty edges). **Refactor:** the pure comparator moved
+  out of `storage.py` into a new I/O-free `secantus.ordering` module
+  (`sort_docs`/`_bson_lt`/`_bson_type_rank`/`_SortKey`/`_to_decimal`; `storage`
+  re-exports them) so `sort_docs` is importable without the WiredTiger
+  extension — matching the pure-operator-engine layering. Parity:
+  `tests/test_rust_aggregate_parity.py` (mixed-type sort corpus + fuzz with
+  arrays / mixed-type fields).
+- [x] **Widen the pipeline: `$group` + `$sortByCount`.** Ported in
+  `crates/secantus-core/src/group.rs`. **Group-key bucketing** matches Python's
+  dict semantics — each `_id` value is canonicalised into a hashable `GKey`
+  (numbers + bool normalised through `numeric::NumVal`, so `1 == 1.0 == True`
+  collapse into one bucket; docs/arrays recurse via `_hashable`'s key-sorted
+  tuple) preserving first-seen `_id` and insertion order; key types we can't
+  canonicalise faithfully (Decimal128, NaN, Binary/Timestamp/Regex/Min/MaxKey,
+  exotic) defer. **Accumulators** reproduce Python's exact semantics:
+  `$sum`/`$count`/`$avg` (running int-vs-float via a `Num` enum; `$avg` is
+  always a double and the field stays *absent* when no non-null value is seen —
+  matching the pure code that never creates the bucket key; non-numeric operands
+  `TypeError` → defer); `$min`/`$max` (native `<`/`>` via `expressions::py_order`
+  — cross-type pairs that Python would raise on → defer, not guess; null is a
+  no-op that never "unsets"); `$first`/`$last`/`$push`; `$addToSet` (membership
+  via Python `==` / `expressions::py_eq`). `$sortByCount` = group + stable count-
+  descending sort. Validated across the in-repo curated + 5-seed fuzz **and** 8
+  extra local seeds (~1,650–1,730 group/sortByCount pipelines handled per 4000,
+  zero mismatches). `numeric::NumVal` gained `Eq + Hash`; `expressions::py_order`
+  /`py_eq` are now `pub`.
+- [ ] **Widen the pipeline further** — still deferring to Python: `$bucket`
+  (boundary placement + per-bucket accumulators), `$facet` (sub-pipelines),
+  `$densify`. Storage-backed stages (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/
+  `$merge`) and non-deterministic `$sample` defer until the storage layer moves
+  into Rust (Phase 3+). Also: `$sort` currently defers on bool / NaN sort keys
+  (the non-transitive `_SortKey` cases above) — reproducing Python's exact
+  Timsort comparison sequence for those would widen it, but the risk/reward is
+  poor. After widening: Phase 3+ (storage, wire/dispatch) per
+  tasks/rust-rewrite-plan.md.
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 

@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 
 use bson::Bson;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NumVal {
     Nan,
     Inf(i8), // +1 / -1

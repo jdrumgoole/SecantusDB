@@ -66,16 +66,16 @@ DOCS = [
     {"_id": 3, "a": 25, "b": "z", "nested": {"k": 9}},
 ]
 
-# A mixed-type corpus for $sort: numbers (int/float), strings, bools, null,
-# missing fields, nested docs/arrays — exercises order.cmp's cross-type ranks.
+# A mixed-type corpus for $sort: numbers (int/float), strings, null, missing
+# fields, nested docs/arrays — exercises order.cmp's cross-type ranks. (bool /
+# NaN are intentionally excluded: they defer to Python — see order.is_sortable.)
 SORT_DOCS = [
     {"_id": 1, "k": 3},
     {"_id": 2, "k": 1.5},
     {"_id": 3, "k": "apple"},
-    {"_id": 4, "k": True},
     {"_id": 5, "k": None},
     {"_id": 6},  # missing -> sorts as null
-    {"_id": 7, "k": 1},  # collides numerically with 1.0? no — distinct value 1
+    {"_id": 7, "k": 1},
     {"_id": 8, "k": [1, 2]},
     {"_id": 9, "k": {"x": 1}},
     {"_id": 10, "k": "Apple"},
@@ -110,10 +110,39 @@ CURATED = [
     [{"$unwind": {"path": "$tags", "includeArrayIndex": "ti"}}],
     [{"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": True}}],
     [{"$unwind": "$tags"}, {"$sort": {"tags": 1, "_id": 1}}],
+    # $group — accumulators + key collision + chaining
+    [{"$group": {"_id": "$b", "total": {"$sum": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": None, "n": {"$sum": 1}, "avg": {"$avg": "$a"}}}],
+    [{"$group": {"_id": "$b", "mn": {"$min": "$a"}, "mx": {"$max": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "f": {"$first": "$a"}, "l": {"$last": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "all": {"$push": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "set": {"$addToSet": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$nested.k", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
+    [{"$sortByCount": "$b"}],
+    [{"$unwind": "$tags"}, {"$group": {"_id": "$tags", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
     # stages that still defer (rust None -> skipped)
-    [{"$group": {"_id": "$b", "total": {"$sum": "$a"}}}],
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 30]}}],
     [{"$sample": {"size": 2}}],
 ]
+
+
+def test_group_numeric_key_collision():
+    # 1 (int), 1.0 (double), True must bucket together (first-seen _id wins),
+    # and stay distinct from 2.
+    docs = [
+        {"_id": 1, "k": 1, "v": 10},
+        {"_id": 2, "k": 1.0, "v": 5},
+        {"_id": 3, "k": True, "v": 2},
+        {"_id": 4, "k": 2, "v": 7},
+    ]
+    docs = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline = bson.decode(
+        bson.encode({"p": [{"$group": {"_id": "$k", "total": {"$sum": "$v"}, "n": {"$sum": 1}}}]})
+    )["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, "expected the Rust $group to handle numeric-key collision"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py}"
 
 
 @pytest.mark.parametrize("direction", [1, -1])
@@ -170,9 +199,11 @@ def _rand_stage(rng):
     kind = rng.choice(
         ["match", "limit", "skip", "count", "project_in", "project_ex",
          "project_comp", "addfields", "unset", "replacewith", "sort",
-         "sort_multi", "unwind", "unwind_idx"]
+         "sort_multi", "unwind", "unwind_idx", "group_count", "group_sum",
+         "group_minmax", "group_push", "group_set", "sortbycount"]
     )
     field = rng.choice(["a", "b", "c"])
+    f2 = rng.choice(["a", "b", "c"])
     if kind == "match":
         op = rng.choice(["$gt", "$gte", "$lt", "$lte", "$eq", "$ne"])
         return {"$match": {field: {op: rng.randint(0, 50)}}}
@@ -207,11 +238,24 @@ def _rand_stage(rng):
                 "preserveNullAndEmptyArrays": rng.choice([True, False]),
             }
         }
+    if kind == "group_count":
+        return {"$group": {"_id": "$" + field, "c": {"$sum": 1}}}
+    if kind == "group_sum":
+        return {"$group": {"_id": "$" + field, "s": {"$sum": "$" + f2}, "n": {"$sum": 1}}}
+    if kind == "group_minmax":
+        return {"$group": {"_id": "$" + field, "mn": {"$min": "$" + f2}, "mx": {"$max": "$" + f2}}}
+    if kind == "group_push":
+        return {"$group": {"_id": "$" + field, "p": {"$push": "$" + f2}, "av": {"$avg": "$" + f2}}}
+    if kind == "group_set":
+        return {"$group": {"_id": "$" + field, "set": {"$addToSet": "$" + f2}}}
+    if kind == "sortbycount":
+        return {"$sortByCount": "$" + field}
     return {"$replaceWith": {"only": "$" + field}}
 
 
-def test_pipeline_fuzz():
-    rng = random.Random(0xA66E)
+@pytest.mark.parametrize("seed", [0xA66E, 1, 2, 0xBEEF, 0xC0FFEE])
+def test_pipeline_fuzz(seed):
+    rng = random.Random(seed)
     handled = 0
     for _ in range(4000):
         docs = [_rand_doc(rng) for _ in range(rng.randint(0, 5))]

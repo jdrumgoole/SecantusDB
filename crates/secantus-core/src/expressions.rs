@@ -264,7 +264,7 @@ fn ord_op(arg: &Bson, ctx: &Ctx, pred: fn(Ordering) -> bool) -> R {
 /// Python ordering (`<`/`>`): `None` when the operands aren't orderable
 /// (different types, null, regex — Python raises `TypeError`, caught as false).
 /// `Err(Fallback)` for Decimal128 / arrays / docs / exotic (deferred).
-fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
+pub fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
     if matches!(a, Bson::Decimal128(_) | Bson::Array(_) | Bson::Document(_))
         || matches!(b, Bson::Decimal128(_) | Bson::Array(_) | Bson::Document(_))
         || is_exotic(a)

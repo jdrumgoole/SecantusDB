@@ -6,14 +6,16 @@
 //!
 //! Graceful whole-pipeline fallback: if any stage isn't ported (storage-backed
 //! `$lookup`/`$geoNear`/`$out`/`$merge`, non-deterministic `$sample`, or the
-//! equality-heavy `$group`/`$sortByCount`/`$bucket`/`$facet`/`$densify` still
-//! being worked on) or any inner expression defers, the entire `apply_pipeline`
-//! returns `Fallback` and the pure-Python pipeline runs instead.
+//! still-unported `$bucket`/`$facet`/`$densify`) or any inner expression defers,
+//! the entire `apply_pipeline` returns `Fallback` and the pure-Python pipeline
+//! runs instead.
 //!
 //! Handled stages: `$match`, `$limit`, `$skip`, `$count`, `$project`,
 //! `$addFields`/`$set`, `$unset`, `$replaceRoot`/`$replaceWith`, `$sort`
 //! (cross-type BSON ordering via `order::cmp`, deferring Decimal128 / exotic
-//! sort keys), `$unwind`.
+//! sort keys), `$unwind`, `$group`/`$sortByCount` (see `group.rs` — defers on
+//! the cross-type key / accumulator cases Python can't reproduce without
+//! raising).
 
 use bson::{Bson, Document};
 
@@ -21,7 +23,7 @@ use std::cmp::Ordering;
 
 use crate::collation::Collation;
 use crate::numeric::{as_int_like, int_to_bson};
-use crate::{expressions, order, paths, query};
+use crate::{expressions, group, order, paths, query};
 
 #[derive(Debug)]
 pub struct Fallback;
@@ -119,7 +121,9 @@ fn apply_stage(
         "$replaceWith" => map_docs(docs, |d| replace_root_one(d, spec, vars)),
         "$sort" => sort_stage(docs, spec),
         "$unwind" => unwind_stage(docs, spec),
-        // $group / $sortByCount / $bucket / storage-backed / $sample / … -> Python.
+        "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback),
+        "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback),
+        // $bucket / $facet / $densify / storage-backed / $sample / … -> Python.
         _ => Err(Fallback),
     }
 }
@@ -480,7 +484,7 @@ mod tests {
     fn unported_stage_defers() {
         assert!(apply_pipeline(
             vec![doc! {"a": 1}],
-            &[bson::bson!({"$group": {"_id": "$a"}})],
+            &[bson::bson!({"$bucket": {"groupBy": "$a", "boundaries": [0, 10]}})],
             &Document::new(),
             None
         )

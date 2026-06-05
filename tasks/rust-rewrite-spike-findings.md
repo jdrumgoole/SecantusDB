@@ -373,3 +373,43 @@ same pure-operator-engine layering as `query` / `update` / `expressions`.
 Validation: `cargo test` (51) + `tests/test_rust_aggregate_parity.py` (mixed-type
 sort corpus + 4000-case fuzz over arrays / mixed-type fields) green; full Rust
 parity sweep is **491 cases**.
+
+### Pipeline widening: `$group` + `$sortByCount`
+
+The hardest pipeline stage. `crates/secantus-core/src/group.rs` reproduces two
+delicate Python behaviours:
+
+* **Group-key bucketing = Python dict semantics.** `_stage_group` buckets on
+  `_hashable(evaluate(_id))` in a plain dict, so `1 == 1.0 == True == Decimal128("1")`
+  collapse into one bucket and embedded docs/arrays recurse (key-sorted tuples).
+  We canonicalise each key into a hashable `GKey` — numbers + bool normalised
+  through `numeric::NumVal` (which gained `Eq + Hash`), so the cross-type
+  collision is exact — preserving first-seen `_id` and group insertion order.
+  Key types we can't canonicalise without a fidelity risk (Decimal128, NaN,
+  Binary/Timestamp/Regex/Min/MaxKey, exotic) defer the whole stage.
+
+* **Accumulators reproduce Python's numeric + raise-on-mixed-type semantics.**
+  `$sum`/`$avg` accumulate through a `Num{Int(i128),Float(f64)}` enum mirroring
+  Python `+` (int stays int; any float widens; `$avg` is always a double and the
+  field stays *absent* when no non-null value arrives — the pure code never
+  creates the bucket key; non-numeric operands `TypeError` -> defer). `$min`/`$max`
+  reuse `expressions::py_order` (Python native `<`/`>`), so cross-type pairs that
+  Python would raise on defer rather than get guessed, and null is a no-op that
+  never "unsets". `$addToSet` membership uses `expressions::py_eq` (Python `==`,
+  incl. bool-as-int + structural). `py_order`/`py_eq` are now `pub`.
+
+`$sortByCount` = `$group` with `{$sum: 1}` then a stable count-descending sort
+(`list.sort(reverse=True)` keeps insertion order on ties).
+
+The `$sort` gate was tightened in the same pass: `sort_docs` wraps keys in
+`_SortKey` whose `__eq__` is Python `==` but whose `__lt__` is rank-based
+`_bson_lt`, and a tuple sort only advances to the next field when `==` is True —
+so the comparator is non-transitive whenever bool/NaN (or Binary-subtype /
+Timestamp / Regex / Min/MaxKey) mix with other values, and Rust's stable sort
+can't be guaranteed to match Python's Timsort. `order::is_sortable` now only
+green-lights the types where Python `==` agrees with `cmp == Equal` and defers
+the rest. (A fuzz seed shift surfaced this as a real `False`-vs-`0` divergence.)
+
+Validation: `cargo test` (57) + `tests/test_rust_aggregate_parity.py` (curated +
+5-seed fuzz) green, plus 8 extra local seeds with ~1,650-1,730 group/sortByCount
+pipelines handled each and zero mismatches; full Rust parity sweep **501 cases**.

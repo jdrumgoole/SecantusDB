@@ -38,27 +38,32 @@ fn type_rank(v: &Bson) -> u8 {
     }
 }
 
-/// True if every value in `v` is one whose ordering we reproduce exactly.
-/// Decimal128 (Python's Decimal-widening path) and exotic BSON types defer the
-/// whole `$sort` stage to pure Python.
+/// True if every value in `v` is one we can sort *faithfully* — meaning Python
+/// `==` agrees with `cmp(...) == Equal` for it.
+///
+/// This gate is what makes the multi-field comparator correct. `sort_docs`
+/// wraps keys in `_SortKey` whose `__eq__` is Python `==` but whose `__lt__` is
+/// rank-based `_bson_lt`; a tuple sort advances to the next field only when `==`
+/// is True. For the types below the two relations coincide, so the comparator
+/// is a consistent total preorder and a stable sort reproduces Python exactly.
+/// The types where they *diverge* — `bool` (`False == 0`, `True == 1`, but a
+/// different BSON rank), `NaN` (`nan != nan`), and the `==`-False-but-`<`-both-
+/// False cases (Binary w/ subtype, Timestamp, Regex, Min/MaxKey) — make the
+/// comparator non-transitive, so we defer the whole `$sort` to pure Python
+/// rather than risk diverging from its Timsort. Decimal128 and exotic types
+/// defer too.
 pub fn is_sortable(v: &Bson) -> bool {
     match v {
-        Bson::MinKey
-        | Bson::MaxKey
-        | Bson::Null
+        Bson::Null
         | Bson::Int32(_)
         | Bson::Int64(_)
-        | Bson::Double(_)
         | Bson::String(_)
-        | Bson::Binary(_)
         | Bson::ObjectId(_)
-        | Bson::Boolean(_)
-        | Bson::DateTime(_)
-        | Bson::Timestamp(_)
-        | Bson::RegularExpression(_) => true,
+        | Bson::DateTime(_) => true,
+        Bson::Double(d) => !d.is_nan(),
         Bson::Document(d) => d.values().all(is_sortable),
         Bson::Array(a) => a.iter().all(is_sortable),
-        // Decimal128, Undefined, JavaScript, Symbol, DbPointer, … -> defer.
+        // bool, NaN, Binary, Timestamp, Regex, Min/MaxKey, Decimal128, exotic.
         _ => false,
     }
 }
@@ -156,7 +161,11 @@ mod tests {
 
     #[test]
     fn sortable_gating() {
-        assert!(is_sortable(&b(bson!({"a": [1, "x", true]}))));
+        assert!(is_sortable(&b(bson!({"a": [1, "x", {"n": 2}]}))));
+        // bool / NaN / Decimal128 defer (their Python `==` diverges from cmp).
+        assert!(!is_sortable(&b(bson!(true))));
+        assert!(!is_sortable(&b(bson!(f64::NAN))));
+        assert!(!is_sortable(&b(bson!([1, "x", true]))));
         assert!(!is_sortable(&Bson::Decimal128("1.5".parse().unwrap())));
         assert!(!is_sortable(&b(
             bson!({"a": Bson::Decimal128("1".parse().unwrap())})

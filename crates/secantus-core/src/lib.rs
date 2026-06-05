@@ -25,6 +25,7 @@ mod aggregate;
 mod collation;
 mod diff;
 mod expressions;
+mod group;
 mod numeric;
 mod order;
 mod paths;
