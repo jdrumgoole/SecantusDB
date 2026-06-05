@@ -4,18 +4,19 @@
 //! `expressions::evaluate`, the `paths` helpers) so a pure pipeline runs end to
 //! end in Rust without re-entering Python per stage / per doc.
 //!
-//! Graceful whole-pipeline fallback: if any stage isn't ported (storage-backed
-//! `$lookup`/`$geoNear`/`$out`/`$merge`, non-deterministic `$sample`, or the
-//! still-unported `$densify`) or any inner expression defers, the entire
-//! `apply_pipeline` returns `Fallback` and the pure-Python pipeline runs
-//! instead.
+//! Graceful whole-pipeline fallback: if any stage isn't ported (the storage-
+//! backed `$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge`, non-deterministic
+//! `$sample`, or date-unit `$densify`) or any inner expression defers, the
+//! entire `apply_pipeline` returns `Fallback` and the pure-Python pipeline runs
+//! instead. Every pipeline stage that doesn't touch `Storage` is now ported.
 //!
 //! Handled stages: `$match`, `$limit`, `$skip`, `$count`, `$project`,
 //! `$addFields`/`$set`, `$unset`, `$replaceRoot`/`$replaceWith`, `$sort`
 //! (cross-type BSON ordering via `order::cmp`, deferring Decimal128 / exotic
 //! sort keys), `$unwind`, `$group`/`$sortByCount`/`$bucket` (see `group.rs` —
 //! defers on the cross-type key / accumulator cases Python can't reproduce
-//! without raising), and `$facet` (recursive sub-pipelines).
+//! without raising), `$facet` (recursive sub-pipelines), and `$densify` (numeric
+//! path; date-unit densify defers — see `densify.rs`).
 
 use bson::{Bson, Document};
 
@@ -23,7 +24,7 @@ use std::cmp::Ordering;
 
 use crate::collation::Collation;
 use crate::numeric::{as_int_like, int_to_bson};
-use crate::{expressions, group, order, paths, query};
+use crate::{densify, expressions, group, order, paths, query};
 
 #[derive(Debug)]
 pub struct Fallback;
@@ -125,7 +126,8 @@ fn apply_stage(
         "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$bucket" => group::bucket_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$facet" => facet_stage(spec, docs, vars, coll),
-        // $densify / storage-backed / $sample / … -> Python.
+        "$densify" => densify::densify_stage(spec, &docs).map_err(|_| Fallback),
+        // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
         _ => Err(Fallback),
     }
 }
@@ -509,9 +511,10 @@ mod tests {
 
     #[test]
     fn unported_stage_defers() {
+        // $sample is non-deterministic -> always defers to Python.
         assert!(apply_pipeline(
             vec![doc! {"a": 1}],
-            &[bson::bson!({"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}})],
+            &[bson::bson!({"$sample": {"size": 1}})],
             &Document::new(),
             None
         )

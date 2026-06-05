@@ -143,9 +143,60 @@ CURATED = [
             }
         }
     ],
+    # $densify — numeric (handled) + date-unit (defers)
+    [{"$densify": {"field": "a", "range": {"step": 5, "bounds": "full"}}}],
+    [{"$densify": {"field": "a", "range": {"step": 10, "bounds": [0, 50]}}}],
+    [{"$densify": {"field": "a", "range": {"step": 1, "unit": "day", "bounds": "full"}}}],
     # stages that still defer (rust None -> skipped)
     [{"$sample": {"size": 2}}],
 ]
+
+
+def _densify_docs(rng):
+    """Docs with an all-numeric densify field `v` (+ optional partition `g`)."""
+    n = rng.randint(0, 5)
+    docs = []
+    for i in range(n):
+        v = rng.choice([rng.randint(0, 30), float(rng.randint(0, 30)), rng.randint(0, 30) + 0.5])
+        d = {"_id": i, "v": v}
+        if rng.random() < 0.5:
+            d["g"] = rng.choice(["p", "q"])
+        docs.append(d)
+    return docs
+
+
+def _densify_spec(rng):
+    step = rng.choice([1, 2, 5, 10, 2.5])
+    rng_spec = {"step": step}
+    if rng.random() < 0.5:
+        lo = rng.randint(0, 10)
+        rng_spec["bounds"] = [lo, lo + rng.choice([5, 10, 20])]
+    else:
+        rng_spec["bounds"] = "full"
+    spec = {"field": "v", "range": rng_spec}
+    if rng.random() < 0.4:
+        spec["partitionByFields"] = ["g"]
+    return {"$densify": spec}
+
+
+def test_densify_fuzz():
+    rng = random.Random(0xDE251F)
+    handled = 0
+    for _ in range(4000):
+        docs = _densify_docs(rng)
+        pipeline = [_densify_spec(rng)]
+        docs = bson.decode(bson.encode({"d": docs}))["d"]
+        pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
+        rust = _rust_pipeline(docs, pipeline)
+        if rust is None:
+            continue
+        try:
+            py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+        except Exception:
+            pytest.fail(f"rust={rust} but pure raised; pipeline={pipeline} docs={docs}")
+        handled += 1
+        assert rust == py, f"rust={rust} pure={py} pipeline={pipeline} docs={docs}"
+    assert handled > 500, f"expected many handled densify pipelines, only {handled}"
 
 
 def test_group_numeric_key_collision():

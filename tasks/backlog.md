@@ -325,14 +325,32 @@ never "remove Python."
   Validated across curated cases + the 5-seed in-repo fuzz **and** 8 extra local
   seeds (~500–580 `$bucket` and ~370–410 `$facet` pipelines handled per 5000,
   zero mismatches).
-- [ ] **Widen the pipeline further** — still deferring to Python: `$densify`.
-  Storage-backed stages (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge`) and
-  non-deterministic `$sample` defer until the storage layer moves into Rust
-  (Phase 3+). Also: `$sort` currently defers on bool / NaN sort keys (the
-  non-transitive `_SortKey` cases above) — reproducing Python's exact Timsort
-  comparison sequence for those would widen it, but the risk/reward is poor.
-  After widening: Phase 3+ (storage, wire/dispatch) per
-  tasks/rust-rewrite-plan.md.
+- [x] **Widen the pipeline: `$densify` (numeric path).** `densify::densify_stage`
+  ports the numeric densify — partition the docs (Python dict semantics via the
+  shared `group::GKey`), sort each partition by the numeric field, and fill every
+  multiple of `step` strictly between the bounds (`"full"`/`"partition"` = the
+  partition's observed min/max; explicit `[lo, hi]`). The cursor arithmetic
+  mirrors Python exactly (a `Num{Int,Float}` enum so `int + int` stays int and
+  widens to f64 once a float enters; `_densify_canon` collapses an
+  integer-valued float filler back to an int), and the `existing_values`
+  membership reproduces the set's `1 == 1.0 == True` collision via
+  `numeric::NumVal`. The no-input-docs-with-explicit-bounds case and the
+  "originals at/beyond `hi`" tail are reproduced. **Defers** to Python: any
+  `range.unit` (date densify — fixed-duration `timedelta` *and* variable-length
+  `relativedelta` month/quarter/year), non-numeric field values / bounds /
+  partition keys (Python's `sorted` / comparisons would raise), and explicit
+  bounds that would emit > 1M fillers (Python raises). `numeric::from_int` /
+  `from_f64` and `group::gkey`/`GKey` are now exposed. Validated across curated
+  cases + a dedicated 4000-case densify fuzz in-repo **and** 8 extra local seeds
+  (5000 densify pipelines each, all handled, zero mismatches).
+- [ ] **Pipeline: only the storage-backed stages remain.** Every pipeline stage
+  that doesn't touch `Storage` is now ported. Still deferring to Python:
+  `$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge` (read/write collections via
+  `ctx.storage`), non-deterministic `$sample`, and date-unit `$densify`. These
+  wait for Phase 3+ (storage / wire / dispatch into Rust) per
+  tasks/rust-rewrite-plan.md. Also still open: `$sort` defers on bool / NaN sort
+  keys (the non-transitive `_SortKey` cases above) — reproducing Python's exact
+  Timsort comparison sequence would widen it, but the risk/reward is poor.
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 

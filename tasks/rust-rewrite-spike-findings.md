@@ -445,3 +445,36 @@ The pure-Python pipeline stages now ported to Rust: `$match`, `$limit`, `$skip`,
 `$facet`. Remaining: `$densify` and the storage-backed stages
 (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge`/`$sample`), which wait for
 the storage layer to move into Rust (Phase 3+).
+
+### Pipeline widening: `$densify` (numeric) — pipeline reaches the storage boundary
+
+`densify::densify_stage` ports the numeric `$densify`: partition the docs (Python
+dict semantics via the shared `group::GKey`), sort each partition by the numeric
+field, then fill every multiple of `step` strictly between the bounds
+(`"full"`/`"partition"` = the partition's observed min/max; explicit `[lo, hi]`).
+The cursor arithmetic mirrors Python exactly — a `Num{Int(i128),Float(f64)}`
+enum so `int + int` stays int and widens to f64 once a float enters, and
+`_densify_canon` collapses an integer-valued float filler back to an int — and
+the `existing_values` membership reproduces the set's `1 == 1.0 == True`
+collision through `numeric::NumVal`. The no-input-docs-with-explicit-bounds case
+and the "originals at/beyond `hi`" tail are reproduced too.
+
+Defers to Python: any `range.unit` (date densify — both fixed-duration
+`timedelta` and variable-length `relativedelta` month/quarter/year), non-numeric
+field values / bounds / partition keys (Python's `sorted` / `<` would raise),
+and explicit bounds that would emit > 1M fillers (Python raises there).
+`numeric::from_int`/`from_f64` and `group::gkey`/`GKey` were exposed for reuse.
+
+Validation: `cargo test` (62) + `tests/test_rust_aggregate_parity.py` (curated +
+a dedicated 4000-case densify fuzz) green, plus 8 extra local seeds (5000
+densify pipelines each, all handled, zero mismatches). Full Rust parity sweep
+**512 cases**.
+
+**Phase 2 milestone:** every aggregation-pipeline stage that doesn't touch
+`Storage` is now ported to Rust — `$match`, `$limit`, `$skip`, `$count`,
+`$project`, `$addFields`/`$set`, `$unset`, `$replaceRoot`/`$replaceWith`,
+`$sort`, `$unwind`, `$group`, `$sortByCount`, `$bucket`, `$facet`, `$densify`.
+The remaining stages (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge` and
+non-deterministic `$sample`) all need the storage layer, so the pipeline port
+has reached its natural boundary; the next frontier is Phase 3 (moving storage /
+wire / dispatch into Rust so the byte seam shifts outward and these light up).

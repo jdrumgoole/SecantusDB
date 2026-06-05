@@ -35,8 +35,9 @@ fn eval(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
 }
 
 /// Canonical, hashable group-key — mirrors `_hashable` + Python dict equality.
+/// Also used by `$densify` for partition keys (same dict semantics).
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum GKey {
+pub enum GKey {
     Null,
     Num(NumVal), // int / int64 / double / bool, normalised (1 == 1.0 == True)
     Str(String),
@@ -48,7 +49,7 @@ enum GKey {
 
 /// Canonicalise a key value, or `Err(())` for a type we don't bucket faithfully
 /// (Decimal128, NaN, Binary/Timestamp/Regex/Min/MaxKey, exotic).
-fn gkey(v: &Bson) -> R<GKey> {
+pub fn gkey(v: &Bson) -> R<GKey> {
     match v {
         Bson::Null => Ok(GKey::Null),
         Bson::Boolean(b) => Ok(GKey::Num(

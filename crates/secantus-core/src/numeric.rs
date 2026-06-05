@@ -78,7 +78,8 @@ fn normalize(digits: &mut Vec<u8>, exp: &mut i64) {
     }
 }
 
-fn from_int(n: i128) -> NumVal {
+/// `NumVal` for a signed integer (exposed for the densify cursor).
+pub fn from_int(n: i128) -> NumVal {
     if n == 0 {
         return NumVal::Zero;
     }
@@ -90,7 +91,8 @@ fn from_int(n: i128) -> NumVal {
     NumVal::Finite { sign, digits, exp }
 }
 
-fn from_f64(d: f64) -> NumVal {
+/// `NumVal` for an f64 (exposed for the densify cursor).
+pub fn from_f64(d: f64) -> NumVal {
     if d.is_nan() {
         return NumVal::Nan;
     }

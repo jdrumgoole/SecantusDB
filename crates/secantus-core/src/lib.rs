@@ -23,6 +23,7 @@ use pyo3::types::PyBytes;
 
 mod aggregate;
 mod collation;
+mod densify;
 mod diff;
 mod expressions;
 mod group;
