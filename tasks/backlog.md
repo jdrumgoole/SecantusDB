@@ -197,10 +197,15 @@ never "remove Python."
 - [x] **Date arithmetic** — `$dateAdd`/`$dateSubtract`/`$dateDiff`/`$dateTrunc`
   ported via dependency-free civil-date math (`days_from_civil` inverse +
   `days_in_month`), UTC, bounded to Python's datetime range (out-of-range
-  defers). The 8000-case date fuzz caught two real Python-semantics quirks:
+  defers). The 8000-case date fuzz caught three real Python-semantics quirks:
   `$dateDiff second` truncates toward zero (`int(total_seconds())`) while
-  hour/minute floor (`// n`), and `$dateTrunc` truncates the *field* (keeping
-  higher fields) not the total-since-midnight.
+  hour/minute floor (`// n`); `$dateTrunc` truncates the *field* (keeping
+  higher fields) not the total-since-midnight; and the sub-day `$dateDiff`
+  units route through Python's lossy `timedelta.total_seconds()`
+  (`total_microseconds / 10**6`, an int/int correctly-rounded divide) — Rust
+  reproduces the same single-rounding float path, guarded to `|total_us| <=
+  2**53` (where the `as f64` conversion is exact) and deferring extreme dates
+  to Python so the double-rounding can't diverge.
 - [ ] **Remaining expression operators are principled defers** (cannot be
   reproduced without a fidelity risk; all run pure-Python): regex
   (`$regexMatch`/`$regexFind`/`$regexFindAll` — Python `re`);
@@ -219,17 +224,18 @@ never "remove Python."
   `$dateToParts`, via a dependency-free civil-date algorithm); a safe subset of
   conversions (`$toInt`/`$toDouble`/`$toBool`/`$toString` for numbers/bools/
   strings); exactly-deterministic math (`$abs`/`$floor`/`$ceil`/`$sqrt`); and
-  `$range`/`$strLenBytes`/`$arrayToObject`. Remaining whole-call fallbacks to
-  widen where faithful: the heavier date ops (`$dateToString`/`$dateAdd`/
-  `$dateDiff`/`$dateTrunc`/`$dateFromString` — timezones, `strftime`, month
-  arithmetic); `$round`/`$pow`/`$trunc` (rounding mode) and transcendental math
+  `$range`/`$strLenBytes`/`$arrayToObject`; and the date-arithmetic ops
+  `$dateAdd`/`$dateSubtract`/`$dateDiff`/`$dateTrunc` (UTC, civil-date math —
+  see the "Date arithmetic" item). Remaining whole-call fallbacks to widen
+  where faithful: `$dateToString`/`$dateFromString` (timezones, `strftime`/
+  `strptime`); `$round`/`$pow`/`$trunc` (rounding mode) and transcendental math
   (`$exp`/`$ln`/`$log`/`$log10` — last-ULP divergence risk vs Python's libm);
   the conversion edges deferred above (Decimal128, string→number parsing, float
   `str()`, `$convert`/`$toDecimal`); `$sortArray` (uses Python `sorted()`
-  ordering/stability + raises on mixed types); `$round`/`$pow`/`$trunc` +
-  transcendentals; and non-ASCII case / default-whitespace `$trim` (defer for
-  Unicode-fidelity safety). Regex ops (`$regexMatch`/…) need Python `re`. Done
-  recently: string index/byte ops, `$getField`/`$setField`, `$zip`.
+  ordering/stability + raises on mixed types); and non-ASCII case /
+  default-whitespace `$trim` (defer for Unicode-fidelity safety). Regex ops
+  (`$regexMatch`/…) need Python `re`. Done recently: string index/byte ops,
+  `$getField`/`$setField`, `$zip`.
 - [x] **Phase 1, leaf engine #5: `projection.apply_projection`** — inclusion /
   exclusion / `$slice` / `$elemMatch` projection shapes ported to Rust
   (`crates/secantus-core/src/projection.rs`). `secantus.projection` delegates
@@ -247,10 +253,29 @@ never "remove Python."
   `paths.rs` alongside the read helpers; `update.rs` keeps a thin `Fallback`-
   mapping wrapper. (Note for the eventual default-flip: same `bson::Document`
   field-order question as the update engine applies to projection/diff outputs.)
-- [ ] **All six leaf engines are ported.** Remaining Phase-1 work is `collation`
-  (unlocks the collation fallbacks across sortkey/query) and *widening* the
-  already-ported engines (see the per-engine "widen" items above). After that,
-  Phase 2+ (aggregate, storage, wire/dispatch) per tasks/rust-rewrite-plan.md.
+- [x] **All six leaf engines are ported** (`collation` landed — see the
+  collation items above). Remaining Phase-1 work is *widening* the
+  already-ported engines (see the per-engine "widen" items above).
+- [x] **Phase 2, aggregation pipeline — first slice.** `apply_pipeline` ported
+  to Rust (`crates/secantus-core/src/aggregate.rs`) behind a list-of-docs byte
+  seam (`{"d": [...]}` / `{"p": [...]}`), reusing the ported leaf engines
+  (`query::matches`, `expressions::evaluate`, the `paths` helpers) so a pure
+  pipeline runs end to end in Rust without re-entering Python per stage / per
+  doc. Stages handled: `$match`, `$limit`, `$skip`, `$count`, `$project`
+  (inclusion / exclusion / computed, mirroring `_project_one`'s mapping-only
+  `_path_present`), `$addFields`/`$set`, `$unset`, `$replaceRoot`/`$replaceWith`.
+  `secantus.aggregate.apply_pipeline` delegates when `SECANTUS_RUST_AGGREGATE=1`.
+  **Graceful whole-pipeline fallback:** any unported stage or any deferred inner
+  expression makes `apply_pipeline` return `None` and the pure-Python pipeline
+  runs. Parity: `tests/test_rust_aggregate_parity.py` (curated + 4000-case fuzz).
+- [ ] **Widen the Rust aggregation pipeline** — the comparison/equality-heavy
+  stages still defer to Python: `$sort` (needs faithful `_bson_lt` cross-type
+  ordering), `$group`/`$sortByCount`/`$bucket` (group-key hashing where
+  `1 == 1.0 == True` collide + the accumulators), `$unwind`, `$facet`,
+  `$densify`. Storage-backed stages (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/
+  `$merge`) and non-deterministic `$sample` defer until the storage layer moves
+  into Rust (Phase 3+). After widening: Phase 3+ (storage, wire/dispatch) per
+  tasks/rust-rewrite-plan.md.
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 

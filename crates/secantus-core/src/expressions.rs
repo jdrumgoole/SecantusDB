@@ -1241,15 +1241,30 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
             ((ey - sy) * 4 + (eq - sq)) as i128
         }
         "month" => ((ey - sy) * 12 + (emo - smo) - i64::from(ed < sd)) as i128,
-        // Python uses `delta.days` / `total_seconds() // n` (floor) for
-        // day/week/hour/minute, but `int(total_seconds())` (truncate toward
-        // zero) for second and `int(total_seconds()*1000)` (== dms) for ms.
+        // day/week use the integer `timedelta.days` (floor). The sub-day units
+        // go through Python's lossy `timedelta.total_seconds()`, which is
+        // `total_microseconds / 10**6` — an int/int *correctly-rounded* true
+        // division — then `// n` (floor) for hour/minute and `int(...)`
+        // (truncate toward zero) for second/ms. We reproduce that float path so
+        // the last-digit rounding matches. The `total_us as f64` conversion is
+        // exact only while `|total_us| <= 2**53`; beyond that a second rounding
+        // could diverge from CPython's single correctly-rounded int/int divide,
+        // so we defer extreme dates to Python.
         "day" => dms.div_euclid(86_400_000),
         "week" => dms.div_euclid(86_400_000).div_euclid(7),
-        "hour" => dms.div_euclid(3_600_000),
-        "minute" => dms.div_euclid(60_000),
-        "second" => dms / 1000, // truncate toward zero
-        "millisecond" => dms,
+        "hour" | "minute" | "second" | "millisecond" => {
+            let total_us = dms * 1000;
+            if total_us.unsigned_abs() > (1u128 << 53) {
+                return Err(Fallback);
+            }
+            let ts = total_us as f64 / 1_000_000.0;
+            match unit.as_str() {
+                "hour" => (ts / 3600.0).floor() as i128,
+                "minute" => (ts / 60.0).floor() as i128,
+                "second" => ts.trunc() as i128,
+                _ => (ts * 1000.0).trunc() as i128, // millisecond
+            }
+        }
         _ => return Err(Fallback),
     };
     int_to_bson(value).ok_or(Fallback)

@@ -302,3 +302,46 @@ instead of reading their own env var. Selection is process-wide:
 `python` is the default; `rust` transparently falls back to Python for any
 component not ported (and warns once if the extension is missing). Unit-tested
 WT-independently by `tests/test_engine.py`.
+
+---
+
+## Phase 2 — aggregation pipeline (first slice)
+
+With all six leaf engines ported, the pipeline is the first composite engine.
+`crates/secantus-core/src/aggregate.rs` ports `apply_pipeline` behind a
+**list-of-docs byte seam** (`{"d": [docs]}` in, `{"d": [docs]}` out; the
+pipeline arrives as `{"p": [stages]}`) and drives the already-ported leaf
+engines directly in Rust — `query::matches` for `$match`, `expressions::evaluate`
+for computed fields, the `paths` write helpers for `$set`/`$unset`/`$project`.
+A pure pipeline therefore runs end to end in Rust without re-entering Python per
+stage or per document.
+
+Stages handled this slice: `$match`, `$limit`, `$skip`, `$count`, `$project`
+(inclusion / exclusion / computed — mirroring `_project_one`, including the
+mapping-only `_path_present` that does *not* walk into arrays),
+`$addFields`/`$set`, `$unset`, `$replaceRoot`/`$replaceWith`.
+
+**Graceful whole-pipeline fallback** keeps it strictly correct: any unported
+stage (`$sort`/`$group`/`$unwind`/`$facet`/storage-backed/`$sample`/…) or any
+deferred inner expression makes `apply_pipeline` return `Fallback` → `None` at
+the seam, and the authoritative pure-Python pipeline runs instead.
+`secantus.aggregate.apply_pipeline` delegates when `SECANTUS_RUST_AGGREGATE=1`.
+
+The comparison/equality-heavy stages are the next widening target and each
+needs faithful reproduction of a Python quirk: `$sort` the `_bson_lt` cross-type
+ordering, `$group`/`$sortByCount`/`$bucket` the group-key collision where
+`1 == 1.0 == True` hash together (plus the accumulators), `$unwind` the
+missing/non-array/empty-array edge cases. Storage-backed stages
+(`$lookup`/`$geoNear`/`$out`/`$merge`) and non-deterministic `$sample` wait for
+the storage layer to move into Rust (Phase 3+).
+
+Validation: `cargo test` (45) + `tests/test_rust_aggregate_parity.py` (curated +
+4000-case pipeline fuzz) green; the full Rust parity sweep is **484 cases**.
+
+A `$dateDiff` fidelity fix rode along: the sub-day units (`hour`/`minute`/
+`second`/`millisecond`) route through Python's lossy
+`timedelta.total_seconds()` = `total_microseconds / 10**6` (an int/int
+*correctly-rounded* true division), then `// n` (floor) or `int(...)` (trunc).
+Rust reproduces the single-rounding float path, guarded to `|total_us| <= 2**53`
+so the `as f64` conversion is exact (matching CPython's single rounding) and
+deferring extreme dates to Python where double-rounding could diverge.

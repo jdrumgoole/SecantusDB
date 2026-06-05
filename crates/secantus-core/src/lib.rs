@@ -16,11 +16,12 @@
 // not our code. Suppress at the crate level until we move to a PyO3 that fixed it.
 #![allow(clippy::useless_conversion)]
 
-use bson::Document;
+use bson::{Bson, Document};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod aggregate;
 mod collation;
 mod diff;
 mod expressions;
@@ -216,6 +217,57 @@ fn compute_update_description(
     }
 }
 
+/// `aggregate.apply_pipeline(docs, pipeline, vars, collation)` over BSON bytes.
+/// `docs_bytes` is `bson.encode({"d": [<doc>, ...]})` and `pipeline_bytes` is
+/// `bson.encode({"p": [<stage>, ...]})`; the result is `{"d": [...]}` bytes, or
+/// `None` to fall back to the pure-Python pipeline (any stage not ported, or an
+/// inner expression that defers).
+#[pyfunction]
+fn apply_pipeline(
+    py: Python<'_>,
+    docs_bytes: &[u8],
+    pipeline_bytes: &[u8],
+    vars_bytes: &[u8],
+    collation_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let docs_wrap: Document = bson::from_slice(docs_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
+    let pipe_wrap: Document = bson::from_slice(pipeline_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid pipeline BSON: {e}")))?;
+    let vars: Document = bson::from_slice(vars_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
+    let coll = parse_collation(collation_bytes)?;
+
+    let Some(Bson::Array(docs_arr)) = docs_wrap.get("d") else {
+        return Err(PyValueError::new_err("docs wrapper missing array 'd'"));
+    };
+    let mut docs: Vec<Document> = Vec::with_capacity(docs_arr.len());
+    for d in docs_arr {
+        match d {
+            Bson::Document(doc) => docs.push(doc.clone()),
+            _ => return Ok(None), // non-document input element -> defer
+        }
+    }
+    let Some(Bson::Array(pipeline)) = pipe_wrap.get("p") else {
+        return Err(PyValueError::new_err("pipeline wrapper missing array 'p'"));
+    };
+
+    match aggregate::apply_pipeline(docs, pipeline, &vars, coll.as_ref()) {
+        Ok(out) => {
+            let mut wrap = Document::new();
+            wrap.insert(
+                "d".to_string(),
+                Bson::Array(out.into_iter().map(Bson::Document).collect()),
+            );
+            let mut buf = Vec::new();
+            wrap.to_writer(&mut buf)
+                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
+            Ok(Some(to_pybytes(py, buf)))
+        }
+        Err(aggregate::Fallback) => Ok(None),
+    }
+}
+
 #[pymodule]
 fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
@@ -230,5 +282,6 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(evaluate, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection, m)?)?;
     m.add_function(wrap_pyfunction!(compute_update_description, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_pipeline, m)?)?;
     Ok(())
 }

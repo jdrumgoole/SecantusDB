@@ -52,7 +52,15 @@ except ImportError:
 
 # The components the Rust core can accelerate (each pure-Python module has a
 # shim that consults ``enabled(<component>)``).
-COMPONENTS = ("sortkey", "query", "update", "expressions", "projection", "diff")
+COMPONENTS = (
+    "sortkey",
+    "query",
+    "update",
+    "expressions",
+    "projection",
+    "diff",
+    "aggregate",
+)
 
 _VALID = ("python", "rust", "auto")
 
