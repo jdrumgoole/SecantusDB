@@ -133,9 +133,31 @@ maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
   matcher re-encodes doc+query per call at the seam; the real win needs the doc
   to already be bytes at the call site (it is, in storage — wire that through
   when the boundary moves outward).
-- [ ] **Remaining Phase 1 leaf engines** — `update`, `projection`,
-  `expressions`, `diff`, `paths`. (`expressions` unlocks `$expr` in the
-  matcher; `collation` unlocks the collation fallbacks.)
+- [x] **Phase 1, leaf engine #3: `update.apply_update`** — the common
+  deterministic operators ported to Rust (`crates/secantus-core/src/update.rs`,
+  with the `secantus.paths` dotted-path helpers): replacement-style, `$set`,
+  `$setOnInsert`, `$unset`, `$inc`, `$mul`, `$push`, `$pop`, `$rename`, plus
+  `_id` immutability. `secantus.update.apply_update` delegates when
+  `SECANTUS_RUST_UPDATE=1`. Returns `None` (→ pure-Python fallback) for pipeline
+  (array) updates, positional ops / array filters, `$currentDate`,
+  `$min`/`$max`/`$pull`/`$addToSet`/`$bit`, Decimal128/non-numeric arithmetic,
+  and every error condition (so the exact `UpdateError`/`PathError` is raised by
+  Python). Parity pinned by `tests/test_rust_update_parity.py` (curated +
+  6000-case fuzz).
+- [ ] **Widen the Rust update matcher** to cover current fallbacks where
+  faithful: `$min`/`$max` (Python `<` cross-type / raise semantics),
+  `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and structural),
+  `$bit`. Each needs care to match Python's exact semantics.
+- [ ] **BEFORE flipping `update` default to Rust: verify field-order on $set of
+  an existing key.** Python `set_path` assigns in place (preserves dict position
+  of an existing field); confirm `bson::Document::insert` on an existing key
+  also preserves position rather than moving it to the end — otherwise a
+  flipped default would reorder fields vs mongod. (Parity test uses dict `==`,
+  which is order-insensitive, so it wouldn't catch this; the full WiredTiger
+  conformance suite would.)
+- [ ] **Remaining Phase 1 leaf engines** — `projection`, `expressions`, `diff`.
+  (`expressions` unlocks `$expr` in the matcher and pipeline updates; `collation`
+  unlocks the collation fallbacks across sortkey/query.)
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 

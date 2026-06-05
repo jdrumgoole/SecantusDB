@@ -174,3 +174,40 @@ behaviour once those two were right.
 
 Next leaf engine: `update.apply_update` (or `expressions`, which would unlock
 `$expr` in the matcher and remove that fallback).
+
+---
+
+## Phase 1 — `update.apply_update` ported (common operators): **DONE**
+
+Third leaf engine. `crates/secantus-core/src/update.rs` ports the deterministic,
+high-value operators behind the byte seam (doc + update cross as BSON bytes,
+result returned as bytes), reproducing `secantus.paths`' dotted-path
+create/set/unset/get semantics (incl. array-index growth and the
+list-growth cap). Same graceful-fallback design: `secantus.update.apply_update`
+delegates when `SECANTUS_RUST_UPDATE=1` and uses the Rust result unless it's
+`None`.
+
+Handled in Rust: replacement-style updates (with `_id` preservation), `$set`,
+`$setOnInsert` (upsert-gated), `$unset`, `$inc`, `$mul`, `$push`, `$pop`,
+`$rename`, and `_id` immutability. Deferred to Python: pipeline (array) updates,
+positional operators (`$`/`$[]`/`$[id]`) + array filters, `$currentDate`
+(non-deterministic), `$min`/`$max`/`$pull`/`$addToSet`/`$bit` (Python
+comparison/`==` semantics), Decimal128/non-numeric arithmetic, and **every error
+condition** — Rust returns `None` so the pure-Python path raises the exact
+`UpdateError`/`PathError`.
+
+The arithmetic was the careful part: `$inc`/`$mul` reproduce Python's int-subclass
+bool handling (True→1), int/float promotion, and — crucially — the result's BSON
+width is chosen by *magnitude* (int32 if it fits, else int64), matching how
+pymongo re-encodes Python's plain-`int` results. Validation: `cargo test` green;
+`tests/test_rust_update_parity.py` — curated corpus mirroring `test_update.py` +
+a 6000-case fuzz — green (no Python-side changes needed this time).
+
+One flip-blocker noted in `tasks/backlog.md` §7: confirm `bson::Document::insert`
+preserves field position on an existing key (Python `set_path` does), so a
+future Rust default doesn't reorder fields vs mongod. The parity test uses
+order-insensitive dict `==`, so it wouldn't catch a reorder — the WiredTiger
+conformance suite would.
+
+Next leaf engine: `expressions.evaluate` — the aggregation expression language,
+which would also unlock `$expr` in the matcher and pipeline updates.

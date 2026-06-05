@@ -24,6 +24,7 @@ use pyo3::types::PyBytes;
 mod numeric;
 mod query;
 mod sortkey;
+mod update;
 
 /// Decode the one-key wrapper document and hand back the wrapped value.
 fn unwrap_value(doc_bytes: &[u8]) -> PyResult<bson::Bson> {
@@ -72,14 +73,43 @@ fn query_matches(doc_bytes: &[u8], query_bytes: &[u8]) -> PyResult<Option<bool>>
     Ok(query::matches(&doc, &query).ok())
 }
 
+/// `update.apply_update(doc, update, is_upsert=...)` over BSON bytes (update is
+/// an operator/replacement document — pipeline updates stay in Python). Returns
+/// the new document's BSON bytes, or `None` to fall back to the pure-Python
+/// `apply_update` (positional ops, array filters, `$currentDate`,
+/// `$min`/`$max`/`$pull`/`$addToSet`/`$bit`, Decimal128 arithmetic, or any
+/// error condition so Python raises the exact `UpdateError`).
+#[pyfunction]
+fn apply_update(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    update_bytes: &[u8],
+    is_upsert: bool,
+) -> PyResult<Option<Py<PyBytes>>> {
+    let doc: Document = bson::from_slice(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    let update: Document = bson::from_slice(update_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
+    match update::apply_update(&doc, &update, is_upsert) {
+        Ok(new) => {
+            let mut buf = Vec::new();
+            new.to_writer(&mut buf)
+                .map_err(|e| PyValueError::new_err(format!("encode failed: {e}")))?;
+            Ok(Some(to_pybytes(py, buf)))
+        }
+        Err(update::Fallback) => Ok(None),
+    }
+}
+
 #[pymodule]
 fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "__doc__",
-        "Rust core for SecantusDB (Phase 1: sortkey, query).",
+        "Rust core for SecantusDB (Phase 1: sortkey, query, update).",
     )?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_update, m)?)?;
     Ok(())
 }

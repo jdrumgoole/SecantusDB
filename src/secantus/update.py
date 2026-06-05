@@ -2,14 +2,34 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import os
 from collections.abc import Mapping
 from typing import Any
+
+import bson
 
 from secantus.paths import get_path, has_path, set_path, unset_path
 
 
 class UpdateError(Exception):
     pass
+
+
+# Phase 1 of the Python -> Rust rewrite: the Rust core ports the common,
+# deterministic update operators behind the byte seam (doc + update cross as
+# BSON bytes). The Rust path returns None to defer to pure Python for: pipeline
+# (array) updates, positional operators / array filters, $currentDate
+# (non-deterministic), $min/$max/$pull/$addToSet/$bit, Decimal128 arithmetic,
+# and every error condition (so the exact UpdateError is raised here). Opt-in
+# via SECANTUS_RUST_UPDATE=1; parity pinned by tests/test_rust_update_parity.py.
+try:
+    import _secantus_core as _rust
+except ImportError:
+    _rust = None
+
+
+def _rust_update_enabled() -> bool:
+    return _rust is not None and os.environ.get("SECANTUS_RUST_UPDATE") == "1"
 
 
 def apply_update(
@@ -21,6 +41,13 @@ def apply_update(
     positional_matches: Mapping[str, int] | None = None,
     let: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if _rust_update_enabled() and isinstance(update, dict):
+        try:
+            res = _rust.apply_update(bson.encode(dict(doc)), bson.encode(dict(update)), is_upsert)
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)
     if isinstance(update, list):
         return _apply_pipeline_update(doc, update, let=let)
     if not update:
