@@ -113,6 +113,15 @@ never "remove Python."
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six
   shims consult it; `SecantusDBServer(engine=)` + `--engine` set it. Unit-tested
   by `tests/test_engine.py` (WT-independent).
+- [x] **CI validates the Rust core** — `.github/workflows/test.yml` has a `rust`
+  job (Linux, py3.12) that builds `_secantus_core`, runs `cargo fmt`/`clippy
+  -D warnings`/`test`, the engine-parity suites, **and the full pytest suite
+  under `SECANTUS_ENGINE=rust`** (the real differential check through pymongo /
+  WiredTiger). Before this, CI built neither the extension nor selected the Rust
+  engine, so the parity suites `importorskip`'d and the rewrite was effectively
+  un-validated by CI. Note: the workflow triggers only on push/PR to `main`, so
+  this job first runs when the rewrite branch opens a PR / merges — watch its
+  first run (the YAML couldn't be exercised in the WT-less dev sandbox).
 - [x] **Phase 0 spikes** — BSON fidelity, WiredTiger FFI, sortkey golden
   vectors all green (`rust/`, `rust/run_spikes.sh`).
 - [x] **Phase 1, leaf engine #1: `sortkey`** — ported to Rust behind the fat
