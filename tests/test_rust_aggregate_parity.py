@@ -36,7 +36,7 @@ def _load_pure_aggregate():
         pkg = types.ModuleType("secantus")
         pkg.__path__ = [str(root)]
         sys.modules["secantus"] = pkg
-    for name in ("paths", "collation", "query", "expressions", "aggregate"):
+    for name in ("paths", "collation", "query", "expressions", "ordering", "aggregate"):
         full = f"secantus.{name}"
         if full not in sys.modules:
             spec = importlib.util.spec_from_file_location(full, root / f"{name}.py")
@@ -66,6 +66,21 @@ DOCS = [
     {"_id": 3, "a": 25, "b": "z", "nested": {"k": 9}},
 ]
 
+# A mixed-type corpus for $sort: numbers (int/float), strings, bools, null,
+# missing fields, nested docs/arrays — exercises order.cmp's cross-type ranks.
+SORT_DOCS = [
+    {"_id": 1, "k": 3},
+    {"_id": 2, "k": 1.5},
+    {"_id": 3, "k": "apple"},
+    {"_id": 4, "k": True},
+    {"_id": 5, "k": None},
+    {"_id": 6},  # missing -> sorts as null
+    {"_id": 7, "k": 1},  # collides numerically with 1.0? no — distinct value 1
+    {"_id": 8, "k": [1, 2]},
+    {"_id": 9, "k": {"x": 1}},
+    {"_id": 10, "k": "Apple"},
+]
+
 CURATED = [
     [{"$match": {"a": {"$gt": 10}}}],
     [{"$match": {"b": "y"}}],
@@ -86,12 +101,29 @@ CURATED = [
     [{"$match": {"a": {"$gte": 10}}}, {"$project": {"a": 1, "_id": 0}}],
     [{"$addFields": {"big": {"$gt": ["$a", 20]}}}, {"$match": {"big": True}}],
     [{"$skip": 1}, {"$limit": 1}, {"$count": "n"}],
-    # stages that defer (rust None -> skipped)
+    # $sort — single + multi-field, both directions
     [{"$sort": {"a": 1}}],
-    [{"$group": {"_id": "$b", "total": {"$sum": "$a"}}}],
+    [{"$sort": {"a": -1}}],
+    [{"$sort": {"b": 1, "a": -1}}],
+    # $unwind — string form, doc form, includeArrayIndex, preserve
     [{"$unwind": "$tags"}],
+    [{"$unwind": {"path": "$tags", "includeArrayIndex": "ti"}}],
+    [{"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": True}}],
+    [{"$unwind": "$tags"}, {"$sort": {"tags": 1, "_id": 1}}],
+    # stages that still defer (rust None -> skipped)
+    [{"$group": {"_id": "$b", "total": {"$sum": "$a"}}}],
     [{"$sample": {"size": 2}}],
 ]
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_sort_mixed_types(direction):
+    docs = bson.decode(bson.encode({"d": SORT_DOCS}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$sort": {"k": direction, "_id": 1}}]}))["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, "expected the Rust $sort to handle the mixed-type corpus"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py}"
 
 
 @pytest.mark.parametrize("pipeline", CURATED)
@@ -105,25 +137,40 @@ def test_curated_parity(pipeline):
     assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
 
 
+def _rand_scalar(rng):
+    r = rng.random()
+    if r < 0.3:
+        return rng.randint(0, 50)
+    if r < 0.45:
+        return rng.choice(["p", "q", "r"])
+    if r < 0.6:
+        return rng.choice([1.5, 2.0, 0.5])
+    if r < 0.75:
+        return rng.choice([True, False])
+    if r < 0.85:
+        return None
+    return {"n": rng.randint(0, 9)}
+
+
 def _rand_doc(rng):
     d = {"_id": rng.randint(1, 1000)}
     for f in ("a", "b", "c"):
         r = rng.random()
         if r < 0.2:
             continue
-        elif r < 0.4:
-            d[f] = rng.choice(["p", "q", "r"])
-        elif r < 0.5:
-            d[f] = {"n": rng.randint(0, 9)}
+        elif r < 0.45:
+            # array-valued (drives $unwind); may be empty
+            d[f] = [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]
         else:
-            d[f] = rng.randint(0, 50)
+            d[f] = _rand_scalar(rng)
     return d
 
 
 def _rand_stage(rng):
     kind = rng.choice(
         ["match", "limit", "skip", "count", "project_in", "project_ex",
-         "project_comp", "addfields", "unset", "replacewith"]
+         "project_comp", "addfields", "unset", "replacewith", "sort",
+         "sort_multi", "unwind", "unwind_idx"]
     )
     field = rng.choice(["a", "b", "c"])
     if kind == "match":
@@ -145,6 +192,21 @@ def _rand_stage(rng):
         return {"$addFields": {"x": {"$multiply": ["$" + field, 2]}}}
     if kind == "unset":
         return {"$unset": field}
+    if kind == "sort":
+        return {"$sort": {field: rng.choice([1, -1]), "_id": 1}}
+    if kind == "sort_multi":
+        f2 = rng.choice(["a", "b", "c"])
+        return {"$sort": {field: rng.choice([1, -1]), f2: rng.choice([1, -1]), "_id": 1}}
+    if kind == "unwind":
+        return {"$unwind": "$" + field}
+    if kind == "unwind_idx":
+        return {
+            "$unwind": {
+                "path": "$" + field,
+                "includeArrayIndex": "idx",
+                "preserveNullAndEmptyArrays": rng.choice([True, False]),
+            }
+        }
     return {"$replaceWith": {"only": "$" + field}}
 
 

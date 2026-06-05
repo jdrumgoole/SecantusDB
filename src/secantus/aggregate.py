@@ -142,7 +142,7 @@ def _stage_skip(
 def _stage_sort(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    from secantus.storage import sort_docs
+    from secantus.ordering import sort_docs
 
     return sort_docs(list(docs), spec)
 

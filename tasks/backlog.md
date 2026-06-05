@@ -268,14 +268,28 @@ never "remove Python."
   **Graceful whole-pipeline fallback:** any unported stage or any deferred inner
   expression makes `apply_pipeline` return `None` and the pure-Python pipeline
   runs. Parity: `tests/test_rust_aggregate_parity.py` (curated + 4000-case fuzz).
-- [ ] **Widen the Rust aggregation pipeline** — the comparison/equality-heavy
-  stages still defer to Python: `$sort` (needs faithful `_bson_lt` cross-type
-  ordering), `$group`/`$sortByCount`/`$bucket` (group-key hashing where
-  `1 == 1.0 == True` collide + the accumulators), `$unwind`, `$facet`,
-  `$densify`. Storage-backed stages (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/
-  `$merge`) and non-deterministic `$sample` defer until the storage layer moves
-  into Rust (Phase 3+). After widening: Phase 3+ (storage, wire/dispatch) per
-  tasks/rust-rewrite-plan.md.
+- [x] **Widen the pipeline: `$sort` + `$unwind`.** `$sort` ported via a faithful
+  cross-type BSON comparator (`crates/secantus-core/src/order.rs`, mirroring
+  `_bson_lt` / `_bson_type_rank` — type ranks, doc/array recursion, the unified
+  numeric type incl. NaN-is-equal). To stay strictly faithful the stage first
+  runs `order::is_sortable` over every sort-key value and defers the whole
+  pipeline to Python on Decimal128 (Python's Decimal-widening path) or exotic /
+  uncomparable BSON types (Python's `TypeError` → type-name fallback). Single +
+  multi-field, both directions, stable. `$unwind` ported (string + doc spec,
+  `includeArrayIndex`, `preserveNullAndEmptyArrays`, missing/null/non-array/empty
+  edges). **Refactor:** the pure comparator moved out of `storage.py` into a new
+  I/O-free `secantus.ordering` module (`sort_docs`/`_bson_lt`/`_bson_type_rank`/
+  `_SortKey`/`_to_decimal`; `storage` re-exports them) so `sort_docs` is
+  importable without the WiredTiger extension — matching the pure-operator-engine
+  layering. Parity: `tests/test_rust_aggregate_parity.py` (mixed-type sort corpus
+  + 4000-case fuzz with arrays / mixed-type fields).
+- [ ] **Widen the pipeline further** — the equality/hashing-heavy stages still
+  defer to Python: `$group`/`$sortByCount`/`$bucket` (group-key hashing where
+  `1 == 1.0 == True` collide + the accumulators, several of which use Python's
+  raise-on-mixed-type `<`/`+`), `$facet`, `$densify`. Storage-backed stages
+  (`$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge`) and non-deterministic
+  `$sample` defer until the storage layer moves into Rust (Phase 3+). After
+  widening: Phase 3+ (storage, wire/dispatch) per tasks/rust-rewrite-plan.md.
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 

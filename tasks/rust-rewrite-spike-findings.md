@@ -345,3 +345,31 @@ A `$dateDiff` fidelity fix rode along: the sub-day units (`hour`/`minute`/
 Rust reproduces the single-rounding float path, guarded to `|total_us| <= 2**53`
 so the `as f64` conversion is exact (matching CPython's single rounding) and
 deferring extreme dates to Python where double-rounding could diverge.
+
+### Pipeline widening: `$sort` + `$unwind`
+
+`$sort` is the first stage needing a cross-type value comparator.
+`crates/secantus-core/src/order.rs` ports `_bson_lt` / `_bson_type_rank` as a
+total `cmp(a, b) -> Ordering` (type ranks, embedded-doc / array recursion, the
+unified numeric type with NaN treated as equal-not-less to match Python's `<`
+returning False both ways). Strict-fidelity gate: the stage runs
+`order::is_sortable` over every sort-key value first and defers the whole
+pipeline to Python on Decimal128 (Python's Decimal-widening branch) or exotic /
+uncomparable types (Python's `TypeError` → type-name fallback), so `cmp` itself
+never has to represent "can't compare". Stable, single + multi-field, both
+directions. `$unwind` ported alongside (string + doc spec, `includeArrayIndex`,
+`preserveNullAndEmptyArrays`, and the missing / null / non-array / empty-array
+edges).
+
+A layering cleanup rode along: the pure sort comparator
+(`sort_docs`/`_bson_lt`/`_bson_type_rank`/`_SortKey`/`_to_decimal`) moved out of
+`storage.py` — where it sat next to the WiredTiger code and so was unimportable
+without the `wiredtiger` extension — into a new I/O-free `secantus.ordering`
+module. `storage` re-exports the names (back-compat for the many existing
+`from secantus.storage import sort_docs` call sites and the monkeypatch tests),
+and the parity harness can now load `ordering` by path without WT. This is the
+same pure-operator-engine layering as `query` / `update` / `expressions`.
+
+Validation: `cargo test` (51) + `tests/test_rust_aggregate_parity.py` (mixed-type
+sort corpus + 4000-case fuzz over arrays / mixed-type fields) green; full Rust
+parity sweep is **491 cases**.
