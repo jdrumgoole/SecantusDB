@@ -12,6 +12,7 @@ corpus sticks to the ported core (paths, comparison, logic, control flow,
 arithmetic, common array ops) so the pure path never needs the lazily-imported
 `secantus.storage` / `bson.Regex` paths.
 """
+
 from __future__ import annotations
 
 import datetime
@@ -54,9 +55,7 @@ _pure = _load_pure_expr()
 
 
 def _rust_eval(expr, doc, vars=None):
-    res = _rust.evaluate(
-        bson.encode(doc), bson.encode({"e": expr}), bson.encode(vars or {})
-    )
+    res = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode(vars or {}))
     return None if res is None else bson.decode(res)["r"]
 
 
@@ -66,6 +65,7 @@ _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 def _mkdate(ms):
     return _EPOCH + datetime.timedelta(milliseconds=ms)
+
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
@@ -91,8 +91,15 @@ CURATED = [
     ({"$cond": {"if": {"$gt": ["$a", 0]}, "then": "pos", "else": "neg"}}, {"a": -1}),
     ({"$ifNull": ["$x", 7]}, {}),
     ({"$ifNull": ["$a", 7]}, {"a": 3}),
-    ({"$switch": {"branches": [{"case": {"$gt": ["$a", 10]}, "then": "big"}],
-                  "default": "small"}}, {"a": 5}),
+    (
+        {
+            "$switch": {
+                "branches": [{"case": {"$gt": ["$a", 10]}, "then": "big"}],
+                "default": "small",
+            }
+        },
+        {"a": 5},
+    ),
     ({"$add": [1, 2, 3]}, {}),
     ({"$add": ["$a", 1]}, {}),  # missing -> null
     ({"$add": [1.5, 2]}, {}),
@@ -142,10 +149,20 @@ CURATED = [
     ({"$map": {"input": "$xs", "as": "n", "in": {"$multiply": ["$$n", 2]}}}, {"xs": [1, 2, 3]}),
     ({"$filter": {"input": [1, 2, 3, 4], "as": "n", "cond": {"$gt": ["$$n", 2]}}}, {}),
     ({"$filter": {"input": [1, 2, 3, 4, 5], "cond": {"$lt": ["$$this", 5]}, "limit": 2}}, {}),
-    ({"$reduce": {"input": [1, 2, 3, 4], "initialValue": 0,
-                  "in": {"$add": ["$$value", "$$this"]}}}, {}),
-    ({"$reduce": {"input": "$xs", "initialValue": "", "in": {"$concat": ["$$value", "$$this"]}}},
-     {"xs": ["a", "b", "c"]}),
+    (
+        {
+            "$reduce": {
+                "input": [1, 2, 3, 4],
+                "initialValue": 0,
+                "in": {"$add": ["$$value", "$$this"]},
+            }
+        },
+        {},
+    ),
+    (
+        {"$reduce": {"input": "$xs", "initialValue": "", "in": {"$concat": ["$$value", "$$this"]}}},
+        {"xs": ["a", "b", "c"]},
+    ),
     ({"$let": {"vars": {"d": {"$add": ["$x", 1]}}, "in": {"$multiply": ["$$d", 2]}}}, {"x": 5}),
     # $map referencing a ROOT field path inside `in` ($$CURRENT stays ROOT).
     ({"$map": {"input": [1, 2], "in": {"$add": ["$$this", "$base"]}}}, {"base": 100}),
@@ -238,25 +255,32 @@ CURATED = [
     ({"$zip": {"inputs": [[1, 2, 3], [4, 5]]}}, {}),  # min length
     ({"$zip": {"inputs": "$xs"}}, {"xs": [["a", "b"], ["c", "d"]]}),
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True}}, {}),
-    ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True,
-               "defaults": [0, 0]}}, {}),
+    ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True, "defaults": [0, 0]}}, {}),
     ({"$zip": {"inputs": "$x"}}, {}),  # missing -> null inputs -> null
     # Date arithmetic.
     ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 5}}, {"d": _DT}),
     ({"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}}, {"d": _DT}),
     ({"$dateAdd": {"startDate": "$d", "unit": "year", "amount": 1}}, {"d": _DT}),
     # Jan 31 + 1 month clamps to Feb 28
-    ({"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}},
-     {"d": datetime.datetime(2026, 1, 31, tzinfo=datetime.timezone.utc)}),
+    (
+        {"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}},
+        {"d": datetime.datetime(2026, 1, 31, tzinfo=datetime.timezone.utc)},
+    ),
     ({"$dateAdd": {"startDate": "$x", "unit": "day", "amount": 5}}, {}),  # null -> null
     ({"$dateSubtract": {"startDate": "$d", "unit": "hour", "amount": 3}}, {"d": _DT}),
     ({"$dateSubtract": {"startDate": "$d", "unit": "month", "amount": 2}}, {"d": _DT}),
-    ({"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "day"}},
-     {"a": _DT, "b": _mkdate(_DT.timestamp() * 1000 + 3 * 86_400_000)}),
-    ({"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "year"}},
-     {"a": datetime.datetime(2020, 6, 5, tzinfo=datetime.timezone.utc), "b": _DT}),
-    ({"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "month"}},
-     {"a": datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc), "b": _DT}),
+    (
+        {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "day"}},
+        {"a": _DT, "b": _mkdate(_DT.timestamp() * 1000 + 3 * 86_400_000)},
+    ),
+    (
+        {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "year"}},
+        {"a": datetime.datetime(2020, 6, 5, tzinfo=datetime.timezone.utc), "b": _DT},
+    ),
+    (
+        {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "month"}},
+        {"a": datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc), "b": _DT},
+    ),
     ({"$dateTrunc": {"date": "$d", "unit": "hour"}}, {"d": _DT}),
     ({"$dateTrunc": {"date": "$d", "unit": "month"}}, {"d": _DT}),
     ({"$dateTrunc": {"date": "$d", "unit": "week"}}, {"d": _DT}),
@@ -300,15 +324,32 @@ def _rand_doc(rng):
 def _rand_operand(rng, depth):
     r = rng.random()
     if depth <= 0 or r < 0.5:
-        return rng.choice([rng.randint(-9, 9), round(rng.uniform(-5, 5), 1), "$a", "$b", "$c",
-                           "lit", True, False])
+        return rng.choice(
+            [rng.randint(-9, 9), round(rng.uniform(-5, 5), 1), "$a", "$b", "$c", "lit", True, False]
+        )
     return _rand_expr(rng, depth - 1)
 
 
 def _rand_expr(rng, depth):
     op = rng.choice(
-        ["$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$add", "$subtract",
-         "$multiply", "$divide", "$mod", "$and", "$or", "$not", "$cond", "$ifNull"]
+        [
+            "$eq",
+            "$ne",
+            "$gt",
+            "$gte",
+            "$lt",
+            "$lte",
+            "$add",
+            "$subtract",
+            "$multiply",
+            "$divide",
+            "$mod",
+            "$and",
+            "$or",
+            "$not",
+            "$cond",
+            "$ifNull",
+        ]
     )
     if op in ("$and", "$or"):
         return {op: [_rand_operand(rng, depth) for _ in range(rng.randint(1, 3))]}
@@ -331,14 +372,16 @@ def test_index_math_fuzz():
         arr = [rng.randint(0, 4) for _ in range(rng.randint(0, 6))]
         s = "".join(rng.choice("abcde") for _ in range(rng.randint(0, 6)))
         lo, hi = rng.randint(-8, 8), rng.randint(-8, 8)
-        expr = rng.choice([
-            {"$slice": [arr, lo]},
-            {"$slice": [arr, lo, hi]},
-            {"$substrCP": [s, lo, hi]},
-            {"$indexOfArray": [arr, rng.randint(0, 4)]},
-            {"$indexOfArray": [arr, rng.randint(0, 4), lo]},
-            {"$indexOfArray": [arr, rng.randint(0, 4), lo, hi]},
-        ])
+        expr = rng.choice(
+            [
+                {"$slice": [arr, lo]},
+                {"$slice": [arr, lo, hi]},
+                {"$substrCP": [s, lo, hi]},
+                {"$indexOfArray": [arr, rng.randint(0, 4)]},
+                {"$indexOfArray": [arr, rng.randint(0, 4), lo]},
+                {"$indexOfArray": [arr, rng.randint(0, 4), lo, hi]},
+            ]
+        )
         expr = bson.decode(bson.encode({"e": expr}))["e"]
         rust = _rust_eval(expr, {})
         if rust is None:
@@ -374,8 +417,7 @@ def test_date_arithmetic_fuzz():
     """$dateAdd/$dateSubtract/$dateDiff/$dateTrunc over random instants, units,
     amounts and binSizes, against Python (calendar + delta arithmetic)."""
     rng = random.Random(0xDA7EA)
-    units = ["year", "quarter", "month", "week", "day", "hour", "minute",
-             "second", "millisecond"]
+    units = ["year", "quarter", "month", "week", "day", "hour", "minute", "second", "millisecond"]
     # ~ year 1950..2200, so add/subtract stays well within datetime range.
     lo, hi = -631_152_000_000, 7_258_118_400_000
     for _ in range(8000):
@@ -410,8 +452,7 @@ def test_zip_fuzz():
     rng = random.Random(0x21B)
     for _ in range(3000):
         inputs = [
-            [rng.randint(0, 9) for _ in range(rng.randint(0, 4))]
-            for _ in range(rng.randint(0, 3))
+            [rng.randint(0, 9) for _ in range(rng.randint(0, 4))] for _ in range(rng.randint(0, 3))
         ]
         spec = {"inputs": inputs}
         if rng.random() < 0.5:
@@ -439,15 +480,17 @@ def test_string_index_fuzz():
         s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
         needle = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 2)))
         lo, hi = rng.randint(-6, 10), rng.randint(-6, 10)
-        expr = rng.choice([
-            {"$indexOfCP": [s, needle]},
-            {"$indexOfCP": [s, needle, lo]},
-            {"$indexOfCP": [s, needle, lo, hi]},
-            {"$indexOfBytes": [s, needle]},
-            {"$indexOfBytes": [s, needle, lo, hi]},
-            {"$substrBytes": [s, lo, hi]},
-            {"$substrCP": [s, lo, hi]},
-        ])
+        expr = rng.choice(
+            [
+                {"$indexOfCP": [s, needle]},
+                {"$indexOfCP": [s, needle, lo]},
+                {"$indexOfCP": [s, needle, lo, hi]},
+                {"$indexOfBytes": [s, needle]},
+                {"$indexOfBytes": [s, needle, lo, hi]},
+                {"$substrBytes": [s, lo, hi]},
+                {"$substrCP": [s, lo, hi]},
+            ]
+        )
         expr = bson.decode(bson.encode({"e": expr}))["e"]
         rust = _rust_eval(expr, {})
         if rust is None:
@@ -464,11 +507,13 @@ def test_math_and_range_fuzz():
     small bounds, against Python wherever the Rust path doesn't defer."""
     rng = random.Random(0x4A7B)
     for _ in range(5000):
-        v = rng.choice([
-            rng.randint(-10000, 10000),
-            round(rng.uniform(-1000, 1000), 3),
-            rng.choice([0, 0.0, -0.0, 2**40, -(2**31)]),
-        ])
+        v = rng.choice(
+            [
+                rng.randint(-10000, 10000),
+                round(rng.uniform(-1000, 1000), 3),
+                rng.choice([0, 0.0, -0.0, 2**40, -(2**31)]),
+            ]
+        )
         for op in ("$abs", "$floor", "$ceil", "$sqrt"):
             expr = {op: v}
             rust = _rust_eval(expr, {})
@@ -492,9 +537,24 @@ def test_conversion_fuzz():
     """$toInt / $toDouble / $toBool / $toString over a mix of scalar types,
     checked against Python wherever the Rust path doesn't defer."""
     values = [
-        0, 1, -7, 2**40, Int64(5), Int64(-3),
-        0.0, 3.9, -3.9, 1e10, 2.5,
-        True, False, None, "", "abc", "12", ObjectId(),
+        0,
+        1,
+        -7,
+        2**40,
+        Int64(5),
+        Int64(-3),
+        0.0,
+        3.9,
+        -3.9,
+        1e10,
+        2.5,
+        True,
+        False,
+        None,
+        "",
+        "abc",
+        "12",
+        ObjectId(),
     ]
     for v in values:
         doc = bson.decode(bson.encode({"v": v}))

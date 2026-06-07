@@ -7,6 +7,7 @@ a concrete result the decoded value must equal the authoritative pure-Python
 
 `diff.py` has no intra-package imports, so it loads directly by path.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -51,8 +52,10 @@ CURATED = [
     ({"a": [{"k": 1}, {"k": 2}]}, {"a": [{"k": 1}, {"k": 9}]}),  # array of subdocs
     ({"a": True}, {"a": 1}),  # bool==int -> no change
     ({"a": "x"}, {"a": "y"}),
-    ({"_id": ObjectId("0123456789abcdef01234567"), "n": 1},
-     {"_id": ObjectId("0123456789abcdef01234567"), "n": 2}),
+    (
+        {"_id": ObjectId("0123456789abcdef01234567"), "n": 1},
+        {"_id": ObjectId("0123456789abcdef01234567"), "n": 2},
+    ),
 ]
 
 
@@ -70,8 +73,18 @@ def test_curated_parity(pre, post):
 def _rand_value(rng, depth):
     r = rng.random()
     if depth <= 0 or r < 0.5:
-        return rng.choice([rng.randint(0, 5), 1.0, "s", "t", True, False, None,
-                           ObjectId("0123456789abcdef01234567")])
+        return rng.choice(
+            [
+                rng.randint(0, 5),
+                1.0,
+                "s",
+                "t",
+                True,
+                False,
+                None,
+                ObjectId("0123456789abcdef01234567"),
+            ]
+        )
     if r < 0.75:
         return [_rand_value(rng, depth - 1) for _ in range(rng.randint(0, 4))]
     return {k: _rand_value(rng, depth - 1) for k in rng.sample(["p", "q", "r"], rng.randint(0, 3))}

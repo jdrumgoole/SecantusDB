@@ -10,6 +10,7 @@ Import-light: prefers the real `secantus.aggregate`, else loads `aggregate.py`
 plus its pure deps by path under a stub `secantus`. The corpus uses only the
 ported stages so the pure path never needs `secantus.storage`.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -271,24 +272,46 @@ def _rand_doc(rng):
 def _rand_simple_stage(rng):
     """A non-recursive stage for $facet sub-pipelines (no $facet/$bucket)."""
     field = rng.choice(["a", "b", "c"])
-    return rng.choice([
-        {"$match": {field: {rng.choice(["$gt", "$lt", "$eq"]): rng.randint(0, 50)}}},
-        {"$limit": rng.randint(0, 3)},
-        {"$skip": rng.randint(0, 2)},
-        {"$count": "n"},
-        {"$group": {"_id": "$" + field, "c": {"$sum": 1}}},
-        {"$sort": {field: rng.choice([1, -1]), "_id": 1}},
-        {"$sortByCount": "$" + field},
-    ])
+    return rng.choice(
+        [
+            {"$match": {field: {rng.choice(["$gt", "$lt", "$eq"]): rng.randint(0, 50)}}},
+            {"$limit": rng.randint(0, 3)},
+            {"$skip": rng.randint(0, 2)},
+            {"$count": "n"},
+            {"$group": {"_id": "$" + field, "c": {"$sum": 1}}},
+            {"$sort": {field: rng.choice([1, -1]), "_id": 1}},
+            {"$sortByCount": "$" + field},
+        ]
+    )
 
 
 def _rand_stage(rng):
     kind = rng.choice(
-        ["match", "limit", "skip", "count", "project_in", "project_ex",
-         "project_comp", "addfields", "unset", "replacewith", "sort",
-         "sort_multi", "unwind", "unwind_idx", "group_count", "group_sum",
-         "group_minmax", "group_push", "group_set", "sortbycount",
-         "bucket", "bucket_default", "facet"]
+        [
+            "match",
+            "limit",
+            "skip",
+            "count",
+            "project_in",
+            "project_ex",
+            "project_comp",
+            "addfields",
+            "unset",
+            "replacewith",
+            "sort",
+            "sort_multi",
+            "unwind",
+            "unwind_idx",
+            "group_count",
+            "group_sum",
+            "group_minmax",
+            "group_push",
+            "group_set",
+            "sortbycount",
+            "bucket",
+            "bucket_default",
+            "facet",
+        ]
     )
     field = rng.choice(["a", "b", "c"])
     f2 = rng.choice(["a", "b", "c"])

@@ -70,6 +70,7 @@ def _collation_to_bson(collation: Any) -> bytes:
         }
     )
 
+
 # Type ranks — must match storage._bson_type_rank.
 RANK_MINKEY = 1
 RANK_NULL = 2

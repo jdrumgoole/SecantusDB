@@ -9,6 +9,7 @@ $slice args, a deferred $elemMatch sub-filter) there's nothing to assert.
 Import-light: prefers the real `secantus.projection`, else loads `projection.py`
 + its `paths` / `collation` / `query` deps by path under a stub `secantus`.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -69,8 +70,10 @@ CURATED = [
     ({"_id": 1, "a": [1, 2, 3, 4, 5]}, {"a": {"$slice": [1, 2]}}),
     ({"_id": 1, "a": [1, 2, 3, 4, 5]}, {"a": {"$slice": [-3, 2]}}),
     ({"_id": 1, "a": [1, 2, 3], "b": 9}, {"a": {"$slice": 2}, "b": 1}),  # slice + inclusion
-    ({"_id": 1, "items": [{"k": 1}, {"k": 5}, {"k": 9}]},
-     {"items": {"$elemMatch": {"k": {"$gte": 5}}}}),
+    (
+        {"_id": 1, "items": [{"k": 1}, {"k": 5}, {"k": 9}]},
+        {"items": {"$elemMatch": {"k": {"$gte": 5}}}},
+    ),
     ({"_id": 1, "vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gt": 4}}}),
     ({"_id": 1, "a": 1, "b": 2}, {}),  # empty spec
     ({"_id": 1, "a": 1, "b": 2}, {"a": True, "b": False}),  # mixed -> defer

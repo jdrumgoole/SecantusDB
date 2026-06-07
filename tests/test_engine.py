@@ -5,6 +5,7 @@ pure-Python engines (default, always present) and the optional Rust core. It
 has no intra-package imports, so it loads standalone by path — these tests run
 with or without the WiredTiger extension and with or without the Rust core.
 """
+
 from __future__ import annotations
 
 import importlib.util

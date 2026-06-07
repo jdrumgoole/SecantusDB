@@ -12,6 +12,7 @@ Import-light: prefers the real `secantus.update`, else loads `update.py` +
 pipeline/positional/arrayFilters/`$currentDate` so the pure path never needs
 `secantus.query` / `secantus.aggregate`).
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -108,8 +109,16 @@ def test_curated_parity(doc, update, upsert):
 
 def _rand_scalar(rng):
     return rng.choice(
-        [rng.randint(-20, 20), Int64(rng.randint(-20, 20)), round(rng.uniform(-9, 9), 2),
-         rng.choice(["a", "bb", "z"]), True, False, None, ObjectId()]
+        [
+            rng.randint(-20, 20),
+            Int64(rng.randint(-20, 20)),
+            round(rng.uniform(-9, 9), 2),
+            rng.choice(["a", "bb", "z"]),
+            True,
+            False,
+            None,
+            ObjectId(),
+        ]
     )
 
 
@@ -167,9 +176,7 @@ def test_randomised_fuzz_parity():
 
 
 def _rust_apply_batch(docs, update, is_upsert=False):
-    res = _rust.apply_update_batch(
-        bson.encode({"d": list(docs)}), bson.encode(update), is_upsert
-    )
+    res = _rust.apply_update_batch(bson.encode({"d": list(docs)}), bson.encode(update), is_upsert)
     return None if res is None else bson.decode(res)["d"]
 
 

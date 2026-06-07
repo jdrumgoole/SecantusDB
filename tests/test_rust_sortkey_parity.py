@@ -12,6 +12,7 @@ the WiredTiger C extension), and the whole module skips cleanly when the Rust
 extension hasn't been built. That lets it run both in full CI and in a
 WiredTiger-less environment with just `pymongo` + the built wheel.
 """
+
 from __future__ import annotations
 
 import datetime

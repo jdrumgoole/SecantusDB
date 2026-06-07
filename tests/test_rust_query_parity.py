@@ -12,6 +12,7 @@ imported (no WiredTiger extension built, as in a spike environment) it loads
 deliberately avoids `$expr`/geo so the pure path never needs the not-yet-loaded
 `secantus.expressions` / `secantus.geo` modules.
 """
+
 from __future__ import annotations
 
 import datetime
@@ -172,10 +173,14 @@ CURATED = [
     ({"n": 13}, {"n": {"$mod": [4, 1]}}),
     ({"n": 13}, {"n": {"$mod": [4, 0]}}),
     ({"vals": [3, 7, 12]}, {"vals": {"$mod": [4, 0]}}),
-    ({"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
-     {"items": {"$elemMatch": {"sku": "b", "qty": {"$gte": 5}}}}),
-    ({"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
-     {"items": {"$elemMatch": {"sku": "b", "qty": {"$gt": 5}}}}),
+    (
+        {"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
+        {"items": {"$elemMatch": {"sku": "b", "qty": {"$gte": 5}}}},
+    ),
+    (
+        {"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
+        {"items": {"$elemMatch": {"sku": "b", "qty": {"$gt": 5}}}},
+    ),
     ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 3, "$lt": 7}}}),
     ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 11}}}),
     ({"a": 1}, {"a": 1, "$comment": "hi"}),
@@ -211,8 +216,10 @@ CURATED = [
     # $expr — now handled in Rust via the expression evaluator.
     ({"a": 5, "b": 3}, {"$expr": {"$gt": ["$a", "$b"]}}),
     ({"a": 1, "b": 3}, {"$expr": {"$gt": ["$a", "$b"]}}),
-    ({"price": 100, "discount": 30},
-     {"$expr": {"$lt": [{"$subtract": ["$price", "$discount"]}, 80]}}),
+    (
+        {"price": 100, "discount": 30},
+        {"$expr": {"$lt": [{"$subtract": ["$price", "$discount"]}, 80]}},
+    ),
     ({"a": 5, "b": 3, "name": "x"}, {"name": "x", "$expr": {"$gt": ["$a", "$b"]}}),
     ({}, {"$expr": "$missing"}),  # falsy
     ({"x": None}, {"$expr": "$x"}),  # falsy
@@ -269,8 +276,21 @@ def _rand_doc(rng):
 def _rand_query(rng):
     field = rng.choice(["a", "b", "c", "a.n", "a.0"])
     op = rng.choice(
-        ["eq", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$ne",
-         "$exists", "$type", "$size", "$mod", "$all"]
+        [
+            "eq",
+            "$gt",
+            "$gte",
+            "$lt",
+            "$lte",
+            "$in",
+            "$nin",
+            "$ne",
+            "$exists",
+            "$type",
+            "$size",
+            "$mod",
+            "$all",
+        ]
     )
     if op == "eq":
         return {field: _rand_scalar(rng)}
