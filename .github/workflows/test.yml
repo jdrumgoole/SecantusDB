@@ -112,3 +112,64 @@ jobs:
         # appeared to "hang at 97%". With this flag we get the
         # crashed test's name in the pytest output instead.
         run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=0
+
+  # The matrix above runs the default pure-Python engines. This job builds the
+  # optional Rust accelerator core (``_secantus_core``) and validates it two
+  # ways: the engine-parity suites (pure-Python vs Rust, byte-for-byte) and the
+  # FULL pytest suite under ``SECANTUS_ENGINE=rust`` — so the Rust engine is
+  # differentially validated against real WiredTiger-backed behaviour through
+  # pymongo. (The Rust engines reproduce the pure path exactly or fall back to
+  # it, so the full suite is expected green under either engine.)
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive  # vendor/wiredtiger is needed by the build
+
+      - name: Install swig
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin  # also builds vendored WT
+
+      - name: Cargo fmt / clippy / unit tests
+        working-directory: crates/secantus-core
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Build & install the Rust core
+        run: |
+          uvx maturin build --release \
+            --manifest-path crates/secantus-core/Cargo.toml --out dist-rust
+          uv pip install dist-rust/secantus_core-*.whl
+
+      - name: Engine-parity suites (pure-Python vs Rust)
+        run: >-
+          uv run python -m pytest
+          tests/test_engine.py
+          tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py
+          tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py
+          tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py
+          tests/test_rust_aggregate_parity.py
+
+      - name: Full suite under the Rust engine
+        env:
+          SECANTUS_ENGINE: rust
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=0

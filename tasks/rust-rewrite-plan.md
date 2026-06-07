@@ -1,9 +1,18 @@
 # Plan: Rewriting the SecantusDB server core in Rust
 
-Status: **proposal / design** — no code changes yet. This document is the
-strategy. It does not commit us to a timeline; it commits us to an order, a
-set of seams, and a list of decisions that have to be made before the first
-line of Rust lands.
+Status: **in progress.** This document is the strategy: an order, a set of
+seams, and the decisions behind them.
+
+> **Policy: both engines are permanent.** This is *not* a replacement of Python
+> by Rust. SecantusDB keeps **both** the original pure-Python engines and the
+> Rust core as first-class, supported implementations. The pure-Python engines
+> are always present and are the **default**; the Rust core is an optional
+> compiled accelerator that reproduces the Python behaviour exactly (pinned by
+> the `tests/test_rust_*_parity.py` suites). Selection is process-wide via
+> `secantus.engine` / the `SECANTUS_ENGINE` env var / `SecantusDBServer(engine=)`.
+> Wherever this plan said "flip the default to Rust," read it as "make the Rust
+> engine selectable and, once proven, possibly the *recommended* default for
+> users who install the extension — never the *only* option."
 
 ---
 

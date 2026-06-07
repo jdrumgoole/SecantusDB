@@ -1,0 +1,3 @@
+# Cargo build output — the Phase 0 spike workspace is throwaway de-risking
+# code; only sources, harnesses, and the lockfile are tracked.
+/target

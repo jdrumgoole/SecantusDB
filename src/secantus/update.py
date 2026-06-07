@@ -5,11 +5,62 @@ import datetime as _dt
 from collections.abc import Mapping
 from typing import Any
 
+import bson
+
+from secantus import engine
 from secantus.paths import get_path, has_path, set_path, unset_path
 
 
 class UpdateError(Exception):
     pass
+
+
+# The Rust core ports the common, deterministic update operators behind the
+# byte seam (doc + update cross as BSON bytes). The Rust path returns None to
+# defer to pure Python for: pipeline (array) updates, positional operators /
+# array filters, $currentDate (non-deterministic), $min/$max/$pull/$addToSet/
+# $bit, Decimal128 arithmetic, and every error condition (so the exact
+# UpdateError is raised here). Both engines are supported; selection is
+# process-wide via ``secantus.engine``. Parity pinned by
+# tests/test_rust_update_parity.py.
+try:
+    import _secantus_core as _rust
+except ImportError:
+    _rust = None
+
+
+def _rust_update_enabled() -> bool:
+    return _rust is not None and engine.enabled("update")
+
+
+def apply_update_batch(
+    docs: list[dict[str, Any]],
+    update: Mapping[str, Any] | list[Mapping[str, Any]],
+    *,
+    is_upsert: bool = False,
+) -> list[dict[str, Any]]:
+    """Apply one operator/replacement ``update`` to every doc in ``docs``.
+
+    The multi-update hot path. With the Rust engine on, this crosses the byte
+    seam once for the whole list (one GIL release covers all N), instead of the
+    per-doc seam + GIL handoff that makes per-doc work scale poorly under
+    concurrency (see ``benchmarks/``). Falls back to the per-doc pure-Python
+    path when Rust isn't enabled, the update is a pipeline (list) form, or any
+    doc defers. Pipeline / array-filter / positional updates are not batched —
+    callers needing those pass through the per-doc ``apply_update``.
+    """
+    if _rust_update_enabled() and isinstance(update, dict):
+        try:
+            res = _rust.apply_update_batch(
+                bson.encode({"d": [dict(d) for d in docs]}),
+                bson.encode(dict(update)),
+                is_upsert,
+            )
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)["d"]
+    return [apply_update(d, update, is_upsert=is_upsert) for d in docs]
 
 
 def apply_update(
@@ -21,6 +72,13 @@ def apply_update(
     positional_matches: Mapping[str, int] | None = None,
     let: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if _rust_update_enabled() and isinstance(update, dict):
+        try:
+            res = _rust.apply_update(bson.encode(dict(doc)), bson.encode(dict(update)), is_upsert)
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)
     if isinstance(update, list):
         return _apply_pipeline_update(doc, update, let=let)
     if not update:

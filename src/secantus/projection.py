@@ -4,6 +4,9 @@ import copy
 from collections.abc import Mapping
 from typing import Any
 
+import bson
+
+from secantus import engine
 from secantus.paths import get_path, has_path, set_path, unset_path
 from secantus.query import matches
 
@@ -12,6 +15,22 @@ _MISSING = object()
 
 class ProjectionError(Exception):
     pass
+
+
+# The Rust core ports the common projection shapes behind the byte seam (doc +
+# spec cross as BSON bytes). The Rust path returns None to defer to pure Python
+# for: mixed inclusion/exclusion (which Python raises on), nested-document
+# specs, unusual $slice arg types, and $elemMatch sub-filters the matcher
+# defers. Both engines are supported; selection is process-wide via
+# ``secantus.engine``. Parity pinned by tests/test_rust_projection_parity.py.
+try:
+    import _secantus_core as _rust
+except ImportError:
+    _rust = None
+
+
+def _rust_projection_enabled() -> bool:
+    return _rust is not None and engine.enabled("projection")
 
 
 def _is_elem_match_spec(value: Any) -> bool:
@@ -56,9 +75,42 @@ def _apply_slice(arr: Any, slice_arg: Any) -> Any:
     return arr
 
 
+def apply_projection_batch(
+    docs: list[dict[str, Any]], spec: Mapping[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Project every doc in ``docs`` against ``spec`` in one shot.
+
+    Every ``find`` result is projected; with the Rust engine on this crosses the
+    byte seam once for the whole list (one GIL release covers all N) rather than
+    per doc — see ``benchmarks/``. Falls back to the per-doc pure-Python path
+    when Rust isn't enabled or any doc defers; an empty spec is a no-op copy.
+    """
+    if not spec:
+        return [copy.deepcopy(d) for d in docs]
+    if _rust_projection_enabled():
+        try:
+            res = _rust.apply_projection_batch(
+                bson.encode({"d": [dict(d) for d in docs]}),
+                bson.encode(dict(spec)),
+            )
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)["d"]
+    return [apply_projection(d, spec) for d in docs]
+
+
 def apply_projection(doc: dict[str, Any], spec: Mapping[str, Any] | None) -> dict[str, Any]:
     if not spec:
         return copy.deepcopy(doc)
+
+    if _rust_projection_enabled():
+        try:
+            res = _rust.apply_projection(bson.encode(dict(doc)), bson.encode(dict(spec)))
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)
 
     # Separate ``$slice`` projections — they don't participate in
     # inclusion / exclusion mode detection (mongod treats them as

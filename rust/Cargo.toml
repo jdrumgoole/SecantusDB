@@ -1,0 +1,13 @@
+# Phase 0 spike workspace for the Python -> Rust core rewrite.
+#
+# This is throwaway de-risking code, kept separate from src/secantus/ (the
+# production Python). Each member proves out one risk from tasks/rust-rewrite-plan.md:
+#   * spike-bson    — bson-crate <-> pymongo byte-fidelity (Spike 1)
+#   * spike-sortkey — byte-exact reproduction of secantus.sortkey (Spike 3)
+#   * spike-wt      — bindgen FFI to the vendored WiredTiger C library (Spike 2)
+[workspace]
+resolver = "2"
+members = ["spike-bson", "spike-sortkey", "spike-wt"]
+
+[workspace.dependencies]
+bson = "2"

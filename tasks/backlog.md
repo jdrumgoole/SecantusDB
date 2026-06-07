@@ -46,6 +46,44 @@ Single-node change streams are implemented and conformant for typical pymongo `w
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
+### 3.3 MongoDB CLI / tool conformance tests
+
+The deck now claims SecantusDB works with the standard MongoDB toolchain (it
+speaks the wire protocol, so in principle they all connect). That claim is
+currently **unverified by an automated test** — the conformance gauges cover the
+five language *drivers*, not the CLI tools. Add tool-level gauges that start a
+standalone SecantusDB on an ephemeral port and drive each tool against its
+`MONGODB_URI`, asserting real round-trips (mirroring the per-driver gauge
+pattern in `/conformance-gauges` and `invoke validate*`).
+
+- [ ] **`mongosh` (shell)** — `mongosh "$URI" --eval '…'` / `--file script.js`:
+  insert / find / aggregate / `db.runCommand`, JSON output asserted. The most
+  important one — it exercises the handshake + a broad command surface.
+- [ ] **`mongodump` / `mongorestore`** — the headline round-trip: seed a DB,
+  `mongodump`, `db.dropDatabase()`, `mongorestore`, assert the collections /
+  docs / indexes come back identical (BSON-level, including `_id` types). This
+  also exercises `listCollections` / `listIndexes` / oplog-free dump paths.
+- [ ] **`mongoimport` / `mongoexport`** — JSON and CSV/TSV round-trip of a
+  collection; assert type fidelity through extended-JSON.
+- [ ] **`bsondump`** — decode a `.bson` produced by `mongodump`; pure-ish, no
+  server needed, but pins the dump format.
+- [ ] **`mongostat` / `mongotop`** — these poll `serverStatus` / `top`; likely
+  reveal stubbed admin commands. Lower priority; may be marked "tool runs,
+  output is best-effort" rather than fully conformant.
+- [ ] **`mongofiles` (GridFS)** — `put` / `get` / `list` against the `fs.*`
+  collections; only if/when GridFS-shaped usage is in scope.
+- [ ] **Compass (GUI)** — Electron, not CLI-automatable in CI. Cover the
+  *operations Compass issues* (schema sample via `$sample`, `$collStats`,
+  `dbStats`, index list, `explain`) as headless command tests rather than
+  driving the GUI. Track separately; document any command it needs that's
+  stubbed.
+
+Wire each into a `validate-tools` invoke task (or extend `validate-all`), gate
+in the weekly `validate.yml`, and record per-tool caveats in
+`/conformance-gauges` the way the driver gauges already do. Where a tool needs a
+command that's currently stubbed (§1) or admin-only, file the gap here as it
+surfaces.
+
 ## 4. Out of scope (intentional, with reasoning)
 
 These are explicit non-goals. Don't add them without a reason.
@@ -92,6 +130,316 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 ### P2 — polish
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
+
+## 7. Python → Rust rewrite (in progress)
+
+Tracking the incremental rewrite (plan: `tasks/rust-rewrite-plan.md`; Phase 0
+spike results: `tasks/rust-rewrite-spike-findings.md`; Phase 3+4 scoping:
+`tasks/rust-rewrite-phase3-scoping.md`). The Rust core lives at
+`crates/secantus-core` and builds as an abi3 extension `_secantus_core` via
+maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
+
+**Both engines are permanent (not a replacement).** The pure-Python engines are
+always present and the default; the Rust core is an optional accelerator.
+Selection is process-wide via `secantus.engine` (the `SECANTUS_ENGINE` env var
+/ `SecantusDBServer(engine=...)` / `--engine`), with per-component overrides
+(`SECANTUS_RUST_<COMPONENT>`). So the old "flip the default to Rust" items below
+mean "make Rust the *recommended* default for users who install the extension,"
+never "remove Python."
+
+- [x] **Engine selection** — `secantus.engine` is the single source of truth
+  (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six
+  shims consult it; `SecantusDBServer(engine=)` + `--engine` set it. Unit-tested
+  by `tests/test_engine.py` (WT-independent).
+- [x] **CI validates the Rust core** — `.github/workflows/test.yml` has a `rust`
+  job (Linux, py3.12) that builds `_secantus_core`, runs `cargo fmt`/`clippy
+  -D warnings`/`test`, the engine-parity suites, **and the full pytest suite
+  under `SECANTUS_ENGINE=rust`** (the real differential check through pymongo /
+  WiredTiger). Before this, CI built neither the extension nor selected the Rust
+  engine, so the parity suites `importorskip`'d and the rewrite was effectively
+  un-validated by CI. Note: the workflow triggers only on push/PR to `main`, so
+  this job first runs when the rewrite branch opens a PR / merges — watch its
+  first run (the YAML couldn't be exercised in the WT-less dev sandbox).
+- [x] **Phase 0 spikes** — BSON fidelity, WiredTiger FFI, sortkey golden
+  vectors all green (`rust/`, `rust/run_spikes.sh`).
+- [x] **GIL release + benchmark** — every `#[pyfunction]` now wraps its pure-Rust
+  compute in `Python::allow_threads` (BSON decode stays GIL-held since it borrows
+  the Python buffers; the work runs GIL-free). `benchmarks/engine_bench.py` +
+  `benchmarks/RESULTS.md` quantify it. **Findings:** (1) the byte seam does *not*
+  eat the win — even paying `bson.encode`/`decode` per call, the Rust path is
+  ~2× faster on the leaf ops and ~8× on the pipeline single-threaded; (2) GIL
+  release parallelises only *coarse* calls — the pipeline scales ~1.5× on 2
+  threads, but cheap per-op leaf calls regress under concurrency (per-call
+  GIL release/re-acquire + GIL-held encode/decode dominate the tiny compute and
+  ping-pong the GIL). **Implication:** the next real throughput lever for CRUD is
+  **coarsening the seam** — batch the per-doc hot loops into one Rust call
+  (`query_matches_batch`, `apply_update_batch`) so one GIL release covers many
+  docs, the way `apply_pipeline` already does — not more operator coverage. Track
+  with the benchmark; validate under a real concurrent server load (needs WT).
+- [x] **Batched seam — prototyped and proven across all three CRUD engines.**
+  `query_matches_batch` / `apply_update_batch` / `apply_projection_batch` (Rust)
+  + `query.matches_batch` / `update.apply_update_batch` /
+  `projection.apply_projection_batch` (shims) each do a whole list in one seam
+  crossing (one GIL release for all N), whole-batch fallback to per-doc Python if
+  any doc defers. Benchmark: each is faster single-threaded (1.06–1.23×) *and*
+  fixes the multi-thread regression — per-doc anti-scales (~0.10–0.15× at 4
+  threads) while the batch path *scales* (1.11–1.44×), **~10–12× more docs/s
+  under 4-thread concurrency**. Parity: `test_batch_matches_parity` /
+  `test_batch_apply_parity` / `test_batch_projection_parity` (batch results equal
+  per-doc; the whole batch defers iff any doc would). Remaining (needs WT to land
+  + measure): wire storage's scan / multi-update / projection paths to the
+  `*_batch` shims; then the bytes-in/bytes-out variant (§4 step 2) that skips the
+  per-doc Python decode entirely.
+- [x] **Phase 1, leaf engine #1: `sortkey`** — ported to Rust behind the fat
+  byte seam; pure-Python `secantus.sortkey` delegates when
+  `SECANTUS_RUST_SORTKEY=1`. Parity pinned by `tests/test_rust_sortkey_parity.py`
+  (curated + 2000-case fuzz, byte-identical).
+- [ ] **Make Rust the *recommended* default (Python stays available).**
+  Currently every component defaults to Python; `SECANTUS_ENGINE=rust` opts in.
+  Recommending Rust by default for extension-having installs requires: (a) the
+  extension shipped in the wheel (Phase 6 packaging — two native build systems
+  to merge), and (b) a decision on the byte seam's per-call
+  `bson.encode({"v": value})` overhead vs passing values without re-encoding.
+  The Python engine remains a permanent, selectable mode regardless.
+- [x] **Collation (query matcher).** `crates/secantus-core/src/collation.rs`
+  implements the ASCII-safe, Unicode-version-independent cases (case-insensitive
+  ASCII = ASCII-lowercase; accent-strip is a no-op on ASCII; strength-3 identity
+  handles any string); threaded through the Rust query matcher's string `$eq`/
+  `$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`. `query.matches` now delegates to
+  Rust *with* a collation, which defers to Python for non-ASCII-under-transform
+  and `numericOrdering`. Parity: `tests/test_rust_query_parity.py` collation
+  cases + 4000-case fuzz.
+- [x] **Collation-aware sortkey in Rust.** `sortkey.encode_value` /
+  `encode_value_directed` thread a collation through to the Rust encoder
+  (`collation::normalize_index_bytes`, where `numericOrdering` is the raw-bytes
+  identity — matching Python's `_encode_string` skipping normalisation when
+  `supports_index_encoding` is false). ASCII normalisation is reproduced;
+  non-ASCII transforms defer to Python. Parity:
+  `tests/test_rust_sortkey_parity.py` collation cases.
+- [x] **Phase 1, leaf engine #2: `query.matches`** — common operators ported
+  to Rust (`crates/secantus-core/src/query.rs` + `numeric.rs`) behind the byte
+  seam; `secantus.query.matches` delegates when `SECANTUS_RUST_QUERY=1` (now
+  including collation — see the collation item above). The Rust matcher returns
+  `None` (→ pure-Python fallback) for anything not reproduced faithfully:
+  `$jsonSchema`, geo,
+  **any regex**, `$all`, structural/compound equality (array/doc operands),
+  bool-as-int comparison, exotic BSON types. Parity pinned by
+  `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).
+- [ ] **Widen the Rust query matcher** — `$all` is now handled (element
+  equality via `expressions::py_eq`; regex elements still defer). Remaining
+  fallbacks to widen where faithful: bool-as-int `$gt`/`$lt` comparison and
+  structural array/doc equality (both need Python's exact quirky semantics).
+- [ ] **Flip `query.matches` default to Rust** — same gating as sortkey
+  (Phase 6 packaging + the per-call `bson.encode` overhead question). Note the
+  matcher re-encodes doc+query per call at the seam; the real win needs the doc
+  to already be bytes at the call site (it is, in storage — wire that through
+  when the boundary moves outward).
+- [x] **Phase 1, leaf engine #3: `update.apply_update`** — the common
+  deterministic operators ported to Rust (`crates/secantus-core/src/update.rs`,
+  with the `secantus.paths` dotted-path helpers): replacement-style, `$set`,
+  `$setOnInsert`, `$unset`, `$inc`, `$mul`, `$push`, `$pop`, `$rename`, plus
+  `_id` immutability. `secantus.update.apply_update` delegates when
+  `SECANTUS_RUST_UPDATE=1`. Returns `None` (→ pure-Python fallback) for pipeline
+  (array) updates, positional ops / array filters, `$currentDate`,
+  `$min`/`$max`/`$pull`/`$addToSet`/`$bit`, Decimal128/non-numeric arithmetic,
+  and every error condition (so the exact `UpdateError`/`PathError` is raised by
+  Python). Parity pinned by `tests/test_rust_update_parity.py` (curated +
+  6000-case fuzz).
+- [ ] **Widen the Rust update matcher** to cover current fallbacks where
+  faithful: `$min`/`$max` (Python `<` cross-type / raise semantics),
+  `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and structural),
+  `$bit`. Each needs care to match Python's exact semantics.
+- [ ] **BEFORE flipping `update` default to Rust: verify field-order on $set of
+  an existing key.** Python `set_path` assigns in place (preserves dict position
+  of an existing field); confirm `bson::Document::insert` on an existing key
+  also preserves position rather than moving it to the end — otherwise a
+  flipped default would reorder fields vs mongod. (Parity test uses dict `==`,
+  which is order-insensitive, so it wouldn't catch this; the full WiredTiger
+  conformance suite would.)
+- [x] **Phase 1, leaf engine #4: `expressions.evaluate`** — a high-value core of
+  the aggregation expression language ported to Rust
+  (`crates/secantus-core/src/expressions.rs`): field paths / `$$var` / `$$ROOT` /
+  `$literal`; comparison (`$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`); logic
+  (`$and`/`$or`/`$not`); control flow (`$cond`/`$ifNull`/`$switch`); arithmetic
+  (`$add`/`$subtract`/`$multiply`/`$divide`/`$mod`); and common array ops
+  (`$size`/`$arrayElemAt`/`$first`/`$last`/`$concatArrays`/`$reverseArray`/`$in`).
+  `secantus.expressions.evaluate` delegates when `SECANTUS_RUST_EXPR=1`. Because
+  expressions are recursive, the evaluator returns `None` (whole-call fallback)
+  if ANY operator/value in the tree isn't ported. Parity pinned by
+  `tests/test_rust_expressions_parity.py` (curated + 8000-case nested fuzz).
+  **This also unlocked `$expr` in the Rust query matcher** (it now calls the Rust
+  evaluator directly, Rust->Rust) — `query_matches` gained a `vars` arg threaded
+  through `$expr`.
+- [x] **Date arithmetic** — `$dateAdd`/`$dateSubtract`/`$dateDiff`/`$dateTrunc`
+  ported via dependency-free civil-date math (`days_from_civil` inverse +
+  `days_in_month`), UTC, bounded to Python's datetime range (out-of-range
+  defers). The 8000-case date fuzz caught three real Python-semantics quirks:
+  `$dateDiff second` truncates toward zero (`int(total_seconds())`) while
+  hour/minute floor (`// n`); `$dateTrunc` truncates the *field* (keeping
+  higher fields) not the total-since-midnight; and the sub-day `$dateDiff`
+  units route through Python's lossy `timedelta.total_seconds()`
+  (`total_microseconds / 10**6`, an int/int correctly-rounded divide) — Rust
+  reproduces the same single-rounding float path, guarded to `|total_us| <=
+  2**53` (where the `as f64` conversion is exact) and deferring extreme dates
+  to Python so the double-rounding can't diverge.
+- [ ] **Remaining expression operators are principled defers** (cannot be
+  reproduced without a fidelity risk; all run pure-Python): regex
+  (`$regexMatch`/`$regexFind`/`$regexFindAll` — Python `re`);
+  `$dateToString`/`$dateFromString` (`strftime`/`strptime` + timezones);
+  `$convert`/`$toDecimal` and float-`str()` / string→number / Decimal128
+  conversion edges; `$round`/`$pow`/`$trunc` (rounding mode) and the
+  transcendentals `$exp`/`$ln`/`$log`/`$log10` (last-ULP vs Python's libm);
+  `$sortArray` (Python `sorted()` ordering/stability, raises on mixed types);
+  `$rand` (non-deterministic); non-ASCII `$toLower`/`$toUpper` and
+  default-whitespace `$trim`. Each is a deliberate fallback, not a gap.
+- [x] **Widen the Rust expression evaluator** — now also handled:
+  `$slice`/`$indexOfArray`; ASCII `$concat`/`$toLower`/`$toUpper`/`$strLenCP`/
+  `$split`/`$substrCP`; `$mergeObjects`/`$objectToArray`; the scope-introducing
+  `$let`/`$map`/`$filter`/`$reduce`; and UTC date component extractors
+  (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/`$dayOfWeek` +
+  `$dateToParts`, via a dependency-free civil-date algorithm); a safe subset of
+  conversions (`$toInt`/`$toDouble`/`$toBool`/`$toString` for numbers/bools/
+  strings); exactly-deterministic math (`$abs`/`$floor`/`$ceil`/`$sqrt`); and
+  `$range`/`$strLenBytes`/`$arrayToObject`; and the date-arithmetic ops
+  `$dateAdd`/`$dateSubtract`/`$dateDiff`/`$dateTrunc` (UTC, civil-date math —
+  see the "Date arithmetic" item). Remaining whole-call fallbacks to widen
+  where faithful: `$dateToString`/`$dateFromString` (timezones, `strftime`/
+  `strptime`); `$round`/`$pow`/`$trunc` (rounding mode) and transcendental math
+  (`$exp`/`$ln`/`$log`/`$log10` — last-ULP divergence risk vs Python's libm);
+  the conversion edges deferred above (Decimal128, string→number parsing, float
+  `str()`, `$convert`/`$toDecimal`); `$sortArray` (uses Python `sorted()`
+  ordering/stability + raises on mixed types); and non-ASCII case /
+  default-whitespace `$trim` (defer for Unicode-fidelity safety). Regex ops
+  (`$regexMatch`/…) need Python `re`. Done recently: string index/byte ops,
+  `$getField`/`$setField`, `$zip`.
+- [x] **Phase 1, leaf engine #5: `projection.apply_projection`** — inclusion /
+  exclusion / `$slice` / `$elemMatch` projection shapes ported to Rust
+  (`crates/secantus-core/src/projection.rs`). `secantus.projection` delegates
+  when `SECANTUS_RUST_PROJECTION=1`; returns `None` for mixed inclusion/exclusion
+  (Python raises), nested-document specs, unusual `$slice` arg types, and
+  `$elemMatch` sub-filters the matcher defers. Parity:
+  `tests/test_rust_projection_parity.py` (curated + 6000-case fuzz).
+- [x] **Phase 1, leaf engine #6: `diff.compute_update_description`** — the
+  change-stream `$v: 2` update diff ported to Rust
+  (`crates/secantus-core/src/diff.rs`), reusing the expression engine's Python-`==`
+  semantics. `secantus.diff` delegates when `SECANTUS_RUST_DIFF=1`; defers on
+  Decimal128 / exotic values. Parity: `tests/test_rust_diff_parity.py` (curated +
+  6000-case fuzz).
+- [ ] **Shared path write helpers** (`set_path`/`unset_path`) now live in
+  `paths.rs` alongside the read helpers; `update.rs` keeps a thin `Fallback`-
+  mapping wrapper. (Note for the eventual default-flip: same `bson::Document`
+  field-order question as the update engine applies to projection/diff outputs.)
+- [x] **All six leaf engines are ported** (`collation` landed — see the
+  collation items above). Remaining Phase-1 work is *widening* the
+  already-ported engines (see the per-engine "widen" items above).
+- [x] **Phase 2, aggregation pipeline — first slice.** `apply_pipeline` ported
+  to Rust (`crates/secantus-core/src/aggregate.rs`) behind a list-of-docs byte
+  seam (`{"d": [...]}` / `{"p": [...]}`), reusing the ported leaf engines
+  (`query::matches`, `expressions::evaluate`, the `paths` helpers) so a pure
+  pipeline runs end to end in Rust without re-entering Python per stage / per
+  doc. Stages handled: `$match`, `$limit`, `$skip`, `$count`, `$project`
+  (inclusion / exclusion / computed, mirroring `_project_one`'s mapping-only
+  `_path_present`), `$addFields`/`$set`, `$unset`, `$replaceRoot`/`$replaceWith`.
+  `secantus.aggregate.apply_pipeline` delegates when `SECANTUS_RUST_AGGREGATE=1`.
+  **Graceful whole-pipeline fallback:** any unported stage or any deferred inner
+  expression makes `apply_pipeline` return `None` and the pure-Python pipeline
+  runs. Parity: `tests/test_rust_aggregate_parity.py` (curated + 4000-case fuzz).
+- [x] **Widen the pipeline: `$sort` + `$unwind`.** `$sort` ported via a faithful
+  cross-type BSON comparator (`crates/secantus-core/src/order.rs`, mirroring
+  `_bson_lt` / `_bson_type_rank` — type ranks, doc/array recursion, the unified
+  numeric type incl. NaN-is-equal). **Subtlety that drives the fidelity gate:**
+  `sort_docs` wraps keys in `_SortKey` whose `__eq__` is Python `==` (so
+  `False == 0`, `True == 1`, `1 == 1.0`) but whose `__lt__` is rank-based
+  `_bson_lt`; a tuple sort advances to the next field only when `==` is True, so
+  the comparator is *non-transitive* whenever `bool`/`NaN` mix with numbers (or
+  the `==`-False-but-`<`-both-False types — Binary-with-subtype / Timestamp /
+  Regex / Min/MaxKey appear). `order::is_sortable` therefore only green-lights
+  the types where Python `==` agrees with `cmp == Equal` (null / non-NaN numbers
+  / string / datetime / ObjectId / docs+arrays thereof) and defers the rest
+  (bool, NaN, Decimal128, Binary, Timestamp, Regex, Min/MaxKey, exotic) to
+  Python's Timsort. Single + multi-field, both directions, stable. `$unwind`
+  ported (string + doc spec, `includeArrayIndex`, `preserveNullAndEmptyArrays`,
+  missing/null/non-array/empty edges). **Refactor:** the pure comparator moved
+  out of `storage.py` into a new I/O-free `secantus.ordering` module
+  (`sort_docs`/`_bson_lt`/`_bson_type_rank`/`_SortKey`/`_to_decimal`; `storage`
+  re-exports them) so `sort_docs` is importable without the WiredTiger
+  extension — matching the pure-operator-engine layering. Parity:
+  `tests/test_rust_aggregate_parity.py` (mixed-type sort corpus + fuzz with
+  arrays / mixed-type fields).
+- [x] **Widen the pipeline: `$group` + `$sortByCount`.** Ported in
+  `crates/secantus-core/src/group.rs`. **Group-key bucketing** matches Python's
+  dict semantics — each `_id` value is canonicalised into a hashable `GKey`
+  (numbers + bool normalised through `numeric::NumVal`, so `1 == 1.0 == True`
+  collapse into one bucket; docs/arrays recurse via `_hashable`'s key-sorted
+  tuple) preserving first-seen `_id` and insertion order; key types we can't
+  canonicalise faithfully (Decimal128, NaN, Binary/Timestamp/Regex/Min/MaxKey,
+  exotic) defer. **Accumulators** reproduce Python's exact semantics:
+  `$sum`/`$count`/`$avg` (running int-vs-float via a `Num` enum; `$avg` is
+  always a double and the field stays *absent* when no non-null value is seen —
+  matching the pure code that never creates the bucket key; non-numeric operands
+  `TypeError` → defer); `$min`/`$max` (native `<`/`>` via `expressions::py_order`
+  — cross-type pairs that Python would raise on → defer, not guess; null is a
+  no-op that never "unsets"); `$first`/`$last`/`$push`; `$addToSet` (membership
+  via Python `==` / `expressions::py_eq`). `$sortByCount` = group + stable count-
+  descending sort. Validated across the in-repo curated + 5-seed fuzz **and** 8
+  extra local seeds (~1,650–1,730 group/sortByCount pipelines handled per 4000,
+  zero mismatches). `numeric::NumVal` gained `Eq + Hash`; `expressions::py_order`
+  /`py_eq` are now `pub`.
+- [x] **Widen the pipeline: `$bucket` + `$facet`.** `$bucket`
+  (`group::bucket_stage`) places each doc into the half-open boundary range
+  `boundaries[i] <= value < boundaries[i+1]` using `expressions::py_order`
+  (Python's native `<=`/`<`, so cross-type / Decimal128 / array-doc boundaries
+  defer rather than guess; NaN / TypeError fall through to `default`), then runs
+  the `output` accumulators per bucket (reusing the `$group` accumulator
+  machinery via `accumulate_into`). Reproduces the pure quirks: empty buckets
+  emit only `{_id}` (accumulator fields are never created), an explicit `null`
+  default counts as absent, missing/empty `output` falls back to
+  `{count: {$sum: 1}}`, and pathological Python-equal bucket keys defer (the dict
+  would collapse them). `$facet` (`aggregate::facet_stage`) runs each named
+  sub-pipeline over a clone of the input via the recursive `apply_pipeline` and
+  collects the results — any sub-pipeline that defers defers the whole stage.
+  Validated across curated cases + the 5-seed in-repo fuzz **and** 8 extra local
+  seeds (~500–580 `$bucket` and ~370–410 `$facet` pipelines handled per 5000,
+  zero mismatches).
+- [x] **Widen the pipeline: `$densify` (numeric path).** `densify::densify_stage`
+  ports the numeric densify — partition the docs (Python dict semantics via the
+  shared `group::GKey`), sort each partition by the numeric field, and fill every
+  multiple of `step` strictly between the bounds (`"full"`/`"partition"` = the
+  partition's observed min/max; explicit `[lo, hi]`). The cursor arithmetic
+  mirrors Python exactly (a `Num{Int,Float}` enum so `int + int` stays int and
+  widens to f64 once a float enters; `_densify_canon` collapses an
+  integer-valued float filler back to an int), and the `existing_values`
+  membership reproduces the set's `1 == 1.0 == True` collision via
+  `numeric::NumVal`. The no-input-docs-with-explicit-bounds case and the
+  "originals at/beyond `hi`" tail are reproduced. **Defers** to Python: any
+  `range.unit` (date densify — fixed-duration `timedelta` *and* variable-length
+  `relativedelta` month/quarter/year), non-numeric field values / bounds /
+  partition keys (Python's `sorted` / comparisons would raise), and explicit
+  bounds that would emit > 1M fillers (Python raises). `numeric::from_int` /
+  `from_f64` and `group::gkey`/`GKey` are now exposed. Validated across curated
+  cases + a dedicated 4000-case densify fuzz in-repo **and** 8 extra local seeds
+  (5000 densify pipelines each, all handled, zero mismatches).
+- [ ] **Pipeline: only the storage-backed stages remain.** Every pipeline stage
+  that doesn't touch `Storage` is now ported. Still deferring to Python:
+  `$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge` (read/write collections via
+  `ctx.storage`), non-deterministic `$sample`, and date-unit `$densify`. These
+  wait for Phase 3+ (storage / wire / dispatch into Rust) per
+  tasks/rust-rewrite-plan.md. Also still open: `$sort` defers on bool / NaN sort
+  keys (the non-transitive `_SortKey` cases above) — reproducing Python's exact
+  Timsort comparison sequence would widen it, but the risk/reward is poor.
+
+### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
+
+Found by the parity test; both changed the **on-disk index-key bytes** for the
+affected values (immaterial for ephemeral test data, but note it):
+
+- **Date keys** used `int(total_seconds() * 1000)`, a float path that rounded
+  sub-second values off by up to 1ms vs the integer millis BSON actually stores
+  (and mongod sorts by). Now integer-exact.
+- **Regex keys** did `bytes(r.flags)`, which — because a BSON-round-tripped
+  `Regex.flags` is an *int* — produced N NUL bytes instead of the option string
+  (e.g. flags=10 → ten NULs instead of `"im"`). Now reconstructs the option
+  chars in pymongo's on-wire order (`ilmsux`).
 
 ---
 

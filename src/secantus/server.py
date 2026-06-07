@@ -82,7 +82,15 @@ class SecantusDBServer:
         tls_key_file: str | None = None,
         tls_ca_file: str | None = None,
         tls_require_client_cert: bool = False,
+        engine: str | None = None,
     ) -> None:
+        # Engine selection is process-wide (see ``secantus.engine``). ``None``
+        # leaves the current selection (SECANTUS_ENGINE env / default Python)
+        # untouched; "python" / "rust" / "auto" set it for the whole process.
+        if engine is not None:
+            from secantus import engine as _engine
+
+            _engine.set_engine(engine)
         self.host = host
         self.port = port
         self.replica_set_name = replica_set_name

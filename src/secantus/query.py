@@ -7,11 +7,45 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
+import bson
 from bson import Binary, Decimal128, Int64, ObjectId, Regex
 
+from secantus import engine
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
 from secantus.collation import equal as _coll_equal
+
+# The Rust core ports the common query operators behind the byte seam (doc +
+# query cross as BSON bytes). The Rust matcher returns None for anything it
+# can't reproduce faithfully (collation, $jsonSchema, geo, any regex,
+# structural/compound equality, exotic BSON types), in which case we fall
+# through to the pure-Python matcher below. Both engines are supported;
+# selection is process-wide via ``secantus.engine``. Pure Python is the default
+# and the only path when a collation is in effect. Parity is pinned by
+# tests/test_rust_query_parity.py.
+try:
+    import _secantus_core as _rust
+except ImportError:
+    _rust = None
+
+
+def _rust_query_enabled() -> bool:
+    return _rust is not None and engine.enabled("query")
+
+
+def _collation_to_bson(collation: Collation | None) -> bytes:
+    # Wire form for the Rust core: {strength, caseLevel, numericOrdering}, or an
+    # empty doc for "no collation". The Rust side handles the ASCII-safe cases
+    # and returns None (-> pure-Python fallback) for non-ASCII / numericOrdering.
+    if collation is None:
+        return bson.encode({})
+    return bson.encode(
+        {
+            "strength": int(collation.strength),
+            "caseLevel": bool(collation.case_level),
+            "numericOrdering": bool(collation.numeric_ordering),
+        }
+    )
 
 
 class _Missing:
@@ -42,7 +76,53 @@ def matches(
 ) -> bool:
     if not query:
         return True
+    if _rust_query_enabled():
+        try:
+            result = _rust.query_matches(
+                bson.encode(dict(doc)),
+                bson.encode(dict(query)),
+                bson.encode(dict(vars) if vars else {}),
+                _collation_to_bson(collation),
+            )
+        except Exception:
+            # Any encode/decode hiccup: fall through to the pure-Python path
+            # rather than surfacing a Rust-side error.
+            result = None
+        if result is not None:
+            return result
     return all(_match_clause(doc, k, v, vars, collation) for k, v in query.items())
+
+
+def matches_batch(
+    docs: list[Mapping[str, Any]],
+    query: Mapping[str, Any],
+    *,
+    vars: dict[str, Any] | None = None,
+    collation: Collation | None = None,
+) -> list[bool]:
+    """Filter ``docs`` against ``query`` in one shot.
+
+    When the Rust engine is enabled this crosses the byte seam **once** for the
+    whole list (a single GIL release covers every doc), instead of paying the
+    per-call seam + GIL handoff per document — which is what makes per-doc
+    matching scale poorly under concurrency (see ``benchmarks/``). Falls back to
+    the per-doc pure-Python matcher when Rust isn't enabled or the query defers.
+    """
+    if not query:
+        return [True] * len(docs)
+    if _rust_query_enabled():
+        try:
+            res = _rust.query_matches_batch(
+                bson.encode({"d": [dict(d) for d in docs]}),
+                bson.encode(dict(query)),
+                bson.encode(dict(vars) if vars else {}),
+                _collation_to_bson(collation),
+            )
+        except Exception:
+            res = None
+        if res is not None:
+            return bson.decode(res)["m"]
+    return [matches(d, query, vars=vars, collation=collation) for d in docs]
 
 
 def _match_clause(
