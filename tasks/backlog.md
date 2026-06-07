@@ -205,15 +205,19 @@ never "remove Python."
   systems into one wheel) is the bridge to the longer-term goal: the Rust side as
   a **first-class standalone Rust package** — a publishable crate and eventually a
   standalone `secantusdb` server binary.
-- [ ] **Release-process: publish `secantus-core` in lockstep.** The
+- [ ] **One-time: configure a PyPI Trusted Publisher for `secantus-core`.**
+  On PyPI, add a Trusted Publisher for the (new) `secantus-core` project pointing
+  at `.github/workflows/rust-wheels.yml` (environment `pypi`), mirroring the
+  `secantus` setup. Until this exists the tag-gated `publish` job fails auth; the
+  `build`/`sdist` jobs run on every push/PR and are already CI-validated, so this
+  is the only thing blocking the first published `secantus-core` wheel.
+- [ ] **Release-process: bump & publish `secantus-core` in lockstep.** The
   `secantus[rust]` extra pins `secantus-core` to the exact SecantusDB version, so
-  a release must (a) bump BOTH `pyproject.toml` versions (root + `crates/
-  secantus-core/pyproject.toml`) and the `rust` extra pin, and (b) publish both.
-  Wire this into the `/secantusdb-release` skill, and configure a **PyPI Trusted
-  Publisher for the `secantus-core` project** (one-time) pointing at
-  `rust-wheels.yml` — until then the publish job will fail auth. The
-  `rust-wheels.yml` build/sdist jobs run on every push/PR and are CI-validated;
-  only the tag-gated `publish` job needs the PyPI setup.
+  every release must (a) bump BOTH versions — root `pyproject.toml` and
+  `crates/secantus-core/pyproject.toml` — and the `rust` extra pin in the root
+  pyproject, and (b) publish both wheels. Wire this into the `/secantusdb-release`
+  skill so the two can never drift (the `secantus[rust]` install breaks if the
+  matching `secantus-core` version isn't on PyPI).
 - [ ] **Toward a standalone Rust package (the "ultimately a Rust package" goal).**
   Today `crates/secantus-core` is one crate that *is* the PyO3 extension. To let
   the Rust side stand on its own (reused by a future standalone server binary
