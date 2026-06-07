@@ -194,13 +194,41 @@ never "remove Python."
   byte seam; pure-Python `secantus.sortkey` delegates when
   `SECANTUS_RUST_SORTKEY=1`. Parity pinned by `tests/test_rust_sortkey_parity.py`
   (curated + 2000-case fuzz, byte-identical).
+- [x] **Packaging decision: ship the Rust core as a separate optional package**
+  (not bundled into the `secantus` wheel). `crates/secantus-core` is a real
+  `secantus-core` package (proper metadata, version **lockstep** with SecantusDB);
+  `pip install "secantus[rust]"` pulls it via the new `rust` extra
+  (`secantus-core==<this version>`); `.github/workflows/rust-wheels.yml` builds
+  the abi3 wheels (maturin-action) across the macOS-arm64 / linux-x86_64 /
+  linux-aarch64 / windows matrix + an sdist, and publishes on a release tag via
+  trusted publishing. Keeping it separate (vs. merging the two native build
+  systems into one wheel) is the bridge to the longer-term goal: the Rust side as
+  a **first-class standalone Rust package** — a publishable crate and eventually a
+  standalone `secantusdb` server binary.
+- [ ] **Release-process: publish `secantus-core` in lockstep.** The
+  `secantus[rust]` extra pins `secantus-core` to the exact SecantusDB version, so
+  a release must (a) bump BOTH `pyproject.toml` versions (root + `crates/
+  secantus-core/pyproject.toml`) and the `rust` extra pin, and (b) publish both.
+  Wire this into the `/secantusdb-release` skill, and configure a **PyPI Trusted
+  Publisher for the `secantus-core` project** (one-time) pointing at
+  `rust-wheels.yml` — until then the publish job will fail auth. The
+  `rust-wheels.yml` build/sdist jobs run on every push/PR and are CI-validated;
+  only the tag-gated `publish` job needs the PyPI setup.
+- [ ] **Toward a standalone Rust package (the "ultimately a Rust package" goal).**
+  Today `crates/secantus-core` is one crate that *is* the PyO3 extension. To let
+  the Rust side stand on its own (reused by a future standalone server binary
+  without dragging in PyO3/CPython), split it into a pure-Rust **core lib crate**
+  (no PyO3 — the engines + `bson`) plus a thin **PyO3 bindings crate** that wraps
+  it. The lib can then publish to crates.io and back a `secantusdb` binary; the
+  bindings crate stays the `secantus-core` wheel. Sequence this with the storage
+  keystone (Phase 4) since the standalone server also needs storage in Rust.
 - [ ] **Make Rust the *recommended* default (Python stays available).**
   Currently every component defaults to Python; `SECANTUS_ENGINE=rust` opts in.
-  Recommending Rust by default for extension-having installs requires: (a) the
-  extension shipped in the wheel (Phase 6 packaging — two native build systems
-  to merge), and (b) a decision on the byte seam's per-call
-  `bson.encode({"v": value})` overhead vs passing values without re-encoding.
-  The Python engine remains a permanent, selectable mode regardless.
+  With the optional package now shipping (above), recommending Rust by default
+  for installs that have the extension still wants: a decision on the byte seam's
+  per-call `bson.encode({"v": value})` overhead vs passing values without
+  re-encoding (see the batching work in `benchmarks/`). The Python engine remains
+  a permanent, selectable mode regardless.
 - [x] **Collation (query matcher).** `crates/secantus-core/src/collation.rs`
   implements the ASCII-safe, Unicode-version-independent cases (case-insensitive
   ASCII = ASCII-lowercase; accent-strip is a no-op on ASCII; strength-3 identity
