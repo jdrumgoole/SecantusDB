@@ -46,6 +46,44 @@ Single-node change streams are implemented and conformant for typical pymongo `w
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
+### 3.3 MongoDB CLI / tool conformance tests
+
+The deck now claims SecantusDB works with the standard MongoDB toolchain (it
+speaks the wire protocol, so in principle they all connect). That claim is
+currently **unverified by an automated test** — the conformance gauges cover the
+five language *drivers*, not the CLI tools. Add tool-level gauges that start a
+standalone SecantusDB on an ephemeral port and drive each tool against its
+`MONGODB_URI`, asserting real round-trips (mirroring the per-driver gauge
+pattern in `/conformance-gauges` and `invoke validate*`).
+
+- [ ] **`mongosh` (shell)** — `mongosh "$URI" --eval '…'` / `--file script.js`:
+  insert / find / aggregate / `db.runCommand`, JSON output asserted. The most
+  important one — it exercises the handshake + a broad command surface.
+- [ ] **`mongodump` / `mongorestore`** — the headline round-trip: seed a DB,
+  `mongodump`, `db.dropDatabase()`, `mongorestore`, assert the collections /
+  docs / indexes come back identical (BSON-level, including `_id` types). This
+  also exercises `listCollections` / `listIndexes` / oplog-free dump paths.
+- [ ] **`mongoimport` / `mongoexport`** — JSON and CSV/TSV round-trip of a
+  collection; assert type fidelity through extended-JSON.
+- [ ] **`bsondump`** — decode a `.bson` produced by `mongodump`; pure-ish, no
+  server needed, but pins the dump format.
+- [ ] **`mongostat` / `mongotop`** — these poll `serverStatus` / `top`; likely
+  reveal stubbed admin commands. Lower priority; may be marked "tool runs,
+  output is best-effort" rather than fully conformant.
+- [ ] **`mongofiles` (GridFS)** — `put` / `get` / `list` against the `fs.*`
+  collections; only if/when GridFS-shaped usage is in scope.
+- [ ] **Compass (GUI)** — Electron, not CLI-automatable in CI. Cover the
+  *operations Compass issues* (schema sample via `$sample`, `$collStats`,
+  `dbStats`, index list, `explain`) as headless command tests rather than
+  driving the GUI. Track separately; document any command it needs that's
+  stubbed.
+
+Wire each into a `validate-tools` invoke task (or extend `validate-all`), gate
+in the weekly `validate.yml`, and record per-tool caveats in
+`/conformance-gauges` the way the driver gauges already do. Where a tool needs a
+command that's currently stubbed (§1) or admin-only, file the gap here as it
+surfaces.
+
 ## 4. Out of scope (intentional, with reasoning)
 
 These are explicit non-goals. Don't add them without a reason.
