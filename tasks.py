@@ -137,6 +137,24 @@ def rust_parity(c: Context) -> None:
     )
 
 
+# The WiredTiger FFI / storage foundation (Phase 4) is a standalone crate outside
+# the secantus-core workspace because it links the vendored WiredTiger C library.
+_RUST_WT_DIR = "crates/secantus-wt"
+
+
+@task(name="rust-wt-test")
+def rust_wt_test(c: Context) -> None:
+    """fmt/clippy/test the secantus-wt WiredTiger FFI crate.
+
+    Needs WiredTiger present: either set SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB,
+    or have it under build/*/wt-build (the project CMake output) or /tmp/wt-build.
+    bindgen needs libclang (set LIBCLANG_PATH if not auto-found).
+    """
+    c.run(f"cd {_RUST_WT_DIR} && cargo fmt --check", pty=True)
+    c.run(f"cd {_RUST_WT_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
+    c.run(f"cd {_RUST_WT_DIR} && cargo test", pty=True)
+
+
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(

@@ -227,12 +227,30 @@ never "remove Python."
   the `_secantus_core` extension / `secantus-core` wheel via maturin. All 62
   engine unit tests, clippy (`-D warnings`), and the maturin wheel build pass; the
   wheel is byte-for-byte the same `secantus_core-<ver>` distribution.
-- [ ] **Toward a standalone Rust package (continued).** With the split done, the
-  remaining steps to "ultimately a Rust package": (a) settle the `secantus-core`
-  lib's public API and flip `publish = false` → publish to crates.io; (b) add a
-  `secantusdb` **binary crate** (a thin `main` over the engines + storage) — this
-  is gated on the storage keystone (Phase 4), since a standalone server also needs
-  storage in Rust, not just the operator engines.
+- [x] **Phase 4 sub-phase 0 — WiredTiger FFI foundation (`crates/secantus-wt`).**
+  Safe Rust bindings over the vendored WiredTiger C lib (bindgen + `build.rs`):
+  `Connection`/`Session`/`Cursor`, the key formats SecantusDB uses
+  (`SS`/`SSu`/`SSS`/`SSSu`/`q`/`S`/`u`), `WT_NOTFOUND`/`WT_DUPLICATE_KEY`/
+  `WT_ROLLBACK` translation, transactions. Verified against real WiredTiger
+  (insert / byte-order scan / point search / NOTFOUND / update / remove / numeric
+  `q` ordering / commit+rollback / on-disk reopen); `cargo fmt` + `clippy -D
+  warnings` clean (`invoke rust-wt-test`). Excluded from the `crates` workspace so
+  the green `secantus-core` CI is untouched. Scoping/status:
+  `tasks/rust-rewrite-phase4-scoping.md`.
+- [ ] **Phase 4 — storage keystone (continued).** Next: sub-phase 1 (the CRUD
+  core — `secantus_collections` + `secantus_documents` tables, find-by-`_id`,
+  natural-order scan, `id_key` via the ported `sortkey`, the lock discipline,
+  `:memory:` + reopen) gated on `test_storage.py`/`test_crud.py`; then indexes,
+  geo, oplog/change-streams. **Phase go/no-go gate:** ship the WiredTiger-linking
+  extension across the wheel matrix (likely by reusing the scikit-build CMake WT
+  build rather than maturin's manylinux container) + a CI job that builds WT then
+  runs `secantus-wt`'s tests. See the scoping doc.
+- [ ] **Toward a standalone Rust package (continued).** With the lib/bindings
+  split done, the remaining steps to "ultimately a Rust package": (a) settle the
+  `secantus-core` lib's public API and flip `publish = false` → publish to
+  crates.io; (b) add a `secantusdb` **binary crate** (a thin `main` over the
+  engines + storage) — gated on the storage keystone (Phase 4 above), since a
+  standalone server also needs storage in Rust, not just the operator engines.
 - [ ] **Make Rust the *recommended* default (Python stays available).**
   Currently every component defaults to Python; `SECANTUS_ENGINE=rust` opts in.
   With the optional package now shipping (above), recommending Rust by default
