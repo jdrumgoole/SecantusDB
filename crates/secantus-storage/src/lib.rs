@@ -435,6 +435,15 @@ fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
     }
 }
 
+/// True if `query` is at least as restrictive as `partial` — every key/value
+/// pair in `partial` appears with the same *bare* value in `query`.
+/// Conservative: operator-form clauses or document-level operators in the query
+/// don't count as implying the partial filter. Mirrors
+/// `storage._query_implies_partial`.
+fn query_implies_partial(query: &Document, partial: &Document) -> bool {
+    partial.iter().all(|(k, v)| query.get(k) == Some(v))
+}
+
 /// Split a filter into `(eq_fields, operator_field, operator_ops)` for the
 /// compound prefix + trailing-operator shape: any number of bare-equality
 /// fields plus exactly one operator-form field whose ops are all in
@@ -1346,7 +1355,7 @@ impl Storage {
             return Ok(None);
         }
         let (field, value) = filter.iter().next().unwrap();
-        let idx = match self.find_leading_field_index(session, db, coll, field)? {
+        let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -1356,39 +1365,48 @@ impl Storage {
     /// The best index whose leading field is `field`, as `(name, direction,
     /// is_compound)`. Single-field indexes win over compound (tighter scan);
     /// otherwise the first compound index with that leading field is the
-    /// fallback. Skips non-`1`/`-1` directions (geo / text / hashed). (Partial /
-    /// collation gating is slice 2e.) Multikey indexes are NOT skipped —
-    /// per-element entries cover the lookup, and `find_matching` re-checks with
-    /// `matches()`. Mirrors `storage._find_leading_field_index`.
+    /// fallback. Skips non-`1`/`-1` directions (geo / text / hashed) and partial
+    /// indexes the `query` doesn't imply. (Collation gating is deferred.)
+    /// Multikey indexes are NOT skipped — per-element entries cover the lookup,
+    /// and `find_matching` re-checks with `matches()`. Mirrors
+    /// `storage._find_leading_field_index`.
     fn find_leading_field_index(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         field: &str,
+        query: &Document,
     ) -> Result<Option<(String, i32, bool)>> {
         let mut compound_fallback: Option<(String, i32, bool)> = None;
-        for (name, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
-            let n_fields = key_spec.len();
-            let (f0, _) = match key_spec.iter().next() {
-                Some(p) => p,
-                None => continue,
-            };
-            if f0.as_str() != field {
+        for desc in self.index_descs(session, db, coll)? {
+            if let Some(pf) = &desc.partial {
+                if !query_implies_partial(query, pf) {
+                    continue;
+                }
+            }
+            let n_fields = desc.key_spec.len();
+            let leads = desc
+                .key_spec
+                .keys()
+                .next()
+                .is_some_and(|f| f.as_str() == field);
+            if !leads {
                 continue;
             }
-            if !key_spec
+            if !desc
+                .key_spec
                 .values()
                 .all(|v| matches!(direction_of(v), Some(1) | Some(-1)))
             {
                 continue;
             }
-            let d = direction_of(key_spec.get(field).unwrap()).unwrap();
+            let d = direction_of(desc.key_spec.get(field).unwrap()).unwrap();
             if n_fields == 1 {
-                return Ok(Some((name, d, false)));
+                return Ok(Some((desc.name, d, false)));
             }
             if compound_fallback.is_none() {
-                compound_fallback = Some((name, d, true));
+                compound_fallback = Some((desc.name, d, true));
             }
         }
         Ok(compound_fallback)
@@ -1802,7 +1820,7 @@ impl Storage {
             return Ok(None);
         }
         let (field, value) = filter.iter().next().unwrap();
-        let idx = match self.find_leading_field_index(session, db, coll, field)? {
+        let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -1841,8 +1859,11 @@ impl Storage {
 
     /// The index `try_compound_eq_id_keys` would walk for a bare-equality
     /// `filter`: one whose leading fields (set-wise) cover the filter's fields,
-    /// preferring the shortest. `None` if none covers it. Mirrors
-    /// `storage._pick_compound_eq_index`. (Partial / collation gating is 2e.)
+    /// preferring the shortest. A partial index is considered only when the
+    /// filter implies its partial filter, and the partial-filter keys are
+    /// stripped from the effective filter fields (the index guarantees them).
+    /// `None` if none covers it. Mirrors `storage._pick_compound_eq_index`.
+    /// (Collation gating is deferred.)
     fn pick_compound_eq_index(
         &self,
         session: &Session,
@@ -1851,29 +1872,43 @@ impl Storage {
         filter: &Document,
     ) -> Result<Option<(String, Document)>> {
         let filter_fields: HashSet<&str> = filter.keys().map(|s| s.as_str()).collect();
-        let eff_len = filter_fields.len();
         let mut best: Option<(String, Document)> = None;
-        for (name, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
-            if !key_spec
+        for desc in self.index_descs(session, db, coll)? {
+            let eff_fields: HashSet<&str> = match &desc.partial {
+                Some(pf) => {
+                    if !query_implies_partial(filter, pf) {
+                        continue;
+                    }
+                    filter_fields
+                        .iter()
+                        .copied()
+                        .filter(|f| !pf.contains_key(*f))
+                        .collect()
+                }
+                None => filter_fields.clone(),
+            };
+            let eff_len = eff_fields.len();
+            if !desc
+                .key_spec
                 .values()
                 .all(|v| matches!(direction_of(v), Some(1) | Some(-1)))
             {
                 continue;
             }
-            let idx_fields: Vec<&String> = key_spec.keys().collect();
+            let idx_fields: Vec<&String> = desc.key_spec.keys().collect();
             if idx_fields.len() < eff_len {
                 continue;
             }
             let prefix_set: HashSet<&str> =
                 idx_fields[..eff_len].iter().map(|s| s.as_str()).collect();
-            if prefix_set != filter_fields {
+            if prefix_set != eff_fields {
                 continue;
             }
             if best
                 .as_ref()
                 .is_none_or(|(_, b)| b.len() > idx_fields.len())
             {
-                best = Some((name, key_spec.clone()));
+                best = Some((desc.name.clone(), desc.key_spec.clone()));
             }
             if idx_fields.len() == eff_len {
                 break;
@@ -1897,8 +1932,9 @@ impl Storage {
             None => return Ok(None),
         };
         let idx_fields: Vec<&String> = key_spec.keys().collect();
-        // Index-order fields that the filter constrains (partial-filter clauses
-        // live outside the key — not relevant until 2e).
+        // Index-order fields that the filter constrains. Partial-filter clauses
+        // live outside the key (the picker already verified the filter implies
+        // them), so an index field absent from the filter just isn't pinned.
         let prefix_fields: Vec<&String> = idx_fields
             .iter()
             .copied()
@@ -1924,7 +1960,8 @@ impl Storage {
 
     /// The index `try_compound_range_id_keys` would walk: leading equalities
     /// (set-wise) then the operator field as the next column, shortest first.
-    /// `None` if none fits. Mirrors `storage._pick_compound_range_index`.
+    /// A partial index is considered only when the filter implies its partial
+    /// filter. `None` if none fits. Mirrors `storage._pick_compound_range_index`.
     fn pick_compound_range_index(
         &self,
         session: &Session,
@@ -1939,14 +1976,20 @@ impl Storage {
         let eq_set: HashSet<&str> = eq_fields.keys().map(|s| s.as_str()).collect();
         let target = eq_set.len();
         let mut best: Option<(String, Document)> = None;
-        for (name, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
-            if !key_spec
+        for desc in self.index_descs(session, db, coll)? {
+            if let Some(pf) = &desc.partial {
+                if !query_implies_partial(filter, pf) {
+                    continue;
+                }
+            }
+            if !desc
+                .key_spec
                 .values()
                 .all(|v| matches!(direction_of(v), Some(1) | Some(-1)))
             {
                 continue;
             }
-            let idx_fields: Vec<&String> = key_spec.keys().collect();
+            let idx_fields: Vec<&String> = desc.key_spec.keys().collect();
             if idx_fields.len() <= target {
                 continue;
             }
@@ -1962,7 +2005,7 @@ impl Storage {
                 .as_ref()
                 .is_none_or(|(_, b)| b.len() > idx_fields.len())
             {
-                best = Some((name, key_spec.clone()));
+                best = Some((desc.name.clone(), desc.key_spec.clone()));
             }
             if idx_fields.len() == target + 1 {
                 break;
