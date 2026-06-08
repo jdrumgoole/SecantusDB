@@ -7,8 +7,6 @@ go/no-go gate). Build + run it with ``invoke rust-storage-py``.
 
 from __future__ import annotations
 
-import tempfile
-
 import bson
 import pytest
 from bson import ObjectId
