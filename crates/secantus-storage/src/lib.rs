@@ -22,7 +22,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;
 
 use bson::oid::ObjectId;
-use bson::{Bson, Document};
+use bson::spec::BinarySubtype;
+use bson::{Binary, Bson, Document};
 use secantus_core::get_path;
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
@@ -36,9 +37,6 @@ const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
 // Oplog / change-stream tables (Phase 4 sub-phase 3). `q`-keyed (int64 seq) for
 // the oplog + pre-images; a single `S` key ("state") for the recovery metadata.
 const OPLOG_TABLE: &str = "table:secantus_oplog";
-// Pre-image storage is wired up in slice 3c (fullDocumentBeforeChange); the
-// table is bootstrapped now so the on-disk schema is stable.
-#[allow(dead_code)]
 const PREIMAGE_TABLE: &str = "table:secantus_preimages";
 const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 
@@ -737,14 +735,23 @@ impl Storage {
 
     /// Append `entries` to the oplog table, stamping each with its minted `ts`
     /// and a `wall` time, and return the highest seq written (0 if disabled or
-    /// empty). Caller holds `self.lock`. Mirrors `storage._emit_oplog` (pre-image
-    /// writes + the change-stream condvar land in later slices).
-    fn emit_oplog(&self, session: &Session, entries: Vec<Document>) -> Result<i64> {
+    /// empty). `pre_images` is parallel to `entries`; a `Some(bytes)` element is
+    /// stored under the matching seq in the pre-image table. Caller holds
+    /// `self.lock`. Mirrors `storage._emit_oplog` (the change-stream condvar lands
+    /// in 3d).
+    fn emit_oplog(
+        &self,
+        session: &Session,
+        entries: Vec<Document>,
+        pre_images: Vec<Option<Vec<u8>>>,
+    ) -> Result<i64> {
         if !self.enable_oplog || entries.is_empty() {
             return Ok(0);
         }
+        debug_assert_eq!(pre_images.len(), entries.len());
         let (start, ts) = self.mint_seq_and_ts(entries.len());
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut pre_cur: Option<Cursor> = None;
         let wall = Bson::DateTime(bson::DateTime::from_millis(now_millis()));
         let mut last = 0i64;
         for (i, mut entry) in entries.into_iter().enumerate() {
@@ -756,6 +763,16 @@ impl Storage {
             cur.set_key_q(seq);
             cur.set_value_u(&blob);
             cur.insert()?;
+            if let Some(pre) = &pre_images[i] {
+                if pre_cur.is_none() {
+                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
+                }
+                let pc = pre_cur.as_ref().unwrap();
+                pc.reset()?;
+                pc.set_key_q(seq);
+                pc.set_value_u(pre);
+                pc.insert()?;
+            }
             last = seq;
         }
         Ok(last)
@@ -851,6 +868,46 @@ impl Storage {
         self.oplog.lock().unwrap().next_seq - 1
     }
 
+    /// Merge `opts` into the collection's options blob (creating the collection
+    /// if needed) — e.g. `{changeStreamPreAndPostImages: {enabled: true}}`.
+    /// Mirrors `storage.set_collection_options`.
+    pub fn set_collection_options(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+        for (k, v) in opts {
+            current.insert(k.clone(), v.clone());
+        }
+        write_coll_options(&session, db, coll, &current)
+    }
+
+    /// The collection's 16-byte UUID (minting + persisting one on first use).
+    /// Mirrors `storage.collection_uuid`.
+    pub fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        collection_uuid(&session, db, coll)
+    }
+
+    /// The pre-image document bytes stored for oplog `seq`, or `None`. Fresh
+    /// session for cross-thread visibility. Mirrors `storage.read_preimage`.
+    pub fn read_preimage(&self, seq: i64) -> Result<Option<Vec<u8>>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(PREIMAGE_TABLE, None)?;
+        cur.set_key_q(seq);
+        match cur.search() {
+            Ok(()) => {
+                let b = cur.get_value_u()?;
+                Ok(if b.is_empty() { None } else { Some(b) })
+            }
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.
     /// Returns the document's `id_key`. A duplicate `_id` yields
     /// `StorageError::DuplicateId`.
@@ -884,16 +941,18 @@ impl Storage {
         // any index this doc makes multikey (array value on an indexed field).
         self.write_index_entries(&session, db, coll, &doc, &descs)?;
         self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
-        // Oplog: an insert is op "i" (the collection UUID `ui` lands in 3c).
+        // Oplog: an insert is op "i". No pre-image (there's no prior document).
         if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut o2 = Document::new();
+            o2.insert("_id", id.clone());
             let mut entry = Document::new();
             entry.insert("op", "i");
             entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("ui", uuid_binary(&ui));
             entry.insert("o", Bson::Document(doc.clone()));
-            let mut o2 = Document::new();
-            o2.insert("_id", id.clone());
             entry.insert("o2", Bson::Document(o2));
-            self.emit_oplog(&session, vec![entry])?;
+            self.emit_oplog(&session, vec![entry], vec![None])?;
         }
         Ok(key)
     }
@@ -993,16 +1052,24 @@ impl Storage {
         }
         // Oplog: a full-document replacement is op "u" with `o` = the new doc
         // (the `$v:2` diff form is for operator-updates, which the storage layer
-        // doesn't expose). `ui` lands in 3c.
+        // doesn't expose). The pre-image (old doc) is stored when the collection
+        // has changeStreamPreAndPostImages enabled.
         if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let pre = if pre_post_images_enabled(&session, db, coll)? {
+                Some(encode_doc(&old_doc)?)
+            } else {
+                None
+            };
             let mut o2 = Document::new();
             o2.insert("_id", id.clone());
             let mut entry = Document::new();
             entry.insert("op", "u");
             entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("ui", uuid_binary(&ui));
             entry.insert("o", Bson::Document(doc.clone()));
             entry.insert("o2", Bson::Document(o2));
-            self.emit_oplog(&session, vec![entry])?;
+            self.emit_oplog(&session, vec![entry], vec![pre])?;
         }
         Ok(true)
     }
@@ -1024,16 +1091,24 @@ impl Storage {
         let old_doc = decode_doc(&old_blob)?;
         let descs = self.index_descs(&session, db, coll)?;
         self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
-        // Oplog: a delete is op "d" with `o` = `o2` = {_id}. `ui` lands in 3c.
+        // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
+        // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
         if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let pre = if pre_post_images_enabled(&session, db, coll)? {
+                Some(encode_doc(&old_doc)?)
+            } else {
+                None
+            };
             let mut o = Document::new();
             o.insert("_id", id.clone());
             let mut entry = Document::new();
             entry.insert("op", "d");
             entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("ui", uuid_binary(&ui));
             entry.insert("o", Bson::Document(o.clone()));
             entry.insert("o2", Bson::Document(o));
-            self.emit_oplog(&session, vec![entry])?;
+            self.emit_oplog(&session, vec![entry], vec![pre])?;
         }
         Ok(true)
     }
@@ -2916,6 +2991,82 @@ fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// The collection's options document (`{}` when registered with none), or
+/// `None` when the collection isn't registered.
+fn coll_options(session: &Session, db: &str, coll: &str) -> Result<Option<Document>> {
+    let cur = session.open_cursor(COLL_TABLE, None)?;
+    cur.set_key_ss(db, coll);
+    match cur.search() {
+        Ok(()) => {
+            let blob = cur.get_value_u()?;
+            if blob.is_empty() {
+                Ok(Some(Document::new()))
+            } else {
+                Ok(Some(decode_doc(&blob)?))
+            }
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Overwrite the collection's options blob (caller has ensured registration).
+fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) -> Result<()> {
+    let blob = encode_doc(opts)?;
+    let cur = session.open_cursor(COLL_TABLE, None)?;
+    cur.set_key_ss(db, coll);
+    cur.set_value_u(&blob);
+    cur.insert()?; // overwrite cursor (default) -> upsert
+    Ok(())
+}
+
+/// The collection's UUID (16 bytes), minting + persisting one into the options on
+/// first use. Mirrors `storage._collection_uuid`.
+fn collection_uuid(session: &Session, db: &str, coll: &str) -> Result<Vec<u8>> {
+    let mut opts = coll_options(session, db, coll)?.unwrap_or_default();
+    if let Some(Bson::Binary(b)) = opts.get("uuid") {
+        if b.bytes.len() == 16 {
+            return Ok(b.bytes.clone());
+        }
+    }
+    let bytes = new_uuid_bytes().to_vec();
+    opts.insert("uuid", uuid_binary(&bytes));
+    write_coll_options(session, db, coll, &opts)?;
+    Ok(bytes)
+}
+
+/// Whether `changeStreamPreAndPostImages.enabled` is set on the collection.
+fn pre_post_images_enabled(session: &Session, db: &str, coll: &str) -> Result<bool> {
+    if let Some(opts) = coll_options(session, db, coll)? {
+        if let Ok(sub) = opts.get_document("changeStreamPreAndPostImages") {
+            return Ok(sub.get_bool("enabled").unwrap_or(false));
+        }
+    }
+    Ok(false)
+}
+
+/// A fresh 16-byte UUID. No `uuid` crate dependency — two `ObjectId`s (which use
+/// `getrandom` + a per-process counter) supply the entropy; the version / variant
+/// nibbles are set cosmetically (the `ui` field is opaque to drivers).
+fn new_uuid_bytes() -> [u8; 16] {
+    let a = ObjectId::new();
+    let b = ObjectId::new();
+    let mut out = [0u8; 16];
+    out[..12].copy_from_slice(&a.bytes());
+    out[12..16].copy_from_slice(&b.bytes()[..4]);
+    out[6] = (out[6] & 0x0f) | 0x40;
+    out[8] = (out[8] & 0x3f) | 0x80;
+    out
+}
+
+/// Wrap 16 UUID bytes as a BSON Binary subtype 4 (mongod's `ui` encoding).
+fn uuid_binary(bytes: &[u8]) -> Bson {
+    Bson::Binary(Binary {
+        subtype: BinarySubtype::Uuid,
+        bytes: bytes.to_vec(),
+    })
 }
 
 /// An empty options document (`{}`) as BSON bytes — the collections-table value.

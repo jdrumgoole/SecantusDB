@@ -193,3 +193,84 @@ fn insert_replace_delete_sequence() {
         assert_eq!(ops, vec!["i", "u", "d"]);
     });
 }
+
+/// The `ui` (collection UUID) bytes from an entry — asserting Binary subtype 4.
+fn ui_of(blob: &[u8]) -> Vec<u8> {
+    match decode(blob).get("ui") {
+        Some(Bson::Binary(b)) => {
+            assert_eq!(b.subtype, bson::spec::BinarySubtype::Uuid);
+            assert_eq!(b.bytes.len(), 16);
+            b.bytes.clone()
+        }
+        other => panic!("expected ui Binary subtype 4, got {other:?}"),
+    }
+}
+
+fn seq_of_op(st: &Storage, op: &str) -> i64 {
+    st.read_oplog(1, 100)
+        .unwrap()
+        .into_iter()
+        .find(|(_, b)| decode(b).get_str("op").unwrap() == op)
+        .unwrap_or_else(|| panic!("no oplog entry with op {op}"))
+        .0
+}
+
+#[test]
+fn entries_carry_stable_collection_uuid() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2})).unwrap();
+        let rows = st.read_oplog(1, 100).unwrap();
+        let u1 = ui_of(&rows[0].1);
+        // Same collection -> same ui, matching the public accessor.
+        assert_eq!(u1, ui_of(&rows[1].1));
+        assert_eq!(u1, st.collection_uuid("app", "c").unwrap());
+        // A different collection gets a distinct ui.
+        st.insert_one("app", "other", &enc(&doc! {"_id": 1}))
+            .unwrap();
+        let other = st.read_oplog(3, 1).unwrap();
+        assert_ne!(ui_of(&other[0].1), u1);
+    });
+}
+
+#[test]
+fn pre_images_written_when_enabled() {
+    with_db(|st| {
+        st.set_collection_options(
+            "app",
+            "c",
+            &doc! {"changeStreamPreAndPostImages": {"enabled": true}},
+        )
+        .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "v": "old"}))
+            .unwrap();
+        st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"v": "new"}))
+            .unwrap();
+        // The replacement's pre-image is the doc as it was before.
+        let pre = st
+            .read_preimage(seq_of_op(st, "u"))
+            .unwrap()
+            .expect("update pre-image present");
+        assert_eq!(decode(&pre).get_str("v").unwrap(), "old");
+        // The delete's pre-image is the doc at delete time.
+        st.delete_by_id("app", "c", &Bson::Int32(1)).unwrap();
+        let pred = st
+            .read_preimage(seq_of_op(st, "d"))
+            .unwrap()
+            .expect("delete pre-image present");
+        assert_eq!(decode(&pred).get_str("v").unwrap(), "new");
+        // Inserts never carry a pre-image.
+        assert!(st.read_preimage(seq_of_op(st, "i")).unwrap().is_none());
+    });
+}
+
+#[test]
+fn no_pre_images_when_disabled() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "v": "a"}))
+            .unwrap();
+        st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"v": "b"}))
+            .unwrap();
+        assert!(st.read_preimage(seq_of_op(st, "u")).unwrap().is_none());
+    });
+}

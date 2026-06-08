@@ -176,8 +176,15 @@ build-out.
      `update_*` method using `secantus-core`'s `diff`), and `delete_by_id` emits
      op `"d"` with `o`=`o2`=`{_id}`. New tests in `tests/oplog.rs`
      (replace→`u`+full-doc, delete→`d`, insert/replace/delete → `[i,u,d]`).
-   - **3c** — collection UUID (`ui`) + pre-images (`changeStreamPreAndPostImages`)
-     + `read_preimage`.
+   - **3c ✅ DONE** — collection UUID (`ui`) + pre-images. Collection-options
+     read/write (`coll_options` / `write_coll_options`), `collection_uuid` (16
+     bytes minted from two `ObjectId`s — no `uuid` crate dep — and persisted into
+     the options on first use), the `ui` Binary subtype-4 field on every
+     insert/replace/delete entry, `set_collection_options` (e.g.
+     `{changeStreamPreAndPostImages: {enabled: true}}`), pre-image writes on
+     replace/delete when enabled (`emit_oplog` now threads a parallel
+     `pre_images` vec), and `read_preimage`. New tests in `tests/oplog.rs`
+     (stable per-collection ui, pre-images when enabled, none when disabled).
    - **3d** — retention (`prune_oplog`), noop heartbeats (`emit_noop_heartbeat`),
      `find_seq_for_ts`, and the change-stream condvar (tailable-wait primitive).
    - **3e** — change-stream event projection (port `changestreams.py` `project()`:
