@@ -175,3 +175,55 @@ jobs:
         env:
           SECANTUS_ENGINE: rust
         run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=0
+
+  # Builds the main `secantus` wheel with the off-by-default storage-engine flag
+  # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
+  # extension links the SAME bundled WiredTiger this wheel already builds and
+  # ships inside it. Proves the "bundle behind a build flag" packaging end to end
+  # on Linux. The DEFAULT wheel build (flag OFF, no Rust/clang needed) is covered
+  # by the `test` matrix and wheels.yml. macOS / Windows flag-on builds are a
+  # follow-up — the storage crate's WiredTiger link flags (pthread/rt/dl) are
+  # POSIX-shaped today (see tasks/backlog.md).
+  storage-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive  # vendor/wiredtiger is needed by the build
+
+      - name: Install build toolchain (swig + clang/libclang for bindgen + ninja)
+        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Build the secantus wheel with the storage engine ON
+        # scikit-build-core forwards SKBUILD_CMAKE_DEFINE entries as -D defines,
+        # so this flips the CMake option ON for this build only. The cargo build
+        # of the extension runs inside CMake, linking the WiredTiger built above.
+        env:
+          SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+        run: uv build --wheel --out-dir dist-storage
+
+      - name: Assert the extension is bundled in the wheel
+        # importorskip in the smoke test would silently pass if the extension
+        # were missing — the whole point here is that it's PRESENT, so fail hard.
+        run: >-
+          uv run --no-project --with "$(ls dist-storage/*.whl)"
+          python -c "import _secantus_storage; print('bundled OK:', _secantus_storage.__file__)"
+
+      - name: Storage extension smoke test
+        run: >-
+          uv run --no-project --with pymongo --with pytest
+          --with "$(ls dist-storage/*.whl)"
+          python -m pytest tests/test_rust_storage_smoke.py
+          -o addopts= -p no:cacheprovider -q

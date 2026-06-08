@@ -80,24 +80,46 @@ Swapping the Rust `Storage` into `SecantusDBServer` needs the *whole* `Storage`
 surface (`find_matching`/indexes/oplog/…), so the server cutover is gated on
 sub-phases 2-4, not just the CRUD core.
 
-## Open gate for the whole phase: the wheel matrix
+## The wheel-matrix gate — decision + status
 
-`secantus-wt` / `secantus-storage-py` build and test where WiredTiger is present
-(dev machines, and CI jobs that build the vendored WT). The unsolved question —
-and the phase's go/no-go — is **shipping it**: the WiredTiger-linking Rust
-extension has to build clean across the wheel matrix (cp310–313 × manylinux /
-musllinux / macOS-arm64 / Windows), the same matrix the pure `secantus-core`
-wheel already covers. The maturin build today produces only a host-glibc wheel.
-Options:
+**Decision (chosen): bundle the extension into the `secantus` wheel behind an
+off-by-default build flag.** The WiredTiger-linking Rust `_secantus_storage`
+extension is built by the main wheel's existing CMake against the SAME vendored
+WiredTiger that wheel already builds — gated behind the
+`SECANTUS_BUILD_STORAGE_ENGINE` CMake option, which defaults **OFF**. With the
+flag OFF (the shipping default) the wheel is byte-for-byte unchanged and needs no
+Rust/clang toolchain; the pure-Python storage path remains the default until
+engine-selection makes the Rust storage engine selectable.
 
-- Link the same vendored WiredTiger the main `secantus` wheel already builds
-  (scikit-build-core CMake output) into the storage extension, reusing that
-  toolchain rather than maturin's manylinux container.
-- Or build the storage extension through the existing scikit-build path (which
-  already vendors + builds WiredTiger) instead of maturin.
+**Why this over a separate companion wheel.** A separate `secantus-storage` wheel
+(building its own static WiredTiger via a `maturin-action` workflow) was
+prototyped first and rejected after CI evidence: it re-derives the entire
+cross-platform WiredTiger build *outside* cibuildwheel (toolchain install,
+Python-dev for WT's CMake, the WT patches, per-platform link flags) — every CI
+failure was something the main wheel's cibuildwheel + CMake build already solves.
+Bundling reuses that proven WT build, so the flag-on path inherits the main
+wheel's cross-platform machinery instead of reimplementing it. The cost — a
+Rust/clang build dep *when the flag is on* — is acceptable precisely because the
+flag is off by default and only flipped on deliberately.
 
-Until that's resolved, `secantus-wt` is deliberately excluded from the
-`crates/Cargo.toml` workspace so the green `secantus-core` / `secantus-core-py`
-build and the `rust` / `rust-wheels` CI stay untouched. CI coverage for
-`secantus-wt` itself is a follow-up: it needs a job that builds the vendored
-WiredTiger first, then `SECANTUS_WT_INCLUDE`/`_LIB` → `cargo test` in the crate.
+**How it works (root `CMakeLists.txt`).** The `wiredtiger_ext` ExternalProject
+builds WiredTiger static (`libwiredtiger.a` + generated headers under
+`build/{wheel_tag}/wt-build`). When `SECANTUS_BUILD_STORAGE_ENGINE=ON`, a custom
+command runs `cargo build --release` on `crates/secantus-storage-py` with
+`SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB` pointed at that WT output (bindgen finds
+libclang from the environment), renames the cdylib to the platform Python-
+extension filename, and `install(... DESTINATION .)`s it at the wheel root so
+`import _secantus_storage` resolves.
+
+**CI.** The `storage-engine` job in `.github/workflows/test.yml` builds the
+`secantus` wheel with `SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON` on
+Linux, asserts `_secantus_storage` is bundled (hard failure if missing), and runs
+`tests/test_rust_storage_smoke.py` against the installed wheel. macOS / Windows
+flag-on builds are a follow-up — the storage crate's WiredTiger link flags
+(`pthread`/`rt`/`dl`) are POSIX-shaped today.
+
+`secantus-wt` / `secantus-storage` stay excluded from the `crates/Cargo.toml`
+workspace so the green `secantus-core` / `secantus-core-py` build and the `rust` /
+`rust-wheels` CI stay untouched. `crates/secantus-storage-py/pyproject.toml` is
+retained for local dev only (`invoke rust-storage-py` via maturin) — not
+published to PyPI.

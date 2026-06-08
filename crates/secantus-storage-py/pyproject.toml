@@ -1,10 +1,14 @@
-# PyO3 bindings for the Rust storage layer (secantus-storage), built with
-# maturin. UNLIKE secantus-core, this extension links the vendored WiredTiger C
-# library, so it cannot build in maturin's plain manylinux container — shipping
-# it across the wheel matrix is Phase 4's go/no-go gate (see
-# tasks/rust-rewrite-phase4-scoping.md). For now it builds where WiredTiger is
-# present (set SECANTUS_WT_INCLUDE/_LIB or use a probed build dir; bindgen needs
-# libclang via LIBCLANG_PATH).
+# PyO3 bindings for the Rust storage layer (secantus-storage). UNLIKE
+# secantus-core, this extension links the vendored WiredTiger C library, so it is
+# NOT a standalone wheel. It is built INTO the main `secantus` wheel by that
+# wheel's CMake — against the WiredTiger that wheel already builds — gated behind
+# the off-by-default `SECANTUS_BUILD_STORAGE_ENGINE` flag (see the root
+# CMakeLists.txt and tasks/rust-rewrite-phase4-scoping.md).
+#
+# This pyproject is kept for LOCAL dev only: `invoke rust-storage-py` (maturin)
+# builds an importable extension for the smoke test where WiredTiger is present
+# (set SECANTUS_WT_INCLUDE/_LIB or use a probed build dir; bindgen needs libclang
+# via LIBCLANG_PATH). It is not published to PyPI.
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
