@@ -160,7 +160,27 @@ build-out.
    Gate: `test_geo_index.py`.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
    time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
-   acceleration here. Gate: `test_change_streams.py`.
+   acceleration here. Gate: `test_change_streams.py`. **Sliced** (3a → 3e):
+   - **3a ✅ DONE** — oplog foundation: `OplogState` (next_seq + last_ts) under a
+     dedicated mutex, strictly-monotonic `mint_ts` / `mint_seq_and_ts`,
+     `current_cluster_time`, `emit_oplog` (stamps `ts` + `wall`), op `"i"`
+     emission wired into `insert_one`, `read_oplog(start, limit)` /
+     `oplog_floor_seq` / `oplog_tail_seq` cross-thread reads (each call opens a
+     fresh session — no sticky snapshot), and seq recovery on open
+     (`load_oplog_meta`: meta row, else fallback scan). `enable_oplog` (default
+     true) + `set_enable_oplog`. New tests in `tests/oplog.rs`. **Deferred:**
+     the collection-UUID `ui` field (3c).
+   - **3b** — `update` (op `"u"`, `$v:2` diff `updateDescription` via
+     `secantus-core`'s `diff`) + `delete` (op `"d"`) emission, wired into
+     `replace_by_id` / `delete_by_id`.
+   - **3c** — collection UUID (`ui`) + pre-images (`changeStreamPreAndPostImages`)
+     + `read_preimage`.
+   - **3d** — retention (`prune_oplog`), noop heartbeats (`emit_noop_heartbeat`),
+     `find_seq_for_ts`, and the change-stream condvar (tailable-wait primitive).
+   - **3e** — change-stream event projection (port `changestreams.py` `project()`:
+     resume tokens, `fullDocument` modes, `invalidate`).
+   - Then: re-home `$lookup` / `$geoNear` pipeline acceleration onto the Rust
+     storage.
 
 ## PyO3 exposure (done) — `crates/secantus-storage-py`
 
