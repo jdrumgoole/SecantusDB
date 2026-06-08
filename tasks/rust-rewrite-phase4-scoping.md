@@ -58,7 +58,104 @@ build-out.
      leaving callers to keep temporaries alive.
 2. **Indexes** — `secantus_indexes` + `secantus_index_entries` + the planner
    (`find_matching` / `explain_plan` / all pickers; single / compound / multikey /
-   partial / TTL). Gate: `test_indexes.py`.
+   partial / TTL). Gate: `test_indexes.py`. **Sliced** (2a → 2f):
+   - **2a ✅ DONE (this slice)** — the registry + `create_index` / `list_indexes`
+     / `drop_index` / `drop_all_indexes`, and index-entry maintenance on
+     insert / replace / delete. Byte-faithful entry packing (`escape_kb` /
+     `pack_entry` / `unpack_entry`), the `index_key_variants` builder (scalar /
+     descending-inverted / multikey per-element + whole-array / compound
+     cartesian product), and create-time multikey-flag detection. Geo / text /
+     hashed rejected (`CreateIndexUnsupported`); re-create-with-conflicting-opts
+     rejected. Pinned by byte-exact unit tests (`crates/secantus-storage/src/
+     lib.rs` `#[cfg(test)]`) + WiredTiger-backed integration tests
+     (`crates/secantus-storage/tests/indexes.rs`). Added `secantus-wt`
+     `get_key_sss` / `get_key_sssu` getters and a `secantus_core::{get_path,
+     has_path}` re-export. **Deferred from 2a:** lazy multikey-flag marking on
+     insert/update (2d); sparse / partial entry-gating, unique enforcement, TTL,
+     collation (2e).
+   - **2b ✅ DONE** — `find_matching` + `explain_plan`: single-field equality /
+     `$eq` / `$in` / range (`$gt`/`$gte`/`$lt`/`$lte`, with DESC operator-flip)
+     routing through the entries table, the `_id` primary-key point-lookup fast
+     path (bare / `$eq` / `$in`), and COLLSCAN fallback — index candidates are
+     re-checked with `secantus_core::query::matches` (which can over-include for
+     multikey). `explain_plan` returns `ExplainPlan::{CollScan, IxScan{...}}`.
+     New WT-backed tests in `tests/query.rs`. **Scoped to single-field indexes**
+     (compound leading-field use is 2c, so the executor and `explain` stay
+     consistent); a `matches()` "defer to Python" construct (e.g. whole-array
+     literal equality) surfaces as `StorageError::QueryUnsupported` for the
+     server's engine-selection layer to route to Python.
+   - **2c ✅ DONE** — compound-index routing: bare-equality prefix (full-cover
+     exact scan + strict-leading-prefix scan, filter-field-order-independent,
+     shortest-covering-index preference), prefix + trailing-operator
+     (`$eq`/`$in`/range on the next column, range pinned to the equality
+     prefix), and mixed-direction compound indexes (per-field
+     `encode_value_directed`, DESC operator-flip). Restored the `prefix` param on
+     `range_scan_index` and added `range_scan_index_leading` (leading-field range
+     with escaped-separator boundary detection); `find_leading_field_index` now
+     returns the compound fallback so a single-field filter can ride a compound
+     index's leading field. Pickers (`pick_compound_eq_index` /
+     `pick_compound_range_index` / `partition_compound_range_filter`) shared by
+     execution and `explain`. New WT-backed tests in `tests/compound.rs`.
+   - **2d ✅ DONE** — lazy multikey marking: `maybe_mark_multikey` rewrites an
+     index's registry options with `multikey: true` when an inserted/replaced doc
+     has an array on an indexed field (sticky — never cleared); wired into
+     `insert_one` / `replace_by_id`. (The sort-acceleration *exclusion* of
+     multikey indexes is part of 2f, where sort lands.) New tests in
+     `tests/indexes.rs` (lazy-mark-on-insert, mark-on-replace, sticky).
+   - **2e ✅ DONE (collation deferred)** — three sub-commits:
+     - **2e-1** — write-path correctness: an `IndexDesc { name, key_spec, sparse,
+       unique, partial }` refactor of the CRUD entry-maintenance paths, the
+       canonical `index_key` (one byte-key per doc, `None` under sparse when a
+       field is missing), `sparse` support in `index_key_variants`, **unique
+       enforcement** (`unique_conflict` prefix-probe on insert / replace /
+       create-over-existing-data → `StorageError::DuplicateKey(Box<UniqueConflict>)`
+       with the mongod-shaped `keyPattern`/`keyValue`), and **partial-index entry
+       gating** (entries written / uniqueness scoped only to docs matching
+       `partialFilterExpression`).
+     - **2e-2** — read-path partial: `query_implies_partial` gates partial indexes
+       in `find_leading_field_index` / `pick_compound_eq_index` (which also strips
+       the partial-filter keys from the effective filter fields) /
+       `pick_compound_range_index`.
+     - **2e-3** — TTL: `prune_ttl(db, coll, now)` deletes docs whose TTL-indexed
+       `DateTime` is older than `now - expireAfterSeconds` (injected clock, no
+       background sweeper; oplog emission is sub-phase 3).
+     - **Collation: deferred.** The Rust `sortkey` / `query` engines defer
+       collation to Python (return the `Fallback` signal), so the canonical-key
+       encoding and `matches()` can't honour a collation at this layer — the
+       picker-level collation gates have nothing to gate against yet. Revisit when
+       the leaf engines grow collation support.
+     - New WT-backed tests: `tests/unique.rs` (9), `tests/partial.rs` (2),
+       `tests/ttl.rs` (3).
+   - **2f ✅ DONE** — sort acceleration + `hint`. `find_matching_with(filter,
+     sort, hint)` / `explain_plan_with(...)` (the 3-arg forms are convenience
+     wrappers): a single-field sort on the filter field, or an empty-filter sort
+     matching a single-field / compound index, is served by walking the index
+     forward / backward (skipping the post-sort); otherwise a COLLSCAN + a
+     byte-sortable-key post-sort (`sort_key` via the same encoder, so order is
+     consistent with the accelerated path). `hint` (`Hint::Name` /
+     `Hint::KeySpec`) resolves to `$natural` / `_id_` / a named index
+     (`resolve_hint` / `candidates_from_hint`); an unresolvable hint is
+     `StorageError::BadHint` in `find` and COLLSCAN in `explain`.
+     `compound_index_for_sort` is strict-shape and **excludes multikey indexes**
+     (the 2d flag's payoff). `explain` now sets `direction` (`forward` /
+     `backward`) via `make_ixscan_plan`. Ported from `storage`'s
+     `_single_sort_spec` / `_multi_sort_spec` / `_compound_index_for_sort` /
+     `_walk_index_in_order` / `_resolve_hint` / `_candidates_from_hint` /
+     `_make_ixscan_plan` and `find_matching`'s sort/hint branches. New WT-backed
+     tests in `tests/sort.rs` (10).
+
+   **Sub-phase 2 complete (collation deferred).** 72 storage tests; the
+   secantus-storage crate now covers the index registry, entry maintenance,
+   single-field + compound + `_id` lookup routing, unique / sparse / partial /
+   TTL, and sort + hint — all byte-faithful to `storage.py` and `clippy
+   -D warnings` clean.
+
+   **CI:** a `rust-storage` job in `.github/workflows/test.yml` builds the
+   vendored WiredTiger via `uv sync` (`build/*/wt-build`, static
+   `libwiredtiger.a`), points `SECANTUS_WT_INCLUDE`/`SECANTUS_WT_LIB` at it, and
+   runs `cargo fmt --check` / `clippy -D warnings` / `cargo test` for the crate
+   on every push-to-main / PR (Linux; cross-platform WT linking stays covered by
+   the `storage-engine` wheel job). Next: sub-phase 3 (oplog / change streams).
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
    Gate: `test_geo_index.py`.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster

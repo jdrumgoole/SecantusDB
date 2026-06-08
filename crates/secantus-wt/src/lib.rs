@@ -365,6 +365,23 @@ impl Cursor {
         })?;
         Ok((owned(a), owned(b), unsafe { item_bytes(&it) }))
     }
+    /// `key_format=SSS` — `(db, coll, index_name)` (the indexes registry).
+    pub fn get_key_sss(&self) -> Result<(String, String, String)> {
+        let (mut a, mut b, mut c): (*const c_char, *const c_char, *const c_char) =
+            (ptr::null(), ptr::null(), ptr::null());
+        check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut a, &mut b, &mut c) })?;
+        Ok((owned(a), owned(b), owned(c)))
+    }
+    /// `key_format=SSSu` — `(db, coll, index_name, packed_bytes)` (index entries).
+    pub fn get_key_sssu(&self) -> Result<(String, String, String, Vec<u8>)> {
+        let (mut a, mut b, mut c): (*const c_char, *const c_char, *const c_char) =
+            (ptr::null(), ptr::null(), ptr::null());
+        let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
+        check(unsafe {
+            cur_fn!(self, get_key)(self.ptr, &mut a, &mut b, &mut c, &mut it as *mut sys::WT_ITEM)
+        })?;
+        Ok((owned(a), owned(b), owned(c), unsafe { item_bytes(&it) }))
+    }
 
     pub fn get_value_u(&self) -> Result<Vec<u8>> {
         let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
