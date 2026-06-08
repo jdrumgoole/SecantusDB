@@ -237,14 +237,24 @@ never "remove Python."
   warnings` clean (`invoke rust-wt-test`). Excluded from the `crates` workspace so
   the green `secantus-core` CI is untouched. Scoping/status:
   `tasks/rust-rewrite-phase4-scoping.md`.
-- [ ] **Phase 4 — storage keystone (continued).** Next: sub-phase 1 (the CRUD
-  core — `secantus_collections` + `secantus_documents` tables, find-by-`_id`,
-  natural-order scan, `id_key` via the ported `sortkey`, the lock discipline,
-  `:memory:` + reopen) gated on `test_storage.py`/`test_crud.py`; then indexes,
-  geo, oplog/change-streams. **Phase go/no-go gate:** ship the WiredTiger-linking
+- [x] **Phase 4 sub-phase 1 — CRUD core (`crates/secantus-storage`).** A `Storage`
+  over `secantus-wt` + `secantus-core`'s `sortkey`: `secantus_collections` +
+  `secantus_documents` tables, `insert_one` (auto-`ObjectId`, duplicate-`_id`
+  rejection), `find_by_id`, `scan_collection` (natural order), `replace_by_id`,
+  `delete_by_id`, collection registry, the coarse serialize-everything lock;
+  `id_key = sortkey.encode_value(_id)`. 7 integration tests vs real WiredTiger
+  (cross-type natural order, db/coll isolation, reopen persistence); `cargo fmt` +
+  `clippy -D warnings` clean (`invoke rust-storage-test`). Standalone crate
+  (excluded from the `crates` workspace). Also fixed a latent use-after-free in
+  `secantus-wt` (the `Cursor` now owns its `S`/`u` key/value buffers).
+- [ ] **Phase 4 — storage keystone (continued).** Next: expose `secantus-storage`
+  via PyO3 + wire `secantus.engine` storage selection so the Rust `Storage` runs
+  under `SECANTUS_ENGINE=rust` and the conformance gate (`test_storage.py` /
+  `test_crud.py`) can run against it; then sub-phases 2-4 (indexes, geo,
+  oplog/change-streams). **Phase go/no-go gate:** ship the WiredTiger-linking
   extension across the wheel matrix (likely by reusing the scikit-build CMake WT
   build rather than maturin's manylinux container) + a CI job that builds WT then
-  runs `secantus-wt`'s tests. See the scoping doc.
+  runs the `secantus-wt`/`secantus-storage` tests. See the scoping doc.
 - [ ] **Toward a standalone Rust package (continued).** With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to

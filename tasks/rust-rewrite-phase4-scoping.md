@@ -40,11 +40,22 @@ build-out.
    (byte-)order scan / point search / NOTFOUND / update / remove / numeric `q`
    ordering / commit+rollback / on-disk reopen persistence. `cargo fmt` +
    `clippy -D warnings` clean.
-1. **CRUD core** — `secantus_collections` + `secantus_documents` tables: insert /
-   find-by-`_id` / update / delete / natural-order scan, `:memory:` + on-disk
-   open/reopen, `id_key = sortkey.encode_value(_id)` via the ported `secantus-core`
-   `sortkey`, the lock discipline. The first end-to-end `Storage` vertical.
-   Gate: `test_storage.py` roundtrip + `test_crud.py`.
+1. **CRUD core — `crates/secantus-storage`. ✅ DONE at the Rust level (this
+   slice).** A `Storage` over `secantus-wt` + `secantus-core`'s `sortkey`: the
+   `secantus_collections` + `secantus_documents` tables, `insert_one`
+   (auto-`ObjectId`, duplicate-`_id` rejection), `find_by_id`, `scan_collection`
+   (natural order), `replace_by_id`, `delete_by_id`, collection registry, the
+   coarse serialize-everything lock. `id_key = sortkey.encode_value(_id)`.
+   Verified against real WiredTiger (7 integration tests): cross-type natural
+   order (double/int/long → string → ObjectId), db/coll isolation, reopen
+   persistence; `cargo fmt` + `clippy -D warnings` clean (`invoke
+   rust-storage-test`). **Still pending for the conformance gate:** the PyO3
+   exposure + `secantus.engine` storage selection, then `test_storage.py` /
+   `test_crud.py` under `SECANTUS_ENGINE=rust`.
+   - Found + fixed a real latent use-after-free in `secantus-wt`: WiredTiger
+     references the caller's memory for `S`/`u` columns until the operation, so
+     the `Cursor` now **owns** its key/value buffers (`*_hold` fields) instead of
+     leaving callers to keep temporaries alive.
 2. **Indexes** — `secantus_indexes` + `secantus_index_entries` + the planner
    (`find_matching` / `explain_plan` / all pickers; single / compound / multikey /
    partial / TTL). Gate: `test_indexes.py`.

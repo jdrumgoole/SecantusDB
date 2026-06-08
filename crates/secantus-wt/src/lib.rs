@@ -13,10 +13,12 @@
 //!   (the variadic C entry points) rather than re-implemented in Rust — passing
 //!   native typed args lets WiredTiger pack in C, avoiding the per-op packing
 //!   cost that the old SWIG-in-Python path paid.
-//! * `u` columns are `WT_ITEM` (raw bytes). On `set_*` WiredTiger holds the
-//!   caller's pointer until the operation completes, so the byte slice must stay
-//!   alive across `set_key`/`set_value` → `insert`/`update`/`search`; on `get_*`
-//!   the returned bytes are copied out (valid only until the next cursor op).
+//! * `u` columns are `WT_ITEM` (raw bytes) and `S` columns are NUL-terminated
+//!   strings. WiredTiger references the caller's memory for these until the next
+//!   cursor operation, so the `Cursor` **owns** the key/value buffers it hands to
+//!   WiredTiger (see its `*_hold` fields) — callers pass borrowed slices/strings
+//!   and don't have to manage lifetimes. On `get_*` the returned bytes/strings
+//!   are copied out (the WiredTiger-owned buffer is valid only until the next op).
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -30,6 +32,7 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/wt_sys.rs"));
 }
 
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -182,7 +185,12 @@ impl Session {
                 &mut cptr,
             )
         })?;
-        Ok(Cursor { ptr: cptr })
+        Ok(Cursor {
+            ptr: cptr,
+            key_strs_hold: RefCell::new(Vec::new()),
+            key_bytes_hold: RefCell::new(Vec::new()),
+            val_bytes_hold: RefCell::new(Vec::new()),
+        })
     }
 
     pub fn begin_transaction(&self, config: Option<&str>) -> Result<()> {
@@ -229,8 +237,17 @@ impl Drop for Session {
 
 /// A WiredTiger cursor. Key/value setters mirror the table's `key_format`; it's
 /// the caller's job to use the variant matching the table.
+///
+/// WiredTiger references the memory behind string (`S`) and `WT_ITEM` (`u`)
+/// columns passed to `set_key`/`set_value` until the next cursor operation, so
+/// the cursor **owns** those buffers (the `*_hold` fields) and keeps them alive
+/// across `set_* -> insert/search/...`. Callers pass borrowed slices and need
+/// not worry about lifetimes.
 pub struct Cursor {
     ptr: *mut sys::WT_CURSOR,
+    key_strs_hold: RefCell<Vec<CString>>,
+    key_bytes_hold: RefCell<Vec<u8>>,
+    val_bytes_hold: RefCell<Vec<u8>>,
 }
 
 /// Fetch a cursor method function pointer. Always used inside an `unsafe` block
@@ -244,58 +261,83 @@ macro_rules! cur_fn {
 impl Cursor {
     // --- key setters (one per table format SecantusDB uses) ---
 
+    // Each setter calls WiredTiger's `set_key`/`set_value` with pointers into
+    // freshly-owned buffers, then stows those buffers in the cursor's `*_hold`
+    // cells so they outlive the operation (moving a `CString`/`Vec` keeps its
+    // heap allocation at a stable address, so the pointers handed to WiredTiger
+    // stay valid).
+
     /// `key_format=u` — a single raw byte string.
     pub fn set_key_u(&self, k: &[u8]) {
-        let it = item(k);
+        let owned = k.to_vec();
+        let it = item(&owned);
         unsafe { cur_fn!(self, set_key)(self.ptr, &it as *const sys::WT_ITEM) };
+        *self.key_bytes_hold.borrow_mut() = owned;
     }
-    /// `key_format=q` — a signed 64-bit integer (the oplog `seq`).
+    /// `key_format=q` — a signed 64-bit integer (the oplog `seq`). Scalars are
+    /// packed by value, so no buffer needs holding.
     pub fn set_key_q(&self, k: i64) {
         unsafe { cur_fn!(self, set_key)(self.ptr, k) };
     }
     /// `key_format=S` — a single NUL-terminated string (the oplog-meta key).
     pub fn set_key_s(&self, k: &str) {
-        let c = CString::new(k).expect("key has interior NUL");
+        let c = cstr(k);
         unsafe { cur_fn!(self, set_key)(self.ptr, c.as_ptr()) };
+        *self.key_strs_hold.borrow_mut() = vec![c];
     }
     /// `key_format=SS` — `(db, coll)` (the collections registry).
     pub fn set_key_ss(&self, a: &str, b: &str) {
-        let (a, b) = (cstr(a), cstr(b));
-        unsafe { cur_fn!(self, set_key)(self.ptr, a.as_ptr(), b.as_ptr()) };
+        let (ca, cb) = (cstr(a), cstr(b));
+        unsafe { cur_fn!(self, set_key)(self.ptr, ca.as_ptr(), cb.as_ptr()) };
+        *self.key_strs_hold.borrow_mut() = vec![ca, cb];
     }
     /// `key_format=SSu` — `(db, coll, id_key_bytes)` (the documents table).
     pub fn set_key_ssu(&self, a: &str, b: &str, c: &[u8]) {
-        let (a, b) = (cstr(a), cstr(b));
-        let it = item(c);
-        unsafe {
-            cur_fn!(self, set_key)(self.ptr, a.as_ptr(), b.as_ptr(), &it as *const sys::WT_ITEM)
-        };
-    }
-    /// `key_format=SSS` — `(db, coll, index_name)` (the indexes registry).
-    pub fn set_key_sss(&self, a: &str, b: &str, c: &str) {
-        let (a, b, c) = (cstr(a), cstr(b), cstr(c));
-        unsafe { cur_fn!(self, set_key)(self.ptr, a.as_ptr(), b.as_ptr(), c.as_ptr()) };
-    }
-    /// `key_format=SSSu` — `(db, coll, index_name, packed_bytes)` (index entries).
-    pub fn set_key_sssu(&self, a: &str, b: &str, c: &str, d: &[u8]) {
-        let (a, b, c) = (cstr(a), cstr(b), cstr(c));
-        let it = item(d);
+        let (ca, cb) = (cstr(a), cstr(b));
+        let owned = c.to_vec();
+        let it = item(&owned);
         unsafe {
             cur_fn!(self, set_key)(
                 self.ptr,
-                a.as_ptr(),
-                b.as_ptr(),
-                c.as_ptr(),
+                ca.as_ptr(),
+                cb.as_ptr(),
                 &it as *const sys::WT_ITEM,
             )
         };
+        *self.key_strs_hold.borrow_mut() = vec![ca, cb];
+        *self.key_bytes_hold.borrow_mut() = owned;
+    }
+    /// `key_format=SSS` — `(db, coll, index_name)` (the indexes registry).
+    pub fn set_key_sss(&self, a: &str, b: &str, c: &str) {
+        let (ca, cb, cc) = (cstr(a), cstr(b), cstr(c));
+        unsafe { cur_fn!(self, set_key)(self.ptr, ca.as_ptr(), cb.as_ptr(), cc.as_ptr()) };
+        *self.key_strs_hold.borrow_mut() = vec![ca, cb, cc];
+    }
+    /// `key_format=SSSu` — `(db, coll, index_name, packed_bytes)` (index entries).
+    pub fn set_key_sssu(&self, a: &str, b: &str, c: &str, d: &[u8]) {
+        let (ca, cb, cc) = (cstr(a), cstr(b), cstr(c));
+        let owned = d.to_vec();
+        let it = item(&owned);
+        unsafe {
+            cur_fn!(self, set_key)(
+                self.ptr,
+                ca.as_ptr(),
+                cb.as_ptr(),
+                cc.as_ptr(),
+                &it as *const sys::WT_ITEM,
+            )
+        };
+        *self.key_strs_hold.borrow_mut() = vec![ca, cb, cc];
+        *self.key_bytes_hold.borrow_mut() = owned;
     }
 
     // --- value (all SecantusDB tables use value_format=u) ---
 
     pub fn set_value_u(&self, v: &[u8]) {
-        let it = item(v);
+        let owned = v.to_vec();
+        let it = item(&owned);
         unsafe { cur_fn!(self, set_value)(self.ptr, &it as *const sys::WT_ITEM) };
+        *self.val_bytes_hold.borrow_mut() = owned;
     }
 
     // --- key getters (for scans) ---
