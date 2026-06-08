@@ -261,13 +261,15 @@ never "remove Python."
   `Storage` surface** (the server needs `find_matching`/indexes/oplog/etc., not
   just CRUD), i.e. sub-phases 2-4 (indexes, geo, oplog/change-streams); then the
   conformance gate (`test_storage.py` / `test_crud.py` under `SECANTUS_ENGINE=rust`).
-  (b) **The wheel-matrix go/no-go gate:** ship the WiredTiger-linking extension
-  across cp310-313 × manylinux/musllinux/macOS-arm64/Windows — the maturin build
-  here produces only a host-glibc wheel; the likely answer is building the
-  storage extension through the existing scikit-build CMake path (which already
-  vendors + builds WiredTiger) rather than maturin's manylinux container — plus a
-  CI job that builds WT then runs the `secantus-wt`/`secantus-storage`/
-  `secantus-storage-py` tests. See the scoping doc.
+  (b) **The wheel-matrix gate — in progress (separate companion wheel).** Decided:
+  `secantus-storage` ships as its own wheel (not bundled into `secantus`). The
+  build recipe is **proven locally** (`cmake/build_wt_static.py` builds WiredTiger
+  static → maturin links the extension → importable abi3 wheel that round-trips
+  CRUD). `.github/workflows/storage-wheels.yml` runs it per platform; **Linux
+  targets first**, macOS/Windows/musl are follow-up matrix entries to shake out in
+  CI (cross-platform native-link packaging can't be validated locally). Still
+  needs: a **PyPI Trusted Publisher for `secantus-storage`** (one-time), and a
+  decision on whether to surface it as a `secantus[...]` extra. See the scoping doc.
 - [ ] **Toward a standalone Rust package (continued).** With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to

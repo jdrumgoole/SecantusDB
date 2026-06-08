@@ -1,10 +1,10 @@
 # PyO3 bindings for the Rust storage layer (secantus-storage), built with
 # maturin. UNLIKE secantus-core, this extension links the vendored WiredTiger C
-# library, so it cannot build in maturin's plain manylinux container — shipping
-# it across the wheel matrix is Phase 4's go/no-go gate (see
-# tasks/rust-rewrite-phase4-scoping.md). For now it builds where WiredTiger is
-# present (set SECANTUS_WT_INCLUDE/_LIB or use a probed build dir; bindgen needs
-# libclang via LIBCLANG_PATH).
+# library. It ships as its own companion wheel (built by `storage-wheels.yml`,
+# which builds WiredTiger static via `cmake/build_wt_static.py` and then maturin-
+# builds the extension against it) rather than bundled into the `secantus` wheel.
+# Build locally: set SECANTUS_WT_INCLUDE/_LIB (or use a probed build dir) and
+# LIBCLANG_PATH (bindgen needs libclang). See tasks/rust-rewrite-phase4-scoping.md.
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
@@ -13,9 +13,26 @@ build-backend = "maturin"
 name = "secantus-storage"
 version = "0.5.2b15"
 description = "Rust storage layer for SecantusDB (the _secantus_storage extension)"
+readme = "README.md"
 requires-python = ">=3.10"
+authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
 license = "GPL-2.0-only"
+keywords = ["mongodb", "wiredtiger", "rust", "pyo3", "secantus", "storage"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/jdrumgoole/SecantusDB"
+Repository = "https://github.com/jdrumgoole/SecantusDB"
+Issues = "https://github.com/jdrumgoole/SecantusDB/issues"
 
 [tool.maturin]
 module-name = "_secantus_storage"
 features = ["pyo3/abi3-py310"]
+

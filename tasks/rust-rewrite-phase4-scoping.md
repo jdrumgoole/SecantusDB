@@ -80,24 +80,31 @@ Swapping the Rust `Storage` into `SecantusDBServer` needs the *whole* `Storage`
 surface (`find_matching`/indexes/oplog/…), so the server cutover is gated on
 sub-phases 2-4, not just the CRUD core.
 
-## Open gate for the whole phase: the wheel matrix
+## The wheel-matrix gate — decision + status
 
-`secantus-wt` / `secantus-storage-py` build and test where WiredTiger is present
-(dev machines, and CI jobs that build the vendored WT). The unsolved question —
-and the phase's go/no-go — is **shipping it**: the WiredTiger-linking Rust
-extension has to build clean across the wheel matrix (cp310–313 × manylinux /
-musllinux / macOS-arm64 / Windows), the same matrix the pure `secantus-core`
-wheel already covers. The maturin build today produces only a host-glibc wheel.
-Options:
+**Decision (chosen): a separate companion wheel.** `secantus-storage` ships as
+its own wheel that builds its own vendored WiredTiger (static) and links the Rust
+extension against it — leaving the main `secantus` wheel completely untouched
+(symmetry with the `secantus-core` companion). The alternative (bundling the
+extension into the `secantus` wheel to reuse its CMake WT build) was rejected to
+keep the load-bearing main wheel unchanged and the extension optional.
 
-- Link the same vendored WiredTiger the main `secantus` wheel already builds
-  (scikit-build-core CMake output) into the storage extension, reusing that
-  toolchain rather than maturin's manylinux container.
-- Or build the storage extension through the existing scikit-build path (which
-  already vendors + builds WiredTiger) instead of maturin.
+**Recipe — proven locally end-to-end:**
+1. `cmake/build_wt_static.py <dir>` builds vendored WiredTiger **static**
+   (`ENABLE_STATIC=ON / ENABLE_SHARED=OFF / ENABLE_PYTHON=OFF / ENABLE_CPPSUITE=OFF`
+   — no SWIG needed), applying the same `patch_wt_strict` / `patch_wt_musl`
+   patches the main build uses. Verified: builds `libwiredtiger.a` + headers.
+2. `maturin build` the extension with `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB`
+   pointing at that build (bindgen needs `LIBCLANG_PATH`). Verified: produces an
+   abi3 wheel that imports and round-trips CRUD through WiredTiger.
 
-Until that's resolved, `secantus-wt` is deliberately excluded from the
-`crates/Cargo.toml` workspace so the green `secantus-core` / `secantus-core-py`
-build and the `rust` / `rust-wheels` CI stay untouched. CI coverage for
-`secantus-wt` itself is a follow-up: it needs a job that builds the vendored
-WiredTiger first, then `SECANTUS_WT_INCLUDE`/`_LIB` → `cargo test` in the crate.
+**CI — `.github/workflows/storage-wheels.yml`** runs that recipe per platform via
+maturin-action (`before-script-linux` builds WT in the manylinux_2_28 container,
+then maturin links it). Started with the **Linux targets**; macOS / Windows /
+musl are follow-up matrix entries (same recipe + platform toolchain setup) and
+will be shaken out via CI — cross-platform native-link packaging can't be
+validated locally. Tag-gated publish needs a **PyPI Trusted Publisher for the
+`secantus-storage` project** (one-time, like `secantus-core`).
+
+The crates stay excluded from the `crates/Cargo.toml` workspace so the green
+`secantus-core` / `rust` / `rust-wheels` CI is untouched.
