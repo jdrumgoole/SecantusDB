@@ -65,14 +65,30 @@ build-out.
    time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
    acceleration here. Gate: `test_change_streams.py`.
 
+## PyO3 exposure (done) — `crates/secantus-storage-py`
+
+The Rust storage is exposed to Python as the `_secantus_storage` extension
+(`RustStorage` over the BSON byte seam, `_id` wrapped as `{"v": id}`). This
+proves the **WiredTiger-linking extension builds (maturin → abi3 wheel) and
+imports**, and drives the CRUD core end-to-end from Python
+(`tests/test_rust_storage_smoke.py`; `invoke rust-storage-py`). That de-risks the
+core of the gate below — what remains is the cross-platform *packaging*, not
+whether a WT-linking Python extension can work at all.
+
+Note: this is **not** yet wired into `secantus.engine`'s storage selection.
+Swapping the Rust `Storage` into `SecantusDBServer` needs the *whole* `Storage`
+surface (`find_matching`/indexes/oplog/…), so the server cutover is gated on
+sub-phases 2-4, not just the CRUD core.
+
 ## Open gate for the whole phase: the wheel matrix
 
-`secantus-wt` builds and tests where WiredTiger is present (dev machines, and CI
-jobs that build the vendored WT). The unsolved question — and the phase's
-go/no-go — is **shipping it**: the WiredTiger-linking Rust extension has to build
-clean across the wheel matrix (cp310–313 × manylinux / musllinux / macOS-arm64 /
-Windows), the same matrix the pure `secantus-core` wheel already covers. Options
-to evaluate when sub-phase 1 has something to ship:
+`secantus-wt` / `secantus-storage-py` build and test where WiredTiger is present
+(dev machines, and CI jobs that build the vendored WT). The unsolved question —
+and the phase's go/no-go — is **shipping it**: the WiredTiger-linking Rust
+extension has to build clean across the wheel matrix (cp310–313 × manylinux /
+musllinux / macOS-arm64 / Windows), the same matrix the pure `secantus-core`
+wheel already covers. The maturin build today produces only a host-glibc wheel.
+Options:
 
 - Link the same vendored WiredTiger the main `secantus` wheel already builds
   (scikit-build-core CMake output) into the storage extension, reusing that

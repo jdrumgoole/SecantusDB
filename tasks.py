@@ -172,6 +172,38 @@ def rust_storage_test(c: Context) -> None:
     c.run(f"cd {_RUST_STORAGE_DIR} && cargo test", pty=True)
 
 
+# The PyO3 bindings that expose the Rust storage layer to Python as the
+# WiredTiger-linking _secantus_storage extension.
+_RUST_STORAGE_PY_DIR = "crates/secantus-storage-py"
+
+
+@task(name="rust-storage-py")
+def rust_storage_py(c: Context) -> None:
+    """Build the _secantus_storage extension and run its Python smoke test.
+
+    Builds the WiredTiger-linking wheel with maturin, then runs the smoke test in
+    an isolated interpreter (pymongo + the freshly built wheel) so it doesn't need
+    the project's own WiredTiger extension installed. Same WiredTiger / libclang
+    prerequisites as ``rust-wt-test``.
+    """
+    import glob
+
+    c.run(
+        f"cd {_RUST_STORAGE_PY_DIR} && uv tool run maturin build --release --out dist",
+        pty=True,
+    )
+    wheels = sorted(glob.glob(f"{_RUST_STORAGE_PY_DIR}/dist/*.whl"))
+    if not wheels:
+        raise SystemExit("no wheel produced by maturin")
+    c.run(
+        "uv run --no-project --reinstall-package secantus-storage "
+        f"--with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
+        "python -m pytest tests/test_rust_storage_smoke.py "
+        "-o addopts= -p no:cacheprovider -q",
+        pty=True,
+    )
+
+
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(
