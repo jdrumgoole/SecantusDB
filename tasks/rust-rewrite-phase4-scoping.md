@@ -126,7 +126,30 @@ build-out.
        the leaf engines grow collation support.
      - New WT-backed tests: `tests/unique.rs` (9), `tests/partial.rs` (2),
        `tests/ttl.rs` (3).
-   - **2f** — sort acceleration (single + compound) + `hint`.
+   - **2f ✅ DONE** — sort acceleration + `hint`. `find_matching_with(filter,
+     sort, hint)` / `explain_plan_with(...)` (the 3-arg forms are convenience
+     wrappers): a single-field sort on the filter field, or an empty-filter sort
+     matching a single-field / compound index, is served by walking the index
+     forward / backward (skipping the post-sort); otherwise a COLLSCAN + a
+     byte-sortable-key post-sort (`sort_key` via the same encoder, so order is
+     consistent with the accelerated path). `hint` (`Hint::Name` /
+     `Hint::KeySpec`) resolves to `$natural` / `_id_` / a named index
+     (`resolve_hint` / `candidates_from_hint`); an unresolvable hint is
+     `StorageError::BadHint` in `find` and COLLSCAN in `explain`.
+     `compound_index_for_sort` is strict-shape and **excludes multikey indexes**
+     (the 2d flag's payoff). `explain` now sets `direction` (`forward` /
+     `backward`) via `make_ixscan_plan`. Ported from `storage`'s
+     `_single_sort_spec` / `_multi_sort_spec` / `_compound_index_for_sort` /
+     `_walk_index_in_order` / `_resolve_hint` / `_candidates_from_hint` /
+     `_make_ixscan_plan` and `find_matching`'s sort/hint branches. New WT-backed
+     tests in `tests/sort.rs` (10).
+
+   **Sub-phase 2 complete (collation deferred).** 72 storage tests; the
+   secantus-storage crate now covers the index registry, entry maintenance,
+   single-field + compound + `_id` lookup routing, unique / sparse / partial /
+   TTL, and sort + hint — all byte-faithful to `storage.py` and `clippy
+   -D warnings` clean. Next: wire the crate into CI, then sub-phase 3 (oplog /
+   change streams) per this doc.
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
    Gate: `test_geo_index.py`.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster

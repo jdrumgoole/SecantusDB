@@ -93,6 +93,24 @@ pub struct UniqueConflict {
     pub key_value: Document,
 }
 
+/// A query hint: either an index name (or `"$natural"` / `"_id_"`) or a key-spec
+/// document (`{a: 1, b: -1}` / `{$natural: 1}` / `{_id: 1}`).
+#[derive(Debug, Clone)]
+pub enum Hint {
+    Name(String),
+    KeySpec(Document),
+}
+
+/// A resolved hint target.
+enum ResolvedHint {
+    /// `$natural` — force a collection scan.
+    Natural,
+    /// The virtual `_id_` index (doc-table order).
+    IdIndex,
+    /// A stored index by name.
+    Named(String),
+}
+
 /// The WiredTiger connection config SecantusDB uses (mirrors `storage.py`):
 /// logging on, commit-sync off by default.
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
@@ -147,6 +165,9 @@ pub enum StorageError {
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
     QueryUnsupported,
+    /// A `hint` did not resolve to an existing index (command layer maps this to
+    /// a mongod `BadValue`).
+    BadHint(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -167,6 +188,7 @@ impl std::fmt::Display for StorageError {
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
+            StorageError::BadHint(m) => write!(f, "{m}"),
         }
     }
 }
@@ -442,6 +464,80 @@ fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
 /// `storage._query_implies_partial`.
 fn query_implies_partial(query: &Document, partial: &Document) -> bool {
     partial.iter().all(|(k, v)| query.get(k) == Some(v))
+}
+
+/// `(field, direction)` if `sort` is a single `±1` field (not operator-prefixed),
+/// else `(None, 0)`. Mirrors `storage._single_sort_spec`.
+fn single_sort_spec(sort: Option<&Document>) -> (Option<&str>, i32) {
+    let s = match sort {
+        Some(s) if s.len() == 1 => s,
+        _ => return (None, 0),
+    };
+    let (f, d) = s.iter().next().unwrap();
+    if f.starts_with('$') {
+        return (None, 0);
+    }
+    match direction_of(d) {
+        Some(di @ (1 | -1)) => (Some(f.as_str()), di),
+        _ => (None, 0),
+    }
+}
+
+/// `(field, direction)` pairs for a multi-field sort, or `None` if any entry is
+/// operator-prefixed or not `±1`. Also used to validate a single-field sort for
+/// the post-sort. Mirrors `storage._multi_sort_spec`.
+fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
+    let s = sort?;
+    if s.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for (f, d) in s {
+        if f.starts_with('$') {
+            return None;
+        }
+        match direction_of(d) {
+            Some(di @ (1 | -1)) => out.push((f.clone(), di)),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The byte-sortable compound key for `doc` under a sort `spec` — the same
+/// encoding the index walk produces, so the COLLSCAN post-sort yields mongod's
+/// cross-type order consistent with the accelerated path.
+fn sort_key(doc: &Document, spec: &[(String, i32)]) -> Result<Vec<u8>> {
+    let mut parts = Vec::with_capacity(spec.len());
+    for (f, d) in spec {
+        let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
+        parts.push(enc_dir(&v, *d)?);
+    }
+    Ok(compound_join(&parts))
+}
+
+/// Build an `IxScan` plan, setting `direction` to `"backward"` when the sort
+/// field is in the key spec with the opposite direction. Mirrors
+/// `storage._make_ixscan_plan`.
+fn make_ixscan_plan(
+    name: String,
+    key_spec: &Document,
+    sort_field: Option<&str>,
+    sort_dir: i32,
+) -> ExplainPlan {
+    let mut direction = "forward";
+    if let Some(sf) = sort_field {
+        if let Some(idx_dir) = key_spec.get(sf).and_then(direction_of) {
+            if sort_dir != 0 && sort_dir != idx_dir {
+                direction = "backward";
+            }
+        }
+    }
+    ExplainPlan::IxScan {
+        index_name: name,
+        key_pattern: key_spec.clone(),
+        direction: direction.to_string(),
+    }
 }
 
 /// Split a filter into `(eq_fields, operator_field, operator_ops)` for the
@@ -1327,49 +1423,370 @@ impl Storage {
         Ok(out)
     }
 
-    // --- query routing (Phase 4 sub-phase 2, slice 2b: single-field) ---
+    // --- query routing (Phase 4 sub-phase 2) ---
 
-    /// Documents matching `filter`, as BSON bytes. Routes through a single-field
-    /// index (equality / `$eq` / `$in` / range) or the `_id` primary-key point
-    /// lookup when one applies, else a full collection scan; index candidates
-    /// are always re-checked with `matches()` (an index walk can over-include,
-    /// e.g. multikey). Compound-index routing is slice 2c. Mirrors the no-sort
-    /// path of `storage.find_matching`.
+    /// Documents matching `filter`, as BSON bytes, in `_id`-natural / index order.
+    /// Convenience wrapper for `find_matching_with(.., None, None)`.
     pub fn find_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<Vec<Vec<u8>>> {
+        self.find_matching_with(db, coll, filter, None, None)
+    }
+
+    /// Documents matching `filter`, as BSON bytes, ordered per `sort` and routed
+    /// per `hint`. Routes the filter through an index (single-field / compound
+    /// equality / `$in` / range, or the `_id` point lookup) else a collection
+    /// scan; index candidates are re-checked with `matches()`. When `sort` can be
+    /// satisfied by walking an index (the filter field equals the sort field, or
+    /// the filter is empty and a single-field / compound index matches the sort)
+    /// the results come back already ordered and the post-sort is skipped;
+    /// otherwise they're sorted with the byte-sortable key encoder (mongod
+    /// cross-type order). `hint` forces an index / `$natural` scan. Mirrors
+    /// `storage.find_matching` (skip / limit / projection stay in the command
+    /// layer).
+    pub fn find_matching_with(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        hint: Option<&Hint>,
+    ) -> Result<Vec<Vec<u8>>> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
-        let blobs = match self.try_index_id_keys(&session, db, coll, filter)? {
-            Some(id_keys) => self.docs_by_id_keys(&session, db, coll, &id_keys)?,
-            None => self
-                .scan_docs(&session, db, coll)?
-                .into_iter()
-                .map(|(_id_k, blob)| blob)
-                .collect(),
+        let (sort_field, sort_dir) = single_sort_spec(sort);
+        let mut in_sort_order = false;
+
+        let blobs: Vec<Vec<u8>> = if let Some(h) = hint {
+            let resolved = self.resolve_hint(&session, db, coll, h)?;
+            let (cands, ord) =
+                self.candidates_from_hint(&session, db, coll, &resolved, sort_field, sort_dir)?;
+            in_sort_order = ord;
+            cands
+        } else if let Some(id_keys) = self.try_index_id_keys(&session, db, coll, filter)? {
+            let mut docs = self.docs_by_id_keys(&session, db, coll, &id_keys)?;
+            // Single-field filter on the sort field: the index walk already
+            // ordered the candidates (modulo direction).
+            if let Some(sf) = sort_field {
+                let single = filter.len() == 1 && filter.keys().next().is_some_and(|f| f == sf);
+                if single {
+                    in_sort_order = true;
+                    let idx_dir = self
+                        .find_leading_field_index(&session, db, coll, sf, filter)?
+                        .map(|m| m.1)
+                        .unwrap_or(1);
+                    if sort_dir != idx_dir {
+                        docs.reverse();
+                    }
+                }
+            }
+            docs
+        } else if filter.is_empty() {
+            if let Some(sf) = sort_field {
+                // Single-field sort: walk a leading-field index, else COLLSCAN.
+                match self.find_leading_field_index(&session, db, coll, sf, filter)? {
+                    Some((idx_name, idx_dir, _is_compound)) => {
+                        in_sort_order = true;
+                        self.walk_index_in_order(
+                            &session,
+                            db,
+                            coll,
+                            &idx_name,
+                            sort_dir != idx_dir,
+                        )?
+                    }
+                    None => self.scan_blobs(&session, db, coll)?,
+                }
+            } else if let Some(multi) = multi_sort_spec(sort).filter(|m| m.len() > 1) {
+                // Multi-field sort: walk a strict-match compound index, else COLLSCAN.
+                match self.compound_index_for_sort(&session, db, coll, &multi)? {
+                    Some((idx_name, reverse)) => {
+                        in_sort_order = true;
+                        self.walk_index_in_order(&session, db, coll, &idx_name, reverse)?
+                    }
+                    None => self.scan_blobs(&session, db, coll)?,
+                }
+            } else {
+                self.scan_blobs(&session, db, coll)?
+            }
+        } else {
+            self.scan_blobs(&session, db, coll)?
         };
+
+        // Decode + filter; keep the doc alongside the blob for the post-sort.
         let vars = Document::new();
-        let mut out = Vec::new();
+        let mut out: Vec<(Document, Vec<u8>)> = Vec::new();
         for blob in blobs {
             let d = decode_doc(&blob)?;
             if query_matches(&d, filter, &vars, None).map_err(|_| StorageError::QueryUnsupported)? {
-                out.push(blob);
+                out.push((d, blob));
             }
         }
-        Ok(out)
+        if !in_sort_order {
+            if let Some(spec) = multi_sort_spec(sort) {
+                // Decorate-sort-undecorate on the byte-sortable compound key.
+                let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(out.len());
+                for (d, blob) in out {
+                    keyed.push((sort_key(&d, &spec)?, blob));
+                }
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                return Ok(keyed.into_iter().map(|(_, b)| b).collect());
+            }
+        }
+        Ok(out.into_iter().map(|(_, b)| b).collect())
     }
 
-    /// The plan `find_matching` would use for `filter` (no execution). Mirrors
-    /// `storage.explain_plan` (filter only; sort / hint are slice 2f).
+    /// The plan `find_matching` would use for `filter` (no execution).
+    /// Convenience wrapper for `explain_plan_with(.., None, None)`.
     pub fn explain_plan(&self, db: &str, coll: &str, filter: &Document) -> Result<ExplainPlan> {
+        self.explain_plan_with(db, coll, filter, None, None)
+    }
+
+    /// The plan `find_matching_with` would use for these args (no execution),
+    /// honouring `sort` (sets the walk `direction`) and `hint`. A `hint` that
+    /// doesn't resolve to an index degrades to COLLSCAN (mirroring
+    /// `storage.explain_plan`, which catches `BadHint`).
+    pub fn explain_plan_with(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        hint: Option<&Hint>,
+    ) -> Result<ExplainPlan> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
-        match self.pick_index_for_filter(&session, db, coll, filter)? {
-            Some((index_name, key_pattern)) => Ok(ExplainPlan::IxScan {
-                index_name,
-                key_pattern,
-                direction: "forward".to_string(),
-            }),
-            None => Ok(ExplainPlan::CollScan),
+        let (sort_field, sort_dir) = single_sort_spec(sort);
+
+        if let Some(h) = hint {
+            let resolved = match self.resolve_hint(&session, db, coll, h) {
+                Ok(r) => r,
+                Err(StorageError::BadHint(_)) => return Ok(ExplainPlan::CollScan),
+                Err(e) => return Err(e),
+            };
+            return match resolved {
+                ResolvedHint::Natural => Ok(ExplainPlan::CollScan),
+                ResolvedHint::IdIndex => {
+                    let direction = if sort_field == Some("_id") && sort_dir == -1 {
+                        "backward"
+                    } else {
+                        "forward"
+                    };
+                    let mut kp = Document::new();
+                    kp.insert("_id", 1i32);
+                    Ok(ExplainPlan::IxScan {
+                        index_name: ID_INDEX_NAME.to_string(),
+                        key_pattern: kp,
+                        direction: direction.to_string(),
+                    })
+                }
+                ResolvedHint::Named(name) => match self.key_spec_for(&session, db, coll, &name)? {
+                    Some(key_spec) => Ok(make_ixscan_plan(name, &key_spec, sort_field, sort_dir)),
+                    None => Ok(ExplainPlan::CollScan),
+                },
+            };
         }
+
+        if let Some((name, key_spec)) = self.pick_index_for_filter(&session, db, coll, filter)? {
+            return Ok(make_ixscan_plan(name, &key_spec, sort_field, sort_dir));
+        }
+        if filter.is_empty() {
+            if let Some(sf) = sort_field {
+                if let Some((name, _dir, _comp)) =
+                    self.find_leading_field_index(&session, db, coll, sf, filter)?
+                {
+                    if let Some(key_spec) = self.key_spec_for(&session, db, coll, &name)? {
+                        return Ok(make_ixscan_plan(name, &key_spec, sort_field, sort_dir));
+                    }
+                }
+            } else if sort.is_some() {
+                if let Some(multi) = multi_sort_spec(sort).filter(|m| m.len() > 1) {
+                    if let Some((name, reverse)) =
+                        self.compound_index_for_sort(&session, db, coll, &multi)?
+                    {
+                        if let Some(key_spec) = self.key_spec_for(&session, db, coll, &name)? {
+                            return Ok(ExplainPlan::IxScan {
+                                index_name: name,
+                                key_pattern: key_spec,
+                                direction: if reverse { "backward" } else { "forward" }.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(ExplainPlan::CollScan)
+    }
+
+    /// Raw doc blobs for `(db, coll)` in natural `_id` order.
+    fn scan_blobs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .scan_docs(session, db, coll)?
+            .into_iter()
+            .map(|(_id_k, blob)| blob)
+            .collect())
+    }
+
+    /// Resolve `hint` to an index name / `$natural` / `_id_`. Mirrors
+    /// `storage._resolve_hint`.
+    fn resolve_hint(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        hint: &Hint,
+    ) -> Result<ResolvedHint> {
+        match hint {
+            Hint::Name(s) => {
+                if s == "$natural" {
+                    return Ok(ResolvedHint::Natural);
+                }
+                if s == ID_INDEX_NAME {
+                    return Ok(ResolvedHint::IdIndex);
+                }
+                for (name, _k, _o) in self.iter_indexes(session, db, coll)? {
+                    if &name == s {
+                        return Ok(ResolvedHint::Named(name));
+                    }
+                }
+                Err(StorageError::BadHint(format!(
+                    "hint {s:?} does not correspond to an existing index"
+                )))
+            }
+            Hint::KeySpec(spec) => {
+                if spec.len() == 1 && spec.contains_key("$natural") {
+                    return Ok(ResolvedHint::Natural);
+                }
+                if spec.len() == 1 && spec.get("_id").and_then(direction_of) == Some(1) {
+                    return Ok(ResolvedHint::IdIndex);
+                }
+                for (name, key_spec, _o) in self.iter_indexes(session, db, coll)? {
+                    if &key_spec == spec {
+                        return Ok(ResolvedHint::Named(name));
+                    }
+                }
+                Err(StorageError::BadHint(format!(
+                    "hint {spec:?} does not correspond to an existing index"
+                )))
+            }
+        }
+    }
+
+    /// Candidate doc blobs for a resolved hint, plus whether they're already in
+    /// the requested sort order. Mirrors `storage._candidates_from_hint`.
+    fn candidates_from_hint(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        resolved: &ResolvedHint,
+        sort_field: Option<&str>,
+        sort_dir: i32,
+    ) -> Result<(Vec<Vec<u8>>, bool)> {
+        match resolved {
+            ResolvedHint::Natural => Ok((self.scan_blobs(session, db, coll)?, false)),
+            ResolvedHint::IdIndex => {
+                // The doc table is keyed by id_key, so a natural scan is _id order.
+                let mut docs = self.scan_blobs(session, db, coll)?;
+                let in_order = sort_field == Some("_id");
+                if in_order && sort_dir == -1 {
+                    docs.reverse();
+                }
+                Ok((docs, in_order))
+            }
+            ResolvedHint::Named(name) => {
+                let mut leading: Option<(String, i32)> = None;
+                for (n, key_spec, _o) in self.iter_indexes(session, db, coll)? {
+                    if &n == name {
+                        if let Some((f, dv)) = key_spec.iter().next() {
+                            leading = Some((f.clone(), direction_of(dv).unwrap_or(1)));
+                        }
+                        break;
+                    }
+                }
+                let mut docs = self.walk_index_in_order(session, db, coll, name, false)?;
+                let in_order = match (&leading, sort_field) {
+                    (Some((f, _)), Some(sf)) => f == sf,
+                    _ => false,
+                };
+                if in_order && sort_dir != leading.as_ref().map(|l| l.1).unwrap_or(1) {
+                    docs.reverse();
+                }
+                Ok((docs, in_order))
+            }
+        }
+    }
+
+    /// All docs of an index, in WT entry order (or reversed), deduped — for
+    /// sort-by-index walks. Mirrors `storage._walk_index_in_order`.
+    fn walk_index_in_order(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        reverse: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        cur.set_key_sssu(db, coll, name, b"");
+        let mut id_keys: Vec<Vec<u8>> = Vec::new();
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, n, packed) = cur.get_key_sssu()?;
+            if d != db || c != coll || n != name {
+                break;
+            }
+            let (_esc, row_id) = unpack_entry(&packed);
+            id_keys.push(row_id.to_vec());
+            more = cur.next()?;
+        }
+        if reverse {
+            id_keys.reverse();
+        }
+        self.docs_by_id_keys(session, db, coll, &id_keys)
+    }
+
+    /// A compound index whose key spec exactly matches `sort_fields` (forward) or
+    /// fully inverts it (backward walk). Multikey indexes are excluded (array
+    /// values break the natural-order walk). Strict shape only. Mirrors
+    /// `storage._compound_index_for_sort`.
+    fn compound_index_for_sort(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        sort_fields: &[(String, i32)],
+    ) -> Result<Option<(String, bool)>> {
+        let inverted: Vec<(String, i32)> =
+            sort_fields.iter().map(|(f, d)| (f.clone(), -d)).collect();
+        for (name, key_spec, opts) in self.iter_indexes(session, db, coll)? {
+            if opts.get_bool("multikey").unwrap_or(false) {
+                continue;
+            }
+            let idx_pairs: Vec<(String, i32)> = match key_spec
+                .iter()
+                .map(|(f, d)| direction_of(d).map(|di| (f.clone(), di)))
+                .collect::<Option<Vec<_>>>()
+            {
+                Some(p) if p.iter().all(|(_, d)| *d == 1 || *d == -1) => p,
+                _ => continue,
+            };
+            if idx_pairs == sort_fields {
+                return Ok(Some((name, false)));
+            }
+            if idx_pairs == inverted {
+                return Ok(Some((name, true)));
+            }
+        }
+        Ok(None)
     }
 
     /// Route `filter` to a set of candidate `id_key`s via an index, or `None`
