@@ -148,8 +148,14 @@ build-out.
    secantus-storage crate now covers the index registry, entry maintenance,
    single-field + compound + `_id` lookup routing, unique / sparse / partial /
    TTL, and sort + hint — all byte-faithful to `storage.py` and `clippy
-   -D warnings` clean. Next: wire the crate into CI, then sub-phase 3 (oplog /
-   change streams) per this doc.
+   -D warnings` clean.
+
+   **CI:** a `rust-storage` job in `.github/workflows/test.yml` builds the
+   vendored WiredTiger via `uv sync` (`build/*/wt-build`, static
+   `libwiredtiger.a`), points `SECANTUS_WT_INCLUDE`/`SECANTUS_WT_LIB` at it, and
+   runs `cargo fmt --check` / `clippy -D warnings` / `cargo test` for the crate
+   on every push-to-main / PR (Linux; cross-platform WT linking stays covered by
+   the `storage-engine` wheel job). Next: sub-phase 3 (oplog / change streams).
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
    Gate: `test_geo_index.py`.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
