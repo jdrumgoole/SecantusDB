@@ -84,7 +84,18 @@ build-out.
      consistent); a `matches()` "defer to Python" construct (e.g. whole-array
      literal equality) surfaces as `StorageError::QueryUnsupported` for the
      server's engine-selection layer to route to Python.
-   - **2c** — compound eq-prefix + trailing-operator + mixed-direction lookups.
+   - **2c ✅ DONE** — compound-index routing: bare-equality prefix (full-cover
+     exact scan + strict-leading-prefix scan, filter-field-order-independent,
+     shortest-covering-index preference), prefix + trailing-operator
+     (`$eq`/`$in`/range on the next column, range pinned to the equality
+     prefix), and mixed-direction compound indexes (per-field
+     `encode_value_directed`, DESC operator-flip). Restored the `prefix` param on
+     `range_scan_index` and added `range_scan_index_leading` (leading-field range
+     with escaped-separator boundary detection); `find_leading_field_index` now
+     returns the compound fallback so a single-field filter can ride a compound
+     index's leading field. Pickers (`pick_compound_eq_index` /
+     `pick_compound_range_index` / `partition_compound_range_filter`) shared by
+     execution and `explain`. New WT-backed tests in `tests/compound.rs`.
    - **2d** — multikey flag (lazy marking) + its sort-acceleration exclusions.
    - **2e** — partial + TTL + unique enforcement + collation.
    - **2f** — sort acceleration (single + compound) + `hint`.

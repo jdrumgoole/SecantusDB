@@ -322,6 +322,19 @@ fn is_regex_value(v: &Bson) -> bool {
     matches!(v, Bson::RegularExpression(_))
 }
 
+/// Flip a range operator for a DESC field (whose stored bytes are inverted, so
+/// the comparison reverses). Non-range ops pass through. Mirrors the
+/// `{$gt:$lt, ...}` table in `storage.py`.
+fn flip_range_op(op: &str) -> &str {
+    match op {
+        "$gt" => "$lt",
+        "$gte" => "$lte",
+        "$lt" => "$gt",
+        "$lte" => "$gte",
+        other => other,
+    }
+}
+
 /// The `id_key`s to fetch for an `{_id: <spec>}` equality predicate, or `None`
 /// when `spec` isn't a pure point lookup (range op, regex, literal subdocument,
 /// operator-valued equality). The documents table is keyed by
@@ -364,6 +377,39 @@ fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
         _ if is_regex_value(spec) => Ok(None),
         _ => Ok(Some(vec![id_key(spec)?])),
     }
+}
+
+/// Split a filter into `(eq_fields, operator_field, operator_ops)` for the
+/// compound prefix + trailing-operator shape: any number of bare-equality
+/// fields plus exactly one operator-form field whose ops are all in
+/// `RANGE_OPS`. `None` if it doesn't fit. Mirrors
+/// `storage._partition_compound_range_filter`.
+fn partition_compound_range_filter(filter: &Document) -> Option<(Document, String, Document)> {
+    let mut eq_fields = Document::new();
+    let mut operator_field: Option<String> = None;
+    let mut operator_ops: Option<Document> = None;
+    for (f, v) in filter {
+        if let Bson::Document(opd) = v {
+            if opd.is_empty() || !opd.keys().all(|k| k.starts_with('$')) {
+                return None;
+            }
+            if !opd.keys().all(|k| RANGE_OPS.contains(&k.as_str())) {
+                return None;
+            }
+            if operator_field.is_some() {
+                return None;
+            }
+            operator_field = Some(f.clone());
+            operator_ops = Some(opd.clone());
+        } else {
+            eq_fields.insert(f.clone(), v.clone());
+        }
+    }
+    let of = operator_field?;
+    if eq_fields.is_empty() || eq_fields.contains_key(&of) {
+        return None;
+    }
+    Some((eq_fields, of, operator_ops.unwrap_or_default()))
 }
 
 /// WiredTiger-backed storage. A global lock serialises public methods, matching
@@ -1017,9 +1063,10 @@ impl Storage {
     }
 
     /// Route `filter` to a set of candidate `id_key`s via an index, or `None`
-    /// (caller does a COLLSCAN). Slice 2b: the `_id` point-lookup fast path and
-    /// single-field equality / `$in` / range. Mirrors the single-field portion
-    /// of `storage._try_index_id_keys`.
+    /// (caller does a COLLSCAN). The `_id` point-lookup fast path, compound
+    /// bare-equality prefix, compound prefix + trailing operator, and
+    /// single-field equality / `$in` / range. Mirrors `storage._try_index_id_keys`
+    /// (geo dispatch is sub-phase 3).
     fn try_index_id_keys(
         &self,
         session: &Session,
@@ -1041,7 +1088,19 @@ impl Storage {
                 }
             }
         }
-        // (Geo dispatch -> sub-phase 3; compound eq / range -> slice 2c.)
+        // (Geo dispatch -> sub-phase 3.) Bare-equality filters of any size can
+        // use a compound (or single-field) index whose leading fields cover them.
+        if filter.values().all(|v| !matches!(v, Bson::Document(_))) {
+            if let Some(r) = self.try_compound_eq_id_keys(session, db, coll, filter)? {
+                return Ok(Some(r));
+            }
+        }
+        // Compound prefix + trailing operator field (eq fields then range / $in).
+        if filter.len() >= 2 {
+            if let Some(r) = self.try_compound_range_id_keys(session, db, coll, filter)? {
+                return Ok(Some(r));
+            }
+        }
         if filter.len() != 1 {
             return Ok(None);
         }
@@ -1053,54 +1112,74 @@ impl Storage {
         self.lookup_id_keys_via_leading_field(session, db, coll, &idx, value)
     }
 
-    /// The best single-field index whose field is `field`, as `(name,
-    /// direction)`. Skips non-`1`/`-1` directions (geo / text / hashed). Slice
-    /// 2b considers single-field indexes only; compound leading-field use is
-    /// slice 2c. (Partial / collation gating is slice 2e.) Multikey indexes are
-    /// NOT skipped — per-element entries cover the lookup, and `find_matching`
-    /// re-checks with `matches()`.
+    /// The best index whose leading field is `field`, as `(name, direction,
+    /// is_compound)`. Single-field indexes win over compound (tighter scan);
+    /// otherwise the first compound index with that leading field is the
+    /// fallback. Skips non-`1`/`-1` directions (geo / text / hashed). (Partial /
+    /// collation gating is slice 2e.) Multikey indexes are NOT skipped —
+    /// per-element entries cover the lookup, and `find_matching` re-checks with
+    /// `matches()`. Mirrors `storage._find_leading_field_index`.
     fn find_leading_field_index(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         field: &str,
-    ) -> Result<Option<(String, i32)>> {
+    ) -> Result<Option<(String, i32, bool)>> {
+        let mut compound_fallback: Option<(String, i32, bool)> = None;
         for (name, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
-            if key_spec.len() != 1 {
-                continue;
-            }
-            let (f0, dir_val) = key_spec.iter().next().unwrap();
+            let n_fields = key_spec.len();
+            let (f0, _) = match key_spec.iter().next() {
+                Some(p) => p,
+                None => continue,
+            };
             if f0.as_str() != field {
                 continue;
             }
-            match direction_of(dir_val) {
-                Some(d @ (1 | -1)) => return Ok(Some((name, d))),
-                _ => continue,
+            if !key_spec
+                .values()
+                .all(|v| matches!(direction_of(v), Some(1) | Some(-1)))
+            {
+                continue;
+            }
+            let d = direction_of(key_spec.get(field).unwrap()).unwrap();
+            if n_fields == 1 {
+                return Ok(Some((name, d, false)));
+            }
+            if compound_fallback.is_none() {
+                compound_fallback = Some((name, d, true));
             }
         }
-        Ok(None)
+        Ok(compound_fallback)
     }
 
-    /// `id_key`s for `field <value>` against the single-field index `(name,
-    /// direction)`: bare/`$eq`/`$in` equality and `$gt`/`$gte`/`$lt`/`$lte`
-    /// ranges (operator semantics flip for a DESC index). `None` falls back to
-    /// COLLSCAN. Mirrors `storage._lookup_id_keys_via_leading_field`.
+    /// `id_key`s for `field <value>` against the index `(name, direction,
+    /// is_compound)` whose leading field is `field`: bare/`$eq`/`$in` equality
+    /// and `$gt`/`$gte`/`$lt`/`$lte` ranges (operator semantics flip for a DESC
+    /// field). A compound index is walked by its leading field only (equality is
+    /// a prefix scan; range uses the leading-field range scan). `None` falls back
+    /// to COLLSCAN. Mirrors `storage._lookup_id_keys_via_leading_field`.
     fn lookup_id_keys_via_leading_field(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
-        idx: &(String, i32),
+        idx: &(String, i32, bool),
         value: &Bson,
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        let (name, direction) = (idx.0.as_str(), idx.1);
+        let (name, direction, is_compound) = (idx.0.as_str(), idx.1, idx.2);
         let opdoc = match value {
             Bson::Document(d) => d,
             _ => {
-                return Ok(Some(
-                    self.eq_id_keys(session, db, coll, name, direction, value)?,
-                ))
+                return Ok(Some(self.eq_id_keys(
+                    session,
+                    db,
+                    coll,
+                    name,
+                    direction,
+                    is_compound,
+                    value,
+                )?))
             }
         };
         if opdoc.is_empty() || !opdoc.keys().all(|k| k.starts_with('$')) {
@@ -1123,7 +1202,7 @@ impl Storage {
                 if matches!(v, Bson::Document(_)) {
                     return Ok(None);
                 }
-                for id_k in self.eq_id_keys(session, db, coll, name, direction, v)? {
+                for id_k in self.eq_id_keys(session, db, coll, name, direction, is_compound, v)? {
                     if seen.insert(id_k.clone()) {
                         out.push(id_k);
                     }
@@ -1140,20 +1219,20 @@ impl Storage {
                 return Ok(None);
             }
             if op == "$eq" {
-                return Ok(Some(
-                    self.eq_id_keys(session, db, coll, name, direction, bound)?,
-                ));
+                return Ok(Some(self.eq_id_keys(
+                    session,
+                    db,
+                    coll,
+                    name,
+                    direction,
+                    is_compound,
+                    bound,
+                )?));
             }
             let kb = enc_dir(bound, direction)?;
-            // DESC index: stored bytes are inverted, so the comparison flips.
+            // DESC field: stored bytes are inverted, so the comparison flips.
             let eff = if direction == -1 {
-                match op.as_str() {
-                    "$gt" => "$lt",
-                    "$gte" => "$lte",
-                    "$lt" => "$gt",
-                    "$lte" => "$gte",
-                    other => other,
-                }
+                flip_range_op(op)
             } else {
                 op.as_str()
             };
@@ -1165,6 +1244,20 @@ impl Storage {
                 _ => {}
             }
         }
+        if is_compound {
+            // Walk the compound index using its leading field only; boundary
+            // detection accounts for the escaped compound separator.
+            return Ok(Some(self.range_scan_index_leading(
+                session,
+                db,
+                coll,
+                name,
+                lower.as_deref(),
+                lower_incl,
+                upper.as_deref(),
+                upper_incl,
+            )?));
+        }
         Ok(Some(self.range_scan_index(
             session,
             db,
@@ -1174,10 +1267,14 @@ impl Storage {
             lower_incl,
             upper.as_deref(),
             upper_incl,
+            None,
         )?))
     }
 
-    /// `id_key`s whose single-field index entry equals `value` (exact `kb`).
+    /// `id_key`s whose index entry equals `value` on the leading field: an exact
+    /// `kb` scan for a single-field index, or a `kb + COMPOUND_SEP` prefix scan
+    /// for a compound index. Mirrors `storage._eq_id_keys_via_leading`.
+    #[allow(clippy::too_many_arguments)]
     fn eq_id_keys(
         &self,
         session: &Session,
@@ -1185,10 +1282,17 @@ impl Storage {
         coll: &str,
         name: &str,
         direction: i32,
+        is_compound: bool,
         value: &Bson,
     ) -> Result<Vec<Vec<u8>>> {
         let kb = enc_dir(value, direction)?;
-        self.scan_index_for_id_keys(session, db, coll, name, &kb, false)
+        if is_compound {
+            let mut seed = kb;
+            seed.extend_from_slice(COMPOUND_SEP);
+            self.scan_index_for_id_keys(session, db, coll, name, &seed, true)
+        } else {
+            self.scan_index_for_id_keys(session, db, coll, name, &kb, false)
+        }
     }
 
     /// Walk index `name`'s entries matching `kb`: exact (`prefix=false`) or
@@ -1245,7 +1349,10 @@ impl Storage {
     }
 
     /// Range-scan index `name` between optional `lower` / `upper` bounds (on the
-    /// directed, unescaped `kb`). Mirrors `storage._range_scan_index`.
+    /// directed, unescaped `kb`). Optional `prefix` constrains the scan to
+    /// entries whose escaped kb starts with `escape(prefix)` — used by compound
+    /// prefix + trailing-operator queries where leading equalities pin part of
+    /// the kb. Mirrors `storage._range_scan_index`.
     #[allow(clippy::too_many_arguments)]
     fn range_scan_index(
         &self,
@@ -1257,14 +1364,18 @@ impl Storage {
         lower_inclusive: bool,
         upper: Option<&[u8]>,
         upper_inclusive: bool,
+        prefix: Option<&[u8]>,
     ) -> Result<Vec<Vec<u8>>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let esc_prefix = prefix.map(escape_kb);
         let esc_lower = lower.map(escape_kb);
         let esc_upper = upper.map(escape_kb);
         let seed: Vec<u8> = if let Some(el) = &esc_lower {
             let mut s = el.clone();
             s.extend_from_slice(ENTRY_SEP);
             s
+        } else if let Some(ep) = &esc_prefix {
+            ep.clone()
         } else {
             Vec::new()
         };
@@ -1287,6 +1398,11 @@ impl Storage {
                 break;
             }
             let (row_esc, row_id) = unpack_entry(&packed);
+            if let Some(ep) = &esc_prefix {
+                if !row_esc.starts_with(ep.as_slice()) {
+                    break;
+                }
+            }
             // Exclusive lower: skip rows whose kb equals the lower bound.
             if let Some(el) = &esc_lower {
                 if !lower_inclusive && row_esc == el.as_slice() {
@@ -1297,6 +1413,78 @@ impl Storage {
             if let Some(eu) = &esc_upper {
                 if upper_inclusive {
                     if row_esc > eu.as_slice() {
+                        break;
+                    }
+                } else if row_esc >= eu.as_slice() {
+                    break;
+                }
+            }
+            out.push(row_id.to_vec());
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Range-scan a compound index using only its leading field. Each row's
+    /// escaped kb is `escape(enc(leading)) + escape(SEP) + escape(enc(rest))`;
+    /// boundary detection uses `starts_with(esc_X + escape(SEP))` to find rows
+    /// whose leading field equals `X` (an escaped numeric terminator can overlap
+    /// the escaped separator, so a literal split is unreliable). Mirrors
+    /// `storage._range_scan_index_leading`.
+    #[allow(clippy::too_many_arguments)]
+    fn range_scan_index_leading(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        lower: Option<&[u8]>,
+        lower_inclusive: bool,
+        upper: Option<&[u8]>,
+        upper_inclusive: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let esc_compound_sep = escape_kb(COMPOUND_SEP);
+        let esc_lower = lower.map(escape_kb);
+        let esc_upper = upper.map(escape_kb);
+        let seed: Vec<u8> = esc_lower.clone().unwrap_or_default();
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        cur.set_key_sssu(db, coll, name, &seed);
+        let mut out = Vec::new();
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        let eq_prefix = |b: &[u8]| -> Vec<u8> {
+            let mut p = b.to_vec();
+            p.extend_from_slice(&esc_compound_sep);
+            p
+        };
+        let lower_eq_prefix = esc_lower.as_deref().map(eq_prefix);
+        let upper_eq_prefix = esc_upper.as_deref().map(eq_prefix);
+        while more {
+            let (d, c, n, packed) = cur.get_key_sssu()?;
+            if d != db || c != coll || n != name {
+                break;
+            }
+            let (row_esc, row_id) = unpack_entry(&packed);
+            if let Some(lep) = &lower_eq_prefix {
+                if !lower_inclusive && row_esc.starts_with(lep.as_slice()) {
+                    more = cur.next()?;
+                    continue;
+                }
+            }
+            if let Some(eu) = &esc_upper {
+                if upper_inclusive {
+                    if row_esc > eu.as_slice()
+                        && !row_esc.starts_with(upper_eq_prefix.as_ref().unwrap().as_slice())
+                    {
                         break;
                     }
                 } else if row_esc >= eu.as_slice() {
@@ -1338,8 +1526,8 @@ impl Storage {
     }
 
     /// The index `(name, key_spec)` `explain_plan` would report for `filter`, or
-    /// `None` (COLLSCAN). Mirrors the single-field portion of
-    /// `storage._pick_index_for_filter`.
+    /// `None` (COLLSCAN). Mirrors `storage._pick_index_for_filter` (no
+    /// execution); the selection order matches `try_index_id_keys`.
     fn pick_index_for_filter(
         &self,
         session: &Session,
@@ -1357,6 +1545,16 @@ impl Storage {
                     kp.insert("_id", 1i32);
                     return Ok(Some((ID_INDEX_NAME.to_string(), kp)));
                 }
+            }
+        }
+        if filter.values().all(|v| !matches!(v, Bson::Document(_))) {
+            if let Some(p) = self.pick_compound_eq_index(session, db, coll, filter)? {
+                return Ok(Some(p));
+            }
+        }
+        if filter.len() >= 2 {
+            if let Some(p) = self.pick_compound_range_index(session, db, coll, filter)? {
+                return Ok(Some(p));
             }
         }
         if filter.len() != 1 {
@@ -1396,6 +1594,252 @@ impl Storage {
             }
         }
         Ok(None)
+    }
+
+    // --- compound-index routing (Phase 4 sub-phase 2, slice 2c) ---
+
+    /// The index `try_compound_eq_id_keys` would walk for a bare-equality
+    /// `filter`: one whose leading fields (set-wise) cover the filter's fields,
+    /// preferring the shortest. `None` if none covers it. Mirrors
+    /// `storage._pick_compound_eq_index`. (Partial / collation gating is 2e.)
+    fn pick_compound_eq_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<(String, Document)>> {
+        let filter_fields: HashSet<&str> = filter.keys().map(|s| s.as_str()).collect();
+        let eff_len = filter_fields.len();
+        let mut best: Option<(String, Document)> = None;
+        for (name, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
+            if !key_spec
+                .values()
+                .all(|v| matches!(direction_of(v), Some(1) | Some(-1)))
+            {
+                continue;
+            }
+            let idx_fields: Vec<&String> = key_spec.keys().collect();
+            if idx_fields.len() < eff_len {
+                continue;
+            }
+            let prefix_set: HashSet<&str> =
+                idx_fields[..eff_len].iter().map(|s| s.as_str()).collect();
+            if prefix_set != filter_fields {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(_, b)| b.len() > idx_fields.len())
+            {
+                best = Some((name, key_spec.clone()));
+            }
+            if idx_fields.len() == eff_len {
+                break;
+            }
+        }
+        Ok(best)
+    }
+
+    /// Bare-equality filter against a compound (or single-field) index prefix:
+    /// equality (full cover) or prefix (strict leading prefix) scan. `None`
+    /// falls back to COLLSCAN. Mirrors `storage._try_compound_eq_id_keys`.
+    fn try_compound_eq_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let (name, key_spec) = match self.pick_compound_eq_index(session, db, coll, filter)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let idx_fields: Vec<&String> = key_spec.keys().collect();
+        // Index-order fields that the filter constrains (partial-filter clauses
+        // live outside the key — not relevant until 2e).
+        let prefix_fields: Vec<&String> = idx_fields
+            .iter()
+            .copied()
+            .filter(|f| filter.contains_key(f.as_str()))
+            .collect();
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(prefix_fields.len());
+        for f in &prefix_fields {
+            let dir = direction_of(key_spec.get(f.as_str()).unwrap()).unwrap();
+            parts.push(enc_dir(filter.get(f.as_str()).unwrap(), dir)?);
+        }
+        let kb = compound_join(&parts);
+        if prefix_fields.len() == idx_fields.len() {
+            return Ok(Some(
+                self.scan_index_for_id_keys(session, db, coll, &name, &kb, false)?,
+            ));
+        }
+        let mut seed = kb;
+        seed.extend_from_slice(COMPOUND_SEP);
+        Ok(Some(self.scan_index_for_id_keys(
+            session, db, coll, &name, &seed, true,
+        )?))
+    }
+
+    /// The index `try_compound_range_id_keys` would walk: leading equalities
+    /// (set-wise) then the operator field as the next column, shortest first.
+    /// `None` if none fits. Mirrors `storage._pick_compound_range_index`.
+    fn pick_compound_range_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<(String, Document)>> {
+        let (eq_fields, operator_field, _ops) = match partition_compound_range_filter(filter) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let eq_set: HashSet<&str> = eq_fields.keys().map(|s| s.as_str()).collect();
+        let target = eq_set.len();
+        let mut best: Option<(String, Document)> = None;
+        for (name, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
+            if !key_spec
+                .values()
+                .all(|v| matches!(direction_of(v), Some(1) | Some(-1)))
+            {
+                continue;
+            }
+            let idx_fields: Vec<&String> = key_spec.keys().collect();
+            if idx_fields.len() <= target {
+                continue;
+            }
+            let prefix_set: HashSet<&str> =
+                idx_fields[..target].iter().map(|s| s.as_str()).collect();
+            if prefix_set != eq_set {
+                continue;
+            }
+            if idx_fields[target].as_str() != operator_field {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(_, b)| b.len() > idx_fields.len())
+            {
+                best = Some((name, key_spec.clone()));
+            }
+            if idx_fields.len() == target + 1 {
+                break;
+            }
+        }
+        Ok(best)
+    }
+
+    /// Compound-prefix lookup with a trailing operator field — `{a: 5, b: {$gt:
+    /// 10}}`: pin the prefix from the leading equalities, apply the operator's
+    /// `$eq` / `$in` / range bounds (DESC-flipped) to the next column. `None`
+    /// falls back to COLLSCAN. Mirrors `storage._try_compound_range_id_keys`.
+    fn try_compound_range_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let (eq_fields, operator_field, operator_ops) =
+            match partition_compound_range_filter(filter) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+        let (name, key_spec) = match self.pick_compound_range_index(session, db, coll, filter)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let idx_fields: Vec<&String> = key_spec.keys().collect();
+        let target = eq_fields.len();
+        let op_dir = direction_of(key_spec.get(operator_field.as_str()).unwrap()).unwrap();
+        let mut eq_parts: Vec<Vec<u8>> = Vec::with_capacity(target);
+        for f in &idx_fields[..target] {
+            let dir = direction_of(key_spec.get(f.as_str()).unwrap()).unwrap();
+            eq_parts.push(enc_dir(eq_fields.get(f.as_str()).unwrap(), dir)?);
+        }
+        let mut prefix_with_sep = compound_join(&eq_parts);
+        prefix_with_sep.extend_from_slice(COMPOUND_SEP);
+        let use_prefix = idx_fields.len() > target + 1;
+
+        // Helper: prefix + enc(value), then COMPOUND_SEP if more columns follow.
+        let make_kb = |v: &Bson| -> Result<Vec<u8>> {
+            let mut kb = prefix_with_sep.clone();
+            kb.extend_from_slice(&enc_dir(v, op_dir)?);
+            if use_prefix {
+                kb.extend_from_slice(COMPOUND_SEP);
+            }
+            Ok(kb)
+        };
+
+        if operator_ops.contains_key("$in") {
+            if operator_ops.len() != 1 {
+                return Ok(None);
+            }
+            let vals = match operator_ops.get("$in") {
+                Some(Bson::Array(a)) => a,
+                _ => return Ok(None),
+            };
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for v in vals {
+                if matches!(v, Bson::Document(_)) {
+                    return Ok(None);
+                }
+                let inner = make_kb(v)?;
+                for id_k in
+                    self.scan_index_for_id_keys(session, db, coll, &name, &inner, use_prefix)?
+                {
+                    if seen.insert(id_k.clone()) {
+                        out.push(id_k);
+                    }
+                }
+            }
+            return Ok(Some(out));
+        }
+        if operator_ops.contains_key("$eq") {
+            if operator_ops.len() != 1 {
+                return Ok(None);
+            }
+            let inner = make_kb(operator_ops.get("$eq").unwrap())?;
+            return Ok(Some(self.scan_index_for_id_keys(
+                session, db, coll, &name, &inner, use_prefix,
+            )?));
+        }
+        let mut lower: Option<Vec<u8>> = None;
+        let mut lower_incl = true;
+        let mut upper: Option<Vec<u8>> = None;
+        let mut upper_incl = true;
+        for (op, bound) in &operator_ops {
+            if matches!(bound, Bson::Document(_)) {
+                return Ok(None);
+            }
+            let mut full = prefix_with_sep.clone();
+            full.extend_from_slice(&enc_dir(bound, op_dir)?);
+            let eff = if op_dir == -1 {
+                flip_range_op(op)
+            } else {
+                op.as_str()
+            };
+            match eff {
+                "$gt" => (lower, lower_incl) = (Some(full), false),
+                "$gte" => (lower, lower_incl) = (Some(full), true),
+                "$lt" => (upper, upper_incl) = (Some(full), false),
+                "$lte" => (upper, upper_incl) = (Some(full), true),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(self.range_scan_index(
+            session,
+            db,
+            coll,
+            &name,
+            lower.as_deref(),
+            lower_incl,
+            upper.as_deref(),
+            upper_incl,
+            Some(&prefix_with_sep),
+        )?))
     }
 }
 
