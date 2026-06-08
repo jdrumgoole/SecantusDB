@@ -660,6 +660,66 @@ impl Storage {
         Ok(true)
     }
 
+    /// Delete docs whose TTL-indexed `DateTime` field is older than `now -
+    /// expireAfterSeconds`, returning the number pruned. For every index with a
+    /// non-negative `expireAfterSeconds` option, the leading field is checked;
+    /// docs missing the field, holding a non-date value, or inside the TTL
+    /// window are left in place. The clock is injected (`now`) so tests can drive
+    /// expiry — there is no background sweeper (mirrors `storage.prune_ttl`, sans
+    /// the sub-phase-3 oplog emission).
+    pub fn prune_ttl(&self, db: &str, coll: &str, now: bson::DateTime) -> Result<usize> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+
+        // TTL indexes as (leading field, ttl seconds).
+        let mut ttl: Vec<(String, f64)> = Vec::new();
+        for (_name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
+            let secs = match opts.get("expireAfterSeconds") {
+                Some(Bson::Int32(i)) => f64::from(*i),
+                Some(Bson::Int64(i)) => *i as f64,
+                Some(Bson::Double(d)) => *d,
+                _ => continue,
+            };
+            if secs < 0.0 {
+                continue;
+            }
+            match key_spec.keys().next() {
+                Some(field) => ttl.push((field.clone(), secs)),
+                None => continue,
+            }
+        }
+        if ttl.is_empty() {
+            return Ok(0);
+        }
+
+        let when_ms = now.timestamp_millis();
+        let descs = self.index_descs(&session, db, coll)?;
+        // Snapshot candidates before mutating (no cursor walk while deleting).
+        let candidates = self.scan_docs(&session, db, coll)?;
+        let doc_cur = session.open_cursor(DOC_TABLE, None)?;
+        let mut pruned = 0usize;
+        for (id_k, blob) in candidates {
+            let doc = decode_doc(&blob)?;
+            let expired = ttl.iter().any(|(field, secs)| match get_path(&doc, field) {
+                Some(Bson::DateTime(v)) => (when_ms - v.timestamp_millis()) as f64 / 1000.0 > *secs,
+                _ => false,
+            });
+            if !expired {
+                continue;
+            }
+            self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+            doc_cur.reset()?;
+            doc_cur.set_key_ssu(db, coll, &id_k);
+            match doc_cur.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+            pruned += 1;
+        }
+        Ok(pruned)
+    }
+
     pub fn collection_exists(&self, db: &str, coll: &str) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;

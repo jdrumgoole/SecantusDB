@@ -102,7 +102,30 @@ build-out.
      `insert_one` / `replace_by_id`. (The sort-acceleration *exclusion* of
      multikey indexes is part of 2f, where sort lands.) New tests in
      `tests/indexes.rs` (lazy-mark-on-insert, mark-on-replace, sticky).
-   - **2e** — partial + TTL + unique enforcement + collation.
+   - **2e ✅ DONE (collation deferred)** — three sub-commits:
+     - **2e-1** — write-path correctness: an `IndexDesc { name, key_spec, sparse,
+       unique, partial }` refactor of the CRUD entry-maintenance paths, the
+       canonical `index_key` (one byte-key per doc, `None` under sparse when a
+       field is missing), `sparse` support in `index_key_variants`, **unique
+       enforcement** (`unique_conflict` prefix-probe on insert / replace /
+       create-over-existing-data → `StorageError::DuplicateKey(Box<UniqueConflict>)`
+       with the mongod-shaped `keyPattern`/`keyValue`), and **partial-index entry
+       gating** (entries written / uniqueness scoped only to docs matching
+       `partialFilterExpression`).
+     - **2e-2** — read-path partial: `query_implies_partial` gates partial indexes
+       in `find_leading_field_index` / `pick_compound_eq_index` (which also strips
+       the partial-filter keys from the effective filter fields) /
+       `pick_compound_range_index`.
+     - **2e-3** — TTL: `prune_ttl(db, coll, now)` deletes docs whose TTL-indexed
+       `DateTime` is older than `now - expireAfterSeconds` (injected clock, no
+       background sweeper; oplog emission is sub-phase 3).
+     - **Collation: deferred.** The Rust `sortkey` / `query` engines defer
+       collation to Python (return the `Fallback` signal), so the canonical-key
+       encoding and `matches()` can't honour a collation at this layer — the
+       picker-level collation gates have nothing to gate against yet. Revisit when
+       the leaf engines grow collation support.
+     - New WT-backed tests: `tests/unique.rs` (9), `tests/partial.rs` (2),
+       `tests/ttl.rs` (3).
    - **2f** — sort acceleration (single + compound) + `hint`.
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
    Gate: `test_geo_index.py`.
