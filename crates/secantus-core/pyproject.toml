@@ -1,17 +1,41 @@
-# Standalone maturin build for the Phase 1 Rust core. Kept separate from the
-# top-level SecantusDB wheel (scikit-build-core + vendored WiredTiger) on
-# purpose: merging the two native build systems into one wheel is a Phase 6
-# packaging task. For now `maturin build` / `maturin develop` here produces an
-# importable `_secantus_core` extension the `secantus.sortkey` shim can pick up.
+# The Rust accelerator core ships as its **own optional package**, not bundled
+# into the top-level SecantusDB wheel. `pip install secantus` is pure-Python +
+# vendored WiredTiger as always; `pip install "secantus[rust]"` additionally
+# pulls this `secantus-core` wheel, which provides the `_secantus_core`
+# extension the engine shims pick up at runtime (selected via SECANTUS_ENGINE).
+#
+# Keeping it separate is deliberate and is the bridge to the longer-term goal of
+# the Rust side standing on its own as a first-class Rust package (a publishable
+# crate, and eventually a standalone `secantusdb` server binary) — see
+# tasks/rust-rewrite-plan.md. Version is kept in lockstep with the SecantusDB
+# release it accelerates (the `secantus[rust]` extra pins it exactly), so the
+# release process must bump and publish both together.
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
 name = "secantus-core"
-version = "0.0.0"
+version = "0.5.2b15"
+description = "Optional Rust acceleration core for SecantusDB (the _secantus_core extension)"
+readme = "README.md"
 requires-python = ">=3.10"
-description = "Rust core for SecantusDB (Phase 1: sortkey)"
+authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
+license = "GPL-2.0-only"
+keywords = ["mongodb", "wiredtiger", "rust", "pyo3", "secantus"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/jdrumgoole/SecantusDB"
+Repository = "https://github.com/jdrumgoole/SecantusDB"
+Issues = "https://github.com/jdrumgoole/SecantusDB/issues"
 
 [tool.maturin]
 module-name = "_secantus_core"
