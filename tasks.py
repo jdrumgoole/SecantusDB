@@ -155,6 +155,23 @@ def rust_wt_test(c: Context) -> None:
     c.run(f"cd {_RUST_WT_DIR} && cargo test", pty=True)
 
 
+# The Rust storage layer (Phase 4 sub-phase 1+), built on secantus-wt +
+# secantus-core. Also standalone (links WiredTiger transitively via secantus-wt).
+_RUST_STORAGE_DIR = "crates/secantus-storage"
+
+
+@task(name="rust-storage-test")
+def rust_storage_test(c: Context) -> None:
+    """fmt/clippy/test the secantus-storage crate (the Rust Storage layer).
+
+    Same WiredTiger / libclang prerequisites as ``rust-wt-test`` (it links
+    WiredTiger transitively through secantus-wt).
+    """
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo fmt --check", pty=True)
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo test", pty=True)
+
+
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(
