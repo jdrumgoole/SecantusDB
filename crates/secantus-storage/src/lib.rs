@@ -18,12 +18,13 @@
 //! Later sub-phases add indexes, geo, and the oplog (see
 //! `tasks/rust-rewrite-phase4-scoping.md`).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;
 
 use bson::oid::ObjectId;
 use bson::{Bson, Document};
 use secantus_core::get_path;
+use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
@@ -49,6 +50,27 @@ const CONFLICTING_OPTS: &[&str] = &[
     "expireAfterSeconds",
     "partialFilterExpression",
 ];
+
+/// Field-level operators a single-field index can serve. Mirrors
+/// `storage._RANGE_OPS`.
+const RANGE_OPS: &[&str] = &["$eq", "$gt", "$gte", "$lt", "$lte", "$in"];
+
+/// The plan `find_matching` would use for a filter — what `explain_plan`
+/// reports. Mirrors `storage.explain_plan`'s `{kind, index_name, key_pattern,
+/// direction}` shape.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExplainPlan {
+    /// A full collection scan.
+    CollScan,
+    /// An index scan over `index_name` (`key_pattern`), walked in `direction`
+    /// (`"forward"` / `"backward"`; always `"forward"` until sort acceleration
+    /// lands in slice 2f).
+    IxScan {
+        index_name: String,
+        key_pattern: Document,
+        direction: String,
+    },
+}
 
 /// The WiredTiger connection config SecantusDB uses (mirrors `storage.py`):
 /// logging on, commit-sync off by default.
@@ -96,6 +118,10 @@ pub enum StorageError {
     /// `create_index` was asked to re-create an existing index with conflicting
     /// options.
     IndexOptionsConflict(String),
+    /// A query filter used a construct the Rust query engine can't evaluate
+    /// (the `matches` "defer to Python" signal). The server's engine selection
+    /// is responsible for not routing such queries to the Rust storage.
+    QueryUnsupported,
 }
 
 impl std::fmt::Display for StorageError {
@@ -110,6 +136,9 @@ impl std::fmt::Display for StorageError {
             StorageError::DuplicateId => write!(f, "duplicate _id"),
             StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
+            StorageError::QueryUnsupported => {
+                write!(f, "query construct not supported by the Rust query engine")
+            }
         }
     }
 }
@@ -286,6 +315,55 @@ fn index_key_variants(doc: &Document, key_spec: &Document) -> Result<Vec<Vec<u8>
         }
     }
     Ok(keys)
+}
+
+/// True for a BSON regular-expression value (never a point-lookup target).
+fn is_regex_value(v: &Bson) -> bool {
+    matches!(v, Bson::RegularExpression(_))
+}
+
+/// The `id_key`s to fetch for an `{_id: <spec>}` equality predicate, or `None`
+/// when `spec` isn't a pure point lookup (range op, regex, literal subdocument,
+/// operator-valued equality). The documents table is keyed by
+/// `encode_value(_id)`, so `_id` equality is a primary-key point lookup, not a
+/// COLLSCAN — and `_id_` is virtual (no entries table). `$in` keys come back
+/// deduplicated in ascending byte order. Mirrors `storage._id_point_lookup_keys`.
+fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
+    match spec {
+        Bson::Document(d) => {
+            let keys: Vec<&String> = d.keys().collect();
+            if keys.is_empty() || !keys.iter().all(|k| k.starts_with('$')) {
+                return Ok(None); // literal subdocument _id — normal path
+            }
+            if keys.len() == 1 && keys[0] == "$eq" {
+                let v = d.get("$eq").unwrap();
+                if matches!(v, Bson::Document(_)) || is_regex_value(v) {
+                    return Ok(None);
+                }
+                return Ok(Some(vec![id_key(v)?]));
+            }
+            if keys.len() == 1 && keys[0] == "$in" {
+                let vals = match d.get("$in") {
+                    Some(Bson::Array(a)) => a,
+                    _ => return Ok(None),
+                };
+                if vals
+                    .iter()
+                    .any(|v| matches!(v, Bson::Document(_)) || is_regex_value(v))
+                {
+                    return Ok(None);
+                }
+                let mut set: BTreeSet<Vec<u8>> = BTreeSet::new();
+                for v in vals {
+                    set.insert(id_key(v)?);
+                }
+                return Ok(Some(set.into_iter().collect()));
+            }
+            Ok(None)
+        }
+        _ if is_regex_value(spec) => Ok(None),
+        _ => Ok(Some(vec![id_key(spec)?])),
+    }
 }
 
 /// WiredTiger-backed storage. A global lock serialises public methods, matching
@@ -892,6 +970,433 @@ impl Storage {
         }
         Ok(out)
     }
+
+    // --- query routing (Phase 4 sub-phase 2, slice 2b: single-field) ---
+
+    /// Documents matching `filter`, as BSON bytes. Routes through a single-field
+    /// index (equality / `$eq` / `$in` / range) or the `_id` primary-key point
+    /// lookup when one applies, else a full collection scan; index candidates
+    /// are always re-checked with `matches()` (an index walk can over-include,
+    /// e.g. multikey). Compound-index routing is slice 2c. Mirrors the no-sort
+    /// path of `storage.find_matching`.
+    pub fn find_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<Vec<Vec<u8>>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let blobs = match self.try_index_id_keys(&session, db, coll, filter)? {
+            Some(id_keys) => self.docs_by_id_keys(&session, db, coll, &id_keys)?,
+            None => self
+                .scan_docs(&session, db, coll)?
+                .into_iter()
+                .map(|(_id_k, blob)| blob)
+                .collect(),
+        };
+        let vars = Document::new();
+        let mut out = Vec::new();
+        for blob in blobs {
+            let d = decode_doc(&blob)?;
+            if query_matches(&d, filter, &vars, None).map_err(|_| StorageError::QueryUnsupported)? {
+                out.push(blob);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The plan `find_matching` would use for `filter` (no execution). Mirrors
+    /// `storage.explain_plan` (filter only; sort / hint are slice 2f).
+    pub fn explain_plan(&self, db: &str, coll: &str, filter: &Document) -> Result<ExplainPlan> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        match self.pick_index_for_filter(&session, db, coll, filter)? {
+            Some((index_name, key_pattern)) => Ok(ExplainPlan::IxScan {
+                index_name,
+                key_pattern,
+                direction: "forward".to_string(),
+            }),
+            None => Ok(ExplainPlan::CollScan),
+        }
+    }
+
+    /// Route `filter` to a set of candidate `id_key`s via an index, or `None`
+    /// (caller does a COLLSCAN). Slice 2b: the `_id` point-lookup fast path and
+    /// single-field equality / `$in` / range. Mirrors the single-field portion
+    /// of `storage._try_index_id_keys`.
+    fn try_index_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if filter.is_empty() {
+            return Ok(None);
+        }
+        if filter.keys().any(|f| f.starts_with('$')) {
+            return Ok(None);
+        }
+        // `_id` equality is a primary-key point lookup on the documents table.
+        if filter.len() == 1 {
+            if let Some(spec) = filter.get("_id") {
+                if let Some(id_keys) = id_point_lookup_keys(spec)? {
+                    return Ok(Some(id_keys));
+                }
+            }
+        }
+        // (Geo dispatch -> sub-phase 3; compound eq / range -> slice 2c.)
+        if filter.len() != 1 {
+            return Ok(None);
+        }
+        let (field, value) = filter.iter().next().unwrap();
+        let idx = match self.find_leading_field_index(session, db, coll, field)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        self.lookup_id_keys_via_leading_field(session, db, coll, &idx, value)
+    }
+
+    /// The best single-field index whose field is `field`, as `(name,
+    /// direction)`. Skips non-`1`/`-1` directions (geo / text / hashed). Slice
+    /// 2b considers single-field indexes only; compound leading-field use is
+    /// slice 2c. (Partial / collation gating is slice 2e.) Multikey indexes are
+    /// NOT skipped — per-element entries cover the lookup, and `find_matching`
+    /// re-checks with `matches()`.
+    fn find_leading_field_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        field: &str,
+    ) -> Result<Option<(String, i32)>> {
+        for (name, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
+            if key_spec.len() != 1 {
+                continue;
+            }
+            let (f0, dir_val) = key_spec.iter().next().unwrap();
+            if f0.as_str() != field {
+                continue;
+            }
+            match direction_of(dir_val) {
+                Some(d @ (1 | -1)) => return Ok(Some((name, d))),
+                _ => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// `id_key`s for `field <value>` against the single-field index `(name,
+    /// direction)`: bare/`$eq`/`$in` equality and `$gt`/`$gte`/`$lt`/`$lte`
+    /// ranges (operator semantics flip for a DESC index). `None` falls back to
+    /// COLLSCAN. Mirrors `storage._lookup_id_keys_via_leading_field`.
+    fn lookup_id_keys_via_leading_field(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        idx: &(String, i32),
+        value: &Bson,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let (name, direction) = (idx.0.as_str(), idx.1);
+        let opdoc = match value {
+            Bson::Document(d) => d,
+            _ => {
+                return Ok(Some(
+                    self.eq_id_keys(session, db, coll, name, direction, value)?,
+                ))
+            }
+        };
+        if opdoc.is_empty() || !opdoc.keys().all(|k| k.starts_with('$')) {
+            return Ok(None);
+        }
+        if !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str())) {
+            return Ok(None);
+        }
+        if opdoc.contains_key("$in") {
+            if opdoc.len() != 1 {
+                return Ok(None);
+            }
+            let vals = match opdoc.get("$in") {
+                Some(Bson::Array(a)) => a,
+                _ => return Ok(None),
+            };
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for v in vals {
+                if matches!(v, Bson::Document(_)) {
+                    return Ok(None);
+                }
+                for id_k in self.eq_id_keys(session, db, coll, name, direction, v)? {
+                    if seen.insert(id_k.clone()) {
+                        out.push(id_k);
+                    }
+                }
+            }
+            return Ok(Some(out));
+        }
+        let mut lower: Option<Vec<u8>> = None;
+        let mut lower_incl = true;
+        let mut upper: Option<Vec<u8>> = None;
+        let mut upper_incl = true;
+        for (op, bound) in opdoc {
+            if matches!(bound, Bson::Document(_)) {
+                return Ok(None);
+            }
+            if op == "$eq" {
+                return Ok(Some(
+                    self.eq_id_keys(session, db, coll, name, direction, bound)?,
+                ));
+            }
+            let kb = enc_dir(bound, direction)?;
+            // DESC index: stored bytes are inverted, so the comparison flips.
+            let eff = if direction == -1 {
+                match op.as_str() {
+                    "$gt" => "$lt",
+                    "$gte" => "$lte",
+                    "$lt" => "$gt",
+                    "$lte" => "$gte",
+                    other => other,
+                }
+            } else {
+                op.as_str()
+            };
+            match eff {
+                "$gt" => (lower, lower_incl) = (Some(kb), false),
+                "$gte" => (lower, lower_incl) = (Some(kb), true),
+                "$lt" => (upper, upper_incl) = (Some(kb), false),
+                "$lte" => (upper, upper_incl) = (Some(kb), true),
+                _ => {}
+            }
+        }
+        Ok(Some(self.range_scan_index(
+            session,
+            db,
+            coll,
+            name,
+            lower.as_deref(),
+            lower_incl,
+            upper.as_deref(),
+            upper_incl,
+        )?))
+    }
+
+    /// `id_key`s whose single-field index entry equals `value` (exact `kb`).
+    fn eq_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        direction: i32,
+        value: &Bson,
+    ) -> Result<Vec<Vec<u8>>> {
+        let kb = enc_dir(value, direction)?;
+        self.scan_index_for_id_keys(session, db, coll, name, &kb, false)
+    }
+
+    /// Walk index `name`'s entries matching `kb`: exact (`prefix=false`) or
+    /// `escape(kb)`-prefixed (`prefix=true`). Mirrors
+    /// `storage._scan_index_for_id_keys`.
+    fn scan_index_for_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        kb: &[u8],
+        prefix: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let esc_kb = escape_kb(kb);
+        let seed = if prefix {
+            esc_kb.clone()
+        } else {
+            let mut s = esc_kb.clone();
+            s.extend_from_slice(ENTRY_SEP);
+            s
+        };
+        cur.set_key_sssu(db, coll, name, &seed);
+        let mut out = Vec::new();
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, n, packed) = cur.get_key_sssu()?;
+            if d != db || c != coll || n != name {
+                break;
+            }
+            let (row_esc, row_id) = unpack_entry(&packed);
+            if prefix {
+                if !row_esc.starts_with(esc_kb.as_slice()) {
+                    break;
+                }
+            } else if row_esc != esc_kb.as_slice() {
+                break;
+            }
+            out.push(row_id.to_vec());
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Range-scan index `name` between optional `lower` / `upper` bounds (on the
+    /// directed, unescaped `kb`). Mirrors `storage._range_scan_index`.
+    #[allow(clippy::too_many_arguments)]
+    fn range_scan_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        lower: Option<&[u8]>,
+        lower_inclusive: bool,
+        upper: Option<&[u8]>,
+        upper_inclusive: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let esc_lower = lower.map(escape_kb);
+        let esc_upper = upper.map(escape_kb);
+        let seed: Vec<u8> = if let Some(el) = &esc_lower {
+            let mut s = el.clone();
+            s.extend_from_slice(ENTRY_SEP);
+            s
+        } else {
+            Vec::new()
+        };
+        cur.set_key_sssu(db, coll, name, &seed);
+        let mut out = Vec::new();
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, n, packed) = cur.get_key_sssu()?;
+            if d != db || c != coll || n != name {
+                break;
+            }
+            let (row_esc, row_id) = unpack_entry(&packed);
+            // Exclusive lower: skip rows whose kb equals the lower bound.
+            if let Some(el) = &esc_lower {
+                if !lower_inclusive && row_esc == el.as_slice() {
+                    more = cur.next()?;
+                    continue;
+                }
+            }
+            if let Some(eu) = &esc_upper {
+                if upper_inclusive {
+                    if row_esc > eu.as_slice() {
+                        break;
+                    }
+                } else if row_esc >= eu.as_slice() {
+                    break;
+                }
+            }
+            out.push(row_id.to_vec());
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Fetch documents by `id_key` (deduped, order-preserving — a multikey index
+    /// can yield the same `id_key` more than once). Mirrors
+    /// `storage._docs_by_id_keys`.
+    fn docs_by_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_keys: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>> {
+        let cur = session.open_cursor(DOC_TABLE, None)?;
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        let mut out = Vec::new();
+        for id_k in id_keys {
+            if !seen.insert(id_k.as_slice()) {
+                continue;
+            }
+            cur.reset()?;
+            cur.set_key_ssu(db, coll, id_k);
+            match cur.search() {
+                Ok(()) => out.push(cur.get_value_u()?),
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The index `(name, key_spec)` `explain_plan` would report for `filter`, or
+    /// `None` (COLLSCAN). Mirrors the single-field portion of
+    /// `storage._pick_index_for_filter`.
+    fn pick_index_for_filter(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<(String, Document)>> {
+        if filter.is_empty() || filter.keys().any(|f| f.starts_with('$')) {
+            return Ok(None);
+        }
+        if filter.len() == 1 {
+            if let Some(spec) = filter.get("_id") {
+                if id_point_lookup_keys(spec)?.is_some() {
+                    let mut kp = Document::new();
+                    kp.insert("_id", 1i32);
+                    return Ok(Some((ID_INDEX_NAME.to_string(), kp)));
+                }
+            }
+        }
+        if filter.len() != 1 {
+            return Ok(None);
+        }
+        let (field, value) = filter.iter().next().unwrap();
+        let idx = match self.find_leading_field_index(session, db, coll, field)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        // Operator-form values must be range ops the index can serve.
+        if let Bson::Document(opdoc) = value {
+            if opdoc.is_empty()
+                || !opdoc.keys().all(|k| k.starts_with('$'))
+                || !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str()))
+            {
+                return Ok(None);
+            }
+        }
+        match self.key_spec_for(session, db, coll, &idx.0)? {
+            Some(key_spec) => Ok(Some((idx.0, key_spec))),
+            None => Ok(None),
+        }
+    }
+
+    /// The stored `key_spec` of index `name`, or `None`.
+    fn key_spec_for(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Option<Document>> {
+        for (n, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
+            if n == name {
+                return Ok(Some(key_spec));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// True if `(db, coll)` is registered in the collections table.
@@ -1053,5 +1558,37 @@ mod tests {
         assert_eq!(v.len(), 3);
         assert!(v.contains(&compound_join(&[ev(&Bson::Int32(1)), ev(&Bson::Int32(9))])));
         assert!(v.contains(&compound_join(&[ev(&Bson::Int32(2)), ev(&Bson::Int32(9))])));
+    }
+
+    #[test]
+    fn id_point_lookup_classification() {
+        // Bare scalar, $eq, and $in (sorted + deduped) are point lookups.
+        assert_eq!(
+            id_point_lookup_keys(&Bson::Int32(5)).unwrap(),
+            Some(vec![ev(&Bson::Int32(5))])
+        );
+        assert_eq!(
+            id_point_lookup_keys(&Bson::Document(doc! {"$eq": 5i32})).unwrap(),
+            Some(vec![ev(&Bson::Int32(5))])
+        );
+        assert_eq!(
+            id_point_lookup_keys(&Bson::Document(doc! {"$in": [3i32, 1i32, 3i32]}))
+                .unwrap()
+                .unwrap(),
+            vec![ev(&Bson::Int32(1)), ev(&Bson::Int32(3))]
+        );
+        // Range op, literal subdocument, and operator-valued $eq are NOT.
+        assert_eq!(
+            id_point_lookup_keys(&Bson::Document(doc! {"$gt": 1i32})).unwrap(),
+            None
+        );
+        assert_eq!(
+            id_point_lookup_keys(&Bson::Document(doc! {"x": 1i32})).unwrap(),
+            None
+        );
+        assert_eq!(
+            id_point_lookup_keys(&Bson::Document(doc! {"$eq": {"$gt": 1i32}})).unwrap(),
+            None
+        );
     }
 }

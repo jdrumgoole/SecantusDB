@@ -73,8 +73,17 @@ build-out.
      has_path}` re-export. **Deferred from 2a:** lazy multikey-flag marking on
      insert/update (2d); sparse / partial entry-gating, unique enforcement, TTL,
      collation (2e).
-   - **2b** — single-field equality / `$in` / range lookup routing + `_id` point
-     lookups + `explain` IXSCAN/COLLSCAN.
+   - **2b ✅ DONE** — `find_matching` + `explain_plan`: single-field equality /
+     `$eq` / `$in` / range (`$gt`/`$gte`/`$lt`/`$lte`, with DESC operator-flip)
+     routing through the entries table, the `_id` primary-key point-lookup fast
+     path (bare / `$eq` / `$in`), and COLLSCAN fallback — index candidates are
+     re-checked with `secantus_core::query::matches` (which can over-include for
+     multikey). `explain_plan` returns `ExplainPlan::{CollScan, IxScan{...}}`.
+     New WT-backed tests in `tests/query.rs`. **Scoped to single-field indexes**
+     (compound leading-field use is 2c, so the executor and `explain` stay
+     consistent); a `matches()` "defer to Python" construct (e.g. whole-array
+     literal equality) surfaces as `StorageError::QueryUnsupported` for the
+     server's engine-selection layer to route to Python.
    - **2c** — compound eq-prefix + trailing-operator + mixed-direction lookups.
    - **2d** — multikey flag (lazy marking) + its sort-acceleration exclusions.
    - **2e** — partial + TTL + unique enforcement + collation.
