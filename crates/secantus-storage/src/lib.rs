@@ -72,6 +72,27 @@ pub enum ExplainPlan {
     },
 }
 
+/// A stored index, with the options the write / lookup paths care about,
+/// parsed out of its registry `options` blob.
+struct IndexDesc {
+    name: String,
+    key_spec: Document,
+    sparse: bool,
+    unique: bool,
+    /// `partialFilterExpression` if non-empty — entries are written (and the
+    /// index considered) only for docs/queries that match / imply it.
+    partial: Option<Document>,
+}
+
+/// A unique-index violation: the offending index plus the mongod-shaped
+/// `keyPattern` / `keyValue` for the error response the command layer builds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UniqueConflict {
+    pub index: String,
+    pub key_pattern: Document,
+    pub key_value: Document,
+}
+
 /// The WiredTiger connection config SecantusDB uses (mirrors `storage.py`):
 /// logging on, commit-sync off by default.
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
@@ -112,6 +133,10 @@ pub enum StorageError {
     UnsupportedValue,
     /// A document was inserted with an `_id` that already exists.
     DuplicateId,
+    /// A write violated a unique index. Carries the mongod-shaped conflict so the
+    /// command layer can build the `E11000` error response. Boxed to keep
+    /// `StorageError` (and thus `Result`) small.
+    DuplicateKey(Box<UniqueConflict>),
     /// `create_index` was asked for an index type the Rust storage engine
     /// doesn't implement yet (text / hashed / geo).
     CreateIndexUnsupported(String),
@@ -134,6 +159,9 @@ impl std::fmt::Display for StorageError {
                 write!(f, "unsupported value type for index sort-key encoding")
             }
             StorageError::DuplicateId => write!(f, "duplicate _id"),
+            StorageError::DuplicateKey(c) => {
+                write!(f, "E11000 duplicate key error on index {}", c.index)
+            }
             StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
             StorageError::QueryUnsupported => {
@@ -247,14 +275,18 @@ fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
 /// All byte-keys `doc` contributes to an index under `key_spec`. Scalars give
 /// one key; arrays give one key per (deduped) element *plus* the whole-array
 /// key (the multikey layout); compound indexes take the cartesian product
-/// across each field's candidate values. Missing fields encode as `null`
-/// (non-sparse semantics — sparse handling is a later slice). Mirrors
-/// `storage._index_key_variants`.
-fn index_key_variants(doc: &Document, key_spec: &Document) -> Result<Vec<Vec<u8>>> {
+/// across each field's candidate values. A `sparse` index produces no keys when
+/// any indexed field is missing. Missing fields otherwise encode as `null`.
+/// Mirrors `storage._index_key_variants`.
+fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Result<Vec<Vec<u8>>> {
     let fields: Vec<(&String, i32)> = key_spec
         .iter()
         .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
         .collect();
+
+    if sparse && fields.iter().any(|(f, _)| get_path(doc, f).is_none()) {
+        return Ok(Vec::new());
+    }
 
     // Per-field candidate values: scalars -> [val]; arrays -> [uniq elems..., whole_array].
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(fields.len());
@@ -320,6 +352,30 @@ fn index_key_variants(doc: &Document, key_spec: &Document) -> Result<Vec<Vec<u8>
 /// True for a BSON regular-expression value (never a point-lookup target).
 fn is_regex_value(v: &Bson) -> bool {
     matches!(v, Bson::RegularExpression(_))
+}
+
+/// The single canonical byte-key for `doc` under `key_spec` — one per doc
+/// regardless of array shape (array fields encode the whole array). Used by the
+/// uniqueness probe. `None` for a `sparse` index when any indexed field is
+/// missing. Mirrors `storage._index_key`.
+fn index_key(doc: &Document, key_spec: &Document, sparse: bool) -> Result<Option<Vec<u8>>> {
+    if sparse && key_spec.keys().any(|f| get_path(doc, f).is_none()) {
+        return Ok(None);
+    }
+    let fields: Vec<(&String, i32)> = key_spec
+        .iter()
+        .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
+        .collect();
+    if fields.len() == 1 {
+        let v = get_path(doc, fields[0].0).cloned().unwrap_or(Bson::Null);
+        return Ok(Some(enc_dir(&v, fields[0].1)?));
+    }
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+    for (f, d) in &fields {
+        let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
+        parts.push(enc_dir(&v, *d)?);
+    }
+    Ok(Some(compound_join(&parts)))
 }
 
 /// Flip a range operator for a DESC field (whose stored bytes are inverted, so
@@ -458,6 +514,11 @@ impl Storage {
 
         let session = self.conn.open_session()?;
         ensure_collection(&session, db, coll)?;
+        // Reject unique-index violations before writing anything.
+        let descs = self.index_descs(&session, db, coll)?;
+        if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+            return Err(StorageError::DuplicateKey(Box::new(c)));
+        }
         // overwrite=false -> a pre-existing _id is a WT_DUPLICATE_KEY.
         let cur = session.open_cursor(DOC_TABLE, Some("overwrite=false"))?;
         cur.set_key_ssu(db, coll, &key);
@@ -469,9 +530,8 @@ impl Storage {
         }
         // Maintain secondary indexes: write this doc's entries, and lazily flag
         // any index this doc makes multikey (array value on an indexed field).
-        let indexes = self.collection_indexes(&session, db, coll)?;
-        self.write_index_entries(&session, db, coll, &doc, &indexes)?;
-        self.maybe_mark_multikey(&session, db, coll, &doc, &indexes)?;
+        self.write_index_entries(&session, db, coll, &doc, &descs)?;
+        self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         Ok(key)
     }
 
@@ -547,6 +607,14 @@ impl Storage {
         let mut doc = decode_doc(new_doc_bytes)?;
         doc.insert("_id", id.clone()); // replacement preserves _id
         let blob = encode_doc(&doc)?;
+
+        // Reject unique-index violations before mutating anything (the doc's own
+        // existing entries are excluded by its id_key).
+        let descs = self.index_descs(&session, db, coll)?;
+        if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, Some(&key))? {
+            return Err(StorageError::DuplicateKey(Box::new(c)));
+        }
+
         let cur = session.open_cursor(DOC_TABLE, None)?;
         cur.set_key_ssu(db, coll, &key);
         cur.set_value_u(&blob);
@@ -555,11 +623,10 @@ impl Storage {
         // Maintain secondary indexes: retract the old doc's entries, write the
         // new, and lazily flag any index the new doc makes multikey (sticky —
         // the old doc's array-ness is never cleared).
-        let indexes = self.collection_indexes(&session, db, coll)?;
-        if !indexes.is_empty() {
-            self.delete_index_entries(&session, db, coll, &old_doc, &indexes)?;
-            self.write_index_entries(&session, db, coll, &doc, &indexes)?;
-            self.maybe_mark_multikey(&session, db, coll, &doc, &indexes)?;
+        if !descs.is_empty() {
+            self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
+            self.write_index_entries(&session, db, coll, &doc, &descs)?;
+            self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         }
         Ok(true)
     }
@@ -579,8 +646,8 @@ impl Storage {
         };
         cur.remove()?;
         let old_doc = decode_doc(&old_blob)?;
-        let indexes = self.collection_indexes(&session, db, coll)?;
-        self.delete_index_entries(&session, db, coll, &old_doc, &indexes)?;
+        let descs = self.index_descs(&session, db, coll)?;
+        self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
         Ok(true)
     }
 
@@ -685,15 +752,50 @@ impl Storage {
             Err(e) => return Err(e.into()),
         }
 
-        // One doc-table walk: detect multikey and build all entry keys.
+        let sparse = options.get_bool("sparse").unwrap_or(false);
+        let unique = options.get_bool("unique").unwrap_or(false);
+        let partial = options
+            .get_document("partialFilterExpression")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .cloned();
+
+        // One doc-table walk: gate by the partial filter, detect multikey, probe
+        // uniqueness on the canonical key, and build all entry-key variants.
         let mut multikey = false;
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
         for (id_k, blob) in self.scan_docs(&session, db, coll)? {
             let d = decode_doc(&blob)?;
+            if let Some(pf) = &partial {
+                if !query_matches(&d, pf, &Document::new(), None)
+                    .map_err(|_| StorageError::QueryUnsupported)?
+                {
+                    continue;
+                }
+            }
             if !multikey && doc_makes_multikey(&d, key_spec) {
                 multikey = true;
             }
-            for kb in index_key_variants(&d, key_spec)? {
+            if unique {
+                if let Some(canonical) = index_key(&d, key_spec, sparse)? {
+                    if !seen.insert(canonical) {
+                        // A pre-existing doc already holds this key — can't build
+                        // a unique index over the data.
+                        let mut key_value = Document::new();
+                        for f in key_spec.keys() {
+                            key_value
+                                .insert(f.clone(), get_path(&d, f).cloned().unwrap_or(Bson::Null));
+                        }
+                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                            index: name.to_string(),
+                            key_pattern: key_spec.clone(),
+                            key_value,
+                        })));
+                    }
+                }
+            }
+            for kb in index_key_variants(&d, key_spec, sparse)? {
                 entries.push((kb, id_k.clone()));
             }
         }
@@ -833,21 +935,6 @@ impl Storage {
         Ok(out)
     }
 
-    /// `(name, key_spec)` for every stored index — what the entry-maintenance
-    /// paths need.
-    fn collection_indexes(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-    ) -> Result<Vec<(String, Document)>> {
-        Ok(self
-            .iter_indexes(session, db, coll)?
-            .into_iter()
-            .map(|(n, k, _)| (n, k))
-            .collect())
-    }
-
     /// `(id_key, doc_bytes)` for every document in `(db, coll)`, natural order.
     fn scan_docs(
         &self,
@@ -880,7 +967,7 @@ impl Storage {
         Ok(out)
     }
 
-    /// Flag every index in `indexes` that `doc` makes multikey (an array value
+    /// Flag every index in `descs` that `doc` makes multikey (an array value
     /// on an indexed field) by rewriting its registry options with
     /// `multikey: true`. Sticky — never cleared. Indexes already flagged are
     /// left untouched. Mirrors `storage._maybe_mark_multikey`.
@@ -890,10 +977,11 @@ impl Storage {
         db: &str,
         coll: &str,
         doc: &Document,
-        indexes: &[(String, Document)],
+        descs: &[IndexDesc],
     ) -> Result<()> {
-        for (name, key_spec) in indexes {
-            if !doc_makes_multikey(doc, key_spec) {
+        for desc in descs {
+            let name = desc.name.as_str();
+            if !doc_makes_multikey(doc, &desc.key_spec) {
                 continue;
             }
             let cur = session.open_cursor(IDX_TABLE, None)?;
@@ -926,9 +1014,9 @@ impl Storage {
         db: &str,
         coll: &str,
         doc: &Document,
-        indexes: &[(String, Document)],
+        descs: &[IndexDesc],
     ) -> Result<()> {
-        if indexes.is_empty() {
+        if descs.is_empty() {
             return Ok(());
         }
         let id = doc
@@ -936,11 +1024,14 @@ impl Storage {
             .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
         let id_k = id_key(id)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        for (name, key_spec) in indexes {
-            for kb in index_key_variants(doc, key_spec)? {
+        for desc in descs {
+            if !self.doc_in_partial(doc, desc)? {
+                continue;
+            }
+            for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
                 let packed = pack_entry(&kb, &id_k);
                 cur.reset()?;
-                cur.set_key_sssu(db, coll, name, &packed);
+                cur.set_key_sssu(db, coll, &desc.name, &packed);
                 cur.set_value_u(b"");
                 cur.insert()?;
             }
@@ -948,17 +1039,18 @@ impl Storage {
         Ok(())
     }
 
-    /// Remove `doc`'s index entries for every index in `indexes` (recomputes the
-    /// same packed keys `write_index_entries` produced).
+    /// Remove `doc`'s index entries for every index in `descs` (recomputes the
+    /// same packed keys `write_index_entries` produced — same sparse / partial
+    /// gating, so it removes exactly what was written).
     fn delete_index_entries(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         doc: &Document,
-        indexes: &[(String, Document)],
+        descs: &[IndexDesc],
     ) -> Result<()> {
-        if indexes.is_empty() {
+        if descs.is_empty() {
             return Ok(());
         }
         let id = doc
@@ -966,11 +1058,14 @@ impl Storage {
             .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
         let id_k = id_key(id)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        for (name, key_spec) in indexes {
-            for kb in index_key_variants(doc, key_spec)? {
+        for desc in descs {
+            if !self.doc_in_partial(doc, desc)? {
+                continue;
+            }
+            for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
                 let packed = pack_entry(&kb, &id_k);
                 cur.reset()?;
-                cur.set_key_sssu(db, coll, name, &packed);
+                cur.set_key_sssu(db, coll, &desc.name, &packed);
                 match cur.remove() {
                     Ok(()) => {}
                     Err(e) if e.is_not_found() => {}
@@ -979,6 +1074,108 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    /// Whether `doc` is covered by `desc`'s partial filter (always true for a
+    /// non-partial index). A partial filter the Rust query engine can't evaluate
+    /// surfaces as `QueryUnsupported`.
+    fn doc_in_partial(&self, doc: &Document, desc: &IndexDesc) -> Result<bool> {
+        match &desc.partial {
+            None => Ok(true),
+            Some(pf) => query_matches(doc, pf, &Document::new(), None)
+                .map_err(|_| StorageError::QueryUnsupported),
+        }
+    }
+
+    /// Parse every stored index into an `IndexDesc` (name, key_spec, sparse,
+    /// unique, partial filter).
+    fn index_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
+        Ok(self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .map(|(name, key_spec, opts)| {
+                let partial = opts
+                    .get_document("partialFilterExpression")
+                    .ok()
+                    .filter(|d| !d.is_empty())
+                    .cloned();
+                IndexDesc {
+                    name,
+                    key_spec,
+                    sparse: opts.get_bool("sparse").unwrap_or(false),
+                    unique: opts.get_bool("unique").unwrap_or(false),
+                    partial,
+                }
+            })
+            .collect())
+    }
+
+    /// The first unique-index violation `candidate` would cause, or `None`.
+    /// Probes the entries table for an existing row with the same canonical key
+    /// belonging to a *different* doc (`exclude_id_key` skips the candidate's own
+    /// row, for replace/update). Mirrors `storage._unique_conflict`.
+    fn unique_conflict(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        candidate: &Document,
+        descs: &[IndexDesc],
+        exclude_id_key: Option<&[u8]>,
+    ) -> Result<Option<UniqueConflict>> {
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for desc in descs {
+            if !desc.unique || !self.doc_in_partial(candidate, desc)? {
+                continue;
+            }
+            let kb = match index_key(candidate, &desc.key_spec, desc.sparse)? {
+                Some(k) => k,
+                None => continue,
+            };
+            let esc_kb = escape_kb(&kb);
+            let mut seed = esc_kb.clone();
+            seed.extend_from_slice(ENTRY_SEP);
+            cur.reset()?;
+            cur.set_key_sssu(db, coll, &desc.name, &seed);
+            let mut more = match cur.search_near() {
+                Ok(cmp) => {
+                    if cmp < 0 {
+                        cur.next()?
+                    } else {
+                        true
+                    }
+                }
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            while more {
+                let (d, c, n, packed) = cur.get_key_sssu()?;
+                if d != db || c != coll || n != desc.name {
+                    break;
+                }
+                let (row_esc, row_id) = unpack_entry(&packed);
+                if row_esc != esc_kb.as_slice() {
+                    break;
+                }
+                let is_self = exclude_id_key == Some(row_id);
+                if !is_self {
+                    let mut key_value = Document::new();
+                    for f in desc.key_spec.keys() {
+                        key_value.insert(
+                            f.clone(),
+                            get_path(candidate, f).cloned().unwrap_or(Bson::Null),
+                        );
+                    }
+                    return Ok(Some(UniqueConflict {
+                        index: desc.name.clone(),
+                        key_pattern: desc.key_spec.clone(),
+                        key_value,
+                    }));
+                }
+                more = cur.next()?;
+            }
+        }
+        Ok(None)
     }
 
     /// Delete all entries for one index (its `(db, coll, name)` prefix).
@@ -1993,13 +2190,13 @@ mod tests {
 
     #[test]
     fn variants_single_scalar_ascending() {
-        let v = index_key_variants(&doc! {"_id": 1, "a": 5i32}, &doc! {"a": 1}).unwrap();
+        let v = index_key_variants(&doc! {"_id": 1, "a": 5i32}, &doc! {"a": 1}, false).unwrap();
         assert_eq!(v, vec![ev(&Bson::Int32(5))]);
     }
 
     #[test]
     fn variants_single_descending_inverts() {
-        let v = index_key_variants(&doc! {"a": 5i32}, &doc! {"a": -1}).unwrap();
+        let v = index_key_variants(&doc! {"a": 5i32}, &doc! {"a": -1}, false).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], sortkey::invert_bytes(&ev(&Bson::Int32(5))));
         assert_ne!(v[0], ev(&Bson::Int32(5)));
@@ -2007,14 +2204,14 @@ mod tests {
 
     #[test]
     fn variants_missing_field_is_null() {
-        let v = index_key_variants(&doc! {"_id": 1}, &doc! {"a": 1}).unwrap();
+        let v = index_key_variants(&doc! {"_id": 1}, &doc! {"a": 1}, false).unwrap();
         assert_eq!(v, vec![ev(&Bson::Null)]);
     }
 
     #[test]
     fn variants_array_multikey_per_element_plus_whole() {
         let d = doc! {"tags": ["py", "go", "py"]};
-        let v = index_key_variants(&d, &doc! {"tags": 1}).unwrap();
+        let v = index_key_variants(&d, &doc! {"tags": 1}, false).unwrap();
         // "py" deduped: element keys py, go, plus the whole-array key = 3.
         assert_eq!(v.len(), 3);
         assert!(v.contains(&ev(&Bson::String("py".into()))));
@@ -2029,7 +2226,8 @@ mod tests {
 
     #[test]
     fn variants_compound_joins_parts() {
-        let v = index_key_variants(&doc! {"a": 1i32, "b": 2i32}, &doc! {"a": 1, "b": 1}).unwrap();
+        let v = index_key_variants(&doc! {"a": 1i32, "b": 2i32}, &doc! {"a": 1, "b": 1}, false)
+            .unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(
             v[0],
@@ -2042,7 +2240,7 @@ mod tests {
         // a = [1, 2] (array), b = 9: products (1,9), (2,9), plus the whole-array
         // (([1,2]),9) combo = 3 distinct compound keys.
         let d = doc! {"a": [1i32, 2i32], "b": 9i32};
-        let v = index_key_variants(&d, &doc! {"a": 1, "b": 1}).unwrap();
+        let v = index_key_variants(&d, &doc! {"a": 1, "b": 1}, false).unwrap();
         assert_eq!(v.len(), 3);
         assert!(v.contains(&compound_join(&[ev(&Bson::Int32(1)), ev(&Bson::Int32(9))])));
         assert!(v.contains(&compound_join(&[ev(&Bson::Int32(2)), ev(&Bson::Int32(9))])));
