@@ -1,0 +1,14 @@
+# Cargo workspace for the SecantusDB Rust side. Two crates:
+#   * secantus-core    — the pure-Rust operator engines (no PyO3). Publishable to
+#                        crates.io and reusable by a future standalone secantusdb
+#                        server binary.
+#   * secantus-core-py — the thin PyO3 bindings that wrap secantus-core and build
+#                        the `_secantus_core` abi3 extension (the `secantus-core`
+#                        Python wheel, via maturin). This is the package the
+#                        `secantus[rust]` extra pulls in.
+[workspace]
+resolver = "2"
+members = ["secantus-core", "secantus-core-py"]
+
+[workspace.dependencies]
+bson = "2"

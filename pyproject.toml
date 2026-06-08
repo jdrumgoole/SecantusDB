@@ -68,8 +68,9 @@ rust = [
     # Optional Rust acceleration core (the `_secantus_core` extension). Kept as
     # a separate companion wheel rather than bundled, pinned in lockstep so the
     # accelerator always matches this release's behaviour. The pure-Python
-    # engines remain the default; enable with SECANTUS_ENGINE=rust|auto. See
-    # crates/secantus-core/ and tasks/rust-rewrite-plan.md.
+    # engines remain the default; enable with SECANTUS_ENGINE=rust|auto. Built
+    # from the PyO3 bindings crate crates/secantus-core-py/ (which wraps the pure
+    # Rust engines in crates/secantus-core/); see tasks/rust-rewrite-plan.md.
     "secantus-core==0.5.2b15",
 ]
 
@@ -101,7 +102,7 @@ build-backend = "scikit_build_core.build"
 # the `secantus-core==<version>` pin from project.optional-dependencies and
 # resolves it from PyPI as normal.
 [tool.uv.sources]
-secantus-core = { path = "crates/secantus-core" }
+secantus-core = { path = "crates/secantus-core-py" }
 
 [tool.scikit-build]
 minimum-version = "0.10"

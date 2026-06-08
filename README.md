@@ -165,9 +165,11 @@ server = SecantusDBServer(engine="rust")   # same effect, programmatic
 ```
 
 `rust` transparently falls back to Python for anything it doesn't reproduce, so
-it's always correct. The Rust core ships as a separate `secantus-core` package
-(its own crate under `crates/secantus-core/`) so it can evolve toward a
-first-class, standalone Rust build.
+it's always correct. The Rust side is a Cargo workspace under `crates/`: a
+pure-Rust engine crate (`secantus-core`, no PyO3) plus a thin PyO3 bindings crate
+(`secantus-core-py`) that builds the `secantus-core` wheel. Splitting them keeps
+the engines reusable so they can evolve toward a first-class, standalone Rust
+build.
 
 ## Standalone daemon (drop-in `mongod` replacement)
 
