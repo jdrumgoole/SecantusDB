@@ -67,9 +67,10 @@ jobs:
           # below). build_wt_static.py is CWD-independent (it resolves the repo
           # root from its own location).
           before-script-linux: |
-            dnf install -y clang llvm-devel ninja-build || \
-              (yum install -y clang llvm-devel ninja-build)
-            python3 -m pip install --upgrade cmake ninja
+            # manylinux_2_28 == AlmaLinux 8 (dnf). cmake 3.26 + ninja + clang/
+            # libclang (for bindgen) come straight from the repos — no pip needed
+            # (the container python3 has no pip module).
+            dnf install -y clang llvm-devel cmake ninja-build
             python3 ../../cmake/build_wt_static.py /tmp/wt-static
           args: --release --out dist
         env:
