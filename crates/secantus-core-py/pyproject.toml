@@ -1,15 +1,18 @@
-# The Rust accelerator core ships as its **own optional package**, not bundled
-# into the top-level SecantusDB wheel. `pip install secantus` is pure-Python +
+# The Rust accelerator ships as its **own optional package**, not bundled into
+# the top-level SecantusDB wheel. `pip install secantus` is pure-Python +
 # vendored WiredTiger as always; `pip install "secantus[rust]"` additionally
 # pulls this `secantus-core` wheel, which provides the `_secantus_core`
 # extension the engine shims pick up at runtime (selected via SECANTUS_ENGINE).
 #
-# Keeping it separate is deliberate and is the bridge to the longer-term goal of
-# the Rust side standing on its own as a first-class Rust package (a publishable
-# crate, and eventually a standalone `secantusdb` server binary) — see
-# tasks/rust-rewrite-plan.md. Version is kept in lockstep with the SecantusDB
-# release it accelerates (the `secantus[rust]` extra pins it exactly), so the
-# release process must bump and publish both together.
+# This directory (`crates/secantus-core-py`) is the thin PyO3 **bindings** crate
+# only — the byte-seam marshalling + `#[pyfunction]` glue. The pure operator
+# engines live in the sibling `crates/secantus-core` Rust lib crate (no PyO3),
+# so they stay reusable by a future standalone `secantusdb` server binary. The
+# two are a Cargo workspace (`crates/Cargo.toml`); maturin builds this crate.
+#
+# Version is kept in lockstep with the SecantusDB release it accelerates (the
+# `secantus[rust]` extra pins it exactly), so the release process must bump and
+# publish both together — see tasks/rust-rewrite-plan.md and tasks/backlog.md.
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"

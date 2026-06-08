@@ -1748,7 +1748,7 @@ wheels = [
 [[package]]
 name = "secantus-core"
 version = "0.5.2b15"
-source = { directory = "crates/secantus-core" }
+source = { directory = "crates/secantus-core-py" }
 
 [[package]]
 name = "secantusdb"
@@ -1819,7 +1819,7 @@ requires-dist = [
     { name = "pywebview", marker = "extra == 'admin'", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "s2sphere", specifier = ">=0.2.5" },
-    { name = "secantus-core", marker = "extra == 'rust'", directory = "crates/secantus-core" },
+    { name = "secantus-core", marker = "extra == 'rust'", directory = "crates/secantus-core-py" },
     { name = "setproctitle", marker = "extra == 'admin'", specifier = ">=1.3" },
     { name = "shapely", specifier = ">=2.0" },
     { name = "sphinx", marker = "extra == 'dev'", specifier = ">=7.2" },

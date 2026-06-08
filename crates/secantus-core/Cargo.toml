@@ -1,16 +1,20 @@
 [package]
 name = "secantus-core"
-version = "0.0.0"
+version = "0.5.2-beta.15"
 edition = "2021"
+description = "Pure-Rust operator engines for SecantusDB (sort keys, query matcher, update operators, aggregation-expression evaluator, projection, change-stream diff, aggregation pipeline)."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+# Not yet released to crates.io — that's a tracked follow-up (tasks/backlog.md).
+# Flip to publish once the public API is settled and the standalone server lands.
 publish = false
-description = "Rust core for SecantusDB (Phase 1 of the Python -> Rust rewrite)"
 
+# Pure Rust: no PyO3, no Python. The engines operate on `bson` values only, so
+# this crate links into anything (the PyO3 bindings crate today; a standalone
+# Rust server binary tomorrow). The PyO3 boundary lives in `secantus-core-py`.
 [lib]
-name = "_secantus_core"
-# cdylib -> the Python extension module; rlib -> so cargo can run unit tests
-# and so future binaries / crates can link the core directly.
-crate-type = ["cdylib", "rlib"]
+name = "secantus_core"
+crate-type = ["rlib"]
 
 [dependencies]
-bson = "2"
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+bson = { workspace = true }

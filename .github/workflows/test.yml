@@ -148,7 +148,9 @@ jobs:
         run: uv sync --extra dev --extra admin  # also builds vendored WT
 
       - name: Cargo fmt / clippy / unit tests
-        working-directory: crates/secantus-core
+        # Run across the whole Rust workspace (the pure-engine `secantus-core`
+        # lib crate + the `secantus-core-py` PyO3 bindings crate).
+        working-directory: crates
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
@@ -157,7 +159,7 @@ jobs:
       - name: Build & install the Rust core
         run: |
           uvx maturin build --release \
-            --manifest-path crates/secantus-core/Cargo.toml --out dist-rust
+            --manifest-path crates/secantus-core-py/Cargo.toml --out dist-rust
           uv pip install dist-rust/secantus_core-*.whl
 
       - name: Engine-parity suites (pure-Python vs Rust)

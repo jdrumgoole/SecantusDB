@@ -52,7 +52,7 @@ jobs:
       - name: Build abi3 wheel
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: crates/secantus-core
+          working-directory: crates/secantus-core-py
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
@@ -61,13 +61,13 @@ jobs:
         if: matrix.platform == 'linux-x86_64'
         shell: bash
         run: |
-          python -m pip install crates/secantus-core/dist/*.whl
+          python -m pip install crates/secantus-core-py/dist/*.whl
           python -c "import _secantus_core; print('imported', _secantus_core.__doc__[:40])"
 
       - uses: actions/upload-artifact@v4
         with:
           name: secantus-core-${{ matrix.platform }}
-          path: crates/secantus-core/dist/*.whl
+          path: crates/secantus-core-py/dist/*.whl
 
   # Source distribution (lets pip fall back to building from source where a
   # binary wheel isn't published — needs a Rust toolchain on the user's box).
@@ -78,13 +78,13 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: crates/secantus-core
+          working-directory: crates/secantus-core-py
           command: sdist
           args: --out dist
       - uses: actions/upload-artifact@v4
         with:
           name: secantus-core-sdist
-          path: crates/secantus-core/dist/*.tar.gz
+          path: crates/secantus-core-py/dist/*.tar.gz
 
   publish:
     # Only on a release tag. Trusted publishing (OIDC) — no API token.
@@ -101,7 +101,7 @@ jobs:
         shell: bash
         run: |
           tag="${GITHUB_REF#refs/tags/v}"
-          ver=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('crates/secantus-core/pyproject.toml').read_text())['project']['version'])")
+          ver=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('crates/secantus-core-py/pyproject.toml').read_text())['project']['version'])")
           if [ "$tag" != "$ver" ]; then
             echo "Tag $tag != secantus-core version $ver" >&2; exit 1
           fi

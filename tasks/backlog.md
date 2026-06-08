@@ -135,9 +135,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 Tracking the incremental rewrite (plan: `tasks/rust-rewrite-plan.md`; Phase 0
 spike results: `tasks/rust-rewrite-spike-findings.md`; Phase 3+4 scoping:
-`tasks/rust-rewrite-phase3-scoping.md`). The Rust core lives at
-`crates/secantus-core` and builds as an abi3 extension `_secantus_core` via
-maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
+`tasks/rust-rewrite-phase3-scoping.md`). The Rust side is a Cargo workspace under
+`crates/`: the pure-Rust engine lib crate `crates/secantus-core` plus the PyO3
+bindings crate `crates/secantus-core-py`, which builds the abi3 extension
+`_secantus_core` via maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
 
 **Both engines are permanent (not a replacement).** The pure-Python engines are
 always present and the default; the Rust core is an optional accelerator.
@@ -218,14 +219,20 @@ never "remove Python."
   pyproject, and (b) publish both wheels. Wire this into the `/secantusdb-release`
   skill so the two can never drift (the `secantus[rust]` install breaks if the
   matching `secantus-core` version isn't on PyPI).
-- [ ] **Toward a standalone Rust package (the "ultimately a Rust package" goal).**
-  Today `crates/secantus-core` is one crate that *is* the PyO3 extension. To let
-  the Rust side stand on its own (reused by a future standalone server binary
-  without dragging in PyO3/CPython), split it into a pure-Rust **core lib crate**
-  (no PyO3 — the engines + `bson`) plus a thin **PyO3 bindings crate** that wraps
-  it. The lib can then publish to crates.io and back a `secantusdb` binary; the
-  bindings crate stays the `secantus-core` wheel. Sequence this with the storage
-  keystone (Phase 4) since the standalone server also needs storage in Rust.
+- [x] **Lib/bindings split (step 1 toward a standalone Rust package).** The Rust
+  side is now a Cargo workspace (`crates/Cargo.toml`): `crates/secantus-core` is
+  the **pure-Rust engine lib crate** (no PyO3 — engines over `bson`, public API =
+  the 8 engines, internal helpers crate-private) and `crates/secantus-core-py` is
+  the **thin PyO3 bindings crate** (byte seam + `#[pyfunction]` glue) that builds
+  the `_secantus_core` extension / `secantus-core` wheel via maturin. All 62
+  engine unit tests, clippy (`-D warnings`), and the maturin wheel build pass; the
+  wheel is byte-for-byte the same `secantus_core-<ver>` distribution.
+- [ ] **Toward a standalone Rust package (continued).** With the split done, the
+  remaining steps to "ultimately a Rust package": (a) settle the `secantus-core`
+  lib's public API and flip `publish = false` → publish to crates.io; (b) add a
+  `secantusdb` **binary crate** (a thin `main` over the engines + storage) — this
+  is gated on the storage keystone (Phase 4), since a standalone server also needs
+  storage in Rust, not just the operator engines.
 - [ ] **Make Rust the *recommended* default (Python stays available).**
   Currently every component defaults to Python; `SECANTUS_ENGINE=rust` opts in.
   With the optional package now shipping (above), recommending Rust by default

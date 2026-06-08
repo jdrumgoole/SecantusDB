@@ -327,7 +327,7 @@ fn run_group(
     }
 
     let mut out = Vec::with_capacity(ids.len());
-    for (id, accs) in ids.into_iter().zip(states.into_iter()) {
+    for (id, accs) in ids.into_iter().zip(states) {
         let paired: Vec<(&str, Acc)> = compiled.iter().map(|c| c.field).zip(accs).collect();
         out.push(finalize(id, paired)?);
     }
@@ -477,7 +477,7 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
     }
 
     let mut out = Vec::with_capacity(keys.len());
-    for (key, bucket_docs) in keys.into_iter().zip(placed.into_iter()) {
+    for (key, bucket_docs) in keys.into_iter().zip(placed) {
         if bucket_docs.is_empty() {
             // Empty bucket: only `_id` (accumulator fields are never created).
             let mut doc = Document::new();
