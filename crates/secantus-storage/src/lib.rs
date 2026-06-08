@@ -467,9 +467,11 @@ impl Storage {
             Err(e) if e.is_duplicate_key() => return Err(StorageError::DuplicateId),
             Err(e) => return Err(e.into()),
         }
-        // Maintain secondary indexes: write this doc's entries.
+        // Maintain secondary indexes: write this doc's entries, and lazily flag
+        // any index this doc makes multikey (array value on an indexed field).
         let indexes = self.collection_indexes(&session, db, coll)?;
         self.write_index_entries(&session, db, coll, &doc, &indexes)?;
+        self.maybe_mark_multikey(&session, db, coll, &doc, &indexes)?;
         Ok(key)
     }
 
@@ -550,11 +552,14 @@ impl Storage {
         cur.set_value_u(&blob);
         cur.update()?;
 
-        // Maintain secondary indexes: retract the old doc's entries, write the new.
+        // Maintain secondary indexes: retract the old doc's entries, write the
+        // new, and lazily flag any index the new doc makes multikey (sticky —
+        // the old doc's array-ness is never cleared).
         let indexes = self.collection_indexes(&session, db, coll)?;
         if !indexes.is_empty() {
             self.delete_index_entries(&session, db, coll, &old_doc, &indexes)?;
             self.write_index_entries(&session, db, coll, &doc, &indexes)?;
+            self.maybe_mark_multikey(&session, db, coll, &doc, &indexes)?;
         }
         Ok(true)
     }
@@ -873,6 +878,45 @@ impl Storage {
             more = cur.next()?;
         }
         Ok(out)
+    }
+
+    /// Flag every index in `indexes` that `doc` makes multikey (an array value
+    /// on an indexed field) by rewriting its registry options with
+    /// `multikey: true`. Sticky — never cleared. Indexes already flagged are
+    /// left untouched. Mirrors `storage._maybe_mark_multikey`.
+    fn maybe_mark_multikey(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        doc: &Document,
+        indexes: &[(String, Document)],
+    ) -> Result<()> {
+        for (name, key_spec) in indexes {
+            if !doc_makes_multikey(doc, key_spec) {
+                continue;
+            }
+            let cur = session.open_cursor(IDX_TABLE, None)?;
+            cur.set_key_sss(db, coll, name);
+            match cur.search() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e.into()),
+            }
+            let mut payload = decode_doc(&cur.get_value_u()?)?;
+            let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+            if opts.get_bool("multikey").unwrap_or(false) {
+                continue; // already flagged — nothing to do
+            }
+            opts.insert("multikey", Bson::Boolean(true));
+            payload.insert("options", Bson::Document(opts));
+            let blob = encode_doc(&payload)?;
+            let wcur = session.open_cursor(IDX_TABLE, None)?;
+            wcur.set_key_sss(db, coll, name);
+            wcur.set_value_u(&blob);
+            wcur.update()?;
+        }
+        Ok(())
     }
 
     /// Write `doc`'s index entries for every index in `indexes`.

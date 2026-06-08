@@ -39,6 +39,16 @@ fn index_names(st: &Storage, db: &str, coll: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether index `name` carries the `multikey: true` flag (absent == false).
+fn multikey_flag(st: &Storage, db: &str, coll: &str, name: &str) -> bool {
+    st.list_indexes(db, coll)
+        .unwrap()
+        .iter()
+        .find(|d| d.get_str("name").unwrap() == name)
+        .map(|d| d.get_bool("multikey").unwrap_or(false))
+        .unwrap_or(false)
+}
+
 #[test]
 fn create_list_drop_roundtrip() {
     with_db(|st| {
@@ -115,6 +125,53 @@ fn multikey_array_writes_per_element_entries() {
         // only assert the entry variants are written. Create-time detection is
         // covered by `create_index_detects_multikey_on_existing_data`.)
         assert_eq!(st.index_entries("app", "c", "tags_1").unwrap().len(), 3);
+    });
+}
+
+#[test]
+fn insert_array_after_create_lazily_marks_multikey() {
+    with_db(|st| {
+        st.create_index("app", "c", "tags_1", &doc! {"tags": 1}, &doc! {})
+            .unwrap();
+        // Created over an empty collection -> not multikey yet.
+        assert!(!multikey_flag(st, "app", "c", "tags_1"));
+        // Inserting an array-valued doc lazily flags the index.
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "tags": ["a", "b"]}))
+            .unwrap();
+        assert!(multikey_flag(st, "app", "c", "tags_1"));
+    });
+}
+
+#[test]
+fn replace_introducing_array_marks_multikey() {
+    with_db(|st| {
+        st.create_index("app", "c", "t_1", &doc! {"t": 1}, &doc! {})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "t": 5}))
+            .unwrap();
+        assert!(!multikey_flag(st, "app", "c", "t_1"));
+        // Replacing the doc's scalar value with an array flags the index.
+        st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"t": [1, 2]}))
+            .unwrap();
+        assert!(multikey_flag(st, "app", "c", "t_1"));
+    });
+}
+
+#[test]
+fn multikey_flag_is_sticky() {
+    with_db(|st| {
+        st.create_index("app", "c", "tags_1", &doc! {"tags": 1}, &doc! {})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "tags": ["a"]}))
+            .unwrap();
+        assert!(multikey_flag(st, "app", "c", "tags_1"));
+        // Deleting the only array doc does NOT clear the flag.
+        st.delete_by_id("app", "c", &Bson::Int32(1)).unwrap();
+        assert!(multikey_flag(st, "app", "c", "tags_1"));
+        // A later scalar insert leaves it flagged too.
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "tags": "x"}))
+            .unwrap();
+        assert!(multikey_flag(st, "app", "c", "tags_1"));
     });
 }
 

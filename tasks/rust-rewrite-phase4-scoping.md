@@ -96,7 +96,12 @@ build-out.
      index's leading field. Pickers (`pick_compound_eq_index` /
      `pick_compound_range_index` / `partition_compound_range_filter`) shared by
      execution and `explain`. New WT-backed tests in `tests/compound.rs`.
-   - **2d** — multikey flag (lazy marking) + its sort-acceleration exclusions.
+   - **2d ✅ DONE** — lazy multikey marking: `maybe_mark_multikey` rewrites an
+     index's registry options with `multikey: true` when an inserted/replaced doc
+     has an array on an indexed field (sticky — never cleared); wired into
+     `insert_one` / `replace_by_id`. (The sort-acceleration *exclusion* of
+     multikey indexes is part of 2f, where sort lands.) New tests in
+     `tests/indexes.rs` (lazy-mark-on-insert, mark-on-replace, sticky).
    - **2e** — partial + TTL + unique enforcement + collation.
    - **2f** — sort acceleration (single + compound) + `hint`.
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
