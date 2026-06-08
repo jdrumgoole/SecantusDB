@@ -593,6 +593,10 @@ pub struct Storage {
     /// tiny dedicated mutex — `storage._oplog_seq_lock`. Held only for the
     /// microsecond seq/ts reservation, never across the WT cursor writes.
     oplog: Mutex<OplogState>,
+    /// Retention window (seconds) and hard entry cap for `prune_oplog`. Mirrors
+    /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
+    oplog_retention_seconds: i64,
+    oplog_max_entries: usize,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -695,6 +699,8 @@ impl Storage {
             lock: Mutex::new(()),
             enable_oplog: true,
             oplog: Mutex::new(state),
+            oplog_retention_seconds: 3600,
+            oplog_max_entries: 100_000,
         })
     }
 
@@ -702,6 +708,18 @@ impl Storage {
     /// Off means writes skip the oplog tables entirely.
     pub fn set_enable_oplog(&mut self, on: bool) {
         self.enable_oplog = on;
+    }
+
+    /// Set the oplog retention window in seconds (default 3600). Mirrors
+    /// `oplog_retention_seconds`.
+    pub fn set_oplog_retention_seconds(&mut self, secs: i64) {
+        self.oplog_retention_seconds = secs;
+    }
+
+    /// Set the oplog hard entry cap (default 100_000). Mirrors
+    /// `oplog_max_entries`.
+    pub fn set_oplog_max_entries(&mut self, n: usize) {
+        self.oplog_max_entries = n;
     }
 
     // --- oplog (Phase 4 sub-phase 3) ---
@@ -906,6 +924,117 @@ impl Storage {
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Drop oplog rows older than the retention window (`ts.time < now -
+    /// retention`) and, if more than `oplog_max_entries` remain, the oldest
+    /// surplus; paired pre-images go too. `now` is injected seconds (defaults to
+    /// the wall clock). Returns the number of rows pruned. No background sweeper —
+    /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
+    pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let when = now.unwrap_or_else(now_secs);
+        let cutoff = when - self.oplog_retention_seconds;
+
+        // Phase 1: collect every seq + the ones past the retention window.
+        let oc = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut all_seqs: Vec<i64> = Vec::new();
+        let mut doomed: Vec<i64> = Vec::new();
+        let mut more = oc.next()?;
+        while more {
+            let seq = oc.get_key_q()?;
+            all_seqs.push(seq);
+            let blob = oc.get_value_u()?;
+            if !blob.is_empty() {
+                if let Ok(entry) = decode_doc(&blob) {
+                    if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
+                        if i64::from(ts.time) < cutoff {
+                            doomed.push(seq);
+                        }
+                    }
+                }
+            }
+            more = oc.next()?;
+        }
+
+        // Phase 2: extend the doom set to the oldest entries over the cap.
+        let kept = all_seqs.len() - doomed.len();
+        if kept > self.oplog_max_entries {
+            let mut extra = kept - self.oplog_max_entries;
+            let doomed_set: HashSet<i64> = doomed.iter().copied().collect();
+            for &seq in &all_seqs {
+                if extra == 0 {
+                    break;
+                }
+                if !doomed_set.contains(&seq) {
+                    doomed.push(seq);
+                    extra -= 1;
+                }
+            }
+        }
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+
+        let op_del = session.open_cursor(OPLOG_TABLE, None)?;
+        let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
+        for &seq in &doomed {
+            op_del.reset()?;
+            op_del.set_key_q(seq);
+            match op_del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+            pre_del.reset()?;
+            pre_del.set_key_q(seq);
+            match pre_del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(doomed.len())
+    }
+
+    /// Append one `{op: "n", ns: "", o: {msg: "periodic noop"}}` heartbeat and
+    /// return its seq — keeps a quiet collection's resume token advancing with
+    /// cluster time. Mirrors `storage.emit_noop_heartbeat`.
+    pub fn emit_noop_heartbeat(&self) -> Result<i64> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let mut o = Document::new();
+        o.insert("msg", "periodic noop");
+        let mut entry = Document::new();
+        entry.insert("op", "n");
+        entry.insert("ns", "");
+        entry.insert("o", Bson::Document(o));
+        self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
+    /// The smallest seq whose entry `ts >= target` (tail + 1 if none qualify) —
+    /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
+    pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let c = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut more = c.next()?;
+        while more {
+            let seq = c.get_key_q()?;
+            let blob = c.get_value_u()?;
+            if !blob.is_empty() {
+                if let Ok(entry) = decode_doc(&blob) {
+                    if let Some(Bson::Timestamp(e)) = entry.get("ts") {
+                        if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
+                            return Ok(seq);
+                        }
+                    }
+                }
+            }
+            more = c.next()?;
+        }
+        Ok(self.oplog.lock().unwrap().next_seq)
     }
 
     /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.

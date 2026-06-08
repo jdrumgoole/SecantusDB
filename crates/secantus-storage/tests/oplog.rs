@@ -274,3 +274,110 @@ fn no_pre_images_when_disabled() {
         assert!(st.read_preimage(seq_of_op(st, "u")).unwrap().is_none());
     });
 }
+
+fn with_db_mut(body: impl FnOnce(&mut Storage)) {
+    let home = temp_home();
+    let mut st = Storage::open(home.to_str().unwrap()).unwrap();
+    body(&mut st);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn prune_oplog_by_retention() {
+    with_db(|st| {
+        for i in 1..=3 {
+            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        }
+        // `now` far in the future -> every entry is past the retention window.
+        assert_eq!(st.prune_oplog(Some(10_000_000_000)).unwrap(), 3);
+        assert!(st.read_oplog(1, 10).unwrap().is_empty());
+        assert_eq!(st.oplog_floor_seq().unwrap(), 0);
+        assert_eq!(st.oplog_tail_seq(), 3); // tail (next_seq-1) unaffected
+    });
+}
+
+#[test]
+fn prune_oplog_keeps_recent() {
+    with_db(|st| {
+        for i in 1..=3 {
+            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        }
+        // `now`=0 -> negative cutoff -> nothing is old enough to drop.
+        assert_eq!(st.prune_oplog(Some(0)).unwrap(), 0);
+        assert_eq!(st.read_oplog(1, 10).unwrap().len(), 3);
+    });
+}
+
+#[test]
+fn prune_oplog_entry_cap() {
+    with_db_mut(|st| {
+        st.set_oplog_max_entries(2);
+        for i in 1..=5 {
+            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        }
+        // Retention drops nothing (now=0); the cap forces the 3 oldest out.
+        assert_eq!(st.prune_oplog(Some(0)).unwrap(), 3);
+        let rows = st.read_oplog(1, 100).unwrap();
+        assert_eq!(rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(st.oplog_floor_seq().unwrap(), 4);
+    });
+}
+
+#[test]
+fn prune_removes_paired_pre_images() {
+    with_db(|st| {
+        st.set_collection_options(
+            "app",
+            "c",
+            &doc! {"changeStreamPreAndPostImages": {"enabled": true}},
+        )
+        .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "v": "a"}))
+            .unwrap();
+        st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"v": "b"}))
+            .unwrap();
+        let upd_seq = seq_of_op(st, "u");
+        assert!(st.read_preimage(upd_seq).unwrap().is_some());
+        st.prune_oplog(Some(10_000_000_000)).unwrap();
+        assert!(st.read_preimage(upd_seq).unwrap().is_none()); // pre-image gone too
+    });
+}
+
+#[test]
+fn noop_heartbeat_entry() {
+    with_db(|st| {
+        let seq = st.emit_noop_heartbeat().unwrap();
+        assert_eq!(seq, 1);
+        let rows = st.read_oplog(1, 10).unwrap();
+        let e = decode(&rows[0].1);
+        assert_eq!(e.get_str("op").unwrap(), "n");
+        assert_eq!(e.get_str("ns").unwrap(), "");
+        assert_eq!(
+            e.get_document("o").unwrap().get_str("msg").unwrap(),
+            "periodic noop"
+        );
+        assert_eq!(st.oplog_tail_seq(), 1);
+    });
+}
+
+#[test]
+fn find_seq_for_ts_locates_entry() {
+    with_db(|st| {
+        for i in 1..=3 {
+            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        }
+        let rows = st.read_oplog(1, 100).unwrap();
+        let ts2 = match decode(&rows[1].1).get("ts") {
+            Some(Bson::Timestamp(t)) => *t,
+            _ => panic!("no ts"),
+        };
+        assert_eq!(st.find_seq_for_ts(ts2).unwrap(), 2);
+        // A timestamp past the tail resolves to next_seq (= tail + 1).
+        let beyond = bson::Timestamp {
+            time: u32::MAX,
+            increment: u32::MAX,
+        };
+        assert_eq!(st.find_seq_for_ts(beyond).unwrap(), 4);
+    });
+}

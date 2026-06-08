@@ -185,8 +185,16 @@ build-out.
      replace/delete when enabled (`emit_oplog` now threads a parallel
      `pre_images` vec), and `read_preimage`. New tests in `tests/oplog.rs`
      (stable per-collection ui, pre-images when enabled, none when disabled).
-   - **3d** — retention (`prune_oplog`), noop heartbeats (`emit_noop_heartbeat`),
-     `find_seq_for_ts`, and the change-stream condvar (tailable-wait primitive).
+   - **3d ✅ DONE (condvar deferred)** — retention `prune_oplog(now)` (drops rows
+     past `oplog_retention_seconds`, then the oldest over `oplog_max_entries`,
+     plus paired pre-images; injected clock, explicit-only like `prune_ttl`),
+     `emit_noop_heartbeat` (op `"n"`), `find_seq_for_ts` (for
+     `startAtOperationTime`), and `set_oplog_retention_seconds` /
+     `set_oplog_max_entries`. New tests in `tests/oplog.rs` (retention prune,
+     keep-recent, entry-cap, pre-image co-deletion, heartbeat shape,
+     find-seq-for-ts). **Deferred:** the change-stream condvar / tailable-wait
+     primitive — it only matters once a tailable cursor exists (server layer) and
+     needs `Storage: Sync` + multithreaded tests; lands with that consumer.
    - **3e** — change-stream event projection (port `changestreams.py` `project()`:
      resume tokens, `fullDocument` modes, `invalidate`).
    - Then: re-home `$lookup` / `$geoNear` pipeline acceleration onto the Rust
