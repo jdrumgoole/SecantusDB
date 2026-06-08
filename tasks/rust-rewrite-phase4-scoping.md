@@ -170,9 +170,12 @@ build-out.
      (`load_oplog_meta`: meta row, else fallback scan). `enable_oplog` (default
      true) + `set_enable_oplog`. New tests in `tests/oplog.rs`. **Deferred:**
      the collection-UUID `ui` field (3c).
-   - **3b** — `update` (op `"u"`, `$v:2` diff `updateDescription` via
-     `secantus-core`'s `diff`) + `delete` (op `"d"`) emission, wired into
-     `replace_by_id` / `delete_by_id`.
+   - **3b ✅ DONE** — `replace_by_id` emits op `"u"` with `o` = the full new doc
+     (the replacement shape — mongod's `$v:2` diff is only for operator-updates,
+     which the storage layer doesn't expose; that path waits for a future
+     `update_*` method using `secantus-core`'s `diff`), and `delete_by_id` emits
+     op `"d"` with `o`=`o2`=`{_id}`. New tests in `tests/oplog.rs`
+     (replace→`u`+full-doc, delete→`d`, insert/replace/delete → `[i,u,d]`).
    - **3c** — collection UUID (`ui`) + pre-images (`changeStreamPreAndPostImages`)
      + `read_preimage`.
    - **3d** — retention (`prune_oplog`), noop heartbeats (`emit_noop_heartbeat`),

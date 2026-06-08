@@ -991,6 +991,19 @@ impl Storage {
             self.write_index_entries(&session, db, coll, &doc, &descs)?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         }
+        // Oplog: a full-document replacement is op "u" with `o` = the new doc
+        // (the `$v:2` diff form is for operator-updates, which the storage layer
+        // doesn't expose). `ui` lands in 3c.
+        if self.enable_oplog {
+            let mut o2 = Document::new();
+            o2.insert("_id", id.clone());
+            let mut entry = Document::new();
+            entry.insert("op", "u");
+            entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("o", Bson::Document(doc.clone()));
+            entry.insert("o2", Bson::Document(o2));
+            self.emit_oplog(&session, vec![entry])?;
+        }
         Ok(true)
     }
 
@@ -1011,6 +1024,17 @@ impl Storage {
         let old_doc = decode_doc(&old_blob)?;
         let descs = self.index_descs(&session, db, coll)?;
         self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
+        // Oplog: a delete is op "d" with `o` = `o2` = {_id}. `ui` lands in 3c.
+        if self.enable_oplog {
+            let mut o = Document::new();
+            o.insert("_id", id.clone());
+            let mut entry = Document::new();
+            entry.insert("op", "d");
+            entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("o", Bson::Document(o.clone()));
+            entry.insert("o2", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry])?;
+        }
         Ok(true)
     }
 

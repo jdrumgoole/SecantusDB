@@ -139,3 +139,57 @@ fn reopen_recovers_seq_counter() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn replace_emits_update_entry_with_full_doc() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "x": 1}))
+            .unwrap();
+        st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"x": 2}))
+            .unwrap();
+        let rows = st.read_oplog(1, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        // seq 1 = insert, seq 2 = the replacement.
+        let u = decode(&rows[1].1);
+        assert_eq!(u.get_str("op").unwrap(), "u");
+        assert_eq!(u.get_str("ns").unwrap(), "app.c");
+        // Replacement logs the FULL new doc in `o` (not a $v:2 diff).
+        let o = u.get_document("o").unwrap();
+        assert_eq!(o.get_i32("x").unwrap(), 2);
+        assert_eq!(o.get_i32("_id").unwrap(), 1);
+        assert_eq!(u.get_document("o2").unwrap().get_i32("_id").unwrap(), 1);
+    });
+}
+
+#[test]
+fn delete_emits_delete_entry() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 7})).unwrap();
+        assert!(st.delete_by_id("app", "c", &Bson::Int32(7)).unwrap());
+        let rows = st.read_oplog(1, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        let d = decode(&rows[1].1);
+        assert_eq!(d.get_str("op").unwrap(), "d");
+        assert_eq!(d.get_str("ns").unwrap(), "app.c");
+        assert_eq!(d.get_document("o").unwrap().get_i32("_id").unwrap(), 7);
+        assert_eq!(d.get_document("o2").unwrap().get_i32("_id").unwrap(), 7);
+    });
+}
+
+#[test]
+fn insert_replace_delete_sequence() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "n": 0}))
+            .unwrap();
+        st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"n": 1}))
+            .unwrap();
+        st.delete_by_id("app", "c", &Bson::Int32(1)).unwrap();
+        let ops: Vec<String> = st
+            .read_oplog(1, 100)
+            .unwrap()
+            .iter()
+            .map(|(_, b)| decode(b).get_str("op").unwrap().to_string())
+            .collect();
+        assert_eq!(ops, vec!["i", "u", "d"]);
+    });
+}
