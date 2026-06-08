@@ -261,13 +261,17 @@ never "remove Python."
   `Storage` surface** (the server needs `find_matching`/indexes/oplog/etc., not
   just CRUD), i.e. sub-phases 2-4 (indexes, geo, oplog/change-streams); then the
   conformance gate (`test_storage.py` / `test_crud.py` under `SECANTUS_ENGINE=rust`).
-  (b) **The wheel-matrix go/no-go gate:** ship the WiredTiger-linking extension
-  across cp310-313 × manylinux/musllinux/macOS-arm64/Windows — the maturin build
-  here produces only a host-glibc wheel; the likely answer is building the
-  storage extension through the existing scikit-build CMake path (which already
-  vendors + builds WiredTiger) rather than maturin's manylinux container — plus a
-  CI job that builds WT then runs the `secantus-wt`/`secantus-storage`/
-  `secantus-storage-py` tests. See the scoping doc.
+  (b) **The wheel-matrix gate — bundled behind an off-by-default build flag.**
+  Decided (after rejecting a separate companion wheel — see scoping doc): the Rust
+  `_secantus_storage` extension is built INTO the `secantus` wheel by the main
+  wheel's CMake, against the WiredTiger that wheel already builds, gated behind the
+  `SECANTUS_BUILD_STORAGE_ENGINE` CMake option (default **OFF** — wheel unchanged,
+  no Rust/clang needed when off). The `storage-engine` job in `test.yml` validates
+  the flag-on build + import + smoke on **Linux**. Still to do: **macOS / Windows
+  flag-on builds** (the crate's WT link flags `pthread`/`rt`/`dl` are POSIX-shaped
+  — need `cfg`-gating for those targets), and — only once engine-selection makes
+  the Rust storage engine selectable — flipping the flag on in the shipping
+  `wheels.yml` / cibuildwheel matrix.
 - [ ] **Toward a standalone Rust package (continued).** With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to
