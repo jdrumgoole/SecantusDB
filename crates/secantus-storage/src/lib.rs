@@ -18,15 +18,37 @@
 //! Later sub-phases add indexes, geo, and the oplog (see
 //! `tasks/rust-rewrite-phase4-scoping.md`).
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use bson::oid::ObjectId;
 use bson::{Bson, Document};
-use secantus_core::sortkey;
+use secantus_core::get_path;
+use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
 const COLL_TABLE: &str = "table:secantus_collections";
 const DOC_TABLE: &str = "table:secantus_documents";
+const IDX_TABLE: &str = "table:secantus_indexes";
+const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
+
+/// The synthetic `_id` index name. The `_id_` index is virtual — never stored
+/// in the registry; `list_indexes` synthesises it.
+const ID_INDEX_NAME: &str = "_id_";
+
+/// The entry-key separator between the (escaped) index sort-key bytes and the
+/// document's `id_key`. Mirrors `storage._ENTRY_SEP`.
+const ENTRY_SEP: &[u8] = b"\x00\x00";
+
+/// Index options whose value conflicting with an existing index of the same
+/// name makes `create_index` reject the re-creation (mirrors `storage.py`).
+const CONFLICTING_OPTS: &[&str] = &[
+    "unique",
+    "sparse",
+    "hidden",
+    "expireAfterSeconds",
+    "partialFilterExpression",
+];
 
 /// The WiredTiger connection config SecantusDB uses (mirrors `storage.py`):
 /// logging on, commit-sync off by default.
@@ -63,8 +85,17 @@ pub enum StorageError {
     Bson(String),
     /// `_id` is a type the sort-key encoder doesn't handle.
     UnsupportedId,
+    /// An indexed field value couldn't be sort-key encoded (e.g. a construct
+    /// the Rust encoder defers to Python, like a regex or a collation edge).
+    UnsupportedValue,
     /// A document was inserted with an `_id` that already exists.
     DuplicateId,
+    /// `create_index` was asked for an index type the Rust storage engine
+    /// doesn't implement yet (text / hashed / geo).
+    CreateIndexUnsupported(String),
+    /// `create_index` was asked to re-create an existing index with conflicting
+    /// options.
+    IndexOptionsConflict(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -73,7 +104,12 @@ impl std::fmt::Display for StorageError {
             StorageError::Wt(e) => write!(f, "{e}"),
             StorageError::Bson(m) => write!(f, "BSON error: {m}"),
             StorageError::UnsupportedId => write!(f, "unsupported _id type for sort-key encoding"),
+            StorageError::UnsupportedValue => {
+                write!(f, "unsupported value type for index sort-key encoding")
+            }
             StorageError::DuplicateId => write!(f, "duplicate _id"),
+            StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
+            StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
         }
     }
 }
@@ -101,6 +137,155 @@ fn decode_doc(bytes: &[u8]) -> Result<Document> {
 /// `id_key = sortkey.encode_value(_id)` — the byte-sortable key for the `_id`.
 fn id_key(id: &Bson) -> Result<Vec<u8>> {
     sortkey::encode_value(id, None).map_err(|_| StorageError::UnsupportedId)
+}
+
+// --- index-key construction (mirrors `storage.py`, byte-for-byte) ---
+
+/// The per-field sort direction of a `key_spec` value: `Some(1)`/`Some(-1)` for
+/// numeric directions, `None` for non-numeric specs (geo `"2dsphere"`/`"2d"`,
+/// `"text"`, `"hashed"` — not supported by the Rust engine yet).
+fn direction_of(v: &Bson) -> Option<i32> {
+    match v {
+        Bson::Int32(i) => Some(*i),
+        Bson::Int64(i) => Some(*i as i32),
+        Bson::Double(d) => Some(*d as i32),
+        _ => None,
+    }
+}
+
+/// Direction-aware sort-key encoding for one value (defers to Python on the
+/// constructs the Rust encoder can't reproduce).
+fn enc_dir(v: &Bson, direction: i32) -> Result<Vec<u8>> {
+    sortkey::encode_value_directed(v, direction, None).map_err(|_| StorageError::UnsupportedValue)
+}
+
+/// Order-preserving escape so `\x00\x00` is unambiguous as a separator: every
+/// `0x00` byte becomes `0x00 0xff`. Mirrors `storage._escape_kb`.
+fn escape_kb(kb: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(kb.len());
+    for &b in kb {
+        out.push(b);
+        if b == 0 {
+            out.push(0xff);
+        }
+    }
+    out
+}
+
+/// Pack an index-entry payload into a single trailing `u` column:
+/// `escape(kb) + b"\x00\x00" + id_key`. WiredTiger length-prefixes non-trailing
+/// `u` columns, which would break lexicographic order — so both halves live in
+/// one column and the B-tree sorts by `escape(kb)` first, then `id_key`.
+/// Mirrors `storage._pack_entry`.
+fn pack_entry(kb: &[u8], id_key: &[u8]) -> Vec<u8> {
+    let mut out = escape_kb(kb);
+    out.extend_from_slice(ENTRY_SEP);
+    out.extend_from_slice(id_key);
+    out
+}
+
+/// Split a packed entry into `(escaped_kb, id_key)` at the FIRST `\x00\x00`.
+/// Correct because the `kb` half is escaped (no bare `\x00\x00` can occur in
+/// it). Mirrors `storage._unpack_entry`.
+fn unpack_entry(packed: &[u8]) -> (&[u8], &[u8]) {
+    match packed.windows(2).position(|w| w == ENTRY_SEP) {
+        Some(i) => (&packed[..i], &packed[i + 2..]),
+        None => (packed, &[]),
+    }
+}
+
+/// Join compound key parts with `COMPOUND_SEP` between components (mirrors
+/// Python's `COMPOUND_SEP.join(parts)`).
+fn compound_join(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(COMPOUND_SEP);
+        }
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// True if any field of `key_spec` resolves to an array value in `doc` — the
+/// signal that marks an index multikey. Mirrors `storage._doc_makes_multikey`.
+fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
+    key_spec
+        .keys()
+        .any(|f| matches!(get_path(doc, f), Some(Bson::Array(_))))
+}
+
+/// All byte-keys `doc` contributes to an index under `key_spec`. Scalars give
+/// one key; arrays give one key per (deduped) element *plus* the whole-array
+/// key (the multikey layout); compound indexes take the cartesian product
+/// across each field's candidate values. Missing fields encode as `null`
+/// (non-sparse semantics — sparse handling is a later slice). Mirrors
+/// `storage._index_key_variants`.
+fn index_key_variants(doc: &Document, key_spec: &Document) -> Result<Vec<Vec<u8>>> {
+    let fields: Vec<(&String, i32)> = key_spec
+        .iter()
+        .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
+        .collect();
+
+    // Per-field candidate values: scalars -> [val]; arrays -> [uniq elems..., whole_array].
+    let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(fields.len());
+    for (f, d) in &fields {
+        let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
+        if let Bson::Array(arr) = &v {
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut uniq: Vec<Bson> = Vec::new();
+            for elem in arr {
+                let eb = enc_dir(elem, *d)?;
+                if seen.insert(eb) {
+                    uniq.push(elem.clone());
+                }
+            }
+            uniq.push(v.clone()); // whole-array key
+            per_field.push(uniq);
+        } else {
+            per_field.push(vec![v]);
+        }
+    }
+
+    if fields.len() == 1 {
+        let d = fields[0].1;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for val in &per_field[0] {
+            let kb = enc_dir(val, d)?;
+            if seen.insert(kb.clone()) {
+                keys.push(kb);
+            }
+        }
+        return Ok(keys);
+    }
+
+    // Compound: cartesian product across the per-field candidate lists.
+    let mut combos: Vec<Vec<&Bson>> = vec![Vec::new()];
+    for cand in &per_field {
+        let mut next: Vec<Vec<&Bson>> = Vec::with_capacity(combos.len() * cand.len());
+        for combo in &combos {
+            for v in cand {
+                let mut c = combo.clone();
+                c.push(v);
+                next.push(c);
+            }
+        }
+        combos = next;
+    }
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for combo in &combos {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+        for (i, (_f, d)) in fields.iter().enumerate() {
+            parts.push(enc_dir(combo[i], *d)?);
+        }
+        let kb = compound_join(&parts);
+        if seen.insert(kb.clone()) {
+            keys.push(kb);
+        }
+    }
+    Ok(keys)
 }
 
 /// WiredTiger-backed storage. A global lock serialises public methods, matching
@@ -154,10 +339,14 @@ impl Storage {
         cur.set_key_ssu(db, coll, &key);
         cur.set_value_u(&blob);
         match cur.insert() {
-            Ok(()) => Ok(key),
-            Err(e) if e.is_duplicate_key() => Err(StorageError::DuplicateId),
-            Err(e) => Err(e.into()),
+            Ok(()) => {}
+            Err(e) if e.is_duplicate_key() => return Err(StorageError::DuplicateId),
+            Err(e) => return Err(e.into()),
         }
+        // Maintain secondary indexes: write this doc's entries.
+        let indexes = self.collection_indexes(&session, db, coll)?;
+        self.write_index_entries(&session, db, coll, &doc, &indexes)?;
+        Ok(key)
     }
 
     /// Fetch a document by `_id`. Returns its BSON bytes, or `None`.
@@ -219,14 +408,15 @@ impl Storage {
         let key = id_key(id)?;
         let session = self.conn.open_session()?;
 
-        // Existence check.
+        // Existence check — capture the old doc so we can retract its entries.
         let probe = session.open_cursor(DOC_TABLE, None)?;
         probe.set_key_ssu(db, coll, &key);
-        match probe.search() {
-            Ok(()) => {}
+        let old_blob = match probe.search() {
+            Ok(()) => probe.get_value_u()?,
             Err(e) if e.is_not_found() => return Ok(false),
             Err(e) => return Err(e.into()),
-        }
+        };
+        let old_doc = decode_doc(&old_blob)?;
 
         let mut doc = decode_doc(new_doc_bytes)?;
         doc.insert("_id", id.clone()); // replacement preserves _id
@@ -235,6 +425,13 @@ impl Storage {
         cur.set_key_ssu(db, coll, &key);
         cur.set_value_u(&blob);
         cur.update()?;
+
+        // Maintain secondary indexes: retract the old doc's entries, write the new.
+        let indexes = self.collection_indexes(&session, db, coll)?;
+        if !indexes.is_empty() {
+            self.delete_index_entries(&session, db, coll, &old_doc, &indexes)?;
+            self.write_index_entries(&session, db, coll, &doc, &indexes)?;
+        }
         Ok(true)
     }
 
@@ -245,11 +442,17 @@ impl Storage {
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(DOC_TABLE, None)?;
         cur.set_key_ssu(db, coll, &key);
-        match cur.remove() {
-            Ok(()) => Ok(true),
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        // Read the doc first so we can retract its index entries, then remove.
+        let old_blob = match cur.search() {
+            Ok(()) => cur.get_value_u()?,
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        cur.remove()?;
+        let old_doc = decode_doc(&old_blob)?;
+        let indexes = self.collection_indexes(&session, db, coll)?;
+        self.delete_index_entries(&session, db, coll, &old_doc, &indexes)?;
+        Ok(true)
     }
 
     pub fn collection_exists(&self, db: &str, coll: &str) -> Result<bool> {
@@ -292,6 +495,414 @@ impl Storage {
         }
         Ok(out)
     }
+
+    // --- secondary indexes (Phase 4 sub-phase 2) ---
+
+    /// Create a secondary index `name` over `key_spec` (field → direction `1`/
+    /// `-1`) with `options`. Builds entries by scanning the collection once.
+    /// Returns `true` if created, `false` if an index of that name already
+    /// exists with compatible options (or `name == "_id_"`). Rejects non-numeric
+    /// index types (geo / text / hashed — deferred to later slices) with
+    /// `CreateIndexUnsupported`, and re-creation with conflicting options with
+    /// `IndexOptionsConflict`. Mirrors `storage.create_index`.
+    pub fn create_index(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+    ) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        if name == ID_INDEX_NAME {
+            return Ok(false);
+        }
+        for (field, v) in key_spec {
+            if direction_of(v).is_none() {
+                let ty = match v {
+                    Bson::String(s) => s.clone(),
+                    other => format!("{other:?}"),
+                };
+                return Err(StorageError::CreateIndexUnsupported(format!(
+                    "{ty} indexes (field {field:?}) are not supported by the Rust storage engine yet"
+                )));
+            }
+        }
+
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+
+        let c = session.open_cursor(IDX_TABLE, None)?;
+        c.set_key_sss(db, coll, name);
+        match c.search() {
+            Ok(()) => {
+                // Index exists: reject conflicting options, else no-op success.
+                let existing = decode_doc(&c.get_value_u()?)?;
+                let existing_opts = existing.get_document("options").ok();
+                for opt in CONFLICTING_OPTS {
+                    let in_new = options.contains_key(opt);
+                    let in_old = existing_opts.is_some_and(|o| o.contains_key(opt));
+                    if (in_new || in_old)
+                        && options.get(opt) != existing_opts.and_then(|o| o.get(opt))
+                    {
+                        return Err(StorageError::IndexOptionsConflict(format!(
+                            "Index with name '{name}' already exists with different options"
+                        )));
+                    }
+                }
+                return Ok(false);
+            }
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // One doc-table walk: detect multikey and build all entry keys.
+        let mut multikey = false;
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (id_k, blob) in self.scan_docs(&session, db, coll)? {
+            let d = decode_doc(&blob)?;
+            if !multikey && doc_makes_multikey(&d, key_spec) {
+                multikey = true;
+            }
+            for kb in index_key_variants(&d, key_spec)? {
+                entries.push((kb, id_k.clone()));
+            }
+        }
+
+        let mut stored_options = options.clone();
+        if multikey {
+            stored_options.insert("multikey", Bson::Boolean(true));
+        }
+        let mut payload_doc = Document::new();
+        payload_doc.insert("key", Bson::Document(key_spec.clone()));
+        payload_doc.insert("options", Bson::Document(stored_options));
+        let payload = encode_doc(&payload_doc)?;
+
+        c.reset()?;
+        c.set_key_sss(db, coll, name);
+        c.set_value_u(&payload);
+        c.insert()?;
+
+        let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (kb, id_k) in &entries {
+            let packed = pack_entry(kb, id_k);
+            ec.reset()?;
+            ec.set_key_sssu(db, coll, name, &packed);
+            ec.set_value_u(b"");
+            ec.insert()?;
+        }
+        Ok(true)
+    }
+
+    /// All indexes on `(db, coll)` in MongoDB's `listIndexes` shape (the virtual
+    /// `_id_` index first, then stored indexes), sorted by name. Empty when the
+    /// collection doesn't exist. Mirrors `storage.list_indexes`.
+    pub fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        if !collection_registered(&session, db, coll)? {
+            return Ok(Vec::new());
+        }
+        let mut id_key_spec = Document::new();
+        id_key_spec.insert("_id", 1i32);
+        let mut id_idx = Document::new();
+        id_idx.insert("v", 2i32);
+        id_idx.insert("key", Bson::Document(id_key_spec));
+        id_idx.insert("name", ID_INDEX_NAME.to_string());
+        let mut out: Vec<Document> = vec![id_idx];
+        for (name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
+            let mut e = Document::new();
+            e.insert("v", 2i32);
+            e.insert("key", Bson::Document(key_spec));
+            e.insert("name", name);
+            for (k, v) in &opts {
+                e.insert(k.clone(), v.clone());
+            }
+            out.push(e);
+        }
+        out.sort_by(|a, b| {
+            a.get_str("name")
+                .unwrap_or("")
+                .cmp(b.get_str("name").unwrap_or(""))
+        });
+        Ok(out)
+    }
+
+    /// Drop the index named `name` (and all its entries). Returns `false` if no
+    /// such index, or `name == "_id_"`. Mirrors `storage.drop_index`.
+    pub fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        if name == ID_INDEX_NAME {
+            return Ok(false);
+        }
+        let session = self.conn.open_session()?;
+        let c = session.open_cursor(IDX_TABLE, None)?;
+        c.set_key_sss(db, coll, name);
+        match c.search() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        c.remove()?;
+        self.delete_entries_prefix(&session, db, coll, name)?;
+        Ok(true)
+    }
+
+    /// Drop every (non-`_id_`) index on `(db, coll)`. Returns how many were
+    /// dropped. Mirrors `storage.drop_all_indexes` (used by drop-collection).
+    pub fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let names: Vec<String> = self
+            .iter_indexes(&session, db, coll)?
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        for name in &names {
+            let c = session.open_cursor(IDX_TABLE, None)?;
+            c.set_key_sss(db, coll, name);
+            if c.search().is_ok() {
+                c.remove()?;
+            }
+            self.delete_entries_prefix(&session, db, coll, name)?;
+        }
+        Ok(names.len())
+    }
+
+    /// Walk the registry for `(db, coll)`: `(name, key_spec, options)` per index.
+    fn iter_indexes(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(String, Document, Document)>> {
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        let mut out = Vec::new();
+        cur.set_key_sss(db, coll, "");
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, name) = cur.get_key_sss()?;
+            if d != db || c != coll {
+                break;
+            }
+            let payload = decode_doc(&cur.get_value_u()?)?;
+            let key_spec = payload.get_document("key").cloned().unwrap_or_default();
+            let opts = payload.get_document("options").cloned().unwrap_or_default();
+            out.push((name, key_spec, opts));
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// `(name, key_spec)` for every stored index — what the entry-maintenance
+    /// paths need.
+    fn collection_indexes(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(String, Document)>> {
+        Ok(self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .map(|(n, k, _)| (n, k))
+            .collect())
+    }
+
+    /// `(id_key, doc_bytes)` for every document in `(db, coll)`, natural order.
+    fn scan_docs(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cur = session.open_cursor(DOC_TABLE, None)?;
+        let mut out = Vec::new();
+        cur.set_key_ssu(db, coll, b"");
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, idk) = cur.get_key_ssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            out.push((idk, cur.get_value_u()?));
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Write `doc`'s index entries for every index in `indexes`.
+    fn write_index_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        doc: &Document,
+        indexes: &[(String, Document)],
+    ) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let id = doc
+            .get("_id")
+            .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
+        let id_k = id_key(id)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (name, key_spec) in indexes {
+            for kb in index_key_variants(doc, key_spec)? {
+                let packed = pack_entry(&kb, &id_k);
+                cur.reset()?;
+                cur.set_key_sssu(db, coll, name, &packed);
+                cur.set_value_u(b"");
+                cur.insert()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove `doc`'s index entries for every index in `indexes` (recomputes the
+    /// same packed keys `write_index_entries` produced).
+    fn delete_index_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        doc: &Document,
+        indexes: &[(String, Document)],
+    ) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let id = doc
+            .get("_id")
+            .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
+        let id_k = id_key(id)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (name, key_spec) in indexes {
+            for kb in index_key_variants(doc, key_spec)? {
+                let packed = pack_entry(&kb, &id_k);
+                cur.reset()?;
+                cur.set_key_sssu(db, coll, name, &packed);
+                match cur.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete all entries for one index (its `(db, coll, name)` prefix).
+    fn delete_entries_prefix(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<()> {
+        let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        scan.set_key_sssu(db, coll, name, b"");
+        let mut packs: Vec<Vec<u8>> = Vec::new();
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, n, packed) = scan.get_key_sssu()?;
+            if d != db || c != coll || n != name {
+                break;
+            }
+            packs.push(packed);
+            more = scan.next()?;
+        }
+        let del = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for p in &packs {
+            del.reset()?;
+            del.set_key_sssu(db, coll, name, p);
+            match del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Introspection: the entries of index `name` as `(escaped_kb, id_key)`
+    /// pairs in WiredTiger (sorted) order. Primarily for tests and explain-style
+    /// inspection; the lookup paths in later slices read entries directly.
+    pub fn index_entries(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        scan.set_key_sssu(db, coll, name, b"");
+        let mut out = Vec::new();
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, n, packed) = scan.get_key_sssu()?;
+            if d != db || c != coll || n != name {
+                break;
+            }
+            let (kb, idk) = unpack_entry(&packed);
+            out.push((kb.to_vec(), idk.to_vec()));
+            more = scan.next()?;
+        }
+        Ok(out)
+    }
+}
+
+/// True if `(db, coll)` is registered in the collections table.
+fn collection_registered(session: &Session, db: &str, coll: &str) -> Result<bool> {
+    let cur = session.open_cursor(COLL_TABLE, None)?;
+    cur.set_key_ss(db, coll);
+    match cur.search() {
+        Ok(()) => Ok(true),
+        Err(e) if e.is_not_found() => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Register `(db, coll)` in the collections table if not already present.
@@ -318,4 +929,129 @@ fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
 /// An empty options document (`{}`) as BSON bytes — the collections-table value.
 fn empty_options() -> Vec<u8> {
     encode_doc(&Document::new()).expect("encoding an empty document cannot fail")
+}
+
+#[cfg(test)]
+mod tests {
+    //! Byte-exact unit tests for the pure index-key functions. These pin the
+    //! on-disk entry layout to the Python reference (`storage._pack_entry` /
+    //! `_index_key_variants`) so a future `SECANTUS_ENGINE=rust` run of
+    //! `test_indexes.py` sees identical bytes. No WiredTiger needed.
+    use super::*;
+    use bson::doc;
+
+    /// Ascending sort-key bytes for a value (what an ASC single-field entry's
+    /// `kb` is).
+    fn ev(b: &Bson) -> Vec<u8> {
+        sortkey::encode_value(b, None).unwrap()
+    }
+
+    #[test]
+    fn escape_kb_doubles_zero_bytes() {
+        assert_eq!(escape_kb(b"\x01\x00\x02"), vec![0x01, 0x00, 0xff, 0x02]);
+        assert_eq!(escape_kb(b"abc"), b"abc".to_vec());
+        assert_eq!(escape_kb(b"\x00\x00"), vec![0x00, 0xff, 0x00, 0xff]);
+    }
+
+    #[test]
+    fn pack_entry_layout_and_unpack_roundtrip() {
+        let (kb, id) = (b"\x01\x00\x02".as_slice(), b"ID".as_slice());
+        let packed = pack_entry(kb, id);
+        assert_eq!(packed, vec![0x01, 0x00, 0xff, 0x02, 0x00, 0x00, b'I', b'D']);
+        let (esc_kb, idk) = unpack_entry(&packed);
+        assert_eq!(esc_kb, escape_kb(kb).as_slice());
+        assert_eq!(idk, id);
+    }
+
+    #[test]
+    fn unpack_splits_on_first_separator() {
+        // The id_key half may itself contain `\x00\x00`; the split must land at
+        // the FIRST separator — correct because the escaped kb half can't
+        // contain a bare `\x00\x00`.
+        let (kb, id) = (b"\x00".as_slice(), b"\x00\x00tail".as_slice());
+        let packed = pack_entry(kb, id);
+        let (esc_kb, idk) = unpack_entry(&packed);
+        assert_eq!(esc_kb, vec![0x00, 0xff].as_slice());
+        assert_eq!(idk, id);
+    }
+
+    #[test]
+    fn compound_join_inserts_separator() {
+        assert_eq!(compound_join(&[vec![1, 2], vec![3]]), vec![1, 2, 0, 0, 3]);
+        assert_eq!(compound_join(&[vec![9]]), vec![9]);
+    }
+
+    #[test]
+    fn direction_of_numeric_only() {
+        assert_eq!(direction_of(&Bson::Int32(1)), Some(1));
+        assert_eq!(direction_of(&Bson::Int32(-1)), Some(-1));
+        assert_eq!(direction_of(&Bson::Int64(-1)), Some(-1));
+        assert_eq!(direction_of(&Bson::Double(1.0)), Some(1));
+        assert_eq!(direction_of(&Bson::String("2dsphere".into())), None);
+    }
+
+    #[test]
+    fn doc_makes_multikey_detects_arrays() {
+        let ks = doc! {"tags": 1};
+        assert!(doc_makes_multikey(&doc! {"tags": ["a", "b"]}, &ks));
+        assert!(!doc_makes_multikey(&doc! {"tags": "a"}, &ks));
+        assert!(!doc_makes_multikey(&doc! {"other": 1}, &ks));
+    }
+
+    #[test]
+    fn variants_single_scalar_ascending() {
+        let v = index_key_variants(&doc! {"_id": 1, "a": 5i32}, &doc! {"a": 1}).unwrap();
+        assert_eq!(v, vec![ev(&Bson::Int32(5))]);
+    }
+
+    #[test]
+    fn variants_single_descending_inverts() {
+        let v = index_key_variants(&doc! {"a": 5i32}, &doc! {"a": -1}).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], sortkey::invert_bytes(&ev(&Bson::Int32(5))));
+        assert_ne!(v[0], ev(&Bson::Int32(5)));
+    }
+
+    #[test]
+    fn variants_missing_field_is_null() {
+        let v = index_key_variants(&doc! {"_id": 1}, &doc! {"a": 1}).unwrap();
+        assert_eq!(v, vec![ev(&Bson::Null)]);
+    }
+
+    #[test]
+    fn variants_array_multikey_per_element_plus_whole() {
+        let d = doc! {"tags": ["py", "go", "py"]};
+        let v = index_key_variants(&d, &doc! {"tags": 1}).unwrap();
+        // "py" deduped: element keys py, go, plus the whole-array key = 3.
+        assert_eq!(v.len(), 3);
+        assert!(v.contains(&ev(&Bson::String("py".into()))));
+        assert!(v.contains(&ev(&Bson::String("go".into()))));
+        let whole = ev(&Bson::Array(vec![
+            Bson::String("py".into()),
+            Bson::String("go".into()),
+            Bson::String("py".into()),
+        ]));
+        assert!(v.contains(&whole));
+    }
+
+    #[test]
+    fn variants_compound_joins_parts() {
+        let v = index_key_variants(&doc! {"a": 1i32, "b": 2i32}, &doc! {"a": 1, "b": 1}).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(
+            v[0],
+            compound_join(&[ev(&Bson::Int32(1)), ev(&Bson::Int32(2))])
+        );
+    }
+
+    #[test]
+    fn variants_compound_array_cartesian_product() {
+        // a = [1, 2] (array), b = 9: products (1,9), (2,9), plus the whole-array
+        // (([1,2]),9) combo = 3 distinct compound keys.
+        let d = doc! {"a": [1i32, 2i32], "b": 9i32};
+        let v = index_key_variants(&d, &doc! {"a": 1, "b": 1}).unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v.contains(&compound_join(&[ev(&Bson::Int32(1)), ev(&Bson::Int32(9))])));
+        assert!(v.contains(&compound_join(&[ev(&Bson::Int32(2)), ev(&Bson::Int32(9))])));
+    }
 }

@@ -37,3 +37,10 @@ mod group;
 mod numeric;
 mod order;
 mod paths;
+
+// Re-export the read-only dotted-path helpers (only) so the Rust storage layer's
+// index-key builders can resolve `key_spec` fields against documents, mirroring
+// how `secantus.storage` imports from `secantus.paths`. The module itself stays
+// private — its `set_path` / `unset_path` use deliberate `Result<_, ()>` "defer"
+// signals that shouldn't become public API (clippy::result_unit_err).
+pub use paths::{get_path, has_path};

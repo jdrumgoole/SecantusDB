@@ -58,7 +58,27 @@ build-out.
      leaving callers to keep temporaries alive.
 2. **Indexes** — `secantus_indexes` + `secantus_index_entries` + the planner
    (`find_matching` / `explain_plan` / all pickers; single / compound / multikey /
-   partial / TTL). Gate: `test_indexes.py`.
+   partial / TTL). Gate: `test_indexes.py`. **Sliced** (2a → 2f):
+   - **2a ✅ DONE (this slice)** — the registry + `create_index` / `list_indexes`
+     / `drop_index` / `drop_all_indexes`, and index-entry maintenance on
+     insert / replace / delete. Byte-faithful entry packing (`escape_kb` /
+     `pack_entry` / `unpack_entry`), the `index_key_variants` builder (scalar /
+     descending-inverted / multikey per-element + whole-array / compound
+     cartesian product), and create-time multikey-flag detection. Geo / text /
+     hashed rejected (`CreateIndexUnsupported`); re-create-with-conflicting-opts
+     rejected. Pinned by byte-exact unit tests (`crates/secantus-storage/src/
+     lib.rs` `#[cfg(test)]`) + WiredTiger-backed integration tests
+     (`crates/secantus-storage/tests/indexes.rs`). Added `secantus-wt`
+     `get_key_sss` / `get_key_sssu` getters and a `secantus_core::{get_path,
+     has_path}` re-export. **Deferred from 2a:** lazy multikey-flag marking on
+     insert/update (2d); sparse / partial entry-gating, unique enforcement, TTL,
+     collation (2e).
+   - **2b** — single-field equality / `$in` / range lookup routing + `_id` point
+     lookups + `explain` IXSCAN/COLLSCAN.
+   - **2c** — compound eq-prefix + trailing-operator + mixed-direction lookups.
+   - **2d** — multikey flag (lazy marking) + its sort-acceleration exclusions.
+   - **2e** — partial + TTL + unique enforcement + collation.
+   - **2f** — sort acceleration (single + compound) + `hint`.
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
    Gate: `test_geo_index.py`.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
