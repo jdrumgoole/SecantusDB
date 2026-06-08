@@ -266,12 +266,13 @@ never "remove Python."
   `_secantus_storage` extension is built INTO the `secantus` wheel by the main
   wheel's CMake, against the WiredTiger that wheel already builds, gated behind the
   `SECANTUS_BUILD_STORAGE_ENGINE` CMake option (default **OFF** — wheel unchanged,
-  no Rust/clang needed when off). The `storage-engine` job in `test.yml` validates
-  the flag-on build + import + smoke on **Linux**. Still to do: **macOS / Windows
-  flag-on builds** (the crate's WT link flags `pthread`/`rt`/`dl` are POSIX-shaped
-  — need `cfg`-gating for those targets), and — only once engine-selection makes
-  the Rust storage engine selectable — flipping the flag on in the shipping
-  `wheels.yml` / cibuildwheel matrix.
+  no Rust/clang needed when off). The `storage-engine` job in `test.yml` is a 3-OS
+  matrix (Linux / macOS / Windows) validating the flag-on build + import + smoke;
+  the WT system-link flags are cfg-gated per target OS in `secantus-wt/build.rs`
+  (Linux `pthread`+`rt`+`dl`; macOS `pthread`+`dl`; Windows none). Remaining: only
+  once engine-selection makes the Rust storage engine selectable, flip the flag on
+  in the shipping `wheels.yml` / cibuildwheel matrix (and add the abi3 storage
+  extension to the wheel's repair/tag handling there).
 - [ ] **Toward a standalone Rust package (continued).** With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to

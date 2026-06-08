@@ -180,19 +180,40 @@ jobs:
   # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
   # extension links the SAME bundled WiredTiger this wheel already builds and
   # ships inside it. Proves the "bundle behind a build flag" packaging end to end
-  # on Linux. The DEFAULT wheel build (flag OFF, no Rust/clang needed) is covered
-  # by the `test` matrix and wheels.yml. macOS / Windows flag-on builds are a
-  # follow-up — the storage crate's WiredTiger link flags (pthread/rt/dl) are
-  # POSIX-shaped today (see tasks/backlog.md).
+  # across Linux / macOS / Windows. The DEFAULT wheel build (flag OFF, no
+  # Rust/clang needed) is covered by the `test` matrix and wheels.yml.
   storage-engine:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive  # vendor/wiredtiger is needed by the build
 
-      - name: Install build toolchain (swig + clang/libclang for bindgen + ninja)
+      # bindgen needs libclang; the WT ExternalProject forces the Ninja
+      # generator; swig builds WT's (unused-here but configured) Python module.
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        # clang/libclang come from the Xcode command line tools already on the
+        # runner; just add swig + ninja.
+        run: brew install swig ninja
+
+      - name: Install toolchain (Windows)
+        if: runner.os == 'Windows'
+        run: choco install -y swig ninja llvm
+
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        # clang-sys doesn't always find choco's LLVM on PATH within the same job;
+        # pin it explicitly for the build step below.
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -217,11 +238,14 @@ jobs:
       - name: Assert the extension is bundled in the wheel
         # importorskip in the smoke test would silently pass if the extension
         # were missing — the whole point here is that it's PRESENT, so fail hard.
+        # bash on all three OSes (git-bash on Windows) for the glob expansion.
+        shell: bash
         run: >-
           uv run --no-project --with "$(ls dist-storage/*.whl)"
           python -c "import _secantus_storage; print('bundled OK:', _secantus_storage.__file__)"
 
       - name: Storage extension smoke test
+        shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest
           --with "$(ls dist-storage/*.whl)"

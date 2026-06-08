@@ -111,12 +111,15 @@ libclang from the environment), renames the cdylib to the platform Python-
 extension filename, and `install(... DESTINATION .)`s it at the wheel root so
 `import _secantus_storage` resolves.
 
-**CI.** The `storage-engine` job in `.github/workflows/test.yml` builds the
-`secantus` wheel with `SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON` on
-Linux, asserts `_secantus_storage` is bundled (hard failure if missing), and runs
-`tests/test_rust_storage_smoke.py` against the installed wheel. macOS / Windows
-flag-on builds are a follow-up — the storage crate's WiredTiger link flags
-(`pthread`/`rt`/`dl`) are POSIX-shaped today.
+**CI.** The `storage-engine` job in `.github/workflows/test.yml` is a 3-OS matrix
+(Linux / macOS / Windows): each builds the `secantus` wheel with
+`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON`, asserts
+`_secantus_storage` is bundled (hard failure if missing), and runs
+`tests/test_rust_storage_smoke.py` against the installed wheel. The storage
+crate's WiredTiger system-link flags are cfg-gated per target OS in
+`crates/secantus-wt/build.rs` (Linux `pthread`+`rt`+`dl`; macOS `pthread`+`dl`,
+no `librt`; Windows none beyond the MSVC defaults), mirroring what WT's own CMake
+detects.
 
 `secantus-wt` / `secantus-storage` stay excluded from the `crates/Cargo.toml`
 workspace so the green `secantus-core` / `secantus-core-py` build and the `rust` /
