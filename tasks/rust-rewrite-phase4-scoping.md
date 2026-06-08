@@ -195,10 +195,26 @@ build-out.
      find-seq-for-ts). **Deferred:** the change-stream condvar / tailable-wait
      primitive — it only matters once a tailable cursor exists (server layer) and
      needs `Storage: Sync` + multithreaded tests; lands with that consumer.
-   - **3e** — change-stream event projection (port `changestreams.py` `project()`:
-     resume tokens, `fullDocument` modes, `invalidate`).
-   - Then: re-home `$lookup` / `$geoNear` pipeline acceleration onto the Rust
-     storage.
+   - **3e ✅ DONE** — change-stream event projection (`crates/secantus-storage/src/
+     changestreams.rs`, a faithful port of `changestreams.py`): resume tokens
+     (`{_data: hex}` over `{s,t,n,k}`, `make`/`parse`), `Scope`
+     (cluster/db/coll) filtering, `project()` mapping insert/update/replace/
+     delete/drop/dropDatabase/rename/createIndexes/dropIndexes (+
+     `showExpandedEvents` gating) with `clusterTime`/`wallTime`/`ns`/
+     `documentKey`, `updateDescription` (diff vs full-doc → update vs replace),
+     `fullDocument` (incl. `updateLookup` re-fetch via `find_matching`),
+     `fullDocumentBeforeChange` (via `read_preimage`; `required` → code-280
+     `ChangeStreamFatal`), `invalidate_event`, and `stamp_split_event` (16 MB
+     fragment envelope). New `tests/changestreams.rs` (11). The noop heartbeat
+     projects to nothing (advances position only).
+   - Then (follow-on): re-home `$lookup` / `$geoNear` pipeline acceleration onto
+     the Rust storage, and the tailable-cursor / server cutover.
+
+   **Sub-phase 3 complete.** The oplog / change-stream *storage* layer is done —
+   emission (i/u/d), `ui` + pre-images, cluster time, retention, heartbeats,
+   recovery, and event projection — 91 storage tests, `clippy -D warnings` +
+   `fmt` clean. Deferred within the phase: the operator-update diff path (needs a
+   future `update_*` storage method) and the tailable-wait condvar (server layer).
 
 ## PyO3 exposure (done) — `crates/secantus-storage-py`
 

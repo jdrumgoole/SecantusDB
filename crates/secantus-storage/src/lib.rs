@@ -29,6 +29,8 @@ use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
+pub mod changestreams;
+
 const COLL_TABLE: &str = "table:secantus_collections";
 const DOC_TABLE: &str = "table:secantus_documents";
 const IDX_TABLE: &str = "table:secantus_indexes";
@@ -175,6 +177,9 @@ pub enum StorageError {
     /// A `hint` did not resolve to an existing index (command layer maps this to
     /// a mongod `BadValue`).
     BadHint(String),
+    /// A `fullDocument` / `fullDocumentBeforeChange: "required"` change-stream
+    /// lookup missed (mongod code 280, `ChangeStreamFatalError`).
+    ChangeStreamFatal(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -196,6 +201,7 @@ impl std::fmt::Display for StorageError {
                 write!(f, "query construct not supported by the Rust query engine")
             }
             StorageError::BadHint(m) => write!(f, "{m}"),
+            StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
         }
     }
 }
