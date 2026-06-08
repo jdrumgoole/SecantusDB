@@ -61,8 +61,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_LIB");
     println!("cargo:rustc-link-search=native={lib}");
     println!("cargo:rustc-link-lib=static=wiredtiger");
-    // WiredTiger's own dependencies (from wiredtiger.pc Libs.private).
-    for l in ["pthread", "rt", "dl"] {
+    // WiredTiger's own system dependencies, per target OS. Mirrors the libs WT's
+    // CMake detects and links (cmake/configs/auto.cmake `config_lib` +
+    // per-OS config.cmake):
+    //   - Linux:   pthread + rt + dl  (all three resolved by find_library)
+    //   - macOS:   pthread + dl        (no librt on Darwin; pthread/dl are stubs
+    //                                   in libSystem, so the links are harmless)
+    //   - Windows: none beyond the MSVC default libs — WT's win port (WT_POSIX
+    //              OFF) uses Win32 APIs the CRT's default-lib directives pull in.
+    // CARGO_CFG_TARGET_OS is set by cargo to the *target* OS (correct under
+    // cross-compilation too), unlike a host-evaluated cfg!.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let sys_libs: &[&str] = match target_os.as_str() {
+        "linux" => &["pthread", "rt", "dl"],
+        "macos" => &["pthread", "dl"],
+        "windows" => &[],
+        // Other POSIX targets (the BSDs etc.): pthread is the safe baseline.
+        _ => &["pthread"],
+    };
+    for l in sys_libs {
         println!("cargo:rustc-link-lib=dylib={l}");
     }
 
