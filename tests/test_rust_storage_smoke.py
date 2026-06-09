@@ -185,7 +185,7 @@ def test_wait_for_oplog_surface(tmp_path):
     captured = st.oplog_tail_seq()
     result = {}
 
-    def wait():
+    def wait(st=st, captured=captured, result=result):
         result["tail"] = st.wait_for_oplog(captured, 10_000)
 
     w = threading.Thread(target=wait)
