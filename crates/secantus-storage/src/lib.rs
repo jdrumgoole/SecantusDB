@@ -28,9 +28,11 @@ use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use s2::rect::Rect;
 use s2::region::RegionCoverer;
+use secantus_core::diff::compute_update_description;
 use secantus_core::get_path;
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
+use secantus_core::update::apply_update;
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
 pub mod changestreams;
@@ -83,6 +85,18 @@ pub enum ExplainPlan {
         key_pattern: Document,
         direction: String,
     },
+}
+
+/// The result of an `update_matching` call (mirrors the `{matched, modified,
+/// upserted_id}` dict `storage.update_matching` returns).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateOutcome {
+    /// Documents that matched the filter (regardless of whether they changed).
+    pub matched: usize,
+    /// Documents actually rewritten (matched *and* the update changed them).
+    pub modified: usize,
+    /// The `_id` inserted by an `upsert` when nothing matched, else `None`.
+    pub upserted_id: Option<Bson>,
 }
 
 /// A stored index, with the options the write / lookup paths care about,
@@ -2647,6 +2661,286 @@ impl Storage {
             }
         }
         Ok(out.into_iter().map(|(_, b)| b).collect())
+    }
+
+    /// Candidate `(id_key, blob)` pairs for `filter`: index-routed (deduped) when
+    /// the filter is covered by an index, else a full natural-order collection
+    /// scan. Always fully materialised — the doc-table writes that
+    /// `update_matching` / `delete_matching` perform during the loop would
+    /// invalidate a still-walking scan cursor on the same session.
+    fn candidate_docs(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if filter.is_empty() {
+            return self.scan_docs(session, db, coll);
+        }
+        if let Some(id_keys) = self.try_index_id_keys(session, db, coll, filter)? {
+            let cur = session.open_cursor(DOC_TABLE, None)?;
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut out = Vec::new();
+            for id_k in id_keys {
+                if !seen.insert(id_k.clone()) {
+                    continue;
+                }
+                cur.reset()?;
+                cur.set_key_ssu(db, coll, &id_k);
+                match cur.search() {
+                    Ok(()) => out.push((id_k, cur.get_value_u()?)),
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(out)
+        } else {
+            self.scan_docs(session, db, coll)
+        }
+    }
+
+    /// Count documents matching `filter` (the whole collection when empty).
+    /// Mirrors `storage.count_matching` (base form — `let` / `collation` route
+    /// to Python at the engine-selection layer).
+    pub fn count_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<usize> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        if filter.is_empty() {
+            return Ok(self.scan_docs(&session, db, coll)?.len());
+        }
+        let vars = Document::new();
+        let mut n = 0usize;
+        for (_id_k, blob) in self.candidate_docs(&session, db, coll, filter)? {
+            let d = decode_doc(&blob)?;
+            if query_matches(&d, filter, &vars, None).map_err(|_| StorageError::QueryUnsupported)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Apply `update` to documents matching `filter`. `multi` updates every
+    /// match (else just the first); `upsert` inserts a seeded document when
+    /// nothing matches. Operator-style updates emit a `$v:2` diff oplog entry,
+    /// replacement-style updates emit the full new doc; index entries, multikey
+    /// flags, unique enforcement and pre-images are all maintained. Mirrors
+    /// `storage.update_matching` (base form — `array_filters` / positional
+    /// operators / `let` / `collation` / `validator` / capped collections route
+    /// to Python at the engine-selection layer).
+    pub fn update_matching(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        update: &Document,
+        multi: bool,
+        upsert: bool,
+    ) -> Result<UpdateOutcome> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        let ns = format!("{db}.{coll}");
+        let descs = self.index_descs(&session, db, coll)?;
+        let oplog_on = self.enable_oplog;
+        let preimages_on = oplog_on && pre_post_images_enabled(&session, db, coll)?;
+        let ui = if oplog_on {
+            Some(collection_uuid(&session, db, coll)?)
+        } else {
+            None
+        };
+        let is_replacement = !update.keys().any(|k| k.starts_with('$'));
+
+        let mut matched = 0usize;
+        let mut modified = 0usize;
+        let mut oplog_entries: Vec<Document> = Vec::new();
+        let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+
+        let vars = Document::new();
+        let candidates = self.candidate_docs(&session, db, coll, filter)?;
+        for (id_k, blob) in candidates {
+            let doc = decode_doc(&blob)?;
+            if !query_matches(&doc, filter, &vars, None)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                continue;
+            }
+            matched += 1;
+            let new =
+                apply_update(&doc, update, false).map_err(|_| StorageError::QueryUnsupported)?;
+            if new != doc {
+                if let Some(c) =
+                    self.unique_conflict(&session, db, coll, &new, &descs, Some(&id_k))?
+                {
+                    return Err(StorageError::DuplicateKey(Box::new(c)));
+                }
+                modified += 1;
+                let new_blob = encode_doc(&new)?;
+                self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+                let cur = session.open_cursor(DOC_TABLE, None)?;
+                cur.set_key_ssu(db, coll, &id_k);
+                cur.set_value_u(&new_blob);
+                cur.update()?;
+                self.write_index_entries(&session, db, coll, &new, &descs)?;
+                self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
+                if oplog_on {
+                    let o_field = if is_replacement {
+                        Bson::Document(new.clone())
+                    } else {
+                        let mut o = Document::new();
+                        o.insert("$v", 2i32);
+                        o.insert(
+                            "diff",
+                            Bson::Document(
+                                compute_update_description(&doc, &new)
+                                    .map_err(|_| StorageError::QueryUnsupported)?,
+                            ),
+                        );
+                        Bson::Document(o)
+                    };
+                    let mut o2 = Document::new();
+                    o2.insert("_id", doc.get("_id").cloned().unwrap_or(Bson::Null));
+                    let mut entry = Document::new();
+                    entry.insert("op", "u");
+                    entry.insert("ns", ns.clone());
+                    entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
+                    entry.insert("o", o_field);
+                    entry.insert("o2", Bson::Document(o2));
+                    oplog_entries.push(entry);
+                    pre_images.push(if preimages_on {
+                        Some(encode_doc(&doc)?)
+                    } else {
+                        None
+                    });
+                }
+            }
+            if !multi {
+                break;
+            }
+        }
+
+        let mut upserted_id: Option<Bson> = None;
+        if matched == 0 && upsert {
+            // Seed from the filter's bare-equality fields, then apply the update.
+            let mut seed = Document::new();
+            for (k, v) in filter {
+                if !k.starts_with('$') && !matches!(v, Bson::Document(_)) {
+                    seed.insert(k.clone(), v.clone());
+                }
+            }
+            let mut new =
+                apply_update(&seed, update, true).map_err(|_| StorageError::QueryUnsupported)?;
+            if !new.contains_key("_id") {
+                new.insert("_id", Bson::ObjectId(ObjectId::new()));
+            }
+            let id = new.get("_id").cloned().unwrap();
+            if let Some(c) = self.unique_conflict(&session, db, coll, &new, &descs, None)? {
+                return Err(StorageError::DuplicateKey(Box::new(c)));
+            }
+            let new_id_key = id_key(&id)?;
+            let new_blob = encode_doc(&new)?;
+            let cur = session.open_cursor(DOC_TABLE, None)?;
+            cur.set_key_ssu(db, coll, &new_id_key);
+            cur.set_value_u(&new_blob);
+            cur.insert()?;
+            self.write_index_entries(&session, db, coll, &new, &descs)?;
+            self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
+            if oplog_on {
+                let mut o2 = Document::new();
+                o2.insert("_id", id.clone());
+                let mut entry = Document::new();
+                entry.insert("op", "i");
+                entry.insert("ns", ns.clone());
+                entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
+                entry.insert("o", Bson::Document(new.clone()));
+                entry.insert("o2", Bson::Document(o2));
+                oplog_entries.push(entry);
+                pre_images.push(None);
+            }
+            upserted_id = Some(id);
+        }
+
+        if oplog_on && !oplog_entries.is_empty() {
+            self.emit_oplog(&session, oplog_entries, pre_images)?;
+        }
+        Ok(UpdateOutcome {
+            matched,
+            modified,
+            upserted_id,
+        })
+    }
+
+    /// Delete documents matching `filter`, returning how many were removed.
+    /// `limit > 0` caps the number deleted (1 for `deleteOne`; 0 = all matches).
+    /// Maintains index entries and emits op `"d"` oplog entries (+ pre-images
+    /// when enabled). Mirrors `storage.delete_matching` (base form — `let` /
+    /// `collation` route to Python at the engine-selection layer).
+    pub fn delete_matching(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+    ) -> Result<usize> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let descs = self.index_descs(&session, db, coll)?;
+        let oplog_on = self.enable_oplog;
+        let preimages_on = oplog_on && pre_post_images_enabled(&session, db, coll)?;
+        let ui = if oplog_on && coll_options(&session, db, coll)?.is_some() {
+            Some(collection_uuid(&session, db, coll)?)
+        } else {
+            None
+        };
+        let ns = if oplog_on {
+            format!("{db}.{coll}")
+        } else {
+            String::new()
+        };
+
+        let mut deleted = 0usize;
+        let mut oplog_entries: Vec<Document> = Vec::new();
+        let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        let vars = Document::new();
+        let candidates = self.candidate_docs(&session, db, coll, filter)?;
+        for (id_k, blob) in candidates {
+            let doc = decode_doc(&blob)?;
+            if !query_matches(&doc, filter, &vars, None)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                continue;
+            }
+            self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+            let cur = session.open_cursor(DOC_TABLE, None)?;
+            cur.set_key_ssu(db, coll, &id_k);
+            cur.remove()?;
+            deleted += 1;
+            if oplog_on {
+                let mut o = Document::new();
+                o.insert("_id", doc.get("_id").cloned().unwrap_or(Bson::Null));
+                let mut entry = Document::new();
+                entry.insert("op", "d");
+                entry.insert("ns", ns.clone());
+                if let Some(u) = &ui {
+                    entry.insert("ui", uuid_binary(u));
+                }
+                entry.insert("o", Bson::Document(o.clone()));
+                entry.insert("o2", Bson::Document(o));
+                oplog_entries.push(entry);
+                pre_images.push(if preimages_on {
+                    Some(encode_doc(&doc)?)
+                } else {
+                    None
+                });
+            }
+            if limit > 0 && deleted >= limit {
+                break;
+            }
+        }
+        if oplog_on && !oplog_entries.is_empty() {
+            self.emit_oplog(&session, oplog_entries, pre_images)?;
+        }
+        Ok(deleted)
     }
 
     /// The plan `find_matching` would use for `filter` (no execution).
