@@ -193,3 +193,24 @@ def test_users_roles_profile_surface(tmp_path):
     st.ensure_profile_collection("app", 4096)
     assert st.collection_is_capped("app", "system.profile")
     del st
+
+
+def test_batch_insert_surface(tmp_path):
+    """Batch insert: ordered/unordered, write-errors, auto-_id."""
+    st = ss.RustStorage(str(tmp_path))
+    # all succeed; missing _id auto-assigned
+    inserted, errors = st.insert("app", "c", [bson.encode({"x": 1}), bson.encode({"x": 2})])
+    assert inserted == 2 and errors == []
+    # unordered continues past a duplicate _id, collecting one write-error
+    st.insert_one("app", "c", bson.encode({"_id": 7}))
+    inserted, errors = st.insert(
+        "app",
+        "c",
+        [bson.encode({"_id": 7}), bson.encode({"_id": 8})],
+        ordered=False,
+    )
+    assert inserted == 1
+    assert len(errors) == 1
+    err = bson.decode(errors[0])
+    assert err["index"] == 0 and err["code"] == 11000
+    del st

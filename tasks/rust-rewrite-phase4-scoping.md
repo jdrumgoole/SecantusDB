@@ -340,10 +340,20 @@ build-out.
        `ensure_profile_collection` (capped `<db>.system.profile`). Shared
        `put_/get_/drop_/list_ss_record` helpers. PyO3 bindings + 6 WT-backed tests
        (`tests/auth.rs`) + smoke coverage.
-     - **Remaining gaps:** batch `insert` (ordered + writeErrors + capped
-       eviction), `checkpoint` / `close` / `create_archive` /
-       `prune_ttl_all_collections`, `oplog_tail_seq_nolock`, the change-stream
-       condvar (`_oplog_cv` tailable-wait) + `_reset_thread_session`.
+     - **5e-gap-b ✅ DONE** — batch `insert` + `prune_ttl_all_collections`.
+       `insert(db, coll, docs, ordered) -> (inserted, errors)` loops the
+       `insert_one` internals (auto-`_id`, unique-conflict pre-check, dup-`_id`
+       detection, index entries, multikey, batched `op:"i"` oplog) collecting
+       mongod-shaped write-error docs (`{index, code, errmsg, keyPattern?,
+       keyValue?}`); `ordered` stops at the first error, else continues.
+       `prune_ttl_all_collections` walks every namespace and sums `prune_ttl`
+       (per-coll errors suppressed). PyO3 bindings + 7 WT-backed tests
+       (`tests/batch_insert.rs`) + smoke coverage. **Deferred (Rust has no capped
+       support):** capped-collection eviction within `insert`, and geo-index
+       validation on insert — tracked in the backlog.
+     - **Remaining gaps:** `checkpoint` / `close` / `create_archive`,
+       `oplog_tail_seq_nolock`, the change-stream condvar (`_oplog_cv`
+       tailable-wait) + `_reset_thread_session`.
      - **Then:** the `secantus.engine` storage-selection + a Python `Storage`
        adapter over `RustStorage` (BSON at the seam, `EngineFallback` → Python
        operators over Rust-scanned docs, E11000 / `BadHint` error translation),
