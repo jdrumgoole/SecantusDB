@@ -289,11 +289,22 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   / `rbac.py`. Pin against `test_auth.py` / `test_x509_auth.py` (tight suites).
   Uses the already-ported users/roles storage (5e-gap-a).
 
-- **R6 — Thin Python embed handle** (`crates/secantus-server-py`). The `#[pyclass]`
-  of §2: `start`/`stop`/`address`/`uri` + context manager, accept loop on a
-  GIL-released Rust thread. A Python wrapper in `secantus` exposes it with the
-  same constructor ergonomics so pytest can boot the Rust server in one or two
-  lines. This is the seam the conformance gate runs through.
+- **R6 ⚠️ WRITTEN, CI-VALIDATED-ONLY** — the thin Python embed handle
+  (`crates/secantus-server-py`, the `_secantus_server` extension). A
+  `#[pyclass] RustServer` whose constructor opens a WiredTiger
+  `secantus_storage::Storage`, wraps it in the R4b `StorageAdapter`, and
+  `secantus_server::bind`s it; exposes `address` / `uri` / `stop` + the
+  context-manager protocol. The accept loop runs on a GIL-released Rust thread
+  in-process; `pymongo` connects over TCP. Lifecycle only — no operators, no
+  Python in the request path. Mirrors `secantus-storage-py`'s build (own
+  `[workspace]`, `build.rs` macOS `dynamic_lookup`, `pyproject.toml` →
+  `maturin`); **links WiredTiger, so excluded from the clean workspace and NOT
+  built in this sandbox** — built by the wheel CMake under
+  `SECANTUS_BUILD_STORAGE_ENGINE` or local `maturin` with WT present. A pymongo
+  smoke test (`tests/test_rust_server_smoke.py`, `importorskip`'d) drives CRUD +
+  handshake against it — the **first pymongo → Rust → WiredTiger** test, the
+  embryonic R8 gate. **Still a Python wrapper in `secantus` for ergonomic parity
+  with `SecantusDBServer` is a follow-up.**
 
 - **R7 — Standalone `secantusdb` binary.** A `main` over the same crates for
   non-Python users. Mostly free once R1–R5 are library crates; adds CLI arg

@@ -1,0 +1,127 @@
+//! `_secantus_server` — R6: the thin embedded Python lifecycle handle over the
+//! Rust server.
+//!
+//! This is the *only* Python-facing surface of the Rust server: `start` (the
+//! constructor) / `stop` / `address` / `uri` + the context-manager protocol —
+//! lifecycle, **not** operators. The accept loop runs on a GIL-released Rust
+//! thread inside the Python process (spawned by `secantus_server::bind`), and a
+//! `pymongo` client connects over real TCP. Python is the launcher; it is never
+//! in the request path (cf. `tasks/rust-server-plan.md` §2).
+//!
+//! The constructor opens a WiredTiger-backed `secantus_storage::Storage`, wraps
+//! it in the `StorageAdapter` (R4b) to satisfy the command `Storage` trait, and
+//! binds the server. Because it links WiredTiger, this crate builds only where WT
+//! is available (the wheel's CMake / local maturin), never the WT-less `rust` CI.
+
+use std::sync::Arc;
+
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+
+use secantus_commands::{CursorRegistry, Storage as CmdStorage};
+use secantus_server::{bind, RunningServer, ServerConfig};
+use secantus_storage::Storage;
+use secantus_storage_adapter::StorageAdapter;
+
+/// An in-process handle to a running Rust SecantusDB server. Constructing it
+/// binds a socket and starts the accept loop; `stop()` (or `__exit__` / drop)
+/// shuts it down.
+#[pyclass(name = "RustServer")]
+struct RustServer {
+    running: Option<RunningServer>,
+    host: String,
+    port: u16,
+}
+
+#[pymethods]
+impl RustServer {
+    /// Open the database at `storage_path` and start the server.
+    ///
+    /// * `port` — `0` (default) lets the OS assign an ephemeral port; read it
+    ///   back from `address` / `uri`.
+    /// * `replica_set_name` — `Some` advertises the single-node `secantus`
+    ///   replica set in `hello` (so change streams are accepted); `None` is a
+    ///   plain standalone.
+    #[new]
+    #[pyo3(signature = (
+        storage_path,
+        port = 0,
+        host = "127.0.0.1".to_string(),
+        replica_set_name = None,
+        enable_oplog = true,
+    ))]
+    fn new(
+        storage_path: &str,
+        port: u16,
+        host: String,
+        replica_set_name: Option<String>,
+        enable_oplog: bool,
+    ) -> PyResult<Self> {
+        let mut storage = Storage::open(storage_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
+        storage.set_enable_oplog(enable_oplog);
+
+        let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(Arc::new(storage)));
+        let cursors = Arc::new(CursorRegistry::new());
+        let config = ServerConfig {
+            replica_set_name,
+            require_auth: false,
+        };
+        let addr = format!("{host}:{port}");
+        let running = bind(&addr, config, adapter, cursors)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to bind {addr}: {e}")))?;
+        let bound = running.address();
+        Ok(RustServer {
+            running: Some(running),
+            host: bound.ip().to_string(),
+            port: bound.port(),
+        })
+    }
+
+    /// The bound `(host, port)`.
+    #[getter]
+    fn address(&self) -> (String, u16) {
+        (self.host.clone(), self.port)
+    }
+
+    /// A `mongodb://host:port` connection URI.
+    #[getter]
+    fn uri(&self) -> String {
+        format!("mongodb://{}:{}", self.host, self.port)
+    }
+
+    /// Stop the server (idempotent). The GIL is released while the accept loop
+    /// is joined.
+    fn stop(&mut self, py: Python<'_>) {
+        if let Some(mut running) = self.running.take() {
+            py.allow_threads(|| running.stop());
+        }
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> bool {
+        self.stop(py);
+        false // don't suppress exceptions
+    }
+}
+
+#[pymodule]
+fn _secantus_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(
+        "__doc__",
+        "Embedded lifecycle handle for the SecantusDB Rust server: start / stop \
+         an in-process Rust server (WiredTiger-backed) that pymongo connects to \
+         over TCP. Python is only the launcher, never in the request path.",
+    )?;
+    m.add_class::<RustServer>()?;
+    Ok(())
+}

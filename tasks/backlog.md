@@ -172,9 +172,14 @@ non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projectio
   command trait's supertrait). Bytes at the seam, `Hint` from `RawHint`, full
   error translation in `map_err`.
 - [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
-- [ ] **R6 — embedded Python handle**: a thin PyO3 `#[pyclass]` over
-  `secantus_server::RunningServer` (`start`/`stop`/`address`), so `pymongo` can
-  connect in-process — the point the conformance gauge finally runs against Rust.
+- [~] **R6 — embedded Python handle** (`crates/secantus-server-py`, the
+  `_secantus_server` extension / `RustServer`): **written but unverified locally**
+  (links WT, excluded — built by the wheel CMake / local maturin only). Opens
+  storage → `StorageAdapter` → `bind`; `address`/`uri`/`stop` + context manager.
+  `tests/test_rust_server_smoke.py` (pymongo, importorskip) is the first
+  pymongo → Rust → WT test. **Follow-ups:** validate via CI / a WT machine; add a
+  Python `secantus`-package wrapper for `SecantusDBServer`-style ergonomics; an
+  `invoke rust-server-py` build task.
 - [ ] **`update` pipeline-form + options** — a *valid* pipeline-form `u` (`[...]`)
   surfaces as a per-op writeError because the Rust `update_matching` takes
   `&Document` and `secantus-storage` has no pipeline-update path. Same for

@@ -1,0 +1,23 @@
+# PyO3 embedded handle for the SecantusDB Rust server (R6). Like
+# secantus-storage-py, this extension links the vendored WiredTiger C library
+# (transitively, via secantus-storage-adapter), so it is NOT a standalone PyPI
+# wheel: it is built INTO the main `secantus` wheel by that wheel's CMake, gated
+# behind the off-by-default SECANTUS_BUILD_STORAGE_ENGINE flag.
+#
+# Kept for LOCAL dev only: `maturin build` produces an importable extension where
+# WiredTiger is present (set SECANTUS_WT_INCLUDE/_LIB; bindgen needs libclang via
+# LIBCLANG_PATH). Not published to PyPI.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "secantus-server"
+version = "0.5.2b15"
+description = "Embedded lifecycle handle for the SecantusDB Rust server (the _secantus_server extension)"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+
+[tool.maturin]
+module-name = "_secantus_server"
+features = ["pyo3/abi3-py310"]

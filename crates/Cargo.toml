@@ -38,6 +38,8 @@ exclude = [
     # R4b: links WiredTiger via secantus-storage, so it's excluded for the same
     # reason — built / tested only where WiredTiger is available (rust-storage CI).
     "secantus-storage-adapter",
+    # R6: the PyO3 embedded handle — links WiredTiger transitively, excluded too.
+    "secantus-server-py",
 ]
 
 [workspace.dependencies]
