@@ -161,3 +161,35 @@ def test_lifecycle_and_oplog_surface(tmp_path):
 def test_engine_fallback_exception_exported():
     """The EngineFallback exception is exported for the engine-selection adapter."""
     assert issubclass(ss.EngineFallback, Exception)
+
+
+def test_users_roles_profile_surface(tmp_path):
+    """The auth + profiling surface: user/role record CRUD + per-db profile."""
+    st = ss.RustStorage(str(tmp_path))
+
+    # user records are opaque BSON blobs, stored verbatim
+    assert st.add_user("admin", "alice", bson.encode({"user": "alice", "roles": ["read"]}), False)
+    assert not st.add_user("admin", "alice", bson.encode({"user": "x"}), False)  # dup, no replace
+    assert bson.decode(st.get_user("admin", "alice"))["user"] == "alice"
+    assert st.add_user("app", "bob", bson.encode({"user": "bob"}), False)
+    assert len(st.list_users()) == 2
+    assert len(st.list_users("admin")) == 1
+    assert st.drop_user("admin", "alice") and not st.drop_user("admin", "alice")
+
+    # roles live in a separate table
+    assert st.add_role("admin", "auditor", bson.encode({"role": "auditor"}), False)
+    assert bson.decode(st.get_role("admin", "auditor"))["role"] == "auditor"
+    assert len(st.list_roles()) == 1
+
+    # per-db profile settings: defaults, round-trip, validation
+    p = bson.decode(st.get_profile("app"))
+    assert p == {"level": 0, "slowms": 100, "sampleRate": 1.0}
+    st.set_profile("app", 1, 0, 0.0)
+    assert bson.decode(st.get_profile("app")) == {"level": 1, "slowms": 0, "sampleRate": 0.0}
+    with pytest.raises(ValueError):
+        st.set_profile("app", 3, 100, 1.0)
+
+    # system.profile is created capped
+    st.ensure_profile_collection("app", 4096)
+    assert st.collection_is_capped("app", "system.profile")
+    del st
