@@ -157,10 +157,100 @@ build-out.
    on every push-to-main / PR (Linux; cross-platform WT linking stays covered by
    the `storage-engine` wheel job). Next: sub-phase 3 (oplog / change streams).
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
-   Gate: `test_geo_index.py`.
+   Gate: `test_geo_index.py`. **Recon done (not yet implemented); sliced
+   geo-1 → geo-4:**
+   - **Key finding:** geo is *not* a storage-only slice. The Rust query engine
+     (`secantus-core`) has **no geo operators** — `$geoWithin` / `$geoIntersects`
+     / `$near` / `$nearSphere` all `Fallback` to Python today. So a geo *index*
+     in `secantus-storage` is useless until `find_matching`'s post-filter
+     `matches()` can evaluate geo predicates. The prerequisite is porting
+     `secantus.geo` (420 lines: geometry coercion + containment) into
+     `secantus-core` first.
+   - **Feasibility:** the `geo` crate (planar geometry: `Point`/`Polygon`/
+     `Relate`/`Intersects`) **fetches + builds in this sandbox** (verified,
+     ~33s). `2d` geohash needs no crate (bit-interleaving). `2dsphere` needs the
+     `s2` crate — **feasibility still UNVERIFIED**; check before committing to
+     geo-3.
+   - **geo-1 (secantus-core):** port `geo.py` — `parse_doc_geometry` (GeoJSON /
+     legacy `[x,y]` / `{x,y}`/`{lng,lat}`), `parse_query_geometry`
+     (`$geometry`/`$box`/`$polygon`/`$center`/`$centerSphere`), `geo_within`
+     (planar via `geo` crate `Relate::is_within`; spherical cap via haversine,
+     `EARTH_RADIUS_METERS = 6_378_100.0`), `geo_intersects`; wire `$geoWithin` +
+     `$geoIntersects` into `query.rs`'s `op_matches` (a `GeoError` → `Fallback`
+     so Python raises the proper `QueryError`). Dispatch site: `op_matches`
+     `_ => Err(Fallback)` (query.rs ~line 186). Gate: extend
+     `test_rust_query_parity.py` with geo cases.
+   - **geo-1b:** `$near` / `$nearSphere` field-operator matching (distance bound;
+     legacy `[x,y,max]` + sibling `$maxDistance`/`$minDistance` shapes — see
+     `query.py` `_parse_near_spec`). Hybrid sort-by-distance stays in the command
+     layer.
+   - **geo-2 (secantus-storage):** `2d` geohash index — write bit-interleaved
+     buckets at the index's `bits` precision; route `$geoWithin` `$box`/`$center`
+     to a single `(lo,hi)` bbox range scan. No external crate.
+   - **geo-3 (secantus-storage):** `2dsphere` S2 cell coverings (needs `s2`
+     crate — verify first). Each geometry writes covering cells + ancestors;
+     queries do exact cell point-lookups + Shapely/haversine verify.
+   - **geo-4:** `$geoNear` aggregation stage.
+   - When geo-2/3 land, relax `create_index`'s current `CreateIndexUnsupported`
+     rejection of `2dsphere`/`2d` (text/hashed stay rejected), and flag geo
+     indexes `multikey: true` so the regular pickers skip them.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
    time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
-   acceleration here. Gate: `test_change_streams.py`.
+   acceleration here. Gate: `test_change_streams.py`. **Sliced** (3a → 3e):
+   - **3a ✅ DONE** — oplog foundation: `OplogState` (next_seq + last_ts) under a
+     dedicated mutex, strictly-monotonic `mint_ts` / `mint_seq_and_ts`,
+     `current_cluster_time`, `emit_oplog` (stamps `ts` + `wall`), op `"i"`
+     emission wired into `insert_one`, `read_oplog(start, limit)` /
+     `oplog_floor_seq` / `oplog_tail_seq` cross-thread reads (each call opens a
+     fresh session — no sticky snapshot), and seq recovery on open
+     (`load_oplog_meta`: meta row, else fallback scan). `enable_oplog` (default
+     true) + `set_enable_oplog`. New tests in `tests/oplog.rs`. **Deferred:**
+     the collection-UUID `ui` field (3c).
+   - **3b ✅ DONE** — `replace_by_id` emits op `"u"` with `o` = the full new doc
+     (the replacement shape — mongod's `$v:2` diff is only for operator-updates,
+     which the storage layer doesn't expose; that path waits for a future
+     `update_*` method using `secantus-core`'s `diff`), and `delete_by_id` emits
+     op `"d"` with `o`=`o2`=`{_id}`. New tests in `tests/oplog.rs`
+     (replace→`u`+full-doc, delete→`d`, insert/replace/delete → `[i,u,d]`).
+   - **3c ✅ DONE** — collection UUID (`ui`) + pre-images. Collection-options
+     read/write (`coll_options` / `write_coll_options`), `collection_uuid` (16
+     bytes minted from two `ObjectId`s — no `uuid` crate dep — and persisted into
+     the options on first use), the `ui` Binary subtype-4 field on every
+     insert/replace/delete entry, `set_collection_options` (e.g.
+     `{changeStreamPreAndPostImages: {enabled: true}}`), pre-image writes on
+     replace/delete when enabled (`emit_oplog` now threads a parallel
+     `pre_images` vec), and `read_preimage`. New tests in `tests/oplog.rs`
+     (stable per-collection ui, pre-images when enabled, none when disabled).
+   - **3d ✅ DONE (condvar deferred)** — retention `prune_oplog(now)` (drops rows
+     past `oplog_retention_seconds`, then the oldest over `oplog_max_entries`,
+     plus paired pre-images; injected clock, explicit-only like `prune_ttl`),
+     `emit_noop_heartbeat` (op `"n"`), `find_seq_for_ts` (for
+     `startAtOperationTime`), and `set_oplog_retention_seconds` /
+     `set_oplog_max_entries`. New tests in `tests/oplog.rs` (retention prune,
+     keep-recent, entry-cap, pre-image co-deletion, heartbeat shape,
+     find-seq-for-ts). **Deferred:** the change-stream condvar / tailable-wait
+     primitive — it only matters once a tailable cursor exists (server layer) and
+     needs `Storage: Sync` + multithreaded tests; lands with that consumer.
+   - **3e ✅ DONE** — change-stream event projection (`crates/secantus-storage/src/
+     changestreams.rs`, a faithful port of `changestreams.py`): resume tokens
+     (`{_data: hex}` over `{s,t,n,k}`, `make`/`parse`), `Scope`
+     (cluster/db/coll) filtering, `project()` mapping insert/update/replace/
+     delete/drop/dropDatabase/rename/createIndexes/dropIndexes (+
+     `showExpandedEvents` gating) with `clusterTime`/`wallTime`/`ns`/
+     `documentKey`, `updateDescription` (diff vs full-doc → update vs replace),
+     `fullDocument` (incl. `updateLookup` re-fetch via `find_matching`),
+     `fullDocumentBeforeChange` (via `read_preimage`; `required` → code-280
+     `ChangeStreamFatal`), `invalidate_event`, and `stamp_split_event` (16 MB
+     fragment envelope). New `tests/changestreams.rs` (11). The noop heartbeat
+     projects to nothing (advances position only).
+   - Then (follow-on): re-home `$lookup` / `$geoNear` pipeline acceleration onto
+     the Rust storage, and the tailable-cursor / server cutover.
+
+   **Sub-phase 3 complete.** The oplog / change-stream *storage* layer is done —
+   emission (i/u/d), `ui` + pre-images, cluster time, retention, heartbeats,
+   recovery, and event projection — 91 storage tests, `clippy -D warnings` +
+   `fmt` clean. Deferred within the phase: the operator-update diff path (needs a
+   future `update_*` storage method) and the tailable-wait condvar (server layer).
 
 ## PyO3 exposure (done) — `crates/secantus-storage-py`
 

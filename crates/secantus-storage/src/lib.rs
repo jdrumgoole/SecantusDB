@@ -22,16 +22,25 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;
 
 use bson::oid::ObjectId;
-use bson::{Bson, Document};
+use bson::spec::BinarySubtype;
+use bson::{Binary, Bson, Document};
 use secantus_core::get_path;
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
+pub mod changestreams;
+
 const COLL_TABLE: &str = "table:secantus_collections";
 const DOC_TABLE: &str = "table:secantus_documents";
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
+
+// Oplog / change-stream tables (Phase 4 sub-phase 3). `q`-keyed (int64 seq) for
+// the oplog + pre-images; a single `S` key ("state") for the recovery metadata.
+const OPLOG_TABLE: &str = "table:secantus_oplog";
+const PREIMAGE_TABLE: &str = "table:secantus_preimages";
+const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 
 /// The synthetic `_id` index name. The `_id_` index is virtual — never stored
 /// in the registry; `list_indexes` synthesises it.
@@ -168,6 +177,9 @@ pub enum StorageError {
     /// A `hint` did not resolve to an existing index (command layer maps this to
     /// a mongod `BadValue`).
     BadHint(String),
+    /// A `fullDocument` / `fullDocumentBeforeChange: "required"` change-stream
+    /// lookup missed (mongod code 280, `ChangeStreamFatalError`).
+    ChangeStreamFatal(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -189,6 +201,7 @@ impl std::fmt::Display for StorageError {
                 write!(f, "query construct not supported by the Rust query engine")
             }
             StorageError::BadHint(m) => write!(f, "{m}"),
+            StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
         }
     }
 }
@@ -579,6 +592,92 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
 pub struct Storage {
     conn: Connection,
     lock: Mutex<()>,
+    /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
+    /// `storage.enable_oplog`. Default `true`.
+    enable_oplog: bool,
+    /// Oplog recovery counters (next seq + last minted timestamp), guarded by a
+    /// tiny dedicated mutex — `storage._oplog_seq_lock`. Held only for the
+    /// microsecond seq/ts reservation, never across the WT cursor writes.
+    oplog: Mutex<OplogState>,
+    /// Retention window (seconds) and hard entry cap for `prune_oplog`. Mirrors
+    /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
+    oplog_retention_seconds: i64,
+    oplog_max_entries: usize,
+}
+
+/// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
+/// `Timestamp(secs, ord)` handed out. Recovered on open so post-restart mints
+/// are strictly greater than anything previously emitted.
+struct OplogState {
+    next_seq: i64,
+    last_ts_secs: i64,
+    last_ts_ord: i64,
+}
+
+/// Milliseconds since the Unix epoch (UTC), for oplog `wall` times.
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whole seconds since the Unix epoch (UTC), for `Timestamp.time`.
+fn now_secs() -> i64 {
+    now_millis() / 1000
+}
+
+/// Recover the oplog counters on open: prefer the persisted meta row, else scan
+/// the oplog table for the max seq and its timestamp. Mirrors
+/// `storage._load_oplog_meta`.
+fn load_oplog_meta(session: &Session) -> Result<OplogState> {
+    let c = session.open_cursor(OPLOG_META_TABLE, None)?;
+    c.set_key_s("state");
+    if c.search().is_ok() {
+        let blob = c.get_value_u()?;
+        if !blob.is_empty() {
+            if let Ok(st) = decode_doc(&blob) {
+                let g = |k: &str| {
+                    st.get_i64(k)
+                        .ok()
+                        .or_else(|| st.get_i32(k).ok().map(i64::from))
+                };
+                return Ok(OplogState {
+                    next_seq: g("next_seq").unwrap_or(1),
+                    last_ts_secs: g("last_ts_secs").unwrap_or(0),
+                    last_ts_ord: g("last_ts_ord").unwrap_or(0),
+                });
+            }
+        }
+    }
+    // Fallback: reconstruct from the highest oplog row.
+    let oc = session.open_cursor(OPLOG_TABLE, None)?;
+    let mut last_seq = 0i64;
+    let mut last_secs = 0i64;
+    let mut last_ord = 0i64;
+    let mut more = oc.next()?;
+    while more {
+        let seq = oc.get_key_q()?;
+        if seq > last_seq {
+            last_seq = seq;
+            let blob = oc.get_value_u()?;
+            if !blob.is_empty() {
+                if let Ok(entry) = decode_doc(&blob) {
+                    if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
+                        last_secs = i64::from(ts.time);
+                        last_ord = i64::from(ts.increment);
+                    }
+                }
+            }
+        }
+        more = oc.next()?;
+    }
+    Ok(OplogState {
+        next_seq: last_seq + 1,
+        last_ts_secs: last_secs,
+        last_ts_ord: last_ord,
+    })
 }
 
 impl Storage {
@@ -592,16 +691,356 @@ impl Storage {
     /// ephemeral database).
     pub fn open_with_config(home: &str, config: &str) -> Result<Storage> {
         let conn = Connection::open(home, config)?;
-        {
+        let state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
                 boot.create(name, fmt)?;
             }
-        }
+            // Recover the oplog seq / timestamp counters from the meta row, or
+            // reconstruct them by scanning the oplog table.
+            load_oplog_meta(&boot)?
+        };
         Ok(Storage {
             conn,
             lock: Mutex::new(()),
+            enable_oplog: true,
+            oplog: Mutex::new(state),
+            oplog_retention_seconds: 3600,
+            oplog_max_entries: 100_000,
         })
+    }
+
+    /// Turn oplog emission on/off (mirrors `SecantusDBServer(enable_oplog=...)`).
+    /// Off means writes skip the oplog tables entirely.
+    pub fn set_enable_oplog(&mut self, on: bool) {
+        self.enable_oplog = on;
+    }
+
+    /// Set the oplog retention window in seconds (default 3600). Mirrors
+    /// `oplog_retention_seconds`.
+    pub fn set_oplog_retention_seconds(&mut self, secs: i64) {
+        self.oplog_retention_seconds = secs;
+    }
+
+    /// Set the oplog hard entry cap (default 100_000). Mirrors
+    /// `oplog_max_entries`.
+    pub fn set_oplog_max_entries(&mut self, n: usize) {
+        self.oplog_max_entries = n;
+    }
+
+    // --- oplog (Phase 4 sub-phase 3) ---
+
+    /// Mint a strictly-monotonic `Timestamp(secs, ord)`. `ord` increments within
+    /// a wall-clock second and resets to 1 on a new second. Caller holds the
+    /// oplog mutex (`state`). Mirrors `storage._mint_ts`.
+    fn mint_ts(state: &mut OplogState) -> bson::Timestamp {
+        let now = now_secs();
+        if now > state.last_ts_secs {
+            state.last_ts_secs = now;
+            state.last_ts_ord = 1;
+        } else {
+            state.last_ts_ord += 1;
+        }
+        bson::Timestamp {
+            time: state.last_ts_secs as u32,
+            increment: state.last_ts_ord as u32,
+        }
+    }
+
+    /// Atomically reserve `n` consecutive seqs and mint `n` monotonic timestamps.
+    /// Mirrors `storage._mint_oplog_seq_and_ts`.
+    fn mint_seq_and_ts(&self, n: usize) -> (i64, Vec<bson::Timestamp>) {
+        let mut st = self.oplog.lock().unwrap();
+        let start = st.next_seq;
+        st.next_seq += n as i64;
+        let ts: Vec<bson::Timestamp> = (0..n).map(|_| Self::mint_ts(&mut st)).collect();
+        (start, ts)
+    }
+
+    /// Append `entries` to the oplog table, stamping each with its minted `ts`
+    /// and a `wall` time, and return the highest seq written (0 if disabled or
+    /// empty). `pre_images` is parallel to `entries`; a `Some(bytes)` element is
+    /// stored under the matching seq in the pre-image table. Caller holds
+    /// `self.lock`. Mirrors `storage._emit_oplog` (the change-stream condvar lands
+    /// in 3d).
+    fn emit_oplog(
+        &self,
+        session: &Session,
+        entries: Vec<Document>,
+        pre_images: Vec<Option<Vec<u8>>>,
+    ) -> Result<i64> {
+        if !self.enable_oplog || entries.is_empty() {
+            return Ok(0);
+        }
+        debug_assert_eq!(pre_images.len(), entries.len());
+        let (start, ts) = self.mint_seq_and_ts(entries.len());
+        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut pre_cur: Option<Cursor> = None;
+        let wall = Bson::DateTime(bson::DateTime::from_millis(now_millis()));
+        let mut last = 0i64;
+        for (i, mut entry) in entries.into_iter().enumerate() {
+            let seq = start + i as i64;
+            entry.insert("ts", Bson::Timestamp(ts[i]));
+            entry.insert("wall", wall.clone());
+            let blob = encode_doc(&entry)?;
+            cur.reset()?;
+            cur.set_key_q(seq);
+            cur.set_value_u(&blob);
+            cur.insert()?;
+            if let Some(pre) = &pre_images[i] {
+                if pre_cur.is_none() {
+                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
+                }
+                let pc = pre_cur.as_ref().unwrap();
+                pc.reset()?;
+                pc.set_key_q(seq);
+                pc.set_value_u(pre);
+                pc.insert()?;
+            }
+            last = seq;
+        }
+        Ok(last)
+    }
+
+    /// A strictly-monotonic `Timestamp` advancing the cluster clock (used for
+    /// `hello`'s `lastWrite` / the `aggregate` reply's `operationTime`). Persists
+    /// the recovered meta so the counter survives a restart. Mirrors
+    /// `storage.current_cluster_time`.
+    pub fn current_cluster_time(&self) -> Result<bson::Timestamp> {
+        let _g = self.lock.lock().unwrap();
+        let ts = {
+            let mut st = self.oplog.lock().unwrap();
+            Self::mint_ts(&mut st)
+        };
+        let session = self.conn.open_session()?;
+        self.persist_oplog_meta(&session)?;
+        Ok(ts)
+    }
+
+    /// Persist the recovery meta row (`next_seq` / `last_ts_*`). Best-effort
+    /// optimisation — `load_oplog_meta` reconstructs from the oplog table if the
+    /// row is stale or missing. Mirrors `storage._persist_oplog_meta`.
+    fn persist_oplog_meta(&self, session: &Session) -> Result<()> {
+        let mut d = Document::new();
+        {
+            let st = self.oplog.lock().unwrap();
+            d.insert("next_seq", st.next_seq);
+            d.insert("last_ts_secs", st.last_ts_secs);
+            d.insert("last_ts_ord", st.last_ts_ord);
+        }
+        let blob = encode_doc(&d)?;
+        let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+        cur.set_key_s("state");
+        cur.set_value_u(&blob);
+        cur.insert()?; // overwrite cursor (default) -> upsert
+        Ok(())
+    }
+
+    /// Forward-scan the oplog from `start_seq` (inclusive), up to `limit` entries,
+    /// as `(seq, bson_bytes)` pairs. Each public call opens a fresh session, so
+    /// the read view always reflects rows committed by other threads' writers.
+    /// Mirrors `storage.read_oplog` (ns filtering / projection are a higher
+    /// layer's job).
+    pub fn read_oplog(&self, start_seq: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        cur.set_key_q(start_seq);
+        let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let seq = cur.get_key_q()?;
+            let blob = cur.get_value_u()?;
+            if !blob.is_empty() {
+                out.push((seq, blob));
+            }
+            if out.len() >= limit {
+                break;
+            }
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// The smallest seq currently present (0 if empty) — the retention floor a
+    /// resume token must stay at or above. Mirrors `storage.oplog_floor_seq`.
+    pub fn oplog_floor_seq(&self) -> Result<i64> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        match cur.next() {
+            Ok(true) => Ok(cur.get_key_q()?),
+            Ok(false) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The highest seq emitted (`next_seq - 1`), 0 if none. Mirrors
+    /// `storage.oplog_tail_seq`.
+    pub fn oplog_tail_seq(&self) -> i64 {
+        let _g = self.lock.lock().unwrap();
+        self.oplog.lock().unwrap().next_seq - 1
+    }
+
+    /// Merge `opts` into the collection's options blob (creating the collection
+    /// if needed) — e.g. `{changeStreamPreAndPostImages: {enabled: true}}`.
+    /// Mirrors `storage.set_collection_options`.
+    pub fn set_collection_options(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+        for (k, v) in opts {
+            current.insert(k.clone(), v.clone());
+        }
+        write_coll_options(&session, db, coll, &current)
+    }
+
+    /// The collection's 16-byte UUID (minting + persisting one on first use).
+    /// Mirrors `storage.collection_uuid`.
+    pub fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        collection_uuid(&session, db, coll)
+    }
+
+    /// The pre-image document bytes stored for oplog `seq`, or `None`. Fresh
+    /// session for cross-thread visibility. Mirrors `storage.read_preimage`.
+    pub fn read_preimage(&self, seq: i64) -> Result<Option<Vec<u8>>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(PREIMAGE_TABLE, None)?;
+        cur.set_key_q(seq);
+        match cur.search() {
+            Ok(()) => {
+                let b = cur.get_value_u()?;
+                Ok(if b.is_empty() { None } else { Some(b) })
+            }
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Drop oplog rows older than the retention window (`ts.time < now -
+    /// retention`) and, if more than `oplog_max_entries` remain, the oldest
+    /// surplus; paired pre-images go too. `now` is injected seconds (defaults to
+    /// the wall clock). Returns the number of rows pruned. No background sweeper —
+    /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
+    pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let when = now.unwrap_or_else(now_secs);
+        let cutoff = when - self.oplog_retention_seconds;
+
+        // Phase 1: collect every seq + the ones past the retention window.
+        let oc = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut all_seqs: Vec<i64> = Vec::new();
+        let mut doomed: Vec<i64> = Vec::new();
+        let mut more = oc.next()?;
+        while more {
+            let seq = oc.get_key_q()?;
+            all_seqs.push(seq);
+            let blob = oc.get_value_u()?;
+            if !blob.is_empty() {
+                if let Ok(entry) = decode_doc(&blob) {
+                    if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
+                        if i64::from(ts.time) < cutoff {
+                            doomed.push(seq);
+                        }
+                    }
+                }
+            }
+            more = oc.next()?;
+        }
+
+        // Phase 2: extend the doom set to the oldest entries over the cap.
+        let kept = all_seqs.len() - doomed.len();
+        if kept > self.oplog_max_entries {
+            let mut extra = kept - self.oplog_max_entries;
+            let doomed_set: HashSet<i64> = doomed.iter().copied().collect();
+            for &seq in &all_seqs {
+                if extra == 0 {
+                    break;
+                }
+                if !doomed_set.contains(&seq) {
+                    doomed.push(seq);
+                    extra -= 1;
+                }
+            }
+        }
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+
+        let op_del = session.open_cursor(OPLOG_TABLE, None)?;
+        let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
+        for &seq in &doomed {
+            op_del.reset()?;
+            op_del.set_key_q(seq);
+            match op_del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+            pre_del.reset()?;
+            pre_del.set_key_q(seq);
+            match pre_del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(doomed.len())
+    }
+
+    /// Append one `{op: "n", ns: "", o: {msg: "periodic noop"}}` heartbeat and
+    /// return its seq — keeps a quiet collection's resume token advancing with
+    /// cluster time. Mirrors `storage.emit_noop_heartbeat`.
+    pub fn emit_noop_heartbeat(&self) -> Result<i64> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let mut o = Document::new();
+        o.insert("msg", "periodic noop");
+        let mut entry = Document::new();
+        entry.insert("op", "n");
+        entry.insert("ns", "");
+        entry.insert("o", Bson::Document(o));
+        self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
+    /// The smallest seq whose entry `ts >= target` (tail + 1 if none qualify) —
+    /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
+    pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let c = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut more = c.next()?;
+        while more {
+            let seq = c.get_key_q()?;
+            let blob = c.get_value_u()?;
+            if !blob.is_empty() {
+                if let Ok(entry) = decode_doc(&blob) {
+                    if let Some(Bson::Timestamp(e)) = entry.get("ts") {
+                        if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
+                            return Ok(seq);
+                        }
+                    }
+                }
+            }
+            more = c.next()?;
+        }
+        Ok(self.oplog.lock().unwrap().next_seq)
     }
 
     /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.
@@ -637,6 +1076,19 @@ impl Storage {
         // any index this doc makes multikey (array value on an indexed field).
         self.write_index_entries(&session, db, coll, &doc, &descs)?;
         self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+        // Oplog: an insert is op "i". No pre-image (there's no prior document).
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut o2 = Document::new();
+            o2.insert("_id", id.clone());
+            let mut entry = Document::new();
+            entry.insert("op", "i");
+            entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(doc.clone()));
+            entry.insert("o2", Bson::Document(o2));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
         Ok(key)
     }
 
@@ -733,6 +1185,27 @@ impl Storage {
             self.write_index_entries(&session, db, coll, &doc, &descs)?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         }
+        // Oplog: a full-document replacement is op "u" with `o` = the new doc
+        // (the `$v:2` diff form is for operator-updates, which the storage layer
+        // doesn't expose). The pre-image (old doc) is stored when the collection
+        // has changeStreamPreAndPostImages enabled.
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let pre = if pre_post_images_enabled(&session, db, coll)? {
+                Some(encode_doc(&old_doc)?)
+            } else {
+                None
+            };
+            let mut o2 = Document::new();
+            o2.insert("_id", id.clone());
+            let mut entry = Document::new();
+            entry.insert("op", "u");
+            entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(doc.clone()));
+            entry.insert("o2", Bson::Document(o2));
+            self.emit_oplog(&session, vec![entry], vec![pre])?;
+        }
         Ok(true)
     }
 
@@ -753,6 +1226,25 @@ impl Storage {
         let old_doc = decode_doc(&old_blob)?;
         let descs = self.index_descs(&session, db, coll)?;
         self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
+        // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
+        // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let pre = if pre_post_images_enabled(&session, db, coll)? {
+                Some(encode_doc(&old_doc)?)
+            } else {
+                None
+            };
+            let mut o = Document::new();
+            o.insert("_id", id.clone());
+            let mut entry = Document::new();
+            entry.insert("op", "d");
+            entry.insert("ns", format!("{db}.{coll}"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o.clone()));
+            entry.insert("o2", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![pre])?;
+        }
         Ok(true)
     }
 
@@ -2634,6 +3126,82 @@ fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// The collection's options document (`{}` when registered with none), or
+/// `None` when the collection isn't registered.
+fn coll_options(session: &Session, db: &str, coll: &str) -> Result<Option<Document>> {
+    let cur = session.open_cursor(COLL_TABLE, None)?;
+    cur.set_key_ss(db, coll);
+    match cur.search() {
+        Ok(()) => {
+            let blob = cur.get_value_u()?;
+            if blob.is_empty() {
+                Ok(Some(Document::new()))
+            } else {
+                Ok(Some(decode_doc(&blob)?))
+            }
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Overwrite the collection's options blob (caller has ensured registration).
+fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) -> Result<()> {
+    let blob = encode_doc(opts)?;
+    let cur = session.open_cursor(COLL_TABLE, None)?;
+    cur.set_key_ss(db, coll);
+    cur.set_value_u(&blob);
+    cur.insert()?; // overwrite cursor (default) -> upsert
+    Ok(())
+}
+
+/// The collection's UUID (16 bytes), minting + persisting one into the options on
+/// first use. Mirrors `storage._collection_uuid`.
+fn collection_uuid(session: &Session, db: &str, coll: &str) -> Result<Vec<u8>> {
+    let mut opts = coll_options(session, db, coll)?.unwrap_or_default();
+    if let Some(Bson::Binary(b)) = opts.get("uuid") {
+        if b.bytes.len() == 16 {
+            return Ok(b.bytes.clone());
+        }
+    }
+    let bytes = new_uuid_bytes().to_vec();
+    opts.insert("uuid", uuid_binary(&bytes));
+    write_coll_options(session, db, coll, &opts)?;
+    Ok(bytes)
+}
+
+/// Whether `changeStreamPreAndPostImages.enabled` is set on the collection.
+fn pre_post_images_enabled(session: &Session, db: &str, coll: &str) -> Result<bool> {
+    if let Some(opts) = coll_options(session, db, coll)? {
+        if let Ok(sub) = opts.get_document("changeStreamPreAndPostImages") {
+            return Ok(sub.get_bool("enabled").unwrap_or(false));
+        }
+    }
+    Ok(false)
+}
+
+/// A fresh 16-byte UUID. No `uuid` crate dependency — two `ObjectId`s (which use
+/// `getrandom` + a per-process counter) supply the entropy; the version / variant
+/// nibbles are set cosmetically (the `ui` field is opaque to drivers).
+fn new_uuid_bytes() -> [u8; 16] {
+    let a = ObjectId::new();
+    let b = ObjectId::new();
+    let mut out = [0u8; 16];
+    out[..12].copy_from_slice(&a.bytes());
+    out[12..16].copy_from_slice(&b.bytes()[..4]);
+    out[6] = (out[6] & 0x0f) | 0x40;
+    out[8] = (out[8] & 0x3f) | 0x80;
+    out
+}
+
+/// Wrap 16 UUID bytes as a BSON Binary subtype 4 (mongod's `ui` encoding).
+fn uuid_binary(bytes: &[u8]) -> Bson {
+    Bson::Binary(Binary {
+        subtype: BinarySubtype::Uuid,
+        bytes: bytes.to_vec(),
+    })
 }
 
 /// An empty options document (`{}`) as BSON bytes — the collections-table value.
