@@ -34,12 +34,14 @@
 //! families are added.
 
 pub mod crud;
+pub mod cursors;
 pub mod handshake;
 pub mod storage;
 
 use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
+pub use cursors::{CursorError, CursorRegistry};
 pub use secantus_wire::{MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE};
 pub use storage::{Storage, StorageError, UpdateOutcome};
 
@@ -80,6 +82,9 @@ pub struct CommandContext {
     /// The storage backend the data-bearing commands run against. `None` until
     /// the server (R4) wires one in; the handshake family doesn't need it.
     pub storage: Option<Arc<dyn Storage>>,
+    /// The per-server cursor registry (drives `getMore` / `killCursors`). `None`
+    /// until the server wires one in.
+    pub cursors: Option<Arc<CursorRegistry>>,
 }
 
 impl CommandContext {
@@ -97,12 +102,19 @@ impl CommandContext {
                 increment: 0,
             },
             storage: None,
+            cursors: None,
         }
     }
 
     /// Attach a storage backend (builder-style; used by the server and tests).
     pub fn with_storage(mut self, storage: Arc<dyn Storage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Attach a cursor registry (builder-style; used by the server and tests).
+    pub fn with_cursors(mut self, cursors: Arc<CursorRegistry>) -> Self {
+        self.cursors = Some(cursors);
         self
     }
 
@@ -116,6 +128,18 @@ impl CommandContext {
                 1,
                 "InternalError",
                 "storage backend not configured",
+            )),
+        }
+    }
+
+    /// The cursor registry, or an `InternalError` if none is configured.
+    pub fn cursors(&self) -> Result<&CursorRegistry, CommandError> {
+        match &self.cursors {
+            Some(c) => Ok(c.as_ref()),
+            None => Err(CommandError::new(
+                1,
+                "InternalError",
+                "cursor registry not configured",
             )),
         }
     }
@@ -177,6 +201,8 @@ fn lookup(name: &str) -> Option<Handler> {
         "insert" => crud::insert,
         "delete" => crud::delete,
         "count" => crud::count,
+        "getMore" => cursors::get_more,
+        "killCursors" => cursors::kill_cursors,
         _ => return None,
     })
 }

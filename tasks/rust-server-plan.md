@@ -201,6 +201,22 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   in `secantus-storage`) driving `getMore`/`killCursors`. The blocking
   `awaitData` wait uses the storage `wait_for_oplog` / `notify_oplog_waiters`
   condvar primitive (landed in 5e-gap-c). Gate: `test_change_streams.py`.
+  - **R3a ✅ DONE** — `CursorRegistry` (`secantus-commands::cursors`) + the
+    non-tailable `getMore` / `killCursors` handlers. Byte-seam native (pending
+    docs are `Vec<Vec<u8>>`), thread-safe behind one `Mutex`, opportunistic
+    idle-TTL pruning with an **injectable clock**, 63-bit random ids (ordinary
+    odd; tailable `> 2**32`), `max_cursors` cap. `register` / `register_tailable`
+    (producer closure via a `CursorProducer` trait) / `info` / `next_batch`
+    (tailable persists on empty) / `kill` / `invalidate` / `len` / `snapshot`.
+    `getMore` (non-tailable: namespace-ownership check → `CursorNotFound` 43,
+    `nextBatch` + `id` 0-on-exhaustion) and `killCursors` wired into
+    `CommandContext` via `Option<Arc<CursorRegistry>>`. 13 tests (33 crate
+    total), `clippy -D warnings` + `fmt` clean. **Deferred:** the tailable
+    (change-stream) getMore path — drain buffered events, call the producer,
+    block on the storage oplog condvar for `awaitData`, emit
+    `postBatchResumeToken` — lands with the change-stream slice (needs the oplog
+    tail + `notify_oplog_waiters`, not in the command `Storage` trait yet).
+    Cursor *creation* (`find` / `aggregate` / `watch`) lands with those families.
 
 - **R4 — Accept loop + connection threads + TLS** (`crates/secantus-server`). Port
   `server.py`: TCP accept on a daemon thread, thread-per-connection (1:1 with the

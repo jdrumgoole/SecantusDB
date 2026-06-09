@@ -158,7 +158,13 @@ banner above + `tasks/rust-server-plan.md` §3).
 
 **Rust server build-out (`tasks/rust-server-plan.md` §4).** Done: R1
 (`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /
-`delete` / `count` + the `Storage` trait seam). **Deferred / not yet ported:**
+`delete` / `count` + the `Storage` trait seam), R3a (`CursorRegistry` +
+non-tailable `getMore` / `killCursors`). **Deferred / not yet ported:**
+- [ ] **Tailable (change-stream) getMore** — drain buffered events, call the
+  cursor `producer`, block on the storage oplog condvar for `awaitData`, emit
+  `postBatchResumeToken`. Needs the oplog tail + `notify_oplog_waiters` added to
+  the command `Storage` trait. The registry already stores the tailable entry +
+  producer; only the getMore consumer is missing.
 - [ ] **R2c — `update` command.** Document-form maps to `update_matching`, but
   pipeline-form `u` (array), `arrayFilters`, `let`, `collation`, and `validator`
   need storage-signature additions (the Rust `update_matching` takes none). Port

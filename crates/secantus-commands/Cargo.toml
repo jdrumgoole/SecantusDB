@@ -21,3 +21,6 @@ crate-type = ["rlib"]
 [dependencies]
 bson = { workspace = true }
 secantus-wire = { path = "../secantus-wire" }
+# Cryptographically-unpredictable cursor ids (the registry mints 63-bit random
+# ids so another connection can't enumerate / hijack cursors by guessing).
+rand = "0.9"

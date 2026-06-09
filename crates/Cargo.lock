@@ -629,6 +629,7 @@ name = "secantus-commands"
 version = "0.5.2-beta.15"
 dependencies = [
  "bson",
+ "rand",
  "secantus-wire",
 ]
 
