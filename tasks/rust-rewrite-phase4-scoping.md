@@ -267,6 +267,42 @@ build-out.
    recovery, and event projection — 91 storage tests, `clippy -D warnings` +
    `fmt` clean. Deferred within the phase: the operator-update diff path (needs a
    future `update_*` storage method) and the tailable-wait condvar (server layer).
+5. **Server cutover** — expose the *whole* `Storage` surface through PyO3, add a
+   Python adapter selectable by `secantus.engine`, and run the conformance suites
+   under `SECANTUS_ENGINE=rust`. The widest-surface sub-phase; sliced 5a → …:
+   - **5a ✅ DONE** — write-path completion in `secantus-storage`:
+     `update_matching` (operator + replacement, `multi`, `upsert`-with-seed,
+     unique enforcement, index-entry upkeep, multikey marking, **and the deferred
+     3b oplog path** — operator updates emit `o = {$v:2, diff:
+     compute_update_description(pre,post)}`, replacements emit the full new doc),
+     `delete_matching` (filter-routed, `limit`, op `"d"` + pre-images), and
+     `count_matching` (empty-filter fast path + predicate). Shared `candidate_docs`
+     helper (index-routed-deduped else full scan, fully materialised so the
+     write loop can't invalidate a live scan cursor). Public `UpdateOutcome
+     {matched, modified, upserted_id}`. New WT-backed tests in `tests/write.rs`
+     (14). **Deferred to the adapter layer (route to Python):** `array_filters`,
+     positional update operators (`$`/`$[]`), `let`/`collation`, document
+     `validator`, capped-collection bounds, and geo-index validation on update —
+     the Rust signatures take none of these, so the engine-selection layer keeps
+     such ops on the pure-Python `Storage`.
+   - **5b ✅ DONE** — collection / database lifecycle in `secantus-storage`:
+     `create_collection` (register + UUID mint + `op:"c"` `create` w/ `idIndex`),
+     `drop_collection` (purge docs / index registry / index entries + registry
+     row, `op:"c"` `drop`), `drop_database` (purge every collection + a `drop`
+     per collection then a final `dropDatabase:1` command entry, no `ui`),
+     `rename_collection` (move doc / index / entry rows by re-keying, `drop_target`
+     handling, source-missing / target-exists guards returning `(bool, Option<msg>)`,
+     `op:"c"` `renameCollection` — dst re-registered with fresh options, faithful
+     to Python), and `list_databases` (+ synthetic `local` when the oplog is on).
+     Shared `colls_of` / `purge_collection_tables` / `collect_idx_rows` /
+     `collect_entry_rows` helpers. New WT-backed tests in `tests/lifecycle.rs`
+     (10). 144 storage tests; `clippy -D warnings` + `fmt` clean.
+   - **Next:** the remaining higher-level `Storage` surface still Python-only
+     (`get_collection_options` / `collection_data_size` / `index_sizes` /
+     `scan_docs_after_id_key`, plus users / roles / profile / `checkpoint` /
+     `create_archive`), then the PyO3 surface for all of it, the `secantus.engine`
+     storage selection + Python adapter, and the conformance suites under
+     `SECANTUS_ENGINE=rust`.
 
 ## PyO3 exposure (done) — `crates/secantus-storage-py`
 

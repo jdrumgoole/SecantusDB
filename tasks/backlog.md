@@ -255,12 +255,33 @@ never "remove Python."
   2 tests; `invoke rust-storage-py`) — the core risk of the wheel-matrix gate,
   de-risked on Linux. `cargo fmt` + `clippy -D warnings` clean. Standalone crate
   (excluded from the `crates` workspace).
+- [x] **Phase 4 sub-phase 5a — write path in `secantus-storage`.** `update_matching`
+  (operator + replacement, `multi`, `upsert`-with-seed, unique enforcement,
+  index-entry / multikey upkeep, and the `$v:2` diff vs full-doc oplog split — closes
+  the sub-phase-3b deferral), `delete_matching` (filter-routed, `limit`, op `"d"` +
+  pre-images), `count_matching`, the shared materialised `candidate_docs` router, and
+  public `UpdateOutcome`. 14 WT-backed tests in `tests/write.rs`; `clippy -D warnings`
+  + `fmt` clean. **Deferred to the future engine-selection adapter (route to Python):**
+  `array_filters`, positional update operators (`$`/`$[]`), `let`/`collation`,
+  document `validator`, capped-collection eviction bounds, and geo-index validation on
+  update — the Rust signatures don't accept these, so such ops stay on pure-Python
+  `Storage`.
+- [x] **Phase 4 sub-phase 5b — collection/database lifecycle in `secantus-storage`.**
+  `create_collection` / `drop_collection` / `drop_database` / `rename_collection`
+  (move-by-rekey, `drop_target`, source/target guards) / `list_databases`, with the
+  `op:"c"` command oplog entries (`create` w/ `idIndex`, `drop`, `dropDatabase`,
+  `renameCollection`). Shared `purge_collection_tables` / `colls_of` /
+  `collect_idx_rows` / `collect_entry_rows`. 10 WT-backed tests in
+  `tests/lifecycle.rs`; clippy + fmt clean.
 - [ ] **Phase 4 — storage keystone (continued).** Remaining: (a) wire
   `secantus.engine` storage selection so `SecantusDBServer` can use the Rust
   `Storage` under `SECANTUS_ENGINE=rust` — **gated on porting the rest of the
   `Storage` surface** (the server needs `find_matching`/indexes/oplog/etc., not
-  just CRUD), i.e. sub-phases 2-4 (indexes, geo, oplog/change-streams); then the
-  conformance gate (`test_storage.py` / `test_crud.py` under `SECANTUS_ENGINE=rust`).
+  just CRUD), i.e. sub-phases 2-4 (indexes, geo, oplog/change-streams) plus the
+  remaining higher-level methods (`get_collection_options`/`collection_data_size`/
+  `index_sizes`/`scan_docs_after_id_key`, users/roles/profile/`checkpoint`/
+  `create_archive`); then the conformance gate
+  (`test_storage.py` / `test_crud.py` under `SECANTUS_ENGINE=rust`).
   (b) **The wheel-matrix gate — bundled behind an off-by-default build flag.**
   Decided (after rejecting a separate companion wheel — see scoping doc): the Rust
   `_secantus_storage` extension is built INTO the `secantus` wheel by the main
