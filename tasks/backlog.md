@@ -273,13 +273,17 @@ never "remove Python."
   `renameCollection`). Shared `purge_collection_tables` / `colls_of` /
   `collect_idx_rows` / `collect_entry_rows`. 10 WT-backed tests in
   `tests/lifecycle.rs`; clippy + fmt clean.
+- [x] **Phase 4 sub-phase 5c — collection stats/introspection in `secantus-storage`.**
+  `get_collection_options` (synthetic `local.oplog.rs` shape; `uuid` stays Binary),
+  `collection_is_capped`, `collection_data_size`, `index_sizes` (`_id_` + per-index
+  packed bytes), `scan_docs_after_id_key`. 7 WT-backed tests in `tests/stats.rs`;
+  clippy + fmt clean.
 - [ ] **Phase 4 — storage keystone (continued).** Remaining: (a) wire
   `secantus.engine` storage selection so `SecantusDBServer` can use the Rust
   `Storage` under `SECANTUS_ENGINE=rust` — **gated on porting the rest of the
   `Storage` surface** (the server needs `find_matching`/indexes/oplog/etc., not
   just CRUD), i.e. sub-phases 2-4 (indexes, geo, oplog/change-streams) plus the
-  remaining higher-level methods (`get_collection_options`/`collection_data_size`/
-  `index_sizes`/`scan_docs_after_id_key`, users/roles/profile/`checkpoint`/
+  remaining higher-level methods (users/roles/profile/`checkpoint`/
   `create_archive`); then the conformance gate
   (`test_storage.py` / `test_crud.py` under `SECANTUS_ENGINE=rust`).
   (b) **The wheel-matrix gate — bundled behind an off-by-default build flag.**

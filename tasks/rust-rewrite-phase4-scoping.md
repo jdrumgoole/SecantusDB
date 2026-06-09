@@ -297,12 +297,19 @@ build-out.
      Shared `colls_of` / `purge_collection_tables` / `collect_idx_rows` /
      `collect_entry_rows` helpers. New WT-backed tests in `tests/lifecycle.rs`
      (10). 144 storage tests; `clippy -D warnings` + `fmt` clean.
-   - **Next:** the remaining higher-level `Storage` surface still Python-only
-     (`get_collection_options` / `collection_data_size` / `index_sizes` /
-     `scan_docs_after_id_key`, plus users / roles / profile / `checkpoint` /
-     `create_archive`), then the PyO3 surface for all of it, the `secantus.engine`
-     storage selection + Python adapter, and the conformance suites under
-     `SECANTUS_ENGINE=rust`.
+   - **5c ✅ DONE** — collection stats / introspection in `secantus-storage`:
+     `get_collection_options` (`{}` when absent; the synthetic `local.oplog.rs`
+     capped shape; stored `uuid` left as a BSON Binary for the command layer),
+     `collection_is_capped`, `collection_data_size` (summed blob bytes),
+     `index_sizes` (`_id_` = summed `id_key` length + each secondary index's
+     summed packed-entry length, via `collect_entry_rows`), and
+     `scan_docs_after_id_key` (natural-order rows with `id_key > after`, for the
+     tailable producer). New WT-backed tests in `tests/stats.rs` (7);
+     `clippy -D warnings` + `fmt` clean.
+   - **Next:** users / roles / profile / `checkpoint` / `create_archive` (the
+     last Python-only `Storage` bits), then the PyO3 surface for the whole
+     `Storage`, the `secantus.engine` storage selection + Python adapter, and the
+     conformance suites under `SECANTUS_ENGINE=rust`.
 
 ## PyO3 exposure (done) — `crates/secantus-storage-py`
 
