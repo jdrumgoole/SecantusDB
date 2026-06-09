@@ -14,6 +14,12 @@ publish = false
 # R4b bridge: the Rust server (R4a, generic over `secantus_commands::Storage`)
 # runs against real WiredTiger by wrapping a `secantus_storage::Storage` in the
 # `StorageAdapter` here.
+
+# Standalone (own [workspace]) so `cargo` invoked inside this dir — as the
+# rust-storage CI job does — isn't pulled into the parent `crates` workspace
+# (where it's excluded), matching secantus-storage / secantus-server-py.
+[workspace]
+
 [lib]
 name = "secantus_storage_adapter"
 crate-type = ["rlib"]

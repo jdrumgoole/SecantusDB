@@ -189,4 +189,44 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     # Wheel root, alongside the other top-level extensions — `import
     # _secantus_storage` resolves from site-packages.
     install(FILES ${STORAGE_EXT_STAGED} DESTINATION . OPTIONAL)
+
+    # -------------------------------------------------------------------------
+    # The Rust server extension (`_secantus_server`, R6) — the embedded Python
+    # lifecycle handle over the standalone Rust server. It links the SAME
+    # vendored WiredTiger (transitively via secantus-storage-adapter →
+    # secantus-storage), so it builds under the same flag, the same way as
+    # `_secantus_storage` above. `import _secantus_server` → `RustServer`.
+    # -------------------------------------------------------------------------
+    set(SERVER_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantus-server-py)
+    set(SERVER_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/server-target)
+
+    if(WIN32)
+        set(SERVER_CARGO_OUT "_secantus_server.dll")
+        set(SERVER_EXT_NAME  "_secantus_server.pyd")
+    elseif(APPLE)
+        set(SERVER_CARGO_OUT "lib_secantus_server.dylib")
+        set(SERVER_EXT_NAME  "_secantus_server.abi3.so")
+    else()
+        set(SERVER_CARGO_OUT "lib_secantus_server.so")
+        set(SERVER_EXT_NAME  "_secantus_server.abi3.so")
+    endif()
+
+    set(SERVER_EXT_BUILT  ${SERVER_TARGET_DIR}/release/${SERVER_CARGO_OUT})
+    set(SERVER_EXT_STAGED ${CMAKE_CURRENT_BINARY_DIR}/${SERVER_EXT_NAME})
+
+    add_custom_command(
+        OUTPUT ${SERVER_EXT_STAGED}
+        COMMAND ${CMAKE_COMMAND} -E env
+            SECANTUS_WT_INCLUDE=${WT_BINARY_DIR}/include
+            SECANTUS_WT_LIB=${WT_BINARY_DIR}
+            CARGO_TARGET_DIR=${SERVER_TARGET_DIR}
+            ${CARGO_EXECUTABLE} build --release
+                --manifest-path ${SERVER_CRATE_DIR}/Cargo.toml
+        COMMAND ${CMAKE_COMMAND} -E copy ${SERVER_EXT_BUILT} ${SERVER_EXT_STAGED}
+        DEPENDS wiredtiger_ext
+        COMMENT "Building Rust server extension (_secantus_server) against bundled WiredTiger"
+        VERBATIM
+    )
+    add_custom_target(secantus_server_ext ALL DEPENDS ${SERVER_EXT_STAGED})
+    install(FILES ${SERVER_EXT_STAGED} DESTINATION . OPTIONAL)
 endif()
