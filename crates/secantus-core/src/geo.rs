@@ -1,16 +1,20 @@
-//! Geospatial query operators (`$geoWithin` / `$geoIntersects`) for the Rust
-//! query engine — a bounded port of `secantus.geo` (Phase 4, slice geo-1).
+//! Geospatial query operators (`$geoWithin` / `$geoIntersects` / `$near` /
+//! `$nearSphere`) for the Rust query engine — a bounded port of `secantus.geo`
+//! (Phase 4, slices geo-1 + geo-1b).
 //!
 //! Planar containment/intersection uses the `geo` crate's DE-9IM `Relate`, which
 //! shares the OGC lineage of Shapely (the pure-Python path), so `is_within` /
-//! `is_intersects` line up. The spherical cap (`$centerSphere`) is done directly
-//! with haversine (Shapely is planar), matching `geo.py`.
+//! `is_intersects` line up. The spherical cap (`$centerSphere`) and `$near`
+//! distance use haversine directly (Shapely is planar), matching `geo.py`.
+//! `$near` is a containment test here (within `[$minDistance, $maxDistance]`);
+//! sort-by-distance is the command layer's job.
 //!
 //! Deferred to Python via `Fallback` (the engine contract):
 //! * `$center` — Shapely approximates the disk with a 64-vertex buffer we can't
-//!   reproduce exactly, so we don't try (an exact circle would diverge on the
-//!   sub-degree annulus).
-//! * `$near` / `$nearSphere` — slice geo-1b.
+//!   reproduce exactly (an exact circle would diverge on the sub-degree annulus).
+//! * the legacy `$near` *sibling* `$maxDistance`/`$minDistance` form — those are
+//!   separate (unknown) operators in the condition doc, so it falls back
+//!   automatically.
 //! * malformed / unrecognised query shapes — Python raises the proper
 //!   `QueryError`.
 
@@ -20,6 +24,10 @@ use geo::{Coord, CoordsIter, Geometry, LineString, MultiLineString, MultiPoint, 
 use geo::{Point, Polygon, Relate};
 
 type R = Result<bool, Fallback>;
+
+/// Mean Earth radius in metres — mongod's `$centerSphere` / `$nearSphere`
+/// constant. Mirrors `geo.EARTH_RADIUS_METERS`.
+const EARTH_RADIUS_METERS: f64 = 6_378_100.0;
 
 /// A parsed query geometry.
 enum QGeom {
@@ -246,6 +254,85 @@ pub fn op_geo_intersects(values: &[Option<Bson>], arg: &Bson) -> R {
     Ok(false)
 }
 
+/// `(center, max, min, spherical, legacy)` for a `$near` arg, or `Fallback` on a
+/// shape Python rejects / we don't reproduce. Mirrors `query._parse_near_spec`
+/// for the non-sibling forms: the legacy `[x,y]`/`[x,y,max]` list and the
+/// GeoJSON `{$geometry: Point, $maxDistance, $minDistance}` doc. (The legacy
+/// *sibling* `$maxDistance` form falls back automatically — `$maxDistance` is a
+/// separate, unknown operator in the condition doc.)
+#[allow(clippy::type_complexity)]
+fn parse_near_spec(
+    arg: &Bson,
+    default_spherical: bool,
+) -> Result<((f64, f64), Option<f64>, Option<f64>, bool, bool), Fallback> {
+    let opt_number = |b: Option<&Bson>| -> Result<Option<f64>, Fallback> {
+        match b {
+            None => Ok(None),
+            Some(v) => num(v).map(Some).ok_or(Fallback),
+        }
+    };
+    match arg {
+        Bson::Document(d) => {
+            let geom = d.get_document("$geometry").map_err(|_| Fallback)?;
+            if geom.get_str("type") != Ok("Point") {
+                return Err(Fallback);
+            }
+            let c = pair(geom.get("coordinates").ok_or(Fallback)?).ok_or(Fallback)?;
+            Ok((
+                (c.x, c.y),
+                opt_number(d.get("$maxDistance"))?,
+                opt_number(d.get("$minDistance"))?,
+                true,  // GeoJSON form is spherical
+                false, // distances already in metres
+            ))
+        }
+        Bson::Array(a) if a.len() == 2 || a.len() == 3 => {
+            let cx = num(&a[0]).ok_or(Fallback)?;
+            let cy = num(&a[1]).ok_or(Fallback)?;
+            let max_d = if a.len() == 3 {
+                Some(num(&a[2]).ok_or(Fallback)?)
+            } else {
+                None
+            };
+            Ok(((cx, cy), max_d, None, default_spherical, true))
+        }
+        _ => Err(Fallback),
+    }
+}
+
+/// `$near` / `$nearSphere` *matching* (not ranking): a doc matches if a
+/// point-valued geometry lies within `[$minDistance, $maxDistance]` of the
+/// centre. Sort-by-distance is the command layer's job. Mirrors
+/// `query._op_geo_near`.
+pub fn op_geo_near(values: &[Option<Bson>], arg: &Bson, default_spherical: bool) -> R {
+    let (center, mut max_d, mut min_d, spherical, legacy) =
+        parse_near_spec(arg, default_spherical)?;
+    // Legacy + spherical: the bound is radians on the unit sphere; convert to
+    // the metres that `distance(spherical=true)` returns.
+    if legacy && spherical {
+        max_d = max_d.map(|m| m * EARTH_RADIUS_METERS);
+        min_d = min_d.map(|m| m * EARTH_RADIUS_METERS);
+    }
+    for v in values.iter().flatten() {
+        // $near is restricted to point geometries (mirroring geo.distance,
+        // which returns None for non-points -> skipped).
+        let p = match parse_doc_geometry(v) {
+            Some(Geometry::Point(pt)) => (pt.x(), pt.y()),
+            _ => continue,
+        };
+        let d = if spherical {
+            haversine(center.0, center.1, p.0, p.1) * EARTH_RADIUS_METERS
+        } else {
+            ((center.0 - p.0).powi(2) + (center.1 - p.1).powi(2)).sqrt()
+        };
+        if max_d.is_some_and(|mx| d > mx) || min_d.is_some_and(|mn| d < mn) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +406,41 @@ mod tests {
             "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
         }});
         assert!(op_geo_intersects(&[Some(xy(5.0, 5.0))], &q).unwrap());
+    }
+
+    #[test]
+    fn near_legacy_planar_bound() {
+        // {$near: [0,0, 5]} (planar): a point ~1.41 away matches, ~7.07 doesn't.
+        let arg = Bson::Array(vec![0.0.into(), 0.0.into(), 5.0.into()]);
+        assert!(op_geo_near(&[Some(xy(1.0, 1.0))], &arg, false).unwrap());
+        assert!(!op_geo_near(&[Some(xy(5.0, 5.0))], &arg, false).unwrap());
+        // Bound-less {$near: [0,0]} matches any point geometry.
+        let bare = Bson::Array(vec![0.0.into(), 0.0.into()]);
+        assert!(op_geo_near(&[Some(xy(99.0, 99.0))], &bare, false).unwrap());
+        // ...but not a non-geometry value.
+        assert!(!op_geo_near(&[Some(Bson::Int32(3))], &bare, false).unwrap());
+    }
+
+    #[test]
+    fn near_geojson_is_spherical_meters() {
+        // GeoJSON form: distances in metres. 0.2 rad ~ 1.28e6 m at the equator.
+        let arg = Bson::Document(doc! {
+            "$geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            "$maxDistance": 1_500_000.0_f64,
+        });
+        assert!(op_geo_near(&[Some(xy(0.0, 0.0))], &arg, true).unwrap()); // dist 0
+                                                                          // ~10 deg away is ~1.11e6 m (< 1.5e6) -> in; tighten the bound to exclude.
+        let tight = Bson::Document(doc! {
+            "$geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            "$maxDistance": 100_000.0_f64,
+        });
+        assert!(!op_geo_near(&[Some(xy(10.0, 10.0))], &tight, true).unwrap());
+    }
+
+    #[test]
+    fn near_malformed_defers() {
+        // A doc arg without $geometry -> Python raises QueryError -> Fallback.
+        let arg = Bson::Document(doc! {"$maxDistance": 5.0_f64});
+        assert!(op_geo_near(&[Some(xy(0.0, 0.0))], &arg, false).is_err());
     }
 }

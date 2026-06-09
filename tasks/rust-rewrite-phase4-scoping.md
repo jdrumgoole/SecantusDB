@@ -167,10 +167,15 @@ build-out.
      wired into `query.rs` `op_matches`. `$center` (Shapely 64-gon buffer) and
      `$near`/`$nearSphere` defer to Python via `Fallback`. 7 unit tests; added
      the `geo = "0.28"` dep to `secantus-core`.
-   - **geo-1b** — `$near` / `$nearSphere` field-operator matching (distance bound;
-     legacy `[x,y,max]` + sibling `$maxDistance`/`$minDistance` — see
-     `query.py` `_parse_near_spec`). Extend `test_rust_query_parity.py` with geo
-     cases.
+   - **geo-1b ✅ DONE** — `$near` / `$nearSphere` field-operator *matching* (within
+     `[$minDistance, $maxDistance]`; sort-by-distance stays in the command layer).
+     Handles the GeoJSON `{$geometry: Point, $maxDistance, $minDistance}` (metres)
+     and legacy `[x,y]`/`[x,y,max]` (planar, or radians→metres for `$nearSphere`)
+     forms; the legacy *sibling* `$maxDistance` form falls back automatically
+     ($maxDistance is a separate unknown op in the condition doc). +3 unit tests.
+     **Still TODO before the geo PR:** extend `test_rust_query_parity.py` with geo
+     cases so CI validates the Shapely↔`geo`-crate agreement (and that
+     `$center`/sibling-form correctly fall back) under the real extension.
    - **geo-2 (storage):** `2d` geohash index (bit-interleaving + bbox scan; no
      crate). **geo-3 (storage):** `2dsphere` S2 coverings (needs `s2` crate —
      verify). **geo-4:** `$geoNear` aggregation stage. When geo-2/3 land, relax
