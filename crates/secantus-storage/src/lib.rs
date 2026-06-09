@@ -1758,6 +1758,90 @@ impl Storage {
         Ok((true, None))
     }
 
+    /// The collection's options document (`{}` if it doesn't exist).
+    /// `local.oplog.rs` reports the synthetic capped shape mongod uses. The
+    /// stored `uuid` stays a BSON Binary (the command layer decodes it). Mirrors
+    /// `storage.get_collection_options`.
+    pub fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document> {
+        if self.enable_oplog && db == "local" && coll == "oplog.rs" {
+            let mut o = Document::new();
+            o.insert("capped", true);
+            o.insert("size", (self.oplog_max_entries as i64) * 16 * 1024);
+            o.insert("max", self.oplog_max_entries as i64);
+            return Ok(o);
+        }
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        Ok(coll_options(&session, db, coll)?.unwrap_or_default())
+    }
+
+    /// Whether the collection has `capped: true`. Mirrors
+    /// `storage.collection_is_capped`.
+    pub fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        Ok(coll_options(&session, db, coll)?
+            .map(|o| o.get_bool("capped").unwrap_or(false))
+            .unwrap_or(false))
+    }
+
+    /// Sum of BSON-encoded document bytes for the collection (the `size` /
+    /// `dataSize` `collStats` reports). Best-effort — excludes WT block
+    /// overhead. Mirrors `storage.collection_data_size`.
+    pub fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let mut total = 0i64;
+        for (_id_k, blob) in self.scan_docs(&session, db, coll)? {
+            total += blob.len() as i64;
+        }
+        Ok(total)
+    }
+
+    /// Per-index byte size as a `{name: bytes}` document: `_id_` is the summed
+    /// `id_key` length over the doc table; each secondary index is its summed
+    /// packed-entry length. Mirrors `storage.index_sizes`.
+    pub fn index_sizes(&self, db: &str, coll: &str) -> Result<Document> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let mut out = Document::new();
+        let mut id_size = 0i64;
+        for (id_k, _blob) in self.scan_docs(&session, db, coll)? {
+            id_size += id_k.len() as i64;
+        }
+        if id_size > 0 {
+            out.insert(ID_INDEX_NAME, id_size);
+        }
+        for (name, packed) in self.collect_entry_rows(&session, db, coll)? {
+            let prev = out.get_i64(&name).unwrap_or(0);
+            out.insert(name, prev + packed.len() as i64);
+        }
+        Ok(out)
+    }
+
+    /// Documents whose `id_key` is strictly greater than `after` (the whole
+    /// collection when `after` is `None`), in natural order, as
+    /// `(id_key, blob)`. Used by the tailable-cursor producer to emit only the
+    /// docs inserted since the last poll. Mirrors
+    /// `storage.scan_docs_after_id_key`.
+    pub fn scan_docs_after_id_key(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let rows = self.scan_docs(&session, db, coll)?;
+        Ok(match after {
+            None => rows,
+            Some(a) => rows
+                .into_iter()
+                .filter(|(id_k, _)| id_k.as_slice() > a)
+                .collect(),
+        })
+    }
+
     // --- secondary indexes (Phase 4 sub-phase 2) ---
 
     /// Create a secondary index `name` over `key_spec` (field → direction `1`/
