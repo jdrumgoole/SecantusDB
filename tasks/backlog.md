@@ -156,6 +156,22 @@ server**; the Rust engines power the separate **Rust server**. The
 `secantus.engine` in-process selection is transitional and being retired (see the
 banner above + `tasks/rust-server-plan.md` §3).
 
+**Rust server build-out (`tasks/rust-server-plan.md` §4).** Done: R1
+(`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /
+`delete` / `count` + the `Storage` trait seam). **Deferred / not yet ported:**
+- [ ] **R2c — `update` command.** Document-form maps to `update_matching`, but
+  pipeline-form `u` (array), `arrayFilters`, `let`, `collation`, and `validator`
+  need storage-signature additions (the Rust `update_matching` takes none). Port
+  the sort-rejection (code 9) + pipeline-stage validation (9 / 168) pre-checks
+  with it.
+- [ ] **`find` command** — lands with R3 (cursor registry) + `secantus-core`
+  projection; first-batch + `getMore`/`killCursors`.
+- [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
+  validation + `writeConcernError` attachment; collection `validator` /
+  `bypassDocumentValidation` (needs `get_collection_options` + the query engine);
+  `_reject_oplog_rs_write`; `let` / `collation` on `delete`; view-collection
+  `count` (needs the aggregation engine). All tracked in `crud.rs`'s module docs.
+
 - [x] **Engine selection** — `secantus.engine` is the single source of truth
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six
   shims consult it; `SecantusDBServer(engine=)` + `--engine` set it. Unit-tested

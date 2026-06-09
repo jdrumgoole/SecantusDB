@@ -33,10 +33,15 @@
 //! [`CommandContext`] only carries what the handshake reads today; it grows as
 //! families are added.
 
+pub mod crud;
 pub mod handshake;
+pub mod storage;
+
+use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
 pub use secantus_wire::{MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE};
+pub use storage::{Storage, StorageError, UpdateOutcome};
 
 /// Max wire protocol version advertised in `hello` (mongod 7.0).
 pub const WIRE_VERSION: i32 = 17;
@@ -52,10 +57,11 @@ pub const DEFAULT_BATCH_SIZE: i32 = 101;
 const VALID_READ_CONCERN_LEVELS: [&str; 5] =
     ["local", "available", "majority", "linearizable", "snapshot"];
 
-/// The per-request state a handler reads. Handshake-scoped for this slice; it
-/// grows (auth, sessions, metrics, …) as command families land. The fields
-/// mirror the subset of `commands.py::CommandContext` the handshake touches.
-#[derive(Debug, Clone)]
+/// The per-request state a handler reads. Handshake- and CRUD-scoped for this
+/// slice; it grows (auth, sessions, cursors, metrics, …) as command families
+/// land. The fields mirror the subset of `commands.py::CommandContext` the
+/// ported handlers touch.
+#[derive(Clone)]
 pub struct CommandContext {
     /// Monotonic per-connection id, surfaced as `connectionId` in `hello`.
     pub connection_id: i64,
@@ -71,10 +77,14 @@ pub struct CommandContext {
     /// the caller (R4 mints it from storage via `current_cluster_time`); a zero
     /// timestamp is harmless when no replica-set block is emitted.
     pub cluster_time: bson::Timestamp,
+    /// The storage backend the data-bearing commands run against. `None` until
+    /// the server (R4) wires one in; the handshake family doesn't need it.
+    pub storage: Option<Arc<dyn Storage>>,
 }
 
 impl CommandContext {
-    /// A minimal context for a plaintext standalone connection.
+    /// A minimal context for a plaintext standalone connection with no storage
+    /// (the handshake family is fully serviceable from this).
     pub fn new(connection_id: i64) -> Self {
         CommandContext {
             connection_id,
@@ -86,6 +96,27 @@ impl CommandContext {
                 time: 0,
                 increment: 0,
             },
+            storage: None,
+        }
+    }
+
+    /// Attach a storage backend (builder-style; used by the server and tests).
+    pub fn with_storage(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// The storage backend, or an `InternalError` if none is configured. Data
+    /// commands call this; a missing backend is a server-wiring bug, not a
+    /// client error.
+    pub fn storage(&self) -> Result<&dyn Storage, CommandError> {
+        match &self.storage {
+            Some(s) => Ok(s.as_ref()),
+            None => Err(CommandError::new(
+                1,
+                "InternalError",
+                "storage backend not configured",
+            )),
         }
     }
 }
@@ -143,6 +174,9 @@ fn lookup(name: &str) -> Option<Handler> {
         "hello" | "isMaster" | "ismaster" => handshake::hello,
         "ping" => handshake::ping,
         "buildInfo" | "buildinfo" => handshake::build_info,
+        "insert" => crud::insert,
+        "delete" => crud::delete,
+        "count" => crud::count,
         _ => return None,
     })
 }

@@ -172,10 +172,27 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     families); `hello`'s `saslSupportedMechs` / `speculativeAuthenticate` /
     client-metadata stash (R5 auth); the `apiStrict` aggregation-stage gate
     (aggregate family).
-  - **R2b+ (next)** — CRUD / cursor / aggregate / admin families, each keeping
-    `test_crud.py` / `test_aggregate.py` / `test_commands*.py` green against the
-    Rust server once R6 can boot it. These need the Rust `Storage` wired into
-    `CommandContext` (the pure-Rust `secantus-storage` crate already exists).
+  - **R2b ✅ DONE** — CRUD write/count family (`insert` / `delete` / `count`) +
+    the storage seam. `secantus-commands` stays **WT-free** via a `Storage`
+    **trait** (`src/storage.rs`: `insert` / `update_matching` / `delete_matching`
+    / `count_matching`, bytes at the seam, a boxed `StorageError` the adapter
+    pre-classifies into per-op `writeError` codes); the real
+    `secantus-storage::Storage` satisfies it through an adapter in the server
+    crate (R4). `CommandContext` gained an `Option<Arc<dyn Storage>>` + a
+    `storage()` accessor (missing backend → `InternalError`). Handlers (ports of
+    `_insert`/`_delete`/`_count`): empty-`documents` → `InvalidLength` (4); `_id`
+    `$`-prefix per-doc rejection (2); ordered/unordered semantics; `writeErrors`
+    index remap from the surviving subset back to original positions; E11000
+    `keyPattern`/`keyValue`; `delete` `{q, limit}` batch; `count` skip/limit
+    clamp. 9 handler tests over an in-memory fake `Storage` (22 crate tests
+    total), `clippy -D warnings` + `fmt` clean. **Deferred (tracked in backlog
+    §7):** `update` (R2c — pipeline-form `u` / `arrayFilters` / `let` /
+    `collation` / `validator` need storage-signature work); `find` (with R3
+    cursors + projection); `writeConcern`, collection `validator`,
+    `_reject_oplog_rs_write`, `let`/`collation` on delete, view-collection count.
+  - **R2c+ (next)** — `update`, then `find` (needs R3), then aggregate / admin
+    families. Each keeps `test_crud.py` / `test_aggregate.py` /
+    `test_commands*.py` green against the Rust server once R6 can boot it.
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL
