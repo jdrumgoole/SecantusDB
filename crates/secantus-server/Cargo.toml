@@ -1,0 +1,24 @@
+[package]
+name = "secantus-server"
+version = "0.5.2-beta.15"
+edition = "2021"
+description = "The standalone SecantusDB Rust server: TCP accept loop + connection handling over secantus-wire + secantus-commands."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+# Part of the Rust-server build-out (tasks/rust-server-plan.md, R4). Not released
+# to crates.io yet.
+publish = false
+
+# The connection loop is **generic over the command `Storage` trait**, so this
+# crate is WT-free: it builds and runs over real TCP in the WT-less `rust` CI
+# job (and this dev sandbox) with any `Storage` impl. The WiredTiger-backed
+# adapter (`secantus_storage::Storage` → the command `Storage` trait) lives
+# elsewhere (R4b) so this crate doesn't link the C library.
+[lib]
+name = "secantus_server"
+crate-type = ["rlib"]
+
+[dependencies]
+bson = { workspace = true }
+secantus-wire = { path = "../secantus-wire" }
+secantus-commands = { path = "../secantus-commands" }

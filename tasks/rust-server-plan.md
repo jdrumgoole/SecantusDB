@@ -249,6 +249,31 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   Python model), per-request `CommandContext`, graceful shutdown. TLS via
   `rustls` (+ `rustls-pemfile`); mTLS peer-cert subject-DN extraction reproduced
   for X509 auth. Gate: `test_server.py` / `test_tls*.py`.
+  - **R4a ✅ DONE** — the accept loop + connection handling, **generic over the
+    command `Storage` trait** (so the crate is WT-free and runs over real TCP in
+    the WT-less CI job / this sandbox). `bind(addr, config, storage, cursors) ->
+    RunningServer` (accept loop on a background thread, one thread per
+    connection, `address()` / `uri()` / `stop()` + Drop-shutdown). Per
+    connection: read header → `body_len` bounds → read body → `parse_body`;
+    `OP_MSG` (merge kind-1 sequences into the body via `_merge_op_msg_body`,
+    honour `moreToCome` = no reply) and legacy `OP_QUERY` (handshake → `OP_REPLY`)
+    both dispatch through `secantus_commands::dispatch`; recoverable wire errors →
+    a `BadValue` reply that keeps the connection (matching
+    `test_wire_malformed.py`), fatal → drop. Read-timeout polling so idle
+    connection threads are reaped on `stop`. **Two WT-free integration tests over
+    real TCP** (`tests/roundtrip.rs`, in-memory `Storage`, hand-rolled wire
+    client): hello / ping / insert / count / find / delete / unknown-command
+    survival / legacy `isMaster`; and `find → getMore → killCursors`. `clippy
+    -D warnings` + `fmt` clean. **`RunningServer` is the exact core R6's embedded
+    Python handle wraps.** **Deferred:** TLS / mTLS (R4 tail); `peer_cert_dn` +
+    auth state (R5); metrics / sessions / failpoints / connreg (their slices);
+    sourcing `cluster_time` from storage (`hello`'s `lastWrite` uses a zero ts
+    until the `Storage` trait exposes `current_cluster_time`).
+  - **R4b (next)** — the WiredTiger adapter: `impl secantus_commands::Storage for
+    secantus_storage::Storage` (bytes at the seam, `Hint` from `RawHint`, error
+    translation: `DuplicateKey` → boxed `DuplicateKey`, `BadHint` / query errors →
+    `WriteError{2}`, else `Internal`). Lives outside the clean workspace (links
+    WT); **compile-checked + tested in CI / a WT machine only.**
 
 - **R5 — Auth** (in the server crate or `crates/secantus-auth`). SCRAM-SHA-1/256
   (`hmac` / `sha2` / `pbkdf2`), MONGODB-X509, and the RBAC checks. Port `auth.py`

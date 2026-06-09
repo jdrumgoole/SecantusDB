@@ -161,8 +161,18 @@ banner above + `tasks/rust-server-plan.md` §3).
 `delete` / `count` + the `Storage` trait seam), R3a (`CursorRegistry` +
 non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projection
 / cursor split → the full `find → getMore → killCursors` path works in dispatch),
-`update` (document-form, multi/upsert, pipeline-shape validation).
+`update` (document-form, multi/upsert, pipeline-shape validation), R4a
+(`secantus-server`: accept loop + connection handling, generic over the command
+`Storage` trait — runs over real TCP, two WT-free roundtrip integration tests).
 **Deferred / not yet ported:**
+- [ ] **R4b — WiredTiger storage adapter** (`impl secantus_commands::Storage for
+  secantus_storage::Storage`): bytes at the seam, `Hint` from `RawHint`, error
+  translation (DuplicateKey/BadHint/query → the command `StorageError`). Links WT,
+  so it lives outside the clean workspace and is CI-/WT-machine-only.
+- [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
+- [ ] **R6 — embedded Python handle**: a thin PyO3 `#[pyclass]` over
+  `secantus_server::RunningServer` (`start`/`stop`/`address`), so `pymongo` can
+  connect in-process — the point the conformance gauge finally runs against Rust.
 - [ ] **`update` pipeline-form + options** — a *valid* pipeline-form `u` (`[...]`)
   surfaces as a per-op writeError because the Rust `update_matching` takes
   `&Document` and `secantus-storage` has no pipeline-update path. Same for

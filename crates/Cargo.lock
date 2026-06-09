@@ -652,6 +652,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "secantus-server"
+version = "0.5.2-beta.15"
+dependencies = [
+ "bson",
+ "secantus-commands",
+ "secantus-wire",
+]
+
+[[package]]
 name = "secantus-wire"
 version = "0.5.2-beta.15"
 dependencies = [
