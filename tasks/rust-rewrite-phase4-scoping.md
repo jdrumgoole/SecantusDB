@@ -177,16 +177,25 @@ build-out.
      `test_rust_query_parity.py` — validated locally (built the extension; 105
      curated cases pass, incl. geo) and re-run by CI's `rust` job under the real
      extension.
-   - **geo-2 (secantus-storage):** `2d` geohash index — write bit-interleaved
-     buckets at the index's `bits` precision; route `$geoWithin` `$box`/`$center`
-     to a single `(lo,hi)` bbox range scan. No external crate.
+   - **geo-2 ✅ DONE** — `2d` geohash index in `secantus-storage`. Core helpers in
+     `secantus_core::geo` (`cell_2d` / `covering_2d` / `encode_cell` / `doc_point`
+     / `query_within_bbox`). `IndexDesc.geo_2d` + `parse_geo_2d`; `create_index`
+     accepts a single-field `2d` (flagged `multikey:true` so the numeric pickers
+     skip it; `2dsphere`/text/hashed still rejected) and builds point-only cell
+     entries; `write`/`delete_index_entries` maintain one geohash entry per
+     point-valued doc. `try_geo_2d_id_keys` routes `{field:{$geoWithin: region}}`
+     to the Z-order covering range scan (reusing `range_scan_index`), with
+     `find_matching` re-checking each candidate via `matches()` (geo-1); `explain`
+     reports `IXSCAN {field: "2d"}`. New WT-backed tests in `tests/geo.rs` (box /
+     centerSphere within, point-only, delete/replace upkeep, create-over-existing,
+     other geo types still rejected).
    - **geo-3 (secantus-storage):** `2dsphere` S2 cell coverings (needs `s2`
      crate — verify first). Each geometry writes covering cells + ancestors;
      queries do exact cell point-lookups + Shapely/haversine verify.
    - **geo-4:** `$geoNear` aggregation stage.
-   - When geo-2/3 land, relax `create_index`'s current `CreateIndexUnsupported`
-     rejection of `2dsphere`/`2d` (text/hashed stay rejected), and flag geo
-     indexes `multikey: true` so the regular pickers skip them.
+   - When geo-3 lands, relax `create_index`'s `2dsphere` rejection and flag it
+     `multikey: true`. (`$geoWithin` `$center` and `$near` index routing aren't
+     accelerated yet — they COLLSCAN, still correct via `matches()`/`Fallback`.)
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
    time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
    acceleration here. Gate: `test_change_streams.py`. **Sliced** (3a → 3e):

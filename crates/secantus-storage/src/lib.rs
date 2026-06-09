@@ -91,6 +91,60 @@ struct IndexDesc {
     /// `partialFilterExpression` if non-empty — entries are written (and the
     /// index considered) only for docs/queries that match / imply it.
     partial: Option<Document>,
+    /// `Some` for a `2d` geohash index — its field + bucketing params. Geo
+    /// indexes use a separate point-only entry scheme, not `index_key_variants`.
+    geo_2d: Option<Geo2d>,
+}
+
+/// A `2d` geohash index's parameters (field + bucketing range / precision).
+#[derive(Clone)]
+struct Geo2d {
+    field: String,
+    bits: u32,
+    lo: f64,
+    hi: f64,
+}
+
+impl Geo2d {
+    /// The geohash cell (8-byte big-endian key bytes) for a point-like value, or
+    /// `None` if the field value isn't a point (a `2d` index is point-only).
+    fn cell_kb(&self, value: &Bson) -> Option<Vec<u8>> {
+        let (x, y) = secantus_core::geo::doc_point(value)?;
+        let cell = secantus_core::geo::cell_2d(x, y, self.bits, self.lo, self.hi);
+        Some(secantus_core::geo::encode_cell(cell).to_vec())
+    }
+}
+
+/// Parse a `2d` geo index from its key spec (`{field: "2d"}`) + options
+/// (`bits` / `min` / `max`, defaulting to mongod's 26 / -180 / 180). `None` if
+/// it isn't a single-field `2d` index.
+fn parse_geo_2d(key_spec: &Document, opts: &Document) -> Option<Geo2d> {
+    if key_spec.len() != 1 {
+        return None;
+    }
+    let (field, v) = key_spec.iter().next().unwrap();
+    if v.as_str() != Some("2d") {
+        return None;
+    }
+    let numf = |k: &str, default: f64| -> f64 {
+        match opts.get(k) {
+            Some(Bson::Double(x)) => *x,
+            Some(Bson::Int32(x)) => f64::from(*x),
+            Some(Bson::Int64(x)) => *x as f64,
+            _ => default,
+        }
+    };
+    let bits = match opts.get("bits") {
+        Some(Bson::Int32(b)) => (*b).clamp(1, 32) as u32,
+        Some(Bson::Int64(b)) => (*b).clamp(1, 32) as u32,
+        _ => 26,
+    };
+    Some(Geo2d {
+        field: field.clone(),
+        bits,
+        lo: numf("min", -180.0),
+        hi: numf("max", 180.0),
+    })
 }
 
 /// A unique-index violation: the offending index plus the mongod-shaped
@@ -1370,15 +1424,20 @@ impl Storage {
         if name == ID_INDEX_NAME {
             return Ok(false);
         }
-        for (field, v) in key_spec {
-            if direction_of(v).is_none() {
-                let ty = match v {
-                    Bson::String(s) => s.clone(),
-                    other => format!("{other:?}"),
-                };
-                return Err(StorageError::CreateIndexUnsupported(format!(
-                    "{ty} indexes (field {field:?}) are not supported by the Rust storage engine yet"
-                )));
+        // `2d` geo indexes are supported (point-only geohash). Other non-numeric
+        // index types (2dsphere / text / hashed) are still rejected.
+        let geo = parse_geo_2d(key_spec, options);
+        if geo.is_none() {
+            for (field, v) in key_spec {
+                if direction_of(v).is_none() {
+                    let ty = match v {
+                        Bson::String(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    return Err(StorageError::CreateIndexUnsupported(format!(
+                        "{ty} indexes (field {field:?}) are not supported by the Rust storage engine yet"
+                    )));
+                }
             }
         }
 
@@ -1409,58 +1468,74 @@ impl Storage {
             Err(e) => return Err(e.into()),
         }
 
-        let sparse = options.get_bool("sparse").unwrap_or(false);
-        let unique = options.get_bool("unique").unwrap_or(false);
-        let partial = options
-            .get_document("partialFilterExpression")
-            .ok()
-            .filter(|d| !d.is_empty())
-            .cloned();
-
-        // One doc-table walk: gate by the partial filter, detect multikey, probe
-        // uniqueness on the canonical key, and build all entry-key variants.
-        let mut multikey = false;
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        for (id_k, blob) in self.scan_docs(&session, db, coll)? {
-            let d = decode_doc(&blob)?;
-            if let Some(pf) = &partial {
-                if !query_matches(&d, pf, &Document::new(), None)
-                    .map_err(|_| StorageError::QueryUnsupported)?
-                {
-                    continue;
+        let mut stored_options = options.clone();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = if let Some(geo) = &geo {
+            // 2d geo index: one geohash cell per point-valued doc. Always flagged
+            // multikey so the regular (numeric) pickers skip it.
+            stored_options.insert("multikey", Bson::Boolean(true));
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for (id_k, blob) in self.scan_docs(&session, db, coll)? {
+                let d = decode_doc(&blob)?;
+                if let Some(kb) = get_path(&d, &geo.field).and_then(|v| geo.cell_kb(v)) {
+                    out.push((kb, id_k));
                 }
             }
-            if !multikey && doc_makes_multikey(&d, key_spec) {
-                multikey = true;
-            }
-            if unique {
-                if let Some(canonical) = index_key(&d, key_spec, sparse)? {
-                    if !seen.insert(canonical) {
-                        // A pre-existing doc already holds this key — can't build
-                        // a unique index over the data.
-                        let mut key_value = Document::new();
-                        for f in key_spec.keys() {
-                            key_value
-                                .insert(f.clone(), get_path(&d, f).cloned().unwrap_or(Bson::Null));
-                        }
-                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
-                            index: name.to_string(),
-                            key_pattern: key_spec.clone(),
-                            key_value,
-                        })));
+            out
+        } else {
+            let sparse = options.get_bool("sparse").unwrap_or(false);
+            let unique = options.get_bool("unique").unwrap_or(false);
+            let partial = options
+                .get_document("partialFilterExpression")
+                .ok()
+                .filter(|d| !d.is_empty())
+                .cloned();
+
+            // One doc-table walk: gate by the partial filter, detect multikey,
+            // probe uniqueness on the canonical key, build all entry-key variants.
+            let mut multikey = false;
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            for (id_k, blob) in self.scan_docs(&session, db, coll)? {
+                let d = decode_doc(&blob)?;
+                if let Some(pf) = &partial {
+                    if !query_matches(&d, pf, &Document::new(), None)
+                        .map_err(|_| StorageError::QueryUnsupported)?
+                    {
+                        continue;
                     }
                 }
+                if !multikey && doc_makes_multikey(&d, key_spec) {
+                    multikey = true;
+                }
+                if unique {
+                    if let Some(canonical) = index_key(&d, key_spec, sparse)? {
+                        if !seen.insert(canonical) {
+                            // A pre-existing doc already holds this key — can't
+                            // build a unique index over the data.
+                            let mut key_value = Document::new();
+                            for f in key_spec.keys() {
+                                key_value.insert(
+                                    f.clone(),
+                                    get_path(&d, f).cloned().unwrap_or(Bson::Null),
+                                );
+                            }
+                            return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                                index: name.to_string(),
+                                key_pattern: key_spec.clone(),
+                                key_value,
+                            })));
+                        }
+                    }
+                }
+                for kb in index_key_variants(&d, key_spec, sparse)? {
+                    entries.push((kb, id_k.clone()));
+                }
             }
-            for kb in index_key_variants(&d, key_spec, sparse)? {
-                entries.push((kb, id_k.clone()));
+            if multikey {
+                stored_options.insert("multikey", Bson::Boolean(true));
             }
-        }
-
-        let mut stored_options = options.clone();
-        if multikey {
-            stored_options.insert("multikey", Bson::Boolean(true));
-        }
+            entries
+        };
         let mut payload_doc = Document::new();
         payload_doc.insert("key", Bson::Document(key_spec.clone()));
         payload_doc.insert("options", Bson::Document(stored_options));
@@ -1682,6 +1757,17 @@ impl Storage {
         let id_k = id_key(id)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
+            // 2d geo index: one cell entry per point-valued field (point-only).
+            if let Some(geo) = &desc.geo_2d {
+                if let Some(kb) = get_path(doc, &geo.field).and_then(|v| geo.cell_kb(v)) {
+                    let packed = pack_entry(&kb, &id_k);
+                    cur.reset()?;
+                    cur.set_key_sssu(db, coll, &desc.name, &packed);
+                    cur.set_value_u(b"");
+                    cur.insert()?;
+                }
+                continue;
+            }
             if !self.doc_in_partial(doc, desc)? {
                 continue;
             }
@@ -1716,6 +1802,19 @@ impl Storage {
         let id_k = id_key(id)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
+            if let Some(geo) = &desc.geo_2d {
+                if let Some(kb) = get_path(doc, &geo.field).and_then(|v| geo.cell_kb(v)) {
+                    let packed = pack_entry(&kb, &id_k);
+                    cur.reset()?;
+                    cur.set_key_sssu(db, coll, &desc.name, &packed);
+                    match cur.remove() {
+                        Ok(()) => {}
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                continue;
+            }
             if !self.doc_in_partial(doc, desc)? {
                 continue;
             }
@@ -1756,12 +1855,14 @@ impl Storage {
                     .ok()
                     .filter(|d| !d.is_empty())
                     .cloned();
+                let geo_2d = parse_geo_2d(&key_spec, &opts);
                 IndexDesc {
                     name,
                     key_spec,
                     sparse: opts.get_bool("sparse").unwrap_or(false),
                     unique: opts.get_bool("unique").unwrap_or(false),
                     partial,
+                    geo_2d,
                 }
             })
             .collect())
@@ -2307,8 +2408,13 @@ impl Storage {
                 }
             }
         }
-        // (Geo dispatch -> sub-phase 3.) Bare-equality filters of any size can
-        // use a compound (or single-field) index whose leading fields cover them.
+        // Geo dispatch: a `$geoWithin` on a 2d-indexed field scans the geohash
+        // covering range.
+        if let Some(r) = self.try_geo_2d_id_keys(session, db, coll, filter)? {
+            return Ok(Some(r));
+        }
+        // Bare-equality filters of any size can use a compound (or single-field)
+        // index whose leading fields cover them.
         if filter.values().all(|v| !matches!(v, Bson::Document(_))) {
             if let Some(r) = self.try_compound_eq_id_keys(session, db, coll, filter)? {
                 return Ok(Some(r));
@@ -2329,6 +2435,73 @@ impl Storage {
             None => return Ok(None),
         };
         self.lookup_id_keys_via_leading_field(session, db, coll, &idx, value)
+    }
+
+    /// Find the `2d` index covering `field`, as `(index_name, params)`.
+    fn geo_2d_for(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        field: &str,
+    ) -> Result<Option<(String, Geo2d)>> {
+        for desc in self.index_descs(session, db, coll)? {
+            if let Some(g) = &desc.geo_2d {
+                if g.field == field {
+                    return Ok(Some((desc.name.clone(), g.clone())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Candidate `id_key`s for `{field: {$geoWithin: <region>}}` via a `2d`
+    /// index: scan the Z-order geohash range covering the region's bounding box
+    /// (a superset — `find_matching` re-checks each with `matches()`). `None`
+    /// (→ COLLSCAN) if there's no 2d index on `field`, the filter isn't a lone
+    /// `$geoWithin`, or the region's matching itself defers (e.g. `$center`).
+    fn try_geo_2d_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if filter.len() != 1 {
+            return Ok(None);
+        }
+        let (field, value) = filter.iter().next().unwrap();
+        let within = match value {
+            Bson::Document(d) => match d.get_document("$geoWithin") {
+                Ok(w) => w,
+                Err(_) => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let (name, g) = match self.geo_2d_for(session, db, coll, field)? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let (min_x, min_y, max_x, max_y) = match secantus_core::geo::query_within_bbox(within) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let (clo, chi) =
+            secantus_core::geo::covering_2d(min_x, min_y, max_x, max_y, g.bits, g.lo, g.hi);
+        let lo_kb = secantus_core::geo::encode_cell(clo);
+        let hi_kb = secantus_core::geo::encode_cell(chi);
+        let ids = self.range_scan_index(
+            session,
+            db,
+            coll,
+            &name,
+            Some(&lo_kb[..]),
+            true,
+            Some(&hi_kb[..]),
+            true,
+            None,
+        )?;
+        Ok(Some(ids))
     }
 
     /// The best index whose leading field is `field`, as `(name, direction,
@@ -2773,6 +2946,18 @@ impl Storage {
                     kp.insert("_id", 1i32);
                     return Ok(Some((ID_INDEX_NAME.to_string(), kp)));
                 }
+            }
+        }
+        // Geo: a `$geoWithin` served by a 2d index (mirrors try_geo_2d_id_keys).
+        if self
+            .try_geo_2d_id_keys(session, db, coll, filter)?
+            .is_some()
+        {
+            let (field, _) = filter.iter().next().unwrap();
+            if let Some((name, _g)) = self.geo_2d_for(session, db, coll, field)? {
+                let mut kp = Document::new();
+                kp.insert(field.clone(), "2d");
+                return Ok(Some((name, kp)));
             }
         }
         if filter.values().all(|v| !matches!(v, Bson::Document(_))) {
