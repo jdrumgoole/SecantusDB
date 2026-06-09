@@ -181,8 +181,12 @@ fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson, coll: Option<&Colla
         "$bitsAnySet" => op_bits(values, arg, |v, m| v & m != 0),
         "$bitsAllClear" => op_bits(values, arg, |v, m| v & m == 0),
         "$bitsAnyClear" => op_bits(values, arg, |v, m| v & m != m),
-        // $regex/$options, geo, and anything unknown -> Python (Python raises
-        // QueryError for genuinely-unknown operators, preserved).
+        "$geoWithin" => crate::geo::op_geo_within(values, arg),
+        "$geoIntersects" => crate::geo::op_geo_intersects(values, arg),
+        "$near" => crate::geo::op_geo_near(values, arg, false),
+        "$nearSphere" => crate::geo::op_geo_near(values, arg, true),
+        // $regex/$options, $center (Shapely 64-gon), and anything unknown ->
+        // Python (Python raises QueryError for genuinely-unknown operators).
         _ => Err(Fallback),
     }
 }

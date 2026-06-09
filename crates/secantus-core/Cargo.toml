@@ -18,3 +18,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 bson = { workspace = true }
+# Planar geometry (DE-9IM `Relate`) for the `$geoWithin` / `$geoIntersects`
+# query operators — the same OGC lineage as Shapely, so containment semantics
+# line up with the pure-Python geo path.
+geo = "0.28"
