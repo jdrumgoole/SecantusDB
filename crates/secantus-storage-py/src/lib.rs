@@ -550,6 +550,20 @@ impl RustStorage {
         self.inner.oplog_tail_seq()
     }
 
+    /// Block (releasing the GIL) until the oplog tail seq exceeds `after_seq`, a
+    /// `notify_oplog_waiters` fires, or `timeout_ms` elapses; returns the current
+    /// tail seq. The change-stream tailable `getMore` waits here instead of on a
+    /// Python `threading.Condition`.
+    fn wait_for_oplog(&self, py: Python<'_>, after_seq: i64, timeout_ms: u64) -> i64 {
+        py.allow_threads(|| self.inner.wait_for_oplog(after_seq, timeout_ms))
+    }
+
+    /// Wake every `wait_for_oplog` waiter without advancing the oplog (e.g. on
+    /// `killCursors`).
+    fn notify_oplog_waiters(&self) {
+        self.inner.notify_oplog_waiters();
+    }
+
     /// The pre-image doc stored for oplog `seq` (BSON), or `None`.
     fn read_preimage(&self, py: Python<'_>, seq: i64) -> PyResult<Option<Py<PyBytes>>> {
         self.inner

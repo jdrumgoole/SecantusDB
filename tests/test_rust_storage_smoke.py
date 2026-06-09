@@ -163,6 +163,41 @@ def test_engine_fallback_exception_exported():
     assert issubclass(ss.EngineFallback, Exception)
 
 
+def test_wait_for_oplog_surface(tmp_path):
+    """The tailable-wait primitive: timeout, already-advanced, and threaded wake."""
+    import threading
+    import time
+
+    st = ss.RustStorage(str(tmp_path))
+    tail = st.oplog_tail_seq()
+
+    # Idle: returns ~after the timeout with the tail unchanged.
+    t0 = time.monotonic()
+    assert st.wait_for_oplog(tail, 200) == tail
+    assert time.monotonic() - t0 >= 0.15
+
+    # A write advances the tail; a wait against the old tail returns at once.
+    st.insert_one("app", "c", bson.encode({"_id": 1}))
+    assert st.wait_for_oplog(tail, 5000) > tail
+
+    # Threaded wake: a blocked waiter is released by a concurrent insert. This
+    # also proves the GIL is released while blocking (the insert thread runs).
+    captured = st.oplog_tail_seq()
+    result = {}
+
+    def wait(st=st, captured=captured, result=result):
+        result["tail"] = st.wait_for_oplog(captured, 10_000)
+
+    w = threading.Thread(target=wait)
+    w.start()
+    time.sleep(0.15)
+    st.insert_one("app", "c", bson.encode({"_id": 2}))
+    w.join(timeout=5)
+    assert not w.is_alive()
+    assert result["tail"] > captured
+    del st
+
+
 def test_users_roles_profile_surface(tmp_path):
     """The auth + profiling surface: user/role record CRUD + per-db profile."""
     st = ss.RustStorage(str(tmp_path))
