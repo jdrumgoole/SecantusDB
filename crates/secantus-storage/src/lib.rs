@@ -24,6 +24,10 @@ use std::sync::Mutex;
 use bson::oid::ObjectId;
 use bson::spec::BinarySubtype;
 use bson::{Binary, Bson, Document};
+use s2::cellid::CellID;
+use s2::latlng::LatLng;
+use s2::rect::Rect;
+use s2::region::RegionCoverer;
 use secantus_core::get_path;
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
@@ -94,6 +98,9 @@ struct IndexDesc {
     /// `Some` for a `2d` geohash index — its field + bucketing params. Geo
     /// indexes use a separate point-only entry scheme, not `index_key_variants`.
     geo_2d: Option<Geo2d>,
+    /// `Some` for a `2dsphere` S2 index — its field. Writes covering cells +
+    /// ancestors per geometry, not `index_key_variants`.
+    geo_sphere: Option<GeoSphere>,
 }
 
 /// A `2d` geohash index's parameters (field + bucketing range / precision).
@@ -145,6 +152,101 @@ fn parse_geo_2d(key_spec: &Document, opts: &Document) -> Option<Geo2d> {
         lo: numf("min", -180.0),
         hi: numf("max", 180.0),
     })
+}
+
+/// A `2dsphere` index's parameters — just the field. Spherical indexes use S2
+/// cell coverings: each indexed geometry writes its covering cells *plus every
+/// ancestor back to level 0* (mirroring real-mongo's S2 scheme and
+/// `geo_index.s2_doc_covering`), so a query covering at any level finds it.
+#[derive(Clone)]
+struct GeoSphere {
+    field: String,
+}
+
+impl GeoSphere {
+    /// The S2 cell key bytes (8-byte big-endian, covering + ancestors) for a
+    /// doc field value: a point covers its leaf cell + ancestors; any other
+    /// geometry covers its bounding rect (over-covers; the `matches()` verifier
+    /// filters false positives). Empty when the value isn't a geometry.
+    fn cell_kbs(&self, value: &Bson) -> Vec<Vec<u8>> {
+        let cells = if let Some((x, y)) = secantus_core::geo::doc_point(value) {
+            s2_cells_for_point(x, y)
+        } else if let Some((min_x, min_y, max_x, max_y)) = secantus_core::geo::doc_bbox(value) {
+            s2_cells_for_bbox(min_x, min_y, max_x, max_y)
+        } else {
+            return Vec::new();
+        };
+        cells
+            .into_iter()
+            .map(|c| secantus_core::geo::encode_cell(c).to_vec())
+            .collect()
+    }
+}
+
+/// Parse a `2dsphere` geo index from its key spec (`{field: "2dsphere"}`).
+/// `None` if it isn't a single-field `2dsphere` index.
+fn parse_geo_sphere(key_spec: &Document) -> Option<GeoSphere> {
+    if key_spec.len() != 1 {
+        return None;
+    }
+    let (field, v) = key_spec.iter().next().unwrap();
+    if v.as_str() != Some("2dsphere") {
+        return None;
+    }
+    Some(GeoSphere {
+        field: field.clone(),
+    })
+}
+
+/// The S2 region coverer SecantusDB uses for `2dsphere` coverings (mirrors
+/// `geo_index._make_coverer`: min level 4, max level 16, 64 cells, level_mod 1).
+fn s2_coverer() -> RegionCoverer {
+    RegionCoverer {
+        min_level: 4,
+        max_level: 16,
+        level_mod: 1,
+        max_cells: 64,
+    }
+}
+
+/// Append `cell` and every ancestor up to level 0 to `out` (deduped via `seen`).
+/// Mirrors `geo_index._cell_with_ancestors`.
+fn cell_with_ancestors(cell: CellID, out: &mut Vec<u64>, seen: &mut HashSet<u64>) {
+    let mut c = cell;
+    loop {
+        if seen.insert(c.0) {
+            out.push(c.0);
+        }
+        let lvl = c.level();
+        if lvl == 0 {
+            break;
+        }
+        c = c.parent(lvl - 1);
+    }
+}
+
+/// S2 cells (covering + ancestors) for a point at `(lng, lat)` — its leaf cell
+/// plus every ancestor. Mirrors `geo_index.s2_doc_covering` for a `Point`.
+fn s2_cells_for_point(lng: f64, lat: f64) -> Vec<u64> {
+    let leaf = CellID::from(LatLng::from_degrees(lat, lng));
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    cell_with_ancestors(leaf, &mut out, &mut seen);
+    out
+}
+
+/// S2 cells (covering + ancestors) for a lng/lat bounding box. Covers the
+/// `LatLngRect` (s2sphere covers shapes via their bounding rect — over-covers,
+/// filtered later) and expands every covering cell to its ancestors.
+fn s2_cells_for_bbox(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<u64> {
+    let rect = Rect::from_degrees(min_y, min_x, max_y, max_x);
+    let union = s2_coverer().covering(&rect);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for c in union.0 {
+        cell_with_ancestors(c, &mut out, &mut seen);
+    }
+    out
 }
 
 /// A unique-index violation: the offending index plus the mongod-shaped
@@ -1424,10 +1526,11 @@ impl Storage {
         if name == ID_INDEX_NAME {
             return Ok(false);
         }
-        // `2d` geo indexes are supported (point-only geohash). Other non-numeric
-        // index types (2dsphere / text / hashed) are still rejected.
+        // `2d` (point-only geohash) and `2dsphere` (S2 cell) geo indexes are
+        // supported. Other non-numeric index types (text / hashed) are rejected.
         let geo = parse_geo_2d(key_spec, options);
-        if geo.is_none() {
+        let geo_sphere = parse_geo_sphere(key_spec);
+        if geo.is_none() && geo_sphere.is_none() {
             for (field, v) in key_spec {
                 if direction_of(v).is_none() {
                     let ty = match v {
@@ -1478,6 +1581,20 @@ impl Storage {
                 let d = decode_doc(&blob)?;
                 if let Some(kb) = get_path(&d, &geo.field).and_then(|v| geo.cell_kb(v)) {
                     out.push((kb, id_k));
+                }
+            }
+            out
+        } else if let Some(gs) = &geo_sphere {
+            // 2dsphere S2 index: covering cells + ancestors per geometry-valued
+            // doc. Flagged multikey (one doc → many cell entries).
+            stored_options.insert("multikey", Bson::Boolean(true));
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for (id_k, blob) in self.scan_docs(&session, db, coll)? {
+                let d = decode_doc(&blob)?;
+                if let Some(v) = get_path(&d, &gs.field) {
+                    for kb in gs.cell_kbs(v) {
+                        out.push((kb, id_k.clone()));
+                    }
                 }
             }
             out
@@ -1768,6 +1885,19 @@ impl Storage {
                 }
                 continue;
             }
+            // 2dsphere S2 index: covering cells + ancestors per geometry field.
+            if let Some(gs) = &desc.geo_sphere {
+                if let Some(v) = get_path(doc, &gs.field) {
+                    for kb in gs.cell_kbs(v) {
+                        let packed = pack_entry(&kb, &id_k);
+                        cur.reset()?;
+                        cur.set_key_sssu(db, coll, &desc.name, &packed);
+                        cur.set_value_u(b"");
+                        cur.insert()?;
+                    }
+                }
+                continue;
+            }
             if !self.doc_in_partial(doc, desc)? {
                 continue;
             }
@@ -1815,6 +1945,21 @@ impl Storage {
                 }
                 continue;
             }
+            if let Some(gs) = &desc.geo_sphere {
+                if let Some(v) = get_path(doc, &gs.field) {
+                    for kb in gs.cell_kbs(v) {
+                        let packed = pack_entry(&kb, &id_k);
+                        cur.reset()?;
+                        cur.set_key_sssu(db, coll, &desc.name, &packed);
+                        match cur.remove() {
+                            Ok(()) => {}
+                            Err(e) if e.is_not_found() => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+                continue;
+            }
             if !self.doc_in_partial(doc, desc)? {
                 continue;
             }
@@ -1856,6 +2001,7 @@ impl Storage {
                     .filter(|d| !d.is_empty())
                     .cloned();
                 let geo_2d = parse_geo_2d(&key_spec, &opts);
+                let geo_sphere = parse_geo_sphere(&key_spec);
                 IndexDesc {
                     name,
                     key_spec,
@@ -1863,6 +2009,7 @@ impl Storage {
                     unique: opts.get_bool("unique").unwrap_or(false),
                     partial,
                     geo_2d,
+                    geo_sphere,
                 }
             })
             .collect())
@@ -2409,8 +2556,11 @@ impl Storage {
             }
         }
         // Geo dispatch: a `$geoWithin` on a 2d-indexed field scans the geohash
-        // covering range.
+        // covering range; on a 2dsphere field, the S2 cell covering.
         if let Some(r) = self.try_geo_2d_id_keys(session, db, coll, filter)? {
+            return Ok(Some(r));
+        }
+        if let Some(r) = self.try_geo_sphere_id_keys(session, db, coll, filter)? {
             return Ok(Some(r));
         }
         // Bare-equality filters of any size can use a compound (or single-field)
@@ -2502,6 +2652,69 @@ impl Storage {
             None,
         )?;
         Ok(Some(ids))
+    }
+
+    /// Find the `2dsphere` index covering `field`, as `(index_name, params)`.
+    fn geo_sphere_for(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        field: &str,
+    ) -> Result<Option<(String, GeoSphere)>> {
+        for desc in self.index_descs(session, db, coll)? {
+            if let Some(g) = &desc.geo_sphere {
+                if g.field == field {
+                    return Ok(Some((desc.name.clone(), g.clone())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Candidate `id_key`s for `{field: {$geoWithin: <region>}}` via a `2dsphere`
+    /// index: S2-cover the query region's bounding box (cells + ancestors) and
+    /// do an exact point-lookup per cell against the entries table, unioning the
+    /// hits (a superset — `find_matching` re-checks each with `matches()`).
+    /// `None` (→ COLLSCAN) if there's no 2dsphere index on `field`, the filter
+    /// isn't a lone `$geoWithin`, or the region's matching itself defers.
+    fn try_geo_sphere_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if filter.len() != 1 {
+            return Ok(None);
+        }
+        let (field, value) = filter.iter().next().unwrap();
+        let within = match value {
+            Bson::Document(d) => match d.get_document("$geoWithin") {
+                Ok(w) => w,
+                Err(_) => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let (name, _gs) = match self.geo_sphere_for(session, db, coll, field)? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let (min_x, min_y, max_x, max_y) = match secantus_core::geo::query_within_bbox(within) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for cid in s2_cells_for_bbox(min_x, min_y, max_x, max_y) {
+            let kb = secantus_core::geo::encode_cell(cid);
+            for id_k in self.scan_index_for_id_keys(session, db, coll, &name, &kb, false)? {
+                if seen.insert(id_k.clone()) {
+                    out.push(id_k);
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     /// The best index whose leading field is `field`, as `(name, direction,
@@ -2957,6 +3170,18 @@ impl Storage {
             if let Some((name, _g)) = self.geo_2d_for(session, db, coll, field)? {
                 let mut kp = Document::new();
                 kp.insert(field.clone(), "2d");
+                return Ok(Some((name, kp)));
+            }
+        }
+        // Geo: a `$geoWithin` served by a 2dsphere index.
+        if self
+            .try_geo_sphere_id_keys(session, db, coll, filter)?
+            .is_some()
+        {
+            let (field, _) = filter.iter().next().unwrap();
+            if let Some((name, _g)) = self.geo_sphere_for(session, db, coll, field)? {
+                let mut kp = Document::new();
+                kp.insert(field.clone(), "2dsphere");
                 return Ok(Some((name, kp)));
             }
         }
