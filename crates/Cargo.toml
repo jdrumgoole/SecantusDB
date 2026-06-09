@@ -9,9 +9,11 @@
 #   * secantus-wire    — pure-Rust MongoDB wire-protocol framing (R1 of the Rust
 #                        server, tasks/rust-server-plan.md). No PyO3, no native
 #                        deps beyond `bson`, so it builds in the same `rust` CI job.
+#   * secantus-commands — pure-Rust command dispatch + handlers (R2). Depends on
+#                        secantus-wire; no PyO3 / native deps, same `rust` CI job.
 [workspace]
 resolver = "2"
-members = ["secantus-core", "secantus-core-py", "secantus-wire"]
+members = ["secantus-core", "secantus-core-py", "secantus-wire", "secantus-commands"]
 # secantus-wt (the WiredTiger FFI / storage foundation, Phase 4) is intentionally
 # NOT a workspace member yet: it links the vendored WiredTiger C library, which
 # isn't present in the maturin manylinux build containers or wired into the

@@ -148,16 +148,34 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   -D warnings` + `fmt` clean. **Follow-up:** dispatch (R2) currently re-decodes
   the borrowed body — a later optimisation can return the validated owned doc.
 
-- **R2 — Command dispatch** (`crates/secantus-commands`, or a module of the
-  server crate). Port `commands.py`: the dispatch table keyed on the first doc
-  key, the handshake family (`hello`/`isMaster`/`ping`/`buildInfo`/…), CRUD
+- **R2 — Command dispatch** (`crates/secantus-commands`). Port `commands.py`: the
+  dispatch table keyed on the first doc key, the handshake family
+  (`hello`/`isMaster`/`ping`/`buildInfo`/…), CRUD
   (`insert`/`find`/`update`/`delete`/`count`/`drop`/`aggregate`/`findAndModify`/
   `listCollections`/…), the error contract (handler error →
   `{ok:0, errmsg, code, codeName}`; unknown command → `59 CommandNotFound` so the
-  connection survives — a Rust `CommandError` + top-level `catch` in dispatch).
-  The widest slice; sub-slice by command family and keep `test_crud.py` /
-  `test_aggregate.py` / `test_commands*.py` green against the Rust server per
-  family.
+  connection survives). The widest slice; **sub-sliced by command family**:
+  - **R2a ✅ DONE** — dispatch framework + handshake family. `command_name`
+    (first key), a `Handler` registry (`lookup`), the [`CommandError`] triple +
+    `into_reply` (`{ok:0, errmsg, code, codeName}`; unknown → `59
+    CommandNotFound`), and the cross-cutting validation `dispatch` runs first:
+    `readConcern.level` (`FailedToParse` 9 / `SnapshotUnavailable` 246) and
+    `apiVersion` / `apiStrict` (`APIVersionError` 322 / `APIStrictError` 323,
+    `distinct` name gate). Handlers: `hello`/`isMaster`/`ismaster` (standalone +
+    single-node `secantus` replica-set block via `ctx.cluster_time`,
+    `accessControlEnabled`, int64 `connectionId`/`counter`), `ping`,
+    `buildInfo`/`buildinfo`. Handlers return `Result<Document, CommandError>` —
+    no Python-style `try/except` (typed errors carry their own code). 13 unit
+    tests, `clippy -D warnings` + `fmt` clean; added to the workspace. **Deferred
+    to later slices:** metrics / session-TTL touch / `--auth` gating / RBAC /
+    failpoints / profiling / `writeConcernError` attachment (land with their
+    families); `hello`'s `saslSupportedMechs` / `speculativeAuthenticate` /
+    client-metadata stash (R5 auth); the `apiStrict` aggregation-stage gate
+    (aggregate family).
+  - **R2b+ (next)** — CRUD / cursor / aggregate / admin families, each keeping
+    `test_crud.py` / `test_aggregate.py` / `test_commands*.py` green against the
+    Rust server once R6 can boot it. These need the Rust `Storage` wired into
+    `CommandContext` (the pure-Rust `secantus-storage` crate already exists).
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL
