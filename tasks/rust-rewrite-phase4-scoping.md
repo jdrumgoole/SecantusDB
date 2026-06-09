@@ -351,9 +351,23 @@ build-out.
        (`tests/batch_insert.rs`) + smoke coverage. **Deferred (Rust has no capped
        support):** capped-collection eviction within `insert`, and geo-index
        validation on insert — tracked in the backlog.
-     - **Remaining gaps:** `checkpoint` / `close` / `create_archive`,
-       `oplog_tail_seq_nolock`, the change-stream condvar (`_oplog_cv`
-       tailable-wait) + `_reset_thread_session`.
+     - **5e-gap-c ✅ DONE** — change-stream tailable-wait primitive. A `Condvar`
+       paired with the existing `oplog` mutex (tail = `next_seq - 1`):
+       `wait_for_oplog(after_seq, timeout_ms) -> tail` does one bounded wait
+       (wakes on a new entry / a notify / timeout — the tail check + wait share
+       the mutex, so no lost-wakeup), `notify_oplog_waiters()` wakes blocked
+       waiters without advancing (for `killCursors`), and `emit_oplog` notifies
+       after writing. The PyO3 `wait_for_oplog` releases the GIL
+       (`py.allow_threads`) while blocking (`Connection` is `Send + Sync`). This
+       is the Rust equivalent of `storage._oplog_cv`; `oplog_tail_seq_nolock` is
+       subsumed (the primitive does its own locking). 4 cross-thread WT-backed
+       tests (`tests/condvar.rs`) + a threaded smoke test. **`commands.py`'s
+       tailable getMore is refactored off the raw `_oplog_cv` attribute onto this
+       `wait_for_oplog`/`notify_oplog_waiters` method pair as part of the adapter
+       slice (both engines then share the method).**
+     - **Remaining gaps:** `checkpoint` / `close` / `create_archive` (admin /
+       `fsync` / backup — none block the CRUD / query / change-stream conformance
+       suites; `close` is handled adapter-side by dropping the handle).
      - **Then:** the `secantus.engine` storage-selection + a Python `Storage`
        adapter over `RustStorage` (BSON at the seam, `EngineFallback` → Python
        operators over Rust-scanned docs, E11000 / `BadHint` error translation),

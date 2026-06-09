@@ -19,7 +19,8 @@
 //! `tasks/rust-rewrite-phase4-scoping.md`).
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use bson::oid::ObjectId;
 use bson::spec::BinarySubtype;
@@ -777,6 +778,12 @@ pub struct Storage {
     /// tiny dedicated mutex — `storage._oplog_seq_lock`. Held only for the
     /// microsecond seq/ts reservation, never across the WT cursor writes.
     oplog: Mutex<OplogState>,
+    /// Change-stream tailable-wait condition, paired with the `oplog` mutex (the
+    /// tail seq is `oplog.next_seq - 1`). `emit_oplog` notifies it after writing,
+    /// `notify_oplog_waiters` wakes it on cursor kill; `wait_for_oplog` blocks on
+    /// it. Mirrors `storage._oplog_cv` — a dedicated condition, *not* the storage
+    /// `lock`, so a waiting tailable getMore can't ABBA-deadlock the write path.
+    oplog_cv: Condvar,
     /// Retention window (seconds) and hard entry cap for `prune_oplog`. Mirrors
     /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
     oplog_retention_seconds: i64,
@@ -883,6 +890,7 @@ impl Storage {
             lock: Mutex::new(()),
             enable_oplog: true,
             oplog: Mutex::new(state),
+            oplog_cv: Condvar::new(),
             oplog_retention_seconds: 3600,
             oplog_max_entries: 100_000,
         })
@@ -977,7 +985,41 @@ impl Storage {
             }
             last = seq;
         }
+        // Wake any tailable change-stream getMore blocked in `wait_for_oplog`:
+        // the rows are committed (autocommit per insert) and the tail (next_seq)
+        // has advanced, so a woken waiter's producer re-read sees the new events.
+        {
+            let _g = self.oplog.lock().unwrap();
+            self.oplog_cv.notify_all();
+        }
         Ok(last)
+    }
+
+    /// Block until the oplog tail seq exceeds `after_seq` (a new entry landed),
+    /// or `timeout_ms` elapses, or a waiter is woken (`notify_oplog_waiters`).
+    /// Returns the current tail seq. One bounded wait — a spurious wake returns
+    /// early and the caller re-drains (matching the Python tailable getMore's
+    /// single `_oplog_cv.wait_for`). The tail / wait check share the `oplog`
+    /// mutex, so there's no lost-wakeup; the wait releases that mutex so writers
+    /// can still mint seqs. Used by the change-stream tailable getMore path.
+    pub fn wait_for_oplog(&self, after_seq: i64, timeout_ms: u64) -> i64 {
+        let guard = self.oplog.lock().unwrap();
+        if guard.next_seq - 1 > after_seq {
+            return guard.next_seq - 1;
+        }
+        let (guard, _timed_out) = self
+            .oplog_cv
+            .wait_timeout(guard, Duration::from_millis(timeout_ms))
+            .unwrap();
+        guard.next_seq - 1
+    }
+
+    /// Wake every `wait_for_oplog` waiter without advancing the oplog (e.g. on
+    /// `killCursors`, so a blocked tailable getMore returns promptly to observe
+    /// its cursor's invalidation). Mirrors `storage._oplog_cv.notify_all()`.
+    pub fn notify_oplog_waiters(&self) {
+        let _g = self.oplog.lock().unwrap();
+        self.oplog_cv.notify_all();
     }
 
     /// A strictly-monotonic `Timestamp` advancing the cluster clock (used for

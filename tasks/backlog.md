@@ -303,13 +303,19 @@ never "remove Python."
   capped collections under `SECANTUS_ENGINE=rust` won't enforce bounds, and a bad
   geometry won't be rejected (just indexed as no geo entry). Close when capped /
   geo-validation land in the Rust storage.
-- [ ] **Phase 4 sub-phase 5e — remaining storage gaps + adapter.** Still to port to
-  Rust before the `SECANTUS_ENGINE=rust` server cutover:
-  `checkpoint`/`close`/`create_archive`,
-  `oplog_tail_seq_nolock`, the change-stream condvar
-  (`_oplog_cv` tailable-wait) + `_reset_thread_session`. Then the `secantus.engine`
+- [x] **Phase 4 sub-phase 5e-gap-c — change-stream tailable-wait in `secantus-storage`.**
+  `wait_for_oplog(after_seq, timeout_ms)` (Condvar paired with the oplog mutex;
+  one bounded wait, no lost-wakeup) + `notify_oplog_waiters()` (for killCursors) +
+  `emit_oplog` notify. PyO3 `wait_for_oplog` releases the GIL while blocking. The
+  Rust equivalent of `storage._oplog_cv`; `oplog_tail_seq_nolock` subsumed. 4
+  cross-thread WT-backed tests (`tests/condvar.rs`) + threaded smoke. `commands.py`
+  refactor off the raw `_oplog_cv` onto this method pair lands with the adapter.
+- [ ] **Phase 4 sub-phase 5e — remaining gaps + adapter.** Remaining gaps:
+  `checkpoint`/`close`/`create_archive` (admin/`fsync`/backup — none block the core
+  conformance suites; `close` handled adapter-side). Then the `secantus.engine`
   storage-selection + Python `Storage` adapter over `RustStorage` (BSON seam,
-  `EngineFallback` → Python-operators-over-Rust-docs, E11000/`BadHint` translation),
+  `EngineFallback` → Python-operators-over-Rust-docs, E11000/`BadHint` translation,
+  `commands.py` getMore refactored onto `wait_for_oplog`/`notify_oplog_waiters`),
   then `test_storage.py`/`test_crud.py` + pymongo gauge under `SECANTUS_ENGINE=rust`.
 - [ ] **Phase 4 — storage keystone (continued).** Remaining: (a) wire
   `secantus.engine` storage selection so `SecantusDBServer` can use the Rust
