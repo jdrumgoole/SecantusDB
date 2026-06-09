@@ -642,6 +642,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "secantus-wire"
+version = "0.5.2-beta.15"
+dependencies = [
+ "bson",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

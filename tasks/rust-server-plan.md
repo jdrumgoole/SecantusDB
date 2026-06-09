@@ -131,11 +131,22 @@ the **server above the storage**, all net-new Rust. Each slice gates on running
 the relevant pymongo-driven suite **against the Rust server** (via the embedded
 handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
 
-- **R1 — Wire layer** (`crates/secantus-wire`). Port `wire.py`: 16-byte
-  little-endian header, `OP_MSG` (2013) kind-0 + kind-1 document-sequence
-  parse/build, legacy `OP_QUERY` (2004) parse + `OP_REPLY` (1) build for the
-  pymongo handshake, bounds checks. Pure bytes-in/bytes-out → unit-testable
-  without a socket. Pin against `wire.py` with shared byte fixtures.
+- **R1 — Wire layer** (`crates/secantus-wire`). ✅ **DONE.** Pure-Rust, PyO3-free
+  port of `wire.py`: the 16-byte little-endian `Header` (pack/unpack +
+  `body_len` bounds), `OP_MSG` (2013) kind-0 body + kind-1 document-sequence
+  parsing, legacy `OP_QUERY` (2004) parsing, and the `OP_MSG` / `OP_REPLY`
+  builders. Parsing is **zero-copy framing** — `OpMsg` / `OpQuery` borrow byte
+  slices (kind-0 body, each kind-1 doc) out of the caller's buffer rather than
+  decoding to owned `Document`s; builders take already-encoded BSON bytes. The
+  `_check_doc_len` bounds discipline and the recoverable-vs-fatal split are
+  preserved via `WireError::{MalformedBody, Protocol}` + `is_recoverable()` (the
+  connection loop pairs a recoverable error with the header it already read). BSON
+  content is deep-validated at parse time (`Document::from_reader`) to match
+  `bson.decode`'s accept/reject, incl. the handcrafted malformed-body case from
+  `tests/test_wire_malformed.py`. Added to the workspace `members` (no native
+  deps beyond `bson`, so the `rust` CI job builds it); 17 unit tests, `clippy
+  -D warnings` + `fmt` clean. **Follow-up:** dispatch (R2) currently re-decodes
+  the borrowed body — a later optimisation can return the validated owned doc.
 
 - **R2 — Command dispatch** (`crates/secantus-commands`, or a module of the
   server crate). Port `commands.py`: the dispatch table keyed on the first doc

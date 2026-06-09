@@ -1,4 +1,4 @@
-# Cargo workspace for the SecantusDB Rust side. Two crates:
+# Cargo workspace for the SecantusDB Rust side:
 #   * secantus-core    — the pure-Rust operator engines (no PyO3). Publishable to
 #                        crates.io and reusable by a future standalone secantusdb
 #                        server binary.
@@ -6,9 +6,12 @@
 #                        the `_secantus_core` abi3 extension (the `secantus-core`
 #                        Python wheel, via maturin). This is the package the
 #                        `secantus[rust]` extra pulls in.
+#   * secantus-wire    — pure-Rust MongoDB wire-protocol framing (R1 of the Rust
+#                        server, tasks/rust-server-plan.md). No PyO3, no native
+#                        deps beyond `bson`, so it builds in the same `rust` CI job.
 [workspace]
 resolver = "2"
-members = ["secantus-core", "secantus-core-py"]
+members = ["secantus-core", "secantus-core-py", "secantus-wire"]
 # secantus-wt (the WiredTiger FFI / storage foundation, Phase 4) is intentionally
 # NOT a workspace member yet: it links the vendored WiredTiger C library, which
 # isn't present in the maturin manylinux build containers or wired into the
