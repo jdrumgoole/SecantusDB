@@ -160,8 +160,15 @@ banner above + `tasks/rust-server-plan.md` §3).
 (`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /
 `delete` / `count` + the `Storage` trait seam), R3a (`CursorRegistry` +
 non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projection
-/ cursor split → the full `find → getMore → killCursors` path works in dispatch).
+/ cursor split → the full `find → getMore → killCursors` path works in dispatch),
+`update` (document-form, multi/upsert, pipeline-shape validation).
 **Deferred / not yet ported:**
+- [ ] **`update` pipeline-form + options** — a *valid* pipeline-form `u` (`[...]`)
+  surfaces as a per-op writeError because the Rust `update_matching` takes
+  `&Document` and `secantus-storage` has no pipeline-update path. Same for
+  `arrayFilters` / `let` / `collation` / `validator` (none in the storage seam).
+  Needs a `secantus-storage` `update_matching` extension, then thread through the
+  command `Storage` trait + handler.
 - [ ] **`find` edges** — up-front empty-collection filter validation (needs the
   query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
   capped-collection poll; `let` / `collation`. (Tracked in `find.rs` module docs.)

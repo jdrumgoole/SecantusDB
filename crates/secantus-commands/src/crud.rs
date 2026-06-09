@@ -1,10 +1,8 @@
-//! The CRUD write/count command family: `insert`, `delete`, `count`.
+//! The CRUD write/count command family: `insert`, `update`, `delete`, `count`.
 //!
-//! Faithful ports of `commands.py::_insert` / `_delete` / `_count`, scoped to
-//! the paths that map onto the current `secantus-storage` signatures. `update`
-//! is the next slice (its pipeline-form `u`, `arrayFilters`, `let`, `collation`,
-//! and `validator` need storage-signature work); `find` lands with the cursor
-//! registry (R3) + projection.
+//! Faithful ports of `commands.py::_insert` / `_update` / `_delete` / `_count`,
+//! scoped to the paths that map onto the current `secantus-storage` signatures.
+//! (`find` lives in the sibling `find` module.)
 //!
 //! **Deferred (documented so parity is honest):**
 //! * `writeConcern` validation and `writeConcernError` attachment (cross-cutting,
@@ -12,8 +10,9 @@
 //! * Collection `validator` / `bypassDocumentValidation` (needs
 //!   `get_collection_options` + the query engine on the write path).
 //! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
-//! * `let` / `collation` on `delete` (the Rust `delete_matching` takes neither
-//!   yet) and view-collection `count` (needs the aggregation engine).
+//! * Pipeline-form `u`, `arrayFilters`, `let`, `collation` on `update`; `let` /
+//!   `collation` on `delete`; view-collection `count` — none are in the Rust
+//!   storage seam yet (see each handler's doc + backlog §7).
 
 use bson::{doc, Bson, Document};
 
@@ -170,6 +169,126 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "n": n as i32, "ok": 1.0 })
 }
 
+/// Stages allowed in a pipeline-form (`u: [...]`) update
+/// (`update.py::_PIPELINE_UPDATE_STAGES`).
+const PIPELINE_UPDATE_STAGES: [&str; 6] = [
+    "$set",
+    "$addFields",
+    "$unset",
+    "$project",
+    "$replaceRoot",
+    "$replaceWith",
+];
+
+/// `update` — batch update, one entry per `{q, u, multi?, upsert?}` spec. Ports
+/// `commands.py::_update`'s document-form path.
+///
+/// **Deferred (tracked in backlog §7):** pipeline-form `u` (a valid `[...]`) —
+/// the Rust `update_matching` takes `&Document`, and `secantus-storage` has no
+/// pipeline-update path yet, so a *valid* pipeline surfaces as a per-op
+/// writeError rather than applying (a malformed pipeline still returns the
+/// faithful command-level `FailedToParse` / `InvalidPipelineOperator`). Also
+/// deferred: `arrayFilters`, `let`, `collation`, `validator`, `writeConcern`,
+/// `_reject_oplog_rs_write` (none are in the Rust `update_matching` seam yet).
+pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let coll = coll_arg(doc, "update")?;
+    let storage = ctx.storage()?;
+    let updates = array_field(doc, "updates");
+    let ordered = bool_field(doc, "ordered", true);
+
+    let mut n = 0_i32;
+    let mut n_modified = 0_i32;
+    let mut upserted: Vec<Bson> = Vec::new();
+    let mut write_errors: Vec<Bson> = Vec::new();
+
+    for (index, spec) in updates.iter().enumerate() {
+        let Bson::Document(spec) = spec else { continue };
+
+        // MongoDB 8.0 added a per-spec `sort`; pre-8.0 (we advertise 7.0) it's a
+        // command-level FailedToParse. Drivers' `*-sort` tests with
+        // `maxServerVersion: "7.99"` assert this.
+        if spec.contains_key("sort") {
+            return Ok(CommandError::new(
+                9,
+                "FailedToParse",
+                "The 'sort' option is not supported on update commands before MongoDB 8.0",
+            )
+            .into_reply());
+        }
+
+        // Pipeline-form `u`: validate the shape up-front (real mongod returns a
+        // command-level error for a malformed/unknown stage, not a writeError).
+        if let Some(Bson::Array(stages)) = spec.get("u") {
+            for stage in stages {
+                match stage {
+                    Bson::Document(s) if s.len() == 1 => {
+                        let name = s.keys().next().map(String::as_str).unwrap_or("");
+                        if !PIPELINE_UPDATE_STAGES.contains(&name) {
+                            return Ok(CommandError::new(
+                                168,
+                                "InvalidPipelineOperator",
+                                format!("stage {name} not allowed in pipeline updates"),
+                            )
+                            .into_reply());
+                        }
+                    }
+                    _ => {
+                        return Ok(CommandError::new(
+                            9,
+                            "FailedToParse",
+                            "each pipeline stage must be a single-key document",
+                        )
+                        .into_reply())
+                    }
+                }
+            }
+            // A well-formed pipeline update can't be applied yet (deferred).
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": 2,
+                "errmsg": "pipeline-form updates are not yet supported by the Rust server",
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
+
+        let q = doc_field(spec, "q");
+        let u = doc_field(spec, "u");
+        let multi = bool_field(spec, "multi", false);
+        let upsert = bool_field(spec, "upsert", false);
+        match storage.update_matching(&ctx.db_name, &coll, &q, &u, multi, upsert) {
+            Ok(outcome) => {
+                n += outcome.matched as i32;
+                n_modified += outcome.modified as i32;
+                if let Some(id) = outcome.upserted_id {
+                    upserted.push(Bson::Document(doc! { "index": index as i32, "_id": id }));
+                    n += 1;
+                }
+            }
+            Err(StorageError::Internal(msg)) => {
+                return Ok(CommandError::new(1, "InternalError", msg).into_reply())
+            }
+            Err(e) => {
+                write_errors.push(Bson::Document(write_error(index, e)));
+                if ordered {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut reply = doc! { "n": n, "nModified": n_modified, "ok": 1.0 };
+    if !upserted.is_empty() {
+        reply.insert("upserted", upserted);
+    }
+    if !write_errors.is_empty() {
+        reply.insert("writeErrors", write_errors);
+    }
+    Ok(reply)
+}
+
 // --- helpers -------------------------------------------------------------
 
 /// An array-valued field as a slice, or empty.
@@ -263,14 +382,59 @@ mod tests {
 
         fn update_matching(
             &self,
-            _db: &str,
-            _coll: &str,
-            _filter: &Document,
-            _update: &Document,
-            _multi: bool,
-            _upsert: bool,
+            db: &str,
+            coll: &str,
+            filter: &Document,
+            update: &Document,
+            multi: bool,
+            upsert: bool,
         ) -> Result<UpdateOutcome, StorageError> {
-            Ok(UpdateOutcome::default())
+            // Minimal `$set`-only semantics, enough to exercise the handler's
+            // matched/modified accounting, multi, and upsert.
+            let mut cols = self.cols.lock().unwrap();
+            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
+            let set = update.get("$set").and_then(Bson::as_document).cloned();
+            let mut matched = 0usize;
+            let mut modified = 0usize;
+            for d in bucket.iter_mut() {
+                if !matches(d, filter) {
+                    continue;
+                }
+                matched += 1;
+                if let Some(set) = &set {
+                    let mut changed = false;
+                    for (k, v) in set.iter() {
+                        if d.get(k) != Some(v) {
+                            d.insert(k.clone(), v.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        modified += 1;
+                    }
+                }
+                if !multi {
+                    break;
+                }
+            }
+            let upserted_id = if matched == 0 && upsert {
+                let id = filter.get("_id").cloned().unwrap_or(Bson::Int64(999));
+                let mut new_doc = doc! { "_id": id.clone() };
+                if let Some(set) = &set {
+                    for (k, v) in set.iter() {
+                        new_doc.insert(k.clone(), v.clone());
+                    }
+                }
+                bucket.push(new_doc);
+                Some(id)
+            } else {
+                None
+            };
+            Ok(UpdateOutcome {
+                matched,
+                modified,
+                upserted_id,
+            })
         }
 
         fn delete_matching(
@@ -504,5 +668,96 @@ mod tests {
         let reply = dispatch(&doc! {"count": "c"}, &mut c);
         assert_eq!(reply.get_i32("code").unwrap(), 1);
         assert_eq!(reply.get_str("codeName").unwrap(), "InternalError");
+    }
+
+    #[test]
+    fn update_set_modifies_and_counts() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}]},
+            &mut c,
+        );
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$set": {"x": 2}}}]},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 1);
+        assert_eq!(reply.get_i32("nModified").unwrap(), 1);
+        assert!(reply.get("upserted").is_none());
+        assert!(reply.get("writeErrors").is_none());
+    }
+
+    #[test]
+    fn update_multi_touches_all_matches() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}, {"_id": 2, "x": 1}]},
+            &mut c,
+        );
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"x": 1}, "u": {"$set": {"y": 9}}, "multi": true}]},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 2);
+        assert_eq!(reply.get_i32("nModified").unwrap(), 2);
+    }
+
+    #[test]
+    fn update_upsert_reports_upserted_id() {
+        let mut c = ctx(FakeStorage::arc());
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"_id": 5}, "u": {"$set": {"a": 1}}, "upsert": true}]},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "upsert counts toward n");
+        assert_eq!(reply.get_i32("nModified").unwrap(), 0);
+        let up = reply.get_array("upserted").unwrap();
+        assert_eq!(up.len(), 1);
+        let e = up[0].as_document().unwrap();
+        assert_eq!(e.get_i32("index").unwrap(), 0);
+        assert_eq!(e.get_i32("_id").unwrap(), 5);
+    }
+
+    #[test]
+    fn update_sort_option_rejected_pre_8() {
+        let mut c = ctx(FakeStorage::arc());
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "sort": {"a": 1}}]},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 9);
+        assert_eq!(reply.get_str("codeName").unwrap(), "FailedToParse");
+    }
+
+    #[test]
+    fn update_pipeline_unknown_stage_is_command_error() {
+        let mut c = ctx(FakeStorage::arc());
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {}, "u": [{"$badStage": {}}]}]},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 168);
+        assert_eq!(
+            reply.get_str("codeName").unwrap(),
+            "InvalidPipelineOperator"
+        );
+    }
+
+    #[test]
+    fn update_valid_pipeline_is_deferred_write_error() {
+        let mut c = ctx(FakeStorage::arc());
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {}, "u": [{"$set": {"a": 1}}]}]},
+            &mut c,
+        );
+        // Command still succeeds; the unsupported pipeline is a per-op writeError.
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        let we = reply.get_array("writeErrors").unwrap();
+        assert_eq!(we.len(), 1);
+        assert_eq!(we[0].as_document().unwrap().get_i32("code").unwrap(), 2);
     }
 }

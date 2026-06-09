@@ -203,9 +203,22 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     `clippy -D warnings` + `fmt` clean. **Deferred:** up-front empty-collection
     filter validation (needs the query engine's parse-vs-`Fallback` distinction);
     `tailable: true` capped-poll; `let` / `collation`.
-  - **R2c+ (next)** — `update`, then aggregate / admin families. Each keeps
-    `test_crud.py` / `test_aggregate.py` / `test_commands*.py` green against the
-    Rust server once R6 can boot it.
+  - **`update` ✅ DONE** (`secantus-commands::crud::update`) — port of `_update`'s
+    document-form path: per-spec `sort` rejection (FailedToParse 9, pre-8.0),
+    pipeline-form shape validation (malformed → command-level FailedToParse 9 /
+    InvalidPipelineOperator 168), `update_matching` per spec with `multi` /
+    `upsert`, error mapping (DuplicateKey → 11000, adapter-classified
+    WriteError → per-op writeError, Internal → command-level), and the
+    `n` / `nModified` / `upserted` / `writeErrors` reply. 6 update tests (47 crate
+    total). **Deferred (backlog §7):** a *valid* pipeline-form `u` surfaces as a
+    per-op writeError (the Rust `update_matching` takes `&Document`;
+    `secantus-storage` has no pipeline-update path yet); `arrayFilters` / `let` /
+    `collation` / `validator` / `writeConcern` likewise pending storage-seam work.
+  - **R2c+ (next)** — pivot to **R4** (accept loop + the real `secantus-storage`
+    adapter + standalone binary) and **R6** (embedded Python handle) so the Rust
+    server is runnable and the pymongo gauge can finally gate it; then aggregate /
+    admin / auth families. Each keeps `test_crud.py` / `test_aggregate.py` /
+    `test_commands*.py` green against the Rust server once R6 can boot it.
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL

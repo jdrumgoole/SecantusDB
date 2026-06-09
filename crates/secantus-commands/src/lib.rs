@@ -201,6 +201,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "ping" => handshake::ping,
         "buildInfo" | "buildinfo" => handshake::build_info,
         "insert" => crud::insert,
+        "update" => crud::update,
         "delete" => crud::delete,
         "count" => crud::count,
         "find" => find::find,
