@@ -286,6 +286,22 @@ never "remove Python."
   built wheel (`tests/test_rust_storage_smoke.py`, 5 tests; `invoke rust-storage-py`).
   **Deferred to the 5e adapter:** rich E11000 `keyPattern`/`keyValue` propagation
   (DuplicateKey → `KeyError` w/ index name for now) and `BadHint` code mapping.
+- [x] **Phase 4 sub-phase 5e-gap-a — users/roles/profiling in `secantus-storage`.**
+  `add_user`/`get_user`/`drop_user`/`list_users` + role equivalents (opaque BSON
+  record blobs over the `secantus_users`/`secantus_roles` `SS` tables, paginated
+  `db`-filtered list), `get_profile`/`set_profile` (validated) over the
+  `secantus_profile_settings` `S` table, and `ensure_profile_collection`. PyO3
+  bindings + 6 WT-backed tests (`tests/auth.rs`) + smoke coverage. First of the
+  5e gap-closure slices (port the 17 server-needed `Storage` methods missing from
+  the Rust binding, then the engine adapter).
+- [ ] **Phase 4 sub-phase 5e — remaining storage gaps + adapter.** Still to port to
+  Rust before the `SECANTUS_ENGINE=rust` server cutover: batch `insert`
+  (ordered/writeErrors/capped eviction), `checkpoint`/`close`/`create_archive`/
+  `prune_ttl_all_collections`, `oplog_tail_seq_nolock`, the change-stream condvar
+  (`_oplog_cv` tailable-wait) + `_reset_thread_session`. Then the `secantus.engine`
+  storage-selection + Python `Storage` adapter over `RustStorage` (BSON seam,
+  `EngineFallback` → Python-operators-over-Rust-docs, E11000/`BadHint` translation),
+  then `test_storage.py`/`test_crud.py` + pymongo gauge under `SECANTUS_ENGINE=rust`.
 - [ ] **Phase 4 — storage keystone (continued).** Remaining: (a) wire
   `secantus.engine` storage selection so `SecantusDBServer` can use the Rust
   `Storage` under `SECANTUS_ENGINE=rust` — **gated on porting the rest of the

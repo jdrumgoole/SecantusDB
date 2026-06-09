@@ -325,12 +325,30 @@ build-out.
      tests; `invoke rust-storage-py`). **Deferred to the adapter slice:** rich
      E11000 `keyPattern`/`keyValue` propagation (DuplicateKey currently surfaces
      as a `KeyError` with the index name) and `BadHint`-code mapping.
-   - **Next (5e):** the `secantus.engine` storage-selection + a Python `Storage`
-     adapter presenting `storage.Storage`'s interface over `RustStorage` (BSON
-     encode/decode at the seam, `EngineFallback` → pure-Python re-run, error
-     translation), then the conformance suites under `SECANTUS_ENGINE=rust`.
-     (The last Python-only `Storage` bits — users / roles / profile /
-     `checkpoint` / `create_archive` — can stay Python-routed in the adapter.)
+   - **5e — server cutover.** A full `SECANTUS_ENGINE=rust` server swap needs the
+     *whole* `Storage` surface in Rust (Python + Rust can't share one WT store,
+     so the adapter must route every data op to one backend). An inventory of the
+     server/command layer found **48 `Storage` methods called, 17 gaps** vs the
+     PyO3 binding. **Decision: port the gaps first, then the adapter + conformance
+     gate.** Gap-closure slices:
+     - **5e-gap-a ✅ DONE** — users / roles / profiling: `add_user` / `get_user` /
+       `drop_user` / `list_users` (+ `add_role` / `get_role` / `drop_role` /
+       `list_roles`) over the `secantus_users` / `secantus_roles` `SS` tables
+       (opaque BSON record blobs, stored verbatim, paginated `db`-filtered list);
+       `get_profile` (mongod defaults) / `set_profile` (level/slowms/sampleRate
+       validation) over the `secantus_profile_settings` `S` table; and
+       `ensure_profile_collection` (capped `<db>.system.profile`). Shared
+       `put_/get_/drop_/list_ss_record` helpers. PyO3 bindings + 6 WT-backed tests
+       (`tests/auth.rs`) + smoke coverage.
+     - **Remaining gaps:** batch `insert` (ordered + writeErrors + capped
+       eviction), `checkpoint` / `close` / `create_archive` /
+       `prune_ttl_all_collections`, `oplog_tail_seq_nolock`, the change-stream
+       condvar (`_oplog_cv` tailable-wait) + `_reset_thread_session`.
+     - **Then:** the `secantus.engine` storage-selection + a Python `Storage`
+       adapter over `RustStorage` (BSON at the seam, `EngineFallback` → Python
+       operators over Rust-scanned docs, E11000 / `BadHint` error translation),
+       then `test_storage.py` / `test_crud.py` + the pymongo gauge under
+       `SECANTUS_ENGINE=rust` — the go/no-go gate.
 
 ## PyO3 exposure (done) — `crates/secantus-storage-py`
 

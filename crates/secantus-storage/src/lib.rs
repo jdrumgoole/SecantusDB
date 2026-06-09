@@ -48,6 +48,14 @@ const OPLOG_TABLE: &str = "table:secantus_oplog";
 const PREIMAGE_TABLE: &str = "table:secantus_preimages";
 const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 
+// Auth / profiling tables. Users + roles are `(db, name) -> bson(record)` (key
+// `SS`); per-database profile settings are `db -> bson({level, slowms,
+// sampleRate})` (key `S`). Records are opaque BSON blobs (the command layer owns
+// their shape), stored / returned verbatim across the byte seam.
+const USERS_TABLE: &str = "table:secantus_users";
+const ROLES_TABLE: &str = "table:secantus_roles";
+const PROFILE_TABLE: &str = "table:secantus_profile_settings";
+
 /// The synthetic `_id` index name. The `_id_` index is virtual — never stored
 /// in the registry; `list_indexes` synthesises it.
 const ID_INDEX_NAME: &str = "_id_";
@@ -1854,6 +1862,234 @@ impl Storage {
                 .filter(|(id_k, _)| id_k.as_slice() > a)
                 .collect(),
         })
+    }
+
+    // --- users / roles / profiling (auth + profiling surface) ---
+
+    /// Persist a user record (opaque BSON blob). Returns `true` if added,
+    /// `false` if it already existed and `replace` is false. Mirrors
+    /// `storage.add_user`.
+    pub fn add_user(&self, db: &str, username: &str, record: &[u8], replace: bool) -> Result<bool> {
+        self.put_ss_record(USERS_TABLE, db, username, record, replace)
+    }
+
+    /// Fetch a user record (BSON blob) or `None`. Mirrors `storage.get_user`.
+    pub fn get_user(&self, db: &str, username: &str) -> Result<Option<Vec<u8>>> {
+        self.get_ss_record(USERS_TABLE, db, username)
+    }
+
+    /// Delete a user. Returns `false` if absent. Mirrors `storage.drop_user`.
+    pub fn drop_user(&self, db: &str, username: &str) -> Result<bool> {
+        self.drop_ss_record(USERS_TABLE, db, username)
+    }
+
+    /// Paginated user listing (`db = None` spans every database). Mirrors
+    /// `storage.list_users`.
+    pub fn list_users(&self, db: Option<&str>, skip: usize, limit: usize) -> Result<Vec<Vec<u8>>> {
+        self.list_ss_records(USERS_TABLE, db, skip, limit)
+    }
+
+    /// Persist a custom-role record (opaque BSON blob). Mirrors
+    /// `storage.add_role`.
+    pub fn add_role(&self, db: &str, name: &str, record: &[u8], replace: bool) -> Result<bool> {
+        self.put_ss_record(ROLES_TABLE, db, name, record, replace)
+    }
+
+    /// Fetch a custom-role record (BSON blob) or `None`. Mirrors
+    /// `storage.get_role`.
+    pub fn get_role(&self, db: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        self.get_ss_record(ROLES_TABLE, db, name)
+    }
+
+    /// Delete a custom role. Returns `false` if absent. Mirrors
+    /// `storage.drop_role`.
+    pub fn drop_role(&self, db: &str, name: &str) -> Result<bool> {
+        self.drop_ss_record(ROLES_TABLE, db, name)
+    }
+
+    /// Paginated custom-role listing (`db = None` spans every database).
+    /// Mirrors `storage.list_roles`.
+    pub fn list_roles(&self, db: Option<&str>, skip: usize, limit: usize) -> Result<Vec<Vec<u8>>> {
+        self.list_ss_records(ROLES_TABLE, db, skip, limit)
+    }
+
+    /// The active profile settings for `db` (`{level, slowms, sampleRate}`),
+    /// defaulting to mongod's `level 0 / slowms 100 / sampleRate 1.0` when
+    /// unset. Mirrors `storage.get_profile`.
+    pub fn get_profile(&self, db: &str) -> Result<Document> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(PROFILE_TABLE, None)?;
+        cur.set_key_s(db);
+        let doc = match cur.search() {
+            Ok(()) => {
+                let blob = cur.get_value_u()?;
+                if blob.is_empty() {
+                    None
+                } else {
+                    Some(decode_doc(&blob)?)
+                }
+            }
+            Err(e) if e.is_not_found() => None,
+            Err(e) => return Err(e.into()),
+        };
+        let stored = doc.unwrap_or_default();
+        let level = stored.get_i32("level").unwrap_or(0);
+        let slowms = stored.get_i32("slowms").unwrap_or(100);
+        let rate = match stored.get("sampleRate") {
+            Some(Bson::Double(r)) => *r,
+            Some(Bson::Int32(r)) => f64::from(*r),
+            Some(Bson::Int64(r)) => *r as f64,
+            _ => 1.0,
+        };
+        let mut out = Document::new();
+        out.insert("level", level);
+        out.insert("slowms", slowms);
+        out.insert("sampleRate", rate);
+        Ok(out)
+    }
+
+    /// Persist profile settings for `db`. `level` must be 0/1/2, `slowms`
+    /// non-negative, `sample_rate` in `[0, 1]` (else `BadValue`). Mirrors
+    /// `storage.set_profile`.
+    pub fn set_profile(&self, db: &str, level: i32, slowms: i32, sample_rate: f64) -> Result<()> {
+        if !(0..=2).contains(&level) {
+            return Err(StorageError::BadHint("level must be 0, 1, or 2".into()));
+        }
+        if slowms < 0 {
+            return Err(StorageError::BadHint("slowms must be non-negative".into()));
+        }
+        if !(0.0..=1.0).contains(&sample_rate) {
+            return Err(StorageError::BadHint("sampleRate must be in [0, 1]".into()));
+        }
+        let mut doc = Document::new();
+        doc.insert("level", level);
+        doc.insert("slowms", slowms);
+        doc.insert("sampleRate", sample_rate);
+        let blob = encode_doc(&doc)?;
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(PROFILE_TABLE, None)?;
+        cur.set_key_s(db);
+        cur.set_value_u(&blob);
+        cur.insert()?;
+        Ok(())
+    }
+
+    /// Ensure `<db>.system.profile` exists as a capped collection (default
+    /// 10 MB). Mirrors `storage.ensure_profile_collection`. Takes no outer lock
+    /// — delegates to the (individually locked) public methods.
+    pub fn ensure_profile_collection(&self, db: &str, size_bytes: i64) -> Result<()> {
+        if self.collection_exists(db, "system.profile")? {
+            return Ok(());
+        }
+        self.create_collection(db, "system.profile")?;
+        let mut opts = Document::new();
+        opts.insert("capped", true);
+        opts.insert("size", size_bytes);
+        self.set_collection_options(db, "system.profile", &opts)
+    }
+
+    /// Insert-or-replace a `(db, name) -> blob` record in an `SS`-keyed table.
+    /// Returns `false` (no write) if the key exists and `replace` is false.
+    fn put_ss_record(
+        &self,
+        table: &str,
+        db: &str,
+        name: &str,
+        record: &[u8],
+        replace: bool,
+    ) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let probe = session.open_cursor(table, None)?;
+        probe.set_key_ss(db, name);
+        let exists = match probe.search() {
+            Ok(()) => true,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        if exists && !replace {
+            return Ok(false);
+        }
+        let cur = session.open_cursor(table, None)?;
+        cur.set_key_ss(db, name);
+        cur.set_value_u(record);
+        cur.insert()?;
+        Ok(true)
+    }
+
+    /// Point-fetch a `(db, name)` blob from an `SS`-keyed table (`None` when
+    /// absent or empty).
+    fn get_ss_record(&self, table: &str, db: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let _g = self.lock.lock().unwrap();
+        // Fresh session for cross-thread visibility (mirrors `get_role`).
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(table, None)?;
+        cur.set_key_ss(db, name);
+        match cur.search() {
+            Ok(()) => {
+                let blob = cur.get_value_u()?;
+                Ok(if blob.is_empty() { None } else { Some(blob) })
+            }
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete a `(db, name)` row from an `SS`-keyed table (`false` if absent).
+    fn drop_ss_record(&self, table: &str, db: &str, name: &str) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(table, None)?;
+        cur.set_key_ss(db, name);
+        match cur.search() {
+            Ok(()) => {
+                cur.remove()?;
+                Ok(true)
+            }
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Paginated walk of an `SS`-keyed table (`db = None` spans all dbs),
+    /// returning the non-empty value blobs in natural key order.
+    fn list_ss_records(
+        &self,
+        table: &str,
+        db: Option<&str>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let limit = if limit == 0 || limit > 1000 {
+            1000
+        } else {
+            limit
+        };
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(table, None)?;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut seen = 0usize;
+        let mut more = cur.next()?;
+        while more {
+            let (row_db, _name) = cur.get_key_ss()?;
+            if db.is_none() || db == Some(row_db.as_str()) {
+                if seen >= skip {
+                    let blob = cur.get_value_u()?;
+                    if !blob.is_empty() {
+                        out.push(blob);
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+                seen += 1;
+            }
+            more = cur.next()?;
+        }
+        Ok(out)
     }
 
     // --- secondary indexes (Phase 4 sub-phase 2) ---

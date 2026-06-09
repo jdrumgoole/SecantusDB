@@ -545,6 +545,96 @@ impl RustStorage {
             })
             .map_err(to_pyerr)
     }
+
+    // --- users / roles / profiling ---
+
+    /// Persist a user record (BSON blob). `False` if it existed and `replace`
+    /// is false.
+    fn add_user(&self, db: &str, username: &str, record: &[u8], replace: bool) -> PyResult<bool> {
+        self.inner
+            .add_user(db, username, record, replace)
+            .map_err(to_pyerr)
+    }
+
+    /// The user record (BSON) or `None`.
+    fn get_user(&self, py: Python<'_>, db: &str, username: &str) -> PyResult<Option<Py<PyBytes>>> {
+        self.inner
+            .get_user(db, username)
+            .map(|opt| opt.map(|b| bytes(py, b)))
+            .map_err(to_pyerr)
+    }
+
+    fn drop_user(&self, db: &str, username: &str) -> PyResult<bool> {
+        self.inner.drop_user(db, username).map_err(to_pyerr)
+    }
+
+    /// Paginated user records (BSON); `db=None` spans every database.
+    #[pyo3(signature = (db=None, skip=0, limit=100))]
+    fn list_users(
+        &self,
+        py: Python<'_>,
+        db: Option<&str>,
+        skip: usize,
+        limit: usize,
+    ) -> PyResult<Vec<Py<PyBytes>>> {
+        self.inner
+            .list_users(db, skip, limit)
+            .map(|docs| doc_list(py, docs))
+            .map_err(to_pyerr)
+    }
+
+    fn add_role(&self, db: &str, name: &str, record: &[u8], replace: bool) -> PyResult<bool> {
+        self.inner
+            .add_role(db, name, record, replace)
+            .map_err(to_pyerr)
+    }
+
+    fn get_role(&self, py: Python<'_>, db: &str, name: &str) -> PyResult<Option<Py<PyBytes>>> {
+        self.inner
+            .get_role(db, name)
+            .map(|opt| opt.map(|b| bytes(py, b)))
+            .map_err(to_pyerr)
+    }
+
+    fn drop_role(&self, db: &str, name: &str) -> PyResult<bool> {
+        self.inner.drop_role(db, name).map_err(to_pyerr)
+    }
+
+    #[pyo3(signature = (db=None, skip=0, limit=100))]
+    fn list_roles(
+        &self,
+        py: Python<'_>,
+        db: Option<&str>,
+        skip: usize,
+        limit: usize,
+    ) -> PyResult<Vec<Py<PyBytes>>> {
+        self.inner
+            .list_roles(db, skip, limit)
+            .map(|docs| doc_list(py, docs))
+            .map_err(to_pyerr)
+    }
+
+    /// The active `{level, slowms, sampleRate}` profile settings for `db` (BSON).
+    fn get_profile(&self, py: Python<'_>, db: &str) -> PyResult<Py<PyBytes>> {
+        let doc = self.inner.get_profile(db).map_err(to_pyerr)?;
+        Ok(bytes(py, encode_doc(&doc)?))
+    }
+
+    /// Persist profile settings (`level` 0/1/2, `slowms` >= 0, `sample_rate`
+    /// in `[0,1]`).
+    fn set_profile(&self, db: &str, level: i32, slowms: i32, sample_rate: f64) -> PyResult<()> {
+        self.inner
+            .set_profile(db, level, slowms, sample_rate)
+            .map_err(to_pyerr)
+    }
+
+    /// Ensure `<db>.system.profile` exists as a capped collection.
+    #[pyo3(signature = (db, size_bytes=10485760))]
+    fn ensure_profile_collection(&self, db: &str, size_bytes: i64) -> PyResult<()> {
+        self.inner
+            .ensure_profile_collection(db, size_bytes)
+            .map_err(to_pyerr)
+    }
 }
 
 #[pymodule]
