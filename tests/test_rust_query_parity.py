@@ -230,6 +230,73 @@ CURATED = [
     ({"tags": [1, 2, 3]}, {"tags": {"$all": [1.0, 2.0]}}),  # numeric bridge
     ({"tags": []}, {"tags": {"$all": []}}),
     ({"tags": ["a", "b"]}, {"tags": {"$all": [Regex("^a")]}}),  # regex elem -> defer
+    # --- geo (slices geo-1 / geo-1b): point docs vs region/near queries ---
+    # $geoWithin $box — point inside / outside.
+    ({"loc": [5.0, 5.0]}, {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}}),
+    ({"loc": [50.0, 5.0]}, {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}}),
+    # $geoWithin $polygon.
+    (
+        {"loc": [5.0, 5.0]},
+        {"loc": {"$geoWithin": {"$polygon": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]}}},
+    ),
+    (
+        {"loc": [20.0, 20.0]},
+        {"loc": {"$geoWithin": {"$polygon": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]}}},
+    ),
+    # $geoWithin $geometry (GeoJSON Polygon) — GeoJSON Point + legacy {lng,lat} docs.
+    (
+        {"loc": {"type": "Point", "coordinates": [5.0, 5.0]}},
+        {
+            "loc": {
+                "$geoWithin": {
+                    "$geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+                    }
+                }
+            }
+        },
+    ),
+    (
+        {"loc": {"lng": 99.0, "lat": 99.0}},
+        {
+            "loc": {
+                "$geoWithin": {
+                    "$geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+                    }
+                }
+            }
+        },
+    ),
+    # $geoIntersects $geometry (point in / out of polygon).
+    (
+        {"loc": [5.0, 5.0]},
+        {
+            "loc": {
+                "$geoIntersects": {
+                    "$geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+                    }
+                }
+            }
+        },
+    ),
+    # $geoWithin $centerSphere (great-circle cap, radians) — in / out.
+    ({"loc": [0.0, 0.0]}, {"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.1]}}}),
+    ({"loc": [10.0, 10.0]}, {"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.1]}}}),
+    # $near (legacy planar, bounded) — within / beyond max.
+    ({"loc": [1.0, 1.0]}, {"loc": {"$near": [0.0, 0.0, 5.0]}}),
+    ({"loc": [5.0, 5.0]}, {"loc": {"$near": [0.0, 0.0, 5.0]}}),
+    # $nearSphere (GeoJSON, metres).
+    (
+        {"loc": [0.0, 0.0]},
+        {"loc": {"$nearSphere": {"$geometry": {"type": "Point", "coordinates": [0.0, 0.0]}, "$maxDistance": 1500000.0}}},
+    ),
+    # $center -> Rust returns None (Fallback to Python); curated test skips it.
+    ({"loc": [1.0, 1.0]}, {"loc": {"$geoWithin": {"$center": [[0.0, 0.0], 5.0]}}}),
 ]
 
 
