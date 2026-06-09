@@ -157,7 +157,43 @@ build-out.
    on every push-to-main / PR (Linux; cross-platform WT linking stays covered by
    the `storage-engine` wheel job). Next: sub-phase 3 (oplog / change streams).
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
-   Gate: `test_geo_index.py`.
+   Gate: `test_geo_index.py`. **Recon done (not yet implemented); sliced
+   geo-1 → geo-4:**
+   - **Key finding:** geo is *not* a storage-only slice. The Rust query engine
+     (`secantus-core`) has **no geo operators** — `$geoWithin` / `$geoIntersects`
+     / `$near` / `$nearSphere` all `Fallback` to Python today. So a geo *index*
+     in `secantus-storage` is useless until `find_matching`'s post-filter
+     `matches()` can evaluate geo predicates. The prerequisite is porting
+     `secantus.geo` (420 lines: geometry coercion + containment) into
+     `secantus-core` first.
+   - **Feasibility:** the `geo` crate (planar geometry: `Point`/`Polygon`/
+     `Relate`/`Intersects`) **fetches + builds in this sandbox** (verified,
+     ~33s). `2d` geohash needs no crate (bit-interleaving). `2dsphere` needs the
+     `s2` crate — **feasibility still UNVERIFIED**; check before committing to
+     geo-3.
+   - **geo-1 (secantus-core):** port `geo.py` — `parse_doc_geometry` (GeoJSON /
+     legacy `[x,y]` / `{x,y}`/`{lng,lat}`), `parse_query_geometry`
+     (`$geometry`/`$box`/`$polygon`/`$center`/`$centerSphere`), `geo_within`
+     (planar via `geo` crate `Relate::is_within`; spherical cap via haversine,
+     `EARTH_RADIUS_METERS = 6_378_100.0`), `geo_intersects`; wire `$geoWithin` +
+     `$geoIntersects` into `query.rs`'s `op_matches` (a `GeoError` → `Fallback`
+     so Python raises the proper `QueryError`). Dispatch site: `op_matches`
+     `_ => Err(Fallback)` (query.rs ~line 186). Gate: extend
+     `test_rust_query_parity.py` with geo cases.
+   - **geo-1b:** `$near` / `$nearSphere` field-operator matching (distance bound;
+     legacy `[x,y,max]` + sibling `$maxDistance`/`$minDistance` shapes — see
+     `query.py` `_parse_near_spec`). Hybrid sort-by-distance stays in the command
+     layer.
+   - **geo-2 (secantus-storage):** `2d` geohash index — write bit-interleaved
+     buckets at the index's `bits` precision; route `$geoWithin` `$box`/`$center`
+     to a single `(lo,hi)` bbox range scan. No external crate.
+   - **geo-3 (secantus-storage):** `2dsphere` S2 cell coverings (needs `s2`
+     crate — verify first). Each geometry writes covering cells + ancestors;
+     queries do exact cell point-lookups + Shapely/haversine verify.
+   - **geo-4:** `$geoNear` aggregation stage.
+   - When geo-2/3 land, relax `create_index`'s current `CreateIndexUnsupported`
+     rejection of `2dsphere`/`2d` (text/hashed stay rejected), and flag geo
+     indexes `multikey: true` so the regular pickers skip them.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
    time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
    acceleration here. Gate: `test_change_streams.py`. **Sliced** (3a → 3e):
