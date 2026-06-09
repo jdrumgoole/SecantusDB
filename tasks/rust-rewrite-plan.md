@@ -3,16 +3,28 @@
 Status: **in progress.** This document is the strategy: an order, a set of
 seams, and the decisions behind them.
 
-> **Policy: both engines are permanent.** This is *not* a replacement of Python
-> by Rust. SecantusDB keeps **both** the original pure-Python engines and the
-> Rust core as first-class, supported implementations. The pure-Python engines
-> are always present and are the **default**; the Rust core is an optional
-> compiled accelerator that reproduces the Python behaviour exactly (pinned by
-> the `tests/test_rust_*_parity.py` suites). Selection is process-wide via
-> `secantus.engine` / the `SECANTUS_ENGINE` env var / `SecantusDBServer(engine=)`.
-> Wherever this plan said "flip the default to Rust," read it as "make the Rust
-> engine selectable and, once proven, possibly the *recommended* default for
-> users who install the extension — never the *only* option."
+> ⚠️ **SUPERSEDED IN PART — integration model changed.** The "two co-resident
+> engines selected process-wide via `secantus.engine` / `SECANTUS_ENGINE`" model
+> below (the policy box, §2's "embeddable extension keeps `SecantusDBServer`
+> wrapping a Rust core selected per-component," §10 item 1) has been **replaced by
+> two completely separate servers** — a pure-Python server and a self-contained
+> Rust server, with the Rust server exposed to Python only through a thin embedded
+> lifecycle handle. The user runs one or the other. **See `tasks/rust-server-
+> plan.md` (authoritative).** The rest of this doc — the porting census (§1), the
+> byte seam (§3), the two hard problems (§4: WT FFI + sortkey/BSON fidelity), the
+> real ports (§5), and the risk register (§8) — is **still valid** and still the
+> foundation; only the *integration/selection* model is superseded.
+
+> **Policy (original, now superseded — kept for history): both engines are
+> permanent.** This is *not* a replacement of Python by Rust. SecantusDB keeps
+> **both** the original pure-Python engines and the Rust core as first-class,
+> supported implementations. ~~The pure-Python engines are always present and are
+> the **default**; the Rust core is an optional compiled accelerator selected
+> process-wide via `secantus.engine` / `SECANTUS_ENGINE` / `SecantusDBServer
+> (engine=)`.~~ → Now: the pure-Python engines power the **Python server**; the
+> Rust engines power the separate **Rust server**. Both implementations remain
+> permanent and parity-pinned; what changed is they no longer co-reside behind one
+> selectable interface in one process.
 
 ---
 

@@ -133,20 +133,28 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
-Tracking the incremental rewrite (plan: `tasks/rust-rewrite-plan.md`; Phase 0
-spike results: `tasks/rust-rewrite-spike-findings.md`; Phase 3+4 scoping:
-`tasks/rust-rewrite-phase3-scoping.md`). The Rust side is a Cargo workspace under
-`crates/`: the pure-Rust engine lib crate `crates/secantus-core` plus the PyO3
-bindings crate `crates/secantus-core-py`, which builds the abi3 extension
-`_secantus_core` via maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
+> ⚠️ **Direction changed — authoritative plan is now `tasks/rust-server-plan.md`.**
+> The end-state is **two completely separate servers** (a pure-Python server and a
+> self-contained Rust server with a thin embedded Python lifecycle handle), **not**
+> the in-process `secantus.engine` selectable model the items below assume. The
+> *porting* work recorded here (the pure-Rust crates) is still valid and is the
+> Rust server's foundation; the `SECANTUS_ENGINE` selection / Python `Storage`
+> adapter / `EngineFallback` items are **retired**. Next work is the Rust server
+> itself (`rust-server-plan.md` §4, R1–R8), not more in-process selection surface.
 
-**Both engines are permanent (not a replacement).** The pure-Python engines are
-always present and the default; the Rust core is an optional accelerator.
-Selection is process-wide via `secantus.engine` (the `SECANTUS_ENGINE` env var
-/ `SecantusDBServer(engine=...)` / `--engine`), with per-component overrides
-(`SECANTUS_RUST_<COMPONENT>`). So the old "flip the default to Rust" items below
-mean "make Rust the *recommended* default for users who install the extension,"
-never "remove Python."
+Tracking the incremental rewrite (plan: `tasks/rust-server-plan.md` — north star;
+`tasks/rust-rewrite-plan.md`; Phase 0 spike results: `tasks/rust-rewrite-spike-
+findings.md`; Phase 3+4 scoping: `tasks/rust-rewrite-phase3-scoping.md`). The Rust
+side is a Cargo workspace under `crates/`: the pure-Rust engine lib crate
+`crates/secantus-core` plus the PyO3 bindings crate `crates/secantus-core-py`,
+which builds the abi3 extension `_secantus_core` via maturin (`invoke rust-build`
+/ `rust-test` / `rust-parity`).
+
+**Both implementations are permanent (not a replacement).** ~~Selection is
+process-wide via `secantus.engine`.~~ → The pure-Python engines power the **Python
+server**; the Rust engines power the separate **Rust server**. The
+`secantus.engine` in-process selection is transitional and being retired (see the
+banner above + `tasks/rust-server-plan.md` §3).
 
 - [x] **Engine selection** — `secantus.engine` is the single source of truth
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six

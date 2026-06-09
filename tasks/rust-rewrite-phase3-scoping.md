@@ -1,5 +1,12 @@
 # Phase 3+4 scoping — cursors / change streams, then the storage keystone
 
+> ⚠️ **Integration model changed — see `tasks/rust-server-plan.md` (authoritative).**
+> The "dual-engine at `Storage` granularity, selected process-wide by
+> `secantus.engine`" decision in §3 below is **superseded**: there are now **two
+> separate servers** (pure-Python and a self-contained Rust server), not two
+> `Storage` implementations behind one selectable interface. The *porting* content
+> here (what ports, the byte seam, the sub-phase order) is still valid.
+
 Written after Phases 1–2 landed (all six leaf engines + the entire
 storage-*independent* aggregation pipeline are ported, parity-pinned, and on
 `claude/python-rust-rewrite-plan-wjZou`). This note refines the roadmap in
