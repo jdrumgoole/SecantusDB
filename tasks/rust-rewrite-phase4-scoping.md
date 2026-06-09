@@ -157,7 +157,25 @@ build-out.
    on every push-to-main / PR (Linux; cross-platform WT linking stays covered by
    the `storage-engine` wheel job). Next: sub-phase 3 (oplog / change streams).
 3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
-   Gate: `test_geo_index.py`.
+   Gate: `test_geo_index.py`. Sliced geo-1 → geo-4:
+   - **geo-1 ✅ DONE** — geo *query operators* in `secantus-core` (the
+     prerequisite the recon surfaced: the Rust query engine had no geo support,
+     so a storage geo index would be moot). New `secantus_core::geo`: doc/query
+     geometry coercion (GeoJSON / legacy `[x,y]` / `{x,y}`/`{lng,lat}`), planar
+     containment via the `geo` crate's DE-9IM `Relate` (same OGC lineage as
+     Shapely), haversine for `$centerSphere`; `$geoWithin` + `$geoIntersects`
+     wired into `query.rs` `op_matches`. `$center` (Shapely 64-gon buffer) and
+     `$near`/`$nearSphere` defer to Python via `Fallback`. 7 unit tests; added
+     the `geo = "0.28"` dep to `secantus-core`.
+   - **geo-1b** — `$near` / `$nearSphere` field-operator matching (distance bound;
+     legacy `[x,y,max]` + sibling `$maxDistance`/`$minDistance` — see
+     `query.py` `_parse_near_spec`). Extend `test_rust_query_parity.py` with geo
+     cases.
+   - **geo-2 (storage):** `2d` geohash index (bit-interleaving + bbox scan; no
+     crate). **geo-3 (storage):** `2dsphere` S2 coverings (needs `s2` crate —
+     verify). **geo-4:** `$geoNear` aggregation stage. When geo-2/3 land, relax
+     `create_index`'s `CreateIndexUnsupported` rejection of `2dsphere`/`2d` and
+     flag geo indexes `multikey: true`.
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
    time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
    acceleration here. Gate: `test_change_streams.py`.
