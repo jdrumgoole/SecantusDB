@@ -104,14 +104,21 @@ jobs:
       - name: Tests
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
         # exceeded hangs (test body busy-loops or blocks on a stuck
-        # producer). ``--max-worker-restart=0`` makes xdist fail
-        # immediately when a worker SUBPROCESS dies (native segfault,
-        # OOM, etc.) instead of silently entering a hung state where
-        # the parent waits forever for results from a dead worker —
-        # which is what was happening on the recent main runs that
-        # appeared to "hang at 97%". With this flag we get the
-        # crashed test's name in the pytest output instead.
-        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=0
+        # producer) — independently of worker restarts.
+        #
+        # ``--max-worker-restart=3``: a few subprocess/threading-heavy tests
+        # (admin websocket change-streams, cross-driver smokes) intermittently
+        # crash their xdist worker on a teardown race (native "node down: not
+        # properly terminated"). With ``=0`` that fatally fails the whole run
+        # ~half the time, blocking every PR on an unrelated flake. A bounded
+        # restart budget lets xdist restart the dead worker and re-run the
+        # crashed test, so a *transient* crash retries to green; a
+        # *deterministic* crash re-crashes on retry and exhausts the budget,
+        # still failing loudly with the test's name. The original ``=0`` was
+        # set to avoid a silent "hang at 97%" where the parent waited forever
+        # on a dead worker — but that hang mode is now caught by the
+        # ``--timeout`` above regardless, so the restart budget is safe.
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
   # The matrix above runs the default pure-Python engines. This job builds the
   # optional Rust accelerator core (``_secantus_core``) and validates it two
@@ -174,7 +181,9 @@ jobs:
       - name: Full suite under the Rust engine
         env:
           SECANTUS_ENGINE: rust
-        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=0
+        # ``--max-worker-restart=3`` for the same transient-worker-crash flake
+        # as the pure-Python ``test`` job above (the timeout still guards hangs).
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
   # The WiredTiger-linking Rust storage crate (`secantus-storage`, Phase 4) — the
   # secondary-index + CRUD storage layer. It's excluded from the `crates/`
