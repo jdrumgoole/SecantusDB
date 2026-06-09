@@ -35,8 +35,10 @@
 
 pub mod crud;
 pub mod cursors;
+pub mod find;
 pub mod handshake;
 pub mod storage;
+mod util;
 
 use std::sync::Arc;
 
@@ -201,6 +203,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "insert" => crud::insert,
         "delete" => crud::delete,
         "count" => crud::count,
+        "find" => find::find,
         "getMore" => cursors::get_more,
         "killCursors" => cursors::kill_cursors,
         _ => return None,

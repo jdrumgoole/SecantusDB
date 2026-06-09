@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use bson::{doc, Bson, Document};
 
+use crate::util::{as_i64, docs_to_bson};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
 /// Idle TTL for ordinary cursors — MongoDB's 10-minute default.
@@ -472,34 +473,8 @@ fn cursor_not_found(cursor_id: i64) -> Document {
     .into_reply()
 }
 
-fn docs_to_bson(batch: Vec<Vec<u8>>) -> Result<Vec<Bson>, CommandError> {
-    batch
-        .iter()
-        .map(|b| {
-            bson::Document::from_reader(&mut b.as_slice())
-                .map(Bson::Document)
-                .map_err(|e| {
-                    CommandError::new(
-                        1,
-                        "InternalError",
-                        format!("failed to decode cursor doc: {e}"),
-                    )
-                })
-        })
-        .collect()
-}
-
 fn int64_array(ids: Vec<i64>) -> Vec<Bson> {
     ids.into_iter().map(Bson::Int64).collect()
-}
-
-fn as_i64(b: &Bson) -> Option<i64> {
-    match b {
-        Bson::Int32(i) => Some(*i as i64),
-        Bson::Int64(i) => Some(*i),
-        Bson::Double(d) => Some(*d as i64),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

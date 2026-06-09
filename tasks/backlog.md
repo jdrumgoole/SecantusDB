@@ -159,7 +159,12 @@ banner above + `tasks/rust-server-plan.md` §3).
 **Rust server build-out (`tasks/rust-server-plan.md` §4).** Done: R1
 (`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /
 `delete` / `count` + the `Storage` trait seam), R3a (`CursorRegistry` +
-non-tailable `getMore` / `killCursors`). **Deferred / not yet ported:**
+non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projection
+/ cursor split → the full `find → getMore → killCursors` path works in dispatch).
+**Deferred / not yet ported:**
+- [ ] **`find` edges** — up-front empty-collection filter validation (needs the
+  query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
+  capped-collection poll; `let` / `collation`. (Tracked in `find.rs` module docs.)
 - [ ] **Tailable (change-stream) getMore** — drain buffered events, call the
   cursor `producer`, block on the storage oplog condvar for `awaitData`, emit
   `postBatchResumeToken`. Needs the oplog tail + `notify_oplog_waiters` added to

@@ -630,6 +630,7 @@ version = "0.5.2-beta.15"
 dependencies = [
  "bson",
  "rand",
+ "secantus-core",
  "secantus-wire",
 ]
 

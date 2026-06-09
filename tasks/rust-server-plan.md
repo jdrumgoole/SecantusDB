@@ -190,9 +190,22 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     `collation` / `validator` need storage-signature work); `find` (with R3
     cursors + projection); `writeConcern`, collection `validator`,
     `_reject_oplog_rs_write`, `let`/`collation` on delete, view-collection count.
-  - **R2c+ (next)** — `update`, then `find` (needs R3), then aggregate / admin
-    families. Each keeps `test_crud.py` / `test_aggregate.py` /
-    `test_commands*.py` green against the Rust server once R6 can boot it.
+  - **`find` ✅ DONE** (`secantus-commands::find`) — the keystone read command
+    and the producer of the cursors R3a manages. Port of `_find`'s non-tailable
+    path: the `Storage` trait gained `find` (= `find_matching_with`; returns the
+    full ordered match set), and the handler does `skip` → `limit` → `projection`
+    (via `secantus_core::projection`; a `Fallback` ⇒ `BadValue`) →
+    `_split_into_cursor` (firstBatch + register the remainder, `batchSize` 0 / +
+    / `singleBatch` all handled). Hints pass through as raw `Bson` (the adapter
+    converts to `secantus_storage::Hint`). The full **`find → getMore →
+    killCursors`** read path now works end-to-end in the Rust dispatch. Helpers
+    refactored into a shared `util` module. 8 find tests (41 crate total),
+    `clippy -D warnings` + `fmt` clean. **Deferred:** up-front empty-collection
+    filter validation (needs the query engine's parse-vs-`Fallback` distinction);
+    `tailable: true` capped-poll; `let` / `collation`.
+  - **R2c+ (next)** — `update`, then aggregate / admin families. Each keeps
+    `test_crud.py` / `test_aggregate.py` / `test_commands*.py` green against the
+    Rust server once R6 can boot it.
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL

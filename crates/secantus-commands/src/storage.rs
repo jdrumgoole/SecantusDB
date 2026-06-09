@@ -14,6 +14,12 @@
 
 use bson::{Bson, Document};
 
+/// A query hint at the command seam: the raw `hint` value (a string index name,
+/// a key-spec document, or a sentinel like `"$natural"` / `"_id_"`). The adapter
+/// converts it to `secantus_storage::Hint`; keeping it as `Bson` lets
+/// `secantus-commands` stay decoupled from the storage crate's `Hint` type.
+pub type RawHint<'a> = &'a Bson;
+
 /// The outcome of an `update` operation (mirrors
 /// `secantus_storage::UpdateOutcome`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -95,4 +101,19 @@ pub trait Storage: Send + Sync {
         coll: &str,
         filter: &Document,
     ) -> Result<usize, StorageError>;
+
+    /// All documents matching `filter`, in `sort` order (or natural order when
+    /// `sort` is `None`), optionally index-`hint`ed. Mirrors
+    /// `secantus_storage::find_matching_with`; **skip / limit / projection are
+    /// applied by the `find` handler**, not here (the storage method returns the
+    /// full ordered match set). A bad hint or filter surfaces as
+    /// `StorageError::WriteError { code: 2, .. }` (BadValue).
+    fn find(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        hint: Option<RawHint<'_>>,
+    ) -> Result<Vec<Vec<u8>>, StorageError>;
 }

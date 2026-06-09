@@ -21,6 +21,9 @@ crate-type = ["rlib"]
 [dependencies]
 bson = { workspace = true }
 secantus-wire = { path = "../secantus-wire" }
+# The pure-Rust operator engines — `find` applies projections via
+# `secantus_core::projection`. Pure Rust, no WT, already in the workspace.
+secantus-core = { path = "../secantus-core" }
 # Cryptographically-unpredictable cursor ids (the registry mints 63-bit random
 # ids so another connection can't enumerate / hijack cursors by guessing).
 rand = "0.9"
