@@ -278,6 +278,14 @@ never "remove Python."
   `collection_is_capped`, `collection_data_size`, `index_sizes` (`_id_` + per-index
   packed bytes), `scan_docs_after_id_key`. 7 WT-backed tests in `tests/stats.rs`;
   clippy + fmt clean.
+- [x] **Phase 4 sub-phase 5d — full PyO3 surface (`crates/secantus-storage-py`).**
+  `RustStorage` now exposes the whole `Storage` interface over the BSON byte seam
+  (query/write/count, indexes+TTL, lifecycle, options+stats, oplog+cluster time,
+  config setters) plus the exported `EngineFallback` exception (the
+  `QueryUnsupported` "defer to Python" signal). Smoke-tested end-to-end against the
+  built wheel (`tests/test_rust_storage_smoke.py`, 5 tests; `invoke rust-storage-py`).
+  **Deferred to the 5e adapter:** rich E11000 `keyPattern`/`keyValue` propagation
+  (DuplicateKey → `KeyError` w/ index name for now) and `BadHint` code mapping.
 - [ ] **Phase 4 — storage keystone (continued).** Remaining: (a) wire
   `secantus.engine` storage selection so `SecantusDBServer` can use the Rust
   `Storage` under `SECANTUS_ENGINE=rust` — **gated on porting the rest of the

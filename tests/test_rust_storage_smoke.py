@@ -72,3 +72,92 @@ def test_dbs_and_collections_isolated(tmp_path):
     assert len(st.scan_collection("db1", "a")) == 1
     assert len(st.scan_collection("db2", "a")) == 1
     del st
+
+
+def test_query_write_index_surface(tmp_path):
+    """The expanded PyO3 surface: query / update / delete / count + indexes."""
+    st = ss.RustStorage(str(tmp_path))
+    for i in range(1, 6):
+        st.insert_one("app", "c", bson.encode({"_id": i, "n": i, "grp": i % 2}))
+
+    # find_matching: filter routed through matches()
+    got = [bson.decode(b)["_id"] for b in st.find_matching("app", "c", bson.encode({"grp": 1}))]
+    assert sorted(got) == [1, 3, 5]
+
+    # count_matching
+    assert st.count_matching("app", "c", bson.encode({})) == 5
+    assert st.count_matching("app", "c", bson.encode({"n": {"$gt": 3}})) == 2
+
+    # create an index, then find_matching_with sort + explain reports IXSCAN
+    assert st.create_index("app", "c", "n_1", bson.encode({"n": 1}), bson.encode({})) is True
+    ordered = [
+        bson.decode(b)["n"]
+        for b in st.find_matching_with("app", "c", bson.encode({}), bson.encode({"n": -1}))
+    ]
+    assert ordered == [5, 4, 3, 2, 1]
+    plan = bson.decode(st.explain_plan("app", "c", bson.encode({"n": 3})))
+    assert plan["kind"] == "IXSCAN" and plan["index_name"] == "n_1"
+
+    # update_matching: operator update, multi
+    out = bson.decode(
+        st.update_matching(
+            "app", "c", bson.encode({"grp": 0}), bson.encode({"$set": {"hit": True}}), True, False
+        )
+    )
+    assert out["matched"] == 2 and out["modified"] == 2 and "upserted_id" not in out
+
+    # upsert path surfaces upserted_id
+    out = bson.decode(
+        st.update_matching(
+            "app", "c", bson.encode({"k": "new"}), bson.encode({"$set": {"v": 1}}), False, True
+        )
+    )
+    assert "upserted_id" in out
+
+    # delete_matching with a limit
+    assert st.delete_matching("app", "c", bson.encode({"grp": 1}), 1) == 1
+
+    # index registry + sizes
+    names = {bson.decode(b)["name"] for b in st.list_indexes("app", "c")}
+    assert {"_id_", "n_1"} <= names
+    sizes = bson.decode(st.index_sizes("app", "c"))
+    assert sizes["n_1"] > 0
+    del st
+
+
+def test_lifecycle_and_oplog_surface(tmp_path):
+    """The expanded PyO3 surface: lifecycle, options, oplog reads."""
+    st = ss.RustStorage(str(tmp_path))
+
+    # create_collection emits an op:"c" create entry
+    floor = st.oplog_tail_seq()
+    assert st.create_collection("app", "c") is True
+    st.insert_one("app", "c", bson.encode({"_id": 1, "x": 1}))
+    cmds = [bson.decode(b) for _seq, b in st.read_oplog(floor + 1, 100)]
+    assert any(e["op"] == "c" and e["o"].get("create") == "c" for e in cmds)
+    assert any(e["op"] == "i" for e in cmds)
+
+    # options round-trip; uuid present as raw bytes
+    opts = bson.decode(st.get_collection_options("app", "c"))
+    assert isinstance(opts.get("uuid"), bytes) and len(opts["uuid"]) == 16
+    assert st.collection_is_capped("app", "c") is False
+
+    # rename moves the data
+    ok, msg = st.rename_collection("app", "c", "app", "d", False)
+    assert ok is True and msg is None
+    assert st.collection_exists("app", "c") is False
+    assert len(st.scan_collection("app", "d")) == 1
+
+    # list_databases includes synthetic local (oplog on by default)
+    assert "local" in st.list_databases()
+
+    # cluster time advances
+    t1 = st.current_cluster_time()
+    t2 = st.current_cluster_time()
+    assert t2 > t1
+    del st
+
+
+def test_engine_fallback_exception_exported():
+    """The EngineFallback exception is exported for the engine-selection adapter."""
+    assert issubclass(ss.EngineFallback, Exception)

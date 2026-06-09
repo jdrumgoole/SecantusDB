@@ -306,20 +306,44 @@ build-out.
      `scan_docs_after_id_key` (natural-order rows with `id_key > after`, for the
      tailable producer). New WT-backed tests in `tests/stats.rs` (7);
      `clippy -D warnings` + `fmt` clean.
-   - **Next:** users / roles / profile / `checkpoint` / `create_archive` (the
-     last Python-only `Storage` bits), then the PyO3 surface for the whole
-     `Storage`, the `secantus.engine` storage selection + Python adapter, and the
-     conformance suites under `SECANTUS_ENGINE=rust`.
+   - **5d ✅ DONE** — full PyO3 surface (`crates/secantus-storage-py`): the
+     `RustStorage` class now exposes the whole `Storage` interface over the BSON
+     byte seam — query (`find_matching` / `find_matching_with` with sort + hint /
+     `explain_plan` / `count_matching`), write (`update_matching` returning a
+     `{matched, modified, upserted_id?}` doc / `delete_matching`), indexes
+     (`create_index` / `list_indexes` / `drop_index` / `drop_all_indexes` /
+     `prune_ttl`), lifecycle (`create`/`drop`/`drop_database`/`rename`/`list_*`),
+     options + stats (`get`/`set_collection_options` / `collection_is_capped` /
+     `collection_data_size` / `index_sizes` / `scan_docs_after_id_key`), and
+     oplog / cluster time (`collection_uuid` / `current_cluster_time` /
+     `read_oplog` / `oplog_floor_seq` / `oplog_tail_seq` / `read_preimage` /
+     `prune_oplog` / `emit_noop_heartbeat` / `find_seq_for_ts`), plus the
+     `set_enable_oplog` / `set_oplog_*` config setters. The **`EngineFallback`**
+     exception (exported from the module) carries the `StorageError::Query
+     Unsupported` "defer to Python" signal for the adapter. Smoke-tested
+     end-to-end against the built wheel (`tests/test_rust_storage_smoke.py`, 5
+     tests; `invoke rust-storage-py`). **Deferred to the adapter slice:** rich
+     E11000 `keyPattern`/`keyValue` propagation (DuplicateKey currently surfaces
+     as a `KeyError` with the index name) and `BadHint`-code mapping.
+   - **Next (5e):** the `secantus.engine` storage-selection + a Python `Storage`
+     adapter presenting `storage.Storage`'s interface over `RustStorage` (BSON
+     encode/decode at the seam, `EngineFallback` → pure-Python re-run, error
+     translation), then the conformance suites under `SECANTUS_ENGINE=rust`.
+     (The last Python-only `Storage` bits — users / roles / profile /
+     `checkpoint` / `create_archive` — can stay Python-routed in the adapter.)
 
 ## PyO3 exposure (done) — `crates/secantus-storage-py`
 
 The Rust storage is exposed to Python as the `_secantus_storage` extension
-(`RustStorage` over the BSON byte seam, `_id` wrapped as `{"v": id}`). This
-proves the **WiredTiger-linking extension builds (maturin → abi3 wheel) and
-imports**, and drives the CRUD core end-to-end from Python
-(`tests/test_rust_storage_smoke.py`; `invoke rust-storage-py`). That de-risks the
-core of the gate below — what remains is the cross-platform *packaging*, not
-whether a WT-linking Python extension can work at all.
+(`RustStorage` over the BSON byte seam, `_id` wrapped as `{"v": id}`). As of
+slice 5d the binding covers the **whole** `Storage` surface (query / write /
+indexes / lifecycle / options+stats / oplog / cluster time — see 5d above), not
+just the CRUD core, plus the exported `EngineFallback` exception for the
+dual-engine "defer to Python" signal. The WiredTiger-linking extension builds
+(maturin → abi3 wheel) and imports, and drives the surface end-to-end from
+Python (`tests/test_rust_storage_smoke.py`; `invoke rust-storage-py`). What
+remains for the gate is the cross-platform *packaging* and the Python adapter +
+engine selection (5e), not whether a WT-linking Python extension can work.
 
 Note: this is **not** yet wired into `secantus.engine`'s storage selection.
 Swapping the Rust `Storage` into `SecantusDBServer` needs the *whole* `Storage`
