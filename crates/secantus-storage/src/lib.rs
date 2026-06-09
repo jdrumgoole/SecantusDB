@@ -1403,6 +1403,259 @@ impl Storage {
         Ok(out)
     }
 
+    /// Every database that has at least one registered collection, plus `local`
+    /// when the oplog is enabled (mongod always exposes it). Sorted. Mirrors
+    /// `storage.list_databases`.
+    pub fn list_databases(&self) -> Result<Vec<String>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(COLL_TABLE, None)?;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut more = cur.next()?;
+        while more {
+            let (d, _c) = cur.get_key_ss()?;
+            seen.insert(d);
+            more = cur.next()?;
+        }
+        if self.enable_oplog {
+            seen.insert("local".to_string());
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    /// Register `(db, coll)` as an (empty) collection. Returns `false` if it
+    /// already exists, `true` if created — minting its UUID and emitting an
+    /// `op: "c"` `create` oplog entry. Mirrors `storage.create_collection`.
+    pub fn create_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        if collection_registered(&session, db, coll)? {
+            return Ok(false);
+        }
+        ensure_collection(&session, db, coll)?;
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut id_key_spec = Document::new();
+            id_key_spec.insert("_id", 1i32);
+            let mut id_index = Document::new();
+            id_index.insert("v", 2i32);
+            id_index.insert("key", Bson::Document(id_key_spec));
+            id_index.insert("name", ID_INDEX_NAME);
+            let mut o = Document::new();
+            o.insert("create", coll);
+            o.insert("idIndex", Bson::Document(id_index));
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
+        Ok(true)
+    }
+
+    /// Drop a collection: delete its documents, indexes, and index entries, then
+    /// its registry row. Returns whether it existed. Emits an `op: "c"` `drop`
+    /// oplog entry when it existed. Mirrors `storage.drop_collection`.
+    pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let existed = coll_options(&session, db, coll)?.is_some();
+        let ui = if existed && self.enable_oplog {
+            Some(collection_uuid(&session, db, coll)?)
+        } else {
+            None
+        };
+        self.purge_collection_tables(&session, db, coll)?;
+        let c = session.open_cursor(COLL_TABLE, None)?;
+        c.set_key_ss(db, coll);
+        match c.search() {
+            Ok(()) => c.remove()?,
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(ui) = ui {
+            let mut o = Document::new();
+            o.insert("drop", coll);
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
+        Ok(existed)
+    }
+
+    /// Drop an entire database: delete every collection's data + registry rows.
+    /// Emits one `op: "c"` `drop` per collection plus a final `dropDatabase: 1`
+    /// command oplog entry (no `ui`). Mirrors `storage.drop_database`.
+    pub fn drop_database(&self, db: &str) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let colls = self.colls_of(&session, db)?;
+        let mut ui_pairs: Vec<(String, Vec<u8>)> = Vec::new();
+        if self.enable_oplog {
+            for c in &colls {
+                ui_pairs.push((c.clone(), collection_uuid(&session, db, c)?));
+            }
+        }
+        for c in &colls {
+            self.purge_collection_tables(&session, db, c)?;
+        }
+        let rc = session.open_cursor(COLL_TABLE, None)?;
+        for c in &colls {
+            rc.reset()?;
+            rc.set_key_ss(db, c);
+            match rc.search() {
+                Ok(()) => rc.remove()?,
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if self.enable_oplog {
+            let mut entries: Vec<Document> = Vec::new();
+            for (c, ui) in &ui_pairs {
+                let mut o = Document::new();
+                o.insert("drop", c.clone());
+                let mut entry = Document::new();
+                entry.insert("op", "c");
+                entry.insert("ns", format!("{db}.$cmd"));
+                entry.insert("ui", uuid_binary(ui));
+                entry.insert("o", Bson::Document(o));
+                entries.push(entry);
+            }
+            let mut dd_o = Document::new();
+            dd_o.insert("dropDatabase", 1i32);
+            let mut dd = Document::new();
+            dd.insert("op", "c");
+            dd.insert("ns", format!("{db}.$cmd"));
+            dd.insert("o", Bson::Document(dd_o));
+            entries.push(dd);
+            let n = entries.len();
+            self.emit_oplog(&session, entries, vec![None; n])?;
+        }
+        Ok(())
+    }
+
+    /// Rename `src_db.src_coll` to `dst_db.dst_coll`, moving its document /
+    /// index / entry rows. Returns `(true, None)` on success, `(false, Some(msg))`
+    /// when the source is missing or the target exists without `drop_target`.
+    /// The destination is registered with fresh (empty) options — its UUID is
+    /// re-minted on next use (faithful to `storage.rename_collection`). Emits a
+    /// `renameCollection` `op: "c"` entry (preceded by a `drop` of the target
+    /// when `drop_target` replaced one).
+    pub fn rename_collection(
+        &self,
+        src_db: &str,
+        src_coll: &str,
+        dst_db: &str,
+        dst_coll: &str,
+        drop_target: bool,
+    ) -> Result<(bool, Option<String>)> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        if coll_options(&session, src_db, src_coll)?.is_none() {
+            return Ok((
+                false,
+                Some(format!(
+                    "source namespace does not exist: {src_db}.{src_coll}"
+                )),
+            ));
+        }
+        if (src_db, src_coll) == (dst_db, dst_coll) {
+            return Ok((true, None));
+        }
+        let dst_existed = coll_options(&session, dst_db, dst_coll)?.is_some();
+        if dst_existed && !drop_target {
+            return Ok((
+                false,
+                Some(format!("target namespace exists: {dst_db}.{dst_coll}")),
+            ));
+        }
+        let ui = if self.enable_oplog {
+            Some(collection_uuid(&session, src_db, src_coll)?)
+        } else {
+            None
+        };
+        let dst_ui = if dst_existed && self.enable_oplog {
+            Some(collection_uuid(&session, dst_db, dst_coll)?)
+        } else {
+            None
+        };
+        if dst_existed {
+            self.purge_collection_tables(&session, dst_db, dst_coll)?;
+            let c = session.open_cursor(COLL_TABLE, None)?;
+            c.set_key_ss(dst_db, dst_coll);
+            match c.search() {
+                Ok(()) => c.remove()?,
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Collect every src row, drop the src tables, then re-key into dst.
+        let docs = self.scan_docs(&session, src_db, src_coll)?;
+        let idx_rows = self.collect_idx_rows(&session, src_db, src_coll)?;
+        let entry_rows = self.collect_entry_rows(&session, src_db, src_coll)?;
+        self.purge_collection_tables(&session, src_db, src_coll)?;
+        let dcur = session.open_cursor(DOC_TABLE, None)?;
+        for (id_k, blob) in &docs {
+            dcur.reset()?;
+            dcur.set_key_ssu(dst_db, dst_coll, id_k);
+            dcur.set_value_u(blob);
+            dcur.insert()?;
+        }
+        let icur = session.open_cursor(IDX_TABLE, None)?;
+        for (name, payload) in &idx_rows {
+            icur.reset()?;
+            icur.set_key_sss(dst_db, dst_coll, name);
+            icur.set_value_u(payload);
+            icur.insert()?;
+        }
+        let ecur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (name, packed) in &entry_rows {
+            ecur.reset()?;
+            ecur.set_key_sssu(dst_db, dst_coll, name, packed);
+            ecur.set_value_u(b"");
+            ecur.insert()?;
+        }
+        ensure_collection(&session, dst_db, dst_coll)?;
+        let rc = session.open_cursor(COLL_TABLE, None)?;
+        rc.set_key_ss(src_db, src_coll);
+        match rc.search() {
+            Ok(()) => rc.remove()?,
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+        if self.enable_oplog {
+            let mut entries: Vec<Document> = Vec::new();
+            if let Some(du) = &dst_ui {
+                let mut o = Document::new();
+                o.insert("drop", dst_coll);
+                let mut e = Document::new();
+                e.insert("op", "c");
+                e.insert("ns", format!("{dst_db}.$cmd"));
+                e.insert("ui", uuid_binary(du));
+                e.insert("o", Bson::Document(o));
+                entries.push(e);
+            }
+            let mut o = Document::new();
+            o.insert("renameCollection", format!("{src_db}.{src_coll}"));
+            o.insert("to", format!("{dst_db}.{dst_coll}"));
+            let mut e = Document::new();
+            e.insert("op", "c");
+            e.insert("ns", format!("{src_db}.$cmd"));
+            if let Some(u) = &ui {
+                e.insert("ui", uuid_binary(u));
+            }
+            e.insert("o", Bson::Document(o));
+            entries.push(e);
+            let n = entries.len();
+            self.emit_oplog(&session, entries, vec![None; n])?;
+        }
+        Ok((true, None))
+    }
+
     // --- secondary indexes (Phase 4 sub-phase 2) ---
 
     /// Create a secondary index `name` over `key_spec` (field → direction `1`/
@@ -1977,6 +2230,128 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    /// Collection names registered under `db` (no lock, session-scoped — for
+    /// `drop_database`). Unlike the public `list_collections` this omits the
+    /// synthetic `local.oplog.rs` view and stays unsorted.
+    fn colls_of(&self, session: &Session, db: &str) -> Result<Vec<String>> {
+        let cur = session.open_cursor(COLL_TABLE, None)?;
+        let mut out = Vec::new();
+        cur.set_key_ss(db, "");
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c) = cur.get_key_ss()?;
+            if d != db {
+                break;
+            }
+            out.push(c);
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Delete a collection's document / index-registry / index-entry rows
+    /// (everything except its `secantus_collections` registry row). Shared by
+    /// `drop_collection` / `drop_database` / `rename_collection`.
+    fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        let doc_cur = session.open_cursor(DOC_TABLE, None)?;
+        for (id_k, _blob) in self.scan_docs(session, db, coll)? {
+            doc_cur.reset()?;
+            doc_cur.set_key_ssu(db, coll, &id_k);
+            match doc_cur.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for (name, _key_spec, _opts) in self.iter_indexes(session, db, coll)? {
+            self.delete_entries_prefix(session, db, coll, &name)?;
+            let ic = session.open_cursor(IDX_TABLE, None)?;
+            ic.set_key_sss(db, coll, &name);
+            match ic.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw `(name, payload_bytes)` index-registry rows for `(db, coll)`, for the
+    /// verbatim re-key in `rename_collection`.
+    fn collect_idx_rows(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        let mut out = Vec::new();
+        cur.set_key_sss(db, coll, "");
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, name) = cur.get_key_sss()?;
+            if d != db || c != coll {
+                break;
+            }
+            out.push((name, cur.get_value_u()?));
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Raw `(name, packed)` index-entry rows for `(db, coll)`, for the verbatim
+    /// re-key in `rename_collection`.
+    fn collect_entry_rows(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let mut out = Vec::new();
+        cur.set_key_sssu(db, coll, "", b"");
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, name, packed) = cur.get_key_sssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            out.push((name, packed));
+            more = cur.next()?;
+        }
+        Ok(out)
     }
 
     /// Introspection: the entries of index `name` as `(escaped_kb, id_key)`
