@@ -269,11 +269,20 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     auth state (R5); metrics / sessions / failpoints / connreg (their slices);
     sourcing `cluster_time` from storage (`hello`'s `lastWrite` uses a zero ts
     until the `Storage` trait exposes `current_cluster_time`).
-  - **R4b (next)** — the WiredTiger adapter: `impl secantus_commands::Storage for
-    secantus_storage::Storage` (bytes at the seam, `Hint` from `RawHint`, error
-    translation: `DuplicateKey` → boxed `DuplicateKey`, `BadHint` / query errors →
-    `WriteError{2}`, else `Internal`). Lives outside the clean workspace (links
-    WT); **compile-checked + tested in CI / a WT machine only.**
+  - **R4b ⚠️ WRITTEN, CI-VALIDATED-ONLY** — the WiredTiger adapter
+    (`crates/secantus-storage-adapter`): `StorageAdapter(Arc<secantus_storage::
+    Storage>)` implementing `secantus_commands::Storage`. A near-identity over the
+    matching signatures plus two translations — `RawHint` (`Bson`) →
+    `secantus_storage::Hint` (`String`⇒`Name`, doc⇒`KeySpec`), and
+    `secantus_storage::StorageError` → the command `StorageError` (`DuplicateKey`
+    keeps `keyPattern`/`keyValue`; `BadHint` / `QueryUnsupported` / unsupported
+    id/value → `WriteError{2}` BadValue; engine/IO → `Internal`). **Links
+    WiredTiger, so it's excluded from the clean workspace and could NOT be
+    compiled or tested in this sandbox** — it builds + runs only where WT is
+    available (the `rust-storage` CI job / a WT machine). Written against the
+    confirmed `secantus-storage` signatures; first CI run is its validation.
+    (One risk CI will settle: whether `secantus_storage::Storage` is `Send +
+    Sync` as the trait's supertrait requires.)
 
 - **R5 — Auth** (in the server crate or `crates/secantus-auth`). SCRAM-SHA-1/256
   (`hmac` / `sha2` / `pbkdf2`), MONGODB-X509, and the RBAC checks. Port `auth.py`

@@ -165,10 +165,12 @@ non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projectio
 (`secantus-server`: accept loop + connection handling, generic over the command
 `Storage` trait — runs over real TCP, two WT-free roundtrip integration tests).
 **Deferred / not yet ported:**
-- [ ] **R4b — WiredTiger storage adapter** (`impl secantus_commands::Storage for
-  secantus_storage::Storage`): bytes at the seam, `Hint` from `RawHint`, error
-  translation (DuplicateKey/BadHint/query → the command `StorageError`). Links WT,
-  so it lives outside the clean workspace and is CI-/WT-machine-only.
+- [~] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
+  `StorageAdapter`): **written but unverified locally** (links WT, excluded from
+  the workspace — first compiled by the `rust-storage` CI job). Watch its first CI
+  run; the likely failure point is `secantus_storage::Storage: Send + Sync` (the
+  command trait's supertrait). Bytes at the seam, `Hint` from `RawHint`, full
+  error translation in `map_err`.
 - [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
 - [ ] **R6 — embedded Python handle**: a thin PyO3 `#[pyclass]` over
   `secantus_server::RunningServer` (`start`/`stop`/`address`), so `pymongo` can
