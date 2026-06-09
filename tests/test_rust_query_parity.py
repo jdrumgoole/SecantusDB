@@ -251,7 +251,9 @@ CURATED = [
                 "$geoWithin": {
                     "$geometry": {
                         "type": "Polygon",
-                        "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+                        "coordinates": [
+                            [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]
+                        ],
                     }
                 }
             }
@@ -264,7 +266,9 @@ CURATED = [
                 "$geoWithin": {
                     "$geometry": {
                         "type": "Polygon",
-                        "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+                        "coordinates": [
+                            [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]
+                        ],
                     }
                 }
             }
@@ -278,7 +282,9 @@ CURATED = [
                 "$geoIntersects": {
                     "$geometry": {
                         "type": "Polygon",
-                        "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+                        "coordinates": [
+                            [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]
+                        ],
                     }
                 }
             }
@@ -293,7 +299,14 @@ CURATED = [
     # $nearSphere (GeoJSON, metres).
     (
         {"loc": [0.0, 0.0]},
-        {"loc": {"$nearSphere": {"$geometry": {"type": "Point", "coordinates": [0.0, 0.0]}, "$maxDistance": 1500000.0}}},
+        {
+            "loc": {
+                "$nearSphere": {
+                    "$geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                    "$maxDistance": 1500000.0,
+                }
+            }
+        },
     ),
     # $center -> Rust returns None (Fallback to Python); curated test skips it.
     ({"loc": [1.0, 1.0]}, {"loc": {"$geoWithin": {"$center": [[0.0, 0.0], 5.0]}}}),
