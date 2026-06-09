@@ -20,8 +20,8 @@
 
 use crate::query::Fallback;
 use bson::{Bson, Document};
-use geo::{Coord, CoordsIter, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon};
-use geo::{Point, Polygon, Relate};
+use geo::{BoundingRect, Coord, CoordsIter, Geometry, LineString, MultiLineString, MultiPoint};
+use geo::{MultiPolygon, Point, Polygon, Relate};
 
 type R = Result<bool, Fallback>;
 
@@ -333,6 +333,93 @@ pub fn op_geo_near(values: &[Option<Bson>], arg: &Bson, default_spherical: bool)
     Ok(false)
 }
 
+// --- 2d geohash index support (geo-2) -------------------------------------
+//
+// `2d` indexes bucket a planar point into a bit-interleaved (Z-order) geohash.
+// Storage writes one cell per point doc; a `$geoWithin` query scans the Z-order
+// range spanning the query geometry's bounding box (a superset — the post-filter
+// `matches()` discards false positives). Mirrors `secantus.geo_index`'s 2d path.
+
+fn bucket(value: f64, lo: f64, hi: f64, bits: u32) -> u64 {
+    if hi <= lo {
+        return 0;
+    }
+    let norm = (value - lo) / (hi - lo);
+    if norm <= 0.0 {
+        return 0;
+    }
+    if norm >= 1.0 {
+        return (1u64 << bits) - 1;
+    }
+    (norm * (1u64 << bits) as f64) as u64
+}
+
+fn interleave(bx: u64, by: u64, bits: u32) -> u64 {
+    let mut r = 0u64;
+    for i in 0..bits {
+        r |= ((bx >> i) & 1) << (2 * i);
+        r |= ((by >> i) & 1) << (2 * i + 1);
+    }
+    r
+}
+
+/// The interleaved geohash cell for a planar point under a `2d` index's
+/// (`bits`, `min`, `max`). Mirrors `geo_index.planar_2d_index_for_point`.
+pub fn cell_2d(x: f64, y: f64, bits: u32, lo: f64, hi: f64) -> u64 {
+    interleave(bucket(x, lo, hi, bits), bucket(y, lo, hi, bits), bits)
+}
+
+/// The coarse Z-order `(lo, hi)` cell range covering a bounding box (a superset;
+/// false positives are filtered by the per-doc `matches()`). Mirrors
+/// `geo_index.planar_2d_covering`.
+pub fn covering_2d(
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+    bits: u32,
+    lo: f64,
+    hi: f64,
+) -> (u64, u64) {
+    (
+        cell_2d(min_x, min_y, bits, lo, hi),
+        cell_2d(max_x, max_y, bits, lo, hi),
+    )
+}
+
+/// A cell ID as fixed-width 8-byte big-endian (lex order == cell order, so a WT
+/// range scan visits cells in order). Mirrors `geo_index.encode_cell`.
+pub fn encode_cell(cell: u64) -> [u8; 8] {
+    cell.to_be_bytes()
+}
+
+/// The `(x, y)` of a point-like doc field value (GeoJSON Point, legacy `[x,y]`,
+/// `{x,y}`/`{lng,lat}`), or `None` — used to write `2d` index entries (mongod's
+/// `2d` index is point-only).
+pub fn doc_point(v: &Bson) -> Option<(f64, f64)> {
+    match parse_doc_geometry(v) {
+        Some(Geometry::Point(p)) => Some((p.x(), p.y())),
+        _ => None,
+    }
+}
+
+/// The bounding box `(min_x, min_y, max_x, max_y)` of a `$geoWithin` query
+/// geometry, for the `2d` covering range. `None` for shapes whose *matching*
+/// also defers to Python (`$center`) — no point indexing a query the post-filter
+/// can't evaluate.
+pub fn query_within_bbox(arg: &Document) -> Option<(f64, f64, f64, f64)> {
+    match parse_query_geometry(arg)? {
+        QGeom::Planar(g) => {
+            let r = g.bounding_rect()?;
+            Some((r.min().x, r.min().y, r.max().x, r.max().y))
+        }
+        QGeom::Sphere { lng, lat, rad } => {
+            let d = rad.to_degrees();
+            Some((lng - d, lat - d, lng + d, lat + d))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +529,60 @@ mod tests {
         // A doc arg without $geometry -> Python raises QueryError -> Fallback.
         let arg = Bson::Document(doc! {"$maxDistance": 5.0_f64});
         assert!(op_geo_near(&[Some(xy(0.0, 0.0))], &arg, false).is_err());
+    }
+
+    #[test]
+    fn doc_point_extracts_point_shapes_only() {
+        assert_eq!(doc_point(&xy(3.0, 4.0)), Some((3.0, 4.0)));
+        assert_eq!(
+            doc_point(&Bson::Document(
+                doc! {"type": "Point", "coordinates": [1.0, 2.0]}
+            )),
+            Some((1.0, 2.0))
+        );
+        assert_eq!(
+            doc_point(&Bson::Document(doc! {"lng": 5.0, "lat": 6.0})),
+            Some((5.0, 6.0))
+        );
+        assert_eq!(doc_point(&Bson::Int32(7)), None);
+        // A polygon doc isn't a point.
+        assert_eq!(
+            doc_point(&Bson::Document(doc! {
+                "type": "Polygon",
+                "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn covering_contains_in_box_cell() {
+        let (bits, lo, hi) = (8u32, -180.0, 180.0);
+        let (clo, chi) = covering_2d(0.0, 0.0, 10.0, 10.0, bits, lo, hi);
+        // Every cell of a point inside the bbox falls in the Z-order range.
+        for &(x, y) in &[(0.0, 0.0), (5.0, 5.0), (10.0, 10.0), (2.5, 7.5)] {
+            let c = cell_2d(x, y, bits, lo, hi);
+            assert!(
+                clo <= c && c <= chi,
+                "({x},{y}) cell {c} not in [{clo},{chi}]"
+            );
+        }
+        // encode_cell is order-preserving (lex bytes == numeric order).
+        assert!(encode_cell(clo) <= encode_cell(chi));
+    }
+
+    #[test]
+    fn query_bbox_shapes() {
+        let b = query_within_bbox(&doc! {"$box": [[0.0, 0.0], [10.0, 20.0]]}).unwrap();
+        assert_eq!(b, (0.0, 0.0, 10.0, 20.0));
+        // $centerSphere -> center +/- radius-in-degrees.
+        let s = query_within_bbox(&doc! {"$centerSphere": [[0.0, 0.0], 0.1]}).unwrap();
+        let d = 0.1_f64.to_degrees();
+        assert!((s.0 + d).abs() < 1e-9 && (s.2 - d).abs() < 1e-9);
+        // $center defers (matching also defers) -> no bbox.
+        assert_eq!(
+            query_within_bbox(&doc! {"$center": [[0.0, 0.0], 5.0]}),
+            None
+        );
     }
 }
