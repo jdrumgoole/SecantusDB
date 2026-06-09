@@ -57,6 +57,11 @@ impl RustServer {
         replica_set_name: Option<String>,
         enable_oplog: bool,
     ) -> PyResult<Self> {
+        // WiredTiger requires the home directory to exist; create it so any
+        // path "just works" (matching the one-or-two-line ergonomic).
+        std::fs::create_dir_all(storage_path).map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to create storage dir {storage_path}: {e}"))
+        })?;
         let mut storage = Storage::open(storage_path)
             .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         storage.set_enable_oplog(enable_oplog);

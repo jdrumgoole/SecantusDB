@@ -19,7 +19,9 @@
 use std::sync::Arc;
 
 use bson::{Bson, Document};
-use secantus_commands::storage::{DuplicateKey, RawHint, Storage as CmdStorage, StorageError, UpdateOutcome};
+use secantus_commands::storage::{
+    DuplicateKey, RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
+};
 use secantus_storage::{Hint, Storage as WtStorage, StorageError as WtError};
 
 /// Wraps a shared WiredTiger-backed `Storage` and presents it as the command
