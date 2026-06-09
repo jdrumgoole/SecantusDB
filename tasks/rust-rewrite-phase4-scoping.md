@@ -189,13 +189,27 @@ build-out.
      reports `IXSCAN {field: "2d"}`. New WT-backed tests in `tests/geo.rs` (box /
      centerSphere within, point-only, delete/replace upkeep, create-over-existing,
      other geo types still rejected).
-   - **geo-3 (secantus-storage):** `2dsphere` S2 cell coverings (needs `s2`
-     crate — verify first). Each geometry writes covering cells + ancestors;
-     queries do exact cell point-lookups + Shapely/haversine verify.
-   - **geo-4:** `$geoNear` aggregation stage.
-   - When geo-3 lands, relax `create_index`'s `2dsphere` rejection and flag it
-     `multikey: true`. (`$geoWithin` `$center` and `$near` index routing aren't
-     accelerated yet — they COLLSCAN, still correct via `matches()`/`Fallback`.)
+   - **geo-3 ✅ DONE** — `2dsphere` S2 cell index in `secantus-storage` (via the
+     `s2` crate, kept in `secantus-storage`'s deps, not `secantus-core`, so the
+     shipped core wheel stays lean). `GeoSphere` + `parse_geo_sphere`;
+     `create_index` accepts a single-field `2dsphere` (flagged `multikey:true` so
+     the numeric pickers skip it). Module helpers `s2_coverer` (min 4 / max 16 /
+     64 cells / level_mod 1, mirroring `geo_index._make_coverer`),
+     `cell_with_ancestors`, `s2_cells_for_point` (leaf + ancestors),
+     `s2_cells_for_bbox` (`LatLngRect` covering + ancestors). `GeoSphere.cell_kbs`
+     writes covering cells + ancestors per geometry (point → leaf+ancestors; any
+     other geometry → its bounding rect via `secantus_core::geo::doc_bbox`).
+     `write`/`delete_index_entries` maintain these; `try_geo_sphere_id_keys`
+     routes `{field:{$geoWithin: region}}` to per-cell exact point-lookups over
+     the S2 covering of the query bbox (`query_within_bbox` + `s2_cells_for_bbox`,
+     unioned + deduped), with `find_matching` re-checking each candidate via
+     `matches()`; `explain` reports `IXSCAN {field: "2dsphere"}`. New WT-backed
+     tests in `tests/geo.rs` (box/centerSphere within, polygon docs covered,
+     delete/replace upkeep, create-over-existing). Only text/hashed are now
+     rejected. (`$geoWithin` `$center` and `$near` index routing still COLLSCAN —
+     correct via `matches()`/`Fallback`.)
+   - **geo-4:** `$geoNear` aggregation stage (blocked on the aggregation →
+     storage wiring, like `$lookup` / `$out` / `$merge`).
 4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
    time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
    acceleration here. Gate: `test_change_streams.py`. **Sliced** (3a → 3e):

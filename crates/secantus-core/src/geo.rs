@@ -403,6 +403,14 @@ pub fn doc_point(v: &Bson) -> Option<(f64, f64)> {
     }
 }
 
+/// The bounding box `(min_x, min_y, max_x, max_y)` of any doc geometry, or
+/// `None` if the value isn't a geometry — used to S2-cover non-point docs for a
+/// `2dsphere` index (mongod / s2sphere cover shapes via their bounding rect).
+pub fn doc_bbox(v: &Bson) -> Option<(f64, f64, f64, f64)> {
+    let r = parse_doc_geometry(v)?.bounding_rect()?;
+    Some((r.min().x, r.min().y, r.max().x, r.max().y))
+}
+
 /// The bounding box `(min_x, min_y, max_x, max_y)` of a `$geoWithin` query
 /// geometry, for the `2d` covering range. `None` for shapes whose *matching*
 /// also defers to Python (`$center`) — no point indexing a query the post-filter
