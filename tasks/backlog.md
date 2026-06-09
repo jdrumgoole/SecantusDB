@@ -294,10 +294,19 @@ never "remove Python."
   bindings + 6 WT-backed tests (`tests/auth.rs`) + smoke coverage. First of the
   5e gap-closure slices (port the 17 server-needed `Storage` methods missing from
   the Rust binding, then the engine adapter).
+- [x] **Phase 4 sub-phase 5e-gap-b — batch insert + prune-all in `secantus-storage`.**
+  `insert(db, coll, docs, ordered) -> (inserted, errors)` (auto-`_id`, unique +
+  dup-`_id` write-errors, ordered/unordered, batched `op:"i"` oplog) and
+  `prune_ttl_all_collections`. PyO3 bindings + 7 WT-backed tests
+  (`tests/batch_insert.rs`) + smoke. **Deferred (no Rust capped support):**
+  capped-collection eviction inside `insert` + geo-index validation on insert —
+  capped collections under `SECANTUS_ENGINE=rust` won't enforce bounds, and a bad
+  geometry won't be rejected (just indexed as no geo entry). Close when capped /
+  geo-validation land in the Rust storage.
 - [ ] **Phase 4 sub-phase 5e — remaining storage gaps + adapter.** Still to port to
-  Rust before the `SECANTUS_ENGINE=rust` server cutover: batch `insert`
-  (ordered/writeErrors/capped eviction), `checkpoint`/`close`/`create_archive`/
-  `prune_ttl_all_collections`, `oplog_tail_seq_nolock`, the change-stream condvar
+  Rust before the `SECANTUS_ENGINE=rust` server cutover:
+  `checkpoint`/`close`/`create_archive`,
+  `oplog_tail_seq_nolock`, the change-stream condvar
   (`_oplog_cv` tailable-wait) + `_reset_thread_session`. Then the `secantus.engine`
   storage-selection + Python `Storage` adapter over `RustStorage` (BSON seam,
   `EngineFallback` → Python-operators-over-Rust-docs, E11000/`BadHint` translation),

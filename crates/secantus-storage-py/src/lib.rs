@@ -158,6 +158,33 @@ impl RustStorage {
             .map_err(to_pyerr)
     }
 
+    /// Batch insert (`docs` is a list of BSON byte strings). Returns
+    /// `(inserted, errors)` where `errors` is a list of BSON-encoded write-error
+    /// docs (`{index, code, errmsg, keyPattern?, keyValue?}`). `ordered` stops
+    /// at the first error.
+    #[pyo3(signature = (db, coll, docs, ordered=true))]
+    fn insert(
+        &self,
+        py: Python<'_>,
+        db: &str,
+        coll: &str,
+        docs: Vec<Vec<u8>>,
+        ordered: bool,
+    ) -> PyResult<(usize, Vec<Py<PyBytes>>)> {
+        let (inserted, errors) = self
+            .inner
+            .insert(db, coll, docs, ordered)
+            .map_err(to_pyerr)?;
+        let err_bytes = errors
+            .iter()
+            .map(|e| encode_doc(e))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok((
+            inserted,
+            err_bytes.into_iter().map(|b| bytes(py, b)).collect(),
+        ))
+    }
+
     /// Fetch a document by `_id` (wrapped as `{"v": id}`). Returns its BSON
     /// bytes or `None`.
     fn find_by_id(
@@ -369,6 +396,14 @@ impl RustStorage {
     fn prune_ttl(&self, db: &str, coll: &str, now_millis: i64) -> PyResult<usize> {
         self.inner
             .prune_ttl(db, coll, bson::DateTime::from_millis(now_millis))
+            .map_err(to_pyerr)
+    }
+
+    /// Run TTL pruning across every collection (`now` epoch milliseconds);
+    /// returns the total pruned.
+    fn prune_ttl_all_collections(&self, now_millis: i64) -> PyResult<usize> {
+        self.inner
+            .prune_ttl_all_collections(bson::DateTime::from_millis(now_millis))
             .map_err(to_pyerr)
     }
 

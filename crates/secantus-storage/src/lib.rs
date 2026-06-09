@@ -1270,6 +1270,101 @@ impl Storage {
         Ok(key)
     }
 
+    /// Batch insert. Each element of `docs` is a BSON-encoded document; a
+    /// missing `_id` is assigned an `ObjectId`. Returns `(inserted, errors)`
+    /// where `errors` are mongod-shaped write-error docs (`{index, code,
+    /// errmsg, keyPattern?, keyValue?}`) for duplicate-`_id` / unique-index
+    /// violations. `ordered` stops at the first error (else continues). All
+    /// successful inserts share one batched oplog emit. Mirrors
+    /// `storage.insert`. (Capped-collection eviction and geo-index validation
+    /// are not yet enforced by the Rust engine — see backlog.)
+    pub fn insert(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<Vec<u8>>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>)> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        let descs = self.index_descs(&session, db, coll)?;
+        let ns = format!("{db}.{coll}");
+        let oplog_on = self.enable_oplog;
+        let ui = if oplog_on {
+            Some(collection_uuid(&session, db, coll)?)
+        } else {
+            None
+        };
+        let mut inserted = 0usize;
+        let mut errors: Vec<Document> = Vec::new();
+        let mut oplog_entries: Vec<Document> = Vec::new();
+        let doc_cur = session.open_cursor(DOC_TABLE, Some("overwrite=false"))?;
+        for (index, doc_bytes) in docs.iter().enumerate() {
+            let mut doc = decode_doc(doc_bytes)?;
+            if !doc.contains_key("_id") {
+                doc.insert("_id", Bson::ObjectId(ObjectId::new()));
+            }
+            let id = doc.get("_id").expect("_id present").clone();
+            let key = id_key(&id)?;
+            // Unique-index pre-check (collect a write-error rather than abort).
+            if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+                let mut e = Document::new();
+                e.insert("index", index as i32);
+                e.insert("code", 11000i32);
+                e.insert(
+                    "errmsg",
+                    format!("E11000 duplicate key error in index {}", c.index),
+                );
+                e.insert("keyPattern", Bson::Document(c.key_pattern));
+                e.insert("keyValue", Bson::Document(c.key_value));
+                errors.push(e);
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+            let blob = encode_doc(&doc)?;
+            doc_cur.reset()?;
+            doc_cur.set_key_ssu(db, coll, &key);
+            doc_cur.set_value_u(&blob);
+            match doc_cur.insert() {
+                Ok(()) => {}
+                Err(e) if e.is_duplicate_key() => {
+                    let mut ed = Document::new();
+                    ed.insert("index", index as i32);
+                    ed.insert("code", 11000i32);
+                    ed.insert("errmsg", format!("E11000 duplicate key error: _id {id:?}"));
+                    errors.push(ed);
+                    if ordered {
+                        break;
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+            self.write_index_entries(&session, db, coll, &doc, &descs)?;
+            self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+            inserted += 1;
+            if oplog_on {
+                let mut o2 = Document::new();
+                o2.insert("_id", id.clone());
+                let mut entry = Document::new();
+                entry.insert("op", "i");
+                entry.insert("ns", ns.clone());
+                entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
+                entry.insert("o", Bson::Document(doc.clone()));
+                entry.insert("o2", Bson::Document(o2));
+                oplog_entries.push(entry);
+            }
+        }
+        if oplog_on && !oplog_entries.is_empty() {
+            let n = oplog_entries.len();
+            self.emit_oplog(&session, oplog_entries, vec![None; n])?;
+        }
+        Ok((inserted, errors))
+    }
+
     /// Fetch a document by `_id`. Returns its BSON bytes, or `None`.
     pub fn find_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<Option<Vec<u8>>> {
         let _g = self.lock.lock().unwrap();
@@ -1484,6 +1579,34 @@ impl Storage {
             pruned += 1;
         }
         Ok(pruned)
+    }
+
+    /// Run `prune_ttl` against every collection in every database, returning the
+    /// total docs pruned. Per-collection errors (e.g. a concurrent drop) are
+    /// suppressed so a global sweep never aborts. Mirrors
+    /// `storage.prune_ttl_all_collections`.
+    pub fn prune_ttl_all_collections(&self, now: bson::DateTime) -> Result<usize> {
+        // Snapshot all (db, coll) under the lock, then prune each (prune_ttl
+        // takes the lock itself, so it isn't held across the per-coll work).
+        let pairs: Vec<(String, String)> = {
+            let _g = self.lock.lock().unwrap();
+            let session = self.conn.open_session()?;
+            let cur = session.open_cursor(COLL_TABLE, None)?;
+            let mut pairs = Vec::new();
+            let mut more = cur.next()?;
+            while more {
+                pairs.push(cur.get_key_ss()?);
+                more = cur.next()?;
+            }
+            pairs
+        };
+        let mut total = 0usize;
+        for (db, coll) in pairs {
+            if let Ok(n) = self.prune_ttl(&db, &coll, now) {
+                total += n;
+            }
+        }
+        Ok(total)
     }
 
     pub fn collection_exists(&self, db: &str, coll: &str) -> Result<bool> {
