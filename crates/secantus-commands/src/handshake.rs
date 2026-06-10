@@ -23,7 +23,7 @@ use crate::{
 ///
 /// `topologyVersion.counter` and `connectionId` MUST be int64 on the wire — the
 /// Go driver rejects the handshake otherwise (see `commands.py::_hello`).
-pub fn hello(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let now = DateTime::now();
     let mut response = doc! {
         "isWritablePrimary": true,
@@ -73,6 +73,16 @@ pub fn hello(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     if ctx.require_auth {
         response.insert("accessControlEnabled", true);
+    }
+
+    // `saslSupportedMechs: "<db>.<user>"` — drivers ask which mechanisms to
+    // attempt for a principal. We only implement SCRAM-SHA-256, so advertise
+    // exactly that (mongod lists whatever the user's credentials carry).
+    if doc.get_str("saslSupportedMechs").is_ok() {
+        response.insert(
+            "saslSupportedMechs",
+            vec![Bson::String("SCRAM-SHA-256".to_string())],
+        );
     }
 
     Ok(response)

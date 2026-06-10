@@ -300,8 +300,15 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       inheritance walk with cycle detection), and `createUser` now accepts a
       custom role that exists in storage. 6 unit tests (role lifecycle, built-in
       collision, updateRole, resolver privilege + inheritance) + a pymongo WT
-      round-trip. **Deferred (R5b-4):** the role `grant`/`revoke` quartet,
-      `updateUser` / `dropAllUsersFromDatabase`, `saslSupportedMechs` hinting.
+      round-trip.
+    - **R5b-4 ✅ DONE** — auth/RBAC completion: the role `grant`/`revoke` quartet
+      (`grantPrivilegesToRole` / `revokePrivilegesFromRole` / `grantRolesToRole`
+      / `revokeRolesFromRole` — merge/dedup privileges by resource, drop
+      emptied privileges, dedup inherited roles), `updateUser` (rotate password
+      / replace roles, with a live `effective_roles` refresh on the calling
+      connection), `dropAllUsersFromDatabase`, and `hello`'s `saslSupportedMechs`
+      advertisement. 8 new unit tests + a pymongo WT round-trip. This closes the
+      auth/RBAC surface bar SCRAM-SHA-1 / X509 (R5c).
     - **R5c** — TLS / mTLS (`rustls`) in the accept loop + the X509 mechanism
       (`saslStart`/`authenticate` MONGODB-X509, needs the verified peer cert DN).
     Then the tailable change-stream getMore + storage-backed aggregation stages,

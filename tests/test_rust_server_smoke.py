@@ -231,6 +231,40 @@ def test_custom_roles_against_rust_server(tmp_path) -> None:
         srv.stop()
 
 
+def test_role_grant_revoke_and_update_user(tmp_path) -> None:
+    """grant/revoke quartet + updateUser over WiredTiger (R5b-4)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        admin = _client(srv).admin
+        admin.command("createRole", "r", privileges=[], roles=[])
+        # grant privileges, then read them back via rolesInfo
+        admin.command(
+            "grantPrivilegesToRole",
+            "r",
+            privileges=[{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}],
+        )
+        rec = admin.command("rolesInfo", "r")["roles"][0]
+        assert rec["privileges"][0]["actions"] == ["find"]
+        # revoke it → privilege dropped
+        admin.command(
+            "revokePrivilegesFromRole",
+            "r",
+            privileges=[{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}],
+        )
+        assert admin.command("rolesInfo", "r")["roles"][0]["privileges"] == []
+
+        # updateUser rotates a password
+        admin.command("createUser", "u", pwd="old", roles=[{"role": "read", "db": "app"}])
+        assert admin.command("updateUser", "u", pwd="new")["ok"] == 1.0
+
+        # dropAllUsersFromDatabase clears the db
+        n = admin.command("dropAllUsersFromDatabase", 1)["n"]
+        assert n == 1
+        assert admin.command("usersInfo", 1)["users"] == []
+    finally:
+        srv.stop()
+
+
 def test_require_auth_gating_against_rust_server(tmp_path) -> None:
     """End-to-end `--auth` gating (R5b-2).
 
