@@ -266,12 +266,27 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       client↔server round-trip (6 tests) incl. wrong-password / unknown-user /
       nonce-mismatch / malformed rejections. SCRAM-SHA-1 (MD5 prepass) +
       MONGODB-X509 + non-ASCII SASLprep deferred.
-    - **R5b (next)** — wire it in: `saslStart` / `saslContinue` / `authenticate`
-      + `createUser` / `dropUser` / `usersInfo` (over the users/roles storage,
-      already in `secantus-storage`, via new trait methods + adapter),
-      per-connection `ConnectionAuth` state in the server (R4a), and the
-      dispatch-level `--auth` gating + RBAC privilege checks.
-    - **R5c** — TLS / mTLS (`rustls`) in the accept loop + the X509 mechanism.
+    - **R5b-1 ✅ DONE** — wired SCRAM-SHA-256 into the command layer:
+      `saslStart` / `saslContinue` (`secantus-commands::auth`) drive
+      `begin_scram` / `continue_scram` against a per-connection
+      `ConnectionAuth` (`scram` conversation + authenticated principals),
+      threaded one-per-socket through the server's `handle_connection` →
+      `make_context`. User management — `createUser` (derives + stores the
+      `{credentials: {SCRAM-SHA-256}}` record, mongod-identical shape so both
+      servers share the `secantus_users` table), `dropUser`, `usersInfo`
+      (`showCredentials` gating) — over four new `Storage` trait methods
+      (`add_user` / `get_user` / `drop_user` / `list_users`, default-impl'd,
+      forwarded by the WT adapter to `secantus_storage`). 6 command-level unit
+      tests (full SCRAM client↔server round-trip, wrong-password, unknown-user,
+      unsupported-mechanism, usersInfo cred-hiding, dropUser) + a pymongo TCP
+      auth round-trip in `test_rust_server_smoke.py`.
+    - **R5b-2 (next)** — dispatch-level `--auth` gating + RBAC privilege checks,
+      `updateUser` / `dropAllUsersFromDatabase`, role validation against a role
+      catalogue (`RoleNotFound`), and `saslSupportedMechs` handshake hinting.
+      Today `roles` are stored verbatim (no validation) and commands are not
+      gated on the authenticated principal.
+    - **R5c** — TLS / mTLS (`rustls`) in the accept loop + the X509 mechanism
+      (`saslStart`/`authenticate` MONGODB-X509, needs the verified peer cert DN).
     Then the tailable change-stream getMore + storage-backed aggregation stages,
     and **R7/R8** (standalone `secantusdb` binary + the full pymongo conformance
     gate against the Rust server).

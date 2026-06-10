@@ -707,10 +707,15 @@ dependencies = [
 name = "secantus-commands"
 version = "0.5.2-beta.15"
 dependencies = [
+ "base64",
  "bson",
+ "hmac",
+ "pbkdf2",
  "rand",
+ "secantus-auth",
  "secantus-core",
  "secantus-wire",
+ "sha2",
 ]
 
 [[package]]

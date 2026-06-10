@@ -90,6 +90,41 @@ pub fn derive_credentials(
     }
 }
 
+impl StoredCredentials {
+    /// Base64 of the salt / stored key / server key, for the stored user record
+    /// (`{SCRAM-SHA-256: {iterationCount, salt, storedKey, serverKey}}`).
+    pub fn salt_b64(&self) -> String {
+        B64.encode(&self.salt)
+    }
+    pub fn stored_key_b64(&self) -> String {
+        B64.encode(&self.stored_key)
+    }
+    pub fn server_key_b64(&self) -> String {
+        B64.encode(&self.server_key)
+    }
+
+    /// Reconstruct credentials from the stored base64 record fields.
+    pub fn from_b64(
+        iteration_count: u32,
+        salt_b64: &str,
+        stored_key_b64: &str,
+        server_key_b64: &str,
+    ) -> Result<Self, AuthError> {
+        Ok(StoredCredentials {
+            iteration_count,
+            salt: B64
+                .decode(salt_b64)
+                .map_err(|_| err("invalid stored salt base64"))?,
+            stored_key: B64
+                .decode(stored_key_b64)
+                .map_err(|_| err("invalid storedKey base64"))?,
+            server_key: B64
+                .decode(server_key_b64)
+                .map_err(|_| err("invalid serverKey base64"))?,
+        })
+    }
+}
+
 /// Per-conversation SCRAM state across one `saslStart` → `saslContinue`.
 #[derive(Debug, Clone)]
 pub struct ScramState {
@@ -235,6 +270,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Peek the username (`n=`) out of a SCRAM client-first payload, so the caller
+/// can look up the user's credentials before `begin_scram`. Returns `None` if
+/// the payload is malformed or carries no username.
+pub fn peek_username(payload: &[u8]) -> Option<String> {
+    if !payload.starts_with(b"n,") {
+        return None;
+    }
+    let gs2_end = payload[2..]
+        .iter()
+        .position(|&b| b == b',')
+        .map(|i| i + 2)?;
+    let bare = &payload[gs2_end + 1..];
+    parse_attrs(bare).get("n").cloned()
 }
 
 /// Parse a SCRAM `key=value,key=value` payload into a map.
