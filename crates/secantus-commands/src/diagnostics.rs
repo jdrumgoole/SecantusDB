@@ -187,15 +187,19 @@ mod tests {
 
     #[test]
     fn get_cmd_line_opts_reflects_auth() {
+        // Call the handler directly: under `--auth`, dispatch would gate
+        // `getCmdLineOpts` behind authentication (covered in the auth tests),
+        // so here we verify only that the handler reflects `--auth` in its
+        // `parsed.security` output.
         let mut c = ctx();
-        let off = dispatch(&doc! {"getCmdLineOpts": 1}, &mut c);
+        let off = get_cmd_line_opts(&doc! {"getCmdLineOpts": 1}, &mut c).unwrap();
         assert!(off
             .get_document("parsed")
             .unwrap()
             .get("security")
             .is_none());
         c.require_auth = true;
-        let on = dispatch(&doc! {"getCmdLineOpts": 1}, &mut c);
+        let on = get_cmd_line_opts(&doc! {"getCmdLineOpts": 1}, &mut c).unwrap();
         assert_eq!(
             on.get_document("parsed")
                 .unwrap()

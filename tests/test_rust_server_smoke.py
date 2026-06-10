@@ -186,6 +186,32 @@ def test_scram_auth_roundtrip_against_rust_server(tmp_path) -> None:
         srv.stop()
 
 
+def test_require_auth_gating_against_rust_server(tmp_path) -> None:
+    """End-to-end `--auth` gating (R5b-2).
+
+    With access control on, the driver handshake (`hello` / `ping`) still flows
+    on an unauthenticated connection, but a data command is rejected with
+    Unauthorized (pymongo surfaces it as ``OperationFailure``). The
+    authenticated-success and per-action RBAC paths are covered exhaustively by
+    the Rust unit tests; this asserts the gating boundary over a real socket.
+
+    (We don't drive the authenticated path here: seeding the first user requires
+    either a localhost exception or reopening the same on-disk storage, and
+    WiredTiger only allows one open of a home directory per process.)
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, require_auth=True)
+    try:
+        client = _client(srv)
+        # Pre-auth handshake commands are allowed without authentication.
+        assert client.admin.command("ping")["ok"] == 1.0
+        assert client.admin.command("hello")["ok"] == 1.0
+        # A data command without authentication is rejected.
+        with pytest.raises(pymongo.errors.OperationFailure):
+            client["app"]["c"].find_one({})
+    finally:
+        srv.stop()
+
+
 def test_admin_commands_against_rust_server(tmp_path) -> None:
     """DDL + introspection + db-admin via pymongo: listCollections, createIndexes
     / listIndexes, dbStats, serverStatus, drop."""

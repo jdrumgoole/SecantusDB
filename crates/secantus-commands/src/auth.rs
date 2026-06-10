@@ -20,15 +20,21 @@
 //!   mechanisms: ["SCRAM-SHA-256"] }
 //! ```
 //!
-//! ## Deferred (R5b-2 / R5c, tracked in `tasks/rust-server-plan.md`)
+//! `--auth` gating + RBAC privilege checks run in the dispatcher (see
+//! [`crate::rbac`] and `dispatch`'s `authorize`): under `--auth` a non-handshake
+//! command requires an authenticated principal holding the command's action
+//! grant. `createUser` validates each role against the built-in catalogue
+//! (`RoleNotFound`), and a successful `saslContinue` loads the principal's role
+//! bindings into `ConnectionAuth::effective_roles`.
 //!
-//! * **`--auth` enforcement + RBAC** — handlers authenticate and record the
-//!   principal, but dispatch does not yet *gate* commands on it, and `roles` are
-//!   stored verbatim without validation against a role catalogue (no
-//!   `RoleNotFound`).
-//! * **SCRAM-SHA-1** (legacy MD5 prepass) and **MONGODB-X509** (needs TLS, R5c).
+//! ## Deferred (later slices, tracked in `tasks/rust-server-plan.md`)
+//!
+//! * **Custom user-defined roles** — the `createRole` / `updateRole` family and
+//!   the inheritance-graph resolver `check_privilege` threads through in Python.
+//!   Only built-in role names validate / grant today.
 //! * **`updateUser`** / **`dropAllUsersFromDatabase`** / `saslSupportedMechs`
 //!   handshake hinting.
+//! * **SCRAM-SHA-1** (legacy MD5 prepass) and **MONGODB-X509** (needs TLS, R5c).
 
 use std::sync::{Arc, Mutex};
 
@@ -37,7 +43,7 @@ use bson::{doc, Binary, Bson, Document};
 
 use secantus_auth::{begin_scram, continue_scram, derive_credentials, peek_username, ScramState};
 
-use crate::{CommandContext, CommandError, HandlerResult};
+use crate::{rbac, CommandContext, CommandError, HandlerResult};
 
 /// The only mechanism this slice implements (the modern driver default).
 const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
@@ -60,6 +66,9 @@ pub struct ConnectionAuth {
     next_conversation_id: i32,
     /// Principals (`(db, username)`) authenticated on this connection.
     pub authenticated: Vec<(String, String)>,
+    /// The union of role bindings (`(role, db)`) the authenticated principals
+    /// hold, used by the dispatcher's RBAC check.
+    pub effective_roles: Vec<(String, String)>,
 }
 
 impl ConnectionAuth {
@@ -68,6 +77,7 @@ impl ConnectionAuth {
             scram: None,
             next_conversation_id: 0,
             authenticated: Vec::new(),
+            effective_roles: Vec::new(),
         }
     }
 
@@ -80,6 +90,21 @@ impl ConnectionAuth {
     /// Whether any principal has authenticated on this connection.
     pub fn is_authenticated(&self) -> bool {
         !self.authenticated.is_empty()
+    }
+
+    /// Merge a user record's `roles` (`[{role, db}, ...]`) into the effective
+    /// role set, de-duplicating.
+    pub fn add_principal_roles(&mut self, roles: &[Bson]) {
+        for r in roles {
+            if let Bson::Document(d) = r {
+                if let (Ok(role), Ok(db)) = (d.get_str("role"), d.get_str("db")) {
+                    let binding = (role.to_string(), db.to_string());
+                    if !self.effective_roles.contains(&binding) {
+                        self.effective_roles.push(binding);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -134,6 +159,14 @@ fn lookup_creds(
     let stored_key = sub.get_str("storedKey").ok()?;
     let server_key = sub.get_str("serverKey").ok()?;
     secantus_auth::StoredCredentials::from_b64(iteration_count, salt, stored_key, server_key).ok()
+}
+
+/// The `roles` array (`[{role, db}, ...]`) stored on a user record, or `None`
+/// if the user / roles can't be read.
+fn lookup_roles(ctx: &CommandContext, db: &str, username: &str) -> Option<Vec<Bson>> {
+    let record_bytes = ctx.storage().ok()?.get_user(db, username).ok()??;
+    let record = Document::from_reader(&mut record_bytes.as_slice()).ok()?;
+    record.get_array("roles").ok().cloned()
 }
 
 /// `saslStart` — begin a SCRAM-SHA-256 conversation.
@@ -193,6 +226,10 @@ pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     if !auth.authenticated.contains(&principal) {
         auth.authenticated.push(principal);
     }
+    // Capture the principal's role bindings for the dispatcher's RBAC check.
+    if let Some(roles) = lookup_roles(ctx, &state.db_name, &state.username) {
+        auth.add_principal_roles(&roles);
+    }
     let conversation_id = state.conversation_id;
 
     Ok(doc! {
@@ -208,26 +245,44 @@ fn bad_value(msg: impl Into<String>) -> CommandError {
     CommandError::new(2, "BadValue", msg)
 }
 
-/// Coerce a `roles` argument into the canonical `[{role, db}]` shape. Accepts
-/// the list-of-strings shorthand (each bound to `default_db`) and the
-/// list-of-docs form. **No role-catalogue validation yet** (RBAC is R5b-2), so
-/// any role name is accepted verbatim.
-fn normalise_roles(arg: Option<&Bson>, default_db: &str) -> Vec<Bson> {
-    let Some(Bson::Array(items)) = arg else {
-        return Vec::new();
+/// `RoleNotFound`.
+const ROLE_NOT_FOUND: i32 = 31;
+
+/// Coerce a `roles` argument into the canonical `[{role, db}]` shape and
+/// validate each role name against the built-in catalogue. Accepts the
+/// list-of-strings shorthand (each bound to `default_db`) and the list-of-docs
+/// form. An unrecognised role name is a `RoleNotFound` (31) error. Custom
+/// user-defined roles aren't recognised yet (deferred with the `createRole`
+/// family), so only built-in role names validate.
+fn normalise_roles(arg: Option<&Bson>, default_db: &str) -> Result<Vec<Bson>, CommandError> {
+    let items = match arg {
+        Some(Bson::Array(items)) => items,
+        None => return Ok(Vec::new()),
+        _ => return Err(bad_value("createUser: roles must be an array")),
     };
-    items
-        .iter()
-        .filter_map(|item| match item {
-            Bson::String(role) => Some(Bson::Document(doc! { "role": role, "db": default_db })),
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let (role, db) = match item {
+            Bson::String(role) => (role.clone(), default_db.to_string()),
             Bson::Document(d) => {
-                let role = d.get_str("role").ok()?;
+                let role = d
+                    .get_str("role")
+                    .map_err(|_| bad_value("createUser: role entry needs a string 'role'"))?;
                 let db = d.get_str("db").unwrap_or(default_db);
-                Some(Bson::Document(doc! { "role": role, "db": db }))
+                (role.to_string(), db.to_string())
             }
-            _ => None,
-        })
-        .collect()
+            _ => return Err(bad_value("createUser: roles must be strings or {role, db}")),
+        };
+        if !rbac::is_known_role(&role) {
+            return Err(CommandError::new(
+                ROLE_NOT_FOUND,
+                "RoleNotFound",
+                format!("Role {role}@{db} not found"),
+            ));
+        }
+        out.push(Bson::Document(doc! { "role": role, "db": db }));
+    }
+    Ok(out)
 }
 
 /// `createUser` — derive SCRAM-SHA-256 credentials and store the user record.
@@ -249,7 +304,7 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     } else {
         ctx.db_name.clone()
     };
-    let roles = normalise_roles(doc.get("roles"), &db_name);
+    let roles = normalise_roles(doc.get("roles"), &db_name)?;
 
     let creds = derive_credentials(&pwd, None, None);
     let credentials = doc! {
@@ -513,6 +568,7 @@ mod tests {
         let auth = Arc::new(Mutex::new(ConnectionAuth::new()));
         let mut ctx = CommandContext::new(1)
             .with_storage(store)
+            .with_cursors(Arc::new(crate::CursorRegistry::new()))
             .with_conn_auth(auth.clone());
         ctx.db_name = "admin".to_string();
         (ctx, auth)
@@ -523,6 +579,122 @@ mod tests {
         let bare = format!("n={user},r={nonce}").into_bytes();
         let full = format!("n,,n={user},r={nonce}").into_bytes();
         (full, bare)
+    }
+
+    /// Run the full SCRAM-SHA-256 handshake for `(user, pwd)` against `ctx`,
+    /// leaving the connection authenticated (with its effective roles loaded).
+    fn authenticate(ctx: &mut CommandContext, user: &str, pwd: &str) {
+        let (first, bare) = scram_client_first(user, "clientNonce123");
+        let start = dispatch(
+            &doc! {"saslStart": 1, "mechanism": SCRAM_SHA_256, "payload": payload_binary(first), "$db": "admin"},
+            ctx,
+        );
+        let cid = start.get_i32("conversationId").unwrap();
+        let server_first = payload_bytes(start.get("payload"));
+        let cf = client_final(pwd, &server_first, &bare);
+        let cont = dispatch(
+            &doc! {"saslContinue": 1, "conversationId": cid, "payload": payload_binary(cf), "$db": "admin"},
+            ctx,
+        );
+        assert_eq!(cont.get_f64("ok").unwrap(), 1.0, "auth failed: {cont:?}");
+    }
+
+    #[test]
+    fn require_auth_gates_unauthenticated_commands() {
+        let (mut ctx, _auth) = ctx_with_store();
+        ctx.require_auth = true;
+        // Pre-auth handshake commands flow without authentication.
+        assert_eq!(
+            dispatch(&doc! {"ping": 1}, &mut ctx).get_f64("ok").unwrap(),
+            1.0
+        );
+        assert_eq!(
+            dispatch(&doc! {"hello": 1}, &mut ctx)
+                .get_f64("ok")
+                .unwrap(),
+            1.0
+        );
+        // A data command is rejected with Unauthorized (13).
+        let find = dispatch(&doc! {"find": "c", "$db": "t"}, &mut ctx);
+        assert_eq!(find.get_i32("code").unwrap(), 13);
+        assert_eq!(find.get_str("codeName").unwrap(), "Unauthorized");
+        // An unknown command is still CommandNotFound (59), not Unauthorized.
+        let unknown = dispatch(&doc! {"bogusCmd": 1, "$db": "t"}, &mut ctx);
+        assert_eq!(unknown.get_i32("code").unwrap(), 59);
+    }
+
+    #[test]
+    fn rbac_grants_and_denies_by_role() {
+        let (mut ctx, _auth) = ctx_with_store();
+        // Provision a readWrite-on-"t" user (auth off during setup).
+        dispatch(
+            &doc! {"createUser": "rw", "pwd": "pw", "roles": [{"role": "readWrite", "db": "t"}], "$db": "admin"},
+            &mut ctx,
+        );
+        authenticate(&mut ctx, "rw", "pw");
+        ctx.require_auth = true;
+
+        // The unit-test `dispatch` doesn't read `$db` (the server sets db_name),
+        // so we set the target db on the context directly, as the server would.
+        // readWrite on "t" grants find / insert on "t" ...
+        ctx.db_name = "t".to_string();
+        assert_eq!(
+            dispatch(&doc! {"find": "c"}, &mut ctx)
+                .get_f64("ok")
+                .unwrap(),
+            1.0
+        );
+        assert_eq!(
+            dispatch(&doc! {"insert": "c", "documents": [{"_id": 1}]}, &mut ctx)
+                .get_f64("ok")
+                .unwrap(),
+            1.0
+        );
+        // ... but not on a different db ...
+        ctx.db_name = "other".to_string();
+        let other = dispatch(&doc! {"find": "c"}, &mut ctx);
+        assert_eq!(other.get_i32("code").unwrap(), 13);
+        // ... and not a cluster command (serverStatus needs clusterMonitor/root).
+        ctx.db_name = "admin".to_string();
+        let ss = dispatch(&doc! {"serverStatus": 1}, &mut ctx);
+        assert_eq!(ss.get_i32("code").unwrap(), 13);
+    }
+
+    #[test]
+    fn root_role_authorizes_cluster_commands() {
+        let (mut ctx, _auth) = ctx_with_store();
+        dispatch(
+            &doc! {"createUser": "admin", "pwd": "pw", "roles": [{"role": "root", "db": "admin"}], "$db": "admin"},
+            &mut ctx,
+        );
+        authenticate(&mut ctx, "admin", "pw");
+        ctx.require_auth = true;
+        ctx.db_name = "admin".to_string();
+        assert_eq!(
+            dispatch(&doc! {"serverStatus": 1}, &mut ctx)
+                .get_f64("ok")
+                .unwrap(),
+            1.0
+        );
+        // root spans every db.
+        ctx.db_name = "anydb".to_string();
+        assert_eq!(
+            dispatch(&doc! {"find": "c"}, &mut ctx)
+                .get_f64("ok")
+                .unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn create_user_unknown_role_is_role_not_found() {
+        let (mut ctx, _auth) = ctx_with_store();
+        let reply = dispatch(
+            &doc! {"createUser": "x", "pwd": "pw", "roles": ["notARole"], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 31);
+        assert_eq!(reply.get_str("codeName").unwrap(), "RoleNotFound");
     }
 
     #[test]
