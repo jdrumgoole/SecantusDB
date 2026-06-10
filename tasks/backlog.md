@@ -189,9 +189,14 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
   `getParameter` / `getCmdLineOpts` / `connectionStatus` / `whatsmyuri` /
   `hostInfo` / `getLog` (storage-light; session/txn are no-ops). Removes
   CommandNotFound on driver connect/teardown.
-- [ ] **R5 — auth + TLS** (SCRAM-SHA-1/256, MONGODB-X509, rustls) — the next big
-  family; needs the users/roles storage (already in secantus-storage) wired into
-  the command trait + the server's per-connection auth state.
+- [~] **R5 — auth + TLS** (SCRAM-SHA-1/256, MONGODB-X509, rustls). **R5a DONE**:
+  the SCRAM-SHA-256 mechanism (`crates/secantus-auth`, pure Rust, 6 tests, full
+  client↔server round-trip). **R5b (next):** wire it in — `saslStart`/
+  `saslContinue`/`authenticate` + `createUser`/`dropUser`/`usersInfo` over the
+  users/roles storage (already in secantus-storage) via new trait methods +
+  adapter, per-connection `ConnectionAuth` state in the server, dispatch `--auth`
+  gating + RBAC. **R5c:** TLS/mTLS (rustls) + MONGODB-X509. Deferred: SCRAM-SHA-1
+  (MD5 prepass), non-ASCII SASLprep.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.

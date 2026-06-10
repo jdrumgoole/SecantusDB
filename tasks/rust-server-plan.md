@@ -258,10 +258,23 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     `CommandNotFound` noise on driver connect/teardown/admin probes. 5 tests.
     **Deferred:** real session/cursor affinity; live `connectionStatus` auth info
     (R5); peer-address `whatsmyuri`.
-  - **Next** — **R5** (auth + TLS: SCRAM / X509 / rustls), the tailable
-    change-stream getMore + storage-backed aggregation stages, and **R7/R8**
-    (standalone `secantusdb` binary + the full pymongo conformance gate against
-    the Rust server).
+  - **Next** — **R5 auth + TLS**:
+    - **R5a ✅ DONE** — the SCRAM-SHA-256 mechanism (`crates/secantus-auth`,
+      pure Rust): `derive_credentials` (PBKDF2-HMAC-SHA-256 → client/stored/server
+      keys), `begin_scram` / `continue_scram` server handshake, constant-time
+      proof check, unknown-user-fabrication timing. Verified with a full
+      client↔server round-trip (6 tests) incl. wrong-password / unknown-user /
+      nonce-mismatch / malformed rejections. SCRAM-SHA-1 (MD5 prepass) +
+      MONGODB-X509 + non-ASCII SASLprep deferred.
+    - **R5b (next)** — wire it in: `saslStart` / `saslContinue` / `authenticate`
+      + `createUser` / `dropUser` / `usersInfo` (over the users/roles storage,
+      already in `secantus-storage`, via new trait methods + adapter),
+      per-connection `ConnectionAuth` state in the server (R4a), and the
+      dispatch-level `--auth` gating + RBAC privilege checks.
+    - **R5c** — TLS / mTLS (`rustls`) in the accept loop + the X509 mechanism.
+    Then the tailable change-stream getMore + storage-backed aggregation stages,
+    and **R7/R8** (standalone `secantusdb` binary + the full pymongo conformance
+    gate against the Rust server).
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL

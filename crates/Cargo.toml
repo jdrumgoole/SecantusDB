@@ -14,6 +14,8 @@
 #   * secantus-server  — the TCP accept/connection loop (R4), generic over the
 #                        command Storage trait. WT-free, runs over real TCP in the
 #                        same `rust` CI job; the WT adapter lands separately.
+#   * secantus-auth    — pure-Rust SCRAM-SHA-256 mechanism (R5). No PyO3 / native
+#                        deps; same `rust` CI job.
 [workspace]
 resolver = "2"
 members = [
@@ -22,6 +24,7 @@ members = [
     "secantus-wire",
     "secantus-commands",
     "secantus-server",
+    "secantus-auth",
 ]
 # secantus-wt (the WiredTiger FFI / storage foundation, Phase 4) is intentionally
 # NOT a workspace member yet: it links the vendored WiredTiger C library, which
