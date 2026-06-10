@@ -33,8 +33,11 @@
 //! [`CommandContext`] only carries what the handshake reads today; it grows as
 //! families are added.
 
+pub mod admin;
+pub mod aggregate;
 pub mod crud;
 pub mod cursors;
+pub mod distinct;
 pub mod find;
 pub mod handshake;
 pub mod storage;
@@ -204,9 +207,17 @@ fn lookup(name: &str) -> Option<Handler> {
         "update" => crud::update,
         "delete" => crud::delete,
         "count" => crud::count,
+        "distinct" => distinct::distinct,
         "find" => find::find,
+        "aggregate" => aggregate::aggregate,
         "getMore" => cursors::get_more,
         "killCursors" => cursors::kill_cursors,
+        "create" => admin::create,
+        "drop" => admin::drop,
+        "listCollections" => admin::list_collections,
+        "listIndexes" => admin::list_indexes,
+        "createIndexes" => admin::create_indexes,
+        "dropIndexes" => admin::drop_indexes,
         _ => return None,
     })
 }

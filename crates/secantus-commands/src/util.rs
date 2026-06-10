@@ -60,6 +60,40 @@ pub(crate) fn docs_to_bson(batch: Vec<Vec<u8>>) -> Result<Vec<Bson>, CommandErro
         .collect()
 }
 
+/// Decode encoded documents into owned `Document`s (for handing to the
+/// `secantus-core` engines, e.g. the aggregation pipeline).
+pub(crate) fn decode_docs(batch: Vec<Vec<u8>>) -> Result<Vec<Document>, CommandError> {
+    batch
+        .iter()
+        .map(|b| {
+            Document::from_reader(&mut b.as_slice()).map_err(|e| {
+                CommandError::new(
+                    1,
+                    "InternalError",
+                    format!("failed to decode document: {e}"),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Encode owned `Document`s back to bytes (for the cursor / storage seam).
+pub(crate) fn encode_docs(docs: Vec<Document>) -> Result<Vec<Vec<u8>>, CommandError> {
+    docs.iter()
+        .map(|d| {
+            let mut v = Vec::new();
+            d.to_writer(&mut v).map_err(|e| {
+                CommandError::new(
+                    1,
+                    "InternalError",
+                    format!("failed to encode document: {e}"),
+                )
+            })?;
+            Ok(v)
+        })
+        .collect()
+}
+
 /// Shape a per-operation `writeError` document from a pre-classified storage
 /// error (used by `delete`; `update` will reuse it).
 pub(crate) fn write_error(index: usize, err: StorageError) -> Document {
