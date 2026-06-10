@@ -214,11 +214,23 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     per-op writeError (the Rust `update_matching` takes `&Document`;
     `secantus-storage` has no pipeline-update path yet); `arrayFilters` / `let` /
     `collation` / `validator` / `writeConcern` likewise pending storage-seam work.
-  - **R2c+ (next)** — pivot to **R4** (accept loop + the real `secantus-storage`
-    adapter + standalone binary) and **R6** (embedded Python handle) so the Rust
-    server is runnable and the pymongo gauge can finally gate it; then aggregate /
-    admin / auth families. Each keeps `test_crud.py` / `test_aggregate.py` /
-    `test_commands*.py` green against the Rust server once R6 can boot it.
+  - **`aggregate` ✅ DONE** (`secantus-commands::aggregate`, post-merge of PR #31)
+    — port of `_aggregate`'s storage-independent path: fetch input via the
+    `Storage` trait's `find` (lifting a leading `$match` into the fetch filter +
+    dropping that stage), run `secantus_core::aggregate::apply_pipeline` (all the
+    storage-free stages), split into a cursor (`cursor.batchSize`). `$changeStream`
+    standalone-rejection (40573) honoured; collectionless `aggregate: 1` handled.
+    A pipeline the Rust engine can't reproduce (`Fallback`) → `BadValue`. 6 unit
+    tests; the pymongo smoke test now exercises `count_documents` + a direct
+    `$match`→`$group` pipeline. **Deferred:** storage-backed stages (`$lookup` /
+    `$out` / `$merge` / `$geoNear` / `$sample` / `$collStats` / `$indexStats` —
+    need storage threaded into the pipeline engine), `$changeStream` cursors,
+    `let`-expression evaluation, `collation`.
+  - **Next** — DDL + misc command families (`findAndModify` / `distinct` /
+    `listCollections` / `listIndexes` / `createIndexes` / `create` / `drop` /
+    admin stats), then **R5** (auth + TLS), the tailable change-stream getMore,
+    and **R7/R8** (standalone binary + the full pymongo conformance gate against
+    the Rust server).
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL

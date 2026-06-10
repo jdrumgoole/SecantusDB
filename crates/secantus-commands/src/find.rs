@@ -99,8 +99,8 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// remainder (`commands.py::_split_into_cursor`). `batchSize == 0` is a real
 /// value: an empty `firstBatch` with a live cursor the client drains via
 /// `getMore`. Returns `(first_batch, cursor_id)` with `cursor_id == 0` when
-/// everything fit.
-fn split_into_cursor(
+/// everything fit. Shared with the `aggregate` handler.
+pub(crate) fn split_into_cursor(
     mut docs: Vec<Vec<u8>>,
     batch_size: i64,
     ns: &str,

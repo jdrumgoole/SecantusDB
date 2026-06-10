@@ -6,10 +6,10 @@ real `pymongo` client, exactly as the full suites will once the server grows the
 remaining command families.
 
 Scoped to the commands the Rust dispatch currently implements: handshake
-(`hello` / `ping`), `insert`, `find` (+ `getMore` / `killCursors`), and
-`delete`. **Not yet exercised** (deferred command families): `count_documents`
-(pymongo routes it through `aggregate`, not yet ported), `update`'s richer forms,
-change streams, etc.
+(`hello` / `ping`), `insert`, `find` (+ `getMore` / `killCursors`), `delete`,
+and `aggregate` (incl. `count_documents`, which pymongo routes through an
+aggregation pipeline). **Not yet exercised** (deferred): storage-backed
+aggregation stages (`$lookup` / `$out` / `$merge`), change streams, etc.
 
 Gated on the `_secantus_server` extension being importable, which requires the
 WiredTiger-linking build (the wheel's CMake under
@@ -37,11 +37,7 @@ def _client(srv):
 
 
 def test_pymongo_crud_against_rust_server(tmp_path) -> None:
-    """Insert / find / find-with-filter / delete end-to-end via pymongo.
-
-    Reads back through ``find`` rather than ``count_documents`` — the latter is a
-    pymongo-side ``aggregate``, which the Rust dispatch doesn't implement yet.
-    """
+    """Insert / find / find-with-filter / count_documents / delete end-to-end."""
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
     try:
         coll = _client(srv)["t"]["c"]
@@ -50,9 +46,37 @@ def test_pymongo_crud_against_rust_server(tmp_path) -> None:
         assert len(list(coll.find({}))) == 3
         assert coll.find_one({"_id": 2})["x"] == 2
         assert sorted(d["_id"] for d in coll.find({"x": 1})) == [1, 3]
+        # count_documents routes through an aggregation pipeline.
+        assert coll.count_documents({}) == 3
+        assert coll.count_documents({"x": 1}) == 2
 
         coll.delete_one({"_id": 1})
         assert sorted(d["_id"] for d in coll.find({})) == [2, 3]
+    finally:
+        srv.stop()
+
+
+def test_aggregate_pipeline_against_rust_server(tmp_path) -> None:
+    """A direct aggregation pipeline ($match → $group) via pymongo."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many(
+            [
+                {"_id": 1, "g": "a", "v": 10},
+                {"_id": 2, "g": "a", "v": 20},
+                {"_id": 3, "g": "b", "v": 5},
+            ]
+        )
+        result = list(
+            coll.aggregate(
+                [
+                    {"$match": {"g": "a"}},
+                    {"$group": {"_id": "$g", "total": {"$sum": "$v"}}},
+                ]
+            )
+        )
+        assert result == [{"_id": "a", "total": 30}]
     finally:
         srv.stop()
 

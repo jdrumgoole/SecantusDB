@@ -163,23 +163,27 @@ non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projectio
 / cursor split → the full `find → getMore → killCursors` path works in dispatch),
 `update` (document-form, multi/upsert, pipeline-shape validation), R4a
 (`secantus-server`: accept loop + connection handling, generic over the command
-`Storage` trait — runs over real TCP, two WT-free roundtrip integration tests).
+`Storage` trait — runs over real TCP, two WT-free roundtrip integration tests),
+**R4b + R6 (merged in PR #31, CI-green across Linux/macOS/Windows): the WT adapter
+and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger works.**
+`aggregate` (storage-independent pipeline via `secantus_core::apply_pipeline`;
+`count_documents` + direct pipelines pass through pymongo).
 **Deferred / not yet ported:**
-- [~] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
-  `StorageAdapter`): **written but unverified locally** (links WT, excluded from
-  the workspace — first compiled by the `rust-storage` CI job). Watch its first CI
-  run; the likely failure point is `secantus_storage::Storage: Send + Sync` (the
-  command trait's supertrait). Bytes at the seam, `Hint` from `RawHint`, full
-  error translation in `map_err`.
+- [ ] **`aggregate` storage-backed stages** — `$lookup` / `$out` / `$merge` /
+  `$geoNear` / `$sample` / `$collStats` / `$indexStats` (Rust engine returns
+  `Fallback` → surfaced as `BadValue`); `$changeStream` cursors; `let`-expression
+  evaluation; `collation`. Land when the pipeline engine gets a storage context.
+- [ ] **DDL + misc commands** — `findAndModify` / `distinct` / `listCollections` /
+  `listIndexes` / `createIndexes` / `create` / `drop` / admin stats.
+- [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
+  `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
+  `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.
+- [x] **R6 — embedded Python handle** (`crates/secantus-server-py`, the
+  `_secantus_server` extension / `RustServer`): CI-green — bundled into the wheel
+  by CMake and smoke-tested via pymongo across Linux/macOS/Windows. `RustServer`
+  auto-creates the storage dir. **Follow-ups:** a Python `secantus`-package
+  wrapper for `SecantusDBServer`-style ergonomics; an `invoke rust-server-py` task.
 - [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
-- [~] **R6 — embedded Python handle** (`crates/secantus-server-py`, the
-  `_secantus_server` extension / `RustServer`): **written but unverified locally**
-  (links WT, excluded — built by the wheel CMake / local maturin only). Opens
-  storage → `StorageAdapter` → `bind`; `address`/`uri`/`stop` + context manager.
-  `tests/test_rust_server_smoke.py` (pymongo, importorskip) is the first
-  pymongo → Rust → WT test. **Follow-ups:** validate via CI / a WT machine; add a
-  Python `secantus`-package wrapper for `SecantusDBServer`-style ergonomics; an
-  `invoke rust-server-py` build task.
 - [ ] **`update` pipeline-form + options** — a *valid* pipeline-form `u` (`[...]`)
   surfaces as a per-op writeError because the Rust `update_matching` takes
   `&Document` and `secantus-storage` has no pipeline-update path. Same for

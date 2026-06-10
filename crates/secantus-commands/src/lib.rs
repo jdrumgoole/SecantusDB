@@ -33,6 +33,7 @@
 //! [`CommandContext`] only carries what the handshake reads today; it grows as
 //! families are added.
 
+pub mod aggregate;
 pub mod crud;
 pub mod cursors;
 pub mod find;
@@ -205,6 +206,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "delete" => crud::delete,
         "count" => crud::count,
         "find" => find::find,
+        "aggregate" => aggregate::aggregate,
         "getMore" => cursors::get_more,
         "killCursors" => cursors::kill_cursors,
         _ => return None,
