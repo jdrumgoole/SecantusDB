@@ -280,11 +280,20 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       tests (full SCRAM client↔server round-trip, wrong-password, unknown-user,
       unsupported-mechanism, usersInfo cred-hiding, dropUser) + a pymongo TCP
       auth round-trip in `test_rust_server_smoke.py`.
-    - **R5b-2 (next)** — dispatch-level `--auth` gating + RBAC privilege checks,
-      `updateUser` / `dropAllUsersFromDatabase`, role validation against a role
-      catalogue (`RoleNotFound`), and `saslSupportedMechs` handshake hinting.
-      Today `roles` are stored verbatim (no validation) and commands are not
-      gated on the authenticated principal.
+    - **R5b-2 ✅ DONE** — dispatch-level `--auth` gating + RBAC privilege checks.
+      New `secantus-commands::rbac` ports the built-in role catalogue (`read` /
+      `readWrite` / `dbAdmin` / `userAdmin` / `dbOwner`, the `*AnyDatabase`
+      variants, `clusterMonitor` / `clusterAdmin` / `backup` / `restore`,
+      `root`) + `check_privilege`. `dispatch`'s `authorize` rejects
+      non-handshake commands from unauthenticated connections (`Unauthorized`,
+      13) and checks the principal's effective roles against a per-command
+      `(action, scope)` table; `createUser` validates roles against the
+      catalogue (`RoleNotFound`, 31); a successful `saslContinue` loads the
+      user's role bindings into `ConnectionAuth::effective_roles`. 11 unit tests
+      (rbac matrix + gating + cross-db / cluster denial + role validation).
+      **Deferred (R5b-3):** custom user-defined roles (`createRole` family +
+      inheritance resolver), `updateUser` / `dropAllUsersFromDatabase`,
+      `saslSupportedMechs` handshake hinting.
     - **R5c** — TLS / mTLS (`rustls`) in the accept loop + the X509 mechanism
       (`saslStart`/`authenticate` MONGODB-X509, needs the verified peer cert DN).
     Then the tailable change-stream getMore + storage-backed aggregation stages,

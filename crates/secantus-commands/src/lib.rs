@@ -43,6 +43,7 @@ pub mod distinct;
 pub mod find;
 pub mod findandmodify;
 pub mod handshake;
+pub mod rbac;
 pub mod storage;
 mod util;
 
@@ -276,12 +277,177 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     }
 
     match lookup(name) {
-        Some(handler) => match handler(doc, ctx) {
-            Ok(reply) => reply,
-            Err(e) => e.into_reply(),
-        },
+        Some(handler) => {
+            // Auth gating + RBAC run after CommandNotFound but before the
+            // handler (mirrors `commands.py::dispatch`), so an unknown command
+            // is still `59` rather than `13` even under `--auth`.
+            if let Err(e) = authorize(name, doc, ctx) {
+                return e.into_reply();
+            }
+            match handler(doc, ctx) {
+                Ok(reply) => reply,
+                Err(e) => e.into_reply(),
+            }
+        }
         None => CommandError::command_not_found(name).into_reply(),
     }
+}
+
+/// `--auth` gating + RBAC privilege check (`commands.py::dispatch`). A no-op when
+/// `require_auth` is off (default-allow). When on: any command outside
+/// [`is_pre_auth_command`] requires an authenticated principal (`Unauthorized`,
+/// 13); an authenticated principal must then hold the command's action grant
+/// (also `Unauthorized`). Pre-auth and explicitly exempt commands
+/// ([`is_no_privilege_command`]) bypass the privilege check.
+fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), CommandError> {
+    if !ctx.require_auth {
+        return Ok(());
+    }
+    let authenticated = ctx
+        .conn_auth
+        .as_ref()
+        .map(|a| {
+            a.lock()
+                .expect("conn auth mutex poisoned")
+                .is_authenticated()
+        })
+        .unwrap_or(false);
+
+    if !is_pre_auth_command(name) && !authenticated {
+        return Err(CommandError::new(
+            13,
+            "Unauthorized",
+            format!("command {name} requires authentication"),
+        ));
+    }
+
+    if authenticated && !is_pre_auth_command(name) && !is_no_privilege_command(name) {
+        if let Some((action, scope)) = command_action(name) {
+            let (target_db, cluster) = resource_for_command(name, doc, scope, &ctx.db_name);
+            let roles = ctx
+                .conn_auth
+                .as_ref()
+                .map(|a| {
+                    a.lock()
+                        .expect("conn auth mutex poisoned")
+                        .effective_roles
+                        .clone()
+                })
+                .unwrap_or_default();
+            if !rbac::check_privilege(&roles, action, target_db.as_deref(), cluster) {
+                return Err(CommandError::new(
+                    13,
+                    "Unauthorized",
+                    format!(
+                        "not authorized on {} to execute command (action: {action})",
+                        target_db.as_deref().unwrap_or("cluster")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Commands a connection may invoke before authenticating (`--auth` on): the
+/// driver handshake plus the SCRAM round-trip itself. Mirrors
+/// `commands.py::_PRE_AUTH_COMMANDS`.
+fn is_pre_auth_command(name: &str) -> bool {
+    matches!(
+        name,
+        "hello"
+            | "isMaster"
+            | "ismaster"
+            | "ping"
+            | "buildInfo"
+            | "buildinfo"
+            | "saslStart"
+            | "saslContinue"
+            | "endSessions"
+            | "whatsmyuri"
+    )
+}
+
+/// Commands that skip the RBAC privilege check even when authenticated: cursor
+/// continuation (authorized at find/aggregate time), session administrivia, and
+/// metadata the driver depends on. Mirrors `commands.py::_NO_PRIVILEGE_COMMANDS`.
+fn is_no_privilege_command(name: &str) -> bool {
+    matches!(
+        name,
+        "getMore"
+            | "endSessions"
+            | "startSession"
+            | "refreshSessions"
+            | "ping"
+            | "ismaster"
+            | "isMaster"
+            | "hello"
+            | "buildInfo"
+            | "buildinfo"
+            | "whatsmyuri"
+            | "saslStart"
+            | "saslContinue"
+            | "connectionStatus"
+            | "abortTransaction"
+            | "commitTransaction"
+    )
+}
+
+/// The `(action, scope)` a command needs, or `None` for "no privilege required"
+/// (a permissive default — an authenticated user with any role can invoke it).
+/// Mirrors `commands.py::_COMMAND_ACTIONS`.
+fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
+    use rbac::*;
+    Some(match name {
+        "find" | "count" | "distinct" | "aggregate" => (A_FIND, SCOPE_COLLECTION),
+        "insert" => (A_INSERT, SCOPE_COLLECTION),
+        "update" => (A_UPDATE, SCOPE_COLLECTION),
+        "delete" => (A_REMOVE, SCOPE_COLLECTION),
+        "findAndModify" | "findandmodify" => (A_UPDATE, SCOPE_COLLECTION),
+        "killCursors" => (A_KILL_CURSORS, SCOPE_COLLECTION),
+        "listIndexes" => (A_LIST_INDEXES, SCOPE_COLLECTION),
+        "createIndexes" => (A_CREATE_INDEX, SCOPE_COLLECTION),
+        "dropIndexes" => (A_DROP_INDEX, SCOPE_COLLECTION),
+        "create" => (A_CREATE_COLLECTION, SCOPE_DATABASE),
+        "drop" => (A_DROP_COLLECTION, SCOPE_COLLECTION),
+        "dropDatabase" => (A_DROP_DATABASE, SCOPE_DATABASE),
+        "renameCollection" => (A_RENAME_COLL_SAME_DB, SCOPE_COLLECTION),
+        "listCollections" => (A_LIST_COLLECTIONS, SCOPE_DATABASE),
+        "dbStats" | "dbstats" => (A_DB_STATS, SCOPE_DATABASE),
+        "collStats" => (A_COLL_STATS, SCOPE_COLLECTION),
+        "createUser" => (A_CREATE_USER, SCOPE_DATABASE),
+        "dropUser" => (A_DROP_USER, SCOPE_DATABASE),
+        "usersInfo" => (A_VIEW_USER, SCOPE_DATABASE),
+        "serverStatus" => (A_SERVER_STATUS, SCOPE_CLUSTER),
+        "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
+        "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
+        "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
+        "getLog" => (A_GET_LOG, SCOPE_CLUSTER),
+        _ => return None,
+    })
+}
+
+/// Resolve the `(target_db, cluster_flag)` an action operates on. Cluster-scoped
+/// commands return `(None, true)`; collection/database commands use the
+/// connection's `$db`, except `renameCollection` whose source db is its
+/// namespace prefix. Mirrors `commands.py::_resource_for_command`.
+fn resource_for_command(
+    name: &str,
+    doc: &Document,
+    scope: &str,
+    default_db: &str,
+) -> (Option<String>, bool) {
+    if scope == rbac::SCOPE_CLUSTER {
+        return (None, true);
+    }
+    if name == "renameCollection" {
+        if let Ok(ns) = doc.get_str("renameCollection") {
+            if let Some((db, _)) = ns.split_once('.') {
+                return (Some(db.to_string()), false);
+            }
+        }
+    }
+    (Some(default_db.to_string()), false)
 }
 
 /// `readConcern.level` validation (`commands.py::dispatch`): an invalid level is

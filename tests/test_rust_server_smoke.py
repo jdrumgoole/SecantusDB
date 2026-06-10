@@ -186,6 +186,69 @@ def test_scram_auth_roundtrip_against_rust_server(tmp_path) -> None:
         srv.stop()
 
 
+def test_require_auth_gating_against_rust_server(tmp_path) -> None:
+    """End-to-end `--auth` gating + RBAC (R5b-2).
+
+    Seed a ``readWrite`` user on an auth-off server, then reopen the same
+    storage with ``require_auth=True``. An unauthenticated connection is
+    rejected on a data command; the authenticated user can read/write its db
+    but is denied a cluster command (``serverStatus`` needs clusterMonitor/root).
+    """
+    wt = str(tmp_path / "wt")
+
+    # Phase 1: provision the user with access control off.
+    seed = _server.RustServer(wt, 0)
+    try:
+        admin = _client(seed).admin
+        created = admin.command(
+            "createUser",
+            "rw",
+            pwd="pw",
+            roles=[{"role": "readWrite", "db": "app"}],
+        )
+        assert created["ok"] == 1.0
+    finally:
+        seed.stop()
+
+    # Phase 2: reopen with --auth on.
+    srv = _server.RustServer(wt, 0, require_auth=True)
+    try:
+        host, port = srv.address
+
+        # Unauthenticated client: handshake is fine, but a data command is
+        # rejected with Unauthorized (pymongo raises OperationFailure).
+        anon = pymongo.MongoClient(
+            host, port, directConnection=True, serverSelectionTimeoutMS=5000
+        )
+        try:
+            assert anon.admin.command("ping")["ok"] == 1.0  # pre-auth, allowed
+            with pytest.raises(pymongo.errors.OperationFailure):
+                anon["app"]["c"].find_one({})
+        finally:
+            anon.close()
+
+        # Authenticated readWrite user: can read/write "app" ...
+        auth = pymongo.MongoClient(
+            host,
+            port,
+            username="rw",
+            password="pw",
+            authSource="admin",
+            directConnection=True,
+            serverSelectionTimeoutMS=5000,
+        )
+        try:
+            auth["app"]["c"].insert_one({"_id": 1, "x": 1})
+            assert auth["app"]["c"].find_one({"_id": 1})["x"] == 1
+            # ... but a cluster command is denied.
+            with pytest.raises(pymongo.errors.OperationFailure):
+                auth.admin.command("serverStatus")
+        finally:
+            auth.close()
+    finally:
+        srv.stop()
+
+
 def test_admin_commands_against_rust_server(tmp_path) -> None:
     """DDL + introspection + db-admin via pymongo: listCollections, createIndexes
     / listIndexes, dbStats, serverStatus, drop."""

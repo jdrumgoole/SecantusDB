@@ -42,6 +42,10 @@ impl RustServer {
     /// * `replica_set_name` — `Some` advertises the single-node `secantus`
     ///   replica set in `hello` (so change streams are accepted); `None` is a
     ///   plain standalone.
+    /// * `require_auth` — when `True`, access control is on: non-handshake
+    ///   commands require an authenticated principal (provision users with
+    ///   `createUser` over an initially-open admin connection, or pre-seed the
+    ///   store) and are checked against the principal's RBAC role grants.
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -49,6 +53,7 @@ impl RustServer {
         host = "127.0.0.1".to_string(),
         replica_set_name = None,
         enable_oplog = true,
+        require_auth = false,
     ))]
     fn new(
         storage_path: &str,
@@ -56,6 +61,7 @@ impl RustServer {
         host: String,
         replica_set_name: Option<String>,
         enable_oplog: bool,
+        require_auth: bool,
     ) -> PyResult<Self> {
         // WiredTiger requires the home directory to exist; create it so any
         // path "just works" (matching the one-or-two-line ergonomic).
@@ -70,7 +76,7 @@ impl RustServer {
         let cursors = Arc::new(CursorRegistry::new());
         let config = ServerConfig {
             replica_set_name,
-            require_auth: false,
+            require_auth,
         };
         let addr = format!("{host}:{port}");
         let running = bind(&addr, config, adapter, cursors)
