@@ -191,12 +191,19 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
   CommandNotFound on driver connect/teardown.
 - [~] **R5 — auth + TLS** (SCRAM-SHA-1/256, MONGODB-X509, rustls). **R5a DONE**:
   the SCRAM-SHA-256 mechanism (`crates/secantus-auth`, pure Rust, 6 tests, full
-  client↔server round-trip). **R5b (next):** wire it in — `saslStart`/
-  `saslContinue`/`authenticate` + `createUser`/`dropUser`/`usersInfo` over the
-  users/roles storage (already in secantus-storage) via new trait methods +
-  adapter, per-connection `ConnectionAuth` state in the server, dispatch `--auth`
-  gating + RBAC. **R5c:** TLS/mTLS (rustls) + MONGODB-X509. Deferred: SCRAM-SHA-1
-  (MD5 prepass), non-ASCII SASLprep.
+  client↔server round-trip). **R5b-1 DONE:** wired into the command layer —
+  `saslStart`/`saslContinue` (`secantus-commands::auth`) over a per-connection
+  `ConnectionAuth` (threaded one-per-socket through the server), plus
+  `createUser`/`dropUser`/`usersInfo` over four new `Storage` trait methods
+  (`add_user`/`get_user`/`drop_user`/`list_users`, adapter-forwarded to
+  `secantus-storage`). Stored record is mongod-shape so both servers share the
+  `secantus_users` table. 6 command unit tests + a pymongo TCP auth round-trip.
+  **R5b-2 (next):** dispatch `--auth` gating + RBAC privilege checks,
+  `updateUser`/`dropAllUsersFromDatabase`, role-catalogue validation
+  (`RoleNotFound`), `saslSupportedMechs` handshake hinting (today `roles` are
+  stored verbatim and commands aren't gated on the principal). **R5c:** TLS/mTLS
+  (rustls) + MONGODB-X509. Deferred: SCRAM-SHA-1 (MD5 prepass), non-ASCII
+  SASLprep.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.

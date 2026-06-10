@@ -35,6 +35,7 @@
 
 pub mod admin;
 pub mod aggregate;
+pub mod auth;
 pub mod crud;
 pub mod cursors;
 pub mod diagnostics;
@@ -45,8 +46,9 @@ pub mod handshake;
 pub mod storage;
 mod util;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+pub use auth::ConnectionAuth;
 use bson::{doc, Bson, Document};
 pub use cursors::{CursorError, CursorRegistry};
 pub use secantus_wire::{MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE};
@@ -92,6 +94,10 @@ pub struct CommandContext {
     /// The per-server cursor registry (drives `getMore` / `killCursors`). `None`
     /// until the server wires one in.
     pub cursors: Option<Arc<CursorRegistry>>,
+    /// Per-connection authentication state (SCRAM conversation + authenticated
+    /// principals), shared across the requests on one socket. `None` until the
+    /// server (R4) wires one in; the auth family needs it.
+    pub conn_auth: Option<Arc<Mutex<ConnectionAuth>>>,
 }
 
 impl CommandContext {
@@ -110,6 +116,7 @@ impl CommandContext {
             },
             storage: None,
             cursors: None,
+            conn_auth: None,
         }
     }
 
@@ -122,6 +129,13 @@ impl CommandContext {
     /// Attach a cursor registry (builder-style; used by the server and tests).
     pub fn with_cursors(mut self, cursors: Arc<CursorRegistry>) -> Self {
         self.cursors = Some(cursors);
+        self
+    }
+
+    /// Attach per-connection auth state (builder-style; used by the server and
+    /// tests). The auth family (`saslStart` / `saslContinue` / …) reads it.
+    pub fn with_conn_auth(mut self, conn_auth: Arc<Mutex<ConnectionAuth>>) -> Self {
+        self.conn_auth = Some(conn_auth);
         self
     }
 
@@ -233,6 +247,11 @@ fn lookup(name: &str) -> Option<Handler> {
         | "killAllSessions"
         | "killAllSessionsByPattern" => diagnostics::ok_session_noop,
         "commitTransaction" | "abortTransaction" => diagnostics::ok_transaction,
+        "saslStart" => auth::sasl_start,
+        "saslContinue" => auth::sasl_continue,
+        "createUser" => auth::create_user,
+        "dropUser" => auth::drop_user,
+        "usersInfo" => auth::users_info,
         "getParameter" => diagnostics::get_parameter,
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
         "connectionStatus" => diagnostics::connection_status,

@@ -117,6 +117,75 @@ def test_rust_server_handshake(tmp_path) -> None:
         srv.stop()
 
 
+def test_scram_auth_roundtrip_against_rust_server(tmp_path) -> None:
+    """createUser + a SCRAM-SHA-256 authenticated reconnect (R5b).
+
+    The Rust server doesn't yet *enforce* ``--auth`` (RBAC gating is R5b-2), but
+    a pymongo client given credentials performs the full
+    ``saslStart`` → ``saslContinue`` SCRAM-SHA-256 handshake on connect. A wrong
+    password must surface as ``OperationFailure`` (auth failed); the right one
+    must let commands through.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        host, port = srv.address
+        admin = _client(srv).admin
+        created = admin.command(
+            "createUser",
+            "alice",
+            pwd="s3cr3t",
+            roles=[{"role": "readWrite", "db": "t"}],
+        )
+        assert created["ok"] == 1.0
+
+        # Right password → the SCRAM handshake succeeds and commands run.
+        good = pymongo.MongoClient(
+            host,
+            port,
+            username="alice",
+            password="s3cr3t",
+            authSource="admin",
+            authMechanism="SCRAM-SHA-256",
+            directConnection=True,
+            serverSelectionTimeoutMS=5000,
+        )
+        try:
+            assert good.admin.command("ping")["ok"] == 1.0
+            good["t"]["c"].insert_one({"_id": 1, "ok": True})
+            assert good["t"]["c"].find_one({"_id": 1})["ok"] is True
+        finally:
+            good.close()
+
+        # Wrong password → SCRAM proof fails → OperationFailure on first command.
+        bad = pymongo.MongoClient(
+            host,
+            port,
+            username="alice",
+            password="WRONG",
+            authSource="admin",
+            authMechanism="SCRAM-SHA-256",
+            directConnection=True,
+            serverSelectionTimeoutMS=5000,
+        )
+        try:
+            with pytest.raises(pymongo.errors.OperationFailure):
+                bad.admin.command("ping")
+        finally:
+            bad.close()
+
+        # usersInfo round-trips and hides credentials by default.
+        info = admin.command("usersInfo", "alice")
+        assert len(info["users"]) == 1
+        assert info["users"][0]["user"] == "alice"
+        assert "credentials" not in info["users"][0]
+
+        # dropUser removes it.
+        assert admin.command("dropUser", "alice")["ok"] == 1.0
+        assert admin.command("usersInfo", "alice")["users"] == []
+    finally:
+        srv.stop()
+
+
 def test_admin_commands_against_rust_server(tmp_path) -> None:
     """DDL + introspection + db-admin via pymongo: listCollections, createIndexes
     / listIndexes, dbStats, serverStatus, drop."""

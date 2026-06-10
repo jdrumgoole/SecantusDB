@@ -169,6 +169,35 @@ impl CmdStorage for StorageAdapter {
     fn index_sizes(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
         self.inner.index_sizes(db, coll).map_err(map_err)
     }
+
+    fn add_user(
+        &self,
+        db: &str,
+        username: &str,
+        record: &[u8],
+        replace: bool,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .add_user(db, username, record, replace)
+            .map_err(map_err)
+    }
+
+    fn get_user(&self, db: &str, username: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.get_user(db, username).map_err(map_err)
+    }
+
+    fn drop_user(&self, db: &str, username: &str) -> Result<bool, StorageError> {
+        self.inner.drop_user(db, username).map_err(map_err)
+    }
+
+    fn list_users(
+        &self,
+        db: Option<&str>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.inner.list_users(db, skip, limit).map_err(map_err)
+    }
 }
 
 /// Convert a raw `hint` value into the storage `Hint`. A string is an index

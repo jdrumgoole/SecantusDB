@@ -24,6 +24,16 @@ secantus-wire = { path = "../secantus-wire" }
 # The pure-Rust operator engines — `find` applies projections via
 # `secantus_core::projection`. Pure Rust, no WT, already in the workspace.
 secantus-core = { path = "../secantus-core" }
+# SCRAM-SHA-256 mechanism (R5) for the saslStart / saslContinue handlers.
+secantus-auth = { path = "../secantus-auth" }
 # Cryptographically-unpredictable cursor ids (the registry mints 63-bit random
 # ids so another connection can't enumerate / hijack cursors by guessing).
 rand = "0.9"
+
+# Test-only: the auth-family unit tests drive a SCRAM-SHA-256 *client* to prove
+# the server handshake round-trips end-to-end (same primitives as secantus-auth).
+[dev-dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+base64 = "0.22"

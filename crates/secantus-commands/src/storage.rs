@@ -199,4 +199,38 @@ pub trait Storage: Send + Sync {
     fn index_sizes(&self, _db: &str, _coll: &str) -> Result<Document, StorageError> {
         Ok(Document::new())
     }
+
+    // --- users (R5 auth) ----------------------------------------------------
+
+    /// Store a user record (opaque BSON). Returns `false` if the user already
+    /// exists and `replace` is false.
+    fn add_user(
+        &self,
+        _db: &str,
+        _username: &str,
+        _record: &[u8],
+        _replace: bool,
+    ) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    /// The stored user record bytes for `(db, username)`, or `None`.
+    fn get_user(&self, _db: &str, _username: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
+    }
+
+    /// Drop a user. `true` if it existed.
+    fn drop_user(&self, _db: &str, _username: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// List user records (all dbs when `db` is `None`), paginated.
+    fn list_users(
+        &self,
+        _db: Option<&str>,
+        _skip: usize,
+        _limit: usize,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(Vec::new())
+    }
 }

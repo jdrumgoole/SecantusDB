@@ -22,12 +22,12 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bson::{doc, Bson, Document};
-use secantus_commands::{dispatch, CommandContext, CursorRegistry, Storage};
+use secantus_commands::{dispatch, CommandContext, ConnectionAuth, CursorRegistry, Storage};
 use secantus_wire::{
     build_op_msg_reply, build_op_reply, Header, Op, OpMsg, WireError, HEADER_SIZE,
     OP_MSG_FLAG_MORE_TO_COME,
@@ -149,6 +149,10 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     stream.set_read_timeout(Some(READ_POLL))?;
     let mut stream = stream;
     let conn_id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    // Per-connection auth state, shared across every request on this socket so a
+    // SCRAM conversation (saslStart → saslContinue) and the authenticated
+    // principals persist for the connection's lifetime.
+    let conn_auth = Arc::new(Mutex::new(ConnectionAuth::new()));
 
     loop {
         // Header.
@@ -185,7 +189,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
                         continue;
                     }
                 };
-                let reply = run_dispatch(&request, conn_id, &shared);
+                let reply = run_dispatch(&request, conn_id, &shared, &conn_auth);
                 if !more_to_come {
                     write_op_msg(&mut stream, &header, &shared, &reply)?;
                 }
@@ -205,7 +209,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
                         continue;
                     }
                 };
-                let mut ctx = make_context(conn_id, &shared);
+                let mut ctx = make_context(conn_id, &shared, &conn_auth);
                 ctx.db_name = db_from_namespace(query.full_collection_name);
                 let reply = dispatch(&request, &mut ctx);
                 write_op_reply(&mut stream, &header, &shared, &reply)?;
@@ -236,18 +240,28 @@ fn merge_op_msg_body(msg: &OpMsg) -> Result<Document, WireError> {
     Ok(body)
 }
 
-fn run_dispatch(request: &Document, conn_id: i64, shared: &Arc<Shared>) -> Document {
-    let mut ctx = make_context(conn_id, shared);
+fn run_dispatch(
+    request: &Document,
+    conn_id: i64,
+    shared: &Arc<Shared>,
+    conn_auth: &Arc<Mutex<ConnectionAuth>>,
+) -> Document {
+    let mut ctx = make_context(conn_id, shared, conn_auth);
     if let Ok(db) = request.get_str("$db") {
         ctx.db_name = db.to_string();
     }
     dispatch(request, &mut ctx)
 }
 
-fn make_context(conn_id: i64, shared: &Arc<Shared>) -> CommandContext {
+fn make_context(
+    conn_id: i64,
+    shared: &Arc<Shared>,
+    conn_auth: &Arc<Mutex<ConnectionAuth>>,
+) -> CommandContext {
     let mut ctx = CommandContext::new(conn_id)
         .with_storage(shared.storage.clone())
-        .with_cursors(shared.cursors.clone());
+        .with_cursors(shared.cursors.clone())
+        .with_conn_auth(conn_auth.clone());
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
     ctx.require_auth = shared.config.require_auth;
