@@ -1,5 +1,7 @@
-//! Custom user-defined role management (R5b-3): `createRole` / `updateRole` /
-//! `dropRole` / `dropAllRolesFromDatabase` / `rolesInfo`.
+//! Custom user-defined role management (R5b-3 / R5b-4): `createRole` /
+//! `updateRole` / `dropRole` / `dropAllRolesFromDatabase` / `rolesInfo`, plus the
+//! incremental `grant`/`revoke` quartet (`grantPrivilegesToRole` /
+//! `revokePrivilegesFromRole` / `grantRolesToRole` / `revokeRolesFromRole`).
 //!
 //! A port of `commands.py`'s role handlers. Custom roles carry a `privileges`
 //! array (`[{resource, actions}]`) plus an inherited-`roles` array, stored as
@@ -16,11 +18,6 @@
 //!   privileges: [{ resource: {...}, actions: [...] }, ...],
 //!   roles: [{ role, db }, ...] }
 //! ```
-//!
-//! **Deferred:** the `grant`/`revoke` quartet (`grantPrivilegesToRole` /
-//! `revokePrivilegesFromRole` / `grantRolesToRole` / `revokeRolesFromRole`) —
-//! `createRole` + `updateRole` already cover defining and replacing a role's
-//! privileges / inheritance in place.
 
 use bson::{doc, Bson, Document};
 
@@ -229,6 +226,207 @@ pub fn drop_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     {
         return Err(role_not_found(&name, &db_name));
     }
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// Encode + persist a (replace) role record.
+fn save_role(
+    ctx: &CommandContext,
+    db: &str,
+    name: &str,
+    record: &Document,
+) -> Result<(), CommandError> {
+    let mut bytes = Vec::new();
+    record
+        .to_writer(&mut bytes)
+        .map_err(|e| CommandError::new(1, "InternalError", format!("encode role record: {e}")))?;
+    ctx.storage()?
+        .add_role(db, name, &bytes, true)
+        .map_err(command_error)?;
+    Ok(())
+}
+
+/// The `actions` string list of a privilege document.
+fn priv_actions(p: &Document) -> Vec<String> {
+    p.get_array("actions")
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `grantPrivilegesToRole` — merge privileges into a custom role (by resource,
+/// deduping actions).
+pub fn grant_privileges_to_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name = match doc.get_str("grantPrivilegesToRole") {
+        Ok(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            return Err(bad_value(
+                "grantPrivilegesToRole: role name (string) required",
+            ))
+        }
+    };
+    let db_name = db_of(ctx);
+    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
+        return Err(role_not_found(&name, &db_name));
+    };
+    let additions = normalise_privileges(doc.get("privileges"))?;
+    let mut privs: Vec<Document> = record
+        .get_array("privileges")
+        .map(|a| a.iter().filter_map(|p| p.as_document().cloned()).collect())
+        .unwrap_or_default();
+    for add in &additions {
+        let Bson::Document(add) = add else { continue };
+        let add_resource = add.get_document("resource").ok();
+        let mut merged = false;
+        for existing in privs.iter_mut() {
+            if existing.get_document("resource").ok() == add_resource {
+                let mut actions = priv_actions(existing);
+                for a in priv_actions(add) {
+                    if !actions.contains(&a) {
+                        actions.push(a);
+                    }
+                }
+                existing.insert("actions", actions);
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            privs.push(add.clone());
+        }
+    }
+    record.insert(
+        "privileges",
+        privs.into_iter().map(Bson::Document).collect::<Vec<_>>(),
+    );
+    save_role(ctx, &db_name, &name, &record)?;
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `revokePrivilegesFromRole` — remove actions from matching-resource
+/// privileges; privileges left with no actions are dropped.
+pub fn revoke_privileges_from_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name = match doc.get_str("revokePrivilegesFromRole") {
+        Ok(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            return Err(bad_value(
+                "revokePrivilegesFromRole: role name (string) required",
+            ))
+        }
+    };
+    let db_name = db_of(ctx);
+    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
+        return Err(role_not_found(&name, &db_name));
+    };
+    let revocations = normalise_privileges(doc.get("privileges"))?;
+    let mut privs: Vec<Document> = record
+        .get_array("privileges")
+        .map(|a| a.iter().filter_map(|p| p.as_document().cloned()).collect())
+        .unwrap_or_default();
+    for rev in &revocations {
+        let Bson::Document(rev) = rev else { continue };
+        let rev_resource = rev.get_document("resource").ok();
+        let rev_actions = priv_actions(rev);
+        for existing in privs.iter_mut() {
+            if existing.get_document("resource").ok() == rev_resource {
+                let kept: Vec<String> = priv_actions(existing)
+                    .into_iter()
+                    .filter(|a| !rev_actions.contains(a))
+                    .collect();
+                existing.insert("actions", kept);
+            }
+        }
+    }
+    privs.retain(|p| !priv_actions(p).is_empty());
+    record.insert(
+        "privileges",
+        privs.into_iter().map(Bson::Document).collect::<Vec<_>>(),
+    );
+    save_role(ctx, &db_name, &name, &record)?;
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// The `(role, db)` pairs of an inherited-roles array.
+fn role_pairs(arr: &[Bson]) -> Vec<(String, String)> {
+    arr.iter()
+        .filter_map(|r| {
+            let d = r.as_document()?;
+            Some((
+                d.get_str("role").ok()?.to_string(),
+                d.get_str("db").ok()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// `grantRolesToRole` — add inherited roles (deduped).
+pub fn grant_roles_to_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name = match doc.get_str("grantRolesToRole") {
+        Ok(n) if !n.is_empty() => n.to_string(),
+        _ => return Err(bad_value("grantRolesToRole: role name (string) required")),
+    };
+    let db_name = db_of(ctx);
+    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
+        return Err(role_not_found(&name, &db_name));
+    };
+    let additions = normalise_inherited_roles(doc.get("roles"), &db_name)?;
+    let mut inherited: Vec<Bson> = record.get_array("roles").cloned().unwrap_or_default();
+    let mut seen: Vec<(String, String)> = role_pairs(&inherited);
+    for add in additions {
+        if let Bson::Document(d) = &add {
+            let pair = (
+                d.get_str("role").unwrap_or("").to_string(),
+                d.get_str("db").unwrap_or("").to_string(),
+            );
+            if !seen.contains(&pair) {
+                seen.push(pair);
+                inherited.push(add);
+            }
+        }
+    }
+    record.insert("roles", inherited);
+    save_role(ctx, &db_name, &name, &record)?;
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `revokeRolesFromRole` — remove inherited roles.
+pub fn revoke_roles_from_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name = match doc.get_str("revokeRolesFromRole") {
+        Ok(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            return Err(bad_value(
+                "revokeRolesFromRole: role name (string) required",
+            ))
+        }
+    };
+    let db_name = db_of(ctx);
+    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
+        return Err(role_not_found(&name, &db_name));
+    };
+    let revocations = normalise_inherited_roles(doc.get("roles"), &db_name)?;
+    let drop_set = role_pairs(&revocations);
+    let kept: Vec<Bson> = record
+        .get_array("roles")
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.as_document()
+                .and_then(|d| {
+                    Some((
+                        d.get_str("role").ok()?.to_string(),
+                        d.get_str("db").ok()?.to_string(),
+                    ))
+                })
+                .map(|pair| !drop_set.contains(&pair))
+                .unwrap_or(true)
+        })
+        .collect();
+    record.insert("roles", kept);
+    save_role(ctx, &db_name, &name, &record)?;
     Ok(doc! { "ok": 1.0 })
 }
 
@@ -563,5 +761,113 @@ mod tests {
             false,
             Some(&resolver),
         ));
+    }
+
+    fn privileges(rec: &Document) -> Vec<Document> {
+        rec.get_array("privileges")
+            .unwrap()
+            .iter()
+            .map(|p| p.as_document().unwrap().clone())
+            .collect()
+    }
+
+    fn fetch(c: &mut CommandContext, name: &str) -> Document {
+        let info = dispatch(&doc! {"rolesInfo": name}, c);
+        info.get_array("roles").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn grant_and_revoke_privileges() {
+        let mut c = ctx();
+        dispatch(
+            &doc! {"createRole": "r", "privileges": [], "roles": []},
+            &mut c,
+        );
+        // grant find on app
+        dispatch(
+            &doc! {
+                "grantPrivilegesToRole": "r",
+                "privileges": [{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}],
+            },
+            &mut c,
+        );
+        // grant insert on the same resource → merges into one privilege, two actions
+        dispatch(
+            &doc! {
+                "grantPrivilegesToRole": "r",
+                "privileges": [{"resource": {"db": "app", "collection": ""}, "actions": ["insert"]}],
+            },
+            &mut c,
+        );
+        let privs = privileges(&fetch(&mut c, "r"));
+        assert_eq!(privs.len(), 1);
+        let actions: Vec<&str> = privs[0]
+            .get_array("actions")
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(actions.contains(&"find") && actions.contains(&"insert"));
+
+        // revoke find → only insert left
+        dispatch(
+            &doc! {
+                "revokePrivilegesFromRole": "r",
+                "privileges": [{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}],
+            },
+            &mut c,
+        );
+        let privs = privileges(&fetch(&mut c, "r"));
+        assert_eq!(privs[0].get_array("actions").unwrap().len(), 1);
+
+        // revoke the last action → the privilege is dropped entirely
+        dispatch(
+            &doc! {
+                "revokePrivilegesFromRole": "r",
+                "privileges": [{"resource": {"db": "app", "collection": ""}, "actions": ["insert"]}],
+            },
+            &mut c,
+        );
+        assert!(privileges(&fetch(&mut c, "r")).is_empty());
+    }
+
+    #[test]
+    fn grant_and_revoke_inherited_roles() {
+        let mut c = ctx();
+        dispatch(
+            &doc! {"createRole": "base", "privileges": [], "roles": []},
+            &mut c,
+        );
+        dispatch(
+            &doc! {"createRole": "r", "privileges": [], "roles": []},
+            &mut c,
+        );
+        // grant base (twice → deduped)
+        dispatch(
+            &doc! {"grantRolesToRole": "r", "roles": [{"role": "base", "db": "admin"}]},
+            &mut c,
+        );
+        dispatch(
+            &doc! {"grantRolesToRole": "r", "roles": [{"role": "base", "db": "admin"}]},
+            &mut c,
+        );
+        assert_eq!(fetch(&mut c, "r").get_array("roles").unwrap().len(), 1);
+
+        // revoke base
+        dispatch(
+            &doc! {"revokeRolesFromRole": "r", "roles": [{"role": "base", "db": "admin"}]},
+            &mut c,
+        );
+        assert!(fetch(&mut c, "r").get_array("roles").unwrap().is_empty());
+    }
+
+    #[test]
+    fn grant_to_missing_role_is_role_not_found() {
+        let mut c = ctx();
+        let reply = dispatch(&doc! {"grantRolesToRole": "ghost", "roles": []}, &mut c);
+        assert_eq!(reply.get_i32("code").unwrap(), ROLE_NOT_FOUND);
     }
 }

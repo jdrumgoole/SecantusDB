@@ -252,12 +252,18 @@ fn lookup(name: &str) -> Option<Handler> {
         "saslStart" => auth::sasl_start,
         "saslContinue" => auth::sasl_continue,
         "createUser" => auth::create_user,
+        "updateUser" => auth::update_user,
         "dropUser" => auth::drop_user,
+        "dropAllUsersFromDatabase" => auth::drop_all_users_from_database,
         "usersInfo" => auth::users_info,
         "createRole" => roles::create_role,
         "updateRole" => roles::update_role,
         "dropRole" => roles::drop_role,
         "dropAllRolesFromDatabase" => roles::drop_all_roles_from_database,
+        "grantPrivilegesToRole" => roles::grant_privileges_to_role,
+        "revokePrivilegesFromRole" => roles::revoke_privileges_from_role,
+        "grantRolesToRole" => roles::grant_roles_to_role,
+        "revokeRolesFromRole" => roles::revoke_roles_from_role,
         "rolesInfo" => roles::roles_info,
         "getParameter" => diagnostics::get_parameter,
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
@@ -435,12 +441,18 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "dbStats" | "dbstats" => (A_DB_STATS, SCOPE_DATABASE),
         "collStats" => (A_COLL_STATS, SCOPE_COLLECTION),
         "createUser" => (A_CREATE_USER, SCOPE_DATABASE),
+        "updateUser" => (A_CHANGE_PASSWORD, SCOPE_DATABASE),
         "dropUser" => (A_DROP_USER, SCOPE_DATABASE),
+        "dropAllUsersFromDatabase" => (A_DROP_USER, SCOPE_DATABASE),
         "usersInfo" => (A_VIEW_USER, SCOPE_DATABASE),
         "createRole" => (A_CREATE_ROLE, SCOPE_DATABASE),
         "updateRole" => (A_GRANT_ROLE, SCOPE_DATABASE),
         "dropRole" => (A_DROP_ROLE, SCOPE_DATABASE),
         "dropAllRolesFromDatabase" => (A_DROP_ROLE, SCOPE_DATABASE),
+        "grantPrivilegesToRole" => (A_GRANT_ROLE, SCOPE_DATABASE),
+        "revokePrivilegesFromRole" => (A_REVOKE_ROLE, SCOPE_DATABASE),
+        "grantRolesToRole" => (A_GRANT_ROLE, SCOPE_DATABASE),
+        "revokeRolesFromRole" => (A_REVOKE_ROLE, SCOPE_DATABASE),
         "rolesInfo" => (A_VIEW_ROLE, SCOPE_DATABASE),
         "serverStatus" => (A_SERVER_STATUS, SCOPE_CLUSTER),
         "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
@@ -590,6 +602,20 @@ mod tests {
         // No replica-set fields without a configured set name.
         assert!(reply.get("setName").is_none());
         assert!(reply.get("accessControlEnabled").is_none());
+    }
+
+    #[test]
+    fn hello_advertises_sasl_supported_mechs() {
+        // Without the field, hello doesn't volunteer mechanisms.
+        let plain = dispatch(&doc! {"hello": 1}, &mut ctx());
+        assert!(plain.get("saslSupportedMechs").is_none());
+        // With saslSupportedMechs: "<db>.<user>", advertise SCRAM-SHA-256.
+        let reply = dispatch(
+            &doc! {"hello": 1, "saslSupportedMechs": "admin.alice"},
+            &mut ctx(),
+        );
+        let mechs = reply.get_array("saslSupportedMechs").unwrap();
+        assert_eq!(mechs, &vec![Bson::String("SCRAM-SHA-256".into())]);
     }
 
     #[test]

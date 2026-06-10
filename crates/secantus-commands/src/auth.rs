@@ -27,16 +27,16 @@
 //! (`RoleNotFound`), and a successful `saslContinue` loads the principal's role
 //! bindings into `ConnectionAuth::effective_roles`.
 //!
-//! Custom user-defined roles land in [`crate::roles`] (R5b-3): `createRole` /
-//! `updateRole` / `dropRole` / `rolesInfo`, expanded by `check_privilege`'s
-//! resolver; `createUser` accepts a custom role that exists in storage.
+//! User mutation: `updateUser` (rotate password / replace roles) and
+//! `dropAllUsersFromDatabase` (R5b-4). Custom user-defined roles land in
+//! [`crate::roles`]; `createUser` / `updateUser` accept a custom role that
+//! exists in storage. `hello` advertises `saslSupportedMechs` for a queried
+//! principal (R5b-4).
 //!
 //! ## Deferred (later slices, tracked in `tasks/rust-server-plan.md`)
 //!
-//! * The role `grant`/`revoke` quartet (`grantPrivilegesToRole` / …).
-//! * **`updateUser`** / **`dropAllUsersFromDatabase`** / `saslSupportedMechs`
-//!   handshake hinting.
 //! * **SCRAM-SHA-1** (legacy MD5 prepass) and **MONGODB-X509** (needs TLS, R5c).
+//! * Non-ASCII SASLprep.
 
 use std::sync::{Arc, Mutex};
 
@@ -384,6 +384,128 @@ pub fn drop_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }
 
+/// Rebuild the calling connection's effective roles from its authenticated
+/// principals' current records (after a role change). Mirrors
+/// `commands.py::_refresh_effective_roles`.
+fn refresh_effective_roles(ctx: &CommandContext) {
+    let Some(auth) = &ctx.conn_auth else { return };
+    let mut auth = auth.lock().expect("conn auth mutex poisoned");
+    let principals = auth.authenticated.clone();
+    auth.effective_roles.clear();
+    for (db, user) in principals {
+        if let Some(roles) = lookup_roles(ctx, &db, &user) {
+            auth.add_principal_roles(&roles);
+        }
+    }
+}
+
+/// `updateUser` — rotate the password and/or replace role bindings in place
+/// (without invalidating other connections, matching mongod). At least one of
+/// `pwd` / `roles` must be supplied.
+pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let username = match doc.get_str("updateUser") {
+        Ok(u) if !u.is_empty() => u.to_string(),
+        _ => return Err(bad_value("updateUser: username (string) required")),
+    };
+    let db_name = if ctx.db_name.is_empty() {
+        "admin".to_string()
+    } else {
+        ctx.db_name.clone()
+    };
+    let Some(bytes) = ctx
+        .storage()?
+        .get_user(&db_name, &username)
+        .map_err(crate::util::command_error)?
+    else {
+        return Err(CommandError::new(
+            USER_NOT_FOUND,
+            "UserNotFound",
+            format!("User '{username}@{db_name}' not found"),
+        ));
+    };
+    let mut record = Document::from_reader(&mut bytes.as_slice())
+        .map_err(|e| CommandError::new(1, "InternalError", format!("decode user record: {e}")))?;
+
+    let pwd = doc.get_str("pwd").ok();
+    let has_roles = doc.contains_key("roles");
+    if pwd.is_none() && !has_roles {
+        return Err(bad_value(
+            "updateUser: nothing to update (supply pwd and/or roles)",
+        ));
+    }
+    if let Some(pwd) = pwd {
+        if pwd.is_empty() {
+            return Err(bad_value("updateUser: pwd must be a non-empty string"));
+        }
+        let creds = derive_credentials(pwd, None, None);
+        record.insert(
+            "credentials",
+            doc! {
+                SCRAM_SHA_256: {
+                    "iterationCount": creds.iteration_count as i32,
+                    "salt": creds.salt_b64(),
+                    "storedKey": creds.stored_key_b64(),
+                    "serverKey": creds.server_key_b64(),
+                }
+            },
+        );
+    }
+    if has_roles {
+        let roles = normalise_roles(doc.get("roles"), &db_name, ctx)?;
+        record.insert("roles", roles);
+    }
+    let mut new_bytes = Vec::new();
+    record
+        .to_writer(&mut new_bytes)
+        .map_err(|e| CommandError::new(1, "InternalError", format!("encode user record: {e}")))?;
+    ctx.storage()?
+        .add_user(&db_name, &username, &new_bytes, true)
+        .map_err(crate::util::command_error)?;
+    if has_roles {
+        refresh_effective_roles(ctx);
+    }
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `dropAllUsersFromDatabase` — drop every user bound to the calling db; returns
+/// `n` = removed count.
+pub fn drop_all_users_from_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let db_name = if ctx.db_name.is_empty() {
+        "admin".to_string()
+    } else {
+        ctx.db_name.clone()
+    };
+    let storage = ctx.storage()?;
+    let mut removed = 0_i32;
+    loop {
+        let batch = storage
+            .list_users(Some(&db_name), 0, 1000)
+            .map_err(crate::util::command_error)?;
+        let n = batch.len();
+        for bytes in &batch {
+            if let Ok(rec) = Document::from_reader(&mut bytes.as_slice()) {
+                if let Ok(user) = rec.get_str("user") {
+                    if storage
+                        .drop_user(&db_name, user)
+                        .map_err(crate::util::command_error)?
+                    {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        if n < 1000 {
+            break;
+        }
+    }
+    if let Some(auth) = &ctx.conn_auth {
+        let mut auth = auth.lock().expect("conn auth mutex poisoned");
+        auth.authenticated.retain(|(d, _)| d != &db_name);
+    }
+    refresh_effective_roles(ctx);
+    Ok(doc! { "ok": 1.0, "n": removed })
+}
+
 /// `usersInfo` — list user records (optionally with credentials).
 pub fn users_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let db_name = if ctx.db_name.is_empty() {
@@ -706,6 +828,82 @@ mod tests {
         );
         assert_eq!(reply.get_i32("code").unwrap(), 31);
         assert_eq!(reply.get_str("codeName").unwrap(), "RoleNotFound");
+    }
+
+    #[test]
+    fn update_user_rotates_password_and_roles() {
+        let (mut ctx, _auth) = ctx_with_store();
+        dispatch(
+            &doc! {"createUser": "u", "pwd": "old", "roles": ["read"], "$db": "admin"},
+            &mut ctx,
+        );
+        // rotate password — the old one no longer authenticates, the new one does
+        assert_eq!(
+            dispatch(&doc! {"updateUser": "u", "pwd": "new"}, &mut ctx)
+                .get_f64("ok")
+                .unwrap(),
+            1.0
+        );
+        let (first, bare) = scram_client_first("u", "nonceUpd");
+        let start = dispatch(
+            &doc! {"saslStart": 1, "mechanism": SCRAM_SHA_256, "payload": payload_binary(first), "$db": "admin"},
+            &mut ctx,
+        );
+        let cid = start.get_i32("conversationId").unwrap();
+        let sf = payload_bytes(start.get("payload"));
+        let cont = dispatch(
+            &doc! {"saslContinue": 1, "conversationId": cid, "payload": payload_binary(client_final("new", &sf, &bare)), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(
+            cont.get_f64("ok").unwrap(),
+            1.0,
+            "new password authenticates"
+        );
+
+        // replace roles
+        assert_eq!(
+            dispatch(&doc! {"updateUser": "u", "roles": ["readWrite"]}, &mut ctx)
+                .get_f64("ok")
+                .unwrap(),
+            1.0
+        );
+        let info = dispatch(&doc! {"usersInfo": "u"}, &mut ctx);
+        let roles = info.get_array("users").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .get_array("roles")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            roles[0].as_document().unwrap().get_str("role").unwrap(),
+            "readWrite"
+        );
+
+        // updateUser on a missing user → UserNotFound
+        let missing = dispatch(&doc! {"updateUser": "ghost", "pwd": "x"}, &mut ctx);
+        assert_eq!(missing.get_i32("code").unwrap(), USER_NOT_FOUND);
+        // nothing to update → BadValue
+        let empty = dispatch(&doc! {"updateUser": "u"}, &mut ctx);
+        assert_eq!(empty.get_i32("code").unwrap(), 2);
+    }
+
+    #[test]
+    fn drop_all_users_from_database() {
+        let (mut ctx, _auth) = ctx_with_store();
+        for u in ["a", "b", "c"] {
+            dispatch(
+                &doc! {"createUser": u, "pwd": "pw", "roles": [], "$db": "admin"},
+                &mut ctx,
+            );
+        }
+        let reply = dispatch(&doc! {"dropAllUsersFromDatabase": 1}, &mut ctx);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(reply.get_i32("n").unwrap(), 3);
+        assert!(dispatch(&doc! {"usersInfo": 1}, &mut ctx)
+            .get_array("users")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

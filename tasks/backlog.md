@@ -210,9 +210,12 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
   `rbac::check_privilege_resolved` expands them via a `get_role`-backed resolver
   (privilege match + inheritance walk, cycle detection); `createUser` accepts
   storage-resident custom roles. 6 unit tests + a pymongo WT round-trip. **R5b-4
-  (next):** the role `grant`/`revoke` quartet, `updateUser`/`dropAllUsersFromDatabase`,
-  `saslSupportedMechs` handshake hinting. **R5c:** TLS/mTLS (rustls) + MONGODB-X509.
-  Deferred: SCRAM-SHA-1 (MD5 prepass), non-ASCII SASLprep.
+  DONE:** auth/RBAC completion — the role `grant`/`revoke` quartet
+  (`grantPrivilegesToRole`/`revokePrivilegesFromRole`/`grantRolesToRole`/
+  `revokeRolesFromRole`), `updateUser` (password rotation / role replacement +
+  live `effective_roles` refresh), `dropAllUsersFromDatabase`, and `hello`'s
+  `saslSupportedMechs`. 8 unit tests + a pymongo WT round-trip. **R5c:** TLS/mTLS
+  (rustls) + MONGODB-X509. Deferred: SCRAM-SHA-1 (MD5 prepass), non-ASCII SASLprep.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.
