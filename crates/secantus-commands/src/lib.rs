@@ -37,8 +37,10 @@ pub mod admin;
 pub mod aggregate;
 pub mod crud;
 pub mod cursors;
+pub mod diagnostics;
 pub mod distinct;
 pub mod find;
+pub mod findandmodify;
 pub mod handshake;
 pub mod storage;
 mod util;
@@ -208,6 +210,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "delete" => crud::delete,
         "count" => crud::count,
         "distinct" => distinct::distinct,
+        "findAndModify" | "findandmodify" => findandmodify::find_and_modify,
         "find" => find::find,
         "aggregate" => aggregate::aggregate,
         "getMore" => cursors::get_more,
@@ -218,6 +221,24 @@ fn lookup(name: &str) -> Option<Handler> {
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
         "dropIndexes" => admin::drop_indexes,
+        "dropDatabase" => admin::drop_database,
+        "renameCollection" => admin::rename_collection,
+        "collStats" => admin::coll_stats,
+        "dbStats" => admin::db_stats,
+        "serverStatus" => admin::server_status,
+        "startSession" => diagnostics::start_session,
+        "endSessions"
+        | "refreshSessions"
+        | "killSessions"
+        | "killAllSessions"
+        | "killAllSessionsByPattern" => diagnostics::ok_session_noop,
+        "commitTransaction" | "abortTransaction" => diagnostics::ok_transaction,
+        "getParameter" => diagnostics::get_parameter,
+        "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
+        "connectionStatus" => diagnostics::connection_status,
+        "whatsmyuri" => diagnostics::whatsmyuri,
+        "hostInfo" => diagnostics::host_info,
+        "getLog" => diagnostics::get_log,
         _ => return None,
     })
 }

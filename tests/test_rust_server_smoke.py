@@ -56,6 +56,28 @@ def test_pymongo_crud_against_rust_server(tmp_path) -> None:
         srv.stop()
 
 
+def test_find_one_and_update_against_rust_server(tmp_path) -> None:
+    """findAndModify via pymongo's find_one_and_update (old + new images)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "x": 1})
+        # default returns the pre-image
+        old = coll.find_one_and_update({"_id": 1}, {"$set": {"x": 2}})
+        assert old["x"] == 1
+        # ReturnDocument.AFTER returns the post-image
+        new = coll.find_one_and_update(
+            {"_id": 1}, {"$set": {"x": 3}}, return_document=pymongo.ReturnDocument.AFTER
+        )
+        assert new["x"] == 3
+        # removed
+        removed = coll.find_one_and_delete({"_id": 1})
+        assert removed["x"] == 3
+        assert coll.find_one({"_id": 1}) is None
+    finally:
+        srv.stop()
+
+
 def test_aggregate_pipeline_against_rust_server(tmp_path) -> None:
     """A direct aggregation pipeline ($match → $group) via pymongo."""
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
@@ -91,5 +113,30 @@ def test_rust_server_handshake(tmp_path) -> None:
         assert hello["ok"] == 1.0
         assert hello["isWritablePrimary"] is True
         assert admin.command("ping")["ok"] == 1.0
+    finally:
+        srv.stop()
+
+
+def test_admin_commands_against_rust_server(tmp_path) -> None:
+    """DDL + introspection + db-admin via pymongo: listCollections, createIndexes
+    / listIndexes, dbStats, serverStatus, drop."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        client = _client(srv)
+        db = client["t"]
+        db.c.insert_one({"_id": 1, "x": 1})  # auto-creates the collection
+        assert "c" in db.list_collection_names()
+
+        db.c.create_index([("x", 1)])
+        index_names = [ix["name"] for ix in db.c.list_indexes()]
+        assert "_id_" in index_names
+        assert any(n.startswith("x_") for n in index_names)
+
+        stats = db.command("dbStats")
+        assert stats["ok"] == 1.0 and stats["db"] == "t"
+        assert client.admin.command("serverStatus")["ok"] == 1.0
+
+        db.c.drop()
+        assert "c" not in db.list_collection_names()
     finally:
         srv.stop()

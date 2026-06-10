@@ -165,4 +165,38 @@ pub trait Storage: Send + Sync {
     fn drop_all_indexes(&self, _db: &str, _coll: &str) -> Result<usize, StorageError> {
         Ok(0)
     }
+
+    /// Drop an entire database (all its collections + indexes).
+    fn drop_database(&self, _db: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Rename a collection. Returns `(succeeded, error_message)`; `succeeded ==
+    /// false` carries a reason (source missing / target exists).
+    fn rename_collection(
+        &self,
+        _src_db: &str,
+        _src_coll: &str,
+        _dst_db: &str,
+        _dst_coll: &str,
+        _drop_target: bool,
+    ) -> Result<(bool, Option<String>), StorageError> {
+        Ok((true, None))
+    }
+
+    /// Whether the collection is capped.
+    fn collection_is_capped(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Total size in bytes of the collection's documents.
+    fn collection_data_size(&self, _db: &str, _coll: &str) -> Result<i64, StorageError> {
+        Ok(0)
+    }
+
+    /// Per-index sizes in bytes (`{index_name: size}`), for `collStats` /
+    /// `dbStats`.
+    fn index_sizes(&self, _db: &str, _coll: &str) -> Result<Document, StorageError> {
+        Ok(Document::new())
+    }
 }

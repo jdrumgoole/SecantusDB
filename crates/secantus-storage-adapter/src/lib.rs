@@ -140,6 +140,35 @@ impl CmdStorage for StorageAdapter {
     fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize, StorageError> {
         self.inner.drop_all_indexes(db, coll).map_err(map_err)
     }
+
+    fn drop_database(&self, db: &str) -> Result<(), StorageError> {
+        self.inner.drop_database(db).map_err(map_err)
+    }
+
+    fn rename_collection(
+        &self,
+        src_db: &str,
+        src_coll: &str,
+        dst_db: &str,
+        dst_coll: &str,
+        drop_target: bool,
+    ) -> Result<(bool, Option<String>), StorageError> {
+        self.inner
+            .rename_collection(src_db, src_coll, dst_db, dst_coll, drop_target)
+            .map_err(map_err)
+    }
+
+    fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+        self.inner.collection_is_capped(db, coll).map_err(map_err)
+    }
+
+    fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64, StorageError> {
+        self.inner.collection_data_size(db, coll).map_err(map_err)
+    }
+
+    fn index_sizes(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
+        self.inner.index_sizes(db, coll).map_err(map_err)
+    }
 }
 
 /// Convert a raw `hint` value into the storage `Hint`. A string is an index
