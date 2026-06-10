@@ -233,4 +233,38 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         Ok(Vec::new())
     }
+
+    // --- custom roles (R5b-3) -----------------------------------------------
+
+    /// Store a custom-role record (opaque BSON). Returns `false` if the role
+    /// already exists and `replace` is false.
+    fn add_role(
+        &self,
+        _db: &str,
+        _name: &str,
+        _record: &[u8],
+        _replace: bool,
+    ) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    /// The stored custom-role record bytes for `(db, name)`, or `None`.
+    fn get_role(&self, _db: &str, _name: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
+    }
+
+    /// Drop a custom role. `true` if it existed.
+    fn drop_role(&self, _db: &str, _name: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// List custom-role records (all dbs when `db` is `None`), paginated.
+    fn list_roles(
+        &self,
+        _db: Option<&str>,
+        _skip: usize,
+        _limit: usize,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(Vec::new())
+    }
 }

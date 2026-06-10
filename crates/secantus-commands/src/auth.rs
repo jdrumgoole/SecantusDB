@@ -27,11 +27,13 @@
 //! (`RoleNotFound`), and a successful `saslContinue` loads the principal's role
 //! bindings into `ConnectionAuth::effective_roles`.
 //!
+//! Custom user-defined roles land in [`crate::roles`] (R5b-3): `createRole` /
+//! `updateRole` / `dropRole` / `rolesInfo`, expanded by `check_privilege`'s
+//! resolver; `createUser` accepts a custom role that exists in storage.
+//!
 //! ## Deferred (later slices, tracked in `tasks/rust-server-plan.md`)
 //!
-//! * **Custom user-defined roles** — the `createRole` / `updateRole` family and
-//!   the inheritance-graph resolver `check_privilege` threads through in Python.
-//!   Only built-in role names validate / grant today.
+//! * The role `grant`/`revoke` quartet (`grantPrivilegesToRole` / …).
 //! * **`updateUser`** / **`dropAllUsersFromDatabase`** / `saslSupportedMechs`
 //!   handshake hinting.
 //! * **SCRAM-SHA-1** (legacy MD5 prepass) and **MONGODB-X509** (needs TLS, R5c).
@@ -249,12 +251,15 @@ fn bad_value(msg: impl Into<String>) -> CommandError {
 const ROLE_NOT_FOUND: i32 = 31;
 
 /// Coerce a `roles` argument into the canonical `[{role, db}]` shape and
-/// validate each role name against the built-in catalogue. Accepts the
-/// list-of-strings shorthand (each bound to `default_db`) and the list-of-docs
-/// form. An unrecognised role name is a `RoleNotFound` (31) error. Custom
-/// user-defined roles aren't recognised yet (deferred with the `createRole`
-/// family), so only built-in role names validate.
-fn normalise_roles(arg: Option<&Bson>, default_db: &str) -> Result<Vec<Bson>, CommandError> {
+/// validate each role name. Accepts the list-of-strings shorthand (each bound to
+/// `default_db`) and the list-of-docs form. A role validates if it's a built-in
+/// **or** a custom role that exists in storage (`get_role`); otherwise it's a
+/// `RoleNotFound` (31) error.
+fn normalise_roles(
+    arg: Option<&Bson>,
+    default_db: &str,
+    ctx: &CommandContext,
+) -> Result<Vec<Bson>, CommandError> {
     let items = match arg {
         Some(Bson::Array(items)) => items,
         None => return Ok(Vec::new()),
@@ -273,7 +278,13 @@ fn normalise_roles(arg: Option<&Bson>, default_db: &str) -> Result<Vec<Bson>, Co
             }
             _ => return Err(bad_value("createUser: roles must be strings or {role, db}")),
         };
-        if !rbac::is_known_role(&role) {
+        let known = rbac::is_known_role(&role)
+            || ctx
+                .storage()
+                .ok()
+                .and_then(|s| s.get_role(&db, &role).ok().flatten())
+                .is_some();
+        if !known {
             return Err(CommandError::new(
                 ROLE_NOT_FOUND,
                 "RoleNotFound",
@@ -304,7 +315,7 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     } else {
         ctx.db_name.clone()
     };
-    let roles = normalise_roles(doc.get("roles"), &db_name)?;
+    let roles = normalise_roles(doc.get("roles"), &db_name, ctx)?;
 
     let creds = derive_credentials(&pwd, None, None);
     let credentials = doc! {
