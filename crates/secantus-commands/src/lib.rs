@@ -220,6 +220,11 @@ fn lookup(name: &str) -> Option<Handler> {
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
         "dropIndexes" => admin::drop_indexes,
+        "dropDatabase" => admin::drop_database,
+        "renameCollection" => admin::rename_collection,
+        "collStats" => admin::coll_stats,
+        "dbStats" => admin::db_stats,
+        "serverStatus" => admin::server_status,
         _ => return None,
     })
 }

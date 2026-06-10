@@ -1,5 +1,7 @@
-//! Collection/index DDL + introspection commands: `create` / `drop` /
-//! `listCollections` / `listIndexes` / `createIndexes` / `dropIndexes`.
+//! Collection/index DDL + introspection + db-admin commands: `create` / `drop`
+//! / `listCollections` / `listIndexes` / `createIndexes` / `dropIndexes` /
+//! `dropDatabase` / `renameCollection` / `collStats` / `dbStats` /
+//! `serverStatus`.
 //!
 //! Ports of the corresponding `commands.py` handlers, scoped to the core paths.
 //!
@@ -11,12 +13,14 @@
 //! * `listIndexes` `NamespaceNotFound` on a missing collection (returns an empty
 //!   cursor instead).
 //! * `dropIndexes` by key-spec document (only by name / `"*"`).
+//! * `serverStatus` reports a minimal subset; `collStats` / `dbStats` use
+//!   `dataSize` for `storageSize` (no separate on-disk accounting).
 //! * `writeConcern`, `_reject_oplog_rs_write`.
 
 use bson::{doc, Bson, Document};
 
 use crate::find::split_into_cursor;
-use crate::util::{coll_arg, command_error, docs_to_bson, encode_docs};
+use crate::util::{as_i64, coll_arg, command_error, docs_to_bson, encode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
 /// `create` — create a collection.
@@ -195,6 +199,148 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     Ok(doc! { "nIndexesWas": before as i32, "ok": 1.0 })
+}
+
+/// `dropDatabase` — drop the current database.
+pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    storage.drop_database(&ctx.db_name).map_err(command_error)?;
+    Ok(doc! { "dropped": ctx.db_name.clone(), "ok": 1.0 })
+}
+
+/// `renameCollection` — rename `renameCollection` (a full `db.coll` ns) to `to`.
+pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let src = match doc.get("renameCollection") {
+        Some(Bson::String(s)) => s.clone(),
+        _ => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "renameCollection requires a string source namespace",
+            ))
+        }
+    };
+    let to = match doc.get("to") {
+        Some(Bson::String(s)) => s.clone(),
+        _ => {
+            return Ok(CommandError::new(
+                2,
+                "BadValue",
+                "renameCollection requires a string 'to' namespace",
+            )
+            .into_reply())
+        }
+    };
+    let drop_target = doc
+        .get("dropTarget")
+        .and_then(Bson::as_bool)
+        .unwrap_or(false);
+    let (src_db, src_coll) = split_ns(&src);
+    let (dst_db, dst_coll) = split_ns(&to);
+
+    let storage = ctx.storage()?;
+    let (ok_, msg) = storage
+        .rename_collection(&src_db, &src_coll, &dst_db, &dst_coll, drop_target)
+        .map_err(command_error)?;
+    if !ok_ {
+        let m = msg.unwrap_or_else(|| "rename failed".to_string());
+        let (code, name) = if m.to_lowercase().contains("exist") {
+            (48, "NamespaceExists")
+        } else {
+            (26, "NamespaceNotFound")
+        };
+        return Ok(CommandError::new(code, name, m).into_reply());
+    }
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `collStats` — per-collection size / count / index statistics.
+pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let coll = coll_arg(doc, "collStats")?;
+    let storage = ctx.storage()?;
+    let count = storage
+        .count_matching(&ctx.db_name, &coll, &Document::new())
+        .map_err(command_error)? as i64;
+    let size = storage
+        .collection_data_size(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    let index_sizes = storage
+        .index_sizes(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    let capped = storage
+        .collection_is_capped(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
+    let avg_obj_size = if count > 0 { size / count } else { 0 };
+    Ok(doc! {
+        "ns": format!("{}.{}", ctx.db_name, coll),
+        "count": count as i32,
+        "size": size,
+        "avgObjSize": avg_obj_size,
+        "storageSize": size,
+        "nindexes": index_sizes.len() as i32,
+        "totalIndexSize": total_index_size,
+        "indexSizes": index_sizes,
+        "capped": capped,
+        "ok": 1.0,
+    })
+}
+
+/// `dbStats` — database-wide totals aggregated across collections.
+pub fn db_stats(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    let colls = storage
+        .list_collections(&ctx.db_name)
+        .map_err(command_error)?;
+    let mut objects = 0i64;
+    let mut data_size = 0i64;
+    let mut indexes = 0i64;
+    let mut index_size = 0i64;
+    for c in &colls {
+        objects += storage
+            .count_matching(&ctx.db_name, c, &Document::new())
+            .map_err(command_error)? as i64;
+        data_size += storage
+            .collection_data_size(&ctx.db_name, c)
+            .map_err(command_error)?;
+        let isz = storage
+            .index_sizes(&ctx.db_name, c)
+            .map_err(command_error)?;
+        indexes += isz.len() as i64;
+        index_size += isz.values().filter_map(as_i64).sum::<i64>();
+    }
+    Ok(doc! {
+        "db": ctx.db_name.clone(),
+        "collections": colls.len() as i32,
+        "objects": objects,
+        "dataSize": data_size,
+        "storageSize": data_size,
+        "indexes": indexes,
+        "indexSize": index_size,
+        "ok": 1.0,
+    })
+}
+
+/// `serverStatus` — a minimal subset (host / version / process / uptime).
+pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    Ok(doc! {
+        "host": "secantus",
+        "version": crate::SERVER_VERSION,
+        "process": "mongod",
+        "pid": Bson::Int64(0),
+        "uptime": 0.0,
+        "uptimeMillis": Bson::Int64(0),
+        "localTime": bson::DateTime::now(),
+        "ok": 1.0,
+    })
+}
+
+/// Split a `db.coll` namespace into `(db, coll)`.
+fn split_ns(ns: &str) -> (String, String) {
+    match ns.split_once('.') {
+        Some((d, c)) => (d.to_string(), c.to_string()),
+        None => (String::new(), ns.to_string()),
+    }
 }
 
 /// The default index name mongod derives from a key spec, e.g. `{a:1, b:-1}` →
@@ -496,5 +642,59 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn server_status_minimal_shape() {
+        let mut c = ctx(FakeStorage::arc());
+        let reply = dispatch(&doc! {"serverStatus": 1}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(reply.get_str("version").unwrap(), crate::SERVER_VERSION);
+        assert_eq!(reply.get_str("process").unwrap(), "mongod");
+    }
+
+    #[test]
+    fn drop_database_reports_dropped() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        dispatch(&doc! {"create": "c"}, &mut c);
+        let mut c = ctx(s);
+        let reply = dispatch(&doc! {"dropDatabase": 1}, &mut c);
+        assert_eq!(reply.get_str("dropped").unwrap(), "t");
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn db_stats_counts_collections() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        dispatch(&doc! {"create": "a"}, &mut c);
+        let mut c = ctx(s.clone());
+        dispatch(&doc! {"create": "b"}, &mut c);
+        let mut c = ctx(s);
+        let reply = dispatch(&doc! {"dbStats": 1}, &mut c);
+        assert_eq!(reply.get_str("db").unwrap(), "t");
+        assert_eq!(reply.get_i32("collections").unwrap(), 2);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn coll_stats_shape() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        dispatch(&doc! {"create": "c"}, &mut c);
+        let mut c = ctx(s);
+        let reply = dispatch(&doc! {"collStats": "c"}, &mut c);
+        assert_eq!(reply.get_str("ns").unwrap(), "t.c");
+        assert!(reply.get("indexSizes").is_some());
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn rename_collection_default_ok() {
+        // The fake uses the trait default (succeeds); validates dispatch + ns parse.
+        let mut c = ctx(FakeStorage::arc());
+        let reply = dispatch(&doc! {"renameCollection": "t.a", "to": "t.b"}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     }
 }

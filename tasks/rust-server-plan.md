@@ -239,10 +239,20 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     auto-creates the collection. 4 tests. **Deferred:** `create` option/capped/
     view validation; `listCollections` filter; `listIndexes` NamespaceNotFound;
     `dropIndexes` by key spec.
-  - **Next** — `findAndModify` (needs a find-and-modify storage primitive that
-    returns the doc), then **R5** (auth + TLS), the tailable change-stream
-    getMore, and **R7/R8** (standalone binary + the full pymongo conformance gate
-    against the Rust server).
+  - **`findAndModify` ✅ DONE** — composed at the command layer (find limit-1 +
+    sort → update/remove → re-find for the new image → projection); old/new
+    image, upsert, remove, E11000 preserved. Not atomic across the find+modify
+    calls (caveat). 7 tests.
+  - **db-admin ✅ DONE** (`secantus-commands::admin`) — `dropDatabase` /
+    `renameCollection` / `collStats` / `dbStats` / `serverStatus` (the `Storage`
+    trait gained `drop_database` / `rename_collection` / `collection_is_capped` /
+    `collection_data_size` / `index_sizes`; the R4b adapter forwards them).
+    `serverStatus` is a minimal subset; `collStats`/`dbStats` use `dataSize` for
+    `storageSize`. 5 tests.
+  - **Next** — **R5** (auth + TLS: SCRAM / X509 / rustls), the tailable
+    change-stream getMore + storage-backed aggregation stages, and **R7/R8**
+    (standalone `secantusdb` binary + the full pymongo conformance gate against
+    the Rust server).
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL

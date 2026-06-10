@@ -180,8 +180,13 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
   update/remove → re-find for the new image → projection). **Caveat:** not atomic
   across the find+modify calls (a find-and-modify storage primitive would close
   that); `arrayFilters` / `let` / `collation` / `validator` deferred.
-- [ ] **misc command coverage** — admin stats (`dbStats` / `collStats` /
-  `serverStatus`), `dropDatabase`, `renameCollection`, etc.
+- [x] **db-admin commands** — `dropDatabase`, `renameCollection`, `collStats`,
+  `dbStats`, `serverStatus` (trait gained drop_database / rename_collection /
+  collection_is_capped / collection_data_size / index_sizes; adapter forwards).
+  `serverStatus` minimal; `collStats`/`dbStats` use dataSize for storageSize.
+- [ ] **R5 — auth + TLS** (SCRAM-SHA-1/256, MONGODB-X509, rustls) — the next big
+  family; needs the users/roles storage (already in secantus-storage) wired into
+  the command trait + the server's per-connection auth state.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.
