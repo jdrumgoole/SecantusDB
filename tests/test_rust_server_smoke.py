@@ -20,6 +20,9 @@ dev sandbox / the default `rust` CI job.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+
 import pytest
 
 _server = pytest.importorskip("_secantus_server")
@@ -227,6 +230,66 @@ def test_custom_roles_against_rust_server(tmp_path) -> None:
         assert admin.command("dropRole", "appReader")["ok"] == 1.0
         with pytest.raises(pymongo.errors.OperationFailure):
             admin.command("dropRole", "appReader")  # RoleNotFound
+    finally:
+        srv.stop()
+
+
+def test_tls_against_rust_server(tmp_path) -> None:
+    """End-to-end TLS: a pymongo client connects over an encrypted channel to a
+    TLS-enabled Rust server (R5c).
+
+    The TLS transport itself is also covered deterministically by the Rust
+    integration test (`crates/secantus-server/tests/tls.rs`); this adds driver
+    coverage. Skipped where `openssl` isn't available to mint a self-signed cert.
+    """
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not available to generate a test certificate")
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    srv = _server.RustServer(
+        str(tmp_path / "wt"),
+        0,
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+    )
+    try:
+        _, port = srv.address
+        client = pymongo.MongoClient(
+            "127.0.0.1",
+            port,
+            tls=True,
+            tlsCAFile=str(cert),
+            directConnection=True,
+            serverSelectionTimeoutMS=5000,
+        )
+        try:
+            assert client.admin.command("ping")["ok"] == 1.0
+            client["t"]["c"].insert_one({"_id": 1, "x": 1})
+            assert client["t"]["c"].find_one({"_id": 1})["x"] == 1
+        finally:
+            client.close()
     finally:
         srv.stop()
 

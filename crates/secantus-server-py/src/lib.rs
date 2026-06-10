@@ -46,6 +46,9 @@ impl RustServer {
     ///   commands require an authenticated principal (provision users with
     ///   `createUser` over an initially-open admin connection, or pre-seed the
     ///   store) and are checked against the principal's RBAC role grants.
+    /// * `tls_cert_file` / `tls_key_file` — enable server-side TLS (both or
+    ///   neither). `tls_ca_file` (+ `tls_require_client_cert`) layers on mTLS
+    ///   client-certificate verification.
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -54,7 +57,12 @@ impl RustServer {
         replica_set_name = None,
         enable_oplog = true,
         require_auth = false,
+        tls_cert_file = None,
+        tls_key_file = None,
+        tls_ca_file = None,
+        tls_require_client_cert = false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         storage_path: &str,
         port: u16,
@@ -62,6 +70,10 @@ impl RustServer {
         replica_set_name: Option<String>,
         enable_oplog: bool,
         require_auth: bool,
+        tls_cert_file: Option<String>,
+        tls_key_file: Option<String>,
+        tls_ca_file: Option<String>,
+        tls_require_client_cert: bool,
     ) -> PyResult<Self> {
         // WiredTiger requires the home directory to exist; create it so any
         // path "just works" (matching the one-or-two-line ergonomic).
@@ -72,11 +84,28 @@ impl RustServer {
             .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         storage.set_enable_oplog(enable_oplog);
 
+        // TLS: cert + key both required to enable it (matching server.py).
+        let tls = match (tls_cert_file, tls_key_file) {
+            (Some(cert_file), Some(key_file)) => Some(secantus_server::TlsOptions {
+                cert_file,
+                key_file,
+                ca_file: tls_ca_file,
+                require_client_cert: tls_require_client_cert,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "tls_cert_file and tls_key_file must both be set or both be None",
+                ))
+            }
+        };
+
         let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(Arc::new(storage)));
         let cursors = Arc::new(CursorRegistry::new());
         let config = ServerConfig {
             replica_set_name,
             require_auth,
+            tls,
         };
         let addr = format!("{host}:{port}");
         let running = bind(&addr, config, adapter, cursors)

@@ -100,6 +100,11 @@ pub struct CommandContext {
     /// principals), shared across the requests on one socket. `None` until the
     /// server (R4) wires one in; the auth family needs it.
     pub conn_auth: Option<Arc<Mutex<ConnectionAuth>>>,
+    /// The verified TLS client certificate's subject DN (RFC 4514), captured
+    /// once per connection by the server's accept loop when mTLS is on. `None`
+    /// on plaintext connections or when no client cert was presented; the
+    /// `MONGODB-X509` mechanism (R5c) reads it.
+    pub peer_cert_dn: Option<String>,
 }
 
 impl CommandContext {
@@ -119,6 +124,7 @@ impl CommandContext {
             storage: None,
             cursors: None,
             conn_auth: None,
+            peer_cert_dn: None,
         }
     }
 

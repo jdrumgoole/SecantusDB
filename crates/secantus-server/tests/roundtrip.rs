@@ -179,6 +179,7 @@ fn full_wire_roundtrip() {
         ServerConfig {
             replica_set_name: Some("secantus".into()),
             require_auth: false,
+            tls: None,
         },
         storage,
         cursors,
