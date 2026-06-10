@@ -176,9 +176,10 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
 - [x] **`distinct` + DDL/introspection** — `distinct`, `create`, `drop`,
   `listCollections`, `listIndexes`, `createIndexes`, `dropIndexes` (the `Storage`
   trait gained the list/DDL methods; the R4b adapter forwards them).
-- [ ] **`findAndModify`** — needs a find-and-modify storage primitive (atomic
-  find + update/remove returning the pre/post doc); `update_matching` doesn't
-  return the document. Add to `secantus-storage` + thread through the trait.
+- [x] **`findAndModify`** — composed at the command layer (find limit-1 + sort →
+  update/remove → re-find for the new image → projection). **Caveat:** not atomic
+  across the find+modify calls (a find-and-modify storage primitive would close
+  that); `arrayFilters` / `let` / `collation` / `validator` deferred.
 - [ ] **misc command coverage** — admin stats (`dbStats` / `collStats` /
   `serverStatus`), `dropDatabase`, `renameCollection`, etc.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,

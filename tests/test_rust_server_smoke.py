@@ -56,6 +56,28 @@ def test_pymongo_crud_against_rust_server(tmp_path) -> None:
         srv.stop()
 
 
+def test_find_one_and_update_against_rust_server(tmp_path) -> None:
+    """findAndModify via pymongo's find_one_and_update (old + new images)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "x": 1})
+        # default returns the pre-image
+        old = coll.find_one_and_update({"_id": 1}, {"$set": {"x": 2}})
+        assert old["x"] == 1
+        # ReturnDocument.AFTER returns the post-image
+        new = coll.find_one_and_update(
+            {"_id": 1}, {"$set": {"x": 3}}, return_document=pymongo.ReturnDocument.AFTER
+        )
+        assert new["x"] == 3
+        # removed
+        removed = coll.find_one_and_delete({"_id": 1})
+        assert removed["x"] == 3
+        assert coll.find_one({"_id": 1}) is None
+    finally:
+        srv.stop()
+
+
 def test_aggregate_pipeline_against_rust_server(tmp_path) -> None:
     """A direct aggregation pipeline ($match → $group) via pymongo."""
     srv = _server.RustServer(str(tmp_path / "wt"), 0)

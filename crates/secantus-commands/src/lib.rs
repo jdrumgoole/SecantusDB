@@ -39,6 +39,7 @@ pub mod crud;
 pub mod cursors;
 pub mod distinct;
 pub mod find;
+pub mod findandmodify;
 pub mod handshake;
 pub mod storage;
 mod util;
@@ -208,6 +209,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "delete" => crud::delete,
         "count" => crud::count,
         "distinct" => distinct::distinct,
+        "findAndModify" | "findandmodify" => findandmodify::find_and_modify,
         "find" => find::find,
         "aggregate" => aggregate::aggregate,
         "getMore" => cursors::get_more,
