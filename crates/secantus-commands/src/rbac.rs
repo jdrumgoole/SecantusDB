@@ -13,6 +13,10 @@
 //! deferred to a later slice — the resolver hook isn't wired here, so an unknown
 //! role name grants nothing, exactly as mongod treats a role it can't see.
 
+use std::collections::HashSet;
+
+use bson::{Bson, Document};
+
 // --- Action constants (mirror rbac.py) ----------------------------------
 
 pub const A_FIND: &str = "find";
@@ -287,17 +291,110 @@ fn role_grants_action(
     Some(role_db) == target_db
 }
 
+/// A custom-role resolver: `(db, role_name) -> the stored role record`
+/// (its `privileges` + inherited `roles`). The dispatcher backs this with
+/// `Storage::get_role`; passing `None` restricts the check to built-in roles.
+pub type RoleResolver<'a> = &'a dyn Fn(&str, &str) -> Option<Document>;
+
 /// True iff any role binding in `roles` (each `(role_name, role_db)`) grants
-/// `action` on the resource. Built-in roles only (see module docs).
+/// `action` on the resource, considering built-in roles only.
 pub fn check_privilege(
     roles: &[(String, String)],
     action: &str,
     target_db: Option<&str>,
     cluster: bool,
 ) -> bool {
-    roles
-        .iter()
-        .any(|(name, db)| role_grants_action(name, db, action, target_db, cluster))
+    check_privilege_resolved(roles, action, target_db, cluster, None)
+}
+
+/// As [`check_privilege`], but expands custom user-defined roles via `resolver`:
+/// a role that isn't built-in is looked up, its `privileges` matched directly,
+/// and its inherited `roles` walked recursively with cycle detection. Mirrors
+/// `rbac.py::check_privilege`.
+pub fn check_privilege_resolved(
+    roles: &[(String, String)],
+    action: &str,
+    target_db: Option<&str>,
+    cluster: bool,
+    resolver: Option<RoleResolver<'_>>,
+) -> bool {
+    let mut pending: Vec<(String, String)> = roles.to_vec();
+    let mut visited: HashSet<(String, String)> = HashSet::new();
+    while let Some((name, db)) = pending.pop() {
+        if !visited.insert((name.clone(), db.clone())) {
+            continue;
+        }
+        // Built-in roles win the lookup race (mongod refuses createRole for a
+        // built-in name, so the names can't collide).
+        if built_in_role(&name).is_some() {
+            if role_grants_action(&name, &db, action, target_db, cluster) {
+                return true;
+            }
+            continue;
+        }
+        let Some(resolver) = resolver else { continue };
+        let Some(record) = resolver(&db, &name) else {
+            continue;
+        };
+        if custom_role_grants(&record, action, target_db, cluster) {
+            return true;
+        }
+        // Walk inherited roles (`record.roles` = [{role, db}, ...]).
+        if let Ok(inherited) = record.get_array("roles") {
+            for r in inherited {
+                if let Bson::Document(d) = r {
+                    if let (Ok(rn), Ok(rd)) = (d.get_str("role"), d.get_str("db")) {
+                        pending.push((rn.to_string(), rd.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Does a custom-role record's `privileges` array grant `action` on the
+/// resource? Pure shape match (no graph walking). Mirrors
+/// `rbac.py::_custom_role_grants`.
+fn custom_role_grants(
+    record: &Document,
+    action: &str,
+    target_db: Option<&str>,
+    cluster: bool,
+) -> bool {
+    let Ok(privs) = record.get_array("privileges") else {
+        return false;
+    };
+    for priv_ in privs {
+        let Bson::Document(p) = priv_ else { continue };
+        let Ok(actions) = p.get_array("actions") else {
+            continue;
+        };
+        if !actions.iter().any(|a| a.as_str() == Some(action)) {
+            continue;
+        }
+        let Ok(resource) = p.get_document("resource") else {
+            continue;
+        };
+        // `{anyResource: true}` matches anything.
+        if resource.get_bool("anyResource").unwrap_or(false) {
+            return true;
+        }
+        if cluster {
+            if resource.get_bool("cluster").unwrap_or(false) {
+                return true;
+            }
+            continue;
+        }
+        // `{db: "X", collection: ""}` matches any collection in db X;
+        // `{db: "", ...}` is mongod's "all databases" sentinel.
+        if let Ok(res_db) = resource.get_str("db") {
+            if res_db.is_empty() || target_db == Some(res_db) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

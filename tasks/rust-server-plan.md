@@ -291,9 +291,17 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       catalogue (`RoleNotFound`, 31); a successful `saslContinue` loads the
       user's role bindings into `ConnectionAuth::effective_roles`. 11 unit tests
       (rbac matrix + gating + cross-db / cluster denial + role validation).
-      **Deferred (R5b-3):** custom user-defined roles (`createRole` family +
-      inheritance resolver), `updateUser` / `dropAllUsersFromDatabase`,
-      `saslSupportedMechs` handshake hinting.
+    - **R5b-3 ✅ DONE** — custom user-defined roles. New `secantus-commands::roles`
+      (`createRole` / `updateRole` / `dropRole` / `dropAllRolesFromDatabase` /
+      `rolesInfo`) over four new role-storage trait methods (`add_role` /
+      `get_role` / `drop_role` / `list_roles`, adapter-forwarded to
+      `secantus-storage`). `rbac::check_privilege_resolved` expands custom roles
+      through a `Storage::get_role`-backed resolver (privilege match +
+      inheritance walk with cycle detection), and `createUser` now accepts a
+      custom role that exists in storage. 6 unit tests (role lifecycle, built-in
+      collision, updateRole, resolver privilege + inheritance) + a pymongo WT
+      round-trip. **Deferred (R5b-4):** the role `grant`/`revoke` quartet,
+      `updateUser` / `dropAllUsersFromDatabase`, `saslSupportedMechs` hinting.
     - **R5c** — TLS / mTLS (`rustls`) in the accept loop + the X509 mechanism
       (`saslStart`/`authenticate` MONGODB-X509, needs the verified peer cert DN).
     Then the tailable change-stream getMore + storage-backed aggregation stages,

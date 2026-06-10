@@ -198,6 +198,35 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         self.inner.list_users(db, skip, limit).map_err(map_err)
     }
+
+    fn add_role(
+        &self,
+        db: &str,
+        name: &str,
+        record: &[u8],
+        replace: bool,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .add_role(db, name, record, replace)
+            .map_err(map_err)
+    }
+
+    fn get_role(&self, db: &str, name: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.get_role(db, name).map_err(map_err)
+    }
+
+    fn drop_role(&self, db: &str, name: &str) -> Result<bool, StorageError> {
+        self.inner.drop_role(db, name).map_err(map_err)
+    }
+
+    fn list_roles(
+        &self,
+        db: Option<&str>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.inner.list_roles(db, skip, limit).map_err(map_err)
+    }
 }
 
 /// Convert a raw `hint` value into the storage `Hint`. A string is an index

@@ -186,6 +186,51 @@ def test_scram_auth_roundtrip_against_rust_server(tmp_path) -> None:
         srv.stop()
 
 
+def test_custom_roles_against_rust_server(tmp_path) -> None:
+    """createRole / rolesInfo / updateRole / dropRole over WiredTiger (R5b-3).
+
+    Exercises the custom-role storage round-trip through the real WT adapter on
+    an auth-off server (no gating needed). The privilege-resolution + inheritance
+    paths are covered by the Rust unit tests.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        admin = _client(srv).admin
+        created = admin.command(
+            "createRole",
+            "appReader",
+            privileges=[{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}],
+            roles=[],
+        )
+        assert created["ok"] == 1.0
+
+        # rolesInfo returns the stored shape.
+        info = admin.command("rolesInfo", "appReader")
+        assert len(info["roles"]) == 1
+        assert info["roles"][0]["role"] == "appReader"
+
+        # a built-in name can't be redefined
+        with pytest.raises(pymongo.errors.OperationFailure):
+            admin.command("createRole", "read", privileges=[], roles=[])
+
+        # updateRole replaces privileges in place
+        assert (
+            admin.command(
+                "updateRole",
+                "appReader",
+                privileges=[{"resource": {"db": "app", "collection": ""}, "actions": ["insert"]}],
+            )["ok"]
+            == 1.0
+        )
+
+        # dropRole removes it
+        assert admin.command("dropRole", "appReader")["ok"] == 1.0
+        with pytest.raises(pymongo.errors.OperationFailure):
+            admin.command("dropRole", "appReader")  # RoleNotFound
+    finally:
+        srv.stop()
+
+
 def test_require_auth_gating_against_rust_server(tmp_path) -> None:
     """End-to-end `--auth` gating (R5b-2).
 

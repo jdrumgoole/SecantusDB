@@ -44,6 +44,7 @@ pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 pub mod rbac;
+pub mod roles;
 pub mod storage;
 mod util;
 
@@ -253,6 +254,11 @@ fn lookup(name: &str) -> Option<Handler> {
         "createUser" => auth::create_user,
         "dropUser" => auth::drop_user,
         "usersInfo" => auth::users_info,
+        "createRole" => roles::create_role,
+        "updateRole" => roles::update_role,
+        "dropRole" => roles::drop_role,
+        "dropAllRolesFromDatabase" => roles::drop_all_roles_from_database,
+        "rolesInfo" => roles::roles_info,
         "getParameter" => diagnostics::get_parameter,
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
         "connectionStatus" => diagnostics::connection_status,
@@ -334,7 +340,20 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
                         .clone()
                 })
                 .unwrap_or_default();
-            if !rbac::check_privilege(&roles, action, target_db.as_deref(), cluster) {
+            // Custom roles are expanded through a storage-backed resolver
+            // (`Storage::get_role`); built-in roles short-circuit without it.
+            let storage = ctx.storage.as_deref();
+            let resolver = |db: &str, role: &str| -> Option<Document> {
+                let bytes = storage?.get_role(db, role).ok()??;
+                Document::from_reader(&mut bytes.as_slice()).ok()
+            };
+            if !rbac::check_privilege_resolved(
+                &roles,
+                action,
+                target_db.as_deref(),
+                cluster,
+                Some(&resolver),
+            ) {
                 return Err(CommandError::new(
                     13,
                     "Unauthorized",
@@ -418,6 +437,11 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "createUser" => (A_CREATE_USER, SCOPE_DATABASE),
         "dropUser" => (A_DROP_USER, SCOPE_DATABASE),
         "usersInfo" => (A_VIEW_USER, SCOPE_DATABASE),
+        "createRole" => (A_CREATE_ROLE, SCOPE_DATABASE),
+        "updateRole" => (A_GRANT_ROLE, SCOPE_DATABASE),
+        "dropRole" => (A_DROP_ROLE, SCOPE_DATABASE),
+        "dropAllRolesFromDatabase" => (A_DROP_ROLE, SCOPE_DATABASE),
+        "rolesInfo" => (A_VIEW_ROLE, SCOPE_DATABASE),
         "serverStatus" => (A_SERVER_STATUS, SCOPE_CLUSTER),
         "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
         "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
