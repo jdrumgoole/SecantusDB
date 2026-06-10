@@ -184,6 +184,11 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
   `dbStats`, `serverStatus` (trait gained drop_database / rename_collection /
   collection_is_capped / collection_data_size / index_sizes; adapter forwards).
   `serverStatus` minimal; `collStats`/`dbStats` use dataSize for storageSize.
+- [x] **sessions + diagnostics** — `startSession` / `endSessions` /
+  `refreshSessions` / `kill*Sessions` / `commit`+`abortTransaction` /
+  `getParameter` / `getCmdLineOpts` / `connectionStatus` / `whatsmyuri` /
+  `hostInfo` / `getLog` (storage-light; session/txn are no-ops). Removes
+  CommandNotFound on driver connect/teardown.
 - [ ] **R5 — auth + TLS** (SCRAM-SHA-1/256, MONGODB-X509, rustls) — the next big
   family; needs the users/roles storage (already in secantus-storage) wired into
   the command trait + the server's per-connection auth state.

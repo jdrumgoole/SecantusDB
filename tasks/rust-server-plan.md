@@ -249,6 +249,15 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     `collection_data_size` / `index_sizes`; the R4b adapter forwards them).
     `serverStatus` is a minimal subset; `collStats`/`dbStats` use `dataSize` for
     `storageSize`. 5 tests.
+  - **sessions + diagnostics ✅ DONE** (`secantus-commands::diagnostics`) —
+    `startSession` (mints a UUID lsid) / `endSessions` / `refreshSessions` /
+    `killSessions` / `killAllSessions[ByPattern]` (no-op bookkeeping) /
+    `commitTransaction` / `abortTransaction` (no-op) / `getParameter` /
+    `getCmdLineOpts` (reflects `--auth`) / `connectionStatus` / `whatsmyuri` /
+    `hostInfo` / `getLog`. Storage-light, mostly static — removes
+    `CommandNotFound` noise on driver connect/teardown/admin probes. 5 tests.
+    **Deferred:** real session/cursor affinity; live `connectionStatus` auth info
+    (R5); peer-address `whatsmyuri`.
   - **Next** — **R5** (auth + TLS: SCRAM / X509 / rustls), the tailable
     change-stream getMore + storage-backed aggregation stages, and **R7/R8**
     (standalone `secantusdb` binary + the full pymongo conformance gate against
