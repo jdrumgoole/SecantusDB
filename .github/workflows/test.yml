@@ -246,6 +246,18 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+      - name: Cargo fmt / clippy / build (secantus-storage-adapter, R4b)
+        # The WiredTiger → command-`Storage` adapter (R4b). Like secantus-storage
+        # it links WiredTiger and is excluded from the workspace, so it's built
+        # here against the vendored WT resolved above. clippy/build also settle
+        # whether `secantus_storage::Storage` is `Send + Sync` (the command
+        # `Storage` trait's supertrait). It has no tests of its own.
+        working-directory: crates/secantus-storage-adapter
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo build
+
   # Builds the main `secantus` wheel with the off-by-default storage-engine flag
   # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
   # extension links the SAME bundled WiredTiger this wheel already builds and
@@ -305,19 +317,25 @@ jobs:
           SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
         run: uv build --wheel --out-dir dist-storage
 
-      - name: Assert the extension is bundled in the wheel
-        # importorskip in the smoke test would silently pass if the extension
-        # were missing — the whole point here is that it's PRESENT, so fail hard.
+      - name: Assert the extensions are bundled in the wheel
+        # importorskip in the smoke tests would silently pass if an extension
+        # were missing — the whole point here is that they're PRESENT, so fail
+        # hard. Both the storage engine (_secantus_storage) and the Rust server
+        # handle (_secantus_server, R6) are built by CMake under the flag.
         # bash on all three OSes (git-bash on Windows) for the glob expansion.
         shell: bash
         run: >-
           uv run --no-project --with "$(ls dist-storage/*.whl)"
-          python -c "import _secantus_storage; print('bundled OK:', _secantus_storage.__file__)"
+          python -c "import _secantus_storage, _secantus_server;
+          print('bundled OK:', _secantus_storage.__file__, _secantus_server.__file__)"
 
-      - name: Storage extension smoke test
+      - name: Storage + Rust-server smoke tests
+        # test_rust_storage_smoke.py drives the storage engine; test_rust_server
+        # _smoke.py drives the embedded Rust server (R6) end-to-end via pymongo —
+        # the first pymongo → Rust → WiredTiger conformance check.
         shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest
           --with "$(ls dist-storage/*.whl)"
-          python -m pytest tests/test_rust_storage_smoke.py
+          python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           -o addopts= -p no:cacheprovider -q

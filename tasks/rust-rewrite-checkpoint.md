@@ -1,5 +1,12 @@
 # Rust rewrite — checkpoint (branch `claude/python-rust-rewrite-plan-wjZou`)
 
+> ⚠️ **Integration model changed since this checkpoint — see `tasks/rust-server-
+> plan.md` (authoritative).** This checkpoint describes the in-process
+> selectable-engine model (`SECANTUS_ENGINE`, the per-component shims). That has
+> been replaced by **two separate servers** (pure-Python + a self-contained Rust
+> server with a thin embedded Python handle). The *engine/storage porting* work
+> recorded here is still valid; the *selection/cutover* framing is superseded.
+
 HEAD `87644fa`, 29 commits ahead of `main`, working tree clean, all pushed.
 This is the state at which the WiredTiger-free work was taken as far as it
 honestly goes. Companion docs: `tasks/rust-rewrite-plan.md` (strategy),

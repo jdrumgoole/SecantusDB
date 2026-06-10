@@ -133,20 +133,79 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
-Tracking the incremental rewrite (plan: `tasks/rust-rewrite-plan.md`; Phase 0
-spike results: `tasks/rust-rewrite-spike-findings.md`; Phase 3+4 scoping:
-`tasks/rust-rewrite-phase3-scoping.md`). The Rust side is a Cargo workspace under
-`crates/`: the pure-Rust engine lib crate `crates/secantus-core` plus the PyO3
-bindings crate `crates/secantus-core-py`, which builds the abi3 extension
-`_secantus_core` via maturin (`invoke rust-build` / `rust-test` / `rust-parity`).
+> ⚠️ **Direction changed — authoritative plan is now `tasks/rust-server-plan.md`.**
+> The end-state is **two completely separate servers** (a pure-Python server and a
+> self-contained Rust server with a thin embedded Python lifecycle handle), **not**
+> the in-process `secantus.engine` selectable model the items below assume. The
+> *porting* work recorded here (the pure-Rust crates) is still valid and is the
+> Rust server's foundation; the `SECANTUS_ENGINE` selection / Python `Storage`
+> adapter / `EngineFallback` items are **retired**. Next work is the Rust server
+> itself (`rust-server-plan.md` §4, R1–R8), not more in-process selection surface.
 
-**Both engines are permanent (not a replacement).** The pure-Python engines are
-always present and the default; the Rust core is an optional accelerator.
-Selection is process-wide via `secantus.engine` (the `SECANTUS_ENGINE` env var
-/ `SecantusDBServer(engine=...)` / `--engine`), with per-component overrides
-(`SECANTUS_RUST_<COMPONENT>`). So the old "flip the default to Rust" items below
-mean "make Rust the *recommended* default for users who install the extension,"
-never "remove Python."
+Tracking the incremental rewrite (plan: `tasks/rust-server-plan.md` — north star;
+`tasks/rust-rewrite-plan.md`; Phase 0 spike results: `tasks/rust-rewrite-spike-
+findings.md`; Phase 3+4 scoping: `tasks/rust-rewrite-phase3-scoping.md`). The Rust
+side is a Cargo workspace under `crates/`: the pure-Rust engine lib crate
+`crates/secantus-core` plus the PyO3 bindings crate `crates/secantus-core-py`,
+which builds the abi3 extension `_secantus_core` via maturin (`invoke rust-build`
+/ `rust-test` / `rust-parity`).
+
+**Both implementations are permanent (not a replacement).** ~~Selection is
+process-wide via `secantus.engine`.~~ → The pure-Python engines power the **Python
+server**; the Rust engines power the separate **Rust server**. The
+`secantus.engine` in-process selection is transitional and being retired (see the
+banner above + `tasks/rust-server-plan.md` §3).
+
+**Rust server build-out (`tasks/rust-server-plan.md` §4).** Done: R1
+(`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /
+`delete` / `count` + the `Storage` trait seam), R3a (`CursorRegistry` +
+non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projection
+/ cursor split → the full `find → getMore → killCursors` path works in dispatch),
+`update` (document-form, multi/upsert, pipeline-shape validation), R4a
+(`secantus-server`: accept loop + connection handling, generic over the command
+`Storage` trait — runs over real TCP, two WT-free roundtrip integration tests).
+**Deferred / not yet ported:**
+- [~] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
+  `StorageAdapter`): **written but unverified locally** (links WT, excluded from
+  the workspace — first compiled by the `rust-storage` CI job). Watch its first CI
+  run; the likely failure point is `secantus_storage::Storage: Send + Sync` (the
+  command trait's supertrait). Bytes at the seam, `Hint` from `RawHint`, full
+  error translation in `map_err`.
+- [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
+- [~] **R6 — embedded Python handle** (`crates/secantus-server-py`, the
+  `_secantus_server` extension / `RustServer`): **written but unverified locally**
+  (links WT, excluded — built by the wheel CMake / local maturin only). Opens
+  storage → `StorageAdapter` → `bind`; `address`/`uri`/`stop` + context manager.
+  `tests/test_rust_server_smoke.py` (pymongo, importorskip) is the first
+  pymongo → Rust → WT test. **Follow-ups:** validate via CI / a WT machine; add a
+  Python `secantus`-package wrapper for `SecantusDBServer`-style ergonomics; an
+  `invoke rust-server-py` build task.
+- [ ] **`update` pipeline-form + options** — a *valid* pipeline-form `u` (`[...]`)
+  surfaces as a per-op writeError because the Rust `update_matching` takes
+  `&Document` and `secantus-storage` has no pipeline-update path. Same for
+  `arrayFilters` / `let` / `collation` / `validator` (none in the storage seam).
+  Needs a `secantus-storage` `update_matching` extension, then thread through the
+  command `Storage` trait + handler.
+- [ ] **`find` edges** — up-front empty-collection filter validation (needs the
+  query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
+  capped-collection poll; `let` / `collation`. (Tracked in `find.rs` module docs.)
+- [ ] **Tailable (change-stream) getMore** — drain buffered events, call the
+  cursor `producer`, block on the storage oplog condvar for `awaitData`, emit
+  `postBatchResumeToken`. Needs the oplog tail + `notify_oplog_waiters` added to
+  the command `Storage` trait. The registry already stores the tailable entry +
+  producer; only the getMore consumer is missing.
+- [ ] **R2c — `update` command.** Document-form maps to `update_matching`, but
+  pipeline-form `u` (array), `arrayFilters`, `let`, `collation`, and `validator`
+  need storage-signature additions (the Rust `update_matching` takes none). Port
+  the sort-rejection (code 9) + pipeline-stage validation (9 / 168) pre-checks
+  with it.
+- [ ] **`find` command** — lands with R3 (cursor registry) + `secantus-core`
+  projection; first-batch + `getMore`/`killCursors`.
+- [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
+  validation + `writeConcernError` attachment; collection `validator` /
+  `bypassDocumentValidation` (needs `get_collection_options` + the query engine);
+  `_reject_oplog_rs_write`; `let` / `collation` on `delete`; view-collection
+  `count` (needs the aggregation engine). All tracked in `crud.rs`'s module docs.
 
 - [x] **Engine selection** — `secantus.engine` is the single source of truth
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six

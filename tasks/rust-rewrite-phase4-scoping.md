@@ -1,5 +1,17 @@
 # Phase 4 — storage keystone: scoping & status
 
+> ⚠️ **Integration model changed — see `tasks/rust-server-plan.md` (authoritative).**
+> The *storage porting* tracked here (sub-phases 0–5e: the pure-Rust
+> `secantus-storage` crate — CRUD, indexes, geo, oplog/change-streams, users/roles,
+> lifecycle, stats) is **done and still valid**; it is the foundation for the Rust
+> server. What is **superseded** is the §5e cutover target: there is **no** Python
+> `Storage` adapter over `RustStorage`, **no** `secantus.engine` storage selection,
+> and **no** `EngineFallback` routing. Storage is consumed **natively in Rust** by
+> the new Rust server; the only Python-facing surface is a thin server lifecycle
+> handle. The "dual-engine at `Storage` granularity behind one interface" decision
+> in §"Decisions (locked)" is replaced by "two separate servers." Read the §5e
+> "Then" plan and the fat `secantus-storage-py` surface as **retired**.
+
 Phase 4 moves SecantusDB's WiredTiger-backed storage layer into Rust. It is the
 keystone: it unblocks running the whole read hot path (scan → filter → project)
 in Rust under one GIL release, and it is the prerequisite for a standalone Rust

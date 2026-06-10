@@ -104,14 +104,55 @@ Documents are stored as **opaque BSON blobs**. All filtering, projection, sortin
 
 When secondary indexes land they will be WT indexes over typed sort-key columns derived from BSON values — not JSON, not coerced numerics.
 
-### Engines: pure-Python and Rust both ship (a deliberate dual-mode decision)
+### Engines: pure-Python and Rust both ship → as TWO SEPARATE SERVERS
 
-There are **two implementations of the operator core, and both are first-class, permanently supported. The Rust rewrite is an accelerator, not a replacement — the pure-Python engine is never removed.** The Rust side is a Cargo workspace under `crates/`: `crates/secantus-core` is the **pure-Rust engine lib crate** (no PyO3 — the ported operator engines over `bson`), and `crates/secantus-core-py` is the **thin PyO3 bindings crate** (the BSON byte seam + `#[pyfunction]` glue) that wraps it and builds the optional abi3 extension `_secantus_core` (the `secantus-core` wheel, via maturin). The split keeps the engines reusable by a future standalone Rust `secantusdb` binary. The original pure-Python engines are always present and are the **default**.
+**Direction (current):** SecantusDB ships **two completely separate servers**,
+and a user runs **one or the other** — never a per-operator/per-`Storage`
+selection inside one request path:
 
-- **Single source of truth: `src/secantus/engine.py`.** `available()` (is the extension importable), `selected()` (`"python"` / `"rust"` / `"auto"`), `set_engine()`, and `enabled(component)`. Every ported module's shim (`sortkey`, `query`, `update`, `expressions`, `projection`, `diff`, `aggregate`) calls `engine.enabled(<component>)` and delegates to `_secantus_core` when on, else runs the pure-Python path. Ported so far: the six leaf engines plus the entire storage-*independent* aggregation pipeline (`$match`/`$project`/`$group`/`$sort`/`$unwind`/`$bucket`/`$facet`/`$densify`/… — the storage-backed `$lookup`/`$geoNear`/`$out`/`$merge` and `$sample` stay Python until the storage layer moves into Rust). See `tasks/rust-rewrite-phase3-scoping.md` for what's next (cursors / change streams, then the storage keystone).
-- **Selection is process-wide:** `SECANTUS_ENGINE=python|rust|auto` (default `python`), `SecantusDBServer(engine=...)`, or `secantusdb --engine`. Per-component overrides `SECANTUS_RUST_<COMPONENT>=1/0` win (for debugging/bisection). `rust` transparently falls back to Python for any component not ported and warns once if the extension is missing.
-- **The Rust core reproduces the Python behaviour exactly** — it is *not* allowed to diverge. Each engine is pinned to its pure-Python counterpart by a `tests/test_rust_*_parity.py` suite (curated corpus + randomised fuzz), and the Rust side returns a "fall back to Python" signal for any construct it can't reproduce byte-for-byte (regex → Python `re`, collation, Decimal128 edges, non-ASCII case, etc.). When porting/widening a Rust engine, **extend the parity suite first**; never let the two engines drift.
-- **Implication for changes:** a change to an operator's semantics must land in *both* the Python module and the Rust port (or the Rust port must explicitly defer that case), and the parity suite must stay green. The plan, phase status, and per-engine fallback lists live in `tasks/rust-rewrite-plan.md`, `tasks/rust-rewrite-spike-findings.md`, and `tasks/backlog.md` §7. Tooling: `invoke rust-test` / `rust-build` / `rust-parity`.
+- **The Python server** — the *original* `SecantusDBServer` (pure-Python `server` /
+  `wire` / `commands` / `Storage` / operator engines). No Rust in the request path.
+- **The Rust server** — a whole, self-contained Rust server (its own wire /
+  dispatch / cursors / accept loop over the pure-Rust `secantus-core` +
+  `secantus-storage` + `secantus-wt` crates). No Python in the request path. Its
+  Python ergonomic is a **thin embedded lifecycle handle** (`start`/`stop`/
+  `address`) — the accept loop runs on a GIL-released Rust thread in-process and
+  `pymongo` connects over real TCP; Python is only the launcher, never an operator.
+
+**The authoritative plan is `tasks/rust-server-plan.md`.** It supersedes the
+earlier *in-process selectable-engine* model (`SECANTUS_ENGINE` process-wide
+selection / the `secantus.engine` per-component shims / the "5e Python `Storage`
+adapter + `EngineFallback`"). Read it before doing Rust-side work.
+
+The Rust side is a Cargo workspace under `crates/`: `secantus-core` (pure-Rust
+engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backed
+`Storage`, pure-Rust), `secantus-wt` (the WT FFI), plus thin PyO3 binding crates
+(`secantus-core-py` → the `_secantus_core` abi3 extension). The PyO3-free split is
+exactly what lets the Rust server / standalone `secantusdb` binary reuse the
+engines.
+
+- **Current code vs direction.** Today the code still contains the transitional
+  in-process selection (`src/secantus/engine.py`: `selected()` / `enabled()` and
+  the `query`/`update`/`expressions`/`projection`/`diff`/`sortkey`/`aggregate`
+  shims that delegate to `_secantus_core` when enabled; `SECANTUS_ENGINE=python|
+  rust|auto`). **This is being retired** in favour of the two-server model: the
+  Python server reverts to pure-Python, and `_secantus_core` is kept **only as the
+  parity-test vehicle**. Don't build new in-process selection surface; build the
+  Rust server (`tasks/rust-server-plan.md` §4, R1–R8).
+- **Parity suites stay (the operator oracle).** Each Rust engine is pinned
+  byte-for-byte to its pure-Python counterpart by a `tests/test_rust_*_parity.py`
+  suite (curated corpus + randomised fuzz); the Rust side returns a "defer to
+  Python" signal for constructs it can't reproduce exactly (regex → Python `re`,
+  collation, Decimal128 edges, non-ASCII case, etc.). When porting/widening a Rust
+  engine, **extend the parity suite first**; never let the two engines drift.
+- **Implication for changes:** a change to an operator's semantics must land in
+  *both* the Python module and the Rust port (or the Rust port must explicitly
+  defer that case), and the parity suite must stay green. Both servers must keep
+  the pymongo + driver gauges non-regressing. Plan / phase status / per-engine
+  fallback lists: `tasks/rust-server-plan.md` (north star), `tasks/rust-rewrite-
+  plan.md`, `tasks/rust-rewrite-phase4-scoping.md`, `tasks/rust-rewrite-spike-
+  findings.md`, `tasks/backlog.md` §7. Tooling: `invoke rust-test` / `rust-build`
+  / `rust-parity`.
 
 ## Tooling
 
