@@ -116,4 +116,53 @@ pub trait Storage: Send + Sync {
         sort: Option<&Document>,
         hint: Option<RawHint<'_>>,
     ) -> Result<Vec<Vec<u8>>, StorageError>;
+
+    // --- DDL / introspection ------------------------------------------------
+    //
+    // These carry default no-op/empty implementations so test fakes that don't
+    // exercise them keep compiling; the real adapter (`secantus-storage-adapter`)
+    // overrides every one. A handler that needs a backend the fake didn't
+    // override sees the default, which is fine for unrelated unit tests.
+
+    /// Collection names in `db`.
+    fn list_collections(&self, _db: &str) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Create a collection. `true` if newly created, `false` if it already existed.
+    fn create_collection(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    /// Drop a collection. `true` if it existed.
+    fn drop_collection(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Index definition documents for a collection (mongod's `listIndexes` shape).
+    fn list_indexes(&self, _db: &str, _coll: &str) -> Result<Vec<Document>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Create an index. `true` if newly created (`false` e.g. for `_id_`).
+    fn create_index(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+        _key: &Document,
+        _options: &Document,
+    ) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    /// Drop a named index. `true` if it existed.
+    fn drop_index(&self, _db: &str, _coll: &str, _name: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Drop every non-`_id` index; returns how many were dropped.
+    fn drop_all_indexes(&self, _db: &str, _coll: &str) -> Result<usize, StorageError> {
+        Ok(0)
+    }
 }

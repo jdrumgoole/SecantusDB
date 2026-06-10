@@ -226,11 +226,23 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     `$out` / `$merge` / `$geoNear` / `$sample` / `$collStats` / `$indexStats` —
     need storage threaded into the pipeline engine), `$changeStream` cursors,
     `let`-expression evaluation, `collation`.
-  - **Next** — DDL + misc command families (`findAndModify` / `distinct` /
-    `listCollections` / `listIndexes` / `createIndexes` / `create` / `drop` /
-    admin stats), then **R5** (auth + TLS), the tailable change-stream getMore,
-    and **R7/R8** (standalone binary + the full pymongo conformance gate against
-    the Rust server).
+  - **`distinct` ✅ DONE** — fetch matching docs via `find`, resolve the dotted
+    `key` (flattening one array level), dedup by BSON equality. Collation
+    deferred. 5 tests.
+  - **DDL + introspection ✅ DONE** (`secantus-commands::admin`) — `create` /
+    `drop` / `listCollections` / `listIndexes` / `createIndexes` / `dropIndexes`.
+    Extended the `Storage` trait with `list_collections` / `create_collection` /
+    `drop_collection` / `list_indexes` / `create_index` / `drop_index` /
+    `drop_all_indexes` (default-impl'd so existing fakes compile; the R4b adapter
+    forwards each to real WT storage). `NamespaceExists` (48) / `NamespaceNotFound`
+    (26) / `IndexNotFound` (27); auto-derived index names; `createIndexes`
+    auto-creates the collection. 4 tests. **Deferred:** `create` option/capped/
+    view validation; `listCollections` filter; `listIndexes` NamespaceNotFound;
+    `dropIndexes` by key spec.
+  - **Next** — `findAndModify` (needs a find-and-modify storage primitive that
+    returns the doc), then **R5** (auth + TLS), the tailable change-stream
+    getMore, and **R7/R8** (standalone binary + the full pymongo conformance gate
+    against the Rust server).
 
 - **R3 — Cursor registry + change-stream tailable plumbing** (in the server
   crate). Port `cursors.CursorRegistry` (int64 id → remaining batch, idle-TTL

@@ -103,6 +103,43 @@ impl CmdStorage for StorageAdapter {
             .find_matching_with(db, coll, filter, sort, resolved.as_ref())
             .map_err(map_err)
     }
+
+    fn list_collections(&self, db: &str) -> Result<Vec<String>, StorageError> {
+        self.inner.list_collections(db).map_err(map_err)
+    }
+
+    fn create_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+        self.inner.create_collection(db, coll).map_err(map_err)
+    }
+
+    fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+        self.inner.drop_collection(db, coll).map_err(map_err)
+    }
+
+    fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>, StorageError> {
+        self.inner.list_indexes(db, coll).map_err(map_err)
+    }
+
+    fn create_index(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key: &Document,
+        options: &Document,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .create_index(db, coll, name, key, options)
+            .map_err(map_err)
+    }
+
+    fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool, StorageError> {
+        self.inner.drop_index(db, coll, name).map_err(map_err)
+    }
+
+    fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize, StorageError> {
+        self.inner.drop_all_indexes(db, coll).map_err(map_err)
+    }
 }
 
 /// Convert a raw `hint` value into the storage `Hint`. A string is an index

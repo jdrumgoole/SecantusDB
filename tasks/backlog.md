@@ -173,8 +173,14 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
   `$geoNear` / `$sample` / `$collStats` / `$indexStats` (Rust engine returns
   `Fallback` → surfaced as `BadValue`); `$changeStream` cursors; `let`-expression
   evaluation; `collation`. Land when the pipeline engine gets a storage context.
-- [ ] **DDL + misc commands** — `findAndModify` / `distinct` / `listCollections` /
-  `listIndexes` / `createIndexes` / `create` / `drop` / admin stats.
+- [x] **`distinct` + DDL/introspection** — `distinct`, `create`, `drop`,
+  `listCollections`, `listIndexes`, `createIndexes`, `dropIndexes` (the `Storage`
+  trait gained the list/DDL methods; the R4b adapter forwards them).
+- [ ] **`findAndModify`** — needs a find-and-modify storage primitive (atomic
+  find + update/remove returning the pre/post doc); `update_matching` doesn't
+  return the document. Add to `secantus-storage` + thread through the trait.
+- [ ] **misc command coverage** — admin stats (`dbStats` / `collStats` /
+  `serverStatus`), `dropDatabase`, `renameCollection`, etc.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.
