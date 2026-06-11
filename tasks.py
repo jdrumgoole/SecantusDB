@@ -204,6 +204,30 @@ def rust_storage_py(c: Context) -> None:
     )
 
 
+# The standalone Rust server binary (R7), over the same crates the embedded
+# _secantus_server handle uses. Links WiredTiger, so it lives outside the clean
+# workspace like secantus-storage-adapter.
+_RUST_BINARY_DIR = "crates/secantusdb"
+
+
+@task(name="rust-binary-test")
+def rust_binary_test(c: Context) -> None:
+    """Build the standalone ``secantusdb`` binary and run its smoke test.
+
+    Builds the WiredTiger-linking bin crate, then launches it from
+    tests/test_rust_binary_smoke.py (ephemeral port, pymongo round-trip,
+    clean SIGTERM exit) in an isolated interpreter. Same WiredTiger /
+    libclang prerequisites as ``rust-wt-test``.
+    """
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build", pty=True)
+    c.run(
+        "uv run --no-project --with pymongo --with pytest "
+        "python -m pytest tests/test_rust_binary_smoke.py "
+        "-o addopts= -p no:cacheprovider -q",
+        pty=True,
+    )
+
+
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(

@@ -27,32 +27,24 @@ SCRAM-SHA-256 auth, `--auth` command gating, built-in + custom-role RBAC, and
 MONGODB-X509 cert auth — all validated by Rust unit tests + pymongo/WT smoke
 tests in the `storage-engine` CI jobs.
 
-## Next up — R7: standalone `secantusdb` binary
+## R7 — standalone `secantusdb` binary: ✅ DONE
 
-The natural next milestone: a runnable/demoable standalone server binary
-(the Python equivalent is `secantus.cli:main`, see `src/secantus/cli.py`).
+Landed per the plan that used to live here:
 
-**Plan:**
-
-1. **Arg-parsing as a WT-free, unit-testable module** in `secantus-server`
-   (so it builds + tests in the `rust` CI job and the dev sandbox). Map the
-   Python CLI flags: `--host`, `--port`, `--storage-path`, `--auth`,
-   `--standalone` (drop the replica-set `hello` advertisement → `replica_set_name
-   = None`), `--tls-cert-file`, `--tls-key-file`, `--tls-ca-file`,
-   `--tls-require-client-cert`. Produce a `ServerConfig` + the storage path.
-   Hand-roll a small parser (no new `clap` dep) or keep it minimal.
-2. **Thin WT-linked `crates/secantusdb` bin crate** (`main.rs`): parse args →
-   open `secantus_storage::Storage` → wrap in `StorageAdapter` → `bind()` →
-   print the bound address → block until Ctrl-C → clean `stop()`. Needs a small
-   signal hook (add the `ctrlc` crate, or park + rely on process exit).
-   This crate links WiredTiger, so — like `secantus-server-py` and
-   `secantus-storage-adapter` — it's **excluded from the clean workspace** and
-   built only in a CI job.
-3. **CI:** add a build/smoke step for the bin to the `storage-engine` job
-   (`.github/workflows/test.yml`) so it's exercised — otherwise it's never
-   compiled in CI. A tiny smoke test: launch the binary on `port=0`, connect a
-   pymongo client, run `hello`, kill it.
-4. Update `tasks/rust-server-plan.md` (R7 section) + `tasks/backlog.md`.
+1. **`secantus-server::args`** — WT-free, hand-rolled parser (`--host` /
+   `--port` / `--storage-path` / `--auth` / `--standalone` / four `--tls-*`
+   flags, both `--flag value` and `--flag=value` spellings, TLS pairing rules
+   enforced), 11 unit tests in the clean workspace.
+2. **`crates/secantusdb`** — WT-linked bin (own `[workspace]`, in the parent
+   `exclude`): open `Storage` → `StorageAdapter` → `bind` → print
+   `secantusdb listening on <addr>` (flushed; launchers parse it) → block on
+   SIGINT/SIGTERM (`ctrlc` + termination feature) → clean `stop()`. Bad args
+   exit 2; `--help` / `--version` exit 0.
+3. **Smoke**: `tests/test_rust_binary_smoke.py` (pymongo CRUD round-trip +
+   clean SIGTERM exit 0, `--standalone` hello shape, bad-args, help) +
+   `invoke rust-binary-test` + a `storage-engine` CI step (Linux/macOS;
+   Windows bin deferred — see backlog §7 "R7 tail").
+4. Plan/backlog updated.
 
 **Heads-up / gotchas learned this session:**
 - The bin and `secantus-server-py` link WT → **can't be built in the WT-less dev

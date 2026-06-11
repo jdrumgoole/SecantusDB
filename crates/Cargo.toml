@@ -43,6 +43,8 @@ exclude = [
     "secantus-storage-adapter",
     # R6: the PyO3 embedded handle — links WiredTiger transitively, excluded too.
     "secantus-server-py",
+    # R7: the standalone server binary — links WiredTiger transitively, excluded too.
+    "secantusdb",
 ]
 
 [workspace.dependencies]

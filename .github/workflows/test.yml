@@ -339,3 +339,24 @@ jobs:
           --with "$(ls dist-storage/*.whl)"
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           -o addopts= -p no:cacheprovider -q
+
+      - name: Build + smoke the standalone secantusdb binary (R7)
+        # The bin crate links the SAME vendored WiredTiger the wheel build above
+        # produced under build/*/wt-build (scikit-build-core's build-dir), via
+        # build.rs's SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB override. Windows is
+        # skipped: build.rs probes libwiredtiger.a/.so, which the MSVC build
+        # doesn't produce — the Windows artifact ships via the wheel's CMake
+        # path only (tracked in tasks/backlog.md §7).
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
+            echo "vendored WiredTiger not found under build/*/wt-build" >&2
+            exit 1
+          fi
+          export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+          cargo build --manifest-path crates/secantusdb/Cargo.toml
+          uv run --no-project --with pymongo --with pytest \
+            python -m pytest tests/test_rust_binary_smoke.py \
+            -o addopts= -p no:cacheprovider -q
