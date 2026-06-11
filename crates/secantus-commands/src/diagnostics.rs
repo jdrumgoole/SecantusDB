@@ -123,9 +123,12 @@ fn known_params() -> Document {
         "enableTestCommands": false,
         "logLevel": 0_i32,
         "quiet": false,
-        // We implement only SCRAM-SHA-256 (once R5 lands); advertise just that
+        // We implement SCRAM-SHA-256 + MONGODB-X509 (R5); advertise just those
         // so driver test runners gating on other mechanisms self-skip.
-        "authenticationMechanisms": [Bson::String("SCRAM-SHA-256".to_string())],
+        "authenticationMechanisms": [
+            Bson::String("SCRAM-SHA-256".to_string()),
+            Bson::String("MONGODB-X509".to_string()),
+        ],
         "version": SERVER_VERSION,
     }
 }
