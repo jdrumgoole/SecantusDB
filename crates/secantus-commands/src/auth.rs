@@ -33,10 +33,15 @@
 //! exists in storage. `hello` advertises `saslSupportedMechs` for a queried
 //! principal (R5b-4).
 //!
+//! **MONGODB-X509** (R5c-2): `createUser` provisions X509-capable users
+//! (`mechanisms: ["MONGODB-X509"]`, no password); `saslStart` (and the legacy
+//! `authenticate` command) read the verified client cert DN
+//! ([`CommandContext::peer_cert_dn`], set by the server's mTLS handshake), look
+//! the user up on `$external` / `admin`, and authenticate without a password.
+//!
 //! ## Deferred (later slices, tracked in `tasks/rust-server-plan.md`)
 //!
-//! * **SCRAM-SHA-1** (legacy MD5 prepass) and **MONGODB-X509** (needs TLS, R5c).
-//! * Non-ASCII SASLprep.
+//! * **SCRAM-SHA-1** (legacy MD5 prepass) and non-ASCII SASLprep.
 
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +54,8 @@ use crate::{rbac, CommandContext, CommandError, HandlerResult};
 
 /// The only mechanism this slice implements (the modern driver default).
 const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+/// The TLS-cert-as-username mechanism (R5c-2).
+const MONGODB_X509: &str = "MONGODB-X509";
 /// `AuthenticationFailed`.
 const AUTHENTICATION_FAILED: i32 = 18;
 /// `UserNotFound`.
@@ -174,9 +181,12 @@ fn lookup_roles(ctx: &CommandContext, db: &str, username: &str) -> Option<Vec<Bs
 /// `saslStart` — begin a SCRAM-SHA-256 conversation.
 pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mechanism = doc.get_str("mechanism").unwrap_or("");
+    if mechanism == MONGODB_X509 {
+        return sasl_start_x509(doc, ctx);
+    }
     if mechanism != SCRAM_SHA_256 {
         return Err(auth_failure(format!(
-            "Unsupported SASL mechanism: '{mechanism}' (supported: {SCRAM_SHA_256})"
+            "Unsupported SASL mechanism: '{mechanism}' (supported: {SCRAM_SHA_256}, {MONGODB_X509})"
         )));
     }
     let payload = payload_bytes(doc.get("payload"));
@@ -242,6 +252,121 @@ pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     })
 }
 
+/// Best-effort username from a MONGODB-X509 SASL payload. pymongo sends an empty
+/// payload and trusts the cert; some drivers send the DN as UTF-8 (sometimes
+/// behind the SCRAM-style `n,,` GS2 marker).
+fn x509_payload_username(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        return None;
+    }
+    let bytes = payload.strip_prefix(b"n,,").unwrap_or(payload);
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Shared MONGODB-X509 verification: the connection must have presented a
+/// verified client cert (mTLS); look the cert DN up as a username on
+/// `$external` (falling back to `admin`), require a MONGODB-X509 credential
+/// entry, then mark the connection authenticated and capture its roles. Returns
+/// the `(db, dn)` the principal authenticated under.
+fn verify_x509(
+    ctx: &CommandContext,
+    claimed: Option<String>,
+) -> Result<(String, String), CommandError> {
+    let Some(dn) = ctx.peer_cert_dn.clone() else {
+        return Err(auth_failure(
+            "MONGODB-X509 requires the client to present a verified TLS cert \
+             (connection is plaintext or no client cert was offered)",
+        ));
+    };
+    if let Some(claimed) = claimed {
+        if !claimed.is_empty() && claimed != dn {
+            return Err(auth_failure(format!(
+                "MONGODB-X509: claimed user '{claimed}' doesn't match cert DN '{dn}'"
+            )));
+        }
+    }
+    let mut db_name = if ctx.db_name.is_empty() {
+        "$external".to_string()
+    } else {
+        ctx.db_name.clone()
+    };
+    let mut record = lookup_user_doc(ctx, &db_name, &dn);
+    if record.is_none() && db_name == "$external" {
+        // Fall back to `admin` for users created with the `--db admin` shorthand.
+        if let Some(r) = lookup_user_doc(ctx, "admin", &dn) {
+            db_name = "admin".to_string();
+            record = Some(r);
+        }
+    }
+    let Some(record) = record else {
+        return Err(auth_failure(format!(
+            "MONGODB-X509: no user found with name '{dn}' on '{db_name}'"
+        )));
+    };
+    let has_x509 = record
+        .get_document("credentials")
+        .map(|c| c.contains_key(MONGODB_X509))
+        .unwrap_or(false);
+    if !has_x509 {
+        return Err(auth_failure(format!(
+            "MONGODB-X509: user '{dn}' on '{db_name}' is not configured for X509 auth"
+        )));
+    }
+    if let Some(auth) = &ctx.conn_auth {
+        let mut auth = auth.lock().expect("conn auth mutex poisoned");
+        let principal = (db_name.clone(), dn.clone());
+        if !auth.authenticated.contains(&principal) {
+            auth.authenticated.push(principal);
+        }
+        if let Ok(roles) = record.get_array("roles") {
+            auth.add_principal_roles(roles);
+        }
+    }
+    Ok((db_name, dn))
+}
+
+/// Decode a stored user record for `(db, username)`.
+fn lookup_user_doc(ctx: &CommandContext, db: &str, username: &str) -> Option<Document> {
+    let bytes = ctx.storage().ok()?.get_user(db, username).ok()??;
+    Document::from_reader(&mut bytes.as_slice()).ok()
+}
+
+/// `saslStart` with `mechanism: "MONGODB-X509"` — one-shot cert auth (no
+/// challenge/response). `done: true` on the first reply.
+fn sasl_start_x509(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let claimed = x509_payload_username(&payload_bytes(doc.get("payload")));
+    verify_x509(ctx, claimed)?;
+    let conversation_id = match &ctx.conn_auth {
+        Some(a) => a
+            .lock()
+            .expect("conn auth mutex poisoned")
+            .new_conversation_id(),
+        None => 1,
+    };
+    Ok(doc! {
+        "conversationId": conversation_id,
+        "done": true,
+        "payload": payload_binary(Vec::new()),
+        "ok": 1.0,
+    })
+}
+
+/// Legacy `authenticate` command — pymongo / Java / Go drivers use it for
+/// MONGODB-X509 (a one-shot, no challenge/response). Only X509 is supported on
+/// this path (SCRAM goes through `saslStart`).
+pub fn authenticate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let mechanism = doc.get_str("mechanism").unwrap_or(SCRAM_SHA_256);
+    if mechanism != MONGODB_X509 {
+        return Err(bad_value(format!(
+            "authenticate: only '{MONGODB_X509}' is supported on this command path; \
+             use saslStart for '{SCRAM_SHA_256}'"
+        )));
+    }
+    let claimed = doc.get_str("user").ok().map(String::from);
+    let (db_name, dn) = verify_x509(ctx, claimed)?;
+    Ok(doc! { "dbname": db_name, "user": dn, "ok": 1.0 })
+}
+
 /// A `BadValue` (2) command error.
 fn bad_value(msg: impl Into<String>) -> CommandError {
     CommandError::new(2, "BadValue", msg)
@@ -296,43 +421,75 @@ fn normalise_roles(
     Ok(out)
 }
 
-/// `createUser` — derive SCRAM-SHA-256 credentials and store the user record.
+/// `createUser` — store a user record with SCRAM-SHA-256 and/or MONGODB-X509
+/// credentials. `mechanisms` selects which (default `["SCRAM-SHA-256"]`); a
+/// password is required only when a SCRAM mechanism is requested (an
+/// X509-only user authenticates by client cert, no password).
 pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let username = match doc.get_str("createUser") {
         Ok(u) if !u.is_empty() => u.to_string(),
         _ => return Err(bad_value("createUser: username (string) required")),
-    };
-    let pwd = match doc.get_str("pwd") {
-        Ok(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            return Err(bad_value(
-                "createUser: pwd (string) required when SCRAM mechanisms are requested",
-            ))
-        }
     };
     let db_name = if ctx.db_name.is_empty() {
         "admin".to_string()
     } else {
         ctx.db_name.clone()
     };
-    let roles = normalise_roles(doc.get("roles"), &db_name, ctx)?;
-
-    let creds = derive_credentials(&pwd, None, None);
-    let credentials = doc! {
-        SCRAM_SHA_256: {
-            "iterationCount": creds.iteration_count as i32,
-            "salt": creds.salt_b64(),
-            "storedKey": creds.stored_key_b64(),
-            "serverKey": creds.server_key_b64(),
-        }
+    // Requested mechanisms (default SCRAM-SHA-256). We implement SCRAM-SHA-256
+    // and MONGODB-X509; an unknown mechanism is dropped.
+    let requested: Vec<String> = match doc.get_array("mechanisms") {
+        Ok(arr) if !arr.is_empty() => arr
+            .iter()
+            .filter_map(|m| m.as_str())
+            .filter(|m| *m == SCRAM_SHA_256 || *m == MONGODB_X509)
+            .map(String::from)
+            .collect(),
+        _ => vec![SCRAM_SHA_256.to_string()],
     };
+    if requested.is_empty() {
+        return Err(bad_value(format!(
+            "createUser: mechanisms must contain at least one of '{SCRAM_SHA_256}', '{MONGODB_X509}'"
+        )));
+    }
+    let scram_requested = requested.iter().any(|m| m == SCRAM_SHA_256);
+    let x509_requested = requested.iter().any(|m| m == MONGODB_X509);
+
+    let mut credentials = Document::new();
+    if scram_requested {
+        let pwd = match doc.get_str("pwd") {
+            Ok(p) if !p.is_empty() => p.to_string(),
+            _ => {
+                return Err(bad_value(
+                    "createUser: pwd (string) required when SCRAM mechanisms are requested",
+                ))
+            }
+        };
+        let creds = derive_credentials(&pwd, None, None);
+        credentials.insert(
+            SCRAM_SHA_256,
+            doc! {
+                "iterationCount": creds.iteration_count as i32,
+                "salt": creds.salt_b64(),
+                "storedKey": creds.stored_key_b64(),
+                "serverKey": creds.server_key_b64(),
+            },
+        );
+    }
+    if x509_requested {
+        // The credential IS the cert presented at the TLS handshake; this
+        // sentinel marks the user as X509-capable (matches the Python marker).
+        credentials.insert(MONGODB_X509, "external");
+    }
+
+    let roles = normalise_roles(doc.get("roles"), &db_name, ctx)?;
+    let mechanisms: Vec<Bson> = requested.iter().map(|m| Bson::String(m.clone())).collect();
     let record = doc! {
         "_id": format!("{db_name}.{username}"),
         "user": &username,
         "db": &db_name,
         "credentials": credentials,
         "roles": roles,
-        "mechanisms": [SCRAM_SHA_256],
+        "mechanisms": mechanisms,
     };
     let mut record_bytes = Vec::new();
     record
@@ -1008,6 +1165,109 @@ mod tests {
             &mut ctx,
         );
         assert_eq!(reply.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+    }
+
+    #[test]
+    fn x509_create_user_needs_no_password() {
+        let (mut ctx, _auth) = ctx_with_store();
+        // X509-only user: no pwd required.
+        let reply = dispatch(
+            &doc! {
+                "createUser": "CN=alice",
+                "mechanisms": [MONGODB_X509],
+                "roles": [{"role": "readWrite", "db": "app"}],
+                "$db": "admin",
+            },
+            &mut ctx,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply:?}");
+        // The stored record carries the X509 credential marker.
+        let info = dispatch(
+            &doc! {"usersInfo": "CN=alice", "showCredentials": true, "$db": "admin"},
+            &mut ctx,
+        );
+        let creds = info.get_array("users").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .get_document("credentials")
+            .unwrap()
+            .clone();
+        assert!(creds.contains_key(MONGODB_X509));
+        assert!(!creds.contains_key(SCRAM_SHA_256));
+    }
+
+    #[test]
+    fn x509_saslstart_authenticates_with_matching_cert() {
+        let (mut ctx, _auth) = ctx_with_store();
+        dispatch(
+            &doc! {"createUser": "CN=bob", "mechanisms": [MONGODB_X509], "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        // No client cert → auth failure.
+        let no_cert = dispatch(
+            &doc! {"saslStart": 1, "mechanism": MONGODB_X509, "payload": payload_binary(Vec::new()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(no_cert.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+
+        // With the verified cert DN, X509 authenticates (done:true).
+        ctx.peer_cert_dn = Some("CN=bob".to_string());
+        let ok = dispatch(
+            &doc! {"saslStart": 1, "mechanism": MONGODB_X509, "payload": payload_binary(Vec::new()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(ok.get_f64("ok").unwrap(), 1.0, "{ok:?}");
+        assert!(ok.get_bool("done").unwrap());
+    }
+
+    #[test]
+    fn x509_rejects_scram_only_user_and_dn_mismatch() {
+        let (mut ctx, _auth) = ctx_with_store();
+        // SCRAM-only user (default mechanisms) — no X509 marker.
+        dispatch(
+            &doc! {"createUser": "CN=carol", "pwd": "pw", "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        ctx.peer_cert_dn = Some("CN=carol".to_string());
+        let reply = dispatch(
+            &doc! {"saslStart": 1, "mechanism": MONGODB_X509, "payload": payload_binary(Vec::new()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+
+        // Payload-claimed username mismatching the cert DN is rejected.
+        dispatch(
+            &doc! {"createUser": "CN=dave", "mechanisms": [MONGODB_X509], "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        ctx.peer_cert_dn = Some("CN=dave".to_string());
+        let mismatch = dispatch(
+            &doc! {"saslStart": 1, "mechanism": MONGODB_X509, "payload": payload_binary(b"CN=someone-else".to_vec()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(mismatch.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+    }
+
+    #[test]
+    fn x509_legacy_authenticate_command() {
+        let (mut ctx, _auth) = ctx_with_store();
+        dispatch(
+            &doc! {"createUser": "CN=erin", "mechanisms": [MONGODB_X509], "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        ctx.peer_cert_dn = Some("CN=erin".to_string());
+        let reply = dispatch(
+            &doc! {"authenticate": 1, "mechanism": MONGODB_X509, "user": "CN=erin", "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply:?}");
+        assert_eq!(reply.get_str("user").unwrap(), "CN=erin");
+        // authenticate with SCRAM mechanism is rejected on this path.
+        let scram = dispatch(
+            &doc! {"authenticate": 1, "mechanism": SCRAM_SHA_256, "user": "x", "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(scram.get_i32("code").unwrap(), 2);
     }
 
     #[test]

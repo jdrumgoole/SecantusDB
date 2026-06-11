@@ -257,6 +257,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "commitTransaction" | "abortTransaction" => diagnostics::ok_transaction,
         "saslStart" => auth::sasl_start,
         "saslContinue" => auth::sasl_continue,
+        "authenticate" => auth::authenticate,
         "createUser" => auth::create_user,
         "updateUser" => auth::update_user,
         "dropUser" => auth::drop_user,
@@ -394,6 +395,7 @@ fn is_pre_auth_command(name: &str) -> bool {
             | "buildinfo"
             | "saslStart"
             | "saslContinue"
+            | "authenticate"
             | "endSessions"
             | "whatsmyuri"
     )
@@ -418,6 +420,7 @@ fn is_no_privilege_command(name: &str) -> bool {
             | "whatsmyuri"
             | "saslStart"
             | "saslContinue"
+            | "authenticate"
             | "connectionStatus"
             | "abortTransaction"
             | "commitTransaction"

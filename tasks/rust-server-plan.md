@@ -321,10 +321,18 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       `tls_require_client_cert`. Validated by a Rust integration test
       (`tests/tls.rs`: self-signed cert via `rcgen` → rustls client → `hello`)
       + an openssl-guarded pymongo TLS smoke test.
-    - **R5c-2 (next)** — the `MONGODB-X509` mechanism: `saslStart` /
-      `authenticate` with `mechanism: "MONGODB-X509"` reading
-      `ctx.peer_cert_dn`, looking up the user by cert DN on `$external` / admin,
-      and marking the connection authenticated (no password). Plus SCRAM-SHA-1.
+    - **R5c-2 ✅ DONE** — the `MONGODB-X509` mechanism. `createUser` provisions
+      X509-capable users (`mechanisms: ["MONGODB-X509"]`, no password, X509
+      credential marker); `saslStart` with `mechanism: "MONGODB-X509"` and the
+      legacy `authenticate` command read `ctx.peer_cert_dn` (the verified client
+      cert DN from R5c-1's mTLS handshake), enforce an optional payload-username
+      match, look the user up by DN on `$external` (falling back to `admin`),
+      require an X509 credential entry, and authenticate without a password.
+      `hello`/`getParameter` advertise `MONGODB-X509` alongside SCRAM-SHA-256.
+      4 unit tests (X509-only createUser, cert auth, SCRAM-only + DN-mismatch
+      rejection, legacy authenticate). **This closes R5 (auth) bar SCRAM-SHA-1.**
+      SCRAM-SHA-1 (legacy MD5 prepass) remains deferred — low priority, no modern
+      driver defaults to it.
     Then the tailable change-stream getMore + storage-backed aggregation stages,
     and **R7/R8** (standalone `secantusdb` binary + the full pymongo conformance
     gate against the Rust server).
