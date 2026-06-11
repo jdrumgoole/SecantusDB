@@ -39,6 +39,22 @@ const READ_POLL: Duration = Duration::from_millis(250);
 /// Accept-loop poll interval (the listener is non-blocking) — same purpose.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 
+/// TLS / mTLS options (R5c). Mirrors `server.py`'s `tls_*` constructor knobs:
+/// `cert_file` + `key_file` enable server-side TLS; adding `ca_file` (and
+/// optionally `require_client_cert`) layers on mTLS client-certificate
+/// verification.
+#[derive(Clone)]
+pub struct TlsOptions {
+    /// PEM server certificate chain.
+    pub cert_file: String,
+    /// PEM private key for `cert_file`.
+    pub key_file: String,
+    /// PEM CA bundle to verify client certs against (enables mTLS).
+    pub ca_file: Option<String>,
+    /// Require a verified client cert (mandatory mTLS) vs. accept-if-present.
+    pub require_client_cert: bool,
+}
+
 /// Server configuration that shapes the handshake and (later) auth.
 #[derive(Clone, Default)]
 pub struct ServerConfig {
@@ -47,6 +63,8 @@ pub struct ServerConfig {
     pub replica_set_name: Option<String>,
     /// Whether access control is on (drives `accessControlEnabled`).
     pub require_auth: bool,
+    /// TLS / mTLS options. `None` ⇒ plaintext connections.
+    pub tls: Option<TlsOptions>,
 }
 
 /// Shared state every connection thread reads.
@@ -58,6 +76,8 @@ struct Shared {
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
     stop: AtomicBool,
+    /// The built rustls server config when TLS is on (shared across connections).
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// A running server: a bound address + a handle to stop the accept loop. Drop
@@ -107,6 +127,13 @@ pub fn bind(
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
 
+    // Build the rustls config up front so a bad cert / key fails `bind`, not the
+    // first connection.
+    let tls = match &config.tls {
+        Some(opts) => Some(build_tls_config(opts)?),
+        None => None,
+    };
+
     let shared = Arc::new(Shared {
         config,
         storage,
@@ -115,6 +142,7 @@ pub fn bind(
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
         stop: AtomicBool::new(false),
+        tls,
     });
 
     let accept_shared = shared.clone();
@@ -145,19 +173,68 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
-    stream.set_read_timeout(Some(READ_POLL))?;
-    let mut stream = stream;
+/// Per-connection setup: read-timeout (for shutdown polling), then either the
+/// TLS handshake (extracting the client cert DN) or plaintext, before driving
+/// the request loop in [`serve`].
+fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+    tcp.set_read_timeout(Some(READ_POLL))?;
     let conn_id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
     // Per-connection auth state, shared across every request on this socket so a
     // SCRAM conversation (saslStart → saslContinue) and the authenticated
     // principals persist for the connection's lifetime.
     let conn_auth = Arc::new(Mutex::new(ConnectionAuth::new()));
 
+    match shared.tls.clone() {
+        Some(tls_config) => {
+            let mut tcp = tcp;
+            let mut conn = match rustls::ServerConnection::new(tls_config) {
+                Ok(c) => c,
+                Err(_) => return Ok(()),
+            };
+            // Drive the handshake, tolerating the shutdown-poll read timeout.
+            while conn.is_handshaking() {
+                if shared.stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                match conn.complete_io(&mut tcp) {
+                    Ok(_) => {}
+                    Err(ref e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        continue;
+                    }
+                    // Handshake failure / peer hung up — drop the connection.
+                    Err(_) => return Ok(()),
+                }
+            }
+            let peer_cert_dn = conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .and_then(|cert| cert_subject_dn(cert.as_ref()));
+            let mut stream = rustls::StreamOwned::new(conn, tcp);
+            serve(&mut stream, peer_cert_dn, conn_id, &conn_auth, &shared)
+        }
+        None => {
+            let mut stream = tcp;
+            serve(&mut stream, None, conn_id, &conn_auth, &shared)
+        }
+    }
+}
+
+/// The request loop, generic over the transport (`TcpStream` or a rustls
+/// `StreamOwned`). Reads framed wire messages, dispatches, writes replies.
+fn serve<S: Read + Write>(
+    stream: &mut S,
+    peer_cert_dn: Option<String>,
+    conn_id: i64,
+    conn_auth: &Arc<Mutex<ConnectionAuth>>,
+    shared: &Arc<Shared>,
+) -> io::Result<()> {
     loop {
         // Header.
         let mut header_buf = [0u8; HEADER_SIZE];
-        match read_full(&mut stream, &mut header_buf, &shared)? {
+        match read_full(stream, &mut header_buf, shared)? {
             ReadOutcome::Filled => {}
             ReadOutcome::Closed => return Ok(()),
         }
@@ -173,7 +250,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
 
         // Body.
         let mut body = vec![0u8; body_len];
-        match read_full(&mut stream, &mut body, &shared)? {
+        match read_full(stream, &mut body, shared)? {
             ReadOutcome::Filled => {}
             ReadOutcome::Closed => return Ok(()),
         }
@@ -185,13 +262,13 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
                     Ok(d) => d,
                     Err(e) => {
                         // A kind-0/kind-1 doc failed BSON validation — recoverable.
-                        send_bad_value(&mut stream, &header, &shared, &e)?;
+                        send_bad_value(stream, &header, shared, &e)?;
                         continue;
                     }
                 };
-                let reply = run_dispatch(&request, conn_id, &shared, &conn_auth);
+                let reply = run_dispatch(&request, conn_id, shared, conn_auth, &peer_cert_dn);
                 if !more_to_come {
-                    write_op_msg(&mut stream, &header, &shared, &reply)?;
+                    write_op_msg(stream, &header, shared, &reply)?;
                 }
             }
             Ok(Op::Query(query)) => {
@@ -201,26 +278,87 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
                     Ok(d) => d,
                     Err(e) => {
                         send_bad_value(
-                            &mut stream,
+                            stream,
                             &header,
-                            &shared,
+                            shared,
                             &WireError::MalformedBody(e.to_string()),
                         )?;
                         continue;
                     }
                 };
-                let mut ctx = make_context(conn_id, &shared, &conn_auth);
+                let mut ctx = make_context(conn_id, shared, conn_auth, &peer_cert_dn);
                 ctx.db_name = db_from_namespace(query.full_collection_name);
                 let reply = dispatch(&request, &mut ctx);
-                write_op_reply(&mut stream, &header, &shared, &reply)?;
+                write_op_reply(stream, &header, shared, &reply)?;
             }
             Err(e) if e.is_recoverable() => {
-                send_bad_value(&mut stream, &header, &shared, &e)?;
+                send_bad_value(stream, &header, shared, &e)?;
             }
             // Fatal protocol fault (unsupported op_code, etc.) — drop.
             Err(_) => return Ok(()),
         }
     }
+}
+
+/// Build the shared rustls server config from [`TlsOptions`]: the server cert
+/// chain and key, plus (when `ca_file` is set) a client-cert verifier —
+/// mandatory under `require_client_cert`, accept-if-present otherwise.
+fn build_tls_config(opts: &TlsOptions) -> io::Result<Arc<rustls::ServerConfig>> {
+    use rustls::server::WebPkiClientVerifier;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let certs = load_certs(&opts.cert_file)?;
+    let key = load_key(&opts.key_file)?;
+
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    let config = if let Some(ca) = &opts.ca_file {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_certs(ca)? {
+            roots
+                .add(cert)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        }
+        let roots = Arc::new(roots);
+        let verifier_builder = WebPkiClientVerifier::builder_with_provider(roots, provider);
+        let verifier = if opts.require_client_cert {
+            verifier_builder.build()
+        } else {
+            verifier_builder.allow_unauthenticated().build()
+        }
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        builder.with_client_cert_verifier(verifier)
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    let config = config
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok(Arc::new(config))
+}
+
+/// Load a PEM certificate chain.
+fn load_certs(path: &str) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+}
+
+/// Load the first PEM private key (PKCS#8 / PKCS#1 / SEC1).
+fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no private key in key file"))
+}
+
+/// Extract a peer certificate's subject DN as an RFC 4514 string
+/// (most-specific-first, short OID names), for `MONGODB-X509`.
+fn cert_subject_dn(der: &[u8]) -> Option<String> {
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    Some(cert.subject().to_string())
 }
 
 /// Build the request document: the kind-0 body with each kind-1 document
@@ -245,8 +383,9 @@ fn run_dispatch(
     conn_id: i64,
     shared: &Arc<Shared>,
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
+    peer_cert_dn: &Option<String>,
 ) -> Document {
-    let mut ctx = make_context(conn_id, shared, conn_auth);
+    let mut ctx = make_context(conn_id, shared, conn_auth, peer_cert_dn);
     if let Ok(db) = request.get_str("$db") {
         ctx.db_name = db.to_string();
     }
@@ -257,6 +396,7 @@ fn make_context(
     conn_id: i64,
     shared: &Arc<Shared>,
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
+    peer_cert_dn: &Option<String>,
 ) -> CommandContext {
     let mut ctx = CommandContext::new(conn_id)
         .with_storage(shared.storage.clone())
@@ -265,6 +405,7 @@ fn make_context(
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
     ctx.require_auth = shared.config.require_auth;
+    ctx.peer_cert_dn = peer_cert_dn.clone();
     ctx
 }
 
@@ -281,8 +422,8 @@ fn next_reply_id(shared: &Arc<Shared>) -> i32 {
     shared.next_reply_id.fetch_add(1, Ordering::SeqCst) as i32
 }
 
-fn write_op_msg(
-    stream: &mut TcpStream,
+fn write_op_msg<S: Write>(
+    stream: &mut S,
     header: &Header,
     shared: &Arc<Shared>,
     reply: &Document,
@@ -295,8 +436,8 @@ fn write_op_msg(
     stream.write_all(&frame)
 }
 
-fn write_op_reply(
-    stream: &mut TcpStream,
+fn write_op_reply<S: Write>(
+    stream: &mut S,
     header: &Header,
     shared: &Arc<Shared>,
     reply: &Document,
@@ -319,8 +460,8 @@ fn write_op_reply(
 /// Reply to a malformed-body request with `{ok:0, code:2 BadValue}` so the
 /// connection survives (`server.py`'s `MalformedBodyError` path). The errmsg
 /// carries "invalid BSON" to match what `tests/test_wire_malformed.py` asserts.
-fn send_bad_value(
-    stream: &mut TcpStream,
+fn send_bad_value<S: Write>(
+    stream: &mut S,
     header: &Header,
     shared: &Arc<Shared>,
     err: &WireError,
@@ -341,8 +482,8 @@ enum ReadOutcome {
 
 /// Fill `buf` from `stream`, tolerating the read-timeout (re-checking the stop
 /// flag between waits) and treating EOF as `Closed`.
-fn read_full(
-    stream: &mut TcpStream,
+fn read_full<S: Read>(
+    stream: &mut S,
     buf: &mut [u8],
     shared: &Arc<Shared>,
 ) -> io::Result<ReadOutcome> {

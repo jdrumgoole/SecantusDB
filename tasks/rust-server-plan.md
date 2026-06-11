@@ -309,8 +309,22 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       connection), `dropAllUsersFromDatabase`, and `hello`'s `saslSupportedMechs`
       advertisement. 8 new unit tests + a pymongo WT round-trip. This closes the
       auth/RBAC surface bar SCRAM-SHA-1 / X509 (R5c).
-    - **R5c** — TLS / mTLS (`rustls`) in the accept loop + the X509 mechanism
-      (`saslStart`/`authenticate` MONGODB-X509, needs the verified peer cert DN).
+    - **R5c-1 ✅ DONE** — TLS / mTLS transport in the accept loop (`rustls`, ring
+      backend — no cmake/nasm). `ServerConfig.tls: Option<TlsOptions>`
+      (`cert_file` / `key_file` / `ca_file` / `require_client_cert`); `bind`
+      builds the rustls config up front (bad cert → `bind` fails). The accept
+      loop drives the handshake under the shutdown-poll timeout, extracts the
+      verified client cert's subject DN (`x509-parser`, RFC 4514) into
+      `CommandContext::peer_cert_dn`, and the request loop (`serve`) is generic
+      over the transport (`TcpStream` | rustls `StreamOwned`). The `RustServer`
+      Python handle gains `tls_cert_file` / `tls_key_file` / `tls_ca_file` /
+      `tls_require_client_cert`. Validated by a Rust integration test
+      (`tests/tls.rs`: self-signed cert via `rcgen` → rustls client → `hello`)
+      + an openssl-guarded pymongo TLS smoke test.
+    - **R5c-2 (next)** — the `MONGODB-X509` mechanism: `saslStart` /
+      `authenticate` with `mechanism: "MONGODB-X509"` reading
+      `ctx.peer_cert_dn`, looking up the user by cert DN on `$external` / admin,
+      and marking the connection authenticated (no password). Plus SCRAM-SHA-1.
     Then the tailable change-stream getMore + storage-backed aggregation stages,
     and **R7/R8** (standalone `secantusdb` binary + the full pymongo conformance
     gate against the Rust server).

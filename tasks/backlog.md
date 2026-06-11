@@ -214,8 +214,14 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
   (`grantPrivilegesToRole`/`revokePrivilegesFromRole`/`grantRolesToRole`/
   `revokeRolesFromRole`), `updateUser` (password rotation / role replacement +
   live `effective_roles` refresh), `dropAllUsersFromDatabase`, and `hello`'s
-  `saslSupportedMechs`. 8 unit tests + a pymongo WT round-trip. **R5c:** TLS/mTLS
-  (rustls) + MONGODB-X509. Deferred: SCRAM-SHA-1 (MD5 prepass), non-ASCII SASLprep.
+  `saslSupportedMechs`. 8 unit tests + a pymongo WT round-trip. **R5c-1 DONE:**
+  TLS/mTLS transport in the accept loop (rustls, ring backend) — `ServerConfig.tls`
+  (cert/key/ca/require_client_cert), handshake under the shutdown-poll timeout,
+  client-cert subject DN (x509-parser, RFC 4514) → `CommandContext::peer_cert_dn`,
+  `serve` generic over `TcpStream`|rustls `StreamOwned`, `RustServer` TLS params.
+  Rust integration test (rcgen self-signed → rustls client → hello) + openssl-guarded
+  pymongo TLS smoke. **R5c-2 (next):** the MONGODB-X509 mechanism (saslStart /
+  authenticate reading peer_cert_dn) + SCRAM-SHA-1. Deferred: non-ASCII SASLprep.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.

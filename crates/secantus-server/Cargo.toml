@@ -22,3 +22,13 @@ crate-type = ["rlib"]
 bson = { workspace = true }
 secantus-wire = { path = "../secantus-wire" }
 secantus-commands = { path = "../secantus-commands" }
+# TLS / mTLS in the accept loop (R5c). `ring` crypto backend (no cmake/nasm
+# build, unlike aws-lc-rs). `rustls-pemfile` loads the PEM cert/key/CA;
+# `x509-parser` extracts the verified client cert's subject DN for MONGODB-X509.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+x509-parser = "0.16"
+
+[dev-dependencies]
+# Self-signed cert generation for the TLS integration tests (ring backend).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
