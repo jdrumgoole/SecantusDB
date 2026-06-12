@@ -1,7 +1,7 @@
 """Turn a pytest-json-report JSON file into docs/validation-report.md.
 
 Usage:
-    python -m pymongo_validation.generate_report <raw.json> <output.md>
+    python -m pymongo_validation.generate_report [--server python|rust] <raw.json> <output.md>
 
 Groups tests by their first-level path component under
 `vendor/pymongo-tests/test/` (e.g. "crud", "test_collection.py",
@@ -47,7 +47,7 @@ def _read_pymongo_version() -> str:
     return "unknown"
 
 
-def render(raw: dict, out_path: Path) -> None:
+def render(raw: dict, out_path: Path, *, server: str = "python") -> None:
     by_cat: dict[str, dict[str, int]] = defaultdict(
         lambda: {"passed": 0, "failed": 0, "skipped": 0, "errored": 0}
     )
@@ -91,8 +91,11 @@ def render(raw: dict, out_path: Path) -> None:
     fails = [t for t in raw.get("tests", []) if t.get("outcome") in ("failed", "error")]
     fails.sort(key=lambda t: t["nodeid"])
 
+    rust = server == "rust"
     md: list[str] = []
-    md.append("# pymongo Validation Report")
+    md.append(
+        "# pymongo Validation Report (Rust server)" if rust else "# pymongo Validation Report"
+    )
     md.append("")
     md.append(
         f"Generated {dt.date.today().isoformat()} — SecantusDB "
@@ -100,11 +103,21 @@ def render(raw: dict, out_path: Path) -> None:
         f" (`vendor/pymongo-tests/`)."
     )
     md.append("")
-    md.append(
-        "Run `uv run python -m invoke validate` to refresh. The pass rate is the "
-        "best honest measure of how close SecantusDB is to a complete MongoDB "
-        "surrogate for the in-scope wire-protocol surface; gaps are the to-do list."
-    )
+    if rust:
+        md.append(
+            "Run `uv run python -m invoke validate --server rust` to refresh. "
+            "This is the R8 conformance gate from `tasks/rust-server-plan.md`: "
+            "the same unmodified pymongo suite the headline gauge runs, pointed "
+            "at the **Rust server** instead of the pure-Python one. The gap "
+            "between this pass rate and `docs/validation-report.md` is the "
+            "Rust server's remaining to-do list."
+        )
+    else:
+        md.append(
+            "Run `uv run python -m invoke validate` to refresh. The pass rate is the "
+            "best honest measure of how close SecantusDB is to a complete MongoDB "
+            "surrogate for the in-scope wire-protocol surface; gaps are the to-do list."
+        )
     md.append("")
     md.append("## Summary by category")
     md.append("")
@@ -134,13 +147,24 @@ def render(raw: dict, out_path: Path) -> None:
 
     md.append("## How this is generated")
     md.append("")
+    if rust:
+        server_clause = (
+            "starts an embedded Rust server (`_secantus_server.RustServer("
+            "storage_path=<fresh tempdir>, port=0)` — the in-process Rust "
+            "accept loop over the pure-Rust engines and WiredTiger-backed "
+            "storage; Python is only the launcher)"
+        )
+    else:
+        server_clause = (
+            "starts an embedded `SecantusDBServer(host='127.0.0.1', port=0, "
+            "storage_path=<fresh tempdir>)`"
+        )
     md.append(
         "**pymongo's tests are run unmodified.** The submodule at "
         "`vendor/pymongo-tests/` is checked out at the pinned upstream tag with "
         "zero local edits — `git diff HEAD` inside the submodule is empty. The "
         "integration is entirely external: `pymongo_validation/plugin.py` "
-        "starts an embedded `SecantusDBServer(host='127.0.0.1', port=0, "
-        "storage_path=<fresh tempdir>)` (real on-disk WiredTiger via "
+        f"{server_clause} (real on-disk WiredTiger via "
         "`tempfile.mkdtemp(prefix='secantus-pymongo-gauge-')`, not "
         "`:memory:`) in `pytest_configure` and writes the bound "
         "host/port into `DB_IP` + `DB_PORT` — the env vars pymongo's own "
@@ -166,9 +190,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("raw_json", type=Path)
     parser.add_argument("output_md", type=Path)
+    parser.add_argument(
+        "--server",
+        choices=["python", "rust"],
+        default="python",
+        help="Which SecantusDB server the gauge ran against (adjusts the report prose).",
+    )
     args = parser.parse_args()
     raw = json.loads(args.raw_json.read_text())
-    render(raw, args.output_md)
+    render(raw, args.output_md, server=args.server)
     return 0
 
 

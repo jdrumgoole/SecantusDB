@@ -33,6 +33,12 @@ jobs:
           - { name: java,    task: validate-java, report: docs/validation-report-java.md }
           - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
           - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
+          # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
+          # suite as the headline gauge, pointed at the Rust server via
+          # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so
+          # its sync step builds the wheel with SECANTUS_BUILD_STORAGE_ENGINE=ON
+          # (extra toolchain steps below).
+          - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,6 +46,17 @@ jobs:
 
       - name: Install swig
         run: sudo apt-get update && sudo apt-get install -y swig
+
+      # The Rust-server gauge builds the _secantus_storage / _secantus_server
+      # extensions inside the wheel build: bindgen needs libclang, the WT
+      # ExternalProject forces Ninja, and the cargo build needs a Rust toolchain.
+      - name: Install storage-engine toolchain
+        if: matrix.driver.name == 'pymongo-rust-server'
+        run: sudo apt-get install -y clang libclang-dev llvm-dev ninja-build
+
+      - name: Install Rust toolchain
+        if: matrix.driver.name == 'pymongo-rust-server'
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -50,7 +67,17 @@ jobs:
         run: uv python install 3.12
 
       - name: Sync dependencies
+        if: matrix.driver.name != 'pymongo-rust-server'
         run: uv sync --extra dev   # builds vendored WT, installs pytest-json-report
+
+      - name: Sync dependencies (storage engine ON)
+        if: matrix.driver.name == 'pymongo-rust-server'
+        # Same sync, but the editable build runs CMake with the storage-engine
+        # flag flipped ON so `import _secantus_server` works in the project
+        # venv — that's what `invoke validate --server rust` launches.
+        env:
+          SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+        run: uv sync --extra dev
 
       - name: Set up Go
         if: matrix.driver.name == 'go'
@@ -206,8 +233,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md
-          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust)"
+          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust + pymongo-vs-Rust-server)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test output."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver validation reports, plus the pymongo-vs-Rust-server R8 gate. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test output."

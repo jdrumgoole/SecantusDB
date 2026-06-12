@@ -180,6 +180,13 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   covers Windows); the Python CLI's TOML config layer + tuning flags
   (`--log-level` / `--cache-size` / `--session-max` / `--sync-on-commit` /
   oplog retention / noop heartbeat) pending matching `Storage::open` knobs.
+- [ ] **R8 tail** — only the pymongo gauge runs against the Rust server
+  (`invoke validate --server rust` / the `pymongo-rust-server` entry in
+  `validate.yml`). The Go/Node/Java/Ruby/Rust-driver gauges still gauge the
+  Python server only: their runners spawn `python -m secantus` as the daemon,
+  and pointing them at the Rust server needs a `secantusdb`-binary launch path
+  in each gauge job — deferred until the Rust server's command surface is wide
+  enough for those suites to be informative.
 - [ ] **`aggregate` storage-backed stages** — `$lookup` / `$out` / `$merge` /
   `$geoNear` / `$sample` / `$collStats` / `$indexStats` (Rust engine returns
   `Fallback` → surfaced as `BadValue`); `$changeStream` cursors; `let`-expression

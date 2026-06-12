@@ -450,6 +450,17 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   headline "MongoDB compatibility" number must not regress vs the Python server.
   This is the definition of "the Rust server is correct."
 
+  **Status: the pymongo gauge is wired.** `pymongo_validation/plugin.py` selects
+  the server via `SECANTUS_GAUGE_SERVER` (`python` default / `rust` → the
+  `_secantus_server.RustServer` embedded handle); `invoke validate --server rust`
+  writes `docs/validation-report-rust-server.md`; the weekly
+  `.github/workflows/validate.yml` matrix gained a `pymongo-rust-server` entry
+  that builds the storage-engine extension into the venv and runs the task. The
+  gate is read by comparing that report's pass rate against
+  `docs/validation-report.md`. The other-language gauges against the Rust server
+  are deferred (their daemon launchers need a `secantusdb`-binary launch path —
+  backlog §7).
+
 **Leftover storage work folded in** (was Phase-4 tail): re-home `$lookup` /
 `$geoNear` / `$out` / `$merge` storage-backed aggregation into `secantus-storage`
 (geo-4 + the lookup/merge acceleration), and the remaining 5e gaps
