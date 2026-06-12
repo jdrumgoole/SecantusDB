@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-12 — SecantusDB 0.5.2b15 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-12 — SecantusDB 0.5.2b18 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -12,7 +12,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_bson.py` | 87 | 0 | 0 | 1 | 88 | 100.0% |
 | `test_bson_corpus.py` | 31 | 0 | 0 | 0 | 31 | 100.0% |
 | `test_bulk.py` | 31 | 3 | 0 | 4 | 38 | 91.2% |
-| `test_change_stream.py` | 79 | 27 | 0 | 49 | 155 | 74.5% |
+| `test_change_stream.py` | 80 | 26 | 0 | 49 | 155 | 75.5% |
 | `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 76 | 11 | 0 | 4 | 91 | 87.4% |
@@ -45,9 +45,9 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1067** | **75** | **0** | **304** | **1446** | **93.4%** |
+| **Overall** | **1068** | **74** | **0** | **304** | **1446** | **93.5%** |
 
-## Failures (75)
+## Failures (74)
 
 First 30 failure node-ids for manual triage:
 
@@ -70,7 +70,6 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_projection_in_change_stream_returns_expected_fields
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_server_error_on_projecting_out__id
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_unknown_operationType_MUST_NOT_err
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsClusterTime::test_clusterTime_is_present
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsDisambiguatedPaths::test_disambiguatedPaths_is_present_on_updateDescription_when_an_ambiguous_path_is_present
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsDisambiguatedPaths::test_disambiguatedPaths_returns_array_indices_as_integers
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when__id_is_projected_out
@@ -82,8 +81,9 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExp
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_create_events_on_views_are_reported
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_modify_events_are_reported
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_new_fields_on_change_stream_events_are_handled_appropriately
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_error_code
 ```
-... and 45 more (see raw JSON).
+... and 44 more (see raw JSON).
 
 ## How this is generated
 
