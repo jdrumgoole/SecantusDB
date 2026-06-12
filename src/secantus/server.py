@@ -21,6 +21,7 @@ from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.sessions import SessionRegistry
 from secantus.storage import Storage
+from secantus.transactions import Transaction, TransactionRegistry
 from secantus.wire import (
     OP_MSG_FLAG_MORE_TO_COME,
     ConnectionClosed,
@@ -78,6 +79,7 @@ class SecantusDBServer:
         cache_size: str = "1G",
         session_max: int = 1000,
         sync_on_commit: bool = False,
+        transaction_lifetime_seconds: float = 60.0,
         tls_cert_file: str | None = None,
         tls_key_file: str | None = None,
         tls_ca_file: str | None = None,
@@ -190,6 +192,25 @@ class SecantusDBServer:
         # errors at the wire (failCommand → errorCode / writeConcernError).
         # See ``secantus.failpoints`` for the supported subset.
         self.failpoints = FailPointRegistry()
+        # Multi-document transaction state machine. The WT work is
+        # bound here so the registry itself stays storage-agnostic;
+        # ``txn.handle`` is None when the transaction never executed a
+        # statement (the WT session is created lazily at the first one).
+        self.transactions = TransactionRegistry(
+            commit_func=self._commit_txn_handle,
+            rollback_func=self._rollback_txn_handle,
+            lifetime_seconds=transaction_lifetime_seconds,
+        )
+
+    def _commit_txn_handle(self, txn: Transaction) -> None:
+        if txn.handle is not None:
+            self.storage.commit_user_transaction(
+                txn.handle, lsid_doc=txn.lsid_doc, txn_number=txn.txn_number
+            )
+
+    def _rollback_txn_handle(self, txn: Transaction) -> None:
+        if txn.handle is not None:
+            self.storage.abort_user_transaction(txn.handle)
 
     @property
     def address(self) -> tuple[str, int]:
@@ -228,6 +249,10 @@ class SecantusDBServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        # Roll back open transactions while storage is still usable;
+        # ``Storage.close()``'s session sweep would roll them back too,
+        # but this releases their WT sessions in an orderly way first.
+        self.transactions.abort_all()
         self.storage.close()
 
     def wait(self) -> None:
@@ -381,6 +406,7 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            transactions=self.transactions,
                             peer_cert_dn=peer_cert_dn,
                         )
                         try:
@@ -424,6 +450,7 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            transactions=self.transactions,
                             peer_cert_dn=peer_cert_dn,
                         )
                         try:

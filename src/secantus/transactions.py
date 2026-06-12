@@ -44,6 +44,7 @@ its (retryable) commit on different pooled connections.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import threading
 import time
@@ -102,12 +103,11 @@ class Transaction:
         self.last_use = now
 
 
-def _no_such_transaction(txn_number: int, *, label: bool) -> dict[str, Any]:
+def no_such_transaction_reply(txn_number: int, *, label: bool) -> dict[str, Any]:
     err: dict[str, Any] = {
         "ok": 0.0,
         "errmsg": (
-            f"Given transaction number {txn_number} does not match any "
-            f"in-progress transactions."
+            f"Given transaction number {txn_number} does not match any in-progress transactions."
         ),
         "code": 251,
         "codeName": "NoSuchTransaction",
@@ -216,26 +216,22 @@ class TransactionRegistry:
                     return None, _cannot_restart(txn_number)
                 if cur is not None:
                     self._abort_locked(cur)
-                txn = Transaction(
-                    lsid_bytes, lsid_doc, txn_number, now=self._time()
-                )
+                txn = Transaction(lsid_bytes, lsid_doc, txn_number, now=self._time())
                 self._txns[lsid_bytes] = txn
                 self._last_number[lsid_bytes] = txn_number
                 return txn, None
             # Continuation statement (no startTransaction flag).
             if cur is None or cur.txn_number != txn_number:
-                return None, _no_such_transaction(txn_number, label=True)
+                return None, no_such_transaction_reply(txn_number, label=True)
             with cur.mutex:
                 if cur.state is TxnState.COMMITTED:
                     return None, _transaction_committed(txn_number)
                 if cur.state is TxnState.ABORTED:
-                    return None, _no_such_transaction(txn_number, label=True)
+                    return None, no_such_transaction_reply(txn_number, label=True)
                 cur.last_use = self._time()
             return cur, None
 
-    def commit(
-        self, lsid_bytes: bytes, txn_number: int
-    ) -> dict[str, Any] | None:
+    def commit(self, lsid_bytes: bytes, txn_number: int) -> dict[str, Any] | None:
         """Commit ``(lsid, txnNumber)``. Returns an error reply or None (ok).
 
         Idempotent on an already-committed transaction. If
@@ -248,12 +244,12 @@ class TransactionRegistry:
             self._prune_locked()
             cur = self._txns.get(lsid_bytes)
         if cur is None or cur.txn_number != txn_number:
-            return _no_such_transaction(txn_number, label=True)
+            return no_such_transaction_reply(txn_number, label=True)
         with cur.mutex:
             if cur.state is TxnState.COMMITTED:
                 return None
             if cur.state is TxnState.ABORTED:
-                return _no_such_transaction(txn_number, label=True)
+                return no_such_transaction_reply(txn_number, label=True)
             try:
                 self._commit(cur)
             except Exception:
@@ -264,21 +260,19 @@ class TransactionRegistry:
             cur.last_use = self._time()
         return None
 
-    def abort(
-        self, lsid_bytes: bytes, txn_number: int
-    ) -> dict[str, Any] | None:
+    def abort(self, lsid_bytes: bytes, txn_number: int) -> dict[str, Any] | None:
         """Abort ``(lsid, txnNumber)``. Returns an error reply or None (ok)."""
         with self._lock:
             self._prune_locked()
             cur = self._txns.get(lsid_bytes)
         if cur is None or cur.txn_number != txn_number:
             # No transient label: drivers fire-and-forget aborts.
-            return _no_such_transaction(txn_number, label=False)
+            return no_such_transaction_reply(txn_number, label=False)
         with cur.mutex:
             if cur.state is TxnState.COMMITTED:
                 return _transaction_committed(txn_number)
             if cur.state is TxnState.ABORTED:
-                return _no_such_transaction(txn_number, label=False)
+                return no_such_transaction_reply(txn_number, label=False)
             self._rollback_quietly(cur)
             cur.state = TxnState.ABORTED
             cur.last_use = self._time()
@@ -351,18 +345,15 @@ class TransactionRegistry:
                 txn.state = TxnState.ABORTED
 
     def _rollback_quietly(self, txn: Transaction) -> None:
-        try:
+        # Defensive: a rollback failure must not mask the state
+        # transition (the WT session sweep in Storage.close() is the
+        # backstop for leaked sessions).
+        with contextlib.suppress(Exception):
             self._rollback(txn)
-        except Exception:  # pragma: no cover - defensive
-            pass
 
     def __len__(self) -> int:
         with self._lock:
-            return sum(
-                1
-                for t in self._txns.values()
-                if t.state is TxnState.IN_PROGRESS
-            )
+            return sum(1 for t in self._txns.values() if t.state is TxnState.IN_PROGRESS)
 
 
 __all__ = [

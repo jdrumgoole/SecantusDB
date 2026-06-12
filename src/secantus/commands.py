@@ -78,7 +78,20 @@ from secantus.rbac import (
     is_known_role,
 )
 from secantus.sessions import SessionRegistry
-from secantus.storage import DuplicateKeyError, GeoExtractError, Storage
+from secantus.storage import (
+    DuplicateKeyError,
+    GeoExtractError,
+    Storage,
+    WriteConflictError,
+    _is_wt_rollback,
+)
+from secantus.transactions import (
+    TRANSIENT_LABEL,
+    Transaction,
+    TransactionRegistry,
+    TxnState,
+    no_such_transaction_reply,
+)
 from secantus.update import UpdateError
 from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 
@@ -365,6 +378,7 @@ class CommandContext:
     logs: LogBuffer | None = None
     sessions: SessionRegistry | None = None
     failpoints: FailPointRegistry | None = None
+    transactions: TransactionRegistry | None = None
     # MONGODB-X509: the subject DN of the verified client cert the
     # connection's TLS handshake produced, in RFC 4514 string form
     # (e.g. ``"CN=alice,O=Acme,C=US"``). None when the connection is
@@ -564,11 +578,13 @@ def _end_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     sessions; SecantusDB doesn't track cursor → session affinity
     yet, so cursors live on under their own idle TTL.
     """
-    if ctx.sessions is not None:
-        for entry in doc.get("endSessions") or []:
-            lsid = _lsid_bytes_from_arg(entry)
-            if lsid is not None:
+    for entry in doc.get("endSessions") or []:
+        lsid = _lsid_bytes_from_arg(entry)
+        if lsid is not None:
+            if ctx.sessions is not None:
                 ctx.sessions.unregister(lsid)
+            if ctx.transactions is not None:
+                ctx.transactions.abort_for_session(lsid)
     return {"ok": 1.0}
 
 
@@ -605,6 +621,8 @@ def _kill_all_sessions(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, A
     """
     if ctx.sessions is not None:
         ctx.sessions.clear()
+    if ctx.transactions is not None:
+        ctx.transactions.abort_all()
     return {"ok": 1.0}
 
 
@@ -616,16 +634,20 @@ def _kill_all_sessions_by_pattern(_doc: dict[str, Any], ctx: CommandContext) -> 
     """
     if ctx.sessions is not None:
         ctx.sessions.clear()
+    if ctx.transactions is not None:
+        ctx.transactions.abort_all()
     return {"ok": 1.0}
 
 
 def _kill_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Drop the listed sessions (driver-callable variant)."""
-    if ctx.sessions is not None:
-        for entry in doc.get("killSessions") or []:
-            lsid = _lsid_bytes_from_arg(entry)
-            if lsid is not None:
+    for entry in doc.get("killSessions") or []:
+        lsid = _lsid_bytes_from_arg(entry)
+        if lsid is not None:
+            if ctx.sessions is not None:
                 ctx.sessions.unregister(lsid)
+            if ctx.transactions is not None:
+                ctx.transactions.abort_for_session(lsid)
     return {"ok": 1.0}
 
 
@@ -644,12 +666,58 @@ def _refresh_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
     return {"ok": 1.0}
 
 
-def _abort_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"ok": 1.0}
+def _txn_envelope(doc: dict[str, Any]) -> tuple[bytes | None, int | None]:
+    """Extract ``(lsid_bytes, txnNumber)`` from a command's transaction
+    envelope; either is None when absent or malformed."""
+    lsid_bytes = _lsid_bytes_from_arg(doc.get("lsid"))
+    txn_number = doc.get("txnNumber")
+    if isinstance(txn_number, bool) or not isinstance(txn_number, int):
+        txn_number = None
+    return lsid_bytes, txn_number
 
 
-def _commit_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"ok": 1.0}
+def _write_conflict_reply(*, label: bool = True) -> dict[str, Any]:
+    reply: dict[str, Any] = {
+        "ok": 0.0,
+        "errmsg": (
+            "WriteConflict error: this operation conflicted with another "
+            "operation. Please retry your operation or multi-document "
+            "transaction."
+        ),
+        "code": 112,
+        "codeName": "WriteConflict",
+    }
+    if label:
+        # The transient label is transaction-specific; a plain write
+        # that loses a conflict race doesn't carry it.
+        reply["errorLabels"] = [TRANSIENT_LABEL]
+    return reply
+
+
+def _abort_transaction(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    lsid_bytes, txn_number = _txn_envelope(doc)
+    if ctx.transactions is None or lsid_bytes is None or txn_number is None:
+        # Envelope-less call (drivers never send this): tolerated no-op,
+        # same as the pre-transactions stub.
+        return {"ok": 1.0}
+    err = ctx.transactions.abort(lsid_bytes, txn_number)
+    return err if err is not None else {"ok": 1.0}
+
+
+def _commit_transaction(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    lsid_bytes, txn_number = _txn_envelope(doc)
+    if ctx.transactions is None or lsid_bytes is None or txn_number is None:
+        return {"ok": 1.0}
+    try:
+        err = ctx.transactions.commit(lsid_bytes, txn_number)
+    except Exception as exc:
+        # The WT commit itself failed; the registry already rolled the
+        # transaction back. A conflict is retryable from the client's
+        # point of view (retry the whole transaction, not the commit).
+        if isinstance(exc, WriteConflictError) or _is_wt_rollback(exc):
+            return _write_conflict_reply()
+        raise
+    return err if err is not None else {"ok": 1.0}
 
 
 def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -5161,6 +5229,150 @@ _API_V1_AGG_STAGES = frozenset(
 )
 
 
+# Commands that may run inside a multi-document transaction. Everything
+# else gets mongod's 263 ``OperationNotSupportedInTransaction`` — the
+# spec's canary is ``count``. ``commitTransaction`` / ``abortTransaction``
+# carry the same envelope but are the transaction *controls*, handled by
+# their own handlers rather than the statement path.
+_TXN_ALLOWED_COMMANDS = frozenset(
+    {
+        "insert",
+        "update",
+        "delete",
+        "findAndModify",
+        "find",
+        "getMore",
+        "killCursors",
+        "aggregate",
+        "distinct",
+        "bulkWrite",
+        "create",
+        "createIndexes",
+    }
+)
+
+# Aggregation stages mongod refuses inside a transaction.
+_TXN_BLOCKED_AGG_STAGES = frozenset(
+    {
+        "$out",
+        "$merge",
+        "$changeStream",
+        "$collStats",
+        "$currentOp",
+        "$indexStats",
+        "$listLocalSessions",
+        "$listSessions",
+    }
+)
+
+# Error codes that get the ``TransientTransactionError`` label when a
+# statement inside a transaction fails: mongod's transient set
+# (WriteConflict, SnapshotUnavailable, NoSuchTransaction, LockTimeout)
+# plus the retryable-error codes, which are transient on any
+# non-commit statement. Notably NOT here: 11000 duplicate key — it
+# aborts the transaction but retrying wouldn't help, so no label.
+_TRANSIENT_TXN_CODES = frozenset(
+    {112, 246, 251, 24, 6, 7, 89, 91, 189, 9001, 10107, 11600, 11602, 13435, 13436}
+)
+
+
+def _txn_unsupported_reason(name: str, doc: dict[str, Any], ctx: CommandContext) -> str | None:
+    """mongod-shaped reason a statement can't run in a transaction, or None."""
+    if name not in _TXN_ALLOWED_COMMANDS:
+        return f"Cannot run '{name}' in a multi-document transaction."
+    if name == "aggregate":
+        pipeline = doc.get("pipeline") or []
+        if isinstance(pipeline, list):
+            for stage in pipeline:
+                if isinstance(stage, Mapping):
+                    stage_name = next(iter(stage), "")
+                    if stage_name in _TXN_BLOCKED_AGG_STAGES:
+                        return (
+                            f"Operation not permitted in transaction :: caused by :: "
+                            f"Aggregation stage {stage_name} cannot run within a "
+                            f"multi-document transaction."
+                        )
+    if name in ("insert", "update", "delete", "findAndModify"):
+        coll = doc.get(name)
+        if isinstance(coll, str):
+            opts = ctx.storage.get_collection_options(ctx.db_name, coll)
+            if opts.get("capped"):
+                return (
+                    f"Collection '{ctx.db_name}.{coll}' is a capped collection. "
+                    f"Writing in a transaction to capped collections is not allowed."
+                )
+    return None
+
+
+def _resolve_txn_statement(
+    name: str,
+    doc: dict[str, Any],
+    ctx: CommandContext,
+    lsid_bytes: bytes,
+    txn_number: int,
+) -> tuple[Transaction | None, dict[str, Any] | None]:
+    """Registry resolution + allowlist gate for an in-transaction statement.
+
+    Returns ``(txn, None)`` to execute, or ``(None, error_reply)``. A
+    disallowed command still resolves first and then aborts the
+    transaction — mongod treats it as a failed statement.
+    """
+    assert ctx.transactions is not None
+    start = bool(doc.get("startTransaction"))
+    txn, err = ctx.transactions.for_statement(lsid_bytes, doc.get("lsid"), txn_number, start=start)
+    if err is not None:
+        return None, err
+    assert txn is not None
+    reason = _txn_unsupported_reason(name, doc, ctx)
+    if reason is not None:
+        ctx.transactions.abort_in_progress(txn)
+        return None, {
+            "ok": 0.0,
+            "errmsg": reason,
+            "code": 263,
+            "codeName": "OperationNotSupportedInTransaction",
+        }
+    return txn, None
+
+
+def _run_txn_statement(
+    txn: Transaction,
+    handler: Any,
+    doc: dict[str, Any],
+    ctx: CommandContext,
+) -> dict[str, Any]:
+    """Execute one statement inside the transaction's WT session.
+
+    The per-transaction mutex serializes statements (and the
+    commit/abort/reaper transitions) so the WT session is never used
+    from two threads at once. State is re-checked under the mutex —
+    the lifetime reaper may have aborted between resolution and here.
+    """
+    with txn.mutex:
+        if txn.state is not TxnState.IN_PROGRESS:
+            return no_such_transaction_reply(txn.txn_number, label=True)
+        if txn.handle is None:
+            txn.handle = ctx.storage.begin_user_transaction()
+        with ctx.storage.use_user_transaction(txn.handle):
+            return handler(doc, ctx)
+
+
+def _finish_txn_statement(ctx: CommandContext, txn: Transaction, result: dict[str, Any]) -> None:
+    """mongod parity: any failed statement aborts the transaction
+    server-side. Only transient-class codes get the
+    ``TransientTransactionError`` label (E11000 aborts unlabeled)."""
+    ok = bool(result.get("ok", 0.0))
+    failed = (not ok) or bool(result.get("writeErrors"))
+    if not failed:
+        return
+    assert ctx.transactions is not None
+    ctx.transactions.abort_in_progress(txn)
+    if not ok and result.get("code") in _TRANSIENT_TXN_CODES:
+        labels = result.setdefault("errorLabels", [])
+        if TRANSIENT_LABEL not in labels:
+            labels.append(TRANSIENT_LABEL)
+
+
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
     # Read-concern + apiVersion validation runs before every command
@@ -5185,7 +5397,12 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # ``snapshot-sessions-not-supported-server-error`` unified spec
         # asserts the error shape (any ``ok: 0`` reply on find / aggregate
         # / distinct with ``readConcern.level: snapshot``).
-        if level == "snapshot":
+        #
+        # Inside a multi-document transaction (``autocommit: false``)
+        # the level IS accepted: every in-transaction read runs against
+        # the transaction's pinned WT snapshot anyway, which is exactly
+        # what ``snapshot`` asks for on a single node.
+        if level == "snapshot" and doc.get("autocommit") is not False:
             return {
                 "ok": 0.0,
                 "errmsg": "Snapshot read concern is not supported on standalone",
@@ -5355,10 +5572,37 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 failpoint_wce = wce
                 failpoint_labels = match.error_labels
 
+    # Multi-document transaction envelope. ``autocommit: false`` +
+    # ``lsid`` + ``txnNumber`` marks an in-transaction statement (the
+    # first one also carries ``startTransaction: true``); ``txnNumber``
+    # WITHOUT ``autocommit`` stays the tolerated retryable-write
+    # envelope. Resolution runs AFTER the failpoint block on purpose:
+    # failpoint-injected errors must not abort the transaction —
+    # retryable-commit tests inject an error on the first commit
+    # attempt and expect the retry to succeed.
+    txn: Transaction | None = None
+    if ctx.transactions is not None and "txnNumber" in doc:
+        lsid_bytes, txn_number = _txn_envelope(doc)
+        if lsid_bytes is not None and txn_number is not None:
+            if doc.get("autocommit") is False:
+                if name not in ("commitTransaction", "abortTransaction"):
+                    txn, txn_err = _resolve_txn_statement(name, doc, ctx, lsid_bytes, txn_number)
+                    if txn_err is not None:
+                        return txn_err
+            else:
+                # Retryable write: consumes the session's txnNumber
+                # sequence and implicitly aborts an older open
+                # transaction, as in mongod.
+                ctx.transactions.on_retryable_write(lsid_bytes, txn_number)
     profile_eligible = _profile_eligible_command(name, doc)
     start_ns = _time.monotonic_ns() if profile_eligible else 0
     try:
-        result = handler(doc, ctx)
+        if txn is not None:
+            result = _run_txn_statement(txn, handler, doc, ctx)
+        else:
+            result = handler(doc, ctx)
+    except WriteConflictError:
+        result = _write_conflict_reply(label=txn is not None)
     except _USER_FACING_EXCEPTIONS as exc:
         # Validation-class errors: messages are deliberately shaped to
         # match mongod, drivers parse them. Surface verbatim.
@@ -5368,24 +5612,32 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 14,
             "codeName": "TypeMismatch",
         }
-    except Exception:
-        # Anything else is an internal bug. Logging the full traceback
-        # server-side preserves debuggability; returning a generic
-        # message avoids leaking field paths, file paths, document
-        # contents, or stack frames over the wire to an unauthenticated
-        # peer.
-        logger.exception(
-            "internal error handling command %s (conn=%s, db=%s)",
-            name,
-            ctx.connection_id,
-            ctx.db_name,
-        )
-        result = {
-            "ok": 0.0,
-            "errmsg": "internal server error",
-            "code": 1,
-            "codeName": "InternalError",
-        }
+    except Exception as exc:
+        if _is_wt_rollback(exc):
+            # WT_ROLLBACK surfacing from a write path that doesn't
+            # classify locally (update/delete cursors raise the raw
+            # WiredTigerError): same WriteConflict as the typed path.
+            result = _write_conflict_reply(label=txn is not None)
+        else:
+            # Anything else is an internal bug. Logging the full traceback
+            # server-side preserves debuggability; returning a generic
+            # message avoids leaking field paths, file paths, document
+            # contents, or stack frames over the wire to an unauthenticated
+            # peer.
+            logger.exception(
+                "internal error handling command %s (conn=%s, db=%s)",
+                name,
+                ctx.connection_id,
+                ctx.db_name,
+            )
+            result = {
+                "ok": 0.0,
+                "errmsg": "internal server error",
+                "code": 1,
+                "codeName": "InternalError",
+            }
+    if txn is not None:
+        _finish_txn_statement(ctx, txn, result)
     if profile_eligible:
         _maybe_record_profile(ctx, name, doc, result, start_ns)
     if failpoint_wce is not None and result.get("ok", 0.0):

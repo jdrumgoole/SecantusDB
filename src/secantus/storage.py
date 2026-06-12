@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import functools
 import os
 import re
 import shutil
@@ -512,6 +513,53 @@ def _is_wt_rollback(exc: BaseException) -> bool:
         return True
     msg = str(exc)
     return "WT_ROLLBACK" in msg or "conflict between concurrent operations" in msg
+
+
+# Non-transactional writers that hit a user transaction's uncommitted
+# write retry briefly instead of blocking: mongod blocks such writers
+# until the transaction commits or aborts, which we approximate with a
+# backoff loop bounded by this deadline (the transaction lifetime cap
+# is 60s, but a multi-second stall already covers the overwhelmingly
+# common test patterns; see tasks/backlog.md for the divergence note).
+_WRITE_CONFLICT_RETRY_DEADLINE_S = 5.0
+_WRITE_CONFLICT_RETRY_DELAY_S = 0.005
+_WRITE_CONFLICT_RETRY_DELAY_MAX_S = 0.02
+
+
+def _retry_write_conflicts(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Retry a whole public write method on WT_ROLLBACK.
+
+    Safe because the failed attempt's ``_batch_transaction`` already
+    rolled everything back and the per-collection lock is released on
+    the way out — the retry re-runs from scratch. Inside a user
+    transaction the conflict is NOT retried: it surfaces immediately so
+    the command layer can abort the transaction with mongod's
+    statement-time ``WriteConflict``.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: Storage, *args: Any, **kwargs: Any) -> Any:
+        deadline: float | None = None
+        delay = _WRITE_CONFLICT_RETRY_DELAY_S
+        while True:
+            try:
+                return fn(self, *args, **kwargs)
+            except (WriteConflictError, wt.WiredTigerError) as exc:
+                if not isinstance(exc, WriteConflictError) and not _is_wt_rollback(exc):
+                    raise
+                if getattr(self._tls, "user_txn", None) is not None:
+                    raise
+                now = _time.monotonic()
+                if deadline is None:
+                    deadline = now + _WRITE_CONFLICT_RETRY_DEADLINE_S
+                if now >= deadline:
+                    if isinstance(exc, WriteConflictError):
+                        raise
+                    raise WriteConflictError(str(exc)) from exc
+                _time.sleep(delay)
+                delay = min(delay * 2, _WRITE_CONFLICT_RETRY_DELAY_MAX_S)
+
+    return wrapper
 
 
 class UserTransactionHandle:
@@ -2300,6 +2348,7 @@ class Storage:
             opts = self._coll_options(db, coll) or {}
             return bool(opts.get("capped"))
 
+    @_retry_write_conflicts
     def insert(
         self,
         db: str,
@@ -2309,6 +2358,9 @@ class Storage:
         ordered: bool = True,
         journal: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
+        # Materialized so the conflict-retry wrapper can safely re-run
+        # the whole method (a generator would arrive exhausted).
+        docs = list(docs)
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
@@ -3048,6 +3100,7 @@ class Storage:
                 sizes[name] = sizes.get(name, 0) + len(packed)
             return sizes
 
+    @_retry_write_conflicts
     def update_matching(
         self,
         db: str,
@@ -3211,6 +3264,7 @@ class Storage:
                 self._emit_oplog(oplog_entries, pre_images)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
 
+    @_retry_write_conflicts
     def delete_matching(
         self,
         db: str,
