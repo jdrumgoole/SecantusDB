@@ -652,3 +652,56 @@ def test_create_archive_creates_parent_directory(tmp_path) -> None:
         assert result["sizeBytes"] > 0
     finally:
         s.close()
+
+
+def test_drop_collection_sees_writes_from_other_threads(tmp_path) -> None:
+    """drop_collection must see rows committed by other threads.
+
+    Companion to the snapshot-refresh fix in the mutating scanners
+    (drop_collection / drop_database / rename_collection / drop_index /
+    drop_all_indexes): a pinned read snapshot on the dropping thread made
+    the prefix-scan miss other threads' rows, surfacing in the pymongo
+    gauge as drop-then-reinsert E11000. The full pin needs server-layer
+    state and is covered by the gauge (test_cursor.py: TestCursor +
+    TestRawBatchCommandCursor); this pins the storage-level contract."""
+    import threading
+
+    s = Storage(str(tmp_path))
+    try:
+        # Pin this thread's snapshot: a FAILED duplicate insert leaves the
+        # overwrite=False doc-table cursor positioned on the conflicting
+        # row, and no later operation on this thread resets that cursor
+        # variant — the session's read snapshot stays pinned from here on.
+        # (pymongo's TestCursor runs duplicate-insert tests, which is how
+        # the gauge's shared-client thread got pinned in the wild.)
+        s.insert("db", "pin", [{"_id": 1}])
+        _, dup_errors = s.insert("db", "pin", [{"_id": 1}], ordered=False)
+        assert dup_errors and dup_errors[0]["code"] == 11000
+
+        # Another thread commits docs this thread's snapshot predates.
+        def writer() -> None:
+            s.insert("db", "c", [{"_id": i} for i in range(3)])
+
+        t = threading.Thread(target=writer)
+        t.start()
+        t.join()
+
+        # The drop on the pinned thread must still see and delete them.
+        s.drop_collection("db", "c")
+
+        survivors: list[dict] = []
+
+        def reader() -> None:
+            survivors.extend(s.find_matching("db", "c", {}))
+
+        t2 = threading.Thread(target=reader)
+        t2.start()
+        t2.join()
+        assert survivors == []
+
+        # And a re-insert of the same ids must not collide.
+        inserted, errors = s.insert("db", "c", [{"_id": i} for i in range(3)])
+        assert errors == []
+        assert inserted == 3
+    finally:
+        s.close()

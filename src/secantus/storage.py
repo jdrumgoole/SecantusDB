@@ -3104,6 +3104,12 @@ class Storage:
         indexes for an accurate ``totalIndexSize``.
         """
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             sizes: dict[str, int] = {}
             id_size = sum(len(id_k) for id_k, _blob in self._scan_docs(db, coll))
             if id_size:
@@ -3476,14 +3482,13 @@ class Storage:
             c.reset()
 
     def drop_collection(self, db: str, coll: str) -> bool:
-        # Without a snapshot refresh, rows committed by ANOTHER session
-        # (most importantly a multi-document transaction's dedicated WT
-        # session) after this thread's cached session pinned its read
-        # view are invisible to the _collect_prefix walk — the drop
-        # would silently leave them behind and they'd resurface in the
-        # recreated collection.
-        self._refresh_read_snapshot()
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             existed = self._coll_options(db, coll) is not None
             ui = self._collection_uuid(db, coll) if existed else None
             for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
@@ -3507,10 +3512,13 @@ class Storage:
             return existed
 
     def drop_database(self, db: str) -> None:
-        # See drop_collection: stale snapshots must not hide rows from
-        # the destructive walk.
-        self._refresh_read_snapshot()
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             colls_with_ui: list[tuple[str, _uuid.UUID]] = []
             for c_name in self.list_collections(db):
                 ui = self._collection_uuid(db, c_name)
@@ -3540,10 +3548,13 @@ class Storage:
         *,
         drop_target: bool = False,
     ) -> tuple[bool, str | None]:
-        # See drop_collection: stale snapshots must not hide rows from
-        # the move/destroy walks.
-        self._refresh_read_snapshot()
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             if self._coll_options(src_db, src_coll) is None:
                 return False, f"source namespace does not exist: {src_db}.{src_coll}"
             if (src_db, src_coll) == (dst_db, dst_coll):
@@ -3819,10 +3830,13 @@ class Storage:
     def drop_index(self, db: str, coll: str, name: str) -> bool:
         if name == _ID_INDEX_NAME:
             return False
-        # See drop_collection: stale snapshots must not hide rows from
-        # the destructive walk.
-        self._refresh_read_snapshot()
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             c = self._cursor(_IDX_TABLE)
             c.set_key(db, coll, name)
             if c.search() != 0:
@@ -3844,10 +3858,13 @@ class Storage:
             return True
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
-        # See drop_collection: stale snapshots must not hide rows from
-        # the destructive walk.
-        self._refresh_read_snapshot()
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             rows = self._collect_prefix(_IDX_TABLE, (db, coll))
             names = [k[2] for k, _ in rows]
             self._delete_keys(_IDX_TABLE, [k for k, _ in rows])

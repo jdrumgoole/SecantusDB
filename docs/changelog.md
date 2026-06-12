@@ -130,13 +130,14 @@ address.
 
 #### Fixed
 
-- Destructive DDL walks (`drop` / `dropDatabase` / `renameCollection` /
-  `dropIndexes`) now refresh the thread session's WT read snapshot
-  before collecting rows. Without it, documents committed by another
-  session — most importantly a multi-document transaction's dedicated
-  WT session — after the DDL thread's snapshot was pinned were
-  invisible to the walk and silently survived the drop, resurfacing in
-  the recreated collection.
+- Stale WT read snapshots made the mutating scanners
+  (`drop_collection` / `drop_database` / `rename_collection` /
+  `drop_index` / `drop_all_indexes`, plus `index_sizes`) silently miss
+  rows committed by other connection threads — a pinned snapshot from
+  an earlier positioned cursor turned `drop` into a partial or complete
+  no-op, surfacing in the pymongo gauge as drop-then-reinsert E11000
+  duplicate-key errors. All six now refresh the session snapshot on
+  entry, the same discipline the public read paths already had.
 - `mongostat` no longer panics against SecantusDB (missing
   `serverStatus.mem`); `mongotop` no longer fails with
   `CommandNotFound`.
