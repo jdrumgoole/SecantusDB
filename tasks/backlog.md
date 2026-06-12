@@ -168,7 +168,18 @@ non-tailable `getMore` / `killCursors`), `find` (read path: skip/limit/projectio
 and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger works.**
 `aggregate` (storage-independent pipeline via `secantus_core::apply_pipeline`;
 `count_documents` + direct pipelines pass through pymongo).
+**R7 (the standalone `secantusdb` binary): `crates/secantusdb`** — args module in
+`secantus-server` (WT-free, 11 unit tests) + a WT-linked bin (open Storage →
+adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
+`tests/test_rust_binary_smoke.py` / `invoke rust-binary-test` and the
+`storage-engine` CI job (Linux/macOS).
 **Deferred / not yet ported:**
+- [ ] **R7 tail** — a Windows standalone binary (`secantus-wt`'s `build.rs`
+  probes `libwiredtiger.a/.so`; the MSVC wheel build produces neither name, so
+  the bin builds only where the .a exists — wheel-bundled `_secantus_server`
+  covers Windows); the Python CLI's TOML config layer + tuning flags
+  (`--log-level` / `--cache-size` / `--session-max` / `--sync-on-commit` /
+  oplog retention / noop heartbeat) pending matching `Storage::open` knobs.
 - [ ] **`aggregate` storage-backed stages** — `$lookup` / `$out` / `$merge` /
   `$geoNear` / `$sample` / `$collStats` / `$indexStats` (Rust engine returns
   `Fallback` → surfaced as `BadValue`); `$changeStream` cursors; `let`-expression
