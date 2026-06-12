@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-12 — SecantusDB 0.5.2b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-12 — SecantusDB 0.5.2b18 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -15,7 +15,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_change_stream.py` | 3 | 106 | 0 | 46 | 155 | 2.8% |
 | `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_collation.py` | 15 | 1 | 0 | 0 | 16 | 93.8% |
-| `test_collection.py` | 63 | 24 | 0 | 4 | 91 | 72.4% |
+| `test_collection.py` | 64 | 23 | 0 | 4 | 91 | 73.6% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
@@ -45,9 +45,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **861** | **284** | **0** | **301** | **1446** | **75.2%** |
+| **Overall** | **862** | **283** | **0** | **301** | **1446** | **75.3%** |
 
-## Failures (284)
+## Failures (283)
 
 First 30 failure node-ids for manual triage:
 
@@ -83,7 +83,7 @@ vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::tes
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_kill_cursors
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_next_blocks
 ```
-... and 254 more (see raw JSON).
+... and 253 more (see raw JSON).
 
 ## How this is generated
 

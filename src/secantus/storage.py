@@ -964,21 +964,19 @@ class Storage:
         return ts
 
     def peek_cluster_time(self) -> Timestamp:
-        """Return the current cluster time WITHOUT advancing or persisting it.
+        """The last minted cluster time WITHOUT advancing the clock.
 
-        Used to stamp ``$clusterTime`` / ``operationTime`` onto every
-        command reply — mongod replica sets gossip cluster time on each
-        exchange, and pymongo needs it to send
-        ``readConcern.afterClusterTime`` for causal consistency and
-        transaction starts. A mint per reply would add a meta-persist WT
-        write to every command; the peek is just the in-memory counters.
-        Falls back to a real mint the first time, before any write has
-        advanced the clock.
+        Reply gossip (``$clusterTime`` / ``operationTime`` attached to
+        every command reply) observes cluster time; only writes and the
+        explicit ``current_cluster_time`` advance it — matching mongod,
+        where reads gossip the node's known cluster time. A virgin
+        store mints once so the gossiped value is never
+        ``Timestamp(0, 0)``.
         """
         with self._oplog_seq_lock:
-            if self._last_ts_secs == 0:
-                return self._mint_ts()
-            return Timestamp(self._last_ts_secs, self._last_ts_ord)
+            if self._last_ts_secs:
+                return Timestamp(self._last_ts_secs, self._last_ts_ord)
+        return self.current_cluster_time()
 
     def _write_coll_options(self, db: str, coll: str, opts: Mapping[str, Any]) -> None:
         c = self._cursor(_COLL_TABLE)

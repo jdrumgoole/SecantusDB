@@ -5653,18 +5653,17 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         wc_wce = _unsatisfiable_wc_error(doc)
         if wc_wce is not None:
             result["writeConcernError"] = wc_wce
-    # Cluster-time gossip (replica-set mode only, like mongod): every
-    # reply — success or error — carries ``$clusterTime`` and
-    # ``operationTime``. Drivers track these per session and echo the
-    # time back as ``readConcern.afterClusterTime`` on causally
-    # consistent reads and transaction starts; without the gossip,
-    # pymongo never sends ``afterClusterTime`` and the transactions /
-    # causal-consistency spec tests can't see the wire shapes they
-    # assert. The signature is the unsigned-cluster placeholder (all
-    # zeros, keyId 0) that mongod itself uses without auth keys.
-    if ctx.replica_set_name is not None:
+    # Cluster-time gossip: real mongod attaches ``$clusterTime`` and
+    # ``operationTime`` to EVERY reply — successes and errors — when the
+    # node is a replica-set member (standalones don't gossip; neither do
+    # we when the replica-set persona is off). Drivers and pymongo's
+    # tests read ``reply["operationTime"]`` for causal consistency and
+    # ``startAtOperationTime``. The keyless signature (20 zero bytes,
+    # keyId 0) is what auth-less replica sets send. ``setdefault``
+    # preserves handlers that already attach a more specific value
+    # (e.g. the change-stream ``aggregate`` reply).
+    if ctx.replica_set_name:
         ts = ctx.storage.peek_cluster_time()
-        result.setdefault("operationTime", ts)
         result.setdefault(
             "$clusterTime",
             {
@@ -5672,4 +5671,5 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "signature": {"hash": bson.Binary(b"\x00" * 20), "keyId": bson.Int64(0)},
             },
         )
+        result.setdefault("operationTime", ts)
     return result

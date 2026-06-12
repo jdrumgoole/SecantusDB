@@ -769,6 +769,49 @@ def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) ->
     assert "maxSize" not in cs[0]["storageStats"]
 
 
+def test_replies_gossip_cluster_time(client: MongoClient) -> None:
+    # Real mongod attaches ``$clusterTime`` + ``operationTime`` to every
+    # reply on a replica set. pymongo's change-stream tests read
+    # ``reply["operationTime"]`` for ``startAtOperationTime``; causal
+    # consistency reads ``$clusterTime``. Both must be present on reads,
+    # writes, and admin commands alike.
+    from bson import Timestamp
+
+    db = client["gossip_test"]
+    for reply in (
+        client.admin.command("ping"),
+        db.command("insert", "c", documents=[{"_id": 1}]),
+        db.command("find", "c"),
+    ):
+        ct = reply["$clusterTime"]
+        assert isinstance(ct["clusterTime"], Timestamp)
+        assert ct["signature"]["keyId"] == 0
+        assert isinstance(reply["operationTime"], Timestamp)
+
+    # A write advances the cluster clock; its reply's operationTime must
+    # be at least the pre-write gossiped time (causal ordering).
+    before = client.admin.command("ping")["operationTime"]
+    after = db.command("insert", "c", documents=[{"_id": 2}])["operationTime"]
+    assert after >= before
+
+
+def test_no_cluster_time_gossip_on_standalone(tmp_path) -> None:
+    # Standalone mongod does not gossip cluster time; neither do we when
+    # the replica-set persona is switched off.
+    standalone_srv = SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "nogossip"), replica_set_name=None
+    )
+    standalone_srv.start()
+    try:
+        mc = MongoClient(standalone_srv.uri, serverSelectionTimeoutMS=2000, directConnection=True)
+        reply = mc.admin.command("ping")
+        assert "$clusterTime" not in reply
+        assert "operationTime" not in reply
+        mc.close()
+    finally:
+        standalone_srv.stop()
+
+
 def test_change_stream_rejected_on_standalone(tmp_path) -> None:
     # When SecantusDB is booted in standalone mode (no replica-set
     # advertisement in ``hello``), opening a change stream must
