@@ -520,9 +520,17 @@ def validate(c: Context, server: str = "python") -> None:
     raw_json = f".validation/raw{suffix}.json"
     report = f"docs/validation-report{suffix}.md"
     # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
-    # `-p no:xdist -o addopts=`: pymongo's tests aren't xdist-safe (shared DBs);
-    #   override the project-wide `addopts="-n auto"` from pyproject.toml.
-    # `-p pymongo_validation.plugin`: load our embedded-server bootstrap.
+    # `-n1 -o addopts=`: pymongo's tests aren't parallel-safe (shared DBs), so
+    #   exactly ONE xdist worker — serial semantics, but a pytest-timeout
+    #   process kill on a hung test only takes out the worker (xdist records
+    #   the crash, restarts the worker, and the json report survives). A bare
+    #   no-xdist run would lose the whole report to the first hang.
+    #   `--max-worker-restart=200`: don't let repeated hangs end the run.
+    # `-o timeout=120`: tighter than the project-wide 600s — a gauge test
+    #   that blocks >2 min against SecantusDB is a conformance failure worth
+    #   recording, and at 600s a handful of hangs would add hours.
+    # `-p pymongo_validation.plugin`: load our embedded-server bootstrap (the
+    #   CONTROLLER starts the server pre-conftest; workers inherit the env).
     # `--continue-on-collection-errors`: a collection failure in one file
     #   shouldn't abort the whole run — we want every category measured.
     # `-c pyproject.toml` forces pytest to use OUR config; without it pytest
@@ -535,8 +543,9 @@ def validate(c: Context, server: str = "python") -> None:
         f"SECANTUS_GAUGE_SERVER={server} "
         "PYTHONPATH=. uv run --no-sync python -m pytest "
         "-c pyproject.toml "
-        "-o addopts= -o testpaths= "
-        "-p no:cacheprovider -p no:xdist -p pymongo_validation.plugin "
+        "-o addopts= -o testpaths= -o timeout=120 "
+        "-n1 --max-worker-restart=200 "
+        "-p no:cacheprovider -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
         f"--json-report --json-report-file={raw_json} "
         f"--no-header --tb=no -q {deselect} {paths}",
