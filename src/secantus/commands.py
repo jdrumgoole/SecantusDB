@@ -5644,12 +5644,15 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         result = _write_conflict_reply(label=txn is not None)
     except _USER_FACING_EXCEPTIONS as exc:
         # Validation-class errors: messages are deliberately shaped to
-        # match mongod, drivers parse them. Surface verbatim.
+        # match mongod, drivers parse them. Surface verbatim. Exceptions
+        # may carry the mongod code their error uses (ExpressionError
+        # does — $divide-by-zero is 2 BadValue, $mod uses Location
+        # codes); 14 TypeMismatch stays the default.
         result = {
             "ok": 0.0,
             "errmsg": str(exc),
-            "code": 14,
-            "codeName": "TypeMismatch",
+            "code": getattr(exc, "code", 14),
+            "codeName": getattr(exc, "code_name", "TypeMismatch"),
         }
     except Exception as exc:
         if _is_wt_rollback(exc):

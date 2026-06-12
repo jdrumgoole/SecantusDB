@@ -233,15 +233,15 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   order-dependent drop-then-reinsert E11000s are FIXED (stale WT read
   snapshot in the mutating scanners; see changelog Unreleased / the
   snapshot-refresh fix in `drop_collection` et al. — gauge went 93.5% →
-  94.5%, E11000 failures 7 → 1). Still open from the triage:
-  1. `$multiply` (and likely other arithmetic operators) silently tolerates
-     non-numeric operands instead of raising —
-     `TestRawBatchCommandCursor::test_server_error` expects
-     `OperationFailure`. Parity-corpus-first fix (two-engine rule).
-  2. Change-stream event misclassification: an update producing
+  94.5%, E11000 failures 7 → 1). Arithmetic type errors are also FIXED
+  (`$add`/`$subtract`/`$multiply`/`$divide`/`$mod` now raise mongod's
+  errors on non-numeric operands, divide/mod-by-zero, and date misuse;
+  Rust engine defers those cases — parity corpus extended first).
+  Still open from the triage:
+  1. Change-stream event misclassification: an update producing
      `truncatedArrays` is projected as `replace` instead of `update`
      (`test_Test_array_truncation`); also blocks ShowExpandedEvents tests.
-  3. Timeseries collections must not enforce `_id` uniqueness
+  2. Timeseries collections must not enforce `_id` uniqueness
      (`test_insertMany_with_duplicate_ids` — the one surviving E11000).
 - [ ] **Go gauge: CI runs ~1/5 of the local set** — CI weekly artifacts have
   always reported ~450 tests (e.g. 401/453 on 2026-06-08, 447/900 on

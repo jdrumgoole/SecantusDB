@@ -409,10 +409,20 @@ fn arith_nary(arg: &Bson, ctx: &Ctx, mul: bool) -> R {
     if vals.iter().any(is_null) {
         return Ok(Bson::Null);
     }
+    // BSON arithmetic rejects bool (mongod: "$multiply only supports
+    // numeric types, not bool") — Python raises, so defer instead of
+    // folding bools as 0/1 like as_int_like would.
+    if vals.iter().any(|v| matches!(v, Bson::Boolean(_))) {
+        return Err(Fallback);
+    }
     if !mul && vals.len() == 1 {
-        // Python $add returns the single value unchanged (preserving bool/string
-        // identity); only multi-arg goes through numeric folding.
-        return Ok(vals[0].clone());
+        // Python returns a single NUMERIC value unchanged; any other
+        // single-arg type now raises there ($add type-checks even one
+        // operand) -> defer.
+        if as_float_like(&vals[0]).is_some() {
+            return Ok(vals[0].clone());
+        }
+        return Err(Fallback);
     }
     fold_arith(&vals, mul)
 }
@@ -451,6 +461,10 @@ fn op_subtract(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
+    // bool is not BSON-numeric (Python raises) -> defer.
+    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
         return int_to_bson(a.checked_sub(b).ok_or(Fallback)?).ok_or(Fallback);
     }
@@ -468,12 +482,16 @@ fn op_divide(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
+    // bool is not BSON-numeric (Python raises) -> defer.
+    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
     // Decimal128 division has type-specific semantics -> defer.
     let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
         return Err(Fallback);
     };
     if b == 0.0 {
-        return Ok(Bson::Null); // Python: b == 0 -> None
+        return Err(Fallback); // Python raises "can't $divide by zero" (code 2)
     }
     Ok(Bson::Double(a / b)) // Python `/` is always float division
 }
@@ -486,11 +504,15 @@ fn op_mod(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
+    // bool is not BSON-numeric (Python raises) -> defer.
+    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
     // Only integer mod with a positive divisor is reproduced cheaply; Python's
     // float mod and divisor-signed semantics are deferred.
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
         if b == 0 {
-            return Ok(Bson::Null); // Python: b == 0 -> None
+            return Err(Fallback); // Python raises "can't $mod by zero" (16610)
         }
         if b > 0 {
             return int_to_bson(a.rem_euclid(b)).ok_or(Fallback);
