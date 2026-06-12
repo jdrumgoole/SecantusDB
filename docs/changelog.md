@@ -59,6 +59,13 @@ address.
   categorical self-identification that real `mongod` never has. The
   conformance-gauge tripwire checks it over the wire before any test
   runs, so the gauge can never again silently measure a foreign server.
+- Cluster-time gossip: every reply (success or error) now carries
+  `$clusterTime` (keyless signature) and `operationTime` when the
+  replica-set persona is on, exactly like a real replica-set mongod;
+  standalone mode stays gossip-free. Reads observe the cluster clock
+  via the new `Storage.peek_cluster_time()` without advancing it.
+  Clears the `startAtOperationTime` / causal-consistency bucket of the
+  honest pymongo gauge (Rust-server port tracked in backlog §7).
 
 #### Changed
 
