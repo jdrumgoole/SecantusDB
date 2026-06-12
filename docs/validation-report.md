@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-12 — SecantusDB 0.5.2b18 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-12 — SecantusDB 0.5.2b20 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -12,7 +12,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_bson.py` | 87 | 0 | 0 | 1 | 88 | 100.0% |
 | `test_bson_corpus.py` | 31 | 0 | 0 | 0 | 31 | 100.0% |
 | `test_bulk.py` | 31 | 3 | 0 | 4 | 38 | 91.2% |
-| `test_change_stream.py` | 80 | 26 | 0 | 49 | 155 | 75.5% |
+| `test_change_stream.py` | 87 | 19 | 0 | 49 | 155 | 82.1% |
 | `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 76 | 11 | 0 | 4 | 91 | 87.4% |
@@ -21,9 +21,9 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 300 | 1 | 0 | 185 | 486 | 99.7% |
+| `test_crud_unified.py` | 301 | 0 | 0 | 185 | 486 | 100.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
-| `test_cursor.py` | 52 | 15 | 0 | 5 | 72 | 77.6% |
+| `test_cursor.py` | 54 | 13 | 0 | 5 | 72 | 80.6% |
 | `test_custom_types.py` | 49 | 2 | 0 | 0 | 51 | 96.1% |
 | `test_database.py` | 32 | 3 | 0 | 1 | 36 | 91.4% |
 | `test_dbref.py` | 9 | 3 | 0 | 0 | 12 | 75.0% |
@@ -39,15 +39,15 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_read_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
-| `test_run_command.py` | 15 | 1 | 0 | 5 | 21 | 93.8% |
+| `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
 | `test_son.py` | 11 | 0 | 0 | 0 | 11 | 100.0% |
 | `test_timestamp.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1068** | **74** | **0** | **304** | **1446** | **93.5%** |
+| **Overall** | **1079** | **63** | **0** | **304** | **1446** | **94.5%** |
 
-## Failures (74)
+## Failures (63)
 
 First 30 failure node-ids for manual triage:
 
@@ -55,21 +55,14 @@ First 30 failure node-ids for manual triage:
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_large_inserts_ordered
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_large_inserts_unordered
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_upsert_uuid_standard_subdocuments
-vendor/pymongo-tests/test/test_change_stream.py::TestClusterChangeStream::test_start_at_operation_time
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_raises_error_on_missing_id_418plus
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_read_concern
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_resumeafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_startafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_after
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_at_operation_time
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_uuid_representations
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after
-vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_at_operation_time
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_array_truncation
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_newField_added_in_response_MUST_NOT_err
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_projection_in_change_stream_returns_expected_fields
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_server_error_on_projecting_out__id
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_unknown_operationType_MUST_NOT_err
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsDisambiguatedPaths::test_disambiguatedPaths_is_present_on_updateDescription_when_an_ambiguous_path_is_present
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsDisambiguatedPaths::test_disambiguatedPaths_returns_array_indices_as_integers
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when__id_is_projected_out
@@ -82,8 +75,15 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExp
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_modify_events_are_reported
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_new_fields_on_change_stream_events_are_handled_appropriately
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_error_code
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_exhaust
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_field_selection
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_find_one
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_dont_drop_dups
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_filter
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
+vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 ```
-... and 44 more (see raw JSON).
+... and 33 more (see raw JSON).
 
 ## How this is generated
 

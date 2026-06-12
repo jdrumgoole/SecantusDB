@@ -188,33 +188,20 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   attaches `$clusterTime` / `operationTime` to every reply (dispatch tail,
   `Storage.peek_cluster_time`); the Rust server's dispatch doesn't. Port when
   closing the R8 change-stream bucket (106 of its 283 gauge failures).
-- [ ] **Gauge E11000 cluster (7 failures) — triage findings, 2026-06-12.**
-  Decomposed; three distinct causes, none yet fixed:
-  1. *Deterministic, isolated repro*: `$multiply` (and likely the other
-     arithmetic operators) silently tolerates non-numeric operands instead of
-     raising — `test_cursor.py::TestRawBatchCommandCursor::test_server_error`
-     expects `OperationFailure` from `{"$multiply": [2, "$x"]}` over
-     `x: "not a number"`. Reproduce with
-     `pytest ... test_cursor.py::TestRawBatchCommandCursor` through the gauge
-     plugin (fails in a 1.4s run). NOTE: semantics change must extend the
-     Rust parity corpus first (two-engine rule).
-  2. *Deterministic*: change-stream event misclassification — an update
-     producing `truncatedArrays` is projected as op `replace` instead of
-     `update` (`TestUnifiedChangeStreams::test_Test_array_truncation`,
-     `'update' != 'replace'`). Also blocks the ShowExpandedEvents tests.
-  3. *Order-dependent, unexplained*: in full gauge runs only, a
-     drop-then-insert collides (E11000 at a nonzero index, e.g. `_id 3` —
-     i.e. ids 0-2 cleared, 3+ survived the drop). NOT reproducible in
-     isolation (single/cross-connection drop+reinsert, drop-under-watch,
-     runner-sequence replays all pass), and NOT explained by timeout-killed
-     workers (the honest run's slowest test was 14s — no kills). Next step:
-     bisect the full INCLUDE prefix ahead of
-     `TestRawBatchCommandCursor::test_server_error` to find the minimal
-     trigger; suspect a stale WT read snapshot or partial `_delete_keys` in
-     `drop_collection` under some prior-state shape. Timeseries
-     `test_insertMany_with_duplicate_ids` is separate (timeseries collections
-     must not enforce `_id` uniqueness) and the null-`_id` insertMany failure
-     likely shares cause 3.
+- [ ] **Gauge E11000 cluster — remaining tails (2026-06-12).** The
+  order-dependent drop-then-reinsert E11000s are FIXED (stale WT read
+  snapshot in the mutating scanners; see changelog Unreleased / the
+  snapshot-refresh fix in `drop_collection` et al. — gauge went 93.5% →
+  94.5%, E11000 failures 7 → 1). Still open from the triage:
+  1. `$multiply` (and likely other arithmetic operators) silently tolerates
+     non-numeric operands instead of raising —
+     `TestRawBatchCommandCursor::test_server_error` expects
+     `OperationFailure`. Parity-corpus-first fix (two-engine rule).
+  2. Change-stream event misclassification: an update producing
+     `truncatedArrays` is projected as `replace` instead of `update`
+     (`test_Test_array_truncation`); also blocks ShowExpandedEvents tests.
+  3. Timeseries collections must not enforce `_id` uniqueness
+     (`test_insertMany_with_duplicate_ids` — the one surviving E11000).
 - [ ] **Go gauge: CI runs ~1/5 of the local set** — CI weekly artifacts have
   always reported ~450 tests (e.g. 401/453 on 2026-06-08, 447/900 on
   2026-06-12) while local `invoke validate-go` runs ~4700 (the numbers the
