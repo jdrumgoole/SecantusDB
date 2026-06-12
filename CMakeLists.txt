@@ -171,20 +171,24 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     # wiredtiger_ext ExternalProject). `cmake -E env` inherits the rest of the
     # environment (PATH, LIBCLANG_PATH, RUSTUP_* ...), so libclang discovery and
     # the rust toolchain are picked up from the build environment.
-    add_custom_command(
-        OUTPUT ${STORAGE_EXT_STAGED}
+    #
+    # A custom TARGET (not add_custom_command OUTPUT): the command must run on
+    # every build so cargo's own dependency tracking decides freshness. The
+    # OUTPUT form had no DEPENDS on the crate sources, so once the staged file
+    # existed, ninja skipped cargo entirely and editable rebuilds shipped a
+    # STALE extension. copy_if_different keeps the no-change case cheap.
+    add_custom_target(secantus_storage_ext ALL
         COMMAND ${CMAKE_COMMAND} -E env
             SECANTUS_WT_INCLUDE=${WT_BINARY_DIR}/include
             SECANTUS_WT_LIB=${WT_BINARY_DIR}
             CARGO_TARGET_DIR=${STORAGE_TARGET_DIR}
             ${CARGO_EXECUTABLE} build --release
                 --manifest-path ${STORAGE_CRATE_DIR}/Cargo.toml
-        COMMAND ${CMAKE_COMMAND} -E copy ${STORAGE_EXT_BUILT} ${STORAGE_EXT_STAGED}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${STORAGE_EXT_BUILT} ${STORAGE_EXT_STAGED}
         DEPENDS wiredtiger_ext
         COMMENT "Building Rust storage extension (_secantus_storage) against bundled WiredTiger"
         VERBATIM
     )
-    add_custom_target(secantus_storage_ext ALL DEPENDS ${STORAGE_EXT_STAGED})
 
     # Wheel root, alongside the other top-level extensions — `import
     # _secantus_storage` resolves from site-packages.
@@ -214,19 +218,19 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     set(SERVER_EXT_BUILT  ${SERVER_TARGET_DIR}/release/${SERVER_CARGO_OUT})
     set(SERVER_EXT_STAGED ${CMAKE_CURRENT_BINARY_DIR}/${SERVER_EXT_NAME})
 
-    add_custom_command(
-        OUTPUT ${SERVER_EXT_STAGED}
+    # Same always-run custom-target shape as secantus_storage_ext above —
+    # see the staleness note there.
+    add_custom_target(secantus_server_ext ALL
         COMMAND ${CMAKE_COMMAND} -E env
             SECANTUS_WT_INCLUDE=${WT_BINARY_DIR}/include
             SECANTUS_WT_LIB=${WT_BINARY_DIR}
             CARGO_TARGET_DIR=${SERVER_TARGET_DIR}
             ${CARGO_EXECUTABLE} build --release
                 --manifest-path ${SERVER_CRATE_DIR}/Cargo.toml
-        COMMAND ${CMAKE_COMMAND} -E copy ${SERVER_EXT_BUILT} ${SERVER_EXT_STAGED}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SERVER_EXT_BUILT} ${SERVER_EXT_STAGED}
         DEPENDS wiredtiger_ext
         COMMENT "Building Rust server extension (_secantus_server) against bundled WiredTiger"
         VERBATIM
     )
-    add_custom_target(secantus_server_ext ALL DEPENDS ${SERVER_EXT_STAGED})
     install(FILES ${SERVER_EXT_STAGED} DESTINATION . OPTIONAL)
 endif()

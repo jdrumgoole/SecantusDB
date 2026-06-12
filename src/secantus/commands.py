@@ -1070,6 +1070,8 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     constructed one (production path); falls back to zeroed values for
     embedded callers that didn't thread a metrics instance through (e.g.
     ad-hoc test harnesses that use ``CommandContext`` directly)."""
+    import secantus
+
     base: dict[str, Any] = {
         "host": "secantus",
         "version": SERVER_VERSION,
@@ -1077,6 +1079,12 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "pid": os.getpid(),
         "localTime": _dt.datetime.now(_dt.timezone.utc),
         "mem": _mem_section(),
+        # Categorical self-identification: real mongod never has this key.
+        # Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
+        # checks it to prove it's talking to SecantusDB rather than an
+        # accidental real MongoDB on the same address. `server`
+        # distinguishes the pure-Python server from the Rust one.
+        "secantus": {"server": "python", "version": secantus.__version__},
         "ok": 1.0,
     }
     if ctx.metrics is not None:

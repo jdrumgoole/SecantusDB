@@ -371,7 +371,10 @@ def test_admin_commands_against_rust_server(tmp_path) -> None:
 
         stats = db.command("dbStats")
         assert stats["ok"] == 1.0 and stats["db"] == "t"
-        assert client.admin.command("serverStatus")["ok"] == 1.0
+        status = client.admin.command("serverStatus")
+        assert status["ok"] == 1.0
+        # Categorical SecantusDB marker (gauge tripwire depends on it).
+        assert status["secantus"]["server"] == "rust"
 
         db.c.drop()
         assert "c" not in db.list_collection_names()

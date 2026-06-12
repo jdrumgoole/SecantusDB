@@ -331,6 +331,12 @@ pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
         "uptime": 0.0,
         "uptimeMillis": Bson::Int64(0),
         "localTime": bson::DateTime::now(),
+        // Categorical self-identification: real mongod never has this key.
+        // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
+        // checks it to prove it's talking to SecantusDB rather than an
+        // accidental real MongoDB on the same address. The Python server
+        // reports `server: "python"`.
+        "secantus": { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
         "ok": 1.0,
     })
 }
@@ -651,6 +657,10 @@ mod tests {
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
         assert_eq!(reply.get_str("version").unwrap(), crate::SERVER_VERSION);
         assert_eq!(reply.get_str("process").unwrap(), "mongod");
+        // The categorical SecantusDB marker — real mongod never has it.
+        let marker = reply.get_document("secantus").unwrap();
+        assert_eq!(marker.get_str("server").unwrap(), "rust");
+        assert!(!marker.get_str("version").unwrap().is_empty());
     }
 
     #[test]

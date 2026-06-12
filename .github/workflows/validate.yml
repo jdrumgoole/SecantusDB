@@ -211,14 +211,28 @@ jobs:
       - name: Stage downloaded reports into docs/
         run: |
           # Each artifact is `report-<driver>` and contains the single
-          # `docs/validation-report*.md` it produced (path was preserved
-          # by upload-artifact). Copy into the checkout so a `git diff`
-          # against main captures every gauge's update in one place.
+          # report it produced at the ARTIFACT ROOT — upload-artifact@v4
+          # strips the common parent (`docs/`), so the old
+          # `report-*/docs/...` glob matched nothing and the weekly PR
+          # was silently never opened. `set -u` + an explicit count so an
+          # empty match can never again read as "no change".
           shopt -s nullglob
-          for f in artifacts/report-*/docs/validation-report*.md; do
+          staged=0
+          for f in artifacts/report-*/validation-report*.md; do
             cp "$f" docs/
+            staged=$((staged + 1))
           done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::no validation reports found under artifacts/ — staging glob is broken again"
+            exit 1
+          fi
           ls -la docs/validation-report*.md
+
+      - name: Track new report files
+        # `git diff --quiet` is blind to untracked files (a brand-new
+        # gauge's report, e.g. validation-report-rust-server.md, would be
+        # invisible). Intent-to-add makes them show up in the diff.
+        run: git add --intent-to-add docs/validation-report*.md
 
       - name: Open PR if reports changed
         env:

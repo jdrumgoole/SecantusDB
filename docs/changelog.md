@@ -54,6 +54,11 @@ address.
 - CLI-tool conformance tests: `tests/test_mongoimport_export.py`,
   `tests/test_mongofiles.py`, `tests/test_mongostat_mongotop.py`, and
   a `bsondump` dump-format test in `tests/test_mongodump_restore.py`.
+- `serverStatus` now carries a `secantus` subdocument
+  (`{server: "python"|"rust", version: ...}`) on both servers —
+  categorical self-identification that real `mongod` never has. The
+  conformance-gauge tripwire checks it over the wire before any test
+  runs, so the gauge can never again silently measure a foreign server.
 
 #### Changed
 
@@ -73,6 +78,30 @@ address.
 - Shutdown race: a request arriving while `stop()` closes the listen
   socket no longer raises `OSError: Bad file descriptor` from the
   address probe.
+- **The pymongo conformance gauge was not measuring SecantusDB.**
+  pymongo's test helpers freeze `DB_IP`/`DB_PORT` at conftest-import
+  time, before the gauge plugin's `pytest_configure` wrote them — so
+  local runs silently targeted whatever listened on `localhost:27017`
+  (a real `mongod`, which produced the previous "100.0%" headline) and
+  CI runs, with nothing on 27017, mass-skipped 1100+ tests. The plugin
+  now starts the embedded server in `pytest_load_initial_conftests`
+  (before any conftest import), aborts via tripwire if the helpers
+  captured the wrong address or the target lacks the `secantus`
+  marker, and the regenerated honest report shows the real number.
+- The weekly `validate.yml` aggregate never opened its report PR:
+  `upload-artifact@v4` strips the `docs/` parent from single-file
+  artifacts, so the staging glob matched nothing and untracked new
+  reports were invisible to `git diff`. Staging now fails loudly on an
+  empty match and `git add --intent-to-add`s new report files.
+- The gauge now runs under one xdist worker (`-n1`) with a 120s
+  per-test deadline, so a hung test is recorded as a crash and the run
+  continues, instead of pytest-timeout killing the whole process and
+  losing the JSON report.
+- Editable storage-engine rebuilds shipped stale Rust extensions: the
+  CMake custom command had no dependency on the crate sources, so once
+  the staged `.so` existed cargo never re-ran. The build now always
+  invokes cargo (its own dependency tracking decides freshness) and
+  stages with `copy_if_different`.
 
 ## [0.5.2b15] — 2026-05-22
 
