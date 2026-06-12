@@ -57,13 +57,39 @@ Landed per the plan that used to live here:
   `Format check` CI step bit PR #36).
 - `**.md` is in the workflow `paths-ignore`, so docs-only commits skip CI.
 
-## After R7 — open threads (pick any)
+## R8 — pymongo conformance gate against the Rust server: wired
+
+The gauge plumbing is in place; the *number* now comes from running it:
+
+- `pymongo_validation/plugin.py` picks the server from
+  `SECANTUS_GAUGE_SERVER` (`python` default / `rust` → the
+  `_secantus_server.RustServer` embedded handle, imported lazily).
+- `invoke validate --server rust` runs the same unmodified suite against
+  the Rust server and writes `docs/validation-report-rust-server.md`
+  (raw JSON in `.validation/raw-rust-server.json`).
+- `.github/workflows/validate.yml` has a `pymongo-rust-server` matrix
+  entry: syncs with `SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON`
+  so the extension is importable in the project venv, then runs the task.
+  The weekly aggregate PR picks the new report up automatically.
+- Local rust-mode runs:
+  `SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev
+  --reinstall-package SecantusDB`, then
+  `uv run python -m invoke validate --server rust`.
+
+The R8 *gate* ("headline number must not regress vs the Python server") is
+read off the two reports; expect a big initial gap — closing it is the
+R-series to-do list. The other-language gauges vs the Rust server are not
+wired (their daemon launchers would need to spawn the `secantusdb` binary —
+deferred, see backlog §7).
+
+## After R8 — open threads (pick any)
 
 - **R3b** — tailable change-stream `getMore` (oplog tail → `changestreams::project`,
   `awaitData` blocking). Server/commands layer over WT storage.
 - **Storage-backed aggregation** — `$lookup` / `$out` / `$merge` (need storage
   access inside the aggregate handler).
-- **R8** — full pymongo conformance gate against the Rust server.
+- **Close the R8 gap** — triage `docs/validation-report-rust-server.md`
+  failures by category; biggest buckets first.
 - **SCRAM-SHA-1** (legacy, low priority — no modern driver defaults to it).
 
 ## Dev setup reminder (per CLAUDE.md)
