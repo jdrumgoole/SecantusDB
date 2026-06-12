@@ -64,23 +64,27 @@ pre code { background: transparent; padding: 0; }
 
 .wrap { max-width: var(--max-width); margin: 0 auto; padding: 0 32px; }
 
-/* ---- Beta banner ---- */
+/* ---- Beta callout ---- */
+/* An inline notice card, not a page band — it sits mid-flow (below the
+   hero on home, below the nav elsewhere) and must not read as a header. */
 
 .beta-banner {
-  background: var(--slate-900);
-  color: var(--slate-100);
-  border-bottom: 2px solid var(--cyan-500);
   font-size: 14px;
+  padding: 28px 0 0;
 }
-.beta-banner .wrap {
+.beta-banner .callout {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 12px;
-  padding-top: 12px;
-  padding-bottom: 12px;
+  background: white;
+  border: 1px solid var(--slate-200);
+  border-left: 4px solid var(--cyan-500);
+  border-radius: 10px;
+  padding: 12px 20px;
+  color: var(--slate-700);
 }
-.beta-banner strong { color: var(--cyan-400); letter-spacing: 0.04em; }
+.beta-banner strong { color: var(--cyan-700); letter-spacing: 0.04em; }
 .beta-banner .badge {
   display: inline-block;
   background: var(--cyan-500);
@@ -92,7 +96,6 @@ pre code { background: transparent; padding: 0; }
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
-.beta-banner a { color: var(--cyan-300); }
 
 /* ---- Site header / nav ---- */
 
