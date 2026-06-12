@@ -870,6 +870,21 @@ class Storage:
         self._persist_oplog_meta()
         return ts
 
+    def peek_cluster_time(self) -> Timestamp:
+        """The last minted cluster time WITHOUT advancing the clock.
+
+        Reply gossip (``$clusterTime`` / ``operationTime`` attached to
+        every command reply) observes cluster time; only writes and the
+        explicit ``current_cluster_time`` advance it — matching mongod,
+        where reads gossip the node's known cluster time. A virgin
+        store mints once so the gossiped value is never
+        ``Timestamp(0, 0)``.
+        """
+        with self._oplog_seq_lock:
+            if self._last_ts_secs:
+                return Timestamp(self._last_ts_secs, self._last_ts_ord)
+        return self.current_cluster_time()
+
     def _write_coll_options(self, db: str, coll: str, opts: Mapping[str, Any]) -> None:
         c = self._cursor(_COLL_TABLE)
         # bson can't directly encode a uuid.UUID without a codec, so store as Binary subtype 4.

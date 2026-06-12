@@ -184,6 +184,17 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   and pointing them at the Rust server needs a `secantusdb`-binary launch path
   in each gauge job — deferred until the Rust server's command surface is wide
   enough for those suites to be informative.
+- [ ] **Cluster-time gossip not in the Rust server** — the Python server
+  attaches `$clusterTime` / `operationTime` to every reply (dispatch tail,
+  `Storage.peek_cluster_time`); the Rust server's dispatch doesn't. Port when
+  closing the R8 change-stream bucket (106 of its 283 gauge failures).
+- [ ] **Go gauge: CI runs ~1/5 of the local set** — CI weekly artifacts have
+  always reported ~450 tests (e.g. 401/453 on 2026-06-08, 447/900 on
+  2026-06-12) while local `invoke validate-go` runs ~4700 (the numbers the
+  pre-2026-06-12 committed report carried). Suspects: the 30-minute
+  `go test -timeout`, cold caches on runners (GitHub cache service 400s), or
+  package discovery under `./internal/integration/...` differing on CI.
+  Diagnose before trusting week-over-week go comparisons.
 - [ ] **`aggregate` storage-backed stages** — `$lookup` / `$out` / `$merge` /
   `$geoNear` / `$sample` / `$collStats` / `$indexStats` (Rust engine returns
   `Fallback` → surfaced as `BadValue`); `$changeStream` cursors; `let`-expression
