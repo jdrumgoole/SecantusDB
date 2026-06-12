@@ -23,7 +23,7 @@ def _read_project_version() -> str:
 
 SECANTUS_VERSION: str = _read_project_version()
 SECANTUS_IS_ALPHA: bool = "a" in SECANTUS_VERSION.split(".")[-1]
-SECANTUS_DOCS_URL: str = "https://secantusdb.readthedocs.io/"
+SECANTUS_DOCS_URL: str = "https://secantusdb.readthedocs.io/en/latest/"
 SECANTUS_PYPI_URL: str = "https://pypi.org/project/SecantusDB/"
 SECANTUS_GITHUB_URL: str = "https://github.com/jdrumgoole/SecantusDB"
 SECANTUS_TAGLINE: str = "THE SQLITE OF DOCUMENT DATABASES"

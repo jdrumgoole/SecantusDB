@@ -402,6 +402,16 @@ pre code { background: transparent; padding: 0; }
 }
 .drivers-foot strong { color: var(--slate-900); }
 
+/* Honest-performance footnote under the benefits grid. */
+.perf-note {
+  margin: 36px auto 0;
+  max-width: 72ch;
+  font-size: 15px;
+  color: var(--slate-600);
+  line-height: 1.6;
+}
+.perf-note strong { color: var(--slate-900); }
+
 /* ---- Code example block on home ---- */
 
 .code-example { background: white; }

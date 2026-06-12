@@ -36,7 +36,7 @@
       <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>358</strong> tests passed &middot; <strong>0</strong> failed &middot; <strong>1</strong> documented failure (see report)</p>
+    <p class="counts"><strong>358</strong> tests passed &middot; <strong>0</strong> unexpected failures &middot; <strong>1</strong> documented divergence (excluded from the rate; see report)</p>
     <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. We run a curated <code>test/integration/</code> spec set via <code>mocha --config test/mocha_mongodb.js</code> &mdash; real wire commands against an embedded SecantusDB daemon.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-node.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -64,7 +64,7 @@
       <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>293</strong> tests passed &middot; <strong>0</strong> failed &middot; <strong>1</strong> documented failure (see report)</p>
+    <p class="counts"><strong>293</strong> tests passed &middot; <strong>0</strong> unexpected failures &middot; <strong>1</strong> documented divergence (excluded from the rate; see report)</p>
     <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x), the gem the Rails / Sinatra ecosystem builds on. We run a curated set of integration spec files end-to-end against an embedded SecantusDB daemon &mdash; every test opens a real <code>Mongo::Client</code>, SCRAM-authenticates as a pre-provisioned <code>root-user</code>, and exchanges wire commands.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
   </article>
