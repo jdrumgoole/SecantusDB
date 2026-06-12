@@ -125,3 +125,37 @@ def test_malformed_body_logs_warning_does_not_unhandled_traceback(tmp_path, capl
         f"expected 'malformed BSON' WARNING; got: {[r.message for r in caplog.records]}"
     )
     assert not errors, f"unexpected ERROR-level logs: {[r.message for r in errors]}"
+
+
+def test_abrupt_reset_close_is_quiet(tmp_path, caplog) -> None:
+    """An RST-style hang-up (SO_LINGER 0 close — how Go-driver tools like
+    mongodump drop pooled connections) is a normal disconnect: DEBUG log,
+    no ``unhandled error`` traceback through the catch-all handler."""
+    import logging
+    import time
+
+    import bson
+
+    with (
+        SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv,
+        caplog.at_level(logging.DEBUG, logger="secantus.server"),
+    ):
+        host, port = srv.address
+        sock = socket.create_connection((host, port), timeout=5)
+        # Complete one round-trip so the server is parked in read_message
+        # waiting for the next request when the reset lands.
+        ping_body = bson.encode({"ping": 1, "$db": "admin"})
+        sock.sendall(_build_op_msg_with_body(request_id=1, body_bytes=ping_body))
+        _read_op_msg_reply(sock)
+        # SO_LINGER(on, 0) makes close() send RST instead of FIN.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+        # Wait until the server reaps the connection (registry empties)
+        # rather than sleeping a fixed interval.
+        deadline = time.monotonic() + 5
+        while srv.connections.snapshot() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not srv.connections.snapshot(), "server never reaped the reset connection"
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, f"unexpected ERROR-level logs: {[r.message for r in errors]}"

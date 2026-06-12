@@ -17,6 +17,7 @@ These commands accept the request and return a wire-valid response, but the resp
 These work end-to-end but cut corners.
 
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
+- [ ] **`top` counters are always zero** — the command returns the mongod shape (one `totals` entry per namespace, `total`/`readLock`/`writeLock`/per-op sections) and mongotop renders it like an idle server, but SecantusDB doesn't instrument per-namespace operation timing, so every `{time, count}` is `0`. Real counters would need per-ns accounting in `Metrics` threaded through dispatch.
 - ~~**`renameCollection` cross-process safety**~~ structurally guaranteed by WiredTiger (b34). Within-process atomicity is the storage `RLock`. Cross-process exclusion is `WiredTiger.lock` — a second `wiredtiger_open` on the same path fails with ``WT_ERROR Resource busy`` before any state is touched, so concurrent writers across processes / worktrees can't exist in the first place. See `tests/test_storage_exclusion.py`.
 - ~~**`createIndexes` collation**~~ shipped (single-field b25 + compound b27). `sortkey.encode_value_directed` takes a `collation` kwarg; index entries are written under the index's stored collation; single-field equality / range / `$in` (`_find_leading_field_index`), compound bare-equality (`_pick_compound_eq_index`), and compound prefix + trailing-operator (`_pick_compound_range_index`) all thread collation through and gate by exact match. Unique-probe path reads each index's stored collation too. Strength 1/2/3 + `caseLevel` work uniformly across single- and compound-field indexes; `numericOrdering` still falls back to COLLSCAN at every level (would need a length-prefixed digit-run encoding to stay byte-sortable). See `docs/indexes.md` "Per-index collation".
 
@@ -48,41 +49,35 @@ Single-node change streams are implemented and conformant for typical pymongo `w
 
 ### 3.3 MongoDB CLI / tool conformance tests
 
-The deck now claims SecantusDB works with the standard MongoDB toolchain (it
-speaks the wire protocol, so in principle they all connect). That claim is
-currently **unverified by an automated test** — the conformance gauges cover the
-five language *drivers*, not the CLI tools. Add tool-level gauges that start a
-standalone SecantusDB on an ephemeral port and drive each tool against its
-`MONGODB_URI`, asserting real round-trips (mirroring the per-driver gauge
-pattern in `/conformance-gauges` and `invoke validate*`).
+Every connectable tool in the MongoDB toolchain is now covered by tests in the
+default suite (each starts an embedded `SecantusDBServer` and drives the real
+binary; all skip gracefully when the tool isn't on PATH):
 
-- [ ] **`mongosh` (shell)** — `mongosh "$URI" --eval '…'` / `--file script.js`:
-  insert / find / aggregate / `db.runCommand`, JSON output asserted. The most
-  important one — it exercises the handshake + a broad command surface.
-- [ ] **`mongodump` / `mongorestore`** — the headline round-trip: seed a DB,
-  `mongodump`, `db.dropDatabase()`, `mongorestore`, assert the collections /
-  docs / indexes come back identical (BSON-level, including `_id` types). This
-  also exercises `listCollections` / `listIndexes` / oplog-free dump paths.
-- [ ] **`mongoimport` / `mongoexport`** — JSON and CSV/TSV round-trip of a
-  collection; assert type fidelity through extended-JSON.
-- [ ] **`bsondump`** — decode a `.bson` produced by `mongodump`; pure-ish, no
-  server needed, but pins the dump format.
-- [ ] **`mongostat` / `mongotop`** — these poll `serverStatus` / `top`; likely
-  reveal stubbed admin commands. Lower priority; may be marked "tool runs,
-  output is best-effort" rather than fully conformant.
-- [ ] **`mongofiles` (GridFS)** — `put` / `get` / `list` against the `fs.*`
-  collections; only if/when GridFS-shaped usage is in scope.
+- `mongosh` — `tests/test_mongosh.py` (two-direction round-trip).
+- `mongodump` / `mongorestore` / `bsondump` — `tests/test_mongodump_restore.py`
+  (dump-restore round-trip incl. indexes; bsondump pins the extended-JSON dump
+  format).
+- `mongoimport` / `mongoexport` — `tests/test_mongoimport_export.py` (NDJSON +
+  CSV round-trips, `--query`/`--fields`, `--drop`, canonical-extended-JSON type
+  fidelity for ObjectId / datetime / Decimal128 / Int64 / Binary).
+- `mongostat` / `mongotop` — `tests/test_mongostat_mongotop.py` (single
+  iteration each; mongostat needed `serverStatus.mem`, mongotop needed the
+  `top` command — both fixed on the cli-tools slice).
+- `mongofiles` (GridFS) — `tests/test_mongofiles.py` (put/get/list/delete,
+  cross-checked against pymongo's gridfs).
+
+Still open:
+
+- [ ] **CI doesn't install mongosh / MongoDB Database Tools**, so every tool
+  test above skips on GitHub runners — they only run on dev machines that have
+  the Homebrew packages. Add an install step (or a dedicated job) to
+  `test.yml` or the weekly `validate.yml` so the coverage is continuous, and
+  record per-tool caveats in `/conformance-gauges`.
 - [ ] **Compass (GUI)** — Electron, not CLI-automatable in CI. Cover the
   *operations Compass issues* (schema sample via `$sample`, `$collStats`,
   `dbStats`, index list, `explain`) as headless command tests rather than
   driving the GUI. Track separately; document any command it needs that's
   stubbed.
-
-Wire each into a `validate-tools` invoke task (or extend `validate-all`), gate
-in the weekly `validate.yml`, and record per-tool caveats in
-`/conformance-gauges` the way the driver gauges already do. Where a tool needs a
-command that's currently stubbed (§1) or admin-only, file the gap here as it
-surfaces.
 
 ## 4. Out of scope (intentional, with reasoning)
 
