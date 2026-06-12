@@ -1752,7 +1752,7 @@ source = { directory = "crates/secantus-core-py" }
 
 [[package]]
 name = "secantusdb"
-version = "0.5.2b20"
+version = "0.5.2b22"
 source = { editable = "." }
 dependencies = [
     { name = "pymongo" },

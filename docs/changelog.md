@@ -144,6 +144,17 @@ IXSCAN decision the real pipeline run uses.
 
 #### Fixed
 
+- Arithmetic expressions (`$add` / `$subtract` / `$multiply` /
+  `$divide` / `$mod`) now raise mongod's type errors instead of
+  silently producing Python-flavoured results: non-numeric operands
+  error with mongod's exact messages and codes (verified against a
+  real mongod 8.2 oracle), `$divide`/`$mod` by zero error (codes 2 /
+  16610) instead of returning null, bool operands are rejected (BSON
+  arithmetic has no bool), `$add`/`$subtract` date semantics follow
+  mongod (date ± millis, date − date → long, two dates in `$add` →
+  16612), and Decimal128 operands widen the fold to decimal. The Rust
+  engine defers all error-shaped cases to Python (parity corpus
+  extended first; 536 parity tests green).
 - Stale WT read snapshots made the mutating scanners
   (`drop_collection` / `drop_database` / `rename_collection` /
   `drop_index` / `drop_all_indexes`, plus `index_sizes`) silently miss
