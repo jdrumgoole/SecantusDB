@@ -47,7 +47,7 @@ jobs:
           - { os: ubuntu-22.04-arm, platform: linux-aarch64, target: aarch64-unknown-linux-gnu, manylinux: '2014' }
           - { os: windows-2022, platform: windows-x86_64, target: x86_64-pc-windows-msvc, manylinux: '' }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build abi3 wheel
         uses: PyO3/maturin-action@v1
@@ -64,7 +64,7 @@ jobs:
           python -m pip install crates/secantus-core-py/dist/*.whl
           python -c "import _secantus_core; print('imported', _secantus_core.__doc__[:40])"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: secantus-core-${{ matrix.platform }}
           path: crates/secantus-core-py/dist/*.whl
@@ -74,14 +74,14 @@ jobs:
   sdist:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           working-directory: crates/secantus-core-py
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: secantus-core-sdist
           path: crates/secantus-core-py/dist/*.tar.gz
@@ -95,7 +95,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify tag matches secantus-core version
         shell: bash
@@ -106,7 +106,7 @@ jobs:
             echo "Tag $tag != secantus-core version $ver" >&2; exit 1
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           pattern: secantus-core-*

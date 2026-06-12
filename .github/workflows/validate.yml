@@ -40,7 +40,7 @@ jobs:
           # (extra toolchain steps below).
           - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
@@ -81,13 +81,13 @@ jobs:
 
       - name: Set up Go
         if: matrix.driver.name == 'go'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.25"
 
       - name: Cache Go modules + build
         if: matrix.driver.name == 'go'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/go/pkg/mod
@@ -104,13 +104,13 @@ jobs:
 
       - name: Set up Node.js
         if: matrix.driver.name == 'node'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
 
       - name: Cache node_modules
         if: matrix.driver.name == 'node'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/node-mongodb-native/node_modules
           key: ${{ runner.os }}-node-modules-${{ hashFiles('vendor/node-mongodb-native/package-lock.json') }}
@@ -119,14 +119,14 @@ jobs:
 
       - name: Set up JDK
         if: matrix.driver.name == 'java'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
         if: matrix.driver.name == 'java'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.gradle/caches
@@ -149,7 +149,7 @@ jobs:
 
       - name: Cache Ruby bundle
         if: matrix.driver.name == 'ruby'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/mongo-ruby-driver/.bundle
           key: ${{ runner.os }}-ruby-bundle-${{ hashFiles('vendor/mongo-ruby-driver/Gemfile.lock') }}
@@ -166,7 +166,7 @@ jobs:
 
       - name: Cache cargo registry + target
         if: matrix.driver.name == 'rust'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -183,7 +183,7 @@ jobs:
         run: head -50 ${{ matrix.driver.report }}
 
       - name: Upload report artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: report-${{ matrix.driver.name }}
           path: ${{ matrix.driver.report }}
@@ -201,10 +201,10 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all report artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
 

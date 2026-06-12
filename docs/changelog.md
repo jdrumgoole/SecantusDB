@@ -55,6 +55,13 @@ address.
   `tests/test_mongofiles.py`, `tests/test_mongostat_mongotop.py`, and
   a `bsondump` dump-format test in `tests/test_mongodump_restore.py`.
 
+#### Changed
+
+- CI: all `actions/*` workflow actions bumped to their Node-24 majors
+  (checkout v5, setup-python v6, upload-artifact v6, download-artifact
+  v7, cache v5, setup-go v6, setup-java v5, setup-node v5) ahead of
+  GitHub's June 16th 2026 forced Node 20 → 24 switch.
+
 #### Fixed
 
 - `mongostat` no longer panics against SecantusDB (missing

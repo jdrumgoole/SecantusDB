@@ -44,7 +44,7 @@ jobs:
         # (4 Pythons × 3 OSes = 12 cells).
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive  # vendor/wiredtiger is needed by the build
 
@@ -130,7 +130,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive  # vendor/wiredtiger is needed by the build
 
@@ -197,7 +197,7 @@ jobs:
   rust-storage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive  # vendor/wiredtiger is needed by the build
 
@@ -271,7 +271,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive  # vendor/wiredtiger is needed by the build
 

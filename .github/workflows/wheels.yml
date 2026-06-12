@@ -39,7 +39,7 @@ jobs:
             platform: windows-x86_64
             cibw_archs: AMD64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -54,7 +54,7 @@ jobs:
 
       - name: Restore ccache
         if: matrix.platform != 'windows-x86_64'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-${{ matrix.platform }}-wt-${{ steps.wt-sha.outputs.sha }}
@@ -86,7 +86,7 @@ jobs:
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.platform }}
           path: wheelhouse/*.whl
@@ -95,7 +95,7 @@ jobs:
     name: Build sdist
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -105,7 +105,7 @@ jobs:
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sdist
           path: dist/*.tar.gz
