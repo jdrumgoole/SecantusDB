@@ -88,6 +88,13 @@ address.
   Conformance: `tests/test_transactions.py`,
   `tests/test_transaction_registry.py`, `tests/test_storage_user_txn.py`;
   divergence notes in backlog §3.4.
+- Cluster-time gossip: every command reply in replica-set mode now
+  carries `$clusterTime` (unsigned-cluster placeholder signature, as
+  mongod without auth keys) and `operationTime`, via the non-minting
+  `Storage.peek_cluster_time()`. Drivers track these per session and
+  echo `readConcern.afterClusterTime` on causally consistent reads and
+  transaction starts — the wire shape the transactions /
+  causal-consistency unified specs assert.
 - `top` command — mongod-shaped per-namespace reply (`totals` with
   `total`/`readLock`/`writeLock`/per-op `{time, count}` sections,
   RBAC `top` action granted via `clusterMonitor`); counters are zero
@@ -116,6 +123,13 @@ address.
 
 #### Fixed
 
+- Destructive DDL walks (`drop` / `dropDatabase` / `renameCollection` /
+  `dropIndexes`) now refresh the thread session's WT read snapshot
+  before collecting rows. Without it, documents committed by another
+  session — most importantly a multi-document transaction's dedicated
+  WT session — after the DDL thread's snapshot was pinned were
+  invisible to the walk and silently survived the drop, resurfacing in
+  the recreated collection.
 - `mongostat` no longer panics against SecantusDB (missing
   `serverStatus.mem`); `mongotop` no longer fails with
   `CommandNotFound`.

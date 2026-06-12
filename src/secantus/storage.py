@@ -963,6 +963,23 @@ class Storage:
         self._persist_oplog_meta()
         return ts
 
+    def peek_cluster_time(self) -> Timestamp:
+        """Return the current cluster time WITHOUT advancing or persisting it.
+
+        Used to stamp ``$clusterTime`` / ``operationTime`` onto every
+        command reply — mongod replica sets gossip cluster time on each
+        exchange, and pymongo needs it to send
+        ``readConcern.afterClusterTime`` for causal consistency and
+        transaction starts. A mint per reply would add a meta-persist WT
+        write to every command; the peek is just the in-memory counters.
+        Falls back to a real mint the first time, before any write has
+        advanced the clock.
+        """
+        with self._oplog_seq_lock:
+            if self._last_ts_secs == 0:
+                return self._mint_ts()
+            return Timestamp(self._last_ts_secs, self._last_ts_ord)
+
     def _write_coll_options(self, db: str, coll: str, opts: Mapping[str, Any]) -> None:
         c = self._cursor(_COLL_TABLE)
         # bson can't directly encode a uuid.UUID without a codec, so store as Binary subtype 4.
@@ -3461,6 +3478,13 @@ class Storage:
             c.reset()
 
     def drop_collection(self, db: str, coll: str) -> bool:
+        # Without a snapshot refresh, rows committed by ANOTHER session
+        # (most importantly a multi-document transaction's dedicated WT
+        # session) after this thread's cached session pinned its read
+        # view are invisible to the _collect_prefix walk — the drop
+        # would silently leave them behind and they'd resurface in the
+        # recreated collection.
+        self._refresh_read_snapshot()
         with self._lock:
             existed = self._coll_options(db, coll) is not None
             ui = self._collection_uuid(db, coll) if existed else None
@@ -3485,6 +3509,9 @@ class Storage:
             return existed
 
     def drop_database(self, db: str) -> None:
+        # See drop_collection: stale snapshots must not hide rows from
+        # the destructive walk.
+        self._refresh_read_snapshot()
         with self._lock:
             colls_with_ui: list[tuple[str, _uuid.UUID]] = []
             for c_name in self.list_collections(db):
@@ -3515,6 +3542,9 @@ class Storage:
         *,
         drop_target: bool = False,
     ) -> tuple[bool, str | None]:
+        # See drop_collection: stale snapshots must not hide rows from
+        # the move/destroy walks.
+        self._refresh_read_snapshot()
         with self._lock:
             if self._coll_options(src_db, src_coll) is None:
                 return False, f"source namespace does not exist: {src_db}.{src_coll}"
@@ -3791,6 +3821,9 @@ class Storage:
     def drop_index(self, db: str, coll: str, name: str) -> bool:
         if name == _ID_INDEX_NAME:
             return False
+        # See drop_collection: stale snapshots must not hide rows from
+        # the destructive walk.
+        self._refresh_read_snapshot()
         with self._lock:
             c = self._cursor(_IDX_TABLE)
             c.set_key(db, coll, name)
@@ -3813,6 +3846,9 @@ class Storage:
             return True
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
+        # See drop_collection: stale snapshots must not hide rows from
+        # the destructive walk.
+        self._refresh_read_snapshot()
         with self._lock:
             rows = self._collect_prefix(_IDX_TABLE, (db, coll))
             names = [k[2] for k, _ in rows]

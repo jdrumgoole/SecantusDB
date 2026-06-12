@@ -108,6 +108,17 @@ into the thread-local, oplog entries buffered until commit). Conformance:
 - [ ] **No `recoveryToken` / mongos pinning, no prepared transactions, no
   `maxCommitTimeMS`, no `serverStatus.transactions` metrics, no
   `afterClusterTime` enforcement** — multi-node machinery; out of scope.
+  (`$clusterTime` / `operationTime` ARE gossiped on every reply so drivers
+  can send `afterClusterTime`; the value is accepted and ignored.)
+- [ ] **Expected-red in the pymongo transactions gauge**: the three
+  secondary-read-preference unified tests
+  (`TestUnifiedRunCommand::test_run_command_fails_with_*secondary*`,
+  `TestUnifiedReadPref::test_secondary_readPreference`) fail with a
+  client-side 30s `ServerSelectionTimeoutError` — the fictional
+  single-node replica set has no secondary to select, and the asserted
+  server error ("read preference in a transaction must be primary")
+  can only come from a server that received the command. Unfixable on
+  a single node.
 - [ ] **readConcern levels inside transactions are accept-and-ignore** — every
   in-transaction read runs against the transaction's pinned WT snapshot
   regardless of level (`snapshot` is exactly that; `local`/`majority` are
