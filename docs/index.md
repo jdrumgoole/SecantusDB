@@ -128,8 +128,6 @@ features tangential to single-node operation:
   privileged.
 - Text search (no full-text index).
 - `$where` (no JS runtime).
-- Real transaction rollback (we accept `commitTransaction` /
-  `abortTransaction` but operations take effect immediately).
 
 If your application or test depends on those features, run a real
 `mongod`. SecantusDB is the right tool when you need a single-node

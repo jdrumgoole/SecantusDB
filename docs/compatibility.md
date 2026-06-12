@@ -16,7 +16,6 @@ response is fabricated.
 | `hostInfo` / `whatsmyuri` / `buildInfo` | Hardcoded values; `buildInfo.version` is `"7.0.0"` |
 | `getLog` | Empty log array |
 | `startSession` / `endSessions` / `refreshSessions` | `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced |
-| `abortTransaction` / `commitTransaction` | Return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod` |
 
 `dbStats` and `collStats` return real `count`, `size`, `storageSize`,
 `avgObjSize`, `indexSize`, `indexSizes`, `totalIndexSize`, and `totalSize`
@@ -119,12 +118,12 @@ These are explicit non-goals:
   `emit(this.<field>, 1)` + `values.length` count pattern is
   recognised and translated to `$group`, but anything else needs
   real `mongod`.
-- **Real transaction rollback** — `commitTransaction` /
-  `abortTransaction` return `{ok: 1}` but operations take effect
-  immediately. Logical sessions ARE tracked end-to-end.
-
 What HAS shipped that's worth calling out (was previously listed as
-"deferred" or "out of scope"): geo operators + `2d` / `2dsphere`
+"deferred" or "out of scope"): multi-document transactions (real
+`commitTransaction` / `abortTransaction` with WT-native rollback,
+snapshot isolation, write-conflict detection, and
+`TransientTransactionError` labels — divergences in
+`tasks/backlog.md` §3.4); geo operators + `2d` / `2dsphere`
 indexes; capped collections (`create capped: true`) with FIFO
 eviction; profiling (`profile` command + `<db>.system.profile`);
 SCRAM-SHA-256 authentication; the oplog as a queryable

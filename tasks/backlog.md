@@ -10,7 +10,7 @@ Each item should have enough context for a future session to pick it up cold: wh
 
 These commands accept the request and return a wire-valid response, but the response is fabricated — they do no real work.
 
-- [ ] **`abortTransaction`** / **`commitTransaction`** — return `{ok: 1}` but **do not roll back**. Operations inside a transaction take effect immediately. Tests that depend on real transactional rollback need a real `mongod`. (Logical sessions ARE tracked end-to-end via ``secantus.sessions.SessionRegistry``; transactions are the next layer up that doesn't yet correlate with session state.)
+(None currently — `commitTransaction` / `abortTransaction` were the last true stubs; real multi-document transactions shipped via `secantus.transactions` + WT-native per-transaction sessions. Remaining transaction divergences are in §3.4.)
 
 ## 2. Stopgaps (functional but with significant limitations)
 
@@ -43,7 +43,6 @@ SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/sasl
 
 Single-node change streams are implemented and conformant for typical pymongo `watch()` flows, but the following are deferred or intentionally diverge from real `mongod`:
 
-- [ ] **Multi-document transactions in change events** — `txnNumber` and `lsid` are never present on change events; SecantusDB has no real transaction state.
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
@@ -80,6 +79,39 @@ Still open:
   `dbStats`, index list, `explain`) as headless command tests rather than
   driving the GUI. Track separately; document any command it needs that's
   stubbed.
+
+### 3.4 Multi-document transaction limitations
+
+Real transactions shipped (`secantus.transactions` registry + per-transaction
+WT sessions in `Storage`; statements run with the transaction's session swapped
+into the thread-local, oplog entries buffered until commit). Conformance:
+`tests/test_transactions.py` (pymongo-driven), `tests/test_transaction_registry.py`,
+`tests/test_storage_user_txn.py`. Known divergences, all deliberate:
+
+- [ ] **Non-transactional writers don't block until the transaction ends** —
+  mongod parks a plain writer that hits a transaction's uncommitted write until
+  commit/abort. SecantusDB retries in a bounded backoff loop
+  (`storage._retry_write_conflicts`, ~5s deadline) and then surfaces 112
+  `WriteConflict`. A plain writer can therefore fail against a long-lived open
+  transaction where mongod would have waited the full
+  `transactionLifetimeLimitSeconds`.
+- [ ] **Cross-transaction unique-index enforcement can leak** — index-entry
+  keys embed the doc's id_key, so two different docs violating the same unique
+  constraint from a transaction + a concurrent writer don't collide on a WT key
+  and both commits can succeed. mongod prevents this with prepared conflicts.
+  Same-key (`_id`) conflicts ARE caught (WT write-write conflict → 112).
+- [ ] **Failpoint-injected errors on in-transaction statements don't abort the
+  transaction** — the `failCommand` short-circuit runs before transaction
+  resolution so retryable-commit tests (inject once, retry succeeds) work. If a
+  unified test asserts transient labels on injected in-txn statement errors,
+  the label must come from the failpoint's own `errorLabels` data.
+- [ ] **No `recoveryToken` / mongos pinning, no prepared transactions, no
+  `maxCommitTimeMS`, no `serverStatus.transactions` metrics, no
+  `afterClusterTime` enforcement** — multi-node machinery; out of scope.
+- [ ] **readConcern levels inside transactions are accept-and-ignore** — every
+  in-transaction read runs against the transaction's pinned WT snapshot
+  regardless of level (`snapshot` is exactly that; `local`/`majority` are
+  indistinguishable on a single node).
 
 ## 4. Out of scope (intentional, with reasoning)
 

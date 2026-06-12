@@ -19,6 +19,37 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Real multi-document transactions
+
+`commitTransaction` and `abortTransaction` were the last true stubs in
+the Python server: they returned `{ok: 1}` while every operation
+"inside" a driver transaction took effect immediately and could never
+roll back. They're real now. Each transaction owns a dedicated
+WiredTiger session — not the connection thread's, because pymongo can
+legally send a transaction's statements and its retryable commit on
+different pooled connections — and every statement runs with that
+session swapped into the storage layer, so snapshot isolation,
+read-your-own-writes, and rollback all come straight from the same
+engine mongod uses. Oplog entries are buffered and flushed at commit
+with one shared commit timestamp plus `lsid`/`txnNumber`, so change
+streams never see uncommitted writes and transaction events carry
+their session identity, exactly as in mongod.
+
+The server-side state machine (`secantus.transactions`) pins the
+spec's resolution table: statements against unknown or aborted
+transactions get 251 `NoSuchTransaction` with the
+`TransientTransactionError` label, committed ones get 256, stale
+`txnNumber`s get 225 `TransactionTooOld`, commit is idempotent (driver
+commit retries depend on it), and any failed statement aborts the
+transaction server-side. Write-write conflicts between transactions
+surface as statement-time 112 `WriteConflict` + transient label;
+`count` inside a transaction gets mongod's 263
+`OperationNotSupportedInTransaction`. Transactions idle past 60s
+(`transaction_lifetime_seconds`) are reaped, `endSessions`/
+`killSessions` abort their session's transaction, and `readConcern:
+"snapshot"` is now accepted inside transactions (every in-transaction
+read runs against the pinned WT snapshot anyway).
+
 ### The whole MongoDB CLI toolchain now runs against SecantusDB
 
 The MongoDB Database Tools are strict Go-driver clients, and two of
@@ -45,6 +76,18 @@ address.
 
 #### Added
 
+- Multi-document transactions: real `commitTransaction` /
+  `abortTransaction`, per-transaction WiredTiger sessions
+  (`Storage.begin/use/commit/abort_user_transaction`), the
+  `secantus.transactions.TransactionRegistry` state machine
+  (251/256/225/50911/263/112 + `TransientTransactionError` labels,
+  idempotent commit, implicit abort on a newer `txnNumber`, 60s
+  lifetime reaping via `SecantusDBServer(transaction_lifetime_seconds=…)`),
+  oplog buffering with a shared commit timestamp, and `lsid` /
+  `txnNumber` on change-stream events for transactional writes.
+  Conformance: `tests/test_transactions.py`,
+  `tests/test_transaction_registry.py`, `tests/test_storage_user_txn.py`;
+  divergence notes in backlog §3.4.
 - `top` command — mongod-shaped per-namespace reply (`totals` with
   `total`/`readLock`/`writeLock`/per-op `{time, count}` sections,
   RBAC `top` action granted via `clusterMonitor`); counters are zero
