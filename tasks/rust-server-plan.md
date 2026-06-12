@@ -423,9 +423,25 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   embryonic R8 gate. **Still a Python wrapper in `secantus` for ergonomic parity
   with `SecantusDBServer` is a follow-up.**
 
-- **R7 — Standalone `secantusdb` binary.** A `main` over the same crates for
-  non-Python users. Mostly free once R1–R5 are library crates; adds CLI arg
-  parsing (port the relevant bits of `cli.py`).
+- **R7 — Standalone `secantusdb` binary. ✅ DONE.** `crates/secantusdb`, a
+  `main` over the same crates the embedded handle (R6) uses: parse args → open
+  `secantus_storage::Storage` → `StorageAdapter` → `bind` → print the bound
+  address (the smoke test / a wrapping launcher reads it) → block until
+  SIGINT/SIGTERM (`ctrlc`, termination feature) → clean `stop()`. Arg parsing
+  is a WT-free module in `secantus-server` (`args.rs`: `--host` / `--port` /
+  `--storage-path` / `--auth` / `--standalone` / the four `--tls-*` flags;
+  hand-rolled, both `--flag value` and `--flag=value`; TLS pairing rules
+  enforced; 11 unit tests in the clean workspace). The bin crate links
+  WiredTiger → own `[workspace]`, excluded from the clean workspace, built +
+  smoked in the `storage-engine` CI job (Linux/macOS; Windows deferred —
+  `build.rs` probes `libwiredtiger.a/.so`, which MSVC doesn't produce).
+  Smoke: `tests/test_rust_binary_smoke.py` (launch on port 0, pymongo
+  handshake + CRUD round-trip, `--standalone` hello shape, bad-args exit 2,
+  clean SIGTERM exit 0); `invoke rust-binary-test` builds + runs it.
+  **Deferred:** the Python CLI's TOML config-file layer and the tuning flags
+  (`--log-level` / `--cache-size` / `--session-max` / `--sync-on-commit` /
+  oplog retention / noop heartbeat) — need the matching knobs on
+  `secantus_storage::Storage::open` first.
 
 - **R8 — Conformance gate (go/no-go).** Run the **unchanged** pymongo-driven
   suites (`test_crud.py` / `test_storage.py` / `test_indexes.py` /
@@ -433,6 +449,17 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   the **pymongo + Go/Node/Java/Ruby driver gauges** against the Rust server. The
   headline "MongoDB compatibility" number must not regress vs the Python server.
   This is the definition of "the Rust server is correct."
+
+  **Status: the pymongo gauge is wired.** `pymongo_validation/plugin.py` selects
+  the server via `SECANTUS_GAUGE_SERVER` (`python` default / `rust` → the
+  `_secantus_server.RustServer` embedded handle); `invoke validate --server rust`
+  writes `docs/validation-report-rust-server.md`; the weekly
+  `.github/workflows/validate.yml` matrix gained a `pymongo-rust-server` entry
+  that builds the storage-engine extension into the venv and runs the task. The
+  gate is read by comparing that report's pass rate against
+  `docs/validation-report.md`. The other-language gauges against the Rust server
+  are deferred (their daemon launchers need a `secantusdb`-binary launch path —
+  backlog §7).
 
 **Leftover storage work folded in** (was Phase-4 tail): re-home `$lookup` /
 `$geoNear` / `$out` / `$merge` storage-backed aggregation into `secantus-storage`

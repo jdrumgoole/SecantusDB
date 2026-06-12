@@ -194,6 +194,18 @@ testpaths = ["tests"]
 # on a published release, so they belong in `invoke validate-readme`
 # rather than every dev pytest run.
 addopts = "-n auto --dist=loadgroup -m 'not perf and not online and not slow'"
+# Per-test deadline (pytest-timeout, already in the dev extras). A hung
+# test otherwise blocks CI until the runner's 6-hour kill with zero
+# diagnostics — seen once in tests/test_admin_skeleton.py's websocket
+# change-stream tail, which pinned a core for 15+ minutes and never
+# produced a stack. 600s is ~4x the whole suite's wall-clock, so only a
+# genuine hang trips it. `thread` method dumps every thread's stack
+# before killing the worker (the signal method can't interrupt blocking
+# C calls and is unreliable under xdist). Ini keys (not addopts) so the
+# deadline survives runs that override addopts, e.g. the conformance
+# gauges' `-o addopts=`.
+timeout = 600
+timeout_method = "thread"
 markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
     "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",

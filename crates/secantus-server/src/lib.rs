@@ -19,6 +19,8 @@
 //! storage (the command `Storage` trait doesn't expose `current_cluster_time`
 //! yet — `hello`'s replica-set `lastWrite` uses a zero timestamp until then).
 
+pub mod args;
+
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};

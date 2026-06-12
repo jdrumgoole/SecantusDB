@@ -204,6 +204,30 @@ def rust_storage_py(c: Context) -> None:
     )
 
 
+# The standalone Rust server binary (R7), over the same crates the embedded
+# _secantus_server handle uses. Links WiredTiger, so it lives outside the clean
+# workspace like secantus-storage-adapter.
+_RUST_BINARY_DIR = "crates/secantusdb"
+
+
+@task(name="rust-binary-test")
+def rust_binary_test(c: Context) -> None:
+    """Build the standalone ``secantusdb`` binary and run its smoke test.
+
+    Builds the WiredTiger-linking bin crate, then launches it from
+    tests/test_rust_binary_smoke.py (ephemeral port, pymongo round-trip,
+    clean SIGTERM exit) in an isolated interpreter. Same WiredTiger /
+    libclang prerequisites as ``rust-wt-test``.
+    """
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build", pty=True)
+    c.run(
+        "uv run --no-project --with pymongo --with pytest "
+        "python -m pytest tests/test_rust_binary_smoke.py "
+        "-o addopts= -p no:cacheprovider -q",
+        pty=True,
+    )
+
+
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(
@@ -454,16 +478,37 @@ def docs_serve(c: Context, port: int = 8000) -> None:
     )
 
 
-@task
-def validate(c: Context) -> None:
+@task(
+    help={
+        "server": (
+            "Which SecantusDB server the gauge runs against: 'python' (the "
+            "pure-Python SecantusDBServer; the headline gauge, default) or "
+            "'rust' (the Rust server via the _secantus_server embedded "
+            "handle; the R8 conformance gate)."
+        ),
+    }
+)
+def validate(c: Context, server: str = "python") -> None:
     """Run pymongo's vendored test suite against an embedded SecantusDB.
 
     Generates docs/validation-report.md with a per-category pass / fail /
     skip / pass-rate breakdown — the "MongoDB compatibility" gauge.
+
+    ``--server rust`` runs the same unmodified suite against the Rust
+    server instead and writes docs/validation-report-rust-server.md (the
+    R8 gate from tasks/rust-server-plan.md). It needs the WT-linking
+    ``_secantus_server`` extension importable in the project venv — build
+    it into the editable install with::
+
+        SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON \\
+            uv sync --extra dev --reinstall-package SecantusDB
     """
     import pathlib
 
     from pymongo_validation.include_paths import DESELECT_TESTS, INCLUDE
+
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
 
     if not pathlib.Path("vendor/pymongo-tests/test").exists():
         c.run("git submodule update --init --recursive", pty=True)
@@ -471,6 +516,9 @@ def validate(c: Context) -> None:
     pathlib.Path(".validation").mkdir(exist_ok=True)
     paths = " ".join(INCLUDE)
     deselect = " ".join(f"--deselect={t}" for t in DESELECT_TESTS)
+    suffix = "" if server == "python" else "-rust-server"
+    raw_json = f".validation/raw{suffix}.json"
+    report = f"docs/validation-report{suffix}.md"
     # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
     # `-p no:xdist -o addopts=`: pymongo's tests aren't xdist-safe (shared DBs);
     #   override the project-wide `addopts="-n auto"` from pyproject.toml.
@@ -484,22 +532,23 @@ def validate(c: Context) -> None:
     # from our pyproject; this run uses positional paths.
     # PYTHONPATH=. so pytest can import our `pymongo_validation` plugin.
     c.run(
+        f"SECANTUS_GAUGE_SERVER={server} "
         "PYTHONPATH=. uv run --no-sync python -m pytest "
         "-c pyproject.toml "
         "-o addopts= -o testpaths= "
         "-p no:cacheprovider -p no:xdist -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
-        "--json-report --json-report-file=.validation/raw.json "
+        f"--json-report --json-report-file={raw_json} "
         f"--no-header --tb=no -q {deselect} {paths}",
         pty=True,
         warn=True,
     )
     c.run(
         "uv run --no-sync python -m pymongo_validation.generate_report "
-        ".validation/raw.json docs/validation-report.md",
+        f"--server {server} {raw_json} {report}",
         pty=True,
     )
-    print("\nWrote docs/validation-report.md")
+    print(f"\nWrote {report}")
 
 
 @task(name="validate-go")
