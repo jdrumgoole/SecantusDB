@@ -245,6 +245,13 @@ def project(
         }
         if isinstance(wall, object) and wall is not None:
             event["wallTime"] = wall
+        # Writes that happened inside a multi-document transaction carry
+        # the session/transaction identity on their oplog entries; mongod
+        # surfaces both on the change event.
+        if "lsid" in oplog_entry:
+            event["lsid"] = dict(oplog_entry["lsid"])
+        if "txnNumber" in oplog_entry:
+            event["txnNumber"] = oplog_entry["txnNumber"]
         if op == "u" and op_type == "update":
             o = oplog_entry.get("o", {})
             diff = o.get("diff") if isinstance(o, Mapping) else None

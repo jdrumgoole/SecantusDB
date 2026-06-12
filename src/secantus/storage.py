@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import functools
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ from typing import Any
 
 import bson
 import wiredtiger as wt
+from bson.int64 import Int64
 from bson.timestamp import Timestamp
 
 from secantus.diff import compute_update_description
@@ -488,6 +490,97 @@ class IndexConflict(Exception):
         # don't have the index spec handy.
         self.key_pattern = key_pattern
         self.key_value = key_value
+
+
+class WriteConflictError(Exception):
+    """A WiredTiger WT_ROLLBACK: two transactions touched the same item.
+
+    Inside a user (multi-document) transaction this surfaces to the
+    client as mongod's statement-time ``WriteConflict`` (code 112) with
+    the ``TransientTransactionError`` label, and the transaction is
+    aborted server-side. Outside a transaction the storage layer
+    retries the write briefly (a user transaction holds its uncommitted
+    writes until commit/abort) before giving up with the same error.
+    """
+
+
+def _is_wt_rollback(exc: BaseException) -> bool:
+    """True when a ``WiredTigerError`` is the WT_ROLLBACK conflict signal
+    (as opposed to e.g. WT_DUPLICATE_KEY). The SWIG binding raises a
+    typed ``WiredTigerRollbackError`` subclass; the message match is a
+    fallback for raise-sites that re-wrap into the base class."""
+    if isinstance(exc, wt.WiredTigerRollbackError):
+        return True
+    msg = str(exc)
+    return "WT_ROLLBACK" in msg or "conflict between concurrent operations" in msg
+
+
+# Non-transactional writers that hit a user transaction's uncommitted
+# write retry briefly instead of blocking: mongod blocks such writers
+# until the transaction commits or aborts, which we approximate with a
+# backoff loop bounded by this deadline (the transaction lifetime cap
+# is 60s, but a multi-second stall already covers the overwhelmingly
+# common test patterns; see tasks/backlog.md for the divergence note).
+_WRITE_CONFLICT_RETRY_DEADLINE_S = 5.0
+_WRITE_CONFLICT_RETRY_DELAY_S = 0.005
+_WRITE_CONFLICT_RETRY_DELAY_MAX_S = 0.02
+
+
+def _retry_write_conflicts(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Retry a whole public write method on WT_ROLLBACK.
+
+    Safe because the failed attempt's ``_batch_transaction`` already
+    rolled everything back and the per-collection lock is released on
+    the way out — the retry re-runs from scratch. Inside a user
+    transaction the conflict is NOT retried: it surfaces immediately so
+    the command layer can abort the transaction with mongod's
+    statement-time ``WriteConflict``.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: Storage, *args: Any, **kwargs: Any) -> Any:
+        deadline: float | None = None
+        delay = _WRITE_CONFLICT_RETRY_DELAY_S
+        while True:
+            try:
+                return fn(self, *args, **kwargs)
+            except (WriteConflictError, wt.WiredTigerError) as exc:
+                if not isinstance(exc, WriteConflictError) and not _is_wt_rollback(exc):
+                    raise
+                if getattr(self._tls, "user_txn", None) is not None:
+                    raise
+                now = _time.monotonic()
+                if deadline is None:
+                    deadline = now + _WRITE_CONFLICT_RETRY_DEADLINE_S
+                if now >= deadline:
+                    if isinstance(exc, WriteConflictError):
+                        raise
+                    raise WriteConflictError(str(exc)) from exc
+                _time.sleep(delay)
+                delay = min(delay * 2, _WRITE_CONFLICT_RETRY_DELAY_MAX_S)
+
+    return wrapper
+
+
+class UserTransactionHandle:
+    """Storage-side state of one multi-document transaction.
+
+    Knows nothing about ``lsid`` / ``txnNumber`` — that's the
+    ``secantus.transactions`` registry's layer. Carries the dedicated
+    WT session, its cursor cache (same ``(table, overwrite)`` keying as
+    the per-thread cache), and the buffered oplog entries + pre-images
+    that ``commit_user_transaction`` flushes.
+    """
+
+    __slots__ = ("session", "cursors", "began", "closed", "oplog_entries", "pre_images")
+
+    def __init__(self, session: Any) -> None:
+        self.session = session
+        self.cursors: dict[tuple[str, bool], Any] = {}
+        self.began = False
+        self.closed = False
+        self.oplog_entries: list[dict[str, Any]] = []
+        self.pre_images: list[bytes | None] = []
 
 
 class DocumentValidationError(Exception):
@@ -1173,7 +1266,24 @@ class Storage:
         caller's prebuilt ``entries`` list is discarded. The change-stream
         condvar is still notified so any tailable getMore wakes up and
         observes the (empty) state.
+
+        When a user (multi-document) transaction is installed on this
+        thread, entries are **buffered** on the transaction handle and
+        nothing is written or notified: seqs must be minted at commit
+        time, because a statement-time seq could become visible *behind*
+        a concurrent change-stream reader's position and the event would
+        be silently skipped. ``commit_user_transaction`` flushes the
+        buffer through this same method (with the buffering hook
+        disarmed) inside the transaction's WT session.
         """
+        handle = getattr(self._tls, "user_txn", None)
+        if handle is not None:
+            if self.enable_oplog and entries:
+                if pre_images is None:
+                    pre_images = [None] * len(entries)
+                handle.oplog_entries.extend(entries)
+                handle.pre_images.extend(pre_images)
+            return 0
         if not self.enable_oplog:
             with self._oplog_cv:
                 self._oplog_cv.notify_all()
@@ -1932,7 +2042,15 @@ class Storage:
         accumulate per-doc errors (e.g. ``ordered=False`` insert)
         should NOT raise out of the block — they handle the per-doc
         errors locally and let the surviving writes commit.
+
+        Inside a user (multi-document) transaction this is a no-op
+        passthrough: WT doesn't nest transactions, and the statement's
+        writes must stay uncommitted in the user transaction until its
+        ``commitTransaction``.
         """
+        if getattr(self._tls, "user_txn", None) is not None:
+            yield self._session()
+            return
         session = self._session()
         # Cached cursors must be reset before begin_transaction so they
         # don't carry a stale snapshot from before the transaction
@@ -1980,6 +2098,10 @@ class Storage:
         ``count_matching``, ``list_*``, ``explain_plan``) so cross-
         connection visibility matches real ``mongod``.
         """
+        if getattr(self._tls, "user_txn", None) is not None:
+            # A user transaction's whole point is the pinned snapshot:
+            # reads inside it must keep seeing the transaction's view.
+            return
         s = getattr(self._tls, "session", None)
         if s is None:
             return
@@ -1989,6 +2111,141 @@ class Storage:
             # (``_batch_transaction`` is write-only), so the exception
             # path is defensive — log via ``suppress`` and move on.
             s.reset_snapshot()
+
+    # -- user (multi-document) transactions --------------------------------
+    #
+    # A user transaction owns a dedicated WT session, NOT the connection
+    # thread's ``threading.local`` one: pymongo can legally send a
+    # transaction's statements and its retryable commit on different
+    # pooled connections (= different server threads). Statements run
+    # with the transaction's session/cursors swapped into ``_tls`` so
+    # every existing storage path (unique probes, index writes,
+    # ``_ensure_collection``, ``find_matching``) transparently executes
+    # inside the WT transaction — read-your-own-writes and the pinned
+    # snapshot fall out for free. The command layer serializes access
+    # per transaction; these primitives assume no two threads install
+    # the same handle concurrently.
+
+    def begin_user_transaction(self) -> UserTransactionHandle:
+        """Open a dedicated WT session for a multi-document transaction.
+
+        The WT ``begin_transaction`` itself happens lazily on the first
+        ``use_user_transaction`` entry so the snapshot pins at the
+        transaction's first statement (mongod semantics).
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("storage is closed")
+            session = self._conn.open_session()
+            # Registered so ``close()``'s sweep rolls back leftovers.
+            self._all_sessions.append(session)
+        return UserTransactionHandle(session)
+
+    @contextlib.contextmanager
+    def use_user_transaction(self, handle: UserTransactionHandle) -> Any:
+        """Run the body with ``handle``'s session installed as this
+        thread's storage session, arming the oplog buffering hook."""
+        if not handle.began:
+            handle.session.begin_transaction()
+            handle.began = True
+        with self._install_txn_session(handle):
+            self._tls.user_txn = handle
+            try:
+                yield
+            finally:
+                self._tls.user_txn = None
+
+    def commit_user_transaction(
+        self,
+        handle: UserTransactionHandle,
+        *,
+        lsid_doc: Mapping[str, Any] | None = None,
+        txn_number: int | None = None,
+    ) -> int:
+        """Flush the buffered oplog + commit the WT transaction.
+
+        All buffered entries get one shared commit ``Timestamp``
+        (mongod stamps every op in a transaction with the commit time)
+        plus ``lsid`` / ``txnNumber`` for change-stream events. The
+        oplog/preimage rows are written through the transaction's own
+        session *before* ``commit_transaction``, so data and oplog
+        become visible atomically. Returns the last oplog seq emitted.
+
+        On failure the transaction is rolled back and the exception
+        propagates — a failed WT commit cannot be retried into success.
+        """
+        last_seq = 0
+        try:
+            if handle.began:
+                entries = handle.oplog_entries
+                pre_images = handle.pre_images
+                if entries and self.enable_oplog:
+                    # Mint the shared commit timestamp before installing
+                    # the txn session: ``current_cluster_time`` persists
+                    # oplog meta through the calling thread's session and
+                    # that write must not ride inside the transaction.
+                    ts = self.current_cluster_time()
+                    wall = _dt.datetime.now(_dt.timezone.utc)
+                    for entry in entries:
+                        entry.setdefault("ts", ts)
+                        entry.setdefault("wall", wall)
+                        if lsid_doc is not None:
+                            entry["lsid"] = dict(lsid_doc)
+                        if txn_number is not None:
+                            entry["txnNumber"] = Int64(txn_number)
+                with self._install_txn_session(handle):
+                    # ``_tls.user_txn`` is deliberately NOT set here, so
+                    # ``_emit_oplog`` takes its real write path on the
+                    # transaction's session instead of re-buffering.
+                    if entries:
+                        last_seq = self._emit_oplog(entries, pre_images)
+                    handle.session.commit_transaction()
+        except Exception:
+            self.abort_user_transaction(handle)
+            raise
+        self._close_user_txn_session(handle)
+        # ``_emit_oplog`` notified before the WT commit (same order as
+        # the non-transactional write path); one more notify after the
+        # commit guarantees tailable getMore waiters re-poll against
+        # the now-visible rows.
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+        return last_seq
+
+    def abort_user_transaction(self, handle: UserTransactionHandle) -> None:
+        """Roll back and release the transaction's WT session. Idempotent."""
+        if handle.closed:
+            return
+        if handle.began:
+            with contextlib.suppress(Exception):
+                handle.session.rollback_transaction()
+        self._close_user_txn_session(handle)
+
+    @contextlib.contextmanager
+    def _install_txn_session(self, handle: UserTransactionHandle) -> Any:
+        tls = self._tls
+        prev_session = getattr(tls, "session", None)
+        prev_cursors = getattr(tls, "cursors", {})
+        tls.session = handle.session
+        tls.cursors = handle.cursors
+        try:
+            yield
+        finally:
+            tls.session = prev_session
+            tls.cursors = prev_cursors
+
+    def _close_user_txn_session(self, handle: UserTransactionHandle) -> None:
+        if handle.closed:
+            return
+        handle.closed = True
+        for c in handle.cursors.values():
+            with contextlib.suppress(Exception):
+                c.close()
+        handle.cursors.clear()
+        with contextlib.suppress(Exception):
+            handle.session.close()
+        with self._lock, contextlib.suppress(ValueError):
+            self._all_sessions.remove(handle.session)
 
     def _cursor(self, table: str, *, overwrite: bool = True) -> Any:
         self._session()
@@ -2106,6 +2363,7 @@ class Storage:
             opts = self._coll_options(db, coll) or {}
             return bool(opts.get("capped"))
 
+    @_retry_write_conflicts
     def insert(
         self,
         db: str,
@@ -2115,6 +2373,9 @@ class Storage:
         ordered: bool = True,
         journal: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
+        # Materialized so the conflict-retry wrapper can safely re-run
+        # the whole method (a generator would arrive exhausted).
+        docs = list(docs)
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
@@ -2174,7 +2435,12 @@ class Storage:
                 doc_cur.set_value(blob)
                 try:
                     doc_cur.insert()
-                except wt.WiredTigerError:
+                except wt.WiredTigerError as exc:
+                    if _is_wt_rollback(exc):
+                        # Concurrency conflict, not a duplicate key —
+                        # surface for transaction/retry handling instead
+                        # of lying with an E11000.
+                        raise WriteConflictError(str(exc)) from exc
                     errors.append(
                         {
                             "index": index,
@@ -2855,6 +3121,7 @@ class Storage:
                 sizes[name] = sizes.get(name, 0) + len(packed)
             return sizes
 
+    @_retry_write_conflicts
     def update_matching(
         self,
         db: str,
@@ -3018,6 +3285,7 @@ class Storage:
                 self._emit_oplog(oplog_entries, pre_images)
         return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
 
+    @_retry_write_conflicts
     def delete_matching(
         self,
         db: str,

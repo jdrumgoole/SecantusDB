@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-12 — SecantusDB 0.5.2b20 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-12 — SecantusDB 0.5.2b18 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -30,7 +30,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_default_exports.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_errors.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
-| `test_examples.py` | 13 | 5 | 0 | 2 | 20 | 72.2% |
+| `test_examples.py` | 14 | 4 | 0 | 2 | 20 | 77.8% |
 | `test_json_util.py` | 24 | 0 | 0 | 0 | 24 | 100.0% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
 | `test_objectid.py` | 15 | 0 | 0 | 0 | 15 | 100.0% |
@@ -42,12 +42,13 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
 | `test_son.py` | 11 | 0 | 0 | 0 | 11 | 100.0% |
 | `test_timestamp.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
+| `test_transactions_unified.py` | 92 | 3 | 0 | 172 | 267 | 96.8% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1079** | **63** | **0** | **304** | **1446** | **94.5%** |
+| **Overall** | **1172** | **65** | **0** | **476** | **1713** | **94.7%** |
 
-## Failures (63)
+## Failures (65)
 
 First 30 failure node-ids for manual triage:
 
@@ -83,7 +84,7 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_filter
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 ```
-... and 33 more (see raw JSON).
+... and 35 more (see raw JSON).
 
 ## How this is generated
 
