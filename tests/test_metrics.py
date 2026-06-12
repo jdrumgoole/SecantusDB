@@ -100,6 +100,22 @@ def server(tmp_path):
         yield srv
 
 
+def test_server_status_carries_secantus_marker(server: SecantusDBServer) -> None:
+    """The `secantus` subdocument categorically identifies a SecantusDB
+    server — real mongod never has the key. The conformance-gauge
+    tripwire (pymongo_validation/plugin.py) relies on it to refuse to
+    measure a foreign server."""
+    import secantus
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        status = mc["admin"].command("serverStatus")
+    finally:
+        mc.close()
+    assert status["secantus"]["server"] == "python"
+    assert status["secantus"]["version"] == secantus.__version__
+
+
 def test_server_status_surfaces_real_uptime(server: SecantusDBServer) -> None:
     time.sleep(0.05)  # let some uptime accumulate
     mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
