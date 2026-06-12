@@ -66,13 +66,15 @@ binary; all skip gracefully when the tool isn't on PATH):
 - `mongofiles` (GridFS) — `tests/test_mongofiles.py` (put/get/list/delete,
   cross-checked against pymongo's gridfs).
 
+CI installs mongosh + Database Tools on the Linux and macOS `test.yml` cells
+(apt repo / mongodb/brew tap) so the tool tests run continuously there.
+Windows is intentionally uncovered: the mongosh tests skip on win32 by design
+(PowerShell `--eval` quoting), and a choco database-tools install is slow and
+flake-prone for the marginal remainder. Per-tool caveats live in the test
+files' docstrings.
+
 Still open:
 
-- [ ] **CI doesn't install mongosh / MongoDB Database Tools**, so every tool
-  test above skips on GitHub runners — they only run on dev machines that have
-  the Homebrew packages. Add an install step (or a dedicated job) to
-  `test.yml` or the weekly `validate.yml` so the coverage is continuous, and
-  record per-tool caveats in `/conformance-gauges`.
 - [ ] **Compass (GUI)** — Electron, not CLI-automatable in CI. Cover the
   *operations Compass issues* (schema sample via `$sample`, `$collStats`,
   `dbStats`, index list, `explain`) as headless command tests rather than

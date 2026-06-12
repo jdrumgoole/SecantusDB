@@ -57,6 +57,10 @@ address.
 
 #### Changed
 
+- CI: the Linux and macOS test cells install mongosh + MongoDB Database
+  Tools, so the CLI-tool conformance tests run continuously instead of
+  skipping on runners (Windows omitted — mongosh tests skip on win32 by
+  design).
 - CI: all `actions/*` workflow actions bumped to their Node-24 majors
   (checkout v5, setup-python v6, upload-artifact v6, download-artifact
   v7, cache v5, setup-go v6, setup-java v5, setup-node v5) ahead of

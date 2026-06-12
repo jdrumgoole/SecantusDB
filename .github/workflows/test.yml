@@ -64,6 +64,28 @@ jobs:
         # publish-time wheel builds.
         run: choco install -y swig
 
+      - name: Install MongoDB CLI tools (Linux)
+        if: runner.os == 'Linux'
+        # mongosh + Database Tools so the CLI-tool conformance tests
+        # (tests/test_mongosh.py, test_mongodump_restore.py,
+        # test_mongoimport_export.py, test_mongofiles.py,
+        # test_mongostat_mongotop.py) run instead of skipping — they
+        # skipif the binaries are absent. Windows is intentionally
+        # omitted: the mongosh tests skip on win32 by design
+        # (PowerShell --eval quoting), leaving only marginal coverage
+        # for a slow, flake-prone choco install.
+        run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+          sudo apt-get update
+          sudo apt-get install -y mongodb-mongosh mongodb-database-tools
+
+      - name: Install MongoDB CLI tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew tap mongodb/brew
+          brew install mongosh mongodb-database-tools
+
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
