@@ -1301,6 +1301,16 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         sort = inner.get("sort")
         hint = inner.get("hint")
         collation = inner.get("collation")
+        # Mirror ``aggregate``'s own planning: a leading ``$match`` is
+        # lifted into the initial fetch, so explain must report the
+        # same index decision (and execute against the same filter)
+        # the real pipeline run would use.
+        if cmd_name == "aggregate" and not filter_:
+            pipeline_head = (inner.get("pipeline") or [{}])[0]
+            if isinstance(pipeline_head, Mapping) and "$match" in pipeline_head:
+                lifted = pipeline_head["$match"]
+                if isinstance(lifted, Mapping):
+                    filter_ = dict(lifted)
     # MongoDB rejects ``explain`` paired with a journaled write concern
     # (``writeConcern: {j: true}`` or ``{w: "majority"}``). The explain
     # cycle is a no-op read; combining it with a write concern is
@@ -1367,6 +1377,35 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         )
     else:
         plan = {"kind": "COLLSCAN"}
+    # ``executionStats`` / ``allPlansExecution`` really execute the
+    # query, like mongod — Compass renders nReturned /
+    # totalDocsExamined in its explain tab, and hardcoded zeroes would
+    # display as "0 documents returned" for a matching query.
+    n_returned = 0
+    docs_examined = 0
+    keys_examined = 0
+    exec_millis = 0
+    if verbosity != "queryPlanner" and coll:
+        started = _time.monotonic()
+        n_returned = len(
+            ctx.storage.find_matching(
+                ctx.db_name,
+                coll,
+                filter_,
+                sort=sort,
+                hint=hint,
+                collation=collation,
+            )
+        )
+        exec_millis = int((_time.monotonic() - started) * 1000)
+        if plan["kind"] == "IXSCAN":
+            # Exact-bounds index scans fetch one doc per matching key;
+            # we don't instrument residual-filter key scans, so this is
+            # mongod's reported shape for the common case.
+            keys_examined = n_returned
+            docs_examined = n_returned
+        else:
+            docs_examined = ctx.storage.count_matching(ctx.db_name, coll, {})
     if plan["kind"] == "IXSCAN":
         winning_plan = {
             "stage": "FETCH",
@@ -1380,12 +1419,12 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
         execution_stage = {
             "stage": "FETCH",
-            "nReturned": 0,
-            "inputStage": {"stage": "IXSCAN", "nReturned": 0},
+            "nReturned": n_returned,
+            "inputStage": {"stage": "IXSCAN", "nReturned": n_returned},
         }
     else:
         winning_plan = {"stage": "COLLSCAN", "filter": filter_}
-        execution_stage = {"stage": "COLLSCAN", "nReturned": 0}
+        execution_stage = {"stage": "COLLSCAN", "nReturned": n_returned}
     query_planner = {
         "namespace": namespace,
         "indexFilterSet": False,
@@ -1411,10 +1450,10 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         pipeline = inner.get("pipeline") or []
         execution_stats = {
             "executionSuccess": True,
-            "nReturned": 0,
-            "executionTimeMillis": 0,
-            "totalKeysExamined": 0,
-            "totalDocsExamined": 0,
+            "nReturned": n_returned,
+            "executionTimeMillis": exec_millis,
+            "totalKeysExamined": keys_examined,
+            "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
         cursor_stage: dict[str, Any] = {
@@ -1456,10 +1495,10 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if verbosity != "queryPlanner":
         reply["executionStats"] = {
             "executionSuccess": True,
-            "nReturned": 0,
-            "executionTimeMillis": 0,
-            "totalKeysExamined": 0,
-            "totalDocsExamined": 0,
+            "nReturned": n_returned,
+            "executionTimeMillis": exec_millis,
+            "totalKeysExamined": keys_examined,
+            "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
     return reply

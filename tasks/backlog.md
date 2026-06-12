@@ -73,13 +73,11 @@ Windows is intentionally uncovered: the mongosh tests skip on win32 by design
 flake-prone for the marginal remainder. Per-tool caveats live in the test
 files' docstrings.
 
-Still open:
-
-- [ ] **Compass (GUI)** — Electron, not CLI-automatable in CI. Cover the
-  *operations Compass issues* (schema sample via `$sample`, `$collStats`,
-  `dbStats`, index list, `explain`) as headless command tests rather than
-  driving the GUI. Track separately; document any command it needs that's
-  stubbed.
+Compass is covered headlessly in `tests/test_compass_commands.py`: the full
+command surface the GUI issues (instance probes, `$collStats` / `$sample` /
+`$indexStats`, explain at both verbosities, performance-tab polls,
+`atlasVersion` → CommandNotFound) is pinned without driving Electron. Driving
+the actual GUI stays out of scope.
 
 ## 4. Out of scope (intentional, with reasoning)
 

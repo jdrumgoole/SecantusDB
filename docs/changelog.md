@@ -43,6 +43,16 @@ traceback through the catch-all handler, and a request racing
 `stop()`'s socket close no longer raises `OSError` reading the server
 address.
 
+Compass gets the same treatment, headlessly: every command the GUI
+issues — the connect-time instance probes, `$collStats` storage
+figures, `$sample` schema analysis, `$indexStats`, both explain
+verbosities, and the performance-tab polls — is pinned by tests. That
+sweep caught `explain`'s `executionStats` reporting hardcoded zeroes
+(Compass would render "0 documents returned" for any query); the
+server now really executes the query at `executionStats` verbosity,
+and aggregate-explain lifts a leading `$match` so it reports the same
+IXSCAN decision the real pipeline run uses.
+
 #### Added
 
 - `top` command — mongod-shaped per-namespace reply (`totals` with
@@ -54,6 +64,10 @@ address.
 - CLI-tool conformance tests: `tests/test_mongoimport_export.py`,
   `tests/test_mongofiles.py`, `tests/test_mongostat_mongotop.py`, and
   a `bsondump` dump-format test in `tests/test_mongodump_restore.py`.
+- Compass headless coverage: `tests/test_compass_commands.py` pins the
+  full command surface MongoDB Compass issues (instance probes,
+  `$collStats`/`$sample`/`$indexStats`, explain at both verbosities,
+  performance-tab polls, `atlasVersion` → CommandNotFound).
 - `serverStatus` now carries a `secantus` subdocument
   (`{server: "python"|"rust", version: ...}`) on both servers —
   categorical self-identification that real `mongod` never has. The
@@ -91,6 +105,12 @@ address.
 - `mongostat` no longer panics against SecantusDB (missing
   `serverStatus.mem`); `mongotop` no longer fails with
   `CommandNotFound`.
+- `explain` with `executionStats` / `allPlansExecution` verbosity now
+  really executes the query and reports actual `nReturned` /
+  `totalDocsExamined` / `totalKeysExamined` / `executionTimeMillis`
+  instead of hardcoded zeroes; aggregate-explain lifts a leading
+  `$match` into the reported plan, matching the real pipeline run's
+  index decision.
 - Abrupt client resets (RST close, routine for Go-driver tools) are
   treated as normal disconnects instead of logging `unhandled error on
   connection N` tracebacks.
