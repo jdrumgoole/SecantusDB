@@ -19,6 +19,54 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### The whole MongoDB CLI toolchain now runs against SecantusDB
+
+The MongoDB Database Tools are strict Go-driver clients, and two of
+them couldn't talk to SecantusDB at all: `mongostat` crashed with a Go
+nil-pointer panic because `serverStatus` had no `mem` section (the
+tool dereferences `mem.supported` unguarded), and `mongotop` failed
+outright because the `top` command didn't exist. Both work now —
+`serverStatus` reports a real resident-set size under `mem`, and `top`
+returns mongod's exact per-namespace shape (counters are zero pending
+per-namespace instrumentation; mongotop renders it like an idle
+server).
+
+Every connectable tool in the toolchain is pinned by an end-to-end
+test in the default suite: `mongosh`, `mongodump`/`mongorestore`,
+`mongoimport`/`mongoexport` (NDJSON + CSV, plus canonical-extended-JSON
+type fidelity for ObjectId / datetime / Decimal128 / Int64 / Binary),
+`bsondump`, `mongofiles` (GridFS put/get/list/delete against pymongo's
+gridfs), and single-iteration `mongostat` / `mongotop` probes. The
+Go tools also exposed two connection-lifecycle nits, now fixed: an
+RST-style hang-up (how Go's pool drops connections) no longer dumps a
+traceback through the catch-all handler, and a request racing
+`stop()`'s socket close no longer raises `OSError` reading the server
+address.
+
+#### Added
+
+- `top` command — mongod-shaped per-namespace reply (`totals` with
+  `total`/`readLock`/`writeLock`/per-op `{time, count}` sections,
+  RBAC `top` action granted via `clusterMonitor`); counters are zero
+  (no per-namespace timing instrumentation yet, see backlog §2).
+- `serverStatus.mem` section (`bits`/`resident`/`virtual`/`supported`)
+  — `resident` is real (getrusage max-RSS).
+- CLI-tool conformance tests: `tests/test_mongoimport_export.py`,
+  `tests/test_mongofiles.py`, `tests/test_mongostat_mongotop.py`, and
+  a `bsondump` dump-format test in `tests/test_mongodump_restore.py`.
+
+#### Fixed
+
+- `mongostat` no longer panics against SecantusDB (missing
+  `serverStatus.mem`); `mongotop` no longer fails with
+  `CommandNotFound`.
+- Abrupt client resets (RST close, routine for Go-driver tools) are
+  treated as normal disconnects instead of logging `unhandled error on
+  connection N` tracebacks.
+- Shutdown race: a request arriving while `stop()` closes the listen
+  socket no longer raises `OSError: Bad file descriptor` from the
+  address probe.
+
 ## [0.5.2b15] — 2026-05-22
 
 ### WT session leak fix unblocks the rust crud unified runner

@@ -81,3 +81,46 @@ def test_dump_restore_round_trip(tmp_path: Path) -> None:
             assert index_names == {"_id_", "year_1"}
         finally:
             client.close()
+
+
+BSONDUMP = shutil.which("bsondump")
+
+
+@pytest.mark.skipif(BSONDUMP is None, reason="bsondump not on PATH")
+def test_bsondump_decodes_dump_output(tmp_path: Path) -> None:
+    """bsondump round-trips the .bson mongodump produced — pins the dump
+    file format itself, independent of mongorestore."""
+    import json
+
+    docs = [{"_id": i, "n": i * 10} for i in range(4)]
+
+    wt_dir = tmp_path / "secantus-wt"
+    wt_dir.mkdir()
+    with SecantusDBServer(port=0, storage_path=str(wt_dir)) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            client["shop"]["items"].insert_many(docs)
+            dump_dir = tmp_path / "dump"
+            assert MONGODUMP is not None
+            subprocess.run(
+                [MONGODUMP, "--uri", server.uri, "--db", "shop", "-o", str(dump_dir)],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+        finally:
+            client.close()
+
+    assert BSONDUMP is not None  # narrowed by skipif
+    result = subprocess.run(
+        [BSONDUMP, "--type", "json", str(tmp_path / "dump" / "shop" / "items.bson")],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    # bsondump emits canonical extended JSON, one doc per line.
+    decoded = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert decoded == [
+        {"_id": {"$numberInt": str(i)}, "n": {"$numberInt": str(i * 10)}} for i in range(4)
+    ]

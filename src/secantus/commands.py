@@ -4,6 +4,7 @@ import datetime as _dt
 import logging
 import os
 import random as _random
+import sys
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -65,6 +66,7 @@ from secantus.rbac import (
     A_RENAME_COLL_SAME_DB,
     A_REVOKE_ROLE,
     A_SERVER_STATUS,
+    A_TOP,
     A_UPDATE,
     A_VIEW_ROLE,
     A_VIEW_USER,
@@ -1036,6 +1038,33 @@ def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _mem_section() -> dict[str, Any]:
+    """``mem`` in mongod's serverStatus shape.
+
+    mongostat dereferences ``mem.supported`` with no nil guard
+    (status/readers.go ``ReadMapped``), so the section must always be
+    present. ``resident`` is real (getrusage max-RSS, normalised to MB —
+    ru_maxrss is bytes on macOS, KiB on Linux); ``virtual`` isn't
+    portably readable without psutil, so it's reported as 0 rather than
+    invented.
+    """
+    resident_mb = 0
+    try:
+        import resource
+
+        ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+        resident_mb = int(ru_maxrss / divisor)
+    except Exception:  # pragma: no cover - resource absent on Windows
+        pass
+    return {
+        "bits": 64,
+        "resident": resident_mb,
+        "virtual": 0,
+        "supported": True,
+    }
+
+
 def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Real metrics from :class:`secantus.metrics.Metrics` if the server
     constructed one (production path); falls back to zeroed values for
@@ -1047,6 +1076,7 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "process": "secantus",
         "pid": os.getpid(),
         "localTime": _dt.datetime.now(_dt.timezone.utc),
+        "mem": _mem_section(),
         "ok": 1.0,
     }
     if ctx.metrics is not None:
@@ -1074,6 +1104,43 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         )
     return base
+
+
+def _top(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """mongod-shaped ``top``: one entry per existing namespace.
+
+    SecantusDB doesn't instrument per-namespace operation timing, so
+    every counter is zero — mongotop renders an all-zero table the same
+    way it does for an idle mongod. The shape (``note`` + per-ns
+    ``total``/``readLock``/``writeLock``/per-op sections, each
+    ``{time, count}``) is what mongo-tools' decoder requires; it skips
+    the ``note`` key explicitly.
+    """
+    if ctx.db_name != "admin":
+        return {
+            "ok": 0.0,
+            "errmsg": "top may only be run against the admin database.",
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    totals: dict[str, Any] = {"note": "all times in microseconds"}
+    for db in ctx.storage.list_databases():
+        for coll in ctx.storage.list_collections(db):
+            totals[f"{db}.{coll}"] = {
+                section: {"time": 0, "count": 0}
+                for section in (
+                    "total",
+                    "readLock",
+                    "writeLock",
+                    "queries",
+                    "getmore",
+                    "insert",
+                    "update",
+                    "remove",
+                    "commands",
+                )
+            }
+    return {"totals": totals, "ok": 1.0}
 
 
 def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
@@ -4513,6 +4580,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "secantusAdmin.restoreArchive": _secantus_admin_restore_archive,
     "explain": _explain,
     "serverStatus": _server_status,
+    "top": _top,
     "getCmdLineOpts": _get_cmd_line_opts,
     "getParameter": _get_parameter,
     "connectionStatus": _connection_status,
@@ -4656,6 +4724,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "revokeRolesFromRole": (A_REVOKE_ROLE, SCOPE_DATABASE),
     # Cluster / introspection
     "serverStatus": (A_SERVER_STATUS, SCOPE_CLUSTER),
+    "top": (A_TOP, SCOPE_CLUSTER),
     "hostInfo": (A_HOST_INFO, SCOPE_CLUSTER),
     "getCmdLineOpts": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
     # ``getParameter`` exposes server-internal config (featureFlag state,

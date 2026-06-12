@@ -316,6 +316,13 @@ class SecantusDBServer:
                         message = read_message(conn)
                     except ConnectionClosed:
                         return
+                    except ConnectionResetError:
+                        # Abrupt hang-up (RST instead of FIN) — the Go
+                        # driver's tools (mongodump, mongostat, ...) close
+                        # pooled connections this way routinely. A normal
+                        # disconnect, not an error worth a traceback.
+                        logger.debug("client %d reset connection", connection_id)
+                        return
                     except TimeoutError:
                         # Idle timeout fired — drop the connection so the
                         # thread can be reaped instead of pinned forever.
@@ -353,7 +360,10 @@ class SecantusDBServer:
                     op = message.op
                     try:
                         server_addr = self.address if self._socket is not None else None
-                    except RuntimeError:
+                    except (RuntimeError, OSError):
+                        # OSError: stop() closed the listen socket between
+                        # the None check and getsockname() — shutdown race,
+                        # treat the same as "not started".
                         server_addr = None
                     if isinstance(op, OpMsg):
                         body = _merge_op_msg_body(op)

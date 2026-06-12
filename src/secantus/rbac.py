@@ -108,6 +108,7 @@ A_HOST_INFO = "hostInfo"
 A_GET_CMD_LINE_OPTS = "getCmdLineOpts"
 A_GET_LOG = "getLog"
 A_INPROG = "inprog"
+A_TOP = "top"
 A_KILLOP = "killop"
 A_FSYNC = "fsync"
 A_ENABLE_PROFILER = "enableProfiler"
@@ -208,6 +209,7 @@ _CLUSTER_MONITOR_ACTIONS: frozenset[str] = frozenset(
         A_GET_CMD_LINE_OPTS,
         A_GET_LOG,
         A_INPROG,
+        A_TOP,
     }
 )
 
