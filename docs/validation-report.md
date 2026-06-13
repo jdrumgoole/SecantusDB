@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-13 — SecantusDB 0.5.2b29 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-13 — SecantusDB 0.5.2b30 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -12,7 +12,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
 | `test_change_stream.py` | 100 | 6 | 0 | 49 | 155 | 94.3% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
-| `test_collection.py` | 81 | 6 | 0 | 4 | 91 | 93.1% |
+| `test_collection.py` | 82 | 5 | 0 | 4 | 91 | 94.3% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
@@ -36,9 +36,9 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1003** | **25** | **0** | **475** | **1503** | **97.6%** |
+| **Overall** | **1004** | **24** | **0** | **475** | **1503** | **97.7%** |
 
-## Failures (25)
+## Failures (24)
 
 First 30 failure node-ids for manual triage:
 
@@ -49,7 +49,6 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExp
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_create_events_on_views_are_reported
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_modify_events_are_reported
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_new_fields_on_change_stream_events_are_handled_appropriately
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_error_code
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_exhaust
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_dont_drop_dups
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_filter
