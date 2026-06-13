@@ -38,6 +38,15 @@ impl StorageAdapter {
 }
 
 impl CmdStorage for StorageAdapter {
+    fn peek_cluster_time(&self) -> bson::Timestamp {
+        // Gossip must never fail a command — fall back to a zero timestamp
+        // if the (read-only, mints-once-on-virgin) peek somehow errors.
+        self.inner.peek_cluster_time().unwrap_or(bson::Timestamp {
+            time: 0,
+            increment: 0,
+        })
+    }
+
     fn insert(
         &self,
         db: &str,
