@@ -237,11 +237,11 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   (`$add`/`$subtract`/`$multiply`/`$divide`/`$mod` now raise mongod's
   errors on non-numeric operands, divide/mod-by-zero, and date misuse;
   Rust engine defers those cases — parity corpus extended first).
-  Still open from the triage:
-  1. Change-stream event misclassification: an update producing
-     `truncatedArrays` is projected as `replace` instead of `update`
-     (`test_Test_array_truncation`); also blocks ShowExpandedEvents tests.
-  2. Timeseries collections must not enforce `_id` uniqueness
+  Pipeline-update replace-vs-update misclassification also FIXED
+  (`test_Test_array_truncation` passes; the remaining ShowExpandedEvents /
+  disambiguatedPaths failures are separate unimplemented features, not the
+  classifier). Still open from the triage:
+  1. Timeseries collections must not enforce `_id` uniqueness
      (`test_insertMany_with_duplicate_ids` — the one surviving E11000).
 - [ ] **Go gauge: CI runs ~1/5 of the local set** — CI weekly artifacts have
   always reported ~450 tests (e.g. 401/453 on 2026-06-08, 447/900 on
