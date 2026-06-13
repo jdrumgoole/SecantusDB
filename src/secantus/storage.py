@@ -655,6 +655,11 @@ class BadHint(Exception):
     """The ``hint`` passed to ``find_matching`` doesn't name an existing index."""
 
 
+class MinMaxKeyError(Exception):
+    """Cursor ``min`` / ``max`` bounds don't match the hinted index key
+    pattern (mongod surfaces this as 51174)."""
+
+
 class Storage:
     def __init__(
         self,
@@ -2614,6 +2619,8 @@ class Storage:
         hint: str | Mapping[str, Any] | None = None,
         let: dict[str, Any] | None = None,
         collation: Any = None,
+        min_bound: Mapping[str, Any] | None = None,
+        max_bound: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self._is_oplog_rs(db, coll):
             return self._find_oplog_rs(
@@ -2726,6 +2733,10 @@ class Storage:
             assert raw_blobs is not None
             candidates = [bson.decode(b) for b in raw_blobs]
         out = [d for d in candidates if matches(d, filter, vars=let, collation=collation_obj)]
+        if min_bound is not None or max_bound is not None:
+            out = self._apply_minmax_bounds(
+                db, coll, out, hint, min_bound, max_bound, collation_obj
+            )
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
         if skip:
@@ -2735,6 +2746,75 @@ class Storage:
         if projection:
             out = [apply_projection(d, projection) for d in out]
         return out
+
+    def _apply_minmax_bounds(
+        self,
+        db: str,
+        coll: str,
+        docs: list[dict[str, Any]],
+        hint: str | Mapping[str, Any] | None,
+        min_bound: Mapping[str, Any] | None,
+        max_bound: Mapping[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]]:
+        """Filter ``docs`` by cursor ``min`` / ``max`` index bounds.
+
+        ``max`` is an exclusive upper bound, ``min`` an inclusive lower
+        bound, evaluated on the hinted index's key (mongod semantics).
+        The bound documents must name a leading prefix of the hinted
+        index's key fields, in the same order — otherwise mongod raises
+        51174, which we mirror via ``MinMaxKeyError``. Bounds and docs
+        are encoded with the same ``_index_key`` direction-aware byte
+        encoder, so a byte comparison reflects the index's natural order
+        (cross-type, per-field direction).
+        """
+        if hint is None:
+            raise MinMaxKeyError("min/max requires a hint")
+        resolved = self._resolve_hint(db, coll, hint)
+        key_spec: dict[str, Any] | None = None
+        if resolved == _ID_INDEX_NAME:
+            key_spec = {"_id": 1}
+        else:
+            for name, ks, _sparse, _unique in self._all_indexes(db, coll):
+                if name == resolved:
+                    key_spec = dict(ks)
+                    break
+        if key_spec is None:
+            raise MinMaxKeyError("min/max hint does not correspond to an index")
+        index_fields = list(key_spec)
+
+        def _bound_spec(bound: Mapping[str, Any]) -> dict[str, Any]:
+            bound_fields = list(bound)
+            if bound_fields != index_fields[: len(bound_fields)]:
+                raise MinMaxKeyError(
+                    "The field order of the min/max query option does not "
+                    "match the order of the hinted index's key pattern"
+                )
+            return {f: key_spec[f] for f in bound_fields}
+
+        min_key = (
+            _index_key(dict(min_bound), _bound_spec(min_bound), sparse=False, collation=collation)
+            if min_bound is not None
+            else None
+        )
+        max_key = (
+            _index_key(dict(max_bound), _bound_spec(max_bound), sparse=False, collation=collation)
+            if max_bound is not None
+            else None
+        )
+
+        def _in_bounds(doc: dict[str, Any]) -> bool:
+            if min_key is not None:
+                dk = _index_key(doc, _bound_spec(min_bound), sparse=False, collation=collation)
+                if dk is None or dk < min_key:  # min is inclusive
+                    return False
+            if max_key is not None:
+                dk = _index_key(doc, _bound_spec(max_bound), sparse=False, collation=collation)
+                if dk is None or dk >= max_key:  # max is exclusive
+                    return False
+            return True
+
+        return [d for d in docs if _in_bounds(d)]
 
     def _resolve_hint(self, db: str, coll: str, hint: str | Mapping[str, Any]) -> str:
         """Resolve ``hint`` to an index name (or ``$natural``).
