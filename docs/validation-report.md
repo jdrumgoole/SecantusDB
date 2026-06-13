@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-13 — SecantusDB 0.5.2b28 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-13 — SecantusDB 0.5.2b29 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -9,7 +9,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | Category | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
-| `test_bulk.py` | 33 | 1 | 0 | 4 | 38 | 97.1% |
+| `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
 | `test_change_stream.py` | 100 | 6 | 0 | 49 | 155 | 94.3% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 81 | 6 | 0 | 4 | 91 | 93.1% |
@@ -22,7 +22,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 60 | 7 | 0 | 5 | 72 | 89.6% |
 | `test_custom_types.py` | 49 | 2 | 0 | 0 | 51 | 96.1% |
-| `test_database.py` | 34 | 1 | 0 | 1 | 36 | 97.1% |
+| `test_database.py` | 35 | 0 | 0 | 1 | 36 | 100.0% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_examples.py` | 18 | 0 | 0 | 2 | 20 | 100.0% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
@@ -36,14 +36,13 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1001** | **27** | **0** | **475** | **1503** | **97.4%** |
+| **Overall** | **1003** | **25** | **0** | **475** | **1503** | **97.6%** |
 
-## Failures (27)
+## Failures (25)
 
 First 30 failure node-ids for manual triage:
 
 ```
-vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_upsert_uuid_standard_subdocuments
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_resumeafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_startafter
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_create_events_are_reported
@@ -66,7 +65,6 @@ vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
 vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCommandCursor::test_exhaust_cursor_db_set
 vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_aggregate_w_custom_type_decoder
 vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_find_one_and__w_custom_type_decoder
-vendor/pymongo-tests/test/test_database.py::TestDatabase::test_drop_collection
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedReadPref::test_secondary_readPreference
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_explicit_secondary_read_preference
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_secondary_read_preference_from_transaction_options
