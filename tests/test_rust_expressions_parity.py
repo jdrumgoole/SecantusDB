@@ -289,6 +289,24 @@ CURATED = [
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
+    # Arithmetic type errors (mongod raises; Python raises, Rust must
+    # defer — a Rust VALUE here is a divergence the loop fails on).
+    ({"$multiply": [2, "$s"]}, {"s": "nope"}),  # string -> Python raises
+    ({"$multiply": [2, True]}, {}),  # bool is not numeric -> Python raises
+    ({"$multiply": ["$s"]}, {"s": "x"}),  # single non-numeric -> raises
+    ({"$add": [2, "$s"]}, {"s": "nope"}),
+    ({"$add": [2, True]}, {}),
+    ({"$add": ["$s"]}, {"s": "x"}),  # single-arg $add type-checks too
+    ({"$subtract": [2, "$s"]}, {"s": "nope"}),
+    ({"$subtract": [True, 1]}, {}),
+    ({"$divide": [2, "$s"]}, {"s": "nope"}),
+    ({"$divide": [2, True]}, {}),
+    ({"$divide": [2, 0]}, {}),  # mongod: can't $divide by zero -> raises
+    ({"$mod": [2, "$s"]}, {"s": "nope"}),
+    ({"$mod": [2, 0]}, {}),  # mongod: can't $mod by zero -> raises
+    # Null still propagates BEFORE type checks (both engines return null).
+    ({"$multiply": [None, "$s"]}, {"s": "nope"}),
+    ({"$add": [None, True]}, {}),
 ]
 
 

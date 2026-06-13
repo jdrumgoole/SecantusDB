@@ -5750,9 +5750,12 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         result = _change_stream_fatal_reply(exc)
     except _USER_FACING_EXCEPTIONS as exc:
         # Validation-class errors: messages are deliberately shaped to
-        # match mongod, drivers parse them. Surface verbatim. Raise
-        # sites may pin mongod's specific code (e.g. 40324 for an
-        # unrecognized pipeline stage); 14 TypeMismatch is the default.
+        # match mongod, drivers parse them. Surface verbatim. Exceptions
+        # may carry the mongod code their error uses (ExpressionError:
+        # $divide-by-zero is 2 BadValue, $mod uses Location codes;
+        # AggregateError: 40324 for an unrecognized pipeline stage —
+        # which leaves ``code`` as None when unset, hence the ``or``);
+        # 14 TypeMismatch stays the default.
         result = {
             "ok": 0.0,
             "errmsg": str(exc),
