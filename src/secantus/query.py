@@ -318,6 +318,26 @@ def _eq_numeric_aware(a: Any, b: Any, collation: Collation | None = None) -> boo
     collation is in effect — ``strength 2`` makes ``"ping" == "PING"``
     so case-insensitive find / update / delete tests pass.
     """
+    # Embedded documents compare for equality field-ORDER-sensitively
+    # and exactly (no subset), recursively — a mongod gotcha that
+    # Python's order-insensitive ``dict ==`` would get wrong. Arrays
+    # compare positionally with numeric-aware leaves.
+    a_map = isinstance(a, Mapping)
+    b_map = isinstance(b, Mapping)
+    if a_map or b_map:
+        if not (a_map and b_map) or len(a) != len(b):
+            return False
+        return all(
+            ka == kb and _eq_numeric_aware(va, vb, collation)
+            for (ka, va), (kb, vb) in zip(a.items(), b.items(), strict=True)
+        )
+    a_list = isinstance(a, list)
+    b_list = isinstance(b, list)
+    if a_list or b_list:
+        if not (a_list and b_list) or len(a) != len(b):
+            return False
+        return all(_eq_numeric_aware(x, y, collation) for x, y in zip(a, b, strict=True))
+
     a_bool = isinstance(a, bool)
     b_bool = isinstance(b, bool)
     if a_bool != b_bool:

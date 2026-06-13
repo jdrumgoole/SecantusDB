@@ -2406,3 +2406,38 @@ def test_oversized_documents_rejected_server_side(tmp_path) -> None:
             assert fetched is not None and len(fetched["bar"]) == max_size - 64
         finally:
             client.close()
+
+
+def test_upsert_with_none_id_reports_did_upsert(tmp_path) -> None:
+    """An upsert whose resulting _id is None must still report the
+    upsert — None is a valid _id, not a 'no upsert' sentinel.
+    Oracle-pinned: pymongo's test_update_result asserts did_upsert."""
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["test"]
+            r = coll.update_one({"_id": None, "x": 0}, {"$inc": {"x": 1}}, upsert=True)
+            assert r.did_upsert is True
+            assert r.upserted_id is None
+            assert coll.find_one({"_id": None}) == {"_id": None, "x": 1}
+
+            # A plain non-upserting update reports did_upsert False.
+            r2 = coll.update_one({"_id": None}, {"$inc": {"x": 1}})
+            assert r2.did_upsert is False
+
+            # findOneAndUpdate upsert with _id None + return new.
+            from pymongo import ReturnDocument
+
+            doc = client["db"]["fam"].find_one_and_update(
+                {"_id": None},
+                {"$set": {"v": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            assert doc == {"_id": None, "v": 1}
+        finally:
+            client.close()

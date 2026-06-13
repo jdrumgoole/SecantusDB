@@ -138,15 +138,39 @@ the change-stream batch. Still open, precisely characterized:
   — after resuming with resumeAfter/startAfter and inserting docs, the first
   getMore returns empty (`_has_next()` False). Resume positioning bug:
   the resume path likely mis-pins `position_seq` relative to the token's seq.
-- [ ] **Cursor/collection misc from the 64-list** (task #14 of the slice):
-  cursor `min()`/`max()` bounds, `$comment` surfacing, exhaust cursors,
-  tailable-on-capped cursors, `validate` command, `test_error_code` /
-  `test_index_filter` rejections, clustered/timeseries `listCollections`
-  shape (`KeyError: 'v'`), custom-types decode edges, `showRecordId`,
-  and the 3 `test_dbref.py` execnet failures (gauge-harness artifact:
-  xdist can't serialize ObjectId in subtest reports — runner-side, not
-  server-side). Out-of-scope rejections to keep: `$where`, text/hashed
-  indexes (CLAUDE.md), `dropDups` (removed from real mongod 4.0+ too).
+- [ ] **Cursor/collection misc from the 64-list** (task #14 of the slice).
+  Fixed in the gauge-misc slice (2026-06-13): embedded-document equality is
+  now order-sensitive + exact (real matcher correctness bug — `query_embedded`
+  / `query_array` examples), the `validate` command is implemented
+  (clean mongod-shaped result + full/background rejection), and upsert with a
+  `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
+  "no upsert" sentinel). Still open:
+  - cursor `min()`/`max()` index-bound modifiers (`test_max`/`test_min`/
+    `test_min_query`) — need bounded index scans threaded through find.
+  - `$comment` surfacing in currentOp/profiler (`test_comment`).
+  - exhaust cursors (`test_exhaust`, `test_exhaust_cursor_db_set`) — OP_MSG
+    exhaust (moreToCome) flag handling.
+  - tailable cursors on capped collections (`test_tailable`,
+    `test_to_list_tailable`) — non-changestream tailables need capped+tailable.
+  - clustered collections (`clusteredIndex` create option): `listCollections`
+    must report it with a `v` field, `listIndexes` names the clustered index
+    (`KeyError: 'v'`, `'test index' != '_id_'`). Niche feature, 2 tests.
+  - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
+  - `showRecordId` + `returnKey` combo (`test_A_successful_find_with_showRecordId`)
+    — returnKey replaces docs with index keys; fiddly, 1 test.
+  - custom-types decode edges (`test_aggregate_w_custom_type`,
+    `test_find_one_and__w_custom_type`) — driver type-registry round-trips.
+  - `test_error_code` / `test_index_filter` rejections (planner index-filter
+    command surface).
+  - `dropDups` on createIndexes (`test_index_dont_drop_dups`) — mongod 4.0+
+    also rejects, but with a different shape; we error too aggressively.
+  - the 3 `test_dbref.py` execnet failures: gauge-harness artifact (xdist
+    can't serialize ObjectId in subtest reports — runner-side, not server).
+  - `test_maxtime_ms_message` / `test_to_list_csot_applied`: pymongo CSOT
+    client-side timeout formatting — not server-side.
+  Out-of-scope rejections to keep: `$where`, text/hashed indexes (CLAUDE.md).
+  Expected-red (single-node topology): the 3 `test_transactions_unified`
+  secondary-readPreference tests.
 
 ## 4. Out of scope (intentional, with reasoning)
 

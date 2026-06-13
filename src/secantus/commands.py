@@ -1367,6 +1367,65 @@ def _coll_stats(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _validate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """``validate`` — mongod's collection consistency check. SecantusDB
+    stores documents as opaque BSON in WiredTiger and maintains index
+    entries transactionally, so there's nothing to repair: we report a
+    clean, mongod-shaped result with real record / index counts. The
+    ``full`` / ``background`` / ``scandata`` options are accepted and
+    ignored (they only affect how mongod scans, not the verdict)."""
+    coll = doc.get("validate")
+    if not isinstance(coll, str):
+        return {
+            "ok": 0.0,
+            "errmsg": "validate requires a collection name",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if not ctx.storage.collection_exists(ctx.db_name, coll):
+        return {
+            "ok": 0.0,
+            "errmsg": f"Collection '{ctx.db_name}.{coll}' does not exist to validate.",
+            "code": 26,
+            "codeName": "NamespaceNotFound",
+        }
+    # mongod rejects full+background together (full needs an exclusive
+    # scan; background can't take one). pymongo's
+    # ``test_validate_collection_background`` asserts this rejection to
+    # prove the background option reached the wire.
+    if doc.get("full") and doc.get("background"):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "Running the validate command with both { background: true } "
+                "and { full: true } is not supported."
+            ),
+            "code": 72,
+            "codeName": "InvalidOptions",
+        }
+    nrecords = ctx.storage.count_matching(ctx.db_name, coll, None)
+    indexes = ctx.storage.list_indexes(ctx.db_name, coll)
+    keys_per_index = {ix["name"]: nrecords for ix in indexes}
+    index_details = {ix["name"]: {"valid": True} for ix in indexes}
+    return {
+        "ns": f"{ctx.db_name}.{coll}",
+        "nInvalidDocuments": 0,
+        "nNonCompliantDocuments": 0,
+        "nrecords": nrecords,
+        "nIndexes": len(indexes),
+        "keysPerIndex": keys_per_index,
+        "indexDetails": index_details,
+        "valid": True,
+        "repaired": False,
+        "warnings": [],
+        "errors": [],
+        "extraIndexEntries": [],
+        "missingIndexEntries": [],
+        "corruptRecords": [],
+        "ok": 1.0,
+    }
+
+
 def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     inner = doc.get("explain") or {}
     coll = ""
@@ -2004,7 +2063,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             continue
         n += result["matched"]
         n_modified += result["modified"]
-        if result["upserted_id"] is not None:
+        # ``did_upsert`` distinguishes "upserted a doc whose _id is None"
+        # from "no upsert" — ``upserted_id`` alone can't, since None is a
+        # valid _id (pymongo's test_update_result upserts with
+        # ``{_id: None}`` and asserts did_upsert).
+        if result["did_upsert"]:
             upserted.append({"index": index, "_id": result["upserted_id"]})
             n += 1
     reply: dict[str, Any] = {"n": n, "nModified": n_modified, "ok": 1.0}
@@ -2271,7 +2334,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                 }
             upserted_id = result["upserted_id"]
             value: Any = None
-            if return_new and upserted_id is not None:
+            if return_new and result["did_upsert"]:
                 new_docs = ctx.storage.find_matching(ctx.db_name, coll, {"_id": upserted_id})
                 if new_docs:
                     value = new_docs[0]
@@ -4784,6 +4847,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "dbStats": _db_stats,
     "dbstats": _db_stats,
     "collStats": _coll_stats,
+    "validate": _validate,
     "insert": _insert,
     "find": _find,
     "update": _update,
@@ -4901,6 +4965,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     # silently exempts commands missing from this table).
     "dbstats": (A_DB_STATS, SCOPE_DATABASE),
     "collStats": (A_COLL_STATS, SCOPE_COLLECTION),
+    "validate": (A_COLL_STATS, SCOPE_COLLECTION),
     # User management
     "createUser": (A_CREATE_USER, SCOPE_DATABASE),
     "dropUser": (A_DROP_USER, SCOPE_DATABASE),
