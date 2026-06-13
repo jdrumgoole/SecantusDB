@@ -8,12 +8,14 @@
 //! seam (the projector itself lives in the WiredTiger-linked storage crate; the
 //! command crate only sees event bytes).
 //!
-//! **R3b-a (this slice):** create the cursor (always starting at the current
-//! oplog tail) and serve a NON-blocking tailable getMore (poll once, return
-//! what's available). **Deferred to R3b-b:** `awaitData` blocking on the oplog
-//! condvar, resume tokens (`resumeAfter` / `startAfter` / `startAtOperationTime`),
-//! the final `invalidate` event's cursor-close semantics, and empty-batch /
-//! heartbeat `postBatchResumeToken` advancement.
+//! **R3b-a:** create the cursor (starting at the current oplog tail) and serve a
+//! non-blocking tailable getMore. **R3b-b (this slice):** seed the position from
+//! a resume point — resume tokens (`resumeAfter` / `startAfter`) and
+//! `startAtOperationTime` — rejecting a resume point that has fallen off the back
+//! of the oplog with `ChangeStreamHistoryLost` (286). The `awaitData` blocking
+//! getMore and the empty-batch high-water-mark `postBatchResumeToken` live in
+//! [`crate::cursors::get_more`]; the final `invalidate` event's cursor-close
+//! semantics in [`crate::cursors::CursorRegistry::tailable_next_batch`].
 
 use std::sync::Arc;
 
@@ -112,9 +114,41 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         show_expanded_events: cs_spec.get_bool("showExpandedEvents").unwrap_or(false),
     };
 
-    // R3b-a always starts at the current oplog tail (events strictly after
-    // creation). Resume support (`resumeAfter` / `startAtOperationTime`) is R3b-b.
-    let position = storage.oplog_tail_seq();
+    // Start position (events read are strictly after it):
+    //   resumeAfter / startAfter — the token's seq (resume just past it)
+    //   startAtOperationTime     — one before the first seq at/after the ts
+    //   neither                  — the current oplog tail (fresh stream)
+    let resume_token = cs_spec
+        .get("resumeAfter")
+        .or_else(|| cs_spec.get("startAfter"))
+        .and_then(Bson::as_document);
+    let position = if let Some(tok) = resume_token {
+        storage.resume_token_seq(tok).ok_or_else(|| {
+            CommandError::new(
+                40647,
+                "Location40647",
+                "resumeAfter / startAfter resume token is not valid",
+            )
+        })?
+    } else if let Some(Bson::Timestamp(ts)) = cs_spec.get("startAtOperationTime") {
+        storage.seq_for_timestamp(*ts).saturating_sub(1)
+    } else {
+        storage.oplog_tail_seq()
+    };
+
+    // An explicit resume point that has already fallen off the back of the
+    // oplog can't be honoured — mongod's ChangeStreamHistoryLost (286).
+    if resume_token.is_some() {
+        let floor = storage.oplog_floor_seq();
+        if floor > 0 && position + 1 < floor {
+            return Err(CommandError::new(
+                286,
+                "ChangeStreamHistoryLost",
+                "Resume of change stream was not possible, as the resume point may \
+                 no longer be in the oplog.",
+            ));
+        }
+    }
 
     let ns = match doc.get("aggregate") {
         Some(Bson::String(c)) => format!("{}.{}", ctx.db_name, c),

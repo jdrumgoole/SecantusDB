@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-13 — SecantusDB 0.5.2b28 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-13 — SecantusDB 0.5.2b33 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -9,11 +9,8 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | Category | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
-| `test_bson.py` | 87 | 0 | 0 | 1 | 88 | 100.0% |
-| `test_bson_corpus.py` | 31 | 0 | 0 | 0 | 31 | 100.0% |
 | `test_bulk.py` | 29 | 5 | 0 | 4 | 38 | 85.3% |
-| `test_change_stream.py` | 55 | 51 | 0 | 49 | 155 | 51.9% |
-| `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
+| `test_change_stream.py` | 70 | 36 | 0 | 49 | 155 | 66.0% |
 | `test_collation.py` | 15 | 1 | 0 | 0 | 16 | 93.8% |
 | `test_collection.py` | 65 | 22 | 0 | 4 | 91 | 74.7% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
@@ -24,31 +21,24 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_crud_unified.py` | 217 | 84 | 0 | 185 | 486 | 72.1% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 51 | 16 | 0 | 5 | 72 | 76.1% |
-| `test_custom_types.py` | 40 | 11 | 0 | 0 | 51 | 78.4% |
+| `test_custom_types.py` | 46 | 5 | 0 | 0 | 51 | 90.2% |
 | `test_database.py` | 28 | 7 | 0 | 1 | 36 | 80.0% |
-| `test_dbref.py` | 9 | 3 | 0 | 0 | 12 | 75.0% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_default_exports.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| `test_errors.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_examples.py` | 10 | 8 | 0 | 2 | 20 | 55.6% |
-| `test_json_util.py` | 24 | 0 | 0 | 0 | 24 | 100.0% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
-| `test_objectid.py` | 15 | 0 | 0 | 0 | 15 | 100.0% |
 | `test_operations.py` | 2 | 0 | 0 | 0 | 2 | 100.0% |
 | `test_raw_bson.py` | 13 | 1 | 0 | 0 | 14 | 92.9% |
 | `test_read_concern.py` | 5 | 1 | 0 | 0 | 6 | 83.3% |
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 15 | 1 | 0 | 5 | 21 | 93.8% |
-| `test_son.py` | 11 | 0 | 0 | 0 | 11 | 100.0% |
-| `test_timestamp.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_transactions_unified.py` | 69 | 26 | 0 | 172 | 267 | 72.6% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **994** | **243** | **0** | **476** | **1713** | **80.4%** |
+| **Overall** | **809** | **219** | **0** | **475** | **1503** | **78.7%** |
 
-## Failures (243)
+## Failures (219)
 
 First 30 failure node-ids for manual triage:
 
@@ -58,33 +48,33 @@ vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_large_inserts_unordered
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_update_many_pipeline
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_update_one_pipeline
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_upsert_uuid_standard_subdocuments
-vendor/pymongo-tests/test/test_change_stream.py::TestClusterChangeStream::test_start_at_operation_time
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_change_operations
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_iteration
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_kill_cursors
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_raises_error_on_missing_id_418plus
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_read_concern
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resume_on_error
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_empty_batch
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_resumeafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_startafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_split_large_change
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_after
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_after_resume_process_with_changes
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_after_resume_process_without_changes
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_at_operation_time
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_update_resume_token
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_uuid_representations
-vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_change_operations
-vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_iteration
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after_resume_process_with_changes
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after_resume_process_without_changes
-vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_at_operation_time
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Change_Stream_should_allow_valid_aggregate_pipeline_stages
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_array_truncation
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_modified_structure_in_ns_document_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_newField_added_in_response_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_new_structure_in_ns_document_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_projection_in_change_stream_returns_expected_fields
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_server_error_on_projecting_out__id
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_unknown_operationType_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when__id_is_projected_out
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when_an_invalid_aggregation_stage_is_passed_in
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:required_with_changeStreamPreAndPostImages_disabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:required_with_changeStreamPreAndPostImages_enabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_disabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_enabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:off_with_changeStreamPreAndPostImages_disabled
 ```
-... and 213 more (see raw JSON).
+... and 189 more (see raw JSON).
 
 ## How this is generated
 

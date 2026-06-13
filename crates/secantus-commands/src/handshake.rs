@@ -48,7 +48,15 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         (ctx.replica_set_name.as_ref(), ctx.server_address.as_ref())
     {
         let addr = format!("{host}:{port}");
-        let ts = Bson::Timestamp(ctx.cluster_time);
+        // `lastWrite.opTime.ts` mirrors `commands.py`'s
+        // `ctx.storage.current_cluster_time()` — mint the next monotonic cluster
+        // time (strictly greater than the last write) so `startAtOperationTime`
+        // resumes land just past it. Fall back to the supplied `ctx.cluster_time`
+        // when no storage backend is wired (handshake-only fakes).
+        let ts = Bson::Timestamp(match ctx.storage.as_ref() {
+            Some(s) => s.current_cluster_time(),
+            None => ctx.cluster_time,
+        });
         // Fixed sentinel electionId, matching commands.py.
         let election = ObjectId::parse_str("7fffffff0000000000000001")
             .expect("static electionId hex is valid");

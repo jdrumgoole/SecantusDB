@@ -130,6 +130,14 @@ impl RustServer {
         format!("mongodb://{}:{}", self.host, self.port)
     }
 
+    /// The Rust server's embedded version (the `secantus-server` crate version,
+    /// bumped in lockstep across the Rust crates). This is the Rust server's own
+    /// version line — independent of the `secantus` PyPI package's `0.5.2bN`.
+    #[getter]
+    fn version(&self) -> &'static str {
+        secantus_server::VERSION
+    }
+
     /// Stop the server (idempotent). The GIL is released while the accept loop
     /// is joined.
     fn stop(&mut self, py: Python<'_>) {
@@ -162,6 +170,9 @@ fn _secantus_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
          an in-process Rust server (WiredTiger-backed) that pymongo connects to \
          over TCP. Python is only the launcher, never in the request path.",
     )?;
+    // Module-level `__version__` so `_secantus_server.__version__` reports the
+    // embedded Rust server version without having to start a server.
+    m.add("__version__", secantus_server::VERSION)?;
     m.add_class::<RustServer>()?;
     Ok(())
 }

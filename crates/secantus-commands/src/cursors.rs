@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
 
@@ -473,13 +473,52 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(cursor_not_found(cursor_id));
     }
     if info.tailable {
-        // R3b-a: non-blocking — poll the producer once and return what's there.
-        // The client drives the stream by polling; awaitData blocking is R3b-b.
-        let (batch, _position, closed) = match cursors.tailable_next_batch(cursor_id, batch_size) {
-            Ok(x) => x,
-            Err(_) => return Ok(cursor_not_found(cursor_id)),
-        };
-        let pbrt = post_batch_resume_token(&batch);
+        let storage = ctx.storage()?;
+        // awaitData: block until an event arrives or maxTimeMS elapses, instead
+        // of busy-polling. pymongo doesn't always send maxTimeMS on change-stream
+        // getMore, so default to 1s (also lets the connection thread be reaped on
+        // shutdown). A non-await_data cursor or a zero deadline polls exactly once.
+        let max_time_ms = doc.get("maxTimeMS").and_then(as_i64).unwrap_or(1000).max(0) as u64;
+        let deadline = Instant::now() + Duration::from_millis(max_time_ms);
+
+        let mut batch;
+        let mut position;
+        let mut closed;
+        loop {
+            match cursors.tailable_next_batch(cursor_id, batch_size) {
+                Ok((b, p, c)) => {
+                    batch = b;
+                    position = p;
+                    closed = c;
+                }
+                Err(_) => return Ok(cursor_not_found(cursor_id)),
+            }
+            if !batch.is_empty() || closed || !info.await_data {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // Block on the storage oplog condvar until it advances past
+            // `position` or the deadline; then re-poll (the producer reads the
+            // newly-appended entries). killCursors wakes this via notify.
+            storage.wait_for_oplog(position, (deadline - now).as_millis() as u64);
+        }
+
+        // postBatchResumeToken: the last event's token, or — on an empty batch —
+        // a high-water-mark token at the current position so the client can
+        // resume past this quiet getMore.
+        let pbrt = post_batch_resume_token(&batch).or_else(|| {
+            let bytes = storage.high_water_mark_token(position);
+            if bytes.is_empty() {
+                None
+            } else {
+                Document::from_reader(&mut bytes.as_slice())
+                    .ok()
+                    .map(Bson::Document)
+            }
+        });
         let mut cursor_doc = doc! {
             "nextBatch": docs_to_bson(batch)?,
             "id": Bson::Int64(if closed { 0 } else { cursor_id }),
@@ -511,15 +550,21 @@ pub fn kill_cursors(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(Bson::Array(a)) => a.iter().filter_map(as_i64).collect(),
         _ => Vec::new(),
     };
+    // A blocked tailable getMore waits on the STORAGE oplog condvar, not the
+    // registry, so wake it via the storage's notify (best-effort: a cursorless
+    // or storageless context just skips it).
+    let storage = ctx.storage.clone();
     let cursors = ctx.cursors()?;
-    // Invalidate first so a blocked tailable getMore wakes and ends rather than
-    // reporting the cursor still alive after the client killed it. (The storage
-    // oplog-cv notify that actually wakes such a waiter lands with the
-    // change-stream slice.)
+    // Invalidate + remove first so the woken getMore re-polls and sees the
+    // cursor gone (CursorNotFound) or invalidated, rather than reporting it
+    // still alive after the client killed it.
     for &cid in &cursor_ids {
         cursors.invalidate(cid);
     }
     let (killed, not_found) = cursors.kill(&cursor_ids);
+    if let Some(s) = storage {
+        s.notify_oplog_waiters();
+    }
     Ok(doc! {
         "cursorsKilled": int64_array(killed),
         "cursorsNotFound": int64_array(not_found),

@@ -366,12 +366,28 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     so `secantus-commands` stays WiredTiger-free. insert / update / replace /
     delete + `updateLookup` + pre-images all project correctly. **+58 on the R8
     rust-server gauge (936 → 994, 52 change-stream, zero regressions).**
-  - **R3b-b — DEFERRED:** `awaitData` blocking (the `wait_for_oplog` + maxTimeMS
-    loop so the server blocks instead of the client polling), resume tokens
-    (`resumeAfter` / `startAfter` / `startAtOperationTime`, using `seq_for_
-    timestamp` / `oplog_floor_seq`), the final `invalidate` event's cursor-close
-    semantics, and empty-batch / noop-heartbeat `postBatchResumeToken`
-    advancement (high-water-mark tokens).
+  - **R3b-b ✅ DONE** — change-stream blocking + resume. `awaitData` blocking
+    (the tailable `getMore` loop in `cursors::get_more` blocks on the storage
+    oplog condvar via `Storage::wait_for_oplog` until an event arrives or
+    `maxTimeMS`/1s elapses, instead of busy-polling); resume positioning in
+    `changestream::open_change_stream` — `resumeAfter` / `startAfter` (token →
+    `Storage::resume_token_seq`) and `startAtOperationTime` (`seq_for_timestamp`
+    - 1), with a `ChangeStreamHistoryLost` (286) guard when the resume point has
+    fallen below `oplog_floor_seq`; the synthesized terminal `invalidate` event
+    after a drop / rename / dropDatabase (the adapter's `change_stream_poll` now
+    appends `changestreams::invalidate_event`, mirroring `commands.py`'s
+    producer) so the cursor closes only after delivering it; and empty-batch
+    `postBatchResumeToken` advancement via a high-water-mark token
+    (`Storage::high_water_mark_token`). Two supporting fixes the resume path
+    depended on: `hello`'s `lastWrite.opTime.ts` is now minted from
+    `Storage::current_cluster_time` (was a hard-zero R4a stub — `find_seq_for_ts`
+    matched everything, breaking `startAtOperationTime`); and `killCursors` wakes
+    a blocked tailable getMore via `notify_oplog_waiters`. **+15 on the R8
+    rust-server change-stream gauge (55 → 70 / 155) and +6 on `test_custom_types`
+    (40 → 46), zero regressions across all server categories.** **Still deferred:**
+    noop-heartbeat-driven token advancement on a fully quiet stream (no oplog
+    rows at all — the HWM token only advances once a scanned row moves the
+    position).
 
 - **R4 — Accept loop + connection threads + TLS** (`crates/secantus-server`). Port
   `server.py`: TCP accept on a daemon thread, thread-per-connection (1:1 with the

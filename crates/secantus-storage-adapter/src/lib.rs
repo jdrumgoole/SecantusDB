@@ -23,7 +23,7 @@ use secantus_commands::storage::{
     ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, DuplicateKey, RawHint,
     Storage as CmdStorage, StorageError, UpdateOutcome,
 };
-use secantus_storage::changestreams::{self, Scope as WtScope};
+use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
 use secantus_storage::{Hint, Storage as WtStorage, StorageError as WtError};
 
 /// Wraps a shared WiredTiger-backed `Storage` and presents it as the command
@@ -47,6 +47,15 @@ impl CmdStorage for StorageAdapter {
             time: 0,
             increment: 0,
         })
+    }
+
+    fn current_cluster_time(&self) -> bson::Timestamp {
+        self.inner
+            .current_cluster_time()
+            .unwrap_or(bson::Timestamp {
+                time: 0,
+                increment: 0,
+            })
     }
 
     fn change_stream_poll(
@@ -89,7 +98,14 @@ impl CmdStorage for StorageAdapter {
                 events.push(buf);
                 if invalidates {
                     // An invalidating event (drop / rename / dropDatabase on the
-                    // watched scope) is the last event this cursor produces.
+                    // watched scope) is followed by a synthesized terminal
+                    // `invalidate` event, then the cursor closes — mirroring
+                    // `commands.py`'s producer (project → invalidate_event → break).
+                    let inv = changestreams::invalidate_event(seq, &entry).map_err(map_err)?;
+                    let mut inv_buf = Vec::new();
+                    inv.to_writer(&mut inv_buf)
+                        .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
+                    events.push(inv_buf);
                     invalidated = true;
                     break;
                 }
@@ -120,6 +136,34 @@ impl CmdStorage for StorageAdapter {
 
     fn seq_for_timestamp(&self, ts: bson::Timestamp) -> i64 {
         self.inner.find_seq_for_ts(ts).unwrap_or(0)
+    }
+
+    fn resume_token_seq(&self, token: &Document) -> Option<i64> {
+        changestreams::parse_resume_token(token).ok().map(|d| d.seq)
+    }
+
+    fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {
+        let ts = self.inner.peek_cluster_time().unwrap_or(bson::Timestamp {
+            time: 0,
+            increment: 0,
+        });
+        let data = ResumeTokenData {
+            seq,
+            ts,
+            ns: String::new(),
+            document_key: Document::new(),
+        };
+        match changestreams::make_resume_token(&data) {
+            Ok(doc) => {
+                let mut buf = Vec::new();
+                if doc.to_writer(&mut buf).is_ok() {
+                    buf
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     fn insert(

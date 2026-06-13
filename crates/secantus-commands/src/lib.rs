@@ -738,6 +738,94 @@ mod tests {
     }
 
     #[test]
+    fn hello_optime_is_minted_from_storage_when_present() {
+        // With a storage backend wired, `hello`'s lastWrite.opTime.ts comes from
+        // `current_cluster_time()` (minting), not the static `ctx.cluster_time`.
+        // This is what `startAtOperationTime` resumes depend on — the advertised
+        // opTime must be strictly past the last write.
+        use crate::storage::{RawHint, Storage, StorageError, UpdateOutcome};
+        use std::sync::Arc;
+        struct ClockStorage;
+        impl Storage for ClockStorage {
+            fn current_cluster_time(&self) -> bson::Timestamp {
+                bson::Timestamp {
+                    time: 555,
+                    increment: 9,
+                }
+            }
+            fn insert(
+                &self,
+                _db: &str,
+                _coll: &str,
+                _docs: Vec<Vec<u8>>,
+                _ordered: bool,
+            ) -> Result<(usize, Vec<Document>), StorageError> {
+                Ok((0, Vec::new()))
+            }
+            fn update_matching(
+                &self,
+                _db: &str,
+                _coll: &str,
+                _filter: &Document,
+                _update: &Document,
+                _multi: bool,
+                _upsert: bool,
+            ) -> Result<UpdateOutcome, StorageError> {
+                Ok(UpdateOutcome::default())
+            }
+            fn delete_matching(
+                &self,
+                _db: &str,
+                _coll: &str,
+                _filter: &Document,
+                _limit: usize,
+            ) -> Result<usize, StorageError> {
+                Ok(0)
+            }
+            fn count_matching(
+                &self,
+                _db: &str,
+                _coll: &str,
+                _filter: &Document,
+            ) -> Result<usize, StorageError> {
+                Ok(0)
+            }
+            fn find(
+                &self,
+                _db: &str,
+                _coll: &str,
+                _filter: &Document,
+                _sort: Option<&Document>,
+                _hint: Option<RawHint<'_>>,
+            ) -> Result<Vec<Vec<u8>>, StorageError> {
+                Ok(Vec::new())
+            }
+        }
+        let mut c = ctx();
+        c.server_address = Some(("127.0.0.1".into(), 27017));
+        c.replica_set_name = Some("secantus".into());
+        c.cluster_time = bson::Timestamp {
+            time: 100,
+            increment: 1,
+        };
+        c.storage = Some(Arc::new(ClockStorage));
+        let reply = dispatch(&doc! {"hello": 1}, &mut c);
+        let ts = reply
+            .get_document("lastWrite")
+            .unwrap()
+            .get_document("opTime")
+            .unwrap()
+            .get("ts");
+        assert_eq!(
+            ts,
+            Some(&Bson::Timestamp(bson::Timestamp {
+                time: 555,
+                increment: 9,
+            }))
+        );
+    }
+
+    #[test]
     fn build_info_shape() {
         let reply = dispatch(&doc! {"buildInfo": 1}, &mut ctx());
         assert_eq!(reply.get_str("version").unwrap(), SERVER_VERSION);

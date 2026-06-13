@@ -109,6 +109,15 @@ pub trait Storage: Send + Sync {
         }
     }
 
+    /// The next monotonic cluster time, ADVANCING and persisting it — for
+    /// `hello`'s `lastWrite.opTime.ts` (mirrors `Storage.current_cluster_time`).
+    /// Minting (rather than peeking) keeps the advertised opTime strictly greater
+    /// than the last write, which is what `startAtOperationTime` resumes rely on.
+    /// The default forwards to `peek_cluster_time` (fakes don't track time).
+    fn current_cluster_time(&self) -> bson::Timestamp {
+        self.peek_cluster_time()
+    }
+
     // --- change streams (R3b) ----------------------------------------------
     //
     // The command crate stays WiredTiger-free, but the change-stream projector
@@ -161,6 +170,23 @@ pub trait Storage: Send + Sync {
     /// `startAtOperationTime`); tail+1 if none qualify. Default: 0.
     fn seq_for_timestamp(&self, _ts: bson::Timestamp) -> i64 {
         0
+    }
+
+    /// Decode a change-stream resume token (`{_data: "<hex>"}`) to the oplog
+    /// `seq` it points at, for `resumeAfter` / `startAfter`. `None` if the token
+    /// is malformed. Kept on the seam so the token format stays in the
+    /// WiredTiger-linked `changestreams` module. Default: `None`.
+    fn resume_token_seq(&self, _token: &Document) -> Option<i64> {
+        None
+    }
+
+    /// A high-water-mark resume token at oplog `seq` and the current cluster
+    /// time, encoded as `bson::encode({_data: "<hex>"})`. Returned as the
+    /// `postBatchResumeToken` of an empty change-stream batch so the client can
+    /// resume past a quiet stretch. Built via the same encoder as event tokens.
+    /// Default: empty (no token).
+    fn high_water_mark_token(&self, _seq: i64) -> Vec<u8> {
+        Vec::new()
     }
 
     /// Insert a batch of already-encoded documents. Returns

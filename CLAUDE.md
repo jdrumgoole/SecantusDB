@@ -119,6 +119,36 @@ selection inside one request path:
   `address`) — the accept loop runs on a GIL-released Rust thread in-process and
   `pymongo` connects over real TCP; Python is only the launcher, never an operator.
 
+#### Versioning: the two servers version independently
+
+The Python server and the Rust server are **separate deliverables with separate
+version lines** — they **diverged at `0.5.2`** (Python `0.5.2b33` / Rust crates
+`0.5.2-beta.15`) and advance independently from there. A change that touches only
+one server bumps only that server's version:
+
+- **Python server version** — `pyproject.toml` `version` + `src/secantus/__init__.py`
+  `__version__` (`0.5.2bN`, PEP 440). This is the **PyPI package** version. Bump it
+  for Python-server changes (`src/secantus/**`).
+- **Rust server version** — the `version` field in **every** `crates/*/Cargo.toml`,
+  kept in **lockstep** across all crates (`0.5.2-beta.N`, SemVer pre-release).
+  Bump it for Rust-server changes (`crates/**`). There is no single
+  `[workspace.package]` source because the WiredTiger-linked crates
+  (`secantus-storage` / `-wt` / `-storage-adapter` / `-server-py` / `-storage-py` /
+  `secantusdb`) are **excluded** from the clean workspace and can't inherit a
+  workspace version — so all twelve `Cargo.toml` (and their `Cargo.lock`) carry the
+  number and are bumped together (e.g. `find crates -maxdepth 2 -name Cargo.toml
+  -o -name Cargo.lock | xargs sed -i '' 's/0.5.2-beta.N/0.5.2-beta.N+1/'`). The
+  canonical embedded value is `secantus_server::VERSION`
+  (`env!("CARGO_PKG_VERSION")`); the Rust server **embeds and surfaces** it in
+  `buildInfo.secantusVersion` (over the wire), the `secantusdb` binary's
+  `--version`, the embedded Python handle's `RustServer.version` getter, and the
+  `_secantus_server.__version__` module attribute.
+
+A change that genuinely touches both servers (e.g. an operator-semantics change
+landed in the Python module *and* its Rust port) bumps both. Don't bump the Python
+package version for Rust-only work just because the Rust extension is currently
+bundled into the `secantus` wheel — the two numbers are decoupled by intent.
+
 **The authoritative plan is `tasks/rust-server-plan.md`.** It supersedes the
 earlier *in-process selectable-engine* model (`SECANTUS_ENGINE` process-wide
 selection / the `secantus.engine` per-component shims / the "5e Python `Storage`
