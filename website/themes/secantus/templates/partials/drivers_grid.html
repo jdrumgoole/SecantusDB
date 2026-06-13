@@ -5,10 +5,10 @@
       <span class="lang">Python</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">97.6%</span>
+      <span class="rate">97.4%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>1207</strong> tests passed &middot; <strong>30</strong> failed</p>
+    <p class="counts"><strong>1002</strong> tests passed &middot; <strong>27</strong> failed</p>
     <p class="note">The official MongoDB Python driver, and the deepest suite we run &mdash; so it surfaces the long tail. The remaining failures are features outside a single node's scope (text / hashed indexes, server-side <code>$where</code> JavaScript), tests that assume a multi-node cluster, and a few driver-side harness artifacts &mdash; not gaps in the CRUD, aggregation, or change-stream surface that test and dev rely on. We run pymongo's own tests, unmodified, against an embedded SecantusDB.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -64,7 +64,7 @@
       <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>293</strong> tests passed &middot; <strong>1</strong> known divergence</p>
+    <p class="counts"><strong>258</strong> tests passed &middot; <strong>1</strong> known divergence</p>
     <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x), the gem the Rails / Sinatra ecosystem builds on. We run a curated set of integration spec files end-to-end against an embedded SecantusDB daemon &mdash; every test opens a real <code>Mongo::Client</code>, SCRAM-authenticates as a pre-provisioned <code>root-user</code>, and exchanges wire commands.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
   </article>
