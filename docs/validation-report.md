@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-13 — SecantusDB 0.5.2b21 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-13 — SecantusDB 0.5.2b24 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -23,7 +23,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_crud_unified.py` | 301 | 0 | 0 | 185 | 486 | 100.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
-| `test_cursor.py` | 57 | 10 | 0 | 5 | 72 | 85.1% |
+| `test_cursor.py` | 58 | 9 | 0 | 5 | 72 | 86.6% |
 | `test_custom_types.py` | 49 | 2 | 0 | 0 | 51 | 96.1% |
 | `test_database.py` | 32 | 3 | 0 | 1 | 36 | 91.4% |
 | `test_dbref.py` | 9 | 3 | 0 | 0 | 12 | 75.0% |
@@ -46,9 +46,9 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1195** | **42** | **0** | **476** | **1713** | **96.6%** |
+| **Overall** | **1196** | **41** | **0** | **476** | **1713** | **96.7%** |
 
-## Failures (42)
+## Failures (41)
 
 First 30 failure node-ids for manual triage:
 
@@ -81,10 +81,10 @@ vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_tailable
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
 vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCommandCursor::test_exhaust_cursor_db_set
-vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCommandCursor::test_server_error
 vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_aggregate_w_custom_type_decoder
+vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_find_one_and__w_custom_type_decoder
 ```
-... and 12 more (see raw JSON).
+... and 11 more (see raw JSON).
 
 ## How this is generated
 
