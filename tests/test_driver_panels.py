@@ -70,11 +70,20 @@ def test_render_validation_panel_contains_required_chrome() -> None:
 def test_render_validation_panel_shows_expected_failure_note() -> None:
     s = _stats(passed=100, failed=2, skipped=0, expected=2)
     panel = _render_validation_panel("pymongo", s)
-    # actionable_failures = 2 - 2 = 0, so "0 failed"; the expected note
-    # appears alongside so users see the documented gap.
-    assert "<strong>0</strong> failed" in panel
-    assert "documented" in panel
-    assert "<strong>2</strong>" in panel
+    # actionable_failures = 2 - 2 = 0. A clean panel with known,
+    # report-documented divergences folds them in plainly as
+    # "N known divergences" — no defensive rate-accounting on the card.
+    assert "<strong>100</strong> tests passed" in panel
+    assert "<strong>2</strong> known divergences" in panel
+    assert "unexpected failures" not in panel
+    assert "excluded from the rate" not in panel
+
+
+def test_render_validation_panel_singular_known_divergence() -> None:
+    s = _stats(passed=358, failed=1, skipped=0, expected=1)
+    panel = _render_validation_panel("mongo-node-driver", s)
+    assert "<strong>1</strong> known divergence" in panel
+    assert "known divergences" not in panel  # singular
 
 
 def test_render_validation_panel_omits_note_when_no_expected_failures() -> None:

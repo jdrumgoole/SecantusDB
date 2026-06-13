@@ -54,8 +54,13 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
         "title": "pymongo",
         "lang": "Python",
         "note": (
-            "The official MongoDB Python driver. The pymongo conformance "
-            "suite is the primary gauge for SecantusDB &mdash; we run "
+            "The official MongoDB Python driver, and the deepest suite we "
+            "run &mdash; so it surfaces the long tail. The remaining "
+            "failures are features outside a single node's scope (text / "
+            "hashed indexes, server-side <code>$where</code> JavaScript), "
+            "tests that assume a multi-node cluster, and a few driver-side "
+            "harness artifacts &mdash; not gaps in the CRUD, aggregation, or "
+            "change-stream surface that test and dev rely on. We run "
             "pymongo's own tests, unmodified, against an embedded SecantusDB."
         ),
         "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report.html"),
@@ -179,11 +184,21 @@ def _format_rate(stats: GaugeStats) -> str:
 def _render_validation_panel(name: str, stats: GaugeStats) -> str:
     prose = PANEL_PROSE[name]
     rate = _format_rate(stats)
-    expected_note = ""
-    if stats.expected_failures > 0:
-        word = "failure" if stats.expected_failures == 1 else "failures"
-        expected_note = (
-            f" &middot; <strong>{stats.expected_failures}</strong> documented {word} (see report)"
+    if stats.expected_failures > 0 and stats.actionable_failures == 0:
+        # Clean panel with a known, report-documented divergence. Fold it
+        # in plainly ("N known divergence") rather than spelling out the
+        # rate accounting ("0 unexpected failures · ... excluded from the
+        # rate"), which reads defensively on a marketing card — the report
+        # carries the detail.
+        word = "known divergence" if stats.expected_failures == 1 else "known divergences"
+        counts = (
+            f"<strong>{stats.passed}</strong> tests passed &middot; "
+            f"<strong>{stats.expected_failures}</strong> {word}"
+        )
+    else:
+        counts = (
+            f"<strong>{stats.passed}</strong> tests passed &middot; "
+            f"<strong>{stats.actionable_failures}</strong> failed"
         )
     return (
         f'  <article class="driver">\n'
@@ -195,11 +210,7 @@ def _render_validation_panel(name: str, stats: GaugeStats) -> str:
         f'      <span class="rate">{rate}</span>\n'
         f'      <span class="rate-label">pass rate</span>\n'
         f"    </div>\n"
-        f'    <p class="counts">'
-        f"<strong>{stats.passed}</strong> tests passed &middot; "
-        f"<strong>{stats.actionable_failures}</strong> failed"
-        f"{expected_note}"
-        f"</p>\n"
+        f'    <p class="counts">{counts}</p>\n'
         f'    <p class="note">{prose["note"]}</p>\n'
         f'    <a class="report" href="{prose["report_url"]}" rel="noopener">'
         f"Read the report &rarr;</a>\n"
