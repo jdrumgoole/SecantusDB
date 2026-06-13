@@ -71,10 +71,12 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
         "note": (
             "The driver enterprise MongoDB consumers most often use, and the "
             "foundation for many JVM-language wrappers. We run a curated "
-            "subset of <code>driver-sync/src/test/functional/</code> plus the "
-            "BSON unit tests against an embedded SecantusDB daemon. Type-strict "
-            "decoders catch wire-shape divergences pymongo's permissive client "
-            "accepts silently."
+            "subset of <code>driver-sync/src/test/functional/</code> &mdash; "
+            "integration tests that open a real connection to a SecantusDB "
+            "daemon (the driver's own BSON codec unit tests are run but not "
+            "counted here; they never touch the server). Type-strict decoders "
+            "catch wire-shape divergences pymongo's permissive client accepts "
+            "silently."
         ),
         "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-java.html"),
     },

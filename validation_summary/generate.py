@@ -225,6 +225,16 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
     passed = failed = skipped = 0
     failure_descs: list[str] = []
     for xml in xml_dir.rglob("TEST-*.xml"):
+        # Exclude the ``:bson:test`` module: those ~3,800 cases are
+        # pure in-process BSON codec unit tests (BitsTest,
+        # BasicBSONDecoderSpecification, ...) that never open a
+        # connection to SecantusDB. Counting them would inflate the
+        # compatibility number ~10x with tests that pass against any
+        # server — or none. Only the driver-sync / driver-core
+        # integration tests actually exercise SecantusDB's wire path,
+        # which is what the per-gauge report already measures.
+        if xml.parent.name == "bson":
+            continue
         try:
             root = ET.parse(xml).getroot()
         except ET.ParseError:
@@ -256,12 +266,13 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
             sum(1 for _ in functional_dir.rglob("*Test.java")) if functional_dir.is_dir() else 0
         )
         note = (
-            f"{included} of {total_classes} driver-sync functional classes + bson unit tests"
+            f"{included} of {total_classes} driver-sync functional classes "
+            "(bson codec unit tests excluded — they don't touch the server)"
             if total_classes
-            else "driver-sync functional + bson unit tests"
+            else "driver-sync functional integration tests"
         )
     except Exception:
-        note = "driver-sync functional + bson unit tests"
+        note = "driver-sync functional integration tests"
     return GaugeStats(
         name="mongo-java-driver",
         language="Java",
