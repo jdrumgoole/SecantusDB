@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-13 — SecantusDB 0.5.2b24 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-13 — SecantusDB 0.5.2b26 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -15,8 +15,8 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_change_stream.py` | 100 | 6 | 0 | 49 | 155 | 94.3% |
 | `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
-| `test_collection.py` | 79 | 8 | 0 | 4 | 91 | 90.8% |
-| `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
+| `test_collection.py` | 80 | 7 | 0 | 4 | 91 | 92.0% |
+| `test_collection_management.py` | 5 | 2 | 0 | 0 | 7 | 71.4% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
@@ -25,12 +25,12 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 58 | 9 | 0 | 5 | 72 | 86.6% |
 | `test_custom_types.py` | 49 | 2 | 0 | 0 | 51 | 96.1% |
-| `test_database.py` | 32 | 3 | 0 | 1 | 36 | 91.4% |
+| `test_database.py` | 34 | 1 | 0 | 1 | 36 | 97.1% |
 | `test_dbref.py` | 9 | 3 | 0 | 0 | 12 | 75.0% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_default_exports.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_errors.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
-| `test_examples.py` | 16 | 2 | 0 | 2 | 20 | 88.9% |
+| `test_examples.py` | 18 | 0 | 0 | 2 | 20 | 100.0% |
 | `test_json_util.py` | 24 | 0 | 0 | 0 | 24 | 100.0% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
 | `test_objectid.py` | 15 | 0 | 0 | 0 | 15 | 100.0% |
@@ -46,9 +46,9 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1196** | **41** | **0** | **476** | **1713** | **96.7%** |
+| **Overall** | **1202** | **35** | **0** | **476** | **1713** | **97.2%** |
 
-## Failures (41)
+## Failures (35)
 
 First 30 failure node-ids for manual triage:
 
@@ -67,10 +67,8 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_filter
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_min_query
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_update_result
 vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listCollections_includes_clusteredIndex
 vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listIndexes_returns_the_index
-vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementTimeseriesCollection::test_insertMany_with_duplicate_ids
 vendor/pymongo-tests/test/test_command_monitoring.py::TestCommandMonitoringFind::test_A_successful_find_with_showRecordId_and_returnKey
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_comment
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_max
@@ -83,8 +81,10 @@ vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
 vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCommandCursor::test_exhaust_cursor_db_set
 vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_aggregate_w_custom_type_decoder
 vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_find_one_and__w_custom_type_decoder
+vendor/pymongo-tests/test/test_database.py::TestDatabase::test_drop_collection
+vendor/pymongo-tests/test/test_dbref.py::TestDBRefSpec::test_decoding_1_2_3
 ```
-... and 11 more (see raw JSON).
+... and 5 more (see raw JSON).
 
 ## How this is generated
 
