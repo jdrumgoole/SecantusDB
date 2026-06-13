@@ -3222,9 +3222,17 @@ class Storage:
                         db, coll, new, indexes, multikey_names
                     )
                     if oplog_on:
-                        is_replacement = not any(
-                            isinstance(k, str) and k.startswith("$") for k in update
-                        )
+                        if isinstance(update, list):
+                            # Aggregation-pipeline update ([{$set: ...}, ...]):
+                            # mongod classifies it as an "update" event with a
+                            # computed diff, never a replacement. Iterating the
+                            # list would yield stage DICTS (no $-prefixed string
+                            # keys) and misclassify it as replace.
+                            is_replacement = False
+                        else:
+                            is_replacement = not any(
+                                isinstance(k, str) and k.startswith("$") for k in update
+                            )
                         if is_replacement:
                             o_field: dict[str, Any] = dict(new)
                         else:

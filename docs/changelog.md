@@ -155,6 +155,12 @@ IXSCAN decision the real pipeline run uses.
   16612), and Decimal128 operands widen the fold to decimal. The Rust
   engine defers all error-shaped cases to Python (parity corpus
   extended first; 536 parity tests green).
+- Aggregation-pipeline updates (`update_one(filter, [{"$set": ...}])`)
+  now project as `update` change-stream events with a computed
+  `updateDescription`, matching mongod. The replacement classifier
+  iterated the pipeline list (whose elements are stage documents, not
+  `$`-prefixed keys) and emitted a full-document oplog entry, so
+  pymongo's "Test array truncation" unified spec saw `replace`.
 - Stale WT read snapshots made the mutating scanners
   (`drop_collection` / `drop_database` / `rename_collection` /
   `drop_index` / `drop_all_indexes`, plus `index_sizes`) silently miss

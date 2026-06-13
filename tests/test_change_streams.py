@@ -494,3 +494,27 @@ def test_split_large_change_stream_events_omitted_by_default(client: MongoClient
     events = _drain(cs, target=1)
     cs.close()
     assert "splitEvent" not in events[0]
+
+
+def test_pipeline_update_is_update_event_with_truncated_arrays(client: MongoClient) -> None:
+    """An aggregation-pipeline update ([{$set: ...}]) is an "update" event
+    with a computed updateDescription — never "replace". Regression: the
+    replacement classifier iterated the pipeline LIST (whose elements are
+    stage dicts, not $-prefixed keys) and emitted a full-doc oplog entry,
+    so pymongo's "Test array truncation" unified spec saw "replace".
+    Mirrors that spec's shape: shrinking an array surfaces only in
+    updateDescription.truncatedArrays."""
+    db = client["csdb_pipeline_update"]
+    coll = db["c"]
+    db.create_collection("c")
+    coll.insert_one({"_id": 1, "a": 1, "array": ["foo", {"a": "bar"}, 1, 2, 3]})
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.update_one({"_id": 1}, [{"$set": {"array": ["foo", {"a": "bar"}]}}])
+    events = _drain(cs, target=1)
+    cs.close()
+    assert events[0]["operationType"] == "update"
+    desc = events[0]["updateDescription"]
+    assert desc["updatedFields"] == {}
+    assert desc["removedFields"] == []
+    assert desc["truncatedArrays"] == [{"field": "array", "newSize": 2}]
