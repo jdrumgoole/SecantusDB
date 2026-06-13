@@ -705,3 +705,30 @@ def test_drop_collection_sees_writes_from_other_threads(tmp_path) -> None:
         assert inserted == 3
     finally:
         s.close()
+
+
+def test_timeseries_allows_duplicate_ids(tmp_path) -> None:
+    """Timeseries collections don't enforce _id uniqueness (mongod buckets
+    measurements by time; _id is not a key). Pins the doc-key suffix
+    scheme: duplicates coexist, find/count see both, _id-filter reads work
+    (fast path gated off), delete removes both rows."""
+    import datetime as dt
+
+    s = Storage(str(tmp_path))
+    try:
+        s.create_collection("ts", "m")
+        s.set_collection_options("ts", "m", timeseries={"timeField": "time"})
+        t0 = dt.datetime(2019, 3, 18, 22, 53, 50)
+        inserted, errors = s.insert(
+            "ts", "m", [{"_id": 1, "time": t0}, {"_id": 1, "time": t0.replace(second=51)}]
+        )
+        assert (inserted, errors) == (2, [])
+        docs = list(s.find_matching("ts", "m", {}))
+        assert len(docs) == 2
+        assert [d["_id"] for d in docs] == [1, 1]
+        by_id = list(s.find_matching("ts", "m", {"_id": 1}))
+        assert len(by_id) == 2
+        assert s.delete_matching("ts", "m", {"_id": 1}) == 2
+        assert list(s.find_matching("ts", "m", {})) == []
+    finally:
+        s.close()

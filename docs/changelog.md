@@ -208,6 +208,13 @@ IXSCAN decision the real pipeline run uses.
   16612), and Decimal128 operands widen the fold to decimal. The Rust
   engine defers all error-shaped cases to Python (parity corpus
   extended first; 536 parity tests green).
+- Timeseries collections no longer enforce `_id` uniqueness, matching
+  mongod (measurements are bucketed by time; `_id` is not a key there).
+  Doc-table keys for timeseries rows carry a uniqueness suffix so equal
+  `_id`s coexist; index entries point at the actual row key, updates and
+  deletes preserve it, and the `_id` point-lookup fast path falls back
+  to a collection scan for timeseries. Closes the last E11000 item from
+  the honest-gauge triage.
 - Aggregation-pipeline updates (`update_one(filter, [{"$set": ...}])`)
   now project as `update` change-stream events with a computed
   `updateDescription`, matching mongod. The replacement classifier
