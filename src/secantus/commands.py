@@ -2579,11 +2579,39 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "collation",
         "expireAfterSeconds",
         "timeseries",
-        "clusteredIndex",
     )
     for opt_name in _PASSTHROUGH_CREATE_OPTIONS:
         if opt_name in doc:
             stored[opt_name] = doc[opt_name]
+    # ``clusteredIndex`` makes ``_id`` the collection's clustering key
+    # (the doc table IS the index — exactly SecantusDB's WiredTiger
+    # layout already, since the doc table is keyed by ``_id``). mongod
+    # only allows it on ``{_id: 1}`` with ``unique: true``; we normalise
+    # the stored option (default name ``_id_``, add ``v: 2``) so
+    # listCollections / listIndexes echo mongod's shape.
+    if "clusteredIndex" in doc:
+        ci = doc["clusteredIndex"]
+        if isinstance(ci, Mapping):
+            if ci.get("key") != {"_id": 1}:
+                return {
+                    "ok": 0.0,
+                    "errmsg": "The clusteredIndex option is only supported for key: {_id: 1}",
+                    "code": 197,
+                    "codeName": "InvalidIndexSpecificationOption",
+                }
+            if ci.get("unique") is not True:
+                return {
+                    "ok": 0.0,
+                    "errmsg": "The clusteredIndex option requires unique: true to be specified",
+                    "code": 5979700,
+                    "codeName": "Location5979700",
+                }
+            stored["clusteredIndex"] = {
+                "v": 2,
+                "key": {"_id": 1},
+                "name": ci.get("name") or "_id_",
+                "unique": True,
+            }
     # MongoDB 3.4+ ``viewOn`` + ``pipeline`` makes the collection a
     # read-only view of another collection filtered through an
     # aggregation pipeline. Mongo-java-driver's
@@ -2784,6 +2812,22 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    # A clustered collection has no separate ``_id_`` index — the
+    # clustering key IS the index. mongod reports a single entry for it
+    # carrying ``clustered: true`` (and the user's name / unique).
+    # Replace the synthesised ``_id_`` entry; secondary indexes pass
+    # through unchanged.
+    coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll) or {}
+    ci = coll_opts.get("clusteredIndex")
+    if isinstance(ci, Mapping):
+        clustered_entry = {
+            "v": ci.get("v", 2),
+            "key": {"_id": 1},
+            "name": ci.get("name", "_id_"),
+            "unique": True,
+            "clustered": True,
+        }
+        indexes = [clustered_entry] + [ix for ix in indexes if ix.get("name") != "_id_"]
     # Honour ``cursor.batchSize`` so callers with many indexes
     # actually round-trip via ``getMore`` — mongo-go-driver's
     # ``TestIndexView/list/getMore_commands_are_monitored`` test

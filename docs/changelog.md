@@ -19,6 +19,23 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Clustered collections
+
+The `clusteredIndex` create option is now supported. mongod uses it to
+make `_id` the collection's clustering key — which is exactly
+SecantusDB's WiredTiger layout already (the document table is keyed by
+`_id`), so this is a metadata-and-reporting feature: the option is
+validated at `create` (only `{_id: 1}` with `unique: true`, mongod's
+two rejection codes), echoed in `listCollections.options.clusteredIndex`
+with its `v` and defaulted name, and reported by `listIndexes` as a
+single entry carrying `clustered: true` (a clustered collection has no
+separate `_id_` index). Secondary indexes coexist normally.
+
+#### Added
+
+- `clusteredIndex` create option (`create` / `listCollections` /
+  `listIndexes`), oracle-pinned against mongod.
+
 ### Matcher correctness, the validate command, and upsert _id fidelity
 
 Continuing the honest-gauge triage, this slice fixes two genuine
