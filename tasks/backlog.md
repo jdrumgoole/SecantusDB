@@ -272,10 +272,6 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   and pointing them at the Rust server needs a `secantusdb`-binary launch path
   in each gauge job — deferred until the Rust server's command surface is wide
   enough for those suites to be informative.
-- [ ] **Cluster-time gossip not in the Rust server** — the Python server
-  attaches `$clusterTime` / `operationTime` to every reply (dispatch tail,
-  `Storage.peek_cluster_time`); the Rust server's dispatch doesn't. Port when
-  closing the R8 change-stream bucket (106 of its 283 gauge failures).
 - [ ] **Timeseries `_id` non-uniqueness not in the Rust storage layer** —
   the Python `Storage` suffixes timeseries doc-table keys so duplicate
   `_id`s coexist (`_timeseries_doc_suffix`, `id_key_override` on the

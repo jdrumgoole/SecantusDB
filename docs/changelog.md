@@ -65,6 +65,15 @@ rejection of `full` + `background` together.
   the Rust core already deferred Document/Array equality to Python).
 - Upsert with a `None` `_id` reports `did_upsert` and the upserted `_id`
   correctly (update and findAndModify paths).
+- **Rust server:** cluster-time gossip — the Rust server now attaches
+  `$clusterTime` (keyless signature) and `operationTime` to every reply
+  when the replica-set persona is on, matching mongod and the Python
+  server (shipped in 0.5.2b19). Reads observe the clock via the new
+  `secantus_storage::Storage::peek_cluster_time` without advancing it;
+  standalone mode stays gossip-free. Measured +6 on the R8 rust-server
+  gauge (930 → 936 of 1713, zero regressions): the `$clusterTime`-gossip,
+  causal-consistency, and transaction-commit tests that read
+  `operationTime`. Closes a documented Rust-server gap (backlog §7).
 
 
 ### The honest-gauge triage: projection, size caps, snapshot reads, and change-stream fidelity

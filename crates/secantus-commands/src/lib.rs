@@ -286,6 +286,12 @@ fn lookup(name: &str) -> Option<Handler> {
 /// `commands.py::dispatch` runs first. Always returns a reply document (errors
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
+    let mut reply = dispatch_inner(doc, ctx);
+    attach_cluster_time_gossip(&mut reply, ctx);
+    reply
+}
+
+fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     let name = command_name(doc);
 
     if let Err(e) = validate_read_concern(doc) {
@@ -309,6 +315,46 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
             }
         }
         None => CommandError::command_not_found(name).into_reply(),
+    }
+}
+
+/// Cluster-time gossip: real replica-set mongod attaches `$clusterTime` and
+/// `operationTime` to EVERY reply — successes and errors — when the node is a
+/// replica-set member; standalones don't gossip (neither do we when the
+/// replica-set persona is off). Drivers and pymongo read `operationTime` for
+/// causal consistency and `startAtOperationTime`. `contains_key` guards
+/// preserve a handler that already attached a more specific value (e.g. the
+/// change-stream `aggregate` reply). The keyless signature (20 zero bytes,
+/// keyId 0) is what auth-less replica sets send. Mirrors `commands.py::dispatch`.
+fn attach_cluster_time_gossip(reply: &mut Document, ctx: &CommandContext) {
+    if ctx.replica_set_name.is_none() {
+        return;
+    }
+    let ts = ctx
+        .storage
+        .as_ref()
+        .map(|s| s.peek_cluster_time())
+        .unwrap_or(bson::Timestamp {
+            time: 0,
+            increment: 0,
+        });
+    if !reply.contains_key("$clusterTime") {
+        reply.insert(
+            "$clusterTime",
+            doc! {
+                "clusterTime": Bson::Timestamp(ts),
+                "signature": doc! {
+                    "hash": Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: vec![0u8; 20],
+                    }),
+                    "keyId": 0i64,
+                },
+            },
+        );
+    }
+    if !reply.contains_key("operationTime") {
+        reply.insert("operationTime", Bson::Timestamp(ts));
     }
 }
 
@@ -625,6 +671,33 @@ mod tests {
         );
         let mechs = reply.get_array("saslSupportedMechs").unwrap();
         assert_eq!(mechs, &vec![Bson::String("SCRAM-SHA-256".into())]);
+    }
+
+    #[test]
+    fn replica_set_replies_gossip_cluster_time() {
+        // Replica-set persona on: every reply (success or error) carries
+        // $clusterTime + operationTime, exactly like a real replica-set mongod.
+        let mut c = ctx();
+        c.replica_set_name = Some("secantus".into());
+        for req in [doc! {"ping": 1}, doc! {"nonsuchcommand": 1}] {
+            let reply = dispatch(&req, &mut c);
+            let ct = reply.get_document("$clusterTime").unwrap();
+            assert!(matches!(ct.get("clusterTime"), Some(Bson::Timestamp(_))));
+            let sig = ct.get_document("signature").unwrap();
+            assert_eq!(sig.get_i64("keyId").unwrap(), 0);
+            assert!(matches!(
+                reply.get("operationTime"),
+                Some(Bson::Timestamp(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn standalone_replies_do_not_gossip_cluster_time() {
+        // No replica-set persona: no gossip (matches standalone mongod).
+        let reply = dispatch(&doc! {"ping": 1}, &mut ctx());
+        assert!(reply.get("$clusterTime").is_none());
+        assert!(reply.get("operationTime").is_none());
     }
 
     #[test]

@@ -61,6 +61,17 @@ pub enum StorageError {
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
+    /// The current cluster time WITHOUT advancing it — for reply gossip
+    /// (`$clusterTime` / `operationTime` attached to every reply). The default
+    /// returns a zero timestamp (test fakes don't track cluster time); the
+    /// WiredTiger-backed adapter forwards to `Storage::peek_cluster_time`.
+    fn peek_cluster_time(&self) -> bson::Timestamp {
+        bson::Timestamp {
+            time: 0,
+            increment: 0,
+        }
+    }
+
     /// Insert a batch of already-encoded documents. Returns
     /// `(inserted_count, write_errors)` where each write-error document is the
     /// mongod shape `{index, code, errmsg, keyPattern?, keyValue?}` and `index`
