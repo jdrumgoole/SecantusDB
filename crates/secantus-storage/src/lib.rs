@@ -1037,6 +1037,24 @@ impl Storage {
         Ok(ts)
     }
 
+    /// The last minted cluster time WITHOUT advancing the clock. Reply gossip
+    /// (`$clusterTime` / `operationTime` on every reply) observes cluster time;
+    /// only writes and the explicit `current_cluster_time` advance it. A virgin
+    /// store mints once so the gossiped value is never `Timestamp(0, 0)`.
+    /// Mirrors `storage.peek_cluster_time`.
+    pub fn peek_cluster_time(&self) -> Result<bson::Timestamp> {
+        {
+            let st = self.oplog.lock().unwrap();
+            if st.last_ts_secs != 0 {
+                return Ok(bson::Timestamp {
+                    time: st.last_ts_secs as u32,
+                    increment: st.last_ts_ord as u32,
+                });
+            }
+        }
+        self.current_cluster_time()
+    }
+
     /// Persist the recovery meta row (`next_seq` / `last_ts_*`). Best-effort
     /// optimisation — `load_oplog_meta` reconstructs from the oplog table if the
     /// row is stale or missing. Mirrors `storage._persist_oplog_meta`.
