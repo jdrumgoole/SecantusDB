@@ -2480,3 +2480,52 @@ def test_cursor_min_max_index_bounds(tmp_path) -> None:
                 t.find().max([("k", 3)]).hint("nonexistent").to_list()
         finally:
             client.close()
+
+
+def test_upsert_with_subdocument_id(tmp_path) -> None:
+    """An upsert whose filter pins ``_id`` to a SUBDOCUMENT value must
+    seed that _id, not generate a fresh ObjectId. The seed extraction
+    must distinguish a literal subdocument value ({f, f2}) from an
+    operator expression ({$gt: 5}). Oracle-pinned (pymongo's
+    test_upsert_uuid_standard_subdocuments)."""
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    sub_id = {"f": b"x", "f2": 7}
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["t"]
+            r = coll.update_one({"_id": sub_id}, {"$set": {"a": 0}}, upsert=True)
+            assert r.did_upsert is True
+            assert r.upserted_id == sub_id
+            assert coll.find_one({"_id": sub_id}) == {"_id": sub_id, "a": 0}
+
+            # Operator-expression filter fields are still NOT seeded.
+            r2 = coll.update_one({"n": {"$gt": 5}}, {"$set": {"b": 1}}, upsert=True)
+            doc = coll.find_one({"_id": r2.upserted_id})
+            assert "n" not in doc and doc["b"] == 1
+        finally:
+            client.close()
+
+
+def test_drop_collection_honors_unsatisfiable_write_concern(tmp_path) -> None:
+    """``drop`` with an unsatisfiable write concern (w > member count)
+    raises a WriteConcernError, like other write commands on the
+    single-node replica-set persona. Oracle: pymongo's
+    test_drop_collection with IMPOSSIBLE_WRITE_CONCERN."""
+    import pytest as _pytest
+    from pymongo import MongoClient
+    from pymongo.errors import WriteConcernError
+    from pymongo.write_concern import WriteConcern
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            client["db"]["t"].insert_one({"x": 1})
+            db_wc = client.get_database("db", write_concern=WriteConcern(w=50))
+            with _pytest.raises(WriteConcernError):
+                db_wc.drop_collection("t")
+        finally:
+            client.close()

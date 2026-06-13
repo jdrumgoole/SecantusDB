@@ -226,6 +226,14 @@ class DuplicateKeyError(Exception):
         self.doc_id = doc_id
 
 
+def _is_operator_expr(v: Any) -> bool:
+    """True when ``v`` is a query OPERATOR expression (a non-empty dict
+    whose keys all start with ``$``, e.g. ``{$gt: 5}``) — as opposed to
+    a literal subdocument equality value (``{f: 1, f2: 2}``). Used by the
+    upsert seed extraction to tell the two apart."""
+    return isinstance(v, dict) and len(v) > 0 and all(k.startswith("$") for k in v)
+
+
 def _id_key(doc_id: Any) -> bytes:
     """Byte-sortable canonical bytes for an ``_id`` value.
 
@@ -3415,8 +3423,16 @@ class Storage:
             if matched == 0 and upsert:
                 seed: dict[str, Any] = {}
                 for k, v in filter.items():
-                    if not k.startswith("$") and not isinstance(v, dict):
-                        seed[k] = v
+                    # Seed bare-equality predicates into the upserted doc.
+                    # A dict value is only skipped when it's an OPERATOR
+                    # expression ({$gt: 5}); a literal subdocument value
+                    # ({f: ..., f2: ...}, e.g. a compound ``_id``) is a
+                    # real equality and must be seeded — Python's
+                    # ``isinstance(v, dict)`` alone wrongly drops it,
+                    # generating a fresh ObjectId instead.
+                    if k.startswith("$") or _is_operator_expr(v):
+                        continue
+                    seed[k] = v
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
