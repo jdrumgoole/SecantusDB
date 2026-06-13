@@ -312,10 +312,16 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   `go test -timeout`, cold caches on runners (GitHub cache service 400s), or
   package discovery under `./internal/integration/...` differing on CI.
   Diagnose before trusting week-over-week go comparisons.
-- [ ] **`aggregate` storage-backed stages** — `$lookup` / `$out` / `$merge` /
-  `$geoNear` / `$sample` / `$collStats` / `$indexStats` (Rust engine returns
-  `Fallback` → surfaced as `BadValue`); `$changeStream` cursors; `let`-expression
-  evaluation; `collation`. Land when the pipeline engine gets a storage context.
+- [~] **`aggregate` storage-backed stages** — DONE: `$lookup` (simple +
+  `let`/`pipeline` forms), `$sample`, `$collStats`, `$indexStats`, `$out`,
+  `$merge` (deep-merge default + replace/keepExisting/delete/fail modes). A
+  `run_segmented` executor in `secantus-commands::aggregate` interleaves the
+  storage-free core engine with these command-layer stages; `$lookup` `let`
+  expressions are evaluated. **Still deferred:** `$geoNear` / `$graphLookup`
+  (need the geo index planner on the storage seam); `$lookup` nested inside
+  `$facet` (facet sub-pipelines run in the storage-free core → Fallback);
+  `$merge` pipeline-form `whenMatched` + `on`-field unique-index validation;
+  `collation`.
 - [x] **`distinct` + DDL/introspection** — `distinct`, `create`, `drop`,
   `listCollections`, `listIndexes`, `createIndexes`, `dropIndexes` (the `Storage`
   trait gained the list/DDL methods; the R4b adapter forwards them).
@@ -388,11 +394,6 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
 - [ ] **`find` edges** — up-front empty-collection filter validation (needs the
   query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
   capped-collection poll; `let` / `collation`. (Tracked in `find.rs` module docs.)
-- [ ] **Tailable (change-stream) getMore** — drain buffered events, call the
-  cursor `producer`, block on the storage oplog condvar for `awaitData`, emit
-  `postBatchResumeToken`. Needs the oplog tail + `notify_oplog_waiters` added to
-  the command `Storage` trait. The registry already stores the tailable entry +
-  producer; only the getMore consumer is missing.
 - [ ] **R2c — `update` command.** Document-form maps to `update_matching`, but
   pipeline-form `u` (array), `arrayFilters`, `let`, `collation`, and `validator`
   need storage-signature additions (the Rust `update_matching` takes none). Port

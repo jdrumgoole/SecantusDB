@@ -222,10 +222,24 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     standalone-rejection (40573) honoured; collectionless `aggregate: 1` handled.
     A pipeline the Rust engine can't reproduce (`Fallback`) → `BadValue`. 6 unit
     tests; the pymongo smoke test now exercises `count_documents` + a direct
-    `$match`→`$group` pipeline. **Deferred:** storage-backed stages (`$lookup` /
-    `$out` / `$merge` / `$geoNear` / `$sample` / `$collStats` / `$indexStats` —
-    need storage threaded into the pipeline engine), `$changeStream` cursors,
-    `let`-expression evaluation, `collation`.
+    `$match`→`$group` pipeline.
+    - **Storage-backed stages ✅ DONE** — a `run_segmented` executor in
+      `secantus-commands::aggregate` interleaves the storage-free core engine
+      with command-layer storage-backed stages: `$lookup` (simple
+      `localField`/`foreignField` + `let`/`pipeline` forms, array-aware
+      `lookup_match`, `let`-expression evaluation, recursive sub-pipeline via the
+      same executor), `$sample` (`rand`, `SECANTUS_SAMPLE_SEED` for determinism),
+      `$collStats` / `$indexStats` (first-stage, via `count_matching` /
+      `list_indexes` / `collection_is_capped`), `$out` (drop+create+insert), and
+      `$merge` (deep-merge default + `replace`/`keepExisting`/`delete`/`fail`
+      modes, `whenNotMatched` insert/discard/fail). 9 unit tests over a stateful
+      `FakeStorage` + a pymongo→Rust→WiredTiger e2e. **+14 on the R8 rust-server
+      gauge (809 → 823; `test_crud_unified` 217 → 229), zero regressions.**
+    - **Still deferred:** `$geoNear` / `$graphLookup` (need the geo index planner
+      on the storage seam — still `BadValue`); `$lookup` nested in `$facet`
+      (facet sub-pipelines run inside the storage-free core); `$merge`
+      pipeline-form `whenMatched` + `on`-field unique-index validation;
+      `collation`.
   - **`distinct` ✅ DONE** — fetch matching docs via `find`, resolve the dotted
     `key` (flattening one array level), dedup by BSON equality. Collation
     deferred. 5 tests.

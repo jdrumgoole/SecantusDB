@@ -8,19 +8,26 @@
 //! 1. Fetch the input documents from storage (lifting a leading `$match` into
 //!    the fetch filter so the index planner can use it, and dropping that stage
 //!    from the pipeline — exactly as `_aggregate` does).
-//! 2. Run the remaining pipeline via `apply_pipeline`.
+//! 2. Run the pipeline via [`run_segmented`], which interleaves the storage-free
+//!    core engine with the storage-backed stages handled here.
 //! 3. Split the result into `firstBatch` + a cursor (`cursor.batchSize`).
 //!
+//! **Storage-backed stages handled at this layer** (the core engine is
+//! storage-free): `$lookup` (simple + `let`/`pipeline` forms), `$sample`,
+//! `$collStats`, `$indexStats`, `$out`, `$merge`. A `run_segmented` flushes the
+//! buffered run of storage-free stages through `apply_pipeline`, then applies the
+//! storage-backed stage, repeating.
+//!
 //! **Deferred (documented so parity is honest):**
-//! * **Storage-backed stages** — `$lookup` / `$out` / `$merge` / `$geoNear` /
-//!   `$sample` / `$collStats` / `$indexStats` — the Rust engine returns
-//!   `Fallback` for these (they need storage threaded into the pipeline); the
-//!   handler surfaces that as a `BadValue`. They land when the pipeline engine
-//!   gets a storage context.
-//! * **`$changeStream`** — change streams aren't wired into the Rust server yet
-//!   (the standalone-rejection, code 40573, is still honoured).
-//! * **`let` expression evaluation** (the raw `let` doc is threaded as vars; `$$`
-//!   expressions in `let` values aren't pre-evaluated) and **`collation`**.
+//! * **`$geoNear`** — needs the geo index planner threaded through the storage
+//!   seam; still surfaces as `BadValue`. `$graphLookup` likewise.
+//! * **`$lookup` inside `$facet`** — `$facet` sub-pipelines run inside the
+//!   storage-free core, so a storage-backed stage nested in a facet still
+//!   Fallbacks. **`$merge` pipeline-form `whenMatched`** and **`on`-field
+//!   unique-index validation** are also deferred.
+//! * **`$changeStream`** — handled separately (`changestream::open_change_stream`);
+//!   the standalone-rejection (40573) is honoured here.
+//! * **`collation`**.
 
 use bson::{doc, Bson, Document};
 
@@ -94,14 +101,14 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ),
     };
 
-    let result = secantus_core::aggregate::apply_pipeline(input, &working_pipeline, &vars, None)
-        .map_err(|_| {
-            CommandError::new(
-                2,
-                "BadValue",
-                "aggregation pipeline uses a stage or operator not supported by the Rust server",
-            )
-        })?;
+    let result = run_segmented(
+        input,
+        &working_pipeline,
+        &ctx.db_name,
+        coll.as_deref(),
+        &vars,
+        storage,
+    )?;
 
     let (first_batch, cursor_id) =
         split_into_cursor(encode_docs(result)?, batch_size, &ns, cursors)?;
@@ -114,6 +121,551 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         },
         "ok": 1.0,
     })
+}
+
+/// Stages handled at the command layer (they touch storage), rather than by the
+/// storage-free `secantus_core` pipeline engine. Everything else flows through
+/// `apply_pipeline`. `$geoNear` is intentionally absent — it needs the geo index
+/// planner threaded through the storage seam and still surfaces as `BadValue`.
+fn is_storage_backed(name: &str) -> bool {
+    matches!(
+        name,
+        "$lookup" | "$sample" | "$collStats" | "$indexStats" | "$out" | "$merge"
+    )
+}
+
+/// The stage operator name (the single key of a stage document), or `""`.
+fn stage_name(stage: &Bson) -> &str {
+    stage
+        .as_document()
+        .and_then(|d| d.keys().next())
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+/// Run a pipeline that may interleave storage-free stages (handled in one shot by
+/// `secantus_core::apply_pipeline`) with storage-backed stages (`$lookup` etc.,
+/// handled here). Consecutive storage-free stages are buffered and flushed
+/// through the core engine; each storage-backed stage is applied in between. This
+/// is the Rust analogue of `commands.py`'s `_aggregate`, where every stage —
+/// storage-free or not — dispatches through the same `apply_pipeline`.
+fn run_segmented(
+    input: Vec<Document>,
+    pipeline: &[Bson],
+    db: &str,
+    coll: Option<&str>,
+    vars: &Document,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    let mut docs = input;
+    let mut buffer: Vec<Bson> = Vec::new();
+    for stage in pipeline {
+        let name = stage_name(stage);
+        if is_storage_backed(name) {
+            if !buffer.is_empty() {
+                docs = core_run(docs, &buffer, vars)?;
+                buffer.clear();
+            }
+            let spec = stage.as_document().and_then(|d| d.get(name)).cloned();
+            docs = apply_storage_stage(name, spec.as_ref(), docs, db, coll, vars, storage)?;
+        } else {
+            buffer.push(stage.clone());
+        }
+    }
+    if !buffer.is_empty() {
+        docs = core_run(docs, &buffer, vars)?;
+    }
+    Ok(docs)
+}
+
+/// Run a run of storage-free stages through the core engine, mapping the engine's
+/// `Fallback` to the `BadValue` the client sees for unsupported constructs.
+fn core_run(
+    docs: Vec<Document>,
+    stages: &[Bson],
+    vars: &Document,
+) -> Result<Vec<Document>, CommandError> {
+    secantus_core::aggregate::apply_pipeline(docs, stages, vars, None).map_err(|_| {
+        CommandError::new(
+            2,
+            "BadValue",
+            "aggregation pipeline uses a stage or operator not supported by the Rust server",
+        )
+    })
+}
+
+fn bad_value(msg: impl Into<String>) -> CommandError {
+    CommandError::new(2, "BadValue", msg)
+}
+
+/// Dispatch one storage-backed stage.
+fn apply_storage_stage(
+    name: &str,
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    db: &str,
+    coll: Option<&str>,
+    vars: &Document,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    match name {
+        "$lookup" => apply_lookup(spec, docs, db, vars, storage),
+        "$sample" => apply_sample(spec, docs),
+        "$collStats" => apply_coll_stats(spec, db, coll, storage),
+        "$indexStats" => apply_index_stats(db, coll, storage),
+        "$out" => apply_out(spec, docs, db, storage),
+        "$merge" => apply_merge(spec, docs, db, storage),
+        _ => Err(bad_value(format!(
+            "unsupported storage-backed stage {name}"
+        ))),
+    }
+}
+
+/// `$lookup` — join a foreign collection in. Mirrors `aggregate._stage_lookup`:
+/// simple `localField`/`foreignField` equality join (array-aware), or the
+/// `let` + `pipeline` form (each outer doc binds `let` vars, then runs the
+/// sub-pipeline over the candidate foreign docs). We materialise the foreign
+/// collection and hash-join in Rust — correctness-identical to the Python
+/// index-driven path; index acceleration is a follow-up.
+fn apply_lookup(
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    db: &str,
+    vars: &Document,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    let spec = spec
+        .and_then(Bson::as_document)
+        .ok_or_else(|| bad_value("$lookup requires a document spec"))?;
+    let from = spec
+        .get_str("from")
+        .map_err(|_| bad_value("$lookup requires 'from' (string)"))?;
+    let as_field = spec
+        .get_str("as")
+        .map_err(|_| bad_value("$lookup requires 'as' (string)"))?;
+    let local_field = spec.get_str("localField").ok();
+    let foreign_field = spec.get_str("foreignField").ok();
+    let sub_pipeline = spec.get("pipeline").and_then(Bson::as_array);
+    let let_spec = spec.get("let").and_then(Bson::as_document);
+
+    // Materialise the foreign collection once (the whole join's candidate pool).
+    let foreign: Vec<Document> = decode_docs(
+        storage
+            .find(db, from, &Document::new(), None, None)
+            .map_err(command_error)?,
+    )?;
+
+    let mut out = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let joined: Vec<Document> = if let Some(sub) = sub_pipeline {
+            // Pipeline form: bind `let` vars against the outer doc, pick the
+            // candidate foreign docs (pre-filtered by localField/foreignField if
+            // both are present, else the whole collection), then run the inner
+            // pipeline over them.
+            let mut sub_vars = vars.clone();
+            if let Some(ls) = let_spec {
+                for (k, expr) in ls.iter() {
+                    let v = secantus_core::expressions::evaluate(&doc, expr, vars)
+                        .map_err(|_| bad_value("$lookup let expression not supported"))?;
+                    sub_vars.insert(k.clone(), v);
+                }
+            }
+            let candidates: Vec<Document> = match (local_field, foreign_field) {
+                (Some(lf), Some(ff)) => {
+                    let lv = secantus_core::get_path(&doc, lf).cloned();
+                    foreign
+                        .iter()
+                        .filter(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)))
+                        .cloned()
+                        .collect()
+                }
+                _ => foreign.clone(),
+            };
+            run_segmented(candidates, sub, db, Some(from), &sub_vars, storage)?
+        } else {
+            // Simple form: localField == foreignField (array-aware).
+            let lf = local_field
+                .ok_or_else(|| bad_value("$lookup requires localField+foreignField or pipeline"))?;
+            let ff = foreign_field
+                .ok_or_else(|| bad_value("$lookup requires localField+foreignField or pipeline"))?;
+            let lv = secantus_core::get_path(&doc, lf).cloned();
+            foreign
+                .iter()
+                .filter(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)))
+                .cloned()
+                .collect()
+        };
+        let mut new = doc;
+        let arr = Bson::Array(joined.into_iter().map(Bson::Document).collect());
+        set_field_path(&mut new, as_field, arr);
+        out.push(new);
+    }
+    Ok(out)
+}
+
+/// Set `path` (dotted) in `doc` to `value`, creating intermediate documents —
+/// for `$lookup`'s `as` target. `set_path` in `secantus-core` is deliberately
+/// private (its `Result<_, ()>` defer signal isn't public API), so this is a
+/// small local setter; `as` is almost always a top-level field.
+fn set_field_path(doc: &mut Document, path: &str, value: Bson) {
+    match path.split_once('.') {
+        None => {
+            doc.insert(path, value);
+        }
+        Some((head, rest)) => {
+            let child = match doc.get_mut(head) {
+                Some(Bson::Document(d)) => d,
+                _ => {
+                    doc.insert(head, Document::new());
+                    doc.get_document_mut(head).expect("just inserted")
+                }
+            };
+            set_field_path(child, rest, value);
+        }
+    }
+}
+
+/// `$lookup` equality with mongod's array-aware semantics (mirrors
+/// `aggregate._lookup_match`): array↔array → any element equal; one side array →
+/// membership; else plain equality. A missing field is `Null`.
+fn lookup_match(local: Option<&Bson>, foreign: Option<&Bson>) -> bool {
+    let local = local.unwrap_or(&Bson::Null);
+    let foreign = foreign.unwrap_or(&Bson::Null);
+    match (local, foreign) {
+        (Bson::Array(la), Bson::Array(fa)) => la.iter().any(|le| fa.iter().any(|fe| le == fe)),
+        (Bson::Array(la), f) => la.iter().any(|le| le == f),
+        (l, Bson::Array(fa)) => fa.iter().any(|fe| fe == l),
+        (l, f) => l == f,
+    }
+}
+
+/// `$sample` — `{size: N}`. Random N-doc subset (whole set when N ≥ len).
+/// `SECANTUS_SAMPLE_SEED` pins the RNG for deterministic tests, mirroring
+/// `aggregate._SAMPLE_RNG`.
+fn apply_sample(spec: Option<&Bson>, docs: Vec<Document>) -> Result<Vec<Document>, CommandError> {
+    use rand::seq::SliceRandom;
+    let size = spec
+        .and_then(Bson::as_document)
+        .and_then(|d| d.get("size"))
+        .and_then(as_i64)
+        .ok_or_else(|| bad_value("$sample requires {size: N}"))?;
+    if size < 0 {
+        return Err(bad_value("$sample size must be non-negative"));
+    }
+    let size = size as usize;
+    if size >= docs.len() {
+        return Ok(docs);
+    }
+    let mut docs = docs;
+    match sample_seed() {
+        Some(seed) => {
+            use rand::SeedableRng;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            docs.shuffle(&mut rng);
+        }
+        None => docs.shuffle(&mut rand::rng()),
+    }
+    docs.truncate(size);
+    Ok(docs)
+}
+
+fn sample_seed() -> Option<u64> {
+    std::env::var("SECANTUS_SAMPLE_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// `$collStats` — first-stage collection statistics. Minimal but driver-faithful
+/// shape (mirrors `aggregate._stage_coll_stats`): `ns` / `host` / `localTime`,
+/// plus `storageStats` / `latencyStats` / `count` sub-docs when requested.
+fn apply_coll_stats(
+    spec: Option<&Bson>,
+    db: &str,
+    coll: Option<&str>,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    let coll = coll.ok_or_else(|| bad_value("$collStats requires a collection"))?;
+    let spec = spec.and_then(Bson::as_document);
+    let count = storage
+        .count_matching(db, coll, &Document::new())
+        .map_err(command_error)? as i64;
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let mut out = doc! {
+        "ns": format!("{db}.{coll}"),
+        "host": "secantus",
+        "localTime": bson::DateTime::now(),
+    };
+    if spec.is_some_and(|s| s.contains_key("storageStats")) {
+        let mut index_sizes = Document::new();
+        for ix in &indexes {
+            if let Ok(name) = ix.get_str("name") {
+                index_sizes.insert(name.to_string(), 0_i32);
+            }
+        }
+        let mut storage_stats = doc! {
+            "size": 0_i32,
+            "count": count,
+            "avgObjSize": 0_i32,
+            "storageSize": 0_i32,
+            "indexSizes": index_sizes,
+            "totalIndexSize": 0_i32,
+            "scaleFactor": 1_i32,
+            "nindexes": indexes.len() as i32,
+        };
+        if storage.collection_is_capped(db, coll).unwrap_or(false) {
+            storage_stats.insert("capped", true);
+        }
+        out.insert("storageStats", storage_stats);
+    }
+    if spec.is_some_and(|s| s.contains_key("latencyStats")) {
+        out.insert(
+            "latencyStats",
+            doc! {
+                "reads": {"latency": 0_i64, "ops": 0_i64},
+                "writes": {"latency": 0_i64, "ops": 0_i64},
+                "commands": {"latency": 0_i64, "ops": 0_i64},
+            },
+        );
+    }
+    if spec.is_some_and(|s| s.contains_key("count")) {
+        out.insert("count", count);
+    }
+    Ok(vec![out])
+}
+
+/// `$indexStats` — one doc per index (mirrors `aggregate._stage_index_stats`).
+fn apply_index_stats(
+    db: &str,
+    coll: Option<&str>,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    let coll = coll.ok_or_else(|| bad_value("$indexStats requires a collection"))?;
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    Ok(indexes
+        .into_iter()
+        .map(|ix| {
+            doc! {
+                "name": ix.get_str("name").unwrap_or("").to_string(),
+                "key": ix.get_document("key").cloned().unwrap_or_default(),
+                "host": "secantus",
+                "accesses": {"ops": 0_i64, "since": Bson::Null},
+            }
+        })
+        .collect())
+}
+
+/// `$out` — replace the target collection with the pipeline result. Mirrors
+/// `aggregate._stage_out`'s default (same-db) behaviour: drop the target, insert
+/// every result doc, and emit nothing downstream.
+fn apply_out(
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    db: &str,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    let (out_db, out_coll) = out_target(spec, db)?;
+    storage
+        .drop_collection(&out_db, &out_coll)
+        .map_err(command_error)?;
+    storage
+        .create_collection(&out_db, &out_coll)
+        .map_err(command_error)?;
+    if !docs.is_empty() {
+        let encoded = encode_docs(docs)?;
+        storage
+            .insert(&out_db, &out_coll, encoded, true)
+            .map_err(command_error)?;
+    }
+    Ok(Vec::new())
+}
+
+/// Resolve `$out`'s target. Accepts `"coll"` or `{db, coll}`.
+fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), CommandError> {
+    match spec {
+        Some(Bson::String(c)) => Ok((db.to_string(), c.clone())),
+        Some(Bson::Document(d)) => {
+            let coll = d
+                .get_str("coll")
+                .map_err(|_| bad_value("$out target document requires 'coll'"))?;
+            let out_db = d.get_str("db").unwrap_or(db);
+            Ok((out_db.to_string(), coll.to_string()))
+        }
+        _ => Err(bad_value("$out requires a collection name or {db, coll}")),
+    }
+}
+
+/// `$merge` — merge the pipeline result into the target collection. Mirrors
+/// `aggregate._stage_merge`: per result doc, find the target doc(s) matching the
+/// `on` key, then apply `whenMatched` (`merge` deep-merge default / `replace` /
+/// `keepExisting` / `delete` / `fail`) or `whenNotMatched` (`insert` default /
+/// `discard` / `fail`). The pipeline-array `whenMatched` form is deferred
+/// (surfaced as `BadValue`); `on`-field unique-index validation is skipped.
+fn apply_merge(
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    db: &str,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    let (out_db, out_coll, on, when_matched, when_not_matched) = merge_spec(spec, db)?;
+    storage
+        .create_collection(&out_db, &out_coll)
+        .map_err(command_error)?;
+    for d in docs {
+        let mut filter = Document::new();
+        for field in &on {
+            let v = secantus_core::get_path(&d, field)
+                .cloned()
+                .unwrap_or(Bson::Null);
+            filter.insert(field.clone(), v);
+        }
+        let existing = decode_docs(
+            storage
+                .find(&out_db, &out_coll, &filter, None, None)
+                .map_err(command_error)?,
+        )?
+        .into_iter()
+        .next();
+
+        match existing {
+            Some(existing) => {
+                let existing_id = existing.get("_id").cloned().unwrap_or(Bson::Null);
+                let id_filter = doc! {"_id": existing_id.clone()};
+                match when_matched.as_str() {
+                    "keepExisting" => {}
+                    "fail" => {
+                        return Err(CommandError::new(
+                            11000,
+                            "DuplicateKey",
+                            "$merge whenMatched=fail matched an existing document",
+                        ));
+                    }
+                    "delete" => {
+                        storage
+                            .delete_matching(&out_db, &out_coll, &id_filter, 1)
+                            .map_err(command_error)?;
+                    }
+                    "replace" => {
+                        storage
+                            .delete_matching(&out_db, &out_coll, &id_filter, 1)
+                            .map_err(command_error)?;
+                        let mut new = d;
+                        new.entry("_id".to_string()).or_insert(existing_id);
+                        storage
+                            .insert(&out_db, &out_coll, encode_docs(vec![new])?, true)
+                            .map_err(command_error)?;
+                    }
+                    // default: "merge" — deep-merge the result doc over the
+                    // existing one (existing `_id` preserved), then replace.
+                    _ => {
+                        let mut merged = deep_merge_docs(&existing, &d);
+                        merged.insert("_id", existing_id);
+                        storage
+                            .update_matching(&out_db, &out_coll, &id_filter, &merged, false, false)
+                            .map_err(command_error)?;
+                    }
+                }
+            }
+            None => match when_not_matched.as_str() {
+                "discard" => {}
+                "fail" => {
+                    return Err(bad_value(
+                        "$merge whenNotMatched=fail and no matching document exists",
+                    ));
+                }
+                _ => {
+                    storage
+                        .insert(&out_db, &out_coll, encode_docs(vec![d])?, true)
+                        .map_err(command_error)?;
+                }
+            },
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Parse `$merge`'s spec into `(db, coll, on, whenMatched, whenNotMatched)`.
+/// Accepts the string short-form (`$merge: "coll"`) or the document form.
+fn merge_spec(
+    spec: Option<&Bson>,
+    db: &str,
+) -> Result<(String, String, Vec<String>, String, String), CommandError> {
+    const VALID_MATCHED: &[&str] = &["merge", "replace", "keepExisting", "fail", "delete"];
+    const VALID_NOT_MATCHED: &[&str] = &["insert", "discard", "fail"];
+    let (out_db, out_coll, on, when_matched, when_not_matched) = match spec {
+        Some(Bson::String(c)) => (
+            db.to_string(),
+            c.clone(),
+            vec!["_id".to_string()],
+            "merge".to_string(),
+            "insert".to_string(),
+        ),
+        Some(Bson::Document(d)) => {
+            let (odb, ocoll) = match d.get("into") {
+                Some(Bson::String(c)) => (db.to_string(), c.clone()),
+                Some(Bson::Document(into)) => {
+                    let coll = into
+                        .get_str("coll")
+                        .map_err(|_| bad_value("$merge into.coll must be a string"))?;
+                    (
+                        into.get_str("db").unwrap_or(db).to_string(),
+                        coll.to_string(),
+                    )
+                }
+                _ => return Err(bad_value("$merge requires 'into'")),
+            };
+            let on = match d.get("on") {
+                Some(Bson::String(s)) => vec![s.clone()],
+                Some(Bson::Array(a)) => a
+                    .iter()
+                    .filter_map(|b| b.as_str().map(String::from))
+                    .collect(),
+                None => vec!["_id".to_string()],
+                _ => {
+                    return Err(bad_value(
+                        "$merge 'on' must be a string or array of strings",
+                    ))
+                }
+            };
+            if matches!(d.get("whenMatched"), Some(Bson::Array(_))) {
+                return Err(bad_value(
+                    "$merge whenMatched pipeline form is not supported by the Rust server",
+                ));
+            }
+            let wm = d.get_str("whenMatched").unwrap_or("merge").to_string();
+            let wnm = d.get_str("whenNotMatched").unwrap_or("insert").to_string();
+            (odb, ocoll, on, wm, wnm)
+        }
+        _ => return Err(bad_value("$merge requires a string or document spec")),
+    };
+    if !VALID_MATCHED.contains(&when_matched.as_str()) {
+        return Err(bad_value(format!(
+            "$merge whenMatched must be one of {VALID_MATCHED:?} or a pipeline array"
+        )));
+    }
+    if !VALID_NOT_MATCHED.contains(&when_not_matched.as_str()) {
+        return Err(bad_value(format!(
+            "$merge whenNotMatched must be one of {VALID_NOT_MATCHED:?}"
+        )));
+    }
+    Ok((out_db, out_coll, on, when_matched, when_not_matched))
+}
+
+/// Recursive document merge for `$merge whenMatched: "merge"` (mirrors
+/// `aggregate._deep_merge_docs`): overlapping sub-documents merge recursively;
+/// arrays / scalars take the new value; non-overlapping keys from both survive.
+fn deep_merge_docs(existing: &Document, new: &Document) -> Document {
+    let mut result = existing.clone();
+    for (k, v) in new.iter() {
+        match (result.get(k), v) {
+            (Some(Bson::Document(e)), Bson::Document(n)) => {
+                result.insert(k.clone(), Bson::Document(deep_merge_docs(e, n)));
+            }
+            _ => {
+                result.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    result
 }
 
 /// Whether the first pipeline stage has `key`.
@@ -153,6 +705,7 @@ mod tests {
     #[derive(Default)]
     struct FakeStorage {
         cols: Mutex<HashMap<(String, String), Vec<Document>>>,
+        indexes: Mutex<HashMap<(String, String), Vec<Document>>>,
     }
 
     impl FakeStorage {
@@ -164,40 +717,119 @@ mod tests {
                 .insert((db.to_string(), coll.to_string()), docs);
             Arc::new(s)
         }
+        /// Seed an additional collection on an existing fake.
+        fn add(&self, db: &str, coll: &str, docs: Vec<Document>) {
+            self.cols
+                .lock()
+                .unwrap()
+                .insert((db.to_string(), coll.to_string()), docs);
+        }
+        /// Seed an index descriptor (`{name, key}`) for a collection.
+        fn add_index(&self, db: &str, coll: &str, index: Document) {
+            self.indexes
+                .lock()
+                .unwrap()
+                .entry((db.to_string(), coll.to_string()))
+                .or_default()
+                .push(index);
+        }
     }
 
     impl Storage for FakeStorage {
         fn insert(
             &self,
-            _: &str,
-            _: &str,
-            _: Vec<Vec<u8>>,
+            db: &str,
+            coll: &str,
+            docs: Vec<Vec<u8>>,
             _: bool,
         ) -> Result<(usize, Vec<Document>), StorageError> {
-            Ok((0, vec![]))
+            let mut cols = self.cols.lock().unwrap();
+            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
+            let n = docs.len();
+            for bytes in docs {
+                bucket.push(Document::from_reader(&mut bytes.as_slice()).unwrap());
+            }
+            Ok((n, vec![]))
         }
         fn update_matching(
             &self,
-            _: &str,
-            _: &str,
-            _: &Document,
-            _: &Document,
+            db: &str,
+            coll: &str,
+            filter: &Document,
+            update: &Document,
             _: bool,
-            _: bool,
+            upsert: bool,
         ) -> Result<UpdateOutcome, StorageError> {
+            // Only the replacement-document form is exercised by $merge tests.
+            let mut cols = self.cols.lock().unwrap();
+            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
+            if let Some(d) = bucket.iter_mut().find(|d| matches(d, filter)) {
+                *d = update.clone();
+                return Ok(UpdateOutcome {
+                    matched: 1,
+                    modified: 1,
+                    upserted_id: None,
+                });
+            }
+            if upsert {
+                bucket.push(update.clone());
+                return Ok(UpdateOutcome {
+                    matched: 0,
+                    modified: 0,
+                    upserted_id: update.get("_id").cloned(),
+                });
+            }
             Ok(UpdateOutcome::default())
         }
         fn delete_matching(
             &self,
-            _: &str,
-            _: &str,
-            _: &Document,
-            _: usize,
+            db: &str,
+            coll: &str,
+            filter: &Document,
+            limit: usize,
         ) -> Result<usize, StorageError> {
-            Ok(0)
+            let mut cols = self.cols.lock().unwrap();
+            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
+            let mut removed = 0;
+            bucket.retain(|d| {
+                if (limit == 0 || removed < limit) && matches(d, filter) {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            Ok(removed)
         }
-        fn count_matching(&self, _: &str, _: &str, _: &Document) -> Result<usize, StorageError> {
-            Ok(0)
+        fn count_matching(
+            &self,
+            db: &str,
+            coll: &str,
+            filter: &Document,
+        ) -> Result<usize, StorageError> {
+            let cols = self.cols.lock().unwrap();
+            Ok(cols
+                .get(&(db.to_string(), coll.to_string()))
+                .map(|b| b.iter().filter(|d| matches(d, filter)).count())
+                .unwrap_or(0))
+        }
+        fn create_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+            let mut cols = self.cols.lock().unwrap();
+            cols.entry((db.to_string(), coll.to_string())).or_default();
+            Ok(true)
+        }
+        fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+            let mut cols = self.cols.lock().unwrap();
+            Ok(cols.remove(&(db.to_string(), coll.to_string())).is_some())
+        }
+        fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>, StorageError> {
+            Ok(self
+                .indexes
+                .lock()
+                .unwrap()
+                .get(&(db.to_string(), coll.to_string()))
+                .cloned()
+                .unwrap_or_default())
         }
         fn find(
             &self,
@@ -316,10 +948,10 @@ mod tests {
     fn aggregate_unsupported_stage_is_bad_value() {
         let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1}]);
         let mut c = ctx(s);
-        // $lookup is storage-backed → the Rust engine returns Fallback.
+        // $geoNear still needs the geo storage seam → the Rust engine Fallbacks.
         let reply = dispatch(
             &doc! {"aggregate": "c", "pipeline": [
-                {"$lookup": {"from": "o", "localField": "_id", "foreignField": "_id", "as": "j"}}
+                {"$geoNear": {"near": [0, 0], "distanceField": "d"}}
             ], "cursor": {}},
             &mut c,
         );
@@ -337,6 +969,233 @@ mod tests {
         );
         assert_eq!(reply.get_i32("code").unwrap(), 40573);
         assert_eq!(reply.get_str("codeName").unwrap(), "IllegalOperation");
+    }
+
+    fn docs_of(reply: &Document) -> Vec<Document> {
+        first_batch(reply)
+            .iter()
+            .map(|b| b.as_document().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn lookup_simple_form_joins_foreign_docs() {
+        let s = FakeStorage::seed(
+            "t",
+            "c",
+            vec![doc! {"_id": 1, "k": 10}, doc! {"_id": 2, "k": 20}],
+        );
+        s.add(
+            "t",
+            "o",
+            vec![
+                doc! {"_id": 100, "fk": 10, "v": "a"},
+                doc! {"_id": 101, "fk": 10, "v": "b"},
+                doc! {"_id": 102, "fk": 20, "v": "c"},
+            ],
+        );
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$lookup": {"from": "o", "localField": "k", "foreignField": "fk", "as": "j"}},
+                {"$sort": {"_id": 1}}
+            ], "cursor": {}},
+            &mut c,
+        );
+        let out = docs_of(&reply);
+        assert_eq!(out[0].get_array("j").unwrap().len(), 2);
+        assert_eq!(out[1].get_array("j").unwrap().len(), 1);
+        assert_eq!(
+            out[1].get_array("j").unwrap()[0]
+                .as_document()
+                .unwrap()
+                .get_str("v")
+                .unwrap(),
+            "c"
+        );
+    }
+
+    #[test]
+    fn lookup_pipeline_form_with_let_binding() {
+        let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1, "k": 5}]);
+        s.add(
+            "t",
+            "o",
+            vec![doc! {"_id": 1, "n": 3}, doc! {"_id": 2, "n": 9}],
+        );
+        let mut c = ctx(s);
+        // Inner pipeline keeps foreign docs whose n > the outer doc's k (=5).
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$lookup": {
+                    "from": "o",
+                    "let": {"kk": "$k"},
+                    "pipeline": [{"$match": {"$expr": {"$gt": ["$n", "$$kk"]}}}],
+                    "as": "j"
+                }}
+            ], "cursor": {}},
+            &mut c,
+        );
+        let out = docs_of(&reply);
+        let j = out[0].get_array("j").unwrap();
+        assert_eq!(j.len(), 1);
+        assert_eq!(j[0].as_document().unwrap().get_i32("n").unwrap(), 9);
+    }
+
+    #[test]
+    fn sample_returns_requested_size_subset() {
+        let docs: Vec<Document> = (0..10).map(|i| doc! {"_id": i}).collect();
+        let s = FakeStorage::seed("t", "c", docs);
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$sample": {"size": 3}}], "cursor": {}},
+            &mut c,
+        );
+        let out = docs_of(&reply);
+        assert_eq!(out.len(), 3);
+        // every sampled _id is a real one (0..10), no dupes
+        let mut ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn sample_size_ge_len_returns_all() {
+        let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1}, doc! {"_id": 2}]);
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$sample": {"size": 50}}], "cursor": {}},
+            &mut c,
+        );
+        assert_eq!(docs_of(&reply).len(), 2);
+    }
+
+    #[test]
+    fn coll_stats_reports_count_and_index_sizes() {
+        let s = FakeStorage::seed(
+            "t",
+            "c",
+            vec![doc! {"_id": 1}, doc! {"_id": 2}, doc! {"_id": 3}],
+        );
+        s.add_index("t", "c", doc! {"name": "_id_", "key": {"_id": 1}});
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$collStats": {"storageStats": {}, "count": {}}}], "cursor": {}},
+            &mut c,
+        );
+        let out = docs_of(&reply);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get_str("ns").unwrap(), "t.c");
+        let ss = out[0].get_document("storageStats").unwrap();
+        assert_eq!(ss.get_i64("count").unwrap(), 3);
+        assert_eq!(ss.get_i32("nindexes").unwrap(), 1);
+        assert!(ss.get_document("indexSizes").unwrap().contains_key("_id_"));
+        assert_eq!(out[0].get_i64("count").unwrap(), 3);
+    }
+
+    #[test]
+    fn index_stats_one_doc_per_index() {
+        let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1}]);
+        s.add_index("t", "c", doc! {"name": "_id_", "key": {"_id": 1}});
+        s.add_index("t", "c", doc! {"name": "x_1", "key": {"x": 1}});
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$indexStats": {}}], "cursor": {}},
+            &mut c,
+        );
+        let out = docs_of(&reply);
+        assert_eq!(out.len(), 2);
+        let names: Vec<&str> = out.iter().map(|d| d.get_str("name").unwrap()).collect();
+        assert!(names.contains(&"_id_") && names.contains(&"x_1"));
+    }
+
+    #[test]
+    fn out_replaces_target_collection() {
+        let s = FakeStorage::seed(
+            "t",
+            "c",
+            vec![doc! {"_id": 1, "v": 1}, doc! {"_id": 2, "v": 2}],
+        );
+        // Pre-existing junk in the target must be wiped by $out.
+        s.add("t", "dst", vec![doc! {"_id": 99, "stale": true}]);
+        let mut c = ctx(s.clone());
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$out": "dst"}], "cursor": {}},
+            &mut c,
+        );
+        // $out emits nothing downstream.
+        assert_eq!(docs_of(&reply).len(), 0);
+        let dst = s
+            .cols
+            .lock()
+            .unwrap()
+            .get(&("t".into(), "dst".into()))
+            .unwrap()
+            .clone();
+        let mut ids: Vec<i32> = dst.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn merge_deep_merges_matched_and_inserts_unmatched() {
+        let s = FakeStorage::seed(
+            "t",
+            "c",
+            vec![
+                doc! {"_id": 1, "a": {"x": 1}, "new": "f"},
+                doc! {"_id": 2, "fresh": true},
+            ],
+        );
+        s.add(
+            "t",
+            "dst",
+            vec![doc! {"_id": 1, "a": {"y": 2}, "keep": "g"}],
+        );
+        let mut c = ctx(s.clone());
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$merge": {"into": "dst"}}], "cursor": {}},
+            &mut c,
+        );
+        assert_eq!(docs_of(&reply).len(), 0);
+        let dst = s
+            .cols
+            .lock()
+            .unwrap()
+            .get(&("t".into(), "dst".into()))
+            .unwrap()
+            .clone();
+        let merged = dst.iter().find(|d| d.get_i32("_id") == Ok(1)).unwrap();
+        // deep merge: existing a.y kept, new a.x added, keep retained, new added.
+        let a = merged.get_document("a").unwrap();
+        assert_eq!(a.get_i32("x").unwrap(), 1);
+        assert_eq!(a.get_i32("y").unwrap(), 2);
+        assert_eq!(merged.get_str("keep").unwrap(), "g");
+        assert_eq!(merged.get_str("new").unwrap(), "f");
+        // unmatched _id:2 inserted.
+        assert!(dst.iter().any(|d| d.get_i32("_id") == Ok(2)));
+    }
+
+    #[test]
+    fn merge_keep_existing_skips_matched() {
+        let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1, "v": "new"}]);
+        s.add("t", "dst", vec![doc! {"_id": 1, "v": "old"}]);
+        let mut c = ctx(s.clone());
+        dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$merge": {"into": "dst", "whenMatched": "keepExisting"}}
+            ], "cursor": {}},
+            &mut c,
+        );
+        let dst = s
+            .cols
+            .lock()
+            .unwrap()
+            .get(&("t".into(), "dst".into()))
+            .unwrap()
+            .clone();
+        assert_eq!(dst[0].get_str("v").unwrap(), "old");
     }
 
     #[test]

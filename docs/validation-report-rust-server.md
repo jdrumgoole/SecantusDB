@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-13 — SecantusDB 0.5.2b33 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-14 — SecantusDB 0.5.2b33 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -18,17 +18,17 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 217 | 84 | 0 | 185 | 486 | 72.1% |
+| `test_crud_unified.py` | 229 | 72 | 0 | 185 | 486 | 76.1% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 51 | 16 | 0 | 5 | 72 | 76.1% |
 | `test_custom_types.py` | 46 | 5 | 0 | 0 | 51 | 90.2% |
 | `test_database.py` | 28 | 7 | 0 | 1 | 36 | 80.0% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_examples.py` | 10 | 8 | 0 | 2 | 20 | 55.6% |
+| `test_examples.py` | 11 | 7 | 0 | 2 | 20 | 61.1% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
 | `test_operations.py` | 2 | 0 | 0 | 0 | 2 | 100.0% |
 | `test_raw_bson.py` | 13 | 1 | 0 | 0 | 14 | 92.9% |
-| `test_read_concern.py` | 5 | 1 | 0 | 0 | 6 | 83.3% |
+| `test_read_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 15 | 1 | 0 | 5 | 21 | 93.8% |
@@ -36,9 +36,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **809** | **219** | **0** | **475** | **1503** | **78.7%** |
+| **Overall** | **823** | **205** | **0** | **475** | **1503** | **80.1%** |
 
-## Failures (219)
+## Failures (205)
 
 First 30 failure node-ids for manual triage:
 
@@ -74,7 +74,7 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndP
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_enabled
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:off_with_changeStreamPreAndPostImages_disabled
 ```
-... and 189 more (see raw JSON).
+... and 175 more (see raw JSON).
 
 ## How this is generated
 
