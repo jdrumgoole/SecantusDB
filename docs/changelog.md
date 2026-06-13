@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Profiler op-class for `distinct` and `count`
+
+`system.profile` entries for `distinct` and `count` are now recorded
+under `op: "command"`, matching `mongod` — where only `find` carries
+`op: "query"`. The previous bucketing filed both under `op: "query"`, so
+a profile query like `{op: "command", "command.distinct": "<coll>"}`
+found nothing. Monitoring tooling that slices the profiler by operation
+class now sees the same shape it would against a real server.
+
+This closes the pymongo gauge's `test_cursor.test_comment`. The OP_MSG
+exhaust-cursor mid-stream-fault hardening shipped earlier this cycle
+also gained a dedicated regression test (a synthetic mid-stream
+`getMore` fault must terminate the stream with a `moreToCome`-clear
+reply, never drop the connection).
+
+#### Fixed
+
+- `distinct` / `count` profiler entries use `op: "command"` (were
+  `op: "query"`), so `system.profile` queries that filter by operation
+  class find them.
+
 ### OP_MSG exhaust cursors
 
 Exhaust cursors (`CursorType.EXHAUST`) now stream over the wire the way

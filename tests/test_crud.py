@@ -2641,3 +2641,48 @@ def test_exhaust_cursor_single_batch_no_stream(coll) -> None:
     coll.insert_many({"_id": i} for i in range(5))
     cursor = coll.find(cursor_type=CursorType.EXHAUST)
     assert [d["_id"] for d in cursor] == list(range(5))
+
+
+def test_exhaust_midstream_getmore_fault_terminates_cleanly(coll, monkeypatch) -> None:
+    """If a synthetic mid-stream getMore raises unexpectedly after a
+    ``moreToCome`` reply has already gone out, the server must close the
+    stream with a final ``moreToCome``-clear reply (empty batch, id 0)
+    rather than dropping the connection — which the client would surface as
+    "Server ended moreToCome unexpectedly". Regression for the b33 hardening
+    in ``SecantusDBServer._stream_exhaust_getmore``."""
+    from pymongo import CursorType
+
+    import secantus.server as server_mod
+
+    coll.insert_many({"_id": i} for i in range(5))
+
+    real_dispatch = server_mod.dispatch
+    getmore_calls = {"n": 0}
+
+    def faulting_dispatch(body, ctx):
+        # Only meddle with getMores against this test's collection; every
+        # other command (incl. other servers in this worker) passes through
+        # untouched. The first getMore — the client's own exhaustAllowed
+        # request that opens the stream — succeeds and produces a non-empty
+        # ``moreToCome`` batch. The second getMore is the server's synthetic
+        # mid-stream pull; raise there to exercise the fault path.
+        if body.get("getMore") is not None and body.get("collection") == coll.name:
+            getmore_calls["n"] += 1
+            if getmore_calls["n"] >= 2:
+                raise RuntimeError("injected mid-stream getMore fault")
+        return real_dispatch(body, ctx)
+
+    monkeypatch.setattr(server_mod, "dispatch", faulting_dispatch)
+
+    # batchSize 1 guarantees the cursor stays alive past the first getMore,
+    # so the stream emits at least one moreToCome reply before the fault.
+    cursor = coll.find(cursor_type=CursorType.EXHAUST, batch_size=1)
+    # No MongoUnexpectedServerResponseError: the stream ends cleanly. We got
+    # the docs delivered before the fault (find's firstBatch + one streamed
+    # batch); the tail is dropped, but the wire stays well-formed.
+    got = [d["_id"] for d in cursor]
+    assert got == [0, 1]
+    assert getmore_calls["n"] >= 2
+
+    # The connection survives — a fresh command on the same client works.
+    assert coll.count_documents({}) == 5

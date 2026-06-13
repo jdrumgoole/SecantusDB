@@ -5194,8 +5194,12 @@ _PROFILE_SKIP_COMMANDS = frozenset(
 
 _PROFILE_OP_BUCKET: dict[str, str] = {
     "find": "query",
-    "count": "query",
-    "distinct": "query",
+    # mongod's profiler records ``count`` / ``distinct`` under ``op:
+    # "command"`` (only ``find`` is ``op: "query"``); matching that lets
+    # ``system.profile`` queries that filter on ``{op: "command",
+    # command.distinct: ...}`` find the entry.
+    "count": "command",
+    "distinct": "command",
     "aggregate": "command",
     "insert": "insert",
     "update": "update",
