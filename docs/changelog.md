@@ -19,6 +19,59 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### The honest-gauge triage: projection, size caps, snapshot reads, and change-stream fidelity
+
+The first honest pymongo-gauge run (94.8%) left a 64-failure triage list;
+this slice clears the bulk of it. Projection gained mongod's exact
+semantics for three long-standing divergences — `{_id: 1}`-only specs
+are inclusion projections, dotted paths fan out over arrays (with
+`{}`-skeleton preservation), and `$slice` interacts with explicit `_id`
+correctly — fixed in both the Python and Rust engines with the parity
+corpus extended to pin every oracle-checked case. Writes now enforce
+`maxBsonObjectSize` server-side with mongod's codes and wording (10334
+on insert and update-growth, 17420 on upsert).
+
+Snapshot sessions work end-to-end: `readConcern: {level: snapshot}` is
+accepted on find/aggregate/distinct (and their cursor continuations)
+under the replica-set persona, with `atClusterTime` stamped on replies
+for session pinning — and still rejected like a real standalone when
+the persona is off. The `$$NOW` system variable landed as part of the
+same path, seeded per-operation for every command's `let` scope.
+
+Change streams got the biggest batch: events that project out the
+resume token now fail with mongod's 280 `ChangeStreamFatalError` and
+the `NonResumableChangeStreamError` label instead of being silently
+swallowed; `fullDocument: required/whenAvailable` follow post-image
+semantics (error/null when `changeStreamPreAndPostImages` is off);
+`resumeAfter` rejects invalidate-event tokens (260) while `startAfter`
+accepts them; `readConcern: local` on `$changeStream` is rejected;
+unknown pipeline stages return mongod's 40324 at aggregate time;
+pipeline-form updates emit `update` events (with `truncatedArrays`)
+instead of `replace`; and `updateDescription.disambiguatedPaths` is
+computed for ambiguous numeric-string field names — in both engines,
+parity-pinned.
+
+#### Added
+
+- `$$NOW` aggregation system variable (constant per operation, all
+  command `let` scopes).
+- `updateDescription.disambiguatedPaths` on change-stream update
+  events (Python + Rust diff engines).
+- `atClusterTime` on snapshot-read replies (cursor and top-level).
+
+#### Fixed
+
+- Projection: `_id`-only inclusion, dotted-path array fan-out, dict
+  skeletons, `$slice`+`_id` interaction (both engines).
+- Server-side `maxBsonObjectSize` enforcement (10334 / 17420).
+- Change streams: 280 + non-resumable label for projected-out resume
+  tokens, post-image semantics for required/whenAvailable, invalidate
+  tokens rejected by resumeAfter (260), local readConcern rejected,
+  40324 for unknown stages at create time, pipeline updates as diff
+  events, disambiguatedPaths.
+- `AggregateError` can carry mongod-specific codes (40324).
+
+
 ### Real multi-document transactions
 
 `commitTransaction` and `abortTransaction` were the last true stubs in

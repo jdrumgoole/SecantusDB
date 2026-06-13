@@ -22,6 +22,23 @@ struct Acc {
     updated: Document,
     removed: Vec<Bson>,
     truncated: Vec<Bson>,
+    disambiguated: Document,
+}
+
+/// mongod 6.1+ `disambiguatedPaths`: any reported path containing a
+/// numeric-string FIELD name (a dict key like "1" that a reader could
+/// mistake for an array index) maps to its typed segment list — Int32
+/// for real array indices, String for field names. Mirrors
+/// `diff._record_ambiguous` in the Python engine.
+fn record_ambiguous(path: &str, segments: &[Bson], acc: &mut Acc) {
+    let ambiguous = segments.iter().any(|s| match s {
+        Bson::String(k) => !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()),
+        _ => false,
+    });
+    if ambiguous {
+        acc.disambiguated
+            .insert(path.to_string(), Bson::Array(segments.to_vec()));
+    }
 }
 
 fn eq(a: &Bson, b: &Bson) -> R<bool> {
@@ -36,19 +53,25 @@ fn child_path(path: &str, key: &str) -> String {
     }
 }
 
-fn walk(pre: &Bson, post: &Bson, path: &str, acc: &mut Acc) -> R<()> {
+fn walk(pre: &Bson, post: &Bson, path: &str, segments: &[Bson], acc: &mut Acc) -> R<()> {
     match (pre, post) {
         (Bson::Document(a), Bson::Document(b)) => {
             // sorted union of keys (Python `sorted(pre_keys | post_keys)`)
             let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
             for key in keys {
                 let cp = child_path(path, key);
+                let mut cs = segments.to_vec();
+                cs.push(Bson::String(key.clone()));
                 match (a.get(key), b.get(key)) {
-                    (Some(_), None) => acc.removed.push(Bson::String(cp)),
-                    (None, Some(bv)) => {
-                        acc.updated.insert(cp, bv.clone());
+                    (Some(_), None) => {
+                        acc.removed.push(Bson::String(cp.clone()));
+                        record_ambiguous(&cp, &cs, acc);
                     }
-                    (Some(av), Some(bv)) => walk(av, bv, &cp, acc)?,
+                    (None, Some(bv)) => {
+                        acc.updated.insert(cp.clone(), bv.clone());
+                        record_ambiguous(&cp, &cs, acc);
+                    }
+                    (Some(av), Some(bv)) => walk(av, bv, &cp, &cs, acc)?,
                     (None, None) => unreachable!(),
                 }
             }
@@ -61,23 +84,28 @@ fn walk(pre: &Bson, post: &Bson, path: &str, acc: &mut Acc) -> R<()> {
             // Post longer than pre -> wholesale replace (can't encode appends).
             if b.len() > a.len() {
                 acc.updated.insert(path.to_string(), post.clone());
+                record_ambiguous(path, segments, acc);
                 return Ok(());
             }
             for i in 0..b.len() {
                 let cp = child_path(path, &i.to_string());
-                walk(&a[i], &b[i], &cp, acc)?;
+                let mut cs = segments.to_vec();
+                cs.push(Bson::Int32(i as i32));
+                walk(&a[i], &b[i], &cp, &cs, acc)?;
             }
             if b.len() < a.len() {
                 let mut entry = Document::new();
                 entry.insert("field".to_string(), Bson::String(path.to_string()));
                 entry.insert("newSize".to_string(), Bson::Int32(b.len() as i32));
                 acc.truncated.push(Bson::Document(entry));
+                record_ambiguous(path, segments, acc);
             }
             Ok(())
         }
         _ => {
             if !eq(pre, post)? {
                 acc.updated.insert(path.to_string(), post.clone());
+                record_ambiguous(path, segments, acc);
             }
             Ok(())
         }
@@ -91,17 +119,26 @@ pub fn compute_update_description(pre: &Document, post: &Document) -> R<Document
         updated: Document::new(),
         removed: Vec::new(),
         truncated: Vec::new(),
+        disambiguated: Document::new(),
     };
     walk(
         &Bson::Document(pre.clone()),
         &Bson::Document(post.clone()),
         "",
+        &[],
         &mut acc,
     )?;
     let mut out = Document::new();
     out.insert("updatedFields".to_string(), Bson::Document(acc.updated));
     out.insert("removedFields".to_string(), Bson::Array(acc.removed));
     out.insert("truncatedArrays".to_string(), Bson::Array(acc.truncated));
+    if !acc.disambiguated.is_empty() {
+        // Only stamped when an ambiguous path exists (mirrors Python).
+        out.insert(
+            "disambiguatedPaths".to_string(),
+            Bson::Document(acc.disambiguated),
+        );
+    }
     Ok(out)
 }
 

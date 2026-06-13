@@ -1302,3 +1302,15 @@ def test_fill_linear_dates_interpolate_via_timedelta() -> None:
         [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}],
     )
     assert [d["v"] for d in out] == [0, 10, 20, 30]
+
+
+def test_now_system_variable() -> None:
+    """$$NOW is a Date constant across the pipeline (mongod semantics)."""
+    import datetime
+
+    docs = [{"_id": 1}, {"_id": 2}]
+    out = apply_pipeline(docs, [{"$addFields": {"t": "$$NOW"}}])
+    assert all(isinstance(d["t"], datetime.datetime) for d in out)
+    assert out[0]["t"] == out[1]["t"]
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    assert abs((now - out[0]["t"].replace(tzinfo=None)).total_seconds()) < 60

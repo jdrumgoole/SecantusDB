@@ -227,10 +227,11 @@ def test_snapshot_read_concern_accepted_in_transaction(client, coll):
         s.start_transaction(read_concern=pymongo.read_concern.ReadConcern("snapshot")),
     ):
         assert coll.find_one({"_id": 1}, session=s) is not None
-    # Outside a transaction, snapshot is still rejected (single node).
-    with pytest.raises(OperationFailure) as excinfo:
-        client["txndb"].command({"find": "things", "readConcern": {"level": "snapshot"}})
-    assert excinfo.value.code == 246
+    # Outside a transaction, snapshot is accepted on the
+    # snapshot-readable commands too (replica-set persona, mongod 5.0+
+    # semantics) — the reply pins the session via cursor.atClusterTime.
+    reply = client["txndb"].command({"find": "things", "readConcern": {"level": "snapshot"}})
+    assert reply["cursor"]["atClusterTime"] is not None
 
 
 def test_transactions_on_separate_sessions_are_independent(client, coll):

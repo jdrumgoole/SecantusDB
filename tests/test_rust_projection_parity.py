@@ -69,6 +69,31 @@ CURATED = [
     ({"_id": 1, "a": [1, 2, 3, 4, 5]}, {"a": {"$slice": -2}}),
     ({"_id": 1, "a": [1, 2, 3, 4, 5]}, {"a": {"$slice": [1, 2]}}),
     ({"_id": 1, "a": [1, 2, 3, 4, 5]}, {"a": {"$slice": [-3, 2]}}),
+    # _id-only specs: truthy => inclusion (only _id); zero/False => drop _id.
+    # Oracle-pinned against real mongod 2026-06-13: None and "" count as
+    # include; only numeric zero / False mean drop.
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": 1}),
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": True}),
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": None}),
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": ""}),
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": 0.0}),
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": False}),
+    # $slice with an explicit truthy _id flips to inclusion: only _id + the
+    # sliced field survive (oracle-pinned).
+    ({"_id": 1, "a": [1, 2, 3], "b": 9}, {"a": {"$slice": 2}, "_id": 1}),
+    ({"_id": 1, "a": [1, 2, 3], "b": 9}, {"a": {"$slice": 2}, "_id": 0}),
+    ({"_id": 1, "c": {"d": [1, 2, 3]}, "b": 9}, {"c.d": {"$slice": 1}, "_id": 1}),
+    # Dotted paths through arrays + dict skeletons (oracle-pinned 2026-06-13):
+    # inclusion maps over array elements (docs project, scalars drop),
+    # exclusion unsets per element (scalars kept), missing leaves keep {}.
+    ({"_id": 1, "a": [{"q": 1, "w": 2}, {"w": 3}, 7], "b": 9}, {"a.q": 1}),
+    ({"_id": 1, "a": [{"q": 1, "w": 2}, {"w": 3}, 7], "b": 9}, {"a.q": 0}),
+    ({"_id": 1, "a": [{"x": {"q": 1, "r": 2}}, {"x": 5}], "b": 9}, {"a.x.q": 1}),
+    ({"_id": 1, "a": [{"q": 1, "w": 2, "z": 3}], "b": 9}, {"a.q": 1, "a.w": 1}),
+    ({"_id": 1, "a": [[{"q": 1, "w": 2}], {"q": 5, "w": 6}]}, {"a.q": 1}),
+    ({"_id": 1, "a": {"w": 2}, "b": 9}, {"a.q": 1}),
+    ({"_id": 1, "a": 5, "b": 9}, {"a.q": 1}),
+    ({"_id": 1, "a": [{"q": 1}], "b": 9}, {"a.0.q": 1}),
     ({"_id": 1, "a": [1, 2, 3], "b": 9}, {"a": {"$slice": 2}, "b": 1}),  # slice + inclusion
     (
         {"_id": 1, "items": [{"k": 1}, {"k": 5}, {"k": 9}]},

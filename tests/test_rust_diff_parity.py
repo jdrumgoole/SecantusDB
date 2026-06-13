@@ -52,6 +52,11 @@ CURATED = [
     ({"a": [{"k": 1}, {"k": 2}]}, {"a": [{"k": 1}, {"k": 9}]}),  # array of subdocs
     ({"a": True}, {"a": 1}),  # bool==int -> no change
     ({"a": "x"}, {"a": "y"}),
+    # disambiguatedPaths: numeric-string dict keys (vs real array indices).
+    ({"a": {"1": 1}}, {"a": {"1": 2}}),
+    ({"a": [{"1": 1}]}, {"a": [{"1": 2}]}),
+    ({"a": {"1": 1}, "b": 0}, {"b": 0}),  # removal under ambiguous path
+    ({"a": {"2": [1, 2, 3]}}, {"a": {"2": [1]}}),  # truncation under ambiguous path
     (
         {"_id": ObjectId("0123456789abcdef01234567"), "n": 1},
         {"_id": ObjectId("0123456789abcdef01234567"), "n": 2},

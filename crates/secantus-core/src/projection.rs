@@ -159,8 +159,29 @@ pub fn apply_projection(doc: &Document, spec: &Document) -> R<Document> {
         .collect();
 
     if non_id.is_empty() {
+        // The spec is at most an `_id` entry plus `$slice` modifiers.
+        // mongod's rules (oracle-pinned, mirrored in projection.py):
+        //   * non-zero `_id` (incl. null and "") => INCLUSION: only `_id`
+        //     plus any $slice'd fields survive;
+        //   * numeric zero / false => whole doc minus `_id`;
+        //   * no `_id` key => whole doc ($slice applied in place).
+        if let Some(id_v) = id_spec {
+            if !is_drop_id(id_v) {
+                let mut result = Document::new();
+                if let Some(idv) = doc.get("_id") {
+                    result.insert("_id", idv.clone());
+                }
+                for (path, slice_arg) in &slice_specs {
+                    if let Some(current) = paths::get_path(doc, path).cloned() {
+                        let sliced = apply_slice(current, slice_arg)?;
+                        set(&mut result, path, sliced)?;
+                    }
+                }
+                return Ok(result);
+            }
+        }
         let mut result = doc.clone();
-        if id_spec.map(is_drop_id).unwrap_or(false) {
+        if id_spec.is_some() {
             result.remove("_id");
         }
         apply_slices(&mut result, &slice_specs)?;
@@ -195,6 +216,20 @@ pub fn apply_projection(doc: &Document, spec: &Document) -> R<Document> {
                 result.insert("_id".to_string(), id.clone());
             }
         }
+        // Plain inclusion paths go through a path trie so dotted
+        // segments fan over array elements (mirrors projection.py's
+        // _include_doc; oracle-pinned semantics).
+        let plain: Vec<&str> = non_id
+            .iter()
+            .filter(|(_, v)| elem_match_spec(v).is_none())
+            .map(|(k, _)| *k)
+            .collect();
+        if !plain.is_empty() {
+            let tree = spec_tree(&plain);
+            for (k, v) in include_doc(doc, &tree) {
+                result.insert(k, v);
+            }
+        }
         for (path, value) in &non_id {
             if let Some(sub) = elem_match_spec(value) {
                 let Bson::Document(subf) = sub else {
@@ -203,10 +238,6 @@ pub fn apply_projection(doc: &Document, spec: &Document) -> R<Document> {
                 if let Some(first) = first_match(doc, path, subf)? {
                     set(&mut result, path, Bson::Array(vec![first]))?;
                 }
-                continue;
-            }
-            if let Some(extracted) = paths::get_path(doc, path) {
-                set(&mut result, path, extracted.clone())?;
             }
         }
         // $slice implicitly includes its path in inclusion mode.
@@ -224,18 +255,89 @@ pub fn apply_projection(doc: &Document, spec: &Document) -> R<Document> {
         return Ok(result);
     }
 
-    // Exclusion mode.
+    // Exclusion mode: trie-walk so dotted unsets map over array
+    // elements (non-document elements survive untouched).
     let mut result = doc.clone();
-    for (path, _) in &non_id {
-        if paths::has_path(&result, path) {
-            paths::unset_path(&mut result, path);
-        }
-    }
+    let all_paths: Vec<&str> = non_id.iter().map(|(k, _)| *k).collect();
+    exclude_doc(&mut result, &spec_tree(&all_paths));
     if id_spec.map(is_drop_id).unwrap_or(false) {
         result.remove("_id");
     }
     apply_slices(&mut result, &slice_specs)?;
     Ok(result)
+}
+
+/// Dotted paths -> nested trie; a leaf is an empty subtree.
+#[derive(Default)]
+struct SpecTree(std::collections::BTreeMap<String, SpecTree>);
+
+fn spec_tree(paths: &[&str]) -> SpecTree {
+    let mut root = SpecTree::default();
+    for p in paths {
+        let mut node = &mut root;
+        for seg in p.split('.') {
+            node = node.0.entry(seg.to_string()).or_default();
+        }
+    }
+    root
+}
+
+/// Inclusion projection of `doc` against a path trie (mirrors
+/// projection.py's `_include_doc`): a leaf copies the whole value; an
+/// interior segment recurses into documents (keeping the `{}` skeleton
+/// when the leaf is absent), maps over array elements (documents
+/// project — possibly to `{}` — and scalar elements drop), and drops
+/// the field entirely on a scalar. Numeric segments are field names.
+fn include_doc(doc: &Document, tree: &SpecTree) -> Document {
+    let mut out = Document::new();
+    for (key, subtree) in &tree.0 {
+        let Some(val) = doc.get(key) else { continue };
+        if subtree.0.is_empty() {
+            out.insert(key.clone(), val.clone());
+            continue;
+        }
+        if let Some(projected) = include_value(val, subtree) {
+            out.insert(key.clone(), projected);
+        }
+    }
+    out
+}
+
+fn include_value(val: &Bson, subtree: &SpecTree) -> Option<Bson> {
+    match val {
+        Bson::Document(d) => Some(Bson::Document(include_doc(d, subtree))),
+        Bson::Array(arr) => Some(Bson::Array(
+            arr.iter()
+                .filter(|e| matches!(e, Bson::Document(_) | Bson::Array(_)))
+                .filter_map(|e| include_value(e, subtree))
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// Exclusion projection: unset trie leaves, recursing through
+/// documents and mapping over array elements (mirrors `_exclude_doc`).
+fn exclude_doc(doc: &mut Document, tree: &SpecTree) {
+    for (key, subtree) in &tree.0 {
+        if subtree.0.is_empty() {
+            doc.remove(key);
+        } else if let Some(val) = doc.get_mut(key) {
+            exclude_value(val, subtree);
+        }
+    }
+}
+
+fn exclude_value(val: &mut Bson, subtree: &SpecTree) {
+    match val {
+        Bson::Document(d) => exclude_doc(d, subtree),
+        Bson::Array(arr) => {
+            for elem in arr.iter_mut() {
+                exclude_value(elem, subtree);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn apply_slices(result: &mut Document, slice_specs: &[(&str, &Bson)]) -> R<()> {

@@ -889,30 +889,65 @@ def test_get_parameter_advertises_only_scram_auth_mechanism(client: MongoClient)
         assert unsupported not in reply["authenticationMechanisms"]
 
 
-def test_snapshot_read_concern_rejected_on_standalone(client: MongoClient) -> None:
-    # Snapshot read concern requires a real replica set with
-    # majority-committed snapshots; mongod rejects with code 246
-    # (SnapshotUnavailable) on standalone. mongo-java-driver's
-    # ``snapshot-sessions-not-supported-server-error`` unified spec
-    # asserts the error on find / aggregate / distinct.
+def test_snapshot_read_concern_accepted_on_replica_set_persona(client: MongoClient) -> None:
+    # mongod 5.0+ replica sets accept ``snapshot`` on exactly
+    # find / aggregate / distinct (snapshot sessions); the reply
+    # carries ``atClusterTime`` so pymongo can pin the session.
+    # Other commands keep mongod's rejection.
     from pymongo.errors import OperationFailure
 
     db = client["snapshot_rc_db"]
     db.create_collection("things")
 
-    for cmd in (
-        {"find": "things", "readConcern": {"level": "snapshot"}},
-        {"aggregate": "things", "pipeline": [], "cursor": {}, "readConcern": {"level": "snapshot"}},
-        {"distinct": "things", "key": "x", "readConcern": {"level": "snapshot"}},
-    ):
-        with pytest.raises(OperationFailure) as exc:
-            db.command(cmd)
-        assert exc.value.code == 246
-        assert "snapshot" in str(exc.value).lower()
+    reply = db.command({"find": "things", "readConcern": {"level": "snapshot"}})
+    assert reply["cursor"]["atClusterTime"] is not None
+    reply = db.command(
+        {"aggregate": "things", "pipeline": [], "cursor": {}, "readConcern": {"level": "snapshot"}}
+    )
+    assert reply["cursor"]["atClusterTime"] is not None
+    reply = db.command({"distinct": "things", "key": "x", "readConcern": {"level": "snapshot"}})
+    assert reply["atClusterTime"] is not None
 
-    # Other levels still accepted.
-    reply = db.command({"find": "things", "readConcern": {"level": "majority"}})
-    assert reply["ok"] == 1.0
+    with pytest.raises(OperationFailure) as exc:
+        db.command({"count": "things", "readConcern": {"level": "snapshot"}})
+    assert exc.value.code == 246
+    assert "snapshot" in str(exc.value).lower()
+
+
+def test_snapshot_read_concern_rejected_on_standalone(tmp_path) -> None:
+    # With the replica-set persona off, mongod-on-standalone semantics
+    # apply: snapshot is rejected with 246 SnapshotUnavailable on every
+    # command. The mongo-java-driver
+    # ``snapshot-sessions-not-supported-server-error`` unified spec
+    # asserts this error shape.
+    from pymongo.errors import OperationFailure
+
+    with SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "wt-standalone"), replica_set_name=None
+    ) as server:
+        mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000, directConnection=True)
+        try:
+            db = mc["snapshot_rc_db"]
+            db.create_collection("things")
+            for cmd in (
+                {"find": "things", "readConcern": {"level": "snapshot"}},
+                {
+                    "aggregate": "things",
+                    "pipeline": [],
+                    "cursor": {},
+                    "readConcern": {"level": "snapshot"},
+                },
+                {"distinct": "things", "key": "x", "readConcern": {"level": "snapshot"}},
+            ):
+                with pytest.raises(OperationFailure) as exc:
+                    db.command(cmd)
+                assert exc.value.code == 246
+                assert "snapshot" in str(exc.value).lower()
+            # Other levels still accepted.
+            reply = db.command({"find": "things", "readConcern": {"level": "majority"}})
+            assert reply["ok"] == 1.0
+        finally:
+            mc.close()
 
 
 def test_aggregate_linearizable_rc_rejects_write_stage(client: MongoClient) -> None:
@@ -2325,3 +2360,49 @@ def test_backup_archive_rejects_missing_output_path(client) -> None:
     with pytest.raises(OperationFailure) as exc_info:
         client.admin.command("secantusAdmin.backupArchive")
     assert exc_info.value.code == 14
+
+
+def test_oversized_documents_rejected_server_side(tmp_path) -> None:
+    """mongod enforces maxBsonObjectSize per document server-side:
+    insert -> 10334 BSONObjectTooLarge, upsert -> 17420, update that
+    grows a doc over the cap -> 10334. Just-under documents succeed.
+    Wording oracle-pinned against real mongod."""
+    import pytest
+    from pymongo import MongoClient
+    from pymongo.errors import BulkWriteError, OperationFailure
+
+    from secantus import SecantusDBServer
+
+    max_size = 16 * 1024 * 1024
+    big = "x" * max_size
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["shop"]["big"]
+
+            with pytest.raises(OperationFailure) as exc:
+                coll.insert_one({"foo": big})
+            assert exc.value.code == 10334
+            assert "object to insert too large" in str(exc.value)
+
+            with pytest.raises(BulkWriteError) as bexc:
+                coll.insert_many([{"_id": 1, "x": 1}, {"foo": big}])
+            assert bexc.value.details["nInserted"] == 1
+            assert bexc.value.details["writeErrors"][0]["code"] == 10334
+
+            with pytest.raises(OperationFailure) as uexc:
+                coll.replace_one({"missing": 1}, {"foo": big}, upsert=True)
+            assert uexc.value.code == 17420
+
+            coll.insert_one({"_id": 2, "bar": "x"})
+            with pytest.raises(OperationFailure) as gexc:
+                coll.replace_one({"_id": 2}, {"bar": "x" * (max_size - 14)})
+            assert gexc.value.code == 10334
+            assert "Resulting document after update" in str(gexc.value)
+
+            # Just under the cap succeeds end-to-end.
+            coll.replace_one({"_id": 2}, {"bar": "x" * (max_size - 64)})
+            fetched = coll.find_one({"_id": 2})
+            assert fetched is not None and len(fetched["bar"]) == max_size - 64
+        finally:
+            client.close()

@@ -58,17 +58,24 @@ class ResumeTokenData:
     ts: Timestamp
     ns: str
     document_key: dict[str, Any]
+    # True when the token came from an invalidate event. mongod encodes
+    # ``fromInvalidate`` in its keystring tokens; ``resumeAfter``
+    # rejects such tokens (only ``startAfter`` may pass one).
+    from_invalidate: bool = False
 
 
 def make_resume_token(data: ResumeTokenData) -> dict[str, str]:
-    inner = bson.encode(
-        {
-            "s": data.seq,
-            "t": data.ts,
-            "n": data.ns,
-            "k": data.document_key,
-        }
-    )
+    inner_doc: dict[str, Any] = {
+        "s": data.seq,
+        "t": data.ts,
+        "n": data.ns,
+        "k": data.document_key,
+    }
+    if data.from_invalidate:
+        # Only stamped when set so pre-existing tokens stay parseable
+        # and byte-identical.
+        inner_doc["i"] = True
+    inner = bson.encode(inner_doc)
     return {"_data": inner.hex()}
 
 
@@ -87,6 +94,7 @@ def parse_resume_token(token: Mapping[str, Any]) -> ResumeTokenData:
         ts=ts,
         ns=str(inner["n"]),
         document_key=dict(inner.get("k", {})),
+        from_invalidate=bool(inner.get("i", False)),
     )
 
 
@@ -154,6 +162,26 @@ def _attach_full_document(
         ns = str(oplog_entry.get("ns", ""))
         db, coll = _split_ns(ns)
         doc_id = oplog_entry.get("o2", {}).get("_id")
+        # ``required`` / ``whenAvailable`` read the stored POST-image
+        # (mongod 6.0 semantics): the collection must have
+        # ``changeStreamPreAndPostImages`` enabled, else ``required``
+        # errors and ``whenAvailable`` yields null. Only
+        # ``updateLookup`` does a live point-in-time-less lookup. With
+        # images enabled we approximate the post-image with the live
+        # lookup — exact on a single node unless later writes already
+        # changed the doc (recorded divergence, tasks/backlog.md).
+        if full_document_mode in (
+            FULL_DOC_REQUIRED,
+            FULL_DOC_WHEN_AVAILABLE,
+        ) and not storage._pre_post_images_enabled(db, coll):
+            if full_document_mode == FULL_DOC_REQUIRED:
+                raise ChangeStreamFatalError(
+                    "the 'fullDocument: required' option requires "
+                    "changeStreamPreAndPostImages to be enabled on the "
+                    f"collection {ns}"
+                )
+            event["fullDocument"] = None
+            return
         looked_up = _do_lookup(storage, db, coll, doc_id) if doc_id is not None else None
         if looked_up is not None:
             event["fullDocument"] = looked_up
@@ -394,7 +422,7 @@ def invalidate_event(seq: int, oplog_entry: Mapping[str, Any]) -> dict[str, Any]
         affected_ns = str(cmd["renameCollection"])
     else:
         affected_ns = ns
-    token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+    token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}, from_invalidate=True))
     event = {
         "_id": token,
         "operationType": "invalidate",
