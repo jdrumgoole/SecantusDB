@@ -521,6 +521,25 @@ def _is_wt_rollback(exc: BaseException) -> bool:
 # backoff loop bounded by this deadline (the transaction lifetime cap
 # is 60s, but a multi-second stall already covers the overwhelmingly
 # common test patterns; see tasks/backlog.md for the divergence note).
+# mongod's per-document BSON cap (16 MiB). Duplicated from wire.py on
+# purpose: storage must not import the wire layer, and both values pin
+# the same protocol constant.
+MAX_BSON_OBJECT_SIZE = 16 * 1024 * 1024
+
+
+class DocumentTooLargeError(Exception):
+    """A write produced a document over ``MAX_BSON_OBJECT_SIZE``.
+
+    Carries mongod's per-path error code: 10334 (BSONObjectTooLarge)
+    for inserts and update-grown documents, 17420 for upserts. The
+    message is mongod's verbatim wording — drivers' tests assert it.
+    """
+
+    def __init__(self, code: int, errmsg: str) -> None:
+        super().__init__(errmsg)
+        self.code = code
+
+
 _WRITE_CONFLICT_RETRY_DEADLINE_S = 5.0
 _WRITE_CONFLICT_RETRY_DELAY_S = 0.005
 _WRITE_CONFLICT_RETRY_DELAY_MAX_S = 0.02
@@ -2430,6 +2449,22 @@ class Storage:
                         break
                     continue
                 blob = bson.encode(doc)
+                if len(blob) > MAX_BSON_OBJECT_SIZE:
+                    # mongod rejects per-document at insert time with
+                    # BSONObjectTooLarge (10334) and this exact wording.
+                    errors.append(
+                        {
+                            "index": index,
+                            "code": 10334,
+                            "errmsg": (
+                                f"object to insert too large. size in bytes: "
+                                f"{len(blob)}, max size: {MAX_BSON_OBJECT_SIZE}"
+                            ),
+                        }
+                    )
+                    if ordered:
+                        break
+                    continue
                 doc_cur = self._cursor(_DOC_TABLE, overwrite=False)
                 doc_cur.set_key(db, coll, key)
                 doc_cur.set_value(blob)
@@ -3213,18 +3248,31 @@ class Storage:
                     # write happens, otherwise we'd be left with a
                     # half-deleted set of index entries.
                     self._validate_geo_indexes(db, coll, new, indexes, partials)
+                    new_blob = bson.encode(new)
+                    if len(new_blob) > MAX_BSON_OBJECT_SIZE:
+                        raise DocumentTooLargeError(
+                            10334,
+                            "Plan executor error during update :: caused by :: "
+                            f"Resulting document after update is larger than "
+                            f"{MAX_BSON_OBJECT_SIZE}",
+                        )
                     modified += 1
                     self._delete_index_entries(db, coll, doc, indexes, partials)
                     doc_cur = self._cursor(_DOC_TABLE)
-                    doc_cur[db, coll, new_id_key] = bson.encode(new)
+                    doc_cur[db, coll, new_id_key] = new_blob
                     self._write_index_entries(db, coll, new, indexes, partials)
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
+                    # Pipeline-form updates (a list of stages) are
+                    # diff-style in the oplog — mongod emits op "u" with
+                    # an update description (the unified "array
+                    # truncation" spec asserts operationType "update",
+                    # not "replace").
+                    is_replacement = not isinstance(update, list) and not any(
+                        isinstance(k, str) and k.startswith("$") for k in update
+                    )
                     if oplog_on:
-                        is_replacement = not any(
-                            isinstance(k, str) and k.startswith("$") for k in update
-                        )
                         if is_replacement:
                             o_field: dict[str, Any] = dict(new)
                         else:
@@ -3259,8 +3307,15 @@ class Storage:
                     cname, kpat, kval = conflict
                     raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
                 self._validate_geo_indexes(db, coll, new, indexes, partials)
+                upsert_blob = bson.encode(new)
+                if len(upsert_blob) > MAX_BSON_OBJECT_SIZE:
+                    raise DocumentTooLargeError(
+                        17420,
+                        "Plan executor error during update :: caused by :: "
+                        f"Document to upsert is larger than {MAX_BSON_OBJECT_SIZE}",
+                    )
                 doc_cur = self._cursor(_DOC_TABLE)
-                doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
+                doc_cur[db, coll, _id_key(upserted_id)] = upsert_blob
                 self._write_index_entries(db, coll, new, indexes, partials)
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
                 if oplog_on:

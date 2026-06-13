@@ -12,7 +12,13 @@ from typing import Any
 
 import bson
 
-from secantus.aggregate import AggregateError, PipelineContext, apply_pipeline
+from secantus import changestreams
+from secantus.aggregate import (
+    AggregateError,
+    PipelineContext,
+    apply_pipeline,
+    validate_stage_names,
+)
 from secantus.auth import (
     MONGODB_X509,
     SCRAM_SHA_1,
@@ -79,6 +85,7 @@ from secantus.rbac import (
 )
 from secantus.sessions import SessionRegistry
 from secantus.storage import (
+    DocumentTooLargeError,
     DuplicateKeyError,
     GeoExtractError,
     Storage,
@@ -315,7 +322,7 @@ def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
+def _resolve_let_vars(let: Any) -> dict[str, Any]:
     # MongoDB 5.0+ command-level ``let`` values are aggregation
     # expressions: ``{y: {$literal: "bar"}}`` binds ``$$y`` to "bar",
     # ``{n: {$add: [1, 2]}}`` binds ``$$n`` to 3. Driver tests
@@ -323,11 +330,17 @@ def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
     # depend on this — passing the raw mapping through would bind
     # ``$$y`` to the dict ``{$literal: "bar"}`` instead of the
     # string. Scalars are passed through unchanged.
+    #
+    # ``$$NOW`` is seeded unconditionally: mongod binds it as a Date
+    # constant for the whole operation in every command context, and
+    # ``let`` expressions themselves may reference it.
+    now_vars: dict[str, Any] = {"NOW": _dt.datetime.now(_dt.timezone.utc)}
     if not isinstance(let, dict):
-        return None
+        return now_vars
     from secantus.expressions import evaluate
 
-    return {name: evaluate(value, {}) for name, value in let.items()}
+    resolved = {name: evaluate(value, {}, vars=dict(now_vars)) for name, value in let.items()}
+    return {**now_vars, **resolved}
 
 
 def _validate_doc_against_collection(
@@ -1952,6 +1965,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             if ordered:
                 break
             continue
+        except DocumentTooLargeError as exc:
+            write_errors.append({"index": index, "code": exc.code, "errmsg": str(exc)})
+            if ordered:
+                break
+            continue
         except GeoExtractError as exc:
             # Mongod's documented code for "Can't extract geo keys from
             # object" — surfaces to the driver as a write error on the
@@ -2991,6 +3009,20 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _change_stream_fatal_reply(exc: changestreams.ChangeStreamFatalError) -> dict[str, Any]:
+    """mongod's reply shape for fatal change-stream conditions: the
+    error code plus the ``NonResumableChangeStreamError`` label so
+    drivers know not to auto-resume (asserted by the unified
+    change-streams-errors specs)."""
+    return {
+        "ok": 0.0,
+        "errmsg": str(exc),
+        "code": exc.code,
+        "codeName": exc.codeName,
+        "errorLabels": ["NonResumableChangeStreamError"],
+    }
+
+
 def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_id = int(doc["getMore"])
     coll = doc.get("collection", "")
@@ -3049,7 +3081,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     # Drain any already-buffered events first.
     if not entry.remaining and entry.producer is not None:
-        new_events = entry.producer()
+        try:
+            new_events = entry.producer()
+        except changestreams.ChangeStreamFatalError as exc:
+            ctx.cursors.kill([cursor_id])
+            return _change_stream_fatal_reply(exc)
         if new_events:
             entry.remaining.extend(new_events)
     if not entry.remaining and entry.await_data and not entry.invalidated:
@@ -3071,7 +3107,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 timeout=wait_seconds,
             )
         if entry.producer is not None and not entry.remaining:
-            new_events = entry.producer()
+            try:
+                new_events = entry.producer()
+            except changestreams.ChangeStreamFatalError as exc:
+                ctx.cursors.kill([cursor_id])
+                return _change_stream_fatal_reply(exc)
             if new_events:
                 entry.remaining.extend(new_events)
     batch = entry.remaining[:batch_size]
@@ -3182,6 +3222,21 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "errmsg": ("The $changeStream stage is only supported on replica sets"),
                 "code": 40573,
                 "codeName": "IllegalOperation",
+            }
+        # Change streams support only the default / majority read
+        # concern — mongod rejects an explicit ``local`` (or any other
+        # level) with InvalidOptions. pymongo's ``test_read_concern``
+        # pins the rejection server-side.
+        rc_cs = doc.get("readConcern")
+        if isinstance(rc_cs, Mapping) and rc_cs.get("level") not in (None, "majority"):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"readConcern level '{rc_cs.get('level')}' is not supported "
+                    "for change streams; only 'majority' (or the default) is allowed"
+                ),
+                "code": 72,
+                "codeName": "InvalidOptions",
             }
         return _aggregate_change_stream(doc, ctx, coll, pipeline, batch_size)
 
@@ -3327,6 +3382,20 @@ def _aggregate_change_stream(
                 "code": 9,
                 "codeName": "FailedToParse",
             }
+        # ``resumeAfter`` cannot point at an invalidate event's token —
+        # the stream it came from is over. mongod requires
+        # ``startAfter`` for that (260 InvalidResumeToken).
+        if cs_spec.resume_after is not None and data.from_invalidate:
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "Attempting to resume a change stream using 'resumeAfter' "
+                    "is not allowed from an invalidate notification; use "
+                    "'startAfter' instead"
+                ),
+                "code": 260,
+                "codeName": "InvalidResumeToken",
+            }
         # Scope-bind the resume token. Without this check, a client
         # watching `db.collA` can craft a token with a different `ns`
         # (e.g. `db.collB`, or `secrets.users`) and read the oplog of
@@ -3383,6 +3452,9 @@ def _aggregate_change_stream(
         return False
 
     pipeline_after_cs = list(pipeline[1:])
+    # Validate user-stage names NOW — mongod rejects an unrecognized
+    # stage at aggregate time (40324), not at the first getMore.
+    validate_stage_names(pipeline_after_cs)
     # ``$changeStreamSplitLargeEvent`` in the pipeline is a second opt-in
     # path for event-splitting (alongside
     # ``$changeStream: {splitLargeChangeStreamEvents: true}``). The
@@ -3441,13 +3513,13 @@ def _aggregate_change_stream(
                     show_expanded_events=cs_spec.show_expanded_events,
                     scope=scope,
                 )
-            except changestreams.ChangeStreamFatalError as exc:
-                # Best effort: surface as an empty batch and let the next
-                # poll retry. A nicer surface would be a server-side error
-                # cursor; defer.
-                _ = exc
-                last_seen = seq
-                continue
+            except changestreams.ChangeStreamFatalError:
+                # mongod surfaces this as a getMore error (code 280) and
+                # the stream is over — fullDocument: "required" misses
+                # and pre-image lookups that aren't stored both land
+                # here. Don't advance the position: the error, not the
+                # event, is the outcome. _get_more shapes the reply.
+                raise
             if ev is not None:
                 if cs_spec.split_large_events:
                     events.extend(changestreams.stamp_split_event(ev))
@@ -3477,6 +3549,16 @@ def _aggregate_change_stream(
         )
         if pipeline_after_cs:
             events = apply_pipeline(events, pipeline_after_cs, pipeline_ctx)
+            for ev in events:
+                if isinstance(ev, Mapping) and "_id" not in ev:
+                    # mongod 4.1.8+: an event whose ``_id`` (the resume
+                    # token) was projected out by the user pipeline is
+                    # fatal — the stream can't be resumed past it.
+                    raise changestreams.ChangeStreamFatalError(
+                        "Encountered an event whose _id field, which contains the "
+                        "resume token, was modified by the pipeline. Modifying the "
+                        "_id field of an event makes it unusable for resuming"
+                    )
         return events
 
     cursor_id = ctx.cursors.register_tailable(
@@ -5441,7 +5523,26 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # the level IS accepted: every in-transaction read runs against
         # the transaction's pinned WT snapshot anyway, which is exactly
         # what ``snapshot`` asks for on a single node.
-        if level == "snapshot" and doc.get("autocommit") is not False:
+        #
+        # Outside transactions, mongod 5.0+ replica sets accept
+        # ``snapshot`` on exactly find / aggregate / distinct (snapshot
+        # sessions). We advertise such a topology, so those commands
+        # accept it too — accept-and-record: the reply carries
+        # ``atClusterTime`` for session pinning but reads are not
+        # actually timestamp-pinned (single node; tasks/backlog.md).
+        # Everything else keeps mongod's rejection. When the
+        # replica-set persona is off we reject like a real standalone
+        # (the snapshot-sessions-not-supported unified specs pin that
+        # error shape).
+        # getMore / killCursors ride along: pymongo propagates the
+        # pinned ``{level: snapshot, atClusterTime}`` onto cursor
+        # continuation, and mongod accepts it there (the cursor already
+        # owns its snapshot).
+        snapshot_readable = (
+            name in ("find", "aggregate", "distinct", "getMore", "killCursors")
+            and ctx.replica_set_name
+        )
+        if level == "snapshot" and doc.get("autocommit") is not False and not snapshot_readable:
             return {
                 "ok": 0.0,
                 "errmsg": "Snapshot read concern is not supported on standalone",
@@ -5642,14 +5743,21 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             result = handler(doc, ctx)
     except WriteConflictError:
         result = _write_conflict_reply(label=txn is not None)
+    except changestreams.ChangeStreamFatalError as exc:
+        # Change-stream fatal conditions (resume token projected out,
+        # fullDocument: "required" miss, pre-image not stored) surface
+        # with their own codes — mongod replies, not internal errors.
+        result = _change_stream_fatal_reply(exc)
     except _USER_FACING_EXCEPTIONS as exc:
         # Validation-class errors: messages are deliberately shaped to
-        # match mongod, drivers parse them. Surface verbatim.
+        # match mongod, drivers parse them. Surface verbatim. Raise
+        # sites may pin mongod's specific code (e.g. 40324 for an
+        # unrecognized pipeline stage); 14 TypeMismatch is the default.
         result = {
             "ok": 0.0,
             "errmsg": str(exc),
-            "code": 14,
-            "codeName": "TypeMismatch",
+            "code": getattr(exc, "code", None) or 14,
+            "codeName": getattr(exc, "code_name", None) or "TypeMismatch",
         }
     except Exception as exc:
         if _is_wt_rollback(exc):
@@ -5711,4 +5819,18 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             },
         )
         result.setdefault("operationTime", ts)
+        # Snapshot sessions: pymongo pins the session's read timestamp
+        # from the FIRST snapshot read's reply — ``cursor.atClusterTime``
+        # for cursor commands, top-level ``atClusterTime`` otherwise
+        # (client_session.py _update_read_concern) — and sends it back
+        # as ``readConcern.atClusterTime`` on subsequent reads. Reads
+        # are NOT actually pinned (single node, accept-and-record; see
+        # tasks/backlog.md), but the wire contract is satisfied.
+        rc = doc.get("readConcern")
+        if bool(result.get("ok")) and isinstance(rc, Mapping) and rc.get("level") == "snapshot":
+            cursor_part = result.get("cursor")
+            if isinstance(cursor_part, dict):
+                cursor_part.setdefault("atClusterTime", ts)
+            else:
+                result.setdefault("atClusterTime", ts)
     return result

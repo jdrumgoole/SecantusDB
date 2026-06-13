@@ -19,7 +19,16 @@ if TYPE_CHECKING:
 
 
 class AggregateError(Exception):
-    pass
+    """Pipeline-validation error. ``code``/``code_name`` default to the
+    generic user-facing mapping (14 TypeMismatch) but raise sites may
+    pin mongod's specific code (e.g. 40324 for unrecognized stages)."""
+
+    def __init__(
+        self, message: str, *, code: int | None = None, code_name: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.code_name = code_name
 
 
 # The Rust core ports the pure, composing pipeline stages (the leaf engines it
@@ -79,6 +88,16 @@ def apply_pipeline(
     ctx: PipelineContext | None = None,
 ) -> list[dict[str, Any]]:
     ctx = ctx or _NULL_CTX
+    # ``$$NOW``: a Date constant for the whole pipeline execution
+    # (mongod semantics). Seeded into vars so both engines resolve it
+    # through the ordinary user-var path; never mutate the shared
+    # module-level null context.
+    if "NOW" not in ctx.vars:
+        now = _dt.datetime.now(_dt.timezone.utc)
+        if ctx is _NULL_CTX:
+            ctx = PipelineContext(vars={"NOW": now})
+        else:
+            ctx.vars["NOW"] = now
     if _rust_aggregate_enabled():
         try:
             res = _rust.apply_pipeline(
@@ -106,7 +125,13 @@ def _apply_stage(
     name, spec = next(iter(stage.items()))
     handler = _STAGES.get(name)
     if handler is None:
-        raise AggregateError(f"unsupported aggregation stage: {name}")
+        # mongod's exact shape: 40324 with this wording (the unified
+        # change-streams-errors spec pins the code).
+        raise AggregateError(
+            f"Unrecognized pipeline stage name: '{name}'",
+            code=40324,
+            code_name="Location40324",
+        )
     return handler(spec, docs, ctx)
 
 
@@ -2168,3 +2193,19 @@ _STAGES = {
     "$redact": _stage_redact,
     "$setWindowFields": _stage_set_window_fields,
 }
+
+
+def validate_stage_names(pipeline: list[Any]) -> None:
+    """Upfront stage-name validation (mongod validates at parse time,
+    before any document flows — change streams need the 40324 at
+    ``aggregate`` time, not lazily at the first ``getMore``)."""
+    for stage in pipeline:
+        if not isinstance(stage, Mapping) or len(stage) != 1:
+            raise AggregateError("each pipeline stage must have exactly one key")
+        name = next(iter(stage))
+        if name not in _STAGES:
+            raise AggregateError(
+                f"Unrecognized pipeline stage name: '{name}'",
+                code=40324,
+                code_name="Location40324",
+            )
