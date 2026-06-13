@@ -2529,3 +2529,77 @@ def test_drop_collection_honors_unsatisfiable_write_concern(tmp_path) -> None:
                 db_wc.drop_collection("t")
         finally:
             client.close()
+
+
+def test_unknown_update_operator_rejected_on_empty_collection(tmp_path) -> None:
+    """An unknown update modifier is rejected at parse time — even when
+    no documents match (mongod validates before matching). Oracle:
+    pymongo test_error_code expects code in (9, 10147, 16840, 17009)."""
+    from pymongo import MongoClient
+    from pymongo.errors import OperationFailure
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["empty"]  # no documents
+            with pytest.raises(OperationFailure) as exc:
+                coll.update_many({}, {"$thismodifierdoesntexist": 1})
+            assert exc.value.code in (9, 10147, 16840, 17009)
+            assert exc.value.details is not None
+        finally:
+            client.close()
+
+
+def test_bad_partial_filter_expression_rejected(tmp_path) -> None:
+    """createIndexes rejects malformed partialFilterExpression: a
+    non-document, an unknown operator, and a logical operator with a
+    non-array argument. Oracle: pymongo test_index_filter."""
+    from pymongo import MongoClient
+    from pymongo.errors import OperationFailure
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["t"]
+            for bad in (5, {"x": {"$asdasd": 3}}, {"$and": 5}):
+                with pytest.raises(OperationFailure):
+                    coll.create_index("x", partialFilterExpression=bad)
+            # A valid partial filter still works.
+            assert (
+                coll.create_index([("x", 1)], partialFilterExpression={"a": {"$lte": 1.5}}) == "x_1"
+            )
+        finally:
+            client.close()
+
+
+def test_partial_index_range_implication_is_sound(tmp_path) -> None:
+    """A partial index on {a: {$lte: 1.5}} is used only when the query
+    GUARANTEES a <= 1.5 (equality a:1, or a:{$lt:1}); a query that could
+    match docs outside the partial filter must NOT use it (correctness)
+    and must return all matching docs via a full scan."""
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            t = client["db"]["t"]
+            t.create_index([("x", 1)], partialFilterExpression={"a": {"$lte": 1.5}})
+            t.insert_many([{"x": 6, "a": 1}, {"x": 7, "a": 5}])  # a=5 not in index
+
+            # Implying query: uses the partial index, correct result.
+            assert t.count_documents({"x": 6, "a": 1}) == 1
+            plan = t.find({"x": 6, "a": 1}).explain()["queryPlanner"]["winningPlan"]
+            assert plan["inputStage"]["indexName"] == "x_1"
+            assert plan["inputStage"]["isPartial"] is True
+
+            # Non-implying query (a < 10 doesn't guarantee a <= 1.5):
+            # must NOT use the partial index, must still find the a=5 doc.
+            assert t.count_documents({"a": {"$lt": 10}}) == 2
+        finally:
+            client.close()

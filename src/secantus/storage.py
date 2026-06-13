@@ -668,6 +668,54 @@ class MinMaxKeyError(Exception):
     pattern (mongod surfaces this as 51174)."""
 
 
+def _op_implies_bound(qop: str, qv: Any, pop: str, pv: Any) -> bool:
+    """Does a single query constraint ``(qop, qv)`` guarantee the partial
+    bound ``(pop, pv)``? Comparison uses ``encode_value`` so it follows
+    MongoDB's cross-type BSON sort order. Returns ``False`` for any
+    operator pairing it can't prove (soundness over completeness)."""
+    try:
+        a, b = encode_value(qv), encode_value(pv)
+    except Exception:
+        return False
+    le, lt, ge, gt, eq = a <= b, a < b, a >= b, a > b, a == b
+    if pop in ("$lte", "$lt"):
+        # query upper-bounds the field; need its max <= / < pv.
+        if qop == "$eq":
+            return le if pop == "$lte" else lt
+        if qop == "$lte":
+            return le if pop == "$lte" else lt
+        if qop == "$lt":
+            return le  # a < qv <= pv  => a < pv => a <= pv (and a < pv for $lt)
+        return False
+    if pop in ("$gte", "$gt"):
+        if qop == "$eq":
+            return ge if pop == "$gte" else gt
+        if qop == "$gte":
+            return ge if pop == "$gte" else gt
+        if qop == "$gt":
+            return ge
+        return False
+    if pop == "$eq":
+        return qop == "$eq" and eq
+    return False
+
+
+def _clause_implies_bounds(qval: Any, pbound: Mapping[str, Any]) -> bool:
+    """True if the query clause ``qval`` (a bare value or an operator
+    dict) guarantees every constraint in the partial operator dict
+    ``pbound`` (e.g. ``{$lte: 1.5}``)."""
+    if isinstance(qval, Mapping) and qval and all(k.startswith("$") for k in qval):
+        q_constraints = list(qval.items())
+    else:
+        q_constraints = [("$eq", qval)]
+    for pop, pv in pbound.items():
+        if pop not in ("$eq", "$lt", "$lte", "$gt", "$gte"):
+            return False  # partial filter uses an operator we can't reason about
+        if not any(_op_implies_bound(qop, qv, pop, pv) for qop, qv in q_constraints):
+            return False
+    return True
+
+
 class Storage:
     def __init__(
         self,
@@ -4106,15 +4154,33 @@ class Storage:
 
     @staticmethod
     def _query_implies_partial(query: Mapping[str, Any], partial: Mapping[str, Any]) -> bool:
-        """True if ``query`` is at least as restrictive as ``partial`` — every
-        key/value pair in ``partial`` appears with the same bare value in
-        ``query``. Conservative: anything more sophisticated (operator-form
-        clauses, $and, etc.) is treated as not implying the partial filter.
+        """True if every document matching ``query`` is guaranteed to be in
+        a partial index whose filter is ``partial`` — i.e. ``query`` is at
+        least as restrictive as ``partial`` on every partial-filter field.
+
+        SOUNDNESS is the rule: using a partial index for a query that could
+        match documents the index doesn't contain returns wrong results, so
+        this errs to ``False`` (skip the index, full scan — correct but
+        slower) for anything it can't prove implied. Supports bare-equality
+        partial values and the ``$eq``/``$lt``/``$lte``/``$gt``/``$gte``
+        range operators on both sides (``{a: {$lte: 1.5}}`` is implied by a
+        query equality ``a: 1`` or ``a: {$lt: 1}``).
         """
-        for key, value in partial.items():
+        for key, pval in partial.items():
             if key not in query:
                 return False
-            if query[key] != value:
+            qval = query[key]
+            p_is_ops = isinstance(pval, Mapping) and pval and all(k.startswith("$") for k in pval)
+            q_is_ops = isinstance(qval, Mapping) and qval and all(k.startswith("$") for k in qval)
+            if p_is_ops:
+                if not _clause_implies_bounds(qval, pval):
+                    return False
+            elif q_is_ops:
+                # bare-value partial, operator-form query: only an exact
+                # ``$eq`` of the same value implies it.
+                if qval.get("$eq") != pval:
+                    return False
+            elif qval != pval:
                 return False
         return True
 

@@ -99,7 +99,7 @@ from secantus.transactions import (
     TxnState,
     no_such_transaction_reply,
 )
-from secantus.update import UpdateError
+from secantus.update import UpdateError, validate_update_doc
 from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 
 logger = logging.getLogger(__name__)
@@ -1547,15 +1547,24 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         else:
             docs_examined = ctx.storage.count_matching(ctx.db_name, coll, {})
     if plan["kind"] == "IXSCAN":
+        input_stage: dict[str, Any] = {
+            "stage": "IXSCAN",
+            "indexName": plan["index_name"],
+            "keyPattern": plan["key_pattern"],
+            "direction": plan["direction"],
+        }
+        # mongod flags an IXSCAN over a partial index with ``isPartial``.
+        if coll:
+            partial = any(
+                ix.get("name") == plan["index_name"] and "partialFilterExpression" in ix
+                for ix in ctx.storage.list_indexes(ctx.db_name, coll)
+            )
+            if partial:
+                input_stage["isPartial"] = True
         winning_plan = {
             "stage": "FETCH",
             "filter": filter_,
-            "inputStage": {
-                "stage": "IXSCAN",
-                "indexName": plan["index_name"],
-                "keyPattern": plan["key_pattern"],
-                "direction": plan["direction"],
-            },
+            "inputStage": input_stage,
         }
         execution_stage = {
             "stage": "FETCH",
@@ -1996,6 +2005,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                         "codeName": "InvalidPipelineOperator",
                     }
         try:
+            # Parse-time validation: mongod rejects an unknown update
+            # modifier before matching any document, so an invalid update
+            # errors even against an empty collection (apply_update only
+            # runs per matched doc, which would miss this).
+            validate_update_doc(spec.get("u", {}))
             result = ctx.storage.update_matching(
                 ctx.db_name,
                 coll,
@@ -2981,6 +2995,23 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 2,
                 "codeName": "BadValue",
             }
+        # The expression itself must parse as a valid filter — mongod
+        # rejects unknown operators ({x: {$asdasd: 3}}) and malformed
+        # logical operators ({$and: 5}). Run it against an empty doc so
+        # the query engine surfaces the same parse errors it would at
+        # query time. pymongo's test_index_filter pins these rejections.
+        if isinstance(pfe, dict):
+            from secantus.query import QueryError
+
+            try:
+                matches({}, pfe)
+            except (QueryError, ExpressionError, TypeError, ValueError, KeyError) as exc:
+                return {
+                    "ok": 0.0,
+                    "errmsg": f"Error in specification, partialFilterExpression is invalid: {exc}",
+                    "code": 2,
+                    "codeName": "BadValue",
+                }
         # ``wildcardProjection`` is only valid on wildcard indexes (a key
         # of the form ``{ "$**": 1 }`` or ``{ "field.$**": 1 }``). When
         # present it must be a non-empty document — mongod rejects ints,
