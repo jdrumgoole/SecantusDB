@@ -133,6 +133,13 @@ CURATED = [
     ({"a": {"b": {"c": 5}}}, {"a.b.c": 5}),
     ({"a": {"b": {"c": 5}}}, {"a.b.c": 6}),
     ({"tags": ["red", "blue", "green"]}, {"tags": "red"}),
+    # Embedded-document equality is order-sensitive + exact (Rust defers
+    # on Document/Array expected values; Python is the oracle).
+    ({"s": {"h": 14, "w": 21}}, {"s": {"h": 14, "w": 21}}),
+    ({"s": {"h": 14, "w": 21}}, {"s": {"w": 21, "h": 14}}),
+    ({"s": {"h": 14, "w": 21}}, {"s": {"h": 14}}),
+    ({"s": {"a": [1, 2], "b": 3}}, {"s": {"a": [1, 2], "b": 3}}),
+    ({"s": {"a": [1, 2], "b": 3}}, {"s": {"a": [2, 1], "b": 3}}),
     ({"tags": ["red", "blue"]}, {"tags": "yellow"}),
     ({"items": [{"sku": "a"}, {"sku": "b"}]}, {"items.sku": "b"}),
     ({"items": [{"sku": "a"}, {"sku": "b"}]}, {"items.sku": "c"}),

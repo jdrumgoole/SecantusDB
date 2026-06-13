@@ -3218,6 +3218,7 @@ class Storage:
         matched = 0
         modified = 0
         upserted_id: Any = None
+        did_upsert = False
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
@@ -3342,6 +3343,7 @@ class Storage:
                 if validator is not None and not matches(new, validator):
                     raise DocumentValidationError(new.get("_id"))
                 upserted_id = new["_id"]
+                did_upsert = True
                 conflict = self._unique_conflict(
                     db, coll, new, indexes, exclude_id_key=None, partials=partials
                 )
@@ -3380,7 +3382,12 @@ class Storage:
                 pre_images.extend(cap_pre)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
-        return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
+        return {
+            "matched": matched,
+            "modified": modified,
+            "upserted_id": upserted_id,
+            "did_upsert": did_upsert,
+        }
 
     @_retry_write_conflicts
     def delete_matching(

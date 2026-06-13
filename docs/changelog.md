@@ -19,6 +19,37 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Matcher correctness, the validate command, and upsert _id fidelity
+
+Continuing the honest-gauge triage, this slice fixes two genuine
+correctness bugs the gauge surfaced. Embedded-document equality is now
+field-order-sensitive and exact, recursively — `{size: {h: 14, w: 21}}`
+matches a document only when `size` is exactly that, in that key order
+(a documented mongod gotcha that Python's order-insensitive `dict ==`
+got wrong). And an upsert whose resulting `_id` is `None` now reports
+`did_upsert` correctly: `None` was doubling as the "no upsert"
+sentinel, so a legitimate `{_id: null}` upsert looked like a no-op to
+the driver.
+
+The `validate` command is implemented — a clean, mongod-shaped
+consistency report (real record and index counts; SecantusDB's
+WiredTiger-backed storage has nothing to repair), including mongod's
+rejection of `full` + `background` together.
+
+#### Added
+
+- `validate` command (collection consistency check; `full`/`background`/
+  `scandata` options, full+background rejected with InvalidOptions).
+
+#### Fixed
+
+- Embedded-document equality is order-sensitive and exact, recursively,
+  with numeric-bridged leaves (matcher correctness; both query engines —
+  the Rust core already deferred Document/Array equality to Python).
+- Upsert with a `None` `_id` reports `did_upsert` and the upserted `_id`
+  correctly (update and findAndModify paths).
+
+
 ### The honest-gauge triage: projection, size caps, snapshot reads, and change-stream fidelity
 
 The first honest pymongo-gauge run (94.8%) left a 64-failure triage list;

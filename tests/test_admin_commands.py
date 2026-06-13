@@ -223,3 +223,26 @@ def test_top_rejected_outside_admin(client: MongoClient) -> None:
     with pytest.raises(OperationFailure) as exc:
         client["shop"].command("top")
     assert exc.value.code == 13
+
+
+# ---- validate ---------------------------------------------------------------
+
+
+def test_validate_collection_reports_clean(client: MongoClient) -> None:
+    coll = client["valdb"]["things"]
+    coll.insert_many([{"_id": i} for i in range(5)])
+    coll.create_index([("x", 1)])
+
+    out = client["valdb"].validate_collection("things")
+    assert out["valid"] is True
+    assert out["nrecords"] == 5
+    assert out["nIndexes"] == 2
+    assert set(out["keysPerIndex"]) == {"_id_", "x_1"}
+    # full / scandata are accepted and ignored.
+    assert client["valdb"].validate_collection("things", scandata=True, full=True)["valid"]
+
+
+def test_validate_nonexistent_collection_errors(client: MongoClient) -> None:
+    with pytest.raises(OperationFailure) as exc:
+        client["valdb"].validate_collection("nope")
+    assert exc.value.code == 26
