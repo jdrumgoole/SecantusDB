@@ -152,9 +152,6 @@ the change-stream batch. Still open, precisely characterized:
     exhaust (moreToCome) flag handling.
   - tailable cursors on capped collections (`test_tailable`,
     `test_to_list_tailable`) — non-changestream tailables need capped+tailable.
-  - clustered collections (`clusteredIndex` create option): `listCollections`
-    must report it with a `v` field, `listIndexes` names the clustered index
-    (`KeyError: 'v'`, `'test index' != '_id_'`). Niche feature, 2 tests.
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
   - `showRecordId` + `returnKey` combo (`test_A_successful_find_with_showRecordId`)
     — returnKey replaces docs with index keys; fiddly, 1 test.
