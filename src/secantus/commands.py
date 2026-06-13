@@ -1753,7 +1753,7 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.query import QueryError
-    from secantus.storage import BadHint
+    from secantus.storage import BadHint, MinMaxKeyError
 
     coll = doc["find"]
     filter_ = doc.get("filter") or {}
@@ -1762,6 +1762,12 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     sort = doc.get("sort") or None
     projection = doc.get("projection") or None
     hint = doc.get("hint")
+    # Cursor ``min`` / ``max`` index bounds (the find command fields, not
+    # the ``$min`` / ``$max`` aggregation operators): documents whose
+    # keys name a leading prefix of the hinted index. ``max`` is
+    # exclusive, ``min`` inclusive.
+    min_bound = doc.get("min") or None
+    max_bound = doc.get("max") or None
     # ``let`` declares user-vars visible to ``$expr`` clauses in the
     # filter (MongoDB 5.0+).
     let = _resolve_let_vars(doc.get("let"))
@@ -1805,9 +1811,13 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             hint=hint,
             let=let,
             collation=collation,
+            min_bound=min_bound,
+            max_bound=max_bound,
         )
     except BadHint as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    except MinMaxKeyError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 51174, "codeName": "Location51174"}
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     ns = _ns(ctx.db_name, coll)

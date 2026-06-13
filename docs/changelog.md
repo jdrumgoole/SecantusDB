@@ -19,6 +19,21 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Cursor min() / max() index bounds
+
+The find command's `min` / `max` cursor options are now honoured: they
+bound a hinted index scan, with `max` an exclusive upper bound and
+`min` an inclusive lower bound on the index key (mongod semantics).
+Bounds and documents are compared with the same direction-aware
+byte-sortable key encoder the indexes use, so cross-type ordering and
+per-field direction are correct. A bound whose field order doesn't
+match the hinted index's key pattern is rejected with mongod's 51174.
+
+#### Added
+
+- Cursor `min` / `max` index-bound options on `find` (oracle-pinned
+  against mongod; 51174 on a key-pattern mismatch).
+
 ### Clustered collections
 
 The `clusteredIndex` create option is now supported. mongod uses it to

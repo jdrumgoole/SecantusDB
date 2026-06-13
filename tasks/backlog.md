@@ -145,8 +145,6 @@ the change-stream batch. Still open, precisely characterized:
   (clean mongod-shaped result + full/background rejection), and upsert with a
   `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
   "no upsert" sentinel). Still open:
-  - cursor `min()`/`max()` index-bound modifiers (`test_max`/`test_min`/
-    `test_min_query`) — need bounded index scans threaded through find.
   - `$comment` surfacing in currentOp/profiler (`test_comment`).
   - exhaust cursors (`test_exhaust`, `test_exhaust_cursor_db_set`) — OP_MSG
     exhaust (moreToCome) flag handling.

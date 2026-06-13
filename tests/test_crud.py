@@ -2441,3 +2441,42 @@ def test_upsert_with_none_id_reports_did_upsert(tmp_path) -> None:
             assert doc == {"_id": None, "v": 1}
         finally:
             client.close()
+
+
+def test_cursor_min_max_index_bounds(tmp_path) -> None:
+    """Cursor min()/max() bound a hinted index scan: max is an exclusive
+    upper bound, min an inclusive lower bound. Oracle-pinned against a
+    real mongod 2026-06-13."""
+    from pymongo import MongoClient
+    from pymongo.errors import OperationFailure
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            t = client["db"]["t"]
+            t.create_index([("j", 1)])
+            t.insert_many([{"j": j, "k": j} for j in range(10)])
+
+            # max exclusive: j < 3 -> 3 docs.
+            assert len(t.find().max([("j", 3)]).hint([("j", 1)]).to_list()) == 3
+            # min inclusive: j >= 3 -> 7 docs.
+            assert len(t.find().min([("j", 3)]).hint([("j", 1)]).to_list()) == 7
+            # min + max: 2 <= j < 5 -> j in {2,3,4}.
+            got = t.find().min([("j", 2)]).max([("j", 5)]).hint([("j", 1)]).to_list()
+            assert sorted(d["j"] for d in got) == [2, 3, 4]
+
+            # Compound index, full key.
+            t.create_index([("j", 1), ("k", 1)])
+            assert len(t.find().max([("j", 3), ("k", 3)]).hint([("j", 1), ("k", 1)]).to_list()) == 3
+
+            # Wrong field order vs the hinted index -> OperationFailure.
+            with pytest.raises(OperationFailure):
+                t.find().max([("k", 3), ("j", 3)]).hint([("j", 1), ("k", 1)]).to_list()
+
+            # Hint that doesn't correspond to an index -> OperationFailure.
+            with pytest.raises(OperationFailure):
+                t.find().max([("k", 3)]).hint("nonexistent").to_list()
+        finally:
+            client.close()
