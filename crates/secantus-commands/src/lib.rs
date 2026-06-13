@@ -36,6 +36,7 @@
 pub mod admin;
 pub mod aggregate;
 pub mod auth;
+pub mod changestream;
 pub mod crud;
 pub mod cursors;
 pub mod diagnostics;

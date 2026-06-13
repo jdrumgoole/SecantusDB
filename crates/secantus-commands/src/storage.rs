@@ -58,6 +58,43 @@ pub enum StorageError {
     Internal(String),
 }
 
+/// A change-stream watch scope (mirrors `secantus_storage::changestreams::Scope`;
+/// the WiredTiger-backed adapter translates). WT-free so the command crate
+/// stays WT-free — the `$changeStream` handler builds it from the pipeline.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeStreamScope {
+    /// Whole-cluster change stream (`watch()` on the client).
+    Cluster,
+    /// A single database (`db.watch()`).
+    Db(String),
+    /// A single collection (`coll.watch()`).
+    Coll { db: String, coll: String },
+}
+
+/// Full-document / pre-image projection modes for a change-stream watch, passed
+/// through to `secantus_storage::changestreams::project`. Plain strings keep the
+/// seam WT-free.
+#[derive(Debug, Clone, Default)]
+pub struct ChangeStreamOptions {
+    /// `"default"` / `"updateLookup"` / `"whenAvailable"` / `"required"`.
+    pub full_document: String,
+    /// `"off"` / `"whenAvailable"` / `"required"`.
+    pub full_document_before_change: String,
+    /// `showExpandedEvents: true` surfaces DDL events (create / modify / …).
+    pub show_expanded_events: bool,
+}
+
+/// One poll of the oplog tail for a change-stream cursor: the projected event
+/// documents (as `bson::encode` bytes), the new oplog position consumed (the
+/// seq of the last entry read), and whether an invalidating event
+/// (drop / rename / dropDatabase on the watched scope) was produced.
+#[derive(Debug, Clone, Default)]
+pub struct ChangeStreamBatch {
+    pub events: Vec<Vec<u8>>,
+    pub new_position: i64,
+    pub invalidated: bool,
+}
+
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
@@ -70,6 +107,60 @@ pub trait Storage: Send + Sync {
             time: 0,
             increment: 0,
         }
+    }
+
+    // --- change streams (R3b) ----------------------------------------------
+    //
+    // The command crate stays WiredTiger-free, but the change-stream projector
+    // (`changestreams::project`) needs the concrete `secantus_storage::Storage`
+    // for `updateLookup` find / pre-image reads. So the tailable getMore loop
+    // drives these trait methods; the adapter implements them by tailing the
+    // oplog and projecting. Defaults make test fakes (which don't tail) compile.
+
+    /// Poll the oplog from `after_seq` (exclusive) for up to `limit` change
+    /// events matching `scope`, projecting each. Returns the event bytes, the
+    /// new position consumed, and whether an invalidating event was produced.
+    /// Default: an empty batch at the same position (no oplog to tail).
+    fn change_stream_poll(
+        &self,
+        _scope: &ChangeStreamScope,
+        _opts: &ChangeStreamOptions,
+        after_seq: i64,
+        _limit: usize,
+    ) -> Result<ChangeStreamBatch, StorageError> {
+        Ok(ChangeStreamBatch {
+            events: Vec::new(),
+            new_position: after_seq,
+            invalidated: false,
+        })
+    }
+
+    /// Block until the oplog advances past `after_seq` or `timeout_ms` elapses;
+    /// return the current tail seq. Used for `awaitData`. Default: `after_seq`.
+    fn wait_for_oplog(&self, after_seq: i64, _timeout_ms: u64) -> i64 {
+        after_seq
+    }
+
+    /// Wake any blocked `wait_for_oplog` waiters without advancing the oplog
+    /// (`killCursors` uses this to unblock a tailing getMore). Default: no-op.
+    fn notify_oplog_waiters(&self) {}
+
+    /// The current oplog tail seq (`next_seq - 1`) — a fresh watch starts here
+    /// (it sees events strictly after it). Default: 0.
+    fn oplog_tail_seq(&self) -> i64 {
+        0
+    }
+
+    /// The smallest oplog seq still retained (retention floor); 0 if empty.
+    /// A resume token older than this has fallen off the oplog. Default: 0.
+    fn oplog_floor_seq(&self) -> i64 {
+        0
+    }
+
+    /// The smallest oplog seq whose entry timestamp is `>= ts` (for
+    /// `startAtOperationTime`); tail+1 if none qualify. Default: 0.
+    fn seq_for_timestamp(&self, _ts: bson::Timestamp) -> i64 {
+        0
     }
 
     /// Insert a batch of already-encoded documents. Returns

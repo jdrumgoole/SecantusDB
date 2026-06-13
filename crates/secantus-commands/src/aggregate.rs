@@ -51,11 +51,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             )
             .into_reply());
         }
-        return Err(CommandError::new(
-            1,
-            "InternalError",
-            "change streams are not yet supported by the Rust server",
-        ));
+        return crate::changestream::open_change_stream(doc, ctx);
     }
 
     let storage = ctx.storage()?;

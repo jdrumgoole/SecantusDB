@@ -78,6 +78,17 @@ match the hinted index's key pattern is rejected with mongod's 51174.
 
 - Cursor `min` / `max` index-bound options on `find` (oracle-pinned
   against mongod; 51174 on a key-pattern mismatch).
+- **Rust server:** change streams (R3b-a) — `aggregate` with a leading
+  `$changeStream` now opens a tailable oplog cursor instead of
+  rejecting, and tailable `getMore` projects insert / update / replace /
+  delete events (with `documentKey`, `updateDescription`,
+  `updateLookup` `fullDocument`, pre-images, and a resume token under
+  `_id`). The projector runs behind a new WT-free `Storage` trait seam
+  (`change_stream_poll` / `wait_for_oplog` / oplog accessors) so the
+  command crate stays WiredTiger-free. Measured **+58** on the R8
+  rust-server gauge (936 → 994 of 1713, zero regressions; 52 are
+  `test_change_stream.py`). `awaitData` blocking, resume tokens, and
+  invalidation cursor-close land in R3b-b.
 
 ### Clustered collections
 

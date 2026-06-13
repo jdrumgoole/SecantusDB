@@ -354,12 +354,24 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     `getMore` (non-tailable: namespace-ownership check → `CursorNotFound` 43,
     `nextBatch` + `id` 0-on-exhaustion) and `killCursors` wired into
     `CommandContext` via `Option<Arc<CursorRegistry>>`. 13 tests (33 crate
-    total), `clippy -D warnings` + `fmt` clean. **Deferred:** the tailable
-    (change-stream) getMore path — drain buffered events, call the producer,
-    block on the storage oplog condvar for `awaitData`, emit
-    `postBatchResumeToken` — lands with the change-stream slice (needs the oplog
-    tail + `notify_oplog_waiters`, not in the command `Storage` trait yet).
-    Cursor *creation* (`find` / `aggregate` / `watch`) lands with those families.
+    total), `clippy -D warnings` + `fmt` clean.
+  - **R3b-a ✅ DONE** — change streams work end-to-end. `aggregate` with a
+    leading `$changeStream` opens a tailable cursor (`changestream::open_change_
+    stream`); tailable `getMore` drains buffered events, polls the producer
+    (`CursorProducer` extended with `position` / `invalidated`), and returns the
+    batch + `postBatchResumeToken`. The projector runs behind a WT-free `Storage`
+    trait seam — `change_stream_poll` (read oplog + `changestreams::project` +
+    encode), `wait_for_oplog`, `notify_oplog_waiters`, `oplog_tail_seq`,
+    `oplog_floor_seq`, `seq_for_timestamp` — implemented in the WT-linked adapter,
+    so `secantus-commands` stays WiredTiger-free. insert / update / replace /
+    delete + `updateLookup` + pre-images all project correctly. **+58 on the R8
+    rust-server gauge (936 → 994, 52 change-stream, zero regressions).**
+  - **R3b-b — DEFERRED:** `awaitData` blocking (the `wait_for_oplog` + maxTimeMS
+    loop so the server blocks instead of the client polling), resume tokens
+    (`resumeAfter` / `startAfter` / `startAtOperationTime`, using `seq_for_
+    timestamp` / `oplog_floor_seq`), the final `invalidate` event's cursor-close
+    semantics, and empty-batch / noop-heartbeat `postBatchResumeToken`
+    advancement (high-water-mark tokens).
 
 - **R4 — Accept loop + connection threads + TLS** (`crates/secantus-server`). Port
   `server.py`: TCP accept on a daemon thread, thread-per-connection (1:1 with the
