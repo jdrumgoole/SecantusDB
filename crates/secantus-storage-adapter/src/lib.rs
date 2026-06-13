@@ -20,8 +20,10 @@ use std::sync::Arc;
 
 use bson::{Bson, Document};
 use secantus_commands::storage::{
-    DuplicateKey, RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
+    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, DuplicateKey, RawHint,
+    Storage as CmdStorage, StorageError, UpdateOutcome,
 };
+use secantus_storage::changestreams::{self, Scope as WtScope};
 use secantus_storage::{Hint, Storage as WtStorage, StorageError as WtError};
 
 /// Wraps a shared WiredTiger-backed `Storage` and presents it as the command
@@ -45,6 +47,79 @@ impl CmdStorage for StorageAdapter {
             time: 0,
             increment: 0,
         })
+    }
+
+    fn change_stream_poll(
+        &self,
+        scope: &ChangeStreamScope,
+        opts: &ChangeStreamOptions,
+        after_seq: i64,
+        limit: usize,
+    ) -> Result<ChangeStreamBatch, StorageError> {
+        let wt_scope = to_wt_scope(scope);
+        // read_oplog's start_seq is inclusive; after_seq is the last consumed.
+        let rows = self
+            .inner
+            .read_oplog(after_seq + 1, limit)
+            .map_err(map_err)?;
+        let mut events: Vec<Vec<u8>> = Vec::new();
+        let mut new_position = after_seq;
+        let mut invalidated = false;
+        for (seq, blob) in rows {
+            // Always advance the position past a scanned entry, even when it
+            // projects to nothing (noop heartbeats / other-scope writes) — that
+            // keeps the resume token moving and the next poll cheap.
+            new_position = seq;
+            let entry = Document::from_reader(&mut blob.as_slice())
+                .map_err(|e| StorageError::Internal(format!("oplog decode: {e}")))?;
+            let (event, invalidates) = changestreams::project(
+                seq,
+                &entry,
+                &self.inner,
+                &opts.full_document,
+                &opts.full_document_before_change,
+                &wt_scope,
+                opts.show_expanded_events,
+            )
+            .map_err(map_err)?;
+            if let Some(ev) = event {
+                let mut buf = Vec::new();
+                ev.to_writer(&mut buf)
+                    .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
+                events.push(buf);
+                if invalidates {
+                    // An invalidating event (drop / rename / dropDatabase on the
+                    // watched scope) is the last event this cursor produces.
+                    invalidated = true;
+                    break;
+                }
+            }
+        }
+        Ok(ChangeStreamBatch {
+            events,
+            new_position,
+            invalidated,
+        })
+    }
+
+    fn wait_for_oplog(&self, after_seq: i64, timeout_ms: u64) -> i64 {
+        self.inner.wait_for_oplog(after_seq, timeout_ms)
+    }
+
+    fn notify_oplog_waiters(&self) {
+        self.inner.notify_oplog_waiters();
+    }
+
+    fn oplog_tail_seq(&self) -> i64 {
+        self.inner.oplog_tail_seq()
+    }
+
+    fn oplog_floor_seq(&self) -> i64 {
+        self.inner.oplog_floor_seq().unwrap_or(0)
+    }
+
+    fn seq_for_timestamp(&self, ts: bson::Timestamp) -> i64 {
+        self.inner.find_seq_for_ts(ts).unwrap_or(0)
     }
 
     fn insert(
@@ -235,6 +310,20 @@ impl CmdStorage for StorageAdapter {
         limit: usize,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         self.inner.list_roles(db, skip, limit).map_err(map_err)
+    }
+}
+
+/// Translate the WT-free command-layer scope into the storage projector's
+/// `Scope`. Identity-shaped; the split exists only to keep `secantus-commands`
+/// free of the WiredTiger-linked `secantus-storage` crate.
+fn to_wt_scope(scope: &ChangeStreamScope) -> WtScope {
+    match scope {
+        ChangeStreamScope::Cluster => WtScope::Cluster,
+        ChangeStreamScope::Db(db) => WtScope::Db(db.clone()),
+        ChangeStreamScope::Coll { db, coll } => WtScope::Coll {
+            db: db.clone(),
+            coll: coll.clone(),
+        },
     }
 }
 

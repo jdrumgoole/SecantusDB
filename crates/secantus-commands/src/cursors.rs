@@ -45,10 +45,19 @@ pub enum CursorError {
 }
 
 /// Produces newly-available encoded event documents for a tailable cursor.
-/// Invoked by the (future) change-stream getMore handler; the registry only
-/// stores it.
+/// Invoked by the change-stream getMore handler; the registry stores it and
+/// calls `produce` when the buffered events run out.
 pub trait CursorProducer: Send {
+    /// Poll for new events, advancing the producer's internal oplog position.
+    /// Returns the projected event documents (`bson::encode` bytes).
     fn produce(&mut self) -> Vec<Vec<u8>>;
+    /// The producer's current oplog position (seq of the last entry consumed) —
+    /// for the `postBatchResumeToken` and the next `awaitData` wait.
+    fn position(&self) -> i64;
+    /// Whether the producer has seen an invalidating event (drop / rename /
+    /// dropDatabase on the watched scope). Once true, the cursor emits its
+    /// buffered events then closes.
+    fn invalidated(&self) -> bool;
 }
 
 /// Options for a tailable (change-stream) cursor registration.
@@ -284,6 +293,53 @@ impl CursorRegistry {
         Ok((batch, exhausted))
     }
 
+    /// Drain the next batch for a TAILABLE (change-stream) cursor. R3b-a is
+    /// non-blocking: when the buffer is empty the producer is polled once, then
+    /// up to `batch_size` events are drained. Returns `(batch, position, closed)`
+    /// — `position` is the producer's current oplog seq (for the resume token)
+    /// and `closed` is true once an invalidating event (or a `killCursors` /
+    /// drop-driven invalidation) has been delivered AND the buffer is empty, at
+    /// which point the cursor is removed and the handler reports id 0.
+    pub fn tailable_next_batch(
+        &self,
+        cursor_id: i64,
+        batch_size: i64,
+    ) -> Result<(Vec<Vec<u8>>, i64, bool), CursorError> {
+        let mut inner = self.inner.lock().unwrap();
+        self.prune_locked(&mut inner);
+        let now = (self.clock)();
+        let e = inner
+            .cursors
+            .get_mut(&cursor_id)
+            .ok_or(CursorError::NotFound(cursor_id))?;
+        e.last_access = now;
+        // Poll the producer once when nothing is buffered and the cursor hasn't
+        // been invalidated (by an oplog drop/rename or a concurrent killCursors).
+        if e.remaining.is_empty() && !e.invalidated {
+            if let Some(p) = e.producer.as_mut() {
+                let events = p.produce();
+                e.position_seq = p.position();
+                if p.invalidated() {
+                    e.invalidated = true;
+                }
+                e.remaining.extend(events);
+            }
+        }
+        let want = if batch_size <= 0 {
+            e.remaining.len()
+        } else {
+            batch_size as usize
+        };
+        let take = want.min(e.remaining.len());
+        let batch: Vec<Vec<u8>> = e.remaining.drain(..take).collect();
+        let position = e.position_seq;
+        let closed = e.invalidated && e.remaining.is_empty();
+        if closed {
+            inner.cursors.remove(&cursor_id);
+        }
+        Ok((batch, position, closed))
+    }
+
     /// Kill the given cursors, returning `(killed, not_found)`.
     pub fn kill(&self, cursor_ids: &[i64]) -> (Vec<i64>, Vec<i64>) {
         let mut inner = self.inner.lock().unwrap();
@@ -417,13 +473,22 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(cursor_not_found(cursor_id));
     }
     if info.tailable {
-        // Deferred: needs the oplog condvar + producer invocation. No handler
-        // can create a tailable cursor yet, so this is unreachable over the wire.
-        return Err(CommandError::new(
-            1,
-            "InternalError",
-            "tailable getMore is not yet supported by the Rust server",
-        ));
+        // R3b-a: non-blocking — poll the producer once and return what's there.
+        // The client drives the stream by polling; awaitData blocking is R3b-b.
+        let (batch, _position, closed) = match cursors.tailable_next_batch(cursor_id, batch_size) {
+            Ok(x) => x,
+            Err(_) => return Ok(cursor_not_found(cursor_id)),
+        };
+        let pbrt = post_batch_resume_token(&batch);
+        let mut cursor_doc = doc! {
+            "nextBatch": docs_to_bson(batch)?,
+            "id": Bson::Int64(if closed { 0 } else { cursor_id }),
+            "ns": ns,
+        };
+        if let Some(tok) = pbrt {
+            cursor_doc.insert("postBatchResumeToken", tok);
+        }
+        return Ok(doc! { "cursor": cursor_doc, "ok": 1.0 });
     }
 
     let (batch, exhausted) = match cursors.next_batch(cursor_id, batch_size) {
@@ -475,6 +540,17 @@ fn cursor_not_found(cursor_id: i64) -> Document {
 
 fn int64_array(ids: Vec<i64>) -> Vec<Bson> {
     ids.into_iter().map(Bson::Int64).collect()
+}
+
+/// The `postBatchResumeToken` for a tailable batch: the `_id` (resume token) of
+/// the last event in the batch. `None` for an empty batch — R3b-a omits the
+/// PBRT then; pymongo falls back to the last seen event's `_id`, which is
+/// correct when no new events were delivered. Empty-batch high-water-mark
+/// advancement (and noop-heartbeat tracking) is R3b-b.
+fn post_batch_resume_token(batch: &[Vec<u8>]) -> Option<Bson> {
+    let last = batch.last()?;
+    let doc = Document::from_reader(&mut last.as_slice()).ok()?;
+    doc.get("_id").cloned()
 }
 
 #[cfg(test)]
@@ -551,6 +627,12 @@ mod tests {
             fn produce(&mut self) -> Vec<Vec<u8>> {
                 vec![]
             }
+            fn position(&self) -> i64 {
+                0
+            }
+            fn invalidated(&self) -> bool {
+                false
+            }
         }
         let reg = CursorRegistry::new();
         let id = reg
@@ -562,6 +644,80 @@ mod tests {
         assert!(b.is_empty());
         assert!(!ex);
         assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn tailable_next_batch_polls_producer_and_advances() {
+        // A producer that yields two events on the first poll (advancing to
+        // seq 5, then flags invalidated), then nothing.
+        struct Two {
+            calls: u32,
+        }
+        impl CursorProducer for Two {
+            fn produce(&mut self) -> Vec<Vec<u8>> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    vec![enc(&doc! {"_id": "a", "operationType": "insert"})]
+                } else {
+                    vec![]
+                }
+            }
+            fn position(&self) -> i64 {
+                if self.calls >= 1 {
+                    5
+                } else {
+                    0
+                }
+            }
+            fn invalidated(&self) -> bool {
+                false
+            }
+        }
+        let reg = CursorRegistry::new();
+        let id = reg
+            .register_tailable(
+                "d.c",
+                Box::new(Two { calls: 0 }),
+                TailableOptions::default(),
+            )
+            .unwrap();
+        // First poll produces the event; position advances; cursor stays open.
+        let (batch, pos, closed) = reg.tailable_next_batch(id, 10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(pos, 5);
+        assert!(!closed);
+        // Second poll: nothing new, cursor persists (not exhausted).
+        let (batch2, _pos2, closed2) = reg.tailable_next_batch(id, 10).unwrap();
+        assert!(batch2.is_empty());
+        assert!(!closed2);
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn tailable_closes_after_invalidation_drains() {
+        // Producer flags invalidated immediately, yielding one final event.
+        struct Inv;
+        impl CursorProducer for Inv {
+            fn produce(&mut self) -> Vec<Vec<u8>> {
+                vec![enc(&doc! {"_id": "x", "operationType": "invalidate"})]
+            }
+            fn position(&self) -> i64 {
+                9
+            }
+            fn invalidated(&self) -> bool {
+                true
+            }
+        }
+        let reg = CursorRegistry::new();
+        let id = reg
+            .register_tailable("d.c", Box::new(Inv), TailableOptions::default())
+            .unwrap();
+        // The invalidate event is delivered; buffer now empty + invalidated =>
+        // the cursor closes (id 0) and is removed.
+        let (batch, _pos, closed) = reg.tailable_next_batch(id, 10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(closed);
+        assert_eq!(reg.len(), 0);
     }
 
     #[test]

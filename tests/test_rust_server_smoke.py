@@ -380,3 +380,54 @@ def test_admin_commands_against_rust_server(tmp_path) -> None:
         assert "c" not in db.list_collection_names()
     finally:
         srv.stop()
+
+
+def test_change_stream_against_rust_server(tmp_path) -> None:
+    """R3b: a collection change stream on the Rust server sees insert / update /
+    delete events with documentKey, updateDescription, and updateLookup
+    fullDocument. Needs the replica-set persona ($changeStream is rejected with
+    40573 on a standalone).
+
+    Deterministic under parallel execution: ``coll.watch()`` runs its aggregate
+    synchronously, so the tailable cursor is registered *before* the writes —
+    no sleep/thread race. ``try_next`` polls (R3b-a's getMore is non-blocking)
+    with a wall-clock deadline rather than blocking forever on a missing event.
+    """
+    import time
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus")
+    try:
+        coll = _client(srv)["csdb"]["c"]
+        coll.insert_one({"_id": 1, "n": 0})  # create the collection
+
+        # watch() opens the cursor here; writes after this point are captured.
+        cs = coll.watch(full_document="updateLookup", max_await_time_ms=500)
+        try:
+            # Note: updateLookup reads the doc at EVENT-READ time, not update
+            # time (mongod's documented "most current majority-committed
+            # version" semantics — attach_full_document does a live find). So
+            # the updated _id:1 must survive to the poll below; only _id:2 is
+            # deleted.
+            coll.update_one({"_id": 1}, {"$set": {"n": 5}})
+            coll.insert_one({"_id": 2})
+            coll.delete_one({"_id": 2})
+
+            events: list = []
+            deadline = time.monotonic() + 30
+            while len(events) < 3 and time.monotonic() < deadline:
+                ev = cs.try_next()
+                if ev is not None:
+                    events.append(ev)
+
+            ops = [e["operationType"] for e in events]
+            assert ops == ["update", "insert", "delete"], ops
+            assert events[0]["updateDescription"]["updatedFields"] == {"n": 5}
+            assert events[0]["fullDocument"] == {"_id": 1, "n": 5}
+            assert events[1]["documentKey"] == {"_id": 2}
+            assert events[2]["documentKey"] == {"_id": 2}
+            # Each event carries a resume token under _id.
+            assert all("_id" in e for e in events)
+        finally:
+            cs.close()
+    finally:
+        srv.stop()
