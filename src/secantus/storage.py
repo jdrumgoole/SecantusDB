@@ -678,6 +678,11 @@ class Storage:
         self.enable_oplog = enable_oplog
         self._lock = threading.RLock()
         self._closed = False
+        # Per-insert discriminator counter for timeseries doc keys (see
+        # ``_timeseries_doc_suffix``). Only disambiguates inserts that land
+        # in the same nanosecond; wall-clock restart-safety comes from the
+        # ``time_ns`` prefix.
+        self._ts_suffix_counter = 0
         self._tempdir: str | None = None
         # session_max default is ~120; each client connection thread
         # caches its own session in `threading.local()`, and cross-
@@ -2288,6 +2293,27 @@ class Storage:
         blob = bytes(c.get_value())
         return bson.decode(blob) if blob else {}
 
+    def _is_timeseries(self, db: str, coll: str) -> bool:
+        opts = self._coll_options(db, coll)
+        return bool(opts) and "timeseries" in opts
+
+    def _timeseries_doc_suffix(self) -> bytes:
+        """Doc-table key discriminator for timeseries collections.
+
+        Timeseries collections don't enforce ``_id`` uniqueness (mongod
+        buckets measurements by time; ``_id`` is not a key), but our doc
+        table is keyed by ``encode_value(_id)`` — equal ``_id``s would
+        structurally collide. Suffixing the key keeps duplicates adjacent
+        (the sortkey encoding is prefix-free, so grouping by ``_id`` is
+        preserved) in insertion order. ``time_ns`` keeps suffixes unique
+        across store reopens; the counter disambiguates same-nanosecond
+        inserts. Reads decode and filter by content, so the suffix is
+        invisible above storage — but the ``_id`` point-lookup fast path
+        must not be used (it reconstructs the UNsuffixed key).
+        """
+        self._ts_suffix_counter = (self._ts_suffix_counter + 1) % 0x10000
+        return _time.time_ns().to_bytes(8, "big") + self._ts_suffix_counter.to_bytes(2, "big")
+
     def _ensure_collection(self, db: str, coll: str) -> None:
         c = self._cursor(_COLL_TABLE)
         c.set_key(db, coll)
@@ -2414,10 +2440,15 @@ class Storage:
             indexes = self._all_indexes(db, coll)
             partials = self._partial_filters(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
+            timeseries = self._is_timeseries(db, coll)
             for index, doc in enumerate(docs):
                 if "_id" not in doc:
                     doc["_id"] = bson.ObjectId()
                 key = _id_key(doc["_id"])
+                if timeseries:
+                    # Duplicate _ids are legal in timeseries collections —
+                    # see _timeseries_doc_suffix.
+                    key += self._timeseries_doc_suffix()
                 conflict = self._unique_conflict(
                     db, coll, doc, indexes, exclude_id_key=None, partials=partials
                 )
@@ -2486,7 +2517,7 @@ class Storage:
                     if ordered:
                         break
                     continue
-                self._write_index_entries(db, coll, doc, indexes, partials)
+                self._write_index_entries(db, coll, doc, indexes, partials, id_key_override=key)
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
                 if oplog_on:
@@ -3040,10 +3071,12 @@ class Storage:
             return None
         # Mirror the _id point-lookup fast path: report it as an IXSCAN on
         # the virtual _id_ index (key pattern {_id: 1}), matching mongod.
+        # Timeseries collections fall through to COLLSCAN (suffixed keys).
         if (
             len(filter) == 1
             and "_id" in filter
             and _id_point_lookup_keys(filter["_id"]) is not None
+            and not self._is_timeseries(db, coll)
         ):
             return _ID_INDEX_NAME, {"_id": 1}
         # Mirror `_try_index_id_keys`: geo dispatch first.
@@ -3238,7 +3271,12 @@ class Storage:
                     # (``bypassDocumentValidation: true``).
                     if validator is not None and not matches(new, validator):
                         raise DocumentValidationError(new.get("_id"))
-                    new_id_key = _id_key(new["_id"])
+                    # _id is immutable, so the row's actual key is the right
+                    # write target. For ordinary collections that equals
+                    # _id_key(new["_id"]); for timeseries the row key carries
+                    # a uniqueness suffix that a recompute would drop —
+                    # writing at the recomputed key would strand the old row.
+                    new_id_key = id_k
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_id_key=id_k, partials=partials
                     )
@@ -3258,10 +3296,14 @@ class Storage:
                             f"{MAX_BSON_OBJECT_SIZE}",
                         )
                     modified += 1
-                    self._delete_index_entries(db, coll, doc, indexes, partials)
+                    self._delete_index_entries(
+                        db, coll, doc, indexes, partials, id_key_override=id_k
+                    )
                     doc_cur = self._cursor(_DOC_TABLE)
                     doc_cur[db, coll, new_id_key] = new_blob
-                    self._write_index_entries(db, coll, new, indexes, partials)
+                    self._write_index_entries(
+                        db, coll, new, indexes, partials, id_key_override=id_k
+                    )
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
@@ -3398,7 +3440,7 @@ class Storage:
                 doc = bson.decode(blob)
                 if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
-                self._delete_index_entries(db, coll, doc, indexes, partials)
+                self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
@@ -3479,7 +3521,7 @@ class Storage:
                         break
                 if not expired:
                     continue
-                self._delete_index_entries(db, coll, doc, indexes, partials)
+                self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
@@ -4033,11 +4075,15 @@ class Storage:
         doc: dict[str, Any],
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         partials: dict[str, dict[str, Any]] | None = None,
+        *,
+        id_key_override: bytes | None = None,
     ) -> None:
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        id_k = _id_key(doc["_id"])
+        # Timeseries doc-table keys carry a uniqueness suffix; entries must
+        # point at the row's ACTUAL key or index lookups would miss it.
+        id_k = id_key_override if id_key_override is not None else _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
@@ -4065,11 +4111,15 @@ class Storage:
         doc: dict[str, Any],
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         partials: dict[str, dict[str, Any]] | None = None,
+        *,
+        id_key_override: bytes | None = None,
     ) -> None:
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        id_k = _id_key(doc["_id"])
+        # Timeseries doc-table keys carry a uniqueness suffix; entries must
+        # point at the row's ACTUAL key or index lookups would miss it.
+        id_k = id_key_override if id_key_override is not None else _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
@@ -4561,8 +4611,11 @@ class Storage:
         # Fast path: equality on _id alone is a direct primary-key point
         # lookup on the documents table (keyed by encode_value(_id)), not a
         # COLLSCAN — the _id_ index is virtual (no entries table), so the
-        # generic pickers below never match it.
-        if len(filter) == 1 and "_id" in filter:
+        # generic pickers below never match it. Timeseries collections are
+        # excluded: their doc keys carry a uniqueness suffix (duplicate
+        # _ids are legal there), so the reconstructed unsuffixed key would
+        # never match a row.
+        if len(filter) == 1 and "_id" in filter and not self._is_timeseries(db, coll):
             id_keys = _id_point_lookup_keys(filter["_id"])
             if id_keys is not None:
                 return id_keys
