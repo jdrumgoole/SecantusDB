@@ -19,6 +19,31 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Parse-time update validation, partial-index range implication
+
+`update` now rejects an unknown modifier (`$thismodifierdoesntexist`) at
+parse time with code 9, even against an empty collection — matching
+mongod, which validates the update before matching any document (the
+per-document apply path would never see an unmatched update).
+`createIndexes` rejects a malformed `partialFilterExpression` (a
+non-document, an unknown operator, a logical operator with a non-array
+argument). And a partial index whose filter uses a range operator
+(`{a: {$lte: 1.5}}`) is now used when the query provably implies it (an
+equality `a: 1`, or `a: {$lt: 1}`) — a sound, conservative range
+implication that errs to a full scan rather than risk missing
+documents; `explain` flags such a scan with `isPartial`.
+
+#### Added
+
+- Sound range implication for partial indexes (`$eq`/`$lt`/`$lte`/`$gt`/
+  `$gte`), with `isPartial` in the explain IXSCAN stage.
+
+#### Fixed
+
+- `update` rejects an unknown modifier at parse time (code 9), even on
+  an empty collection.
+- `createIndexes` rejects a malformed `partialFilterExpression`.
+
 ### Upsert subdocument _id, and idempotent drop with write concern
 
 Two real correctness fixes. An upsert whose filter pins `_id` to a

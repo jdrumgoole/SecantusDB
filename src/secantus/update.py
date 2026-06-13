@@ -15,6 +15,54 @@ class UpdateError(Exception):
     pass
 
 
+# The update modifiers ``_apply_op`` knows how to apply. Used by
+# ``validate_update_doc`` to reject an unknown modifier at parse time
+# (mongod validates the update before matching any documents, so an
+# unknown operator errors even against an empty collection).
+_KNOWN_UPDATE_OPS = frozenset(
+    {
+        "$set",
+        "$setOnInsert",
+        "$unset",
+        "$currentDate",
+        "$inc",
+        "$mul",
+        "$min",
+        "$max",
+        "$push",
+        "$addToSet",
+        "$pull",
+        "$pop",
+        "$rename",
+        "$bit",
+    }
+)
+
+
+def validate_update_doc(update: Any) -> None:
+    """Parse-time validation of an update document's top-level operators.
+
+    Raises ``UpdateError`` for an unknown modifier or a mix of operators
+    and replacement fields. Does NOT apply the update (so positional /
+    arrayFilter operators don't need a match context here). Pipeline
+    (list) updates and pure replacements are accepted — their own
+    validation happens elsewhere.
+    """
+    if isinstance(update, list) or not isinstance(update, Mapping):
+        return
+    keys = list(update)
+    if not any(k.startswith("$") for k in keys):
+        return  # replacement-style update
+    for op in keys:
+        if not op.startswith("$"):
+            raise UpdateError("update document cannot mix operators with replacement fields")
+        if op not in _KNOWN_UPDATE_OPS:
+            raise UpdateError(
+                f"Unknown modifier: {op}. Expected a valid update modifier "
+                "(e.g. $set, $unset, $inc, ...)"
+            )
+
+
 # The Rust core ports the common, deterministic update operators behind the
 # byte seam (doc + update cross as BSON bytes). The Rust path returns None to
 # defer to pure Python for: pipeline (array) updates, positional operators /
