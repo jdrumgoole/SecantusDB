@@ -255,6 +255,13 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   attaches `$clusterTime` / `operationTime` to every reply (dispatch tail,
   `Storage.peek_cluster_time`); the Rust server's dispatch doesn't. Port when
   closing the R8 change-stream bucket (106 of its 283 gauge failures).
+- [ ] **Timeseries `_id` non-uniqueness not in the Rust storage layer** —
+  the Python `Storage` suffixes timeseries doc-table keys so duplicate
+  `_id`s coexist (`_timeseries_doc_suffix`, `id_key_override` on the
+  index-entry helpers, `_id` point-lookup fast paths gated off for
+  timeseries). `crates/secantus-storage` keys every doc by bare
+  `id_key(_id)` and would reject the duplicate. Port alongside the other
+  Rust-server storage gaps.
 - [ ] **Gauge E11000 cluster — remaining tails (2026-06-12).** The
   order-dependent drop-then-reinsert E11000s are FIXED (stale WT read
   snapshot in the mutating scanners; see changelog Unreleased / the
@@ -263,12 +270,13 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   (`$add`/`$subtract`/`$multiply`/`$divide`/`$mod` now raise mongod's
   errors on non-numeric operands, divide/mod-by-zero, and date misuse;
   Rust engine defers those cases — parity corpus extended first).
-  Pipeline-update replace-vs-update misclassification also FIXED
-  (`test_Test_array_truncation` passes; the remaining ShowExpandedEvents /
-  disambiguatedPaths failures are separate unimplemented features, not the
-  classifier). Still open from the triage:
-  1. Timeseries collections must not enforce `_id` uniqueness
-     (`test_insertMany_with_duplicate_ids` — the one surviving E11000).
+  Pipeline-update replace-vs-update misclassification FIXED, and
+  timeseries `_id` uniqueness FIXED (suffixed doc keys; the one surviving
+  E11000 is gone) — the 2026-06-12 E11000 triage is fully closed. The
+  remaining ShowExpandedEvents / disambiguatedPaths / clusteredIndex
+  introspection failures are separate unimplemented features. Timeseries
+  limitation: mongod's restrictions on timeseries updates (meta-field
+  only) are not enforced — we accept general updates.
 - [ ] **Go gauge: CI runs ~1/5 of the local set** — CI weekly artifacts have
   always reported ~450 tests (e.g. 401/453 on 2026-06-08, 447/900 on
   2026-06-12) while local `invoke validate-go` runs ~4700 (the numbers the
