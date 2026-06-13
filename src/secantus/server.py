@@ -410,9 +410,7 @@ class SecantusDBServer:
                 # final `moreToCome`-clear reply rather than letting the
                 # exception drop the connection mid-stream (which the client
                 # surfaces as "Server ended moreToCome unexpectedly").
-                logger.exception(
-                    "error streaming exhaust getMore on cursor %d", int(target_id)
-                )
+                logger.exception("error streaming exhaust getMore on cursor %d", int(target_id))
                 return send(
                     {
                         "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
