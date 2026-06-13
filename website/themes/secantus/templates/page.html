@@ -31,14 +31,15 @@
       <h2>Why SecantusDB</h2>
       <p class="section-lead">Production-grade engineering &mdash; real wire protocol, real WiredTiger storage &mdash; scoped today to test and dev environments. Each panel links to the reference docs.</p>
       {% include 'partials/benefits_grid.html' %}
-      <p class="perf-note">How slow is it? A like-for-like benchmark currently has SecantusDB <strong>~8&times;&ndash;46&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Benchmark &amp; methodology &rarr;</a></p>
+      <h3 class="perf-heading">Performance</h3>
+      <p class="perf-note">A like-for-like benchmark currently has SecantusDB <strong>~8&times;&ndash;46&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency &mdash; for ephemeral test and dev data, the wall-clock difference rarely matters. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Benchmark &amp; methodology &rarr;</a></p>
     </div>
   </section>
 
   <section class="section drivers-section">
     <div class="wrap">
       <h2>Every major MongoDB driver works</h2>
-      <p class="section-lead">SecantusDB is validated against the official driver test suites, <strong>unmodified</strong> &mdash; the same tests the driver maintainers run against a real <code>mongod</code>. Six driver suites &mdash; Python, Java, Node.js, Go, Ruby, Rust &mdash; plus PHP feature smokes. One wire protocol.</p>
+      <p class="section-lead">SecantusDB is validated against the official driver test suites, <strong>unmodified</strong> &mdash; the same tests the driver maintainers run against a real <code>mongod</code>. Six driver suites &mdash; Python, Java, Node.js, Go, Ruby, Rust &mdash; plus PHP feature smokes. One wire protocol. pymongo is the deepest suite we run and the only one below 100% &mdash; the long tail of edge cases lives there; the others, <strong>mongo-java-driver's 4,256 tests</strong> included, pass clean and unmodified.</p>
       {% include 'partials/drivers_grid.html' %}
       <p class="drivers-foot">A note on the license: SecantusDB is <strong>GPL-2.0-only</strong>. The GPL's obligations apply when you distribute SecantusDB or a derivative of it &mdash; not when you run it. Your application talks to it through a standard MongoDB driver over the wire protocol, and a test/dev dependency you don't ship leaves your application's license untouched.</p>
     </div>
