@@ -9,6 +9,8 @@ import threading
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
+import bson
+
 if TYPE_CHECKING:
     from typing import Self
 
@@ -23,6 +25,7 @@ from secantus.sessions import SessionRegistry
 from secantus.storage import Storage
 from secantus.transactions import Transaction, TransactionRegistry
 from secantus.wire import (
+    OP_MSG_FLAG_EXHAUST_ALLOWED,
     OP_MSG_FLAG_MORE_TO_COME,
     ConnectionClosed,
     MalformedBodyError,
@@ -312,6 +315,94 @@ class SecantusDBServer:
             )
             handler.start()
 
+    def _stream_exhaust_getmore(
+        self,
+        conn: socket.socket,
+        response_to: int,
+        reply_ids: itertools.count[int],
+        body: dict[str, Any],
+        ctx: CommandContext,
+        first_doc: dict[str, Any],
+    ) -> bool:
+        """Stream the rest of an exhaust cursor over one socket.
+
+        Called when a getMore arrives with the OP_MSG ``exhaustAllowed``
+        flag set. ``first_doc`` is the reply the getMore handler already
+        produced. We send that batch (and every subsequent one) with the
+        ``moreToCome`` flag set, pulling further batches with synthetic
+        getMores, until the cursor drains — then a final reply with
+        ``id: 0`` and ``moreToCome`` clear closes the stream. mongod keeps
+        the cursor alive until a getMore returns an empty batch, so even a
+        cursor that drains exactly on a non-empty batch gets a trailing
+        empty reply (this is what makes pymongo's command-monitoring see
+        ``find, getMore, getMore, getMore`` for three docs at batchSize 1).
+
+        Returns True if the whole stream was written (connection survives),
+        False if a socket write failed (caller should drop the connection).
+        """
+        target_id = bson.Int64(int(body["getMore"]))
+        coll = body.get("collection", "")
+        ns = first_doc["cursor"].get("ns", f"{ctx.db_name}.{coll}")
+        db = body.get("$db", ctx.db_name)
+
+        def send(doc: dict[str, Any], *, more: bool) -> bool:
+            flags = OP_MSG_FLAG_MORE_TO_COME if more else 0
+            try:
+                conn.sendall(
+                    build_op_msg_reply(
+                        response_to=response_to,
+                        request_id=next(reply_ids),
+                        body=doc,
+                        flags=flags,
+                    )
+                )
+            except OSError:
+                return False
+            return True
+
+        doc = first_doc
+        while True:
+            cursor = doc.get("cursor")
+            if not isinstance(cursor, dict):
+                # An error reply (ok: 0) mid-stream — deliver it without
+                # moreToCome and end the stream.
+                return send(doc, more=False)
+            batch = cursor.get("nextBatch", cursor.get("firstBatch", []))
+            drained = int(cursor.get("id", 0)) == 0
+            if drained:
+                if batch and not send(
+                    {
+                        "cursor": {"nextBatch": batch, "id": target_id, "ns": ns},
+                        "ok": 1.0,
+                    },
+                    more=True,
+                ):
+                    return False
+                return send(
+                    {
+                        "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
+                        "ok": 1.0,
+                    },
+                    more=False,
+                )
+            if not batch:
+                # A live cursor that yielded nothing this round — a
+                # tailable / awaitData getMore whose wait expired. Don't
+                # keep streaming (that would spin forever); deliver this
+                # empty batch without moreToCome and let the client fall
+                # back to ordinary getMores. Normal cursors never reach
+                # here (an empty batch always drains the cursor to id 0).
+                return send(doc, more=False)
+            if not send(doc, more=True):
+                return False
+            getmore: dict[str, Any] = {"getMore": target_id, "collection": coll}
+            if "batchSize" in body:
+                getmore["batchSize"] = body["batchSize"]
+            if "maxTimeMS" in body:
+                getmore["maxTimeMS"] = body["maxTimeMS"]
+            getmore["$db"] = db
+            doc = dispatch(getmore, ctx)
+
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         # Register the socket alongside the conn_id so killOp can
         # shut it down from another thread.
@@ -430,6 +521,30 @@ class SecantusDBServer:
                         # connection with a responseTo/requestId mismatch.
                         if op.flags & OP_MSG_FLAG_MORE_TO_COME:
                             continue
+                        # OP_MSG exhaust: when the client sets the
+                        # `exhaustAllowed` flag on a getMore, the server
+                        # streams every remaining batch back over the same
+                        # socket using the `moreToCome` flag, instead of
+                        # waiting for a getMore per batch. mongod only
+                        # streams on getMore (the find/aggregate reply that
+                        # opens the cursor is sent normally), so we mirror
+                        # that — find replies fall through to the single
+                        # reply below.
+                        if (
+                            op.flags & OP_MSG_FLAG_EXHAUST_ALLOWED
+                            and "getMore" in body
+                            and isinstance(response_doc.get("cursor"), dict)
+                        ):
+                            if self._stream_exhaust_getmore(
+                                conn,
+                                message.header.request_id,
+                                reply_ids,
+                                body,
+                                ctx,
+                                response_doc,
+                            ):
+                                continue
+                            return
                         reply = build_op_msg_reply(
                             response_to=message.header.request_id,
                             request_id=next(reply_ids),

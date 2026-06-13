@@ -146,8 +146,6 @@ the change-stream batch. Still open, precisely characterized:
   `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
   "no upsert" sentinel). Still open:
   - `$comment` surfacing in currentOp/profiler (`test_comment`).
-  - exhaust cursors (`test_exhaust`, `test_exhaust_cursor_db_set`) — OP_MSG
-    exhaust (moreToCome) flag handling.
   - tailable cursors on capped collections (`test_tailable`,
     `test_to_list_tailable`) — non-changestream tailables need capped+tailable.
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).

@@ -19,6 +19,35 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### OP_MSG exhaust cursors
+
+Exhaust cursors (`CursorType.EXHAUST`) now stream over the wire the way
+a real `mongod` does. When a driver sets the OP_MSG `exhaustAllowed`
+flag on a `getMore`, SecantusDB streams every remaining batch back over
+the same socket using the `moreToCome` flag — one round trip instead of
+a `getMore` per batch — and closes the stream with a trailing empty
+reply carrying `id: 0`. That trailing empty batch is what makes a real
+server keep the cursor alive until the client has drained it; pinning it
+faithfully is why pymongo's command monitor sees `find, getMore,
+getMore, getMore` for three documents at `batchSize: 1`, and why
+exhaust-pinned connections return to the pool at exactly the right
+moment.
+
+This closes the last wire-protocol gap behind the pymongo gauge's
+`test_exhaust` / `test_exhaust_cursor_db_set` cases. The streaming is
+driven entirely in the connection loop (`SecantusDBServer._stream_exhaust_getmore`)
+off the existing cursor registry, so no operator engine or storage path
+changed; `find` / `aggregate` replies that open a cursor are still sent
+as a single message (mongod streams only on `getMore`).
+
+#### Added
+
+- OP_MSG exhaust-cursor streaming: a `getMore` with the `exhaustAllowed`
+  flag streams all remaining batches with `moreToCome`, ending in a
+  trailing empty `id: 0` reply (mongod parity). Tailable / awaitData
+  cursors that yield nothing fall back to ordinary `getMore` rather than
+  spin the stream.
+
 ### Parse-time update validation, partial-index range implication
 
 `update` now rejects an unknown modifier (`$thismodifierdoesntexist`) at

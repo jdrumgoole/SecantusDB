@@ -2603,3 +2603,41 @@ def test_partial_index_range_implication_is_sound(tmp_path) -> None:
             assert t.count_documents({"a": {"$lt": 10}}) == 2
         finally:
             client.close()
+
+
+def test_exhaust_cursor_streams_all_documents(coll) -> None:
+    """CursorType.EXHAUST: the server streams every remaining batch over
+    the same socket using OP_MSG moreToCome, without the driver sending a
+    getMore per batch. Mirrors pymongo's own test_cursor.test_exhaust."""
+    from pymongo import CursorType
+
+    coll.insert_many({"_id": i} for i in range(200))
+    cursor = coll.find(cursor_type=CursorType.EXHAUST, batch_size=10)
+    got = [d["_id"] for d in cursor]
+    assert got == list(range(200))
+
+
+def test_exhaust_raw_batches_round_trip(server: SecantusDBServer) -> None:
+    """find_raw_batches under EXHAUST returns the full result set decoded
+    from the streamed raw batches (the exact shape pymongo's gauge asserts)."""
+    from bson import decode_all
+    from pymongo import CursorType, MongoClient
+
+    client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        c = client["db"]["test"]
+        c.insert_many({"_id": i} for i in range(200))
+        result = b"".join(c.find_raw_batches(cursor_type=CursorType.EXHAUST).to_list())
+        assert decode_all(result) == [{"_id": i} for i in range(200)]
+    finally:
+        client.close()
+
+
+def test_exhaust_cursor_single_batch_no_stream(coll) -> None:
+    """When the whole result fits in firstBatch (cursor id 0), exhaust is a
+    no-op: one reply, no moreToCome streaming, correct docs."""
+    from pymongo import CursorType
+
+    coll.insert_many({"_id": i} for i in range(5))
+    cursor = coll.find(cursor_type=CursorType.EXHAUST)
+    assert [d["_id"] for d in cursor] == list(range(5))
