@@ -19,6 +19,26 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Upsert subdocument _id, and idempotent drop with write concern
+
+Two real correctness fixes. An upsert whose filter pins `_id` to a
+subdocument value (`{_id: {f: ..., f2: ...}}`) now seeds that `_id`
+into the inserted document instead of generating a fresh ObjectId —
+the seed extraction was skipping every dict-valued filter field to
+avoid copying operator expressions (`{$gt: 5}`), but a literal
+subdocument is a real equality and must be kept. And `drop` of a
+non-existent collection now returns `{ok: 1}` (idempotent, as modern
+mongod does) rather than `NamespaceNotFound`, which also lets an
+unsatisfiable write concern surface its `writeConcernError` on the
+reply.
+
+#### Fixed
+
+- Upsert seeds a subdocument `_id` from the filter (operator
+  expressions are still correctly excluded).
+- `drop` of a non-existent collection is idempotent (`{ok: 1}`) and
+  honours an unsatisfiable write concern.
+
 ### Cursor min() / max() index bounds
 
 The find command's `min` / `max` cursor options are now honoured: they

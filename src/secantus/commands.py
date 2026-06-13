@@ -2471,7 +2471,14 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return oplog_err
     existed = ctx.storage.drop_collection(ctx.db_name, coll)
     if not existed:
-        return {"ok": 0.0, "errmsg": "ns not found", "code": 26, "codeName": "NamespaceNotFound"}
+        # Modern mongod treats ``drop`` of a non-existent collection as
+        # an idempotent success (``{ok: 1}``), not a NamespaceNotFound
+        # error. Returning ok:1 also lets the generic dispatch path
+        # attach a ``writeConcernError`` for an unsatisfiable write
+        # concern — pymongo's test_drop_collection drops an
+        # already-absent collection with w:50 and asserts a
+        # WriteConcernError, which requires the ok:1 reply shape.
+        return {"ok": 1.0}
     return {"ns": _ns(ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0}
 
 
