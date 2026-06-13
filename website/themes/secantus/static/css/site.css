@@ -70,7 +70,7 @@ pre code { background: transparent; padding: 0; }
 
 .beta-banner {
   font-size: 14px;
-  padding: 28px 0 0;
+  padding: 28px 0;
 }
 .beta-banner .callout {
   display: flex;
