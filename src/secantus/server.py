@@ -401,7 +401,25 @@ class SecantusDBServer:
             if "maxTimeMS" in body:
                 getmore["maxTimeMS"] = body["maxTimeMS"]
             getmore["$db"] = db
-            doc = dispatch(getmore, ctx)
+            try:
+                doc = dispatch(getmore, ctx)
+            except Exception:
+                # We've already sent a `moreToCome` reply this round, so the
+                # client is waiting for the rest of the stream. If the next
+                # getMore blows up unexpectedly, terminate the stream with a
+                # final `moreToCome`-clear reply rather than letting the
+                # exception drop the connection mid-stream (which the client
+                # surfaces as "Server ended moreToCome unexpectedly").
+                logger.exception(
+                    "error streaming exhaust getMore on cursor %d", int(target_id)
+                )
+                return send(
+                    {
+                        "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
+                        "ok": 1.0,
+                    },
+                    more=False,
+                )
 
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         # Register the socket alongside the conn_id so killOp can

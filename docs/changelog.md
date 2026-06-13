@@ -46,7 +46,9 @@ as a single message (mongod streams only on `getMore`).
   flag streams all remaining batches with `moreToCome`, ending in a
   trailing empty `id: 0` reply (mongod parity). Tailable / awaitData
   cursors that yield nothing fall back to ordinary `getMore` rather than
-  spin the stream.
+  spin the stream. A mid-stream getMore that raises unexpectedly still
+  terminates the stream with a `moreToCome`-clear reply, so the client
+  never sees "Server ended moreToCome unexpectedly".
 
 ### Parse-time update validation, partial-index range implication
 
