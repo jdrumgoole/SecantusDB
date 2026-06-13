@@ -113,26 +113,67 @@ def _read_submodule_head(rel: str) -> str:
         return "unknown"
 
 
+# pymongo test files that are the driver's OWN in-process unit tests —
+# BSON codec, BSON corpus, type classes (ObjectId / SON / Timestamp /
+# Code / DBRef), JSON util, error classes, default-export surface. They
+# never open a connection to SecantusDB (verified: zero
+# ``client_context`` / collection references), so they pass against any
+# server — or none. Counting them would inflate the headline
+# "compatibility" number with tests that don't measure SecantusDB, the
+# same way the Java ``:bson:test`` module did. Excluded from the count;
+# the server-touching files (including test_binary / test_raw_bson /
+# test_common / test_logger / test_custom_types, which DO connect) stay.
+_PYMONGO_NON_SERVER_FILES = frozenset(
+    {
+        "test_bson.py",
+        "test_bson_corpus.py",
+        "test_objectid.py",
+        "test_son.py",
+        "test_json_util.py",
+        "test_dbref.py",
+        "test_code.py",
+        "test_timestamp.py",
+        "test_default_exports.py",
+        "test_errors.py",
+    }
+)
+
+
 def _collect_pymongo(raw_dir: Path) -> GaugeStats | None:
     """Read ``pytest-json-report`` output (``.validation/raw.json``)."""
     f = raw_dir / "raw.json"
     if not f.exists():
         return None
     raw = json.loads(f.read_text())
-    s = raw.get("summary", {})
-    passed = s.get("passed", 0) + s.get("subtests passed", 0)
-    failure_descs = [
-        t["nodeid"] for t in raw.get("tests", []) if t.get("outcome") in ("failed", "error")
-    ]
+
+    def _is_server_test(nodeid: str) -> bool:
+        return nodeid.split("::")[0].split("/")[-1] not in _PYMONGO_NON_SERVER_FILES
+
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for t in raw.get("tests", []):
+        if not _is_server_test(t.get("nodeid", "")):
+            continue
+        o = t.get("outcome")
+        if o == "passed":
+            passed += 1
+        elif o in ("failed", "error"):
+            failed += 1
+            failure_descs.append(t["nodeid"])
+        elif o == "skipped":
+            skipped += 1
+    # ``subtests passed`` (pytest-subtests) come only from the unified
+    # spec runners, which are server-touching — add them to the count.
+    passed += raw.get("summary", {}).get("subtests passed", 0)
     return GaugeStats(
         name="pymongo",
         language="Python",
         driver_version=_read_submodule_head("pymongo-tests"),
         passed=passed,
-        failed=s.get("failed", 0) + s.get("error", 0),
-        skipped=s.get("skipped", 0),
+        failed=failed,
+        skipped=skipped,
         failure_descriptions=failure_descs,
-        note="curated pytest paths under vendor/pymongo-tests/test/",
+        note="curated server-touching pytest paths under vendor/pymongo-tests/test/",
     )
 
 
@@ -196,15 +237,24 @@ def _collect_ruby(raw_dir: Path) -> GaugeStats | None:
     if not f.exists():
         return None
     raw = json.loads(f.read_text())
-    s = raw.get("summary", {})
-    failed = s.get("failure_count", 0)
-    skipped = s.get("pending_count", 0)
-    passed = s.get("example_count", 0) - failed - skipped
-    failure_descs = [
-        e.get("full_description", "")
-        for e in raw.get("examples", [])
-        if e.get("status") == "failed"
-    ]
+    # address_spec.rb / config_spec.rb are client-side-only unit specs
+    # (Address parsing, Config) — zero collection / client references,
+    # never reach the daemon. Exclude from the count so the number
+    # reflects server-touching specs only.
+    _NON_SERVER = {"address_spec.rb", "config_spec.rb"}
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for e in raw.get("examples", []):
+        if e.get("file_path", "").split("/")[-1] in _NON_SERVER:
+            continue
+        st = e.get("status")
+        if st == "passed":
+            passed += 1
+        elif st == "failed":
+            failed += 1
+            failure_descs.append(e.get("full_description", ""))
+        elif st == "pending":
+            skipped += 1
     return GaugeStats(
         name="mongo-ruby-driver",
         language="Ruby",
