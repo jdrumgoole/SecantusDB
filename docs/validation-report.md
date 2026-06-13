@@ -9,11 +9,8 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | Category | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
-| `test_bson.py` | 87 | 0 | 0 | 1 | 88 | 100.0% |
-| `test_bson_corpus.py` | 31 | 0 | 0 | 0 | 31 | 100.0% |
 | `test_bulk.py` | 33 | 1 | 0 | 4 | 38 | 97.1% |
 | `test_change_stream.py` | 100 | 6 | 0 | 49 | 155 | 94.3% |
-| `test_code.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 81 | 6 | 0 | 4 | 91 | 93.1% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
@@ -26,29 +23,22 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_cursor.py` | 60 | 7 | 0 | 5 | 72 | 89.6% |
 | `test_custom_types.py` | 49 | 2 | 0 | 0 | 51 | 96.1% |
 | `test_database.py` | 34 | 1 | 0 | 1 | 36 | 97.1% |
-| `test_dbref.py` | 9 | 3 | 0 | 0 | 12 | 75.0% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_default_exports.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| `test_errors.py` | 8 | 0 | 0 | 0 | 8 | 100.0% |
 | `test_examples.py` | 18 | 0 | 0 | 2 | 20 | 100.0% |
-| `test_json_util.py` | 24 | 0 | 0 | 0 | 24 | 100.0% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
-| `test_objectid.py` | 15 | 0 | 0 | 0 | 15 | 100.0% |
 | `test_operations.py` | 2 | 0 | 0 | 0 | 2 | 100.0% |
 | `test_raw_bson.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_read_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
-| `test_son.py` | 11 | 0 | 0 | 0 | 11 | 100.0% |
-| `test_timestamp.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_transactions_unified.py` | 92 | 3 | 0 | 172 | 267 | 96.8% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1207** | **30** | **0** | **476** | **1713** | **97.6%** |
+| **Overall** | **1001** | **27** | **0** | **475** | **1503** | **97.4%** |
 
-## Failures (30)
+## Failures (27)
 
 First 30 failure node-ids for manual triage:
 
@@ -77,9 +67,6 @@ vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCommandCursor::test_exhaus
 vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_aggregate_w_custom_type_decoder
 vendor/pymongo-tests/test/test_custom_types.py::TestCollectionWCustomType::test_find_one_and__w_custom_type_decoder
 vendor/pymongo-tests/test/test_database.py::TestDatabase::test_drop_collection
-vendor/pymongo-tests/test/test_dbref.py::TestDBRefSpec::test_decoding_1_2_3
-vendor/pymongo-tests/test/test_dbref.py::TestDBRefSpec::test_decoding_4_5
-vendor/pymongo-tests/test/test_dbref.py::TestDBRefSpec::test_encoding_1_2
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedReadPref::test_secondary_readPreference
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_explicit_secondary_read_preference
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_secondary_read_preference_from_transaction_options

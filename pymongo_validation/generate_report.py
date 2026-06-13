@@ -23,6 +23,28 @@ import secantus
 VENDOR_PREFIX = "vendor/pymongo-tests/test/"
 
 
+# pymongo's own in-process unit tests (BSON codec, type classes, JSON
+# util, error classes) — verified zero server references, so they pass
+# against any server or none. Excluded from this report so its headline
+# matches the website grid's server-touching number rather than
+# inflating it with tests that don't measure SecantusDB. Kept in sync
+# with ``validation_summary.generate._PYMONGO_NON_SERVER_FILES``.
+_NON_SERVER_FILES = frozenset(
+    {
+        "test_bson.py",
+        "test_bson_corpus.py",
+        "test_objectid.py",
+        "test_son.py",
+        "test_json_util.py",
+        "test_dbref.py",
+        "test_code.py",
+        "test_timestamp.py",
+        "test_default_exports.py",
+        "test_errors.py",
+    }
+)
+
+
 def _category_for(nodeid: str) -> str:
     """First path component under vendor/pymongo-tests/test/ — directory or file."""
     rel = nodeid
@@ -53,6 +75,8 @@ def render(raw: dict, out_path: Path, *, server: str = "python") -> None:
     )
 
     for test in raw.get("tests", []):
+        if test["nodeid"].split("::")[0].split("/")[-1] in _NON_SERVER_FILES:
+            continue
         cat = _category_for(test["nodeid"])
         outcome = test.get("outcome", "unknown")
         # ``pytest-subtests`` reports the parent test with outcome
@@ -87,8 +111,14 @@ def render(raw: dict, out_path: Path, *, server: str = "python") -> None:
     grand_ran = totals["passed"] + totals["failed"] + totals["errored"]
     grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
 
-    # Top failures for triage.
-    fails = [t for t in raw.get("tests", []) if t.get("outcome") in ("failed", "error")]
+    # Top failures for triage (same non-server exclusion as the counts
+    # above, so the triage list matches the headline).
+    fails = [
+        t
+        for t in raw.get("tests", [])
+        if t.get("outcome") in ("failed", "error")
+        and t["nodeid"].split("::")[0].split("/")[-1] not in _NON_SERVER_FILES
+    ]
     fails.sort(key=lambda t: t["nodeid"])
 
     rust = server == "rust"
