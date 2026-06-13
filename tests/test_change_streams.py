@@ -140,6 +140,57 @@ def test_resume_after_token_picks_up_subsequent_events(client: MongoClient) -> N
     assert keys == [3, 4]
 
 
+@pytest.mark.parametrize("resume_option", ["resume_after", "start_after"])
+def test_resumed_open_returns_backlog_in_first_batch(
+    client: MongoClient, resume_option: str
+) -> None:
+    """A resumed open (resumeAfter / startAfter) must return the already-
+    committed backlog events in the aggregate's firstBatch, so a driver that
+    checks the cursor for buffered data *before* issuing any getMore sees
+    them — pymongo's ``CommandCursor._has_next()`` never sends a getMore.
+    And because firstBatch is non-empty, pymongo doesn't overwrite the
+    cached resume token from the open response's postBatchResumeToken, so an
+    uniterated resumed stream still reports ``resume_token == <the token
+    passed in>`` (pymongo change-streams prose test #14)."""
+    db = client["csdb_backlog"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs1 = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.insert_one({"_id": 0})
+    resume_point = _drain(cs1, target=1)[-1]["_id"]
+    cs1.close()
+
+    # Commit a backlog the resumed stream must surface on open.
+    coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
+
+    cs2 = coll.watch(**{resume_option: resume_point}, max_await_time_ms=2000)
+    # firstBatch is populated: buffered data is visible without a getMore.
+    assert cs2._cursor._has_next() is True
+    # Uniterated: the cached resume token is still the one we passed in.
+    assert cs2.resume_token == resume_point
+    keys = [e["documentKey"]["_id"] for e in _drain(cs2, target=3)]
+    cs2.close()
+    assert keys == [1, 2, 3]
+
+
+def test_fresh_watch_has_empty_first_batch(client: MongoClient) -> None:
+    """A fresh (non-resuming) watch positions at the oplog tail: there is no
+    backlog, so firstBatch stays empty and the cursor has no buffered data
+    until a write arrives. Guards against the resumed-open backlog drain
+    leaking into the common tail-watch path."""
+    db = client["csdb_fresh"]
+    coll = db["c"]
+    db.create_collection("c")
+    cs = coll.watch(max_await_time_ms=2000)
+    assert cs._cursor._has_next() is False
+    coll.insert_one({"_id": 1})
+    keys = [e["documentKey"]["_id"] for e in _drain(cs, target=1)]
+    cs.close()
+    assert keys == [1]
+
+
 def test_start_at_operation_time_picks_up_new_events(client: MongoClient) -> None:
     db = client["csdb_sat"]
     coll = db["c"]

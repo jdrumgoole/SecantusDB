@@ -3178,6 +3178,51 @@ def _change_stream_fatal_reply(exc: changestreams.ChangeStreamFatalError) -> dic
     }
 
 
+def _drain_change_stream_producer(entry: Any) -> None:
+    """Pull one producer batch into ``entry.remaining`` if it's empty.
+
+    May raise ``changestreams.ChangeStreamFatalError`` — the caller turns
+    that into a fatal reply and kills the cursor. Shared by the
+    change-stream open (firstBatch) and ``getMore`` (nextBatch) paths.
+    """
+    if not entry.remaining and entry.producer is not None:
+        new_events = entry.producer()
+        if new_events:
+            entry.remaining.extend(new_events)
+
+
+def _change_stream_cursor_doc(
+    entry: Any, cursor_id: int, batch_size: int, ns: str, *, batch_key: str
+) -> dict[str, Any]:
+    """Slice ``entry.remaining`` into one batch and build the ``cursor``
+    sub-document for a change-stream reply.
+
+    Handles the invalidate/final-event bookkeeping, the cursor-alive →
+    ``id: 0`` transition, and the ``postBatchResumeToken``. ``batch_key``
+    is ``"firstBatch"`` for the aggregate open and ``"nextBatch"`` for
+    ``getMore`` — the only shape difference between the two paths.
+    """
+    batch = entry.remaining[:batch_size]
+    entry.remaining = entry.remaining[batch_size:]
+    if not entry.remaining and entry.invalidated and entry.final_event_pending:
+        # The invalidate event has now been delivered.
+        entry.final_event_pending = False
+    cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
+    cursor_doc: dict[str, Any] = {
+        batch_key: batch,
+        # Cursor `id` MUST be int64 — Go driver hard-fails int32.
+        "id": bson.Int64(cursor_id if cursor_alive else 0),
+        "ns": ns,
+    }
+    if entry.last_token is not None:
+        # `postBatchResumeToken` lets change-stream consumers advance
+        # their resume position even when the batch is empty — MongoDB
+        # 4.2+ feature, mongo-go-driver and pymongo expect it on every
+        # change-stream reply.
+        cursor_doc["postBatchResumeToken"] = entry.last_token
+    return cursor_doc
+
+
 def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_id = int(doc["getMore"])
     coll = doc.get("collection", "")
@@ -3235,14 +3280,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 1.0,
         }
     # Drain any already-buffered events first.
-    if not entry.remaining and entry.producer is not None:
-        try:
-            new_events = entry.producer()
-        except changestreams.ChangeStreamFatalError as exc:
-            ctx.cursors.kill([cursor_id])
-            return _change_stream_fatal_reply(exc)
-        if new_events:
-            entry.remaining.extend(new_events)
+    try:
+        _drain_change_stream_producer(entry)
+    except changestreams.ChangeStreamFatalError as exc:
+        ctx.cursors.kill([cursor_id])
+        return _change_stream_fatal_reply(exc)
     if not entry.remaining and entry.await_data and not entry.invalidated:
         # PyMongo does not always pass maxTimeMS on getMore for change streams;
         # real mongod treats that as "wait indefinitely". We bound the wait so
@@ -3261,34 +3303,15 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 lambda: ctx.storage.oplog_tail_seq_nolock() > captured_tail or entry.invalidated,
                 timeout=wait_seconds,
             )
-        if entry.producer is not None and not entry.remaining:
-            try:
-                new_events = entry.producer()
-            except changestreams.ChangeStreamFatalError as exc:
-                ctx.cursors.kill([cursor_id])
-                return _change_stream_fatal_reply(exc)
-            if new_events:
-                entry.remaining.extend(new_events)
-    batch = entry.remaining[:batch_size]
-    entry.remaining = entry.remaining[batch_size:]
-    if not entry.remaining and entry.invalidated and entry.final_event_pending:
-        # The invalidate event has now been delivered.
-        entry.final_event_pending = False
-    cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
-    cursor_doc: dict[str, Any] = {
-        "nextBatch": batch,
-        # Cursor `id` MUST be int64 — Go driver hard-fails int32.
-        "id": bson.Int64(cursor_id if cursor_alive else 0),
-        "ns": ns,
-    }
-    if entry.last_token is not None:
-        # `postBatchResumeToken` lets change-stream consumers advance
-        # their resume position even when nextBatch is empty —
-        # MongoDB 4.2+ feature, mongo-go-driver and pymongo expect it
-        # on every change-stream getMore.
-        cursor_doc["postBatchResumeToken"] = entry.last_token
+        try:
+            _drain_change_stream_producer(entry)
+        except changestreams.ChangeStreamFatalError as exc:
+            ctx.cursors.kill([cursor_id])
+            return _change_stream_fatal_reply(exc)
     return {
-        "cursor": cursor_doc,
+        "cursor": _change_stream_cursor_doc(
+            entry, cursor_id, batch_size, ns, batch_key="nextBatch"
+        ),
         "ok": 1.0,
     }
 
@@ -3723,13 +3746,56 @@ def _aggregate_change_stream(
         position_seq=start_seq - 1,
         collection_uuid=coll_uuid,
     )
-    entry_ref["entry"] = ctx.cursors.get(cursor_id)
-    _ = batch_size  # firstBatch is empty by design for change streams
+    entry = ctx.cursors.get(cursor_id)
+    entry_ref["entry"] = entry
     initial_ts = ctx.storage.current_cluster_time()
     initial_token = changestreams.make_resume_token(
         changestreams.ResumeTokenData(start_seq - 1, initial_ts, ns, {})
     )
-    entry_ref["entry"].last_token = initial_token
+    entry.last_token = initial_token
+
+    # A *resuming* open (resumeAfter / startAfter / startAtOperationTime) may
+    # have a backlog of already-committed events between the start position
+    # and now. mongod returns those in the aggregate's firstBatch — a driver
+    # that checks the cursor for buffered data before sending any getMore
+    # (pymongo's ``CommandCursor._has_next()``, which never itself issues a
+    # getMore) must see them. Drain the producer once to populate firstBatch;
+    # there is no awaitData wait on open. A fresh tail watch has no backlog,
+    # so this is gated to the resuming forms only — the common case keeps the
+    # untouched empty-firstBatch + minted-token path.
+    is_resuming = (
+        cs_spec.resume_after is not None
+        or cs_spec.start_after is not None
+        or cs_spec.start_at_operation_time is not None
+    )
+    if is_resuming:
+        saved_pos = entry.position_seq
+        try:
+            _drain_change_stream_producer(entry)
+        except changestreams.ChangeStreamFatalError as exc:
+            ctx.cursors.kill([cursor_id])
+            return _change_stream_fatal_reply(exc)
+        if entry.remaining:
+            # Backlog present: the producer advanced ``position_seq`` and set
+            # ``last_token`` to the last backlog event. Hand the batch back as
+            # firstBatch (overflow stays in ``remaining`` for the first
+            # getMore). PyMongo does not cache the PBRT off a *non-empty*
+            # firstBatch, so an uniterated resumed stream still reports
+            # resume_token == the token the caller passed (prose test #14).
+            return {
+                "cursor": _change_stream_cursor_doc(
+                    entry, cursor_id, batch_size, ns, batch_key="firstBatch"
+                ),
+                "operationTime": initial_ts,
+                "ok": 1.0,
+            }
+        # No backlog: restore the at-open position + token so the empty-batch
+        # open behaves exactly as before. The producer's no-match position
+        # advance is a getMore-time concern (so a quiet collection's PBRT can
+        # move past unrelated activity), not an open-time one — at open the
+        # cursor still sits at the resume point.
+        entry.position_seq = saved_pos
+        entry.last_token = initial_token
     return {
         "cursor": {
             "firstBatch": [],
@@ -5194,8 +5260,12 @@ _PROFILE_SKIP_COMMANDS = frozenset(
 
 _PROFILE_OP_BUCKET: dict[str, str] = {
     "find": "query",
-    "count": "query",
-    "distinct": "query",
+    # mongod's profiler records ``count`` / ``distinct`` under ``op:
+    # "command"`` (only ``find`` is ``op: "query"``); matching that lets
+    # ``system.profile`` queries that filter on ``{op: "command",
+    # command.distinct: ...}`` find the entry.
+    "count": "command",
+    "distinct": "command",
     "aggregate": "command",
     "insert": "insert",
     "update": "update",

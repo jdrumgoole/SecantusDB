@@ -19,6 +19,56 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Resumed change streams return their backlog on open
+
+Opening a change stream with `resumeAfter`, `startAfter`, or
+`startAtOperationTime` now returns the already-committed backlog — the
+events between the resume point and now — in the aggregate's `firstBatch`,
+exactly as `mongod` does. Previously every change-stream open returned an
+empty `firstBatch` and deferred all events to the first `getMore`. That
+was invisible to most consumers, but a driver that inspects the cursor
+for buffered data *before* issuing any `getMore` (pymongo's
+`CommandCursor._has_next()`, which never sends one itself) saw nothing
+and reported the stream as empty.
+
+A fresh tail watch has no backlog, so it still opens with an empty
+`firstBatch` — the change is scoped to the resuming forms. And because a
+non-empty `firstBatch` means pymongo doesn't overwrite its cached resume
+token from the open response, an uniterated resumed stream now correctly
+reports `resume_token` equal to the token the caller passed in. Closes
+the pymongo gauge's `test_resumetoken_uniterated_nonempty_batch_*`
+(change-streams prose test #14), lifting the change-stream gauge from
+100 to 102 passing.
+
+#### Fixed
+
+- Resumed change-stream opens (`resumeAfter` / `startAfter` /
+  `startAtOperationTime`) return their committed backlog in `firstBatch`
+  instead of deferring every event to the first `getMore`, so a driver
+  that checks for buffered data before any `getMore` sees the events and
+  an uniterated resumed stream reports the correct `resume_token`.
+
+### Profiler op-class for `distinct` and `count`
+
+`system.profile` entries for `distinct` and `count` are now recorded
+under `op: "command"`, matching `mongod` — where only `find` carries
+`op: "query"`. The previous bucketing filed both under `op: "query"`, so
+a profile query like `{op: "command", "command.distinct": "<coll>"}`
+found nothing. Monitoring tooling that slices the profiler by operation
+class now sees the same shape it would against a real server.
+
+This closes the pymongo gauge's `test_cursor.test_comment`. The OP_MSG
+exhaust-cursor mid-stream-fault hardening shipped earlier this cycle
+also gained a dedicated regression test (a synthetic mid-stream
+`getMore` fault must terminate the stream with a `moreToCome`-clear
+reply, never drop the connection).
+
+#### Fixed
+
+- `distinct` / `count` profiler entries use `op: "command"` (were
+  `op: "query"`), so `system.profile` queries that filter by operation
+  class find them.
+
 ### OP_MSG exhaust cursors
 
 Exhaust cursors (`CursorType.EXHAUST`) now stream over the wire the way
