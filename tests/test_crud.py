@@ -659,6 +659,22 @@ def test_unique_index_blocks_update_via_pymongo(coll) -> None:
         coll.update_one({"_id": 2}, {"$set": {"email": "a@x"}})
 
 
+def test_create_unique_index_with_dropdups_ignores_option_and_fails_on_dup(coll) -> None:
+    """``dropDups`` was removed in MongoDB 3.0; mongod accepts but ignores it
+    rather than rejecting the spec as an unknown field. So a unique index over
+    duplicate data still fails on the duplicate (DuplicateKeyError), the docs
+    are untouched, and no index is created. Mirrors pymongo's
+    test_collection.test_index_dont_drop_dups."""
+    from pymongo.errors import DuplicateKeyError as PyDup
+
+    coll.insert_many([{"i": 1}, {"i": 2}, {"i": 2}, {"i": 3}])  # duplicate i
+    with pytest.raises(PyDup):
+        coll.create_index([("i", pymongo.ASCENDING)], unique=True, dropDups=False)
+    # The duplicate wasn't dropped, and the unique index was never created.
+    assert coll.count_documents({}) == 4
+    assert len(coll.index_information()) == 1  # only the default _id_ index
+
+
 def test_drop_index_via_pymongo(coll) -> None:
     coll.insert_one({"x": 1})
     coll.create_index("x")

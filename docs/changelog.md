@@ -19,6 +19,22 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `createIndexes` accepts and ignores the deprecated `dropDups` option
+
+`dropDups` was removed in MongoDB 3.0, but modern `mongod` still accepts it on
+the wire and silently ignores it rather than rejecting the index spec. SecantusDB
+now matches that: passing `dropDups` no longer trips the unknown-field guard.
+The practical upshot is that building a `unique` index over data that already
+contains a duplicate fails on the duplicate with `DuplicateKey` (11000) — a
+`DuplicateKeyError` to the driver — exactly as a real server does, instead of an
+unrelated "unknown field" error. The collection is left untouched and no index is
+created. Closes the pymongo gauge's `test_collection.test_index_dont_drop_dups`.
+
+#### Changed
+
+- `createIndexes` accepts `dropDups` and strips it from the stored index
+  options (deprecated, ignored — never drops duplicates).
+
 ### Partial indexes serve range-on-indexed-field queries with a residual clause
 
 A query that puts a range on a partial index's indexed field and an extra

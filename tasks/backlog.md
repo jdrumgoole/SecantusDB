@@ -149,8 +149,6 @@ the change-stream batch. Still open, precisely characterized:
     `test_find_one_and__w_custom_type`) — driver type-registry round-trips.
   - `test_error_code` / `test_index_filter` rejections (planner index-filter
     command surface).
-  - `dropDups` on createIndexes (`test_index_dont_drop_dups`) — mongod 4.0+
-    also rejects, but with a different shape; we error too aggressively.
   - the 3 `test_dbref.py` execnet failures: gauge-harness artifact (xdist
     can't serialize ObjectId in subtest reports — runner-side, not server).
   - `test_maxtime_ms_message` / `test_to_list_csot_applied`: pymongo CSOT
