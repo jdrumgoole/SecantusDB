@@ -18,6 +18,12 @@
 //! buffered run of storage-free stages through `apply_pipeline`, then applies the
 //! storage-backed stage, repeating.
 //!
+//! **Source stages** (`$currentOp` / `$listLocalSessions` / `$listSessions`)
+//! also run here: they ignore their input and emit a single synthetic "op" row
+//! (port of `aggregate._stage_current_op`), since SecantusDB runs commands
+//! synchronously and keeps no per-op registry. They're what makes a
+//! database-level `aggregate: 1` pipeline (which has no source collection) work.
+//!
 //! `$geoNear` runs here too (brute-force COLLSCAN: distance from each doc's `key`
 //! to `near` via `secantus_core::geo::point_distance`, min/max filter, ascending
 //! sort, `distanceField`/`includeLocs` attach) — `key` must be explicit
@@ -126,6 +132,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         &vars,
         storage,
         collation.as_ref(),
+        doc,
     )?;
 
     let (first_batch, cursor_id) =
@@ -152,6 +159,51 @@ fn is_storage_backed(name: &str) -> bool {
     )
 }
 
+/// Source stages that ignore their input and emit a synthetic row, mirroring
+/// `aggregate._stage_current_op` (reused for `$listLocalSessions` /
+/// `$listSessions`). They need the command/db/coll context, so they're handled
+/// at this layer rather than in the storage-free core engine.
+fn is_source_stage(name: &str) -> bool {
+    matches!(name, "$currentOp" | "$listLocalSessions" | "$listSessions")
+}
+
+/// `$currentOp` / `$listLocalSessions` / `$listSessions` — emit one synthetic
+/// "op" document (SecantusDB runs commands synchronously and keeps no per-op
+/// registry). Port of `aggregate._stage_current_op`: the `command` field echoes
+/// the actual aggregate request (with `$db` / `cursor` defaulted) so callers
+/// that introspect it see a faithful row; the `ns` / `host` / `op` fields match
+/// the Python stub.
+fn apply_source_stage(
+    _name: &str,
+    db: &str,
+    coll: Option<&str>,
+    cmd_doc: &Document,
+) -> Vec<Document> {
+    let command_doc = if cmd_doc.contains_key("aggregate") {
+        let mut c = cmd_doc.clone();
+        if !c.contains_key("$db") {
+            c.insert("$db", db.to_string());
+        }
+        if !c.contains_key("cursor") {
+            c.insert("cursor", Document::new());
+        }
+        c
+    } else {
+        doc! { "aggregate": 1 }
+    };
+    let ns = format!("{}.{}", db, coll.unwrap_or("$cmd.aggregate"));
+    vec![doc! {
+        "type": "op",
+        "host": "secantus",
+        "desc": "$currentOp",
+        "active": false,
+        "currentOpTime": "",
+        "command": command_doc,
+        "ns": ns,
+        "op": "command",
+    }]
+}
+
 /// The stage operator name (the single key of a stage document), or `""`.
 fn stage_name(stage: &Bson) -> &str {
     stage
@@ -176,12 +228,23 @@ fn run_segmented(
     vars: &Document,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
+    cmd_doc: &Document,
 ) -> Result<Vec<Document>, CommandError> {
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
     for stage in pipeline {
         let name = stage_name(stage);
-        if is_storage_backed(name) {
+        if is_source_stage(name) {
+            // Source stages (e.g. `$currentOp` / `$listLocalSessions`) ignore the
+            // input and emit a synthetic row. Run (and discard) any buffered
+            // stages first so a malformed earlier stage still errors in order,
+            // matching Python; the source stage replaces the docs regardless.
+            if !buffer.is_empty() {
+                let _ = core_run(docs, &buffer, vars, collation)?;
+                buffer.clear();
+            }
+            docs = apply_source_stage(name, db, coll, cmd_doc);
+        } else if is_storage_backed(name) {
             if !buffer.is_empty() {
                 docs = core_run(docs, &buffer, vars, collation)?;
                 buffer.clear();
@@ -324,6 +387,7 @@ fn apply_lookup(
                 &sub_vars,
                 storage,
                 collation,
+                &Document::new(),
             )?
         } else {
             // Simple form: localField == foreignField (array-aware).
@@ -1104,6 +1168,49 @@ mod tests {
         );
         assert_eq!(reply.get_i32("code").unwrap(), 2);
         assert_eq!(reply.get_str("codeName").unwrap(), "BadValue");
+    }
+
+    #[test]
+    fn aggregate_list_local_sessions_source_stage() {
+        // Database-level aggregate over a source stage (the test_database.py
+        // shape): $listLocalSessions emits one synthetic doc, then the rest of
+        // the pipeline reduces it to {dummy: "dummy field"}.
+        let s = FakeStorage::seed("t", "c", vec![]);
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": 1, "pipeline": [
+                {"$listLocalSessions": {}},
+                {"$limit": 1},
+                {"$addFields": {"dummy": "dummy field"}},
+                {"$project": {"_id": 0, "dummy": 1}},
+            ], "cursor": {}},
+            &mut c,
+        );
+        let fb = first_batch(&reply);
+        assert_eq!(fb.len(), 1);
+        assert_eq!(
+            fb[0].as_document().unwrap().get_str("dummy").unwrap(),
+            "dummy field"
+        );
+    }
+
+    #[test]
+    fn aggregate_current_op_synthetic_shape() {
+        let s = FakeStorage::seed("t", "c", vec![]);
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": 1, "pipeline": [{"$currentOp": {}}], "cursor": {}},
+            &mut c,
+        );
+        let fb = first_batch(&reply);
+        assert_eq!(fb.len(), 1);
+        let row = fb[0].as_document().unwrap();
+        assert_eq!(row.get_str("type").unwrap(), "op");
+        assert_eq!(row.get_str("op").unwrap(), "command");
+        // `command` echoes the aggregate request, with `$db` defaulted.
+        let cmd = row.get_document("command").unwrap();
+        assert!(cmd.contains_key("aggregate"));
+        assert_eq!(cmd.get_str("$db").unwrap(), "t");
     }
 
     #[test]

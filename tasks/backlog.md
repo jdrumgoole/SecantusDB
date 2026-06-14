@@ -300,7 +300,13 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   `run_segmented` executor in `secantus-commands::aggregate` interleaves the
   storage-free core engine with these command-layer stages; `$lookup` `let`
   expressions are evaluated; `collation` threads through `$match`/`$sort`.
-  **Still deferred:** `$graphLookup`; `$geoNear` `key`-inference from a geo index
+  **Source stages DONE:** `$currentOp` / `$listLocalSessions` / `$listSessions`
+  emit one synthetic "op" row (port of `aggregate._stage_current_op`, with the
+  `command` field echoing the request + `$db`/`cursor` defaulted), handled in
+  `run_segmented` via `is_source_stage` / `apply_source_stage`. This is what
+  makes a database-level `aggregate: 1` pipeline (no source collection) work —
+  the `test_database.py` `$listLocalSessions` shape and the unified db-aggregate
+  / versioned-API db-aggregate tests. **Still deferred:** `$graphLookup`; `$geoNear` `key`-inference from a geo index
   (explicit `key` required); `$lookup` nested inside `$facet` (facet sub-pipelines
   run in the storage-free core → Fallback); `$merge` pipeline-form `whenMatched`
   + `on`-field unique-index validation.
