@@ -130,7 +130,10 @@ one server bumps only that server's version:
   `__version__` (`0.5.2bN`, PEP 440). This is the **PyPI package** version. Bump it
   for Python-server changes (`src/secantus/**`).
 - **Rust server version** — the `version` field in **every** `crates/*/Cargo.toml`,
-  kept in **lockstep** across all crates (`0.5.2-beta.N`, SemVer pre-release).
+  kept in **lockstep** across all crates (`0.MAJOR.PATCH-beta.N`, SemVer
+  pre-release). Most slices just increment `N`. **Bumping the patch (or
+  minor/major) component resets the beta label to 0** — e.g. `0.5.2-beta.20` →
+  `0.5.3-beta.0`, never `0.5.3-beta.21`.
   Bump it for Rust-server changes (`crates/**`). There is no single
   `[workspace.package]` source because the WiredTiger-linked crates
   (`secantus-storage` / `-wt` / `-storage-adapter` / `-server-py` / `-storage-py` /

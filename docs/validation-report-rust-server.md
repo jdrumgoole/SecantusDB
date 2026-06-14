@@ -18,7 +18,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 258 | 43 | 0 | 185 | 486 | 85.7% |
+| `test_crud_unified.py` | 268 | 33 | 0 | 185 | 486 | 89.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 51 | 16 | 0 | 5 | 72 | 76.1% |
 | `test_custom_types.py` | 46 | 5 | 0 | 0 | 51 | 90.2% |
@@ -36,9 +36,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **855** | **173** | **0** | **475** | **1503** | **83.2%** |
+| **Overall** | **865** | **163** | **0** | **475** | **1503** | **84.1%** |
 
-## Failures (173)
+## Failures (163)
 
 First 30 failure node-ids for manual triage:
 
@@ -74,7 +74,7 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndP
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:required_with_changeStreamPreAndPostImages_disabled
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:required_with_changeStreamPreAndPostImages_enabled
 ```
-... and 143 more (see raw JSON).
+... and 133 more (see raw JSON).
 
 ## How this is generated
 

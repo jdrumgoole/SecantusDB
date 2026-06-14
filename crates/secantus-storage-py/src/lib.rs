@@ -321,7 +321,16 @@ impl RustStorage {
         let update = decode_doc(update_bytes)?;
         let out = self
             .inner
-            .update_matching(db, coll, &filter, &update, multi, upsert, &[])
+            .update_matching(
+                db,
+                coll,
+                &filter,
+                &update,
+                multi,
+                upsert,
+                &[],
+                &Document::new(),
+            )
             .map_err(to_pyerr)?;
         let mut d = Document::new();
         d.insert("matched", out.matched as i64);
@@ -343,7 +352,7 @@ impl RustStorage {
     ) -> PyResult<usize> {
         let filter = decode_doc(filter_bytes)?;
         self.inner
-            .delete_matching(db, coll, &filter, limit)
+            .delete_matching(db, coll, &filter, limit, &Document::new())
             .map_err(to_pyerr)
     }
 

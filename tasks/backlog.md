@@ -384,8 +384,12 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   update_matching` always computes positional matches and takes `array_filters`,
   threaded through the command trait's `update_matching_array_filters` (default
   forwards) + adapter + handler (parses per-statement `arrayFilters`). Parity
-  suite extended (`apply_update_with` binding + 11 arrayFilters cases). **Still
-  deferred:** `let` / `collation` / `validator` (none in the storage seam yet).
+  suite extended (`apply_update_with` binding + 11 arrayFilters cases).
+  **`let` DONE** (update + delete): `resolve_let_vars` (handler) seeds `$$NOW`
+  and evaluates each `let` value, threaded as query vars through
+  `update_matching_array_filters` / `update_matching_pipeline` /
+  `delete_matching_with_let` → the storage query matcher. **Still deferred:**
+  `collation` (its own server-wide COLLSCAN-correct slice) / `validator`.
 - [ ] **`find` edges** — up-front empty-collection filter validation (needs the
   query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
   capped-collection poll; `let` / `collation`. (Tracked in `find.rs` module docs.)

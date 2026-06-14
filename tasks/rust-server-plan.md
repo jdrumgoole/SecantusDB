@@ -228,8 +228,12 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       (parses per-statement `arrayFilters`). Parity suite extended (the
       `apply_update_with` binding + 11 arrayFilters cases stay byte-pinned to
       Python).
-    - **Still deferred (backlog §7):** `let` / `collation` / `validator` /
-      `writeConcern` (pending storage-seam work).
+    - **`let` ✅ DONE** (update + delete) — `resolve_let_vars` seeds `$$NOW` +
+      evaluates each `let` value (mirrors `commands._resolve_let_vars`), threaded
+      as query vars through the storage matcher via `update_matching_array_filters`
+      / `update_matching_pipeline` / the new `delete_matching_with_let`.
+    - **Still deferred (backlog §7):** `collation` (own server-wide
+      COLLSCAN-correct slice) / `validator` / `writeConcern`.
   - **`aggregate` ✅ DONE** (`secantus-commands::aggregate`, post-merge of PR #31)
     — port of `_aggregate`'s storage-independent path: fetch input via the
     `Storage` trait's `find` (lifting a leading `$match` into the fetch filter +

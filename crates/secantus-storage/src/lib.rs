@@ -3240,17 +3240,20 @@ impl Storage {
         multi: bool,
         upsert: bool,
         array_filters: &[Document],
+        let_vars: &Document,
     ) -> Result<UpdateOutcome> {
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
         // doc in `o`, an operator update a `{$v:2, diff}`. Positional operators
         // resolve per matched doc — `$` from the query filter
         // (`find_positional_matches`), `$[]`/`$[ident]` from `array_filters`.
+        // `let_vars` are visible to `$expr` in the filter (command `let`).
         let is_replacement = !update.keys().any(|k| k.starts_with('$'));
         self.update_matching_core(
             db,
             coll,
             filter,
+            let_vars,
             multi,
             upsert,
             is_replacement,
@@ -3277,28 +3280,40 @@ impl Storage {
         pipeline: &[Bson],
         multi: bool,
         upsert: bool,
+        let_vars: &Document,
     ) -> Result<UpdateOutcome> {
-        self.update_matching_core(db, coll, filter, multi, upsert, false, &|doc, _up| {
-            let out = secantus_core::aggregate::apply_pipeline(
-                vec![doc.clone()],
-                pipeline,
-                &Document::new(),
-                None,
-            )
-            .map_err(|_| StorageError::QueryUnsupported)?;
-            out.into_iter().next().ok_or(StorageError::QueryUnsupported)
-        })
+        self.update_matching_core(
+            db,
+            coll,
+            filter,
+            let_vars,
+            multi,
+            upsert,
+            false,
+            &|doc, _up| {
+                let out = secantus_core::aggregate::apply_pipeline(
+                    vec![doc.clone()],
+                    pipeline,
+                    let_vars,
+                    None,
+                )
+                .map_err(|_| StorageError::QueryUnsupported)?;
+                out.into_iter().next().ok_or(StorageError::QueryUnsupported)
+            },
+        )
     }
 
     /// Shared match → rewrite → write → oplog/index path for both the
     /// operator/replacement form and the pipeline form. `transform(doc, is_upsert)`
     /// produces the new doc; `is_replacement` selects the oplog `o` shape.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn update_matching_core(
         &self,
         db: &str,
         coll: &str,
         filter: &Document,
+        vars: &Document,
         multi: bool,
         upsert: bool,
         is_replacement: bool,
@@ -3322,11 +3337,10 @@ impl Storage {
         let mut oplog_entries: Vec<Document> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
 
-        let vars = Document::new();
         let candidates = self.candidate_docs(&session, db, coll, filter)?;
         for (id_k, blob) in candidates {
             let doc = decode_doc(&blob)?;
-            if !query_matches(&doc, filter, &vars, None)
+            if !query_matches(&doc, filter, vars, None)
                 .map_err(|_| StorageError::QueryUnsupported)?
             {
                 continue;
@@ -3445,6 +3459,7 @@ impl Storage {
         coll: &str,
         filter: &Document,
         limit: usize,
+        let_vars: &Document,
     ) -> Result<usize> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
@@ -3465,11 +3480,10 @@ impl Storage {
         let mut deleted = 0usize;
         let mut oplog_entries: Vec<Document> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
-        let vars = Document::new();
         let candidates = self.candidate_docs(&session, db, coll, filter)?;
         for (id_k, blob) in candidates {
             let doc = decode_doc(&blob)?;
-            if !query_matches(&doc, filter, &vars, None)
+            if !query_matches(&doc, filter, let_vars, None)
                 .map_err(|_| StorageError::QueryUnsupported)?
             {
                 continue;

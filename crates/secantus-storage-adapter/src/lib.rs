@@ -188,7 +188,16 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
-            .update_matching(db, coll, filter, update, multi, upsert, &[])
+            .update_matching(
+                db,
+                coll,
+                filter,
+                update,
+                multi,
+                upsert,
+                &[],
+                &Document::new(),
+            )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
             matched: o.matched,
@@ -207,10 +216,20 @@ impl CmdStorage for StorageAdapter {
         multi: bool,
         upsert: bool,
         array_filters: &[Document],
+        let_vars: &Document,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
-            .update_matching(db, coll, filter, update, multi, upsert, array_filters)
+            .update_matching(
+                db,
+                coll,
+                filter,
+                update,
+                multi,
+                upsert,
+                array_filters,
+                let_vars,
+            )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
             matched: o.matched,
@@ -227,10 +246,11 @@ impl CmdStorage for StorageAdapter {
         pipeline: &[Bson],
         multi: bool,
         upsert: bool,
+        let_vars: &Document,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
-            .update_matching_pipeline(db, coll, filter, pipeline, multi, upsert)
+            .update_matching_pipeline(db, coll, filter, pipeline, multi, upsert, let_vars)
             .map_err(map_err)?;
         Ok(UpdateOutcome {
             matched: o.matched,
@@ -247,7 +267,20 @@ impl CmdStorage for StorageAdapter {
         limit: usize,
     ) -> Result<usize, StorageError> {
         self.inner
-            .delete_matching(db, coll, filter, limit)
+            .delete_matching(db, coll, filter, limit, &Document::new())
+            .map_err(map_err)
+    }
+
+    fn delete_matching_with_let(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+        let_vars: &Document,
+    ) -> Result<usize, StorageError> {
+        self.inner
+            .delete_matching(db, coll, filter, limit, let_vars)
             .map_err(map_err)
     }
 

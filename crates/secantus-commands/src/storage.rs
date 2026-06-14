@@ -214,10 +214,11 @@ pub trait Storage: Send + Sync {
     ) -> Result<UpdateOutcome, StorageError>;
 
     /// Operator-form update with positional operators (`$` / `$[]` / `$[ident]`)
-    /// resolved via `array_filters` and the query filter. The default forwards to
-    /// `update_matching` (ignoring `array_filters`) so fakes / the no-positional
-    /// path are unaffected; the WiredTiger adapter routes to the array-filter-aware
-    /// `Storage::update_matching`.
+    /// resolved via `array_filters` and the query filter, plus `let_vars` (command
+    /// `let`) visible to `$expr` in the filter. The default forwards to
+    /// `update_matching` (ignoring `array_filters` / `let_vars`) so fakes / the
+    /// no-positional path are unaffected; the WiredTiger adapter routes to the
+    /// option-aware `Storage::update_matching`.
     #[allow(clippy::too_many_arguments)]
     fn update_matching_array_filters(
         &self,
@@ -228,15 +229,18 @@ pub trait Storage: Send + Sync {
         multi: bool,
         upsert: bool,
         _array_filters: &[Document],
+        _let_vars: &Document,
     ) -> Result<UpdateOutcome, StorageError> {
         self.update_matching(db, coll, filter, update, multi, upsert)
     }
 
     /// Pipeline-form update (`u: [ {$set: …}, … ]`): each matched doc is rewritten
-    /// by running the aggregation pipeline over it, diff-style in the oplog. The
-    /// default rejects it as a `BadValue` write error (test fakes don't implement
-    /// pipeline updates); the WiredTiger adapter forwards to
-    /// `Storage::update_matching_pipeline`.
+    /// by running the aggregation pipeline over it, diff-style in the oplog;
+    /// `let_vars` (command `let`) are visible to `$expr` in the filter and to the
+    /// pipeline expressions. The default rejects it as a `BadValue` write error
+    /// (test fakes don't implement pipeline updates); the WiredTiger adapter
+    /// forwards to `Storage::update_matching_pipeline`.
+    #[allow(clippy::too_many_arguments)]
     fn update_matching_pipeline(
         &self,
         _db: &str,
@@ -245,6 +249,7 @@ pub trait Storage: Send + Sync {
         _pipeline: &[Bson],
         _multi: bool,
         _upsert: bool,
+        _let_vars: &Document,
     ) -> Result<UpdateOutcome, StorageError> {
         Err(StorageError::WriteError {
             code: 2,
@@ -260,6 +265,21 @@ pub trait Storage: Send + Sync {
         filter: &Document,
         limit: usize,
     ) -> Result<usize, StorageError>;
+
+    /// Delete with `let_vars` (command `let`) visible to `$expr` in the filter.
+    /// The default forwards to `delete_matching` (ignoring `let_vars`) so fakes
+    /// are unaffected; the WiredTiger adapter routes to the let-aware
+    /// `Storage::delete_matching`.
+    fn delete_matching_with_let(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+        _let_vars: &Document,
+    ) -> Result<usize, StorageError> {
+        self.delete_matching(db, coll, filter, limit)
+    }
 
     /// Count documents matching `filter`.
     fn count_matching(

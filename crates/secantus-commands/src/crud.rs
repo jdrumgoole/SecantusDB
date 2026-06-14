@@ -114,6 +114,24 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
+/// Resolve a command-level `let` field into query vars. Seeds `$$NOW` (a Date
+/// constant for the whole operation) then evaluates each `let` value as an
+/// aggregation expression against an empty doc (so `{n: {$add: [1, 2]}}` binds
+/// `$$n` to 3; scalars pass through). Mirrors `commands._resolve_let_vars`. A
+/// value the expression engine can't evaluate is kept raw (best-effort).
+fn resolve_let_vars(let_field: Option<&Bson>) -> Document {
+    let mut vars = Document::new();
+    vars.insert("NOW", bson::DateTime::now());
+    if let Some(Bson::Document(d)) = let_field {
+        for (name, value) in d {
+            let resolved = secantus_core::expressions::evaluate(&Document::new(), value, &vars)
+                .unwrap_or_else(|_| value.clone());
+            vars.insert(name.clone(), resolved);
+        }
+    }
+    vars
+}
+
 /// `delete` — batch delete, one entry per `{q, limit}` spec.
 pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "delete")?;
@@ -123,13 +141,15 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     let mut n = 0_i32;
     let mut write_errors: Vec<Bson> = Vec::new();
+    // Command-level `let` → vars visible to `$expr` in each spec's `q` filter.
+    let let_vars = resolve_let_vars(doc.get("let"));
     for (index, spec) in deletes.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
         let filter = doc_field(spec, "q");
         // `limit: 0` ⇒ delete all matches; any positive value ⇒ at most that
         // many (mongod only defines 0 and 1, but we honour the integer).
         let limit = spec.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize;
-        match storage.delete_matching(&ctx.db_name, &coll, &filter, limit) {
+        match storage.delete_matching_with_let(&ctx.db_name, &coll, &filter, limit, &let_vars) {
             Ok(deleted) => n += deleted as i32,
             Err(StorageError::Internal(msg)) => {
                 return Ok(CommandError::new(1, "InternalError", msg).into_reply())
@@ -207,6 +227,10 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut upserted: Vec<Bson> = Vec::new();
     let mut write_errors: Vec<Bson> = Vec::new();
 
+    // Command-level `let` → vars visible to `$expr` in each spec's `q` filter
+    // (and to pipeline-form `u` expressions). Resolved once for the batch.
+    let let_vars = resolve_let_vars(doc.get("let"));
+
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
 
@@ -253,7 +277,15 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     }
                 }
             }
-            storage.update_matching_pipeline(&ctx.db_name, &coll, &q, stages, multi, upsert)
+            storage.update_matching_pipeline(
+                &ctx.db_name,
+                &coll,
+                &q,
+                stages,
+                multi,
+                upsert,
+                &let_vars,
+            )
         } else {
             let u = doc_field(spec, "u");
             // arrayFilters (`$[ident]`) is per-update-statement. The `$` / `$[]`
@@ -272,6 +304,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 multi,
                 upsert,
                 &array_filters,
+                &let_vars,
             )
         };
 
@@ -460,6 +493,7 @@ mod tests {
             })
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn update_matching_pipeline(
             &self,
             db: &str,
@@ -468,6 +502,7 @@ mod tests {
             pipeline: &[Bson],
             multi: bool,
             _upsert: bool,
+            _let_vars: &Document,
         ) -> Result<UpdateOutcome, StorageError> {
             // Apply the pipeline to each matched doc (the real storage path).
             let mut cols = self.cols.lock().unwrap();
