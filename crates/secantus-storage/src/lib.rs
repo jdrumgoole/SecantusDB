@@ -33,7 +33,6 @@ use secantus_core::diff::compute_update_description;
 use secantus_core::get_path;
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
-use secantus_core::update::apply_update;
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
 pub mod changestreams;
@@ -3231,6 +3230,7 @@ impl Storage {
     /// `storage.update_matching` (base form — `array_filters` / positional
     /// operators / `let` / `collation` / `validator` / capped collections route
     /// to Python at the engine-selection layer).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_matching(
         &self,
         db: &str,
@@ -3239,10 +3239,13 @@ impl Storage {
         update: &Document,
         multi: bool,
         upsert: bool,
+        array_filters: &[Document],
     ) -> Result<UpdateOutcome> {
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
-        // doc in `o`, an operator update a `{$v:2, diff}`.
+        // doc in `o`, an operator update a `{$v:2, diff}`. Positional operators
+        // resolve per matched doc — `$` from the query filter
+        // (`find_positional_matches`), `$[]`/`$[ident]` from `array_filters`.
         let is_replacement = !update.keys().any(|k| k.starts_with('$'));
         self.update_matching_core(
             db,
@@ -3251,7 +3254,11 @@ impl Storage {
             multi,
             upsert,
             is_replacement,
-            &|doc, up| apply_update(doc, update, up).map_err(|_| StorageError::QueryUnsupported),
+            &|doc, up| {
+                let pos = secantus_core::update::find_positional_matches(doc, filter);
+                secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
+                    .map_err(|_| StorageError::QueryUnsupported)
+            },
         )
     }
 

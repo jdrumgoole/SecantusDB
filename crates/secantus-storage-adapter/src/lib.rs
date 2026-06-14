@@ -188,7 +188,29 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
-            .update_matching(db, coll, filter, update, multi, upsert)
+            .update_matching(db, coll, filter, update, multi, upsert, &[])
+            .map_err(map_err)?;
+        Ok(UpdateOutcome {
+            matched: o.matched,
+            modified: o.modified,
+            upserted_id: o.upserted_id,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_array_filters(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        update: &Document,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Document],
+    ) -> Result<UpdateOutcome, StorageError> {
+        let o = self
+            .inner
+            .update_matching(db, coll, filter, update, multi, upsert, array_filters)
             .map_err(map_err)?;
         Ok(UpdateOutcome {
             matched: o.matched,

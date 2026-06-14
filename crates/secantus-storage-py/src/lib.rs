@@ -321,7 +321,7 @@ impl RustStorage {
         let update = decode_doc(update_bytes)?;
         let out = self
             .inner
-            .update_matching(db, coll, &filter, &update, multi, upsert)
+            .update_matching(db, coll, &filter, &update, multi, upsert, &[])
             .map_err(to_pyerr)?;
         let mut d = Document::new();
         d.insert("matched", out.matched as i64);

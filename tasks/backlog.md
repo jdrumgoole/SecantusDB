@@ -375,20 +375,24 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   auto-creates the storage dir. **Follow-ups:** a Python `secantus`-package
   wrapper for `SecantusDBServer`-style ergonomics; an `invoke rust-server-py` task.
 - [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
-- [~] **`update` options** — pipeline-form `u` (`[...]`) is DONE: `secantus-storage`
-  gained `update_matching_pipeline` (shares the match/write path with
-  `update_matching` via a transform closure; always diff-style oplog so change
-  streams see `operationType: "update"`), threaded through the command `Storage`
-  trait + adapter + handler (malformed stages still 9 / 168 at command level).
-  **Still deferred:** `arrayFilters` / `let` / `collation` / `validator` (none in
-  the storage seam yet).
+- [~] **`update` options** — DONE: pipeline-form `u` (`[...]`) via
+  `update_matching_pipeline` (diff-style oplog → change streams see
+  `operationType: "update"`); **positional operators (`$` / `$[]` / `$[ident]`)
+  + `arrayFilters`** — `secantus-core::update::apply_update_with` resolves
+  positional paths (`find_positional_matches` for `$` from the query filter,
+  `index_array_filters` + the query matcher for `$[ident]`); `secantus-storage::
+  update_matching` always computes positional matches and takes `array_filters`,
+  threaded through the command trait's `update_matching_array_filters` (default
+  forwards) + adapter + handler (parses per-statement `arrayFilters`). Parity
+  suite extended (`apply_update_with` binding + 11 arrayFilters cases). **Still
+  deferred:** `let` / `collation` / `validator` (none in the storage seam yet).
 - [ ] **`find` edges** — up-front empty-collection filter validation (needs the
   query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
   capped-collection poll; `let` / `collation`. (Tracked in `find.rs` module docs.)
 - [x] **R2c — `update` command.** Document-, replacement-, and pipeline-form `u`
-  all apply (pipeline via `update_matching_pipeline`); sort-rejection (9) +
-  pipeline-stage validation (9 / 168) pre-checks done. `arrayFilters` / `let` /
-  `collation` / `validator` still deferred (see "update options" above).
+  all apply; positional operators + `arrayFilters` done; sort-rejection (9) +
+  pipeline-stage validation (9 / 168) pre-checks done. `let` / `collation` /
+  `validator` still deferred (see "update options" above).
 - [ ] **`find` command** — lands with R3 (cursor registry) + `secantus-core`
   projection; first-batch + `getMore`/`killCursors`.
 - [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`

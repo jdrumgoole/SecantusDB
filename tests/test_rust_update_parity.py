@@ -107,6 +107,61 @@ def test_curated_parity(doc, update, upsert):
     assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update}"
 
 
+def _rust_apply_with(doc, update, array_filters=None, positional_matches=None, is_upsert=False):
+    return _rust.apply_update_with(
+        bson.encode(doc),
+        bson.encode(update),
+        is_upsert,
+        bson.encode({"f": list(array_filters or [])}),
+        bson.encode(dict(positional_matches or {})),
+    )
+
+
+# (doc, update, array_filters, positional_matches) for the positional /
+# arrayFilters path. The Rust `apply_update_with` must match Python's
+# `apply_update(..., array_filters=, positional_matches=)` byte-for-byte.
+ARRAY_FILTER_CASES = [
+    # $[] — all elements
+    ({"g": [1, 2, 3]}, {"$inc": {"g.$[]": 10}}, [], {}),
+    ({"g": [1, 2, 3]}, {"$set": {"g.$[]": 0}}, [], {}),
+    ({"g": [{"v": 1}, {"v": 2}]}, {"$set": {"g.$[].v": 9}}, [], {}),
+    # $[ident] with arrayFilters
+    ({"g": [1, 2, 3]}, {"$set": {"g.$[e]": 0}}, [{"e": {"$gte": 2}}], {}),
+    ({"g": [1, 2, 3, 4]}, {"$inc": {"g.$[e]": 100}}, [{"e": {"$lt": 3}}], {}),
+    (
+        {"items": [{"score": 40}, {"score": 80}, {"score": 10}]},
+        {"$set": {"items.$[e].score": 100}},
+        [{"e.score": {"$lt": 50}}],
+        {},
+    ),
+    # $ positional (resolution supplied)
+    ({"g": [5, 6, 7]}, {"$set": {"g.$": 60}}, [], {"g": 1}),
+    ({"g": [5, 6, 7]}, {"$inc": {"g.$": 1}}, [], {"g": 2}),
+    # nested $[] then $[ident]
+    (
+        {"a": [{"b": [1, 2]}, {"b": [3, 4]}]},
+        {"$set": {"a.$[].b.$[x]": 0}},
+        [{"x": {"$gte": 3}}],
+        {},
+    ),
+    # no-op: identifier matches nothing
+    ({"g": [1, 2]}, {"$set": {"g.$[e]": 9}}, [{"e": {"$gt": 100}}], {}),
+]
+
+
+@pytest.mark.parametrize("doc,update,af,pos", ARRAY_FILTER_CASES)
+def test_array_filter_parity(doc, update, af, pos):
+    doc = bson.decode(bson.encode(doc))
+    update = bson.decode(bson.encode(update))
+    rust = _rust_apply_with(doc, update, af, pos)
+    if rust is None:
+        return  # fallback — Python handles it
+    py = _pure.apply_update(
+        doc, update, array_filters=list(af), positional_matches=dict(pos)
+    )
+    assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
+
+
 def _rand_scalar(rng):
     return rng.choice(
         [

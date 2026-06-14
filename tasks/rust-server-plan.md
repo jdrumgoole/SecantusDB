@@ -218,8 +218,18 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       array-truncation spec). Threaded through the command `Storage` trait
       (default rejects → adapter forwards) + handler; malformed stages still
       surface 9 / 168 at command level; pipeline upsert seeds from the filter.
-    - **Still deferred (backlog §7):** `arrayFilters` / `let` / `collation` /
-      `validator` / `writeConcern` (pending storage-seam work).
+    - **Positional operators + `arrayFilters` ✅ DONE** —
+      `secantus-core::update::apply_update_with` resolves `$` (from the query
+      filter via `find_positional_matches`), `$[]` (all elements), and
+      `$[ident]` (via `index_array_filters` + the query matcher). `secantus-storage::
+      update_matching` always computes positional matches and takes an
+      `array_filters` slice; threaded through the command trait's
+      `update_matching_array_filters` (default forwards, adapter routes) + handler
+      (parses per-statement `arrayFilters`). Parity suite extended (the
+      `apply_update_with` binding + 11 arrayFilters cases stay byte-pinned to
+      Python).
+    - **Still deferred (backlog §7):** `let` / `collation` / `validator` /
+      `writeConcern` (pending storage-seam work).
   - **`aggregate` ✅ DONE** (`secantus-commands::aggregate`, post-merge of PR #31)
     — port of `_aggregate`'s storage-independent path: fetch input via the
     `Storage` trait's `find` (lifting a leading `$match` into the fetch filter +

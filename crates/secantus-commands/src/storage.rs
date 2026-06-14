@@ -213,6 +213,25 @@ pub trait Storage: Send + Sync {
         upsert: bool,
     ) -> Result<UpdateOutcome, StorageError>;
 
+    /// Operator-form update with positional operators (`$` / `$[]` / `$[ident]`)
+    /// resolved via `array_filters` and the query filter. The default forwards to
+    /// `update_matching` (ignoring `array_filters`) so fakes / the no-positional
+    /// path are unaffected; the WiredTiger adapter routes to the array-filter-aware
+    /// `Storage::update_matching`.
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_array_filters(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        update: &Document,
+        multi: bool,
+        upsert: bool,
+        _array_filters: &[Document],
+    ) -> Result<UpdateOutcome, StorageError> {
+        self.update_matching(db, coll, filter, update, multi, upsert)
+    }
+
     /// Pipeline-form update (`u: [ {$set: …}, … ]`): each matched doc is rewritten
     /// by running the aggregation pipeline over it, diff-style in the oplog. The
     /// default rejects it as a `BadValue` write error (test fakes don't implement

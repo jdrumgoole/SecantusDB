@@ -10,10 +10,11 @@
 //! * Collection `validator` / `bypassDocumentValidation` (needs
 //!   `get_collection_options` + the query engine on the write path).
 //! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
-//! * `arrayFilters`, `let`, `collation` on `update`; `let` / `collation` on
-//!   `delete`; view-collection `count` — none are in the Rust storage seam yet
-//!   (see each handler's doc + backlog §7). Pipeline-form `u` is now applied via
-//!   `Storage::update_matching_pipeline` (diff-style oplog).
+//! * `let`, `collation` on `update`; `let` / `collation` on `delete`;
+//!   view-collection `count` — none are in the Rust storage seam yet (see each
+//!   handler's doc + backlog §7). Pipeline-form `u` applies via
+//!   `Storage::update_matching_pipeline`; positional operators (`$` / `$[]` /
+//!   `$[ident]`) + `arrayFilters` via `Storage::update_matching_array_filters`.
 
 use bson::{doc, Bson, Document};
 
@@ -188,8 +189,12 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
 /// returns the faithful command-level `FailedToParse` (9) / `InvalidPipelineOperator`
 /// (168).
 ///
-/// **Deferred (tracked in backlog §7):** `arrayFilters`, `let`, `collation`,
-/// `validator`, `writeConcern`, `_reject_oplog_rs_write` (none are in the Rust
+/// Positional update operators (`$` / `$[]` / `$[ident]`) + `arrayFilters` apply
+/// via `Storage::update_matching_array_filters` (`$` resolved from the query
+/// filter, `$[ident]` from the per-statement `arrayFilters`).
+///
+/// **Deferred (tracked in backlog §7):** `let`, `collation`, `validator`,
+/// `writeConcern`, `_reject_oplog_rs_write` (none are in the Rust
 /// `update_matching` seam yet).
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "update")?;
@@ -251,7 +256,23 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             storage.update_matching_pipeline(&ctx.db_name, &coll, &q, stages, multi, upsert)
         } else {
             let u = doc_field(spec, "u");
-            storage.update_matching(&ctx.db_name, &coll, &q, &u, multi, upsert)
+            // arrayFilters (`$[ident]`) is per-update-statement. The `$` / `$[]`
+            // positional operators resolve in storage regardless; `$[ident]`
+            // needs these filter docs.
+            let array_filters: Vec<Document> = spec
+                .get("arrayFilters")
+                .and_then(Bson::as_array)
+                .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
+                .unwrap_or_default();
+            storage.update_matching_array_filters(
+                &ctx.db_name,
+                &coll,
+                &q,
+                &u,
+                multi,
+                upsert,
+                &array_filters,
+            )
         };
 
         match outcome {

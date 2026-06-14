@@ -229,6 +229,43 @@ fn apply_update(
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
+/// `update.apply_update` with `arrayFilters` + positional support. `array_filters`
+/// is a BSON doc `{"f": [<filter>, ...]}`; `positional_matches` is the `$`
+/// resolution `{path: index}` (Python computes it via `find_positional_matches`).
+/// Same `None`-fallback contract as [`apply_update`]. The parity-test vehicle for
+/// the Rust server's positional/arrayFilters update path.
+#[pyfunction]
+fn apply_update_with(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    update_bytes: &[u8],
+    is_upsert: bool,
+    array_filters_bytes: &[u8],
+    positional_matches_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let doc: Document = bson::from_slice(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    let update: Document = bson::from_slice(update_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
+    let af_wrap: Document = bson::from_slice(array_filters_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid arrayFilters BSON: {e}")))?;
+    let array_filters: Vec<Document> = match af_wrap.get("f") {
+        Some(bson::Bson::Array(a)) => a.iter().filter_map(|b| b.as_document().cloned()).collect(),
+        _ => Vec::new(),
+    };
+    let pos: Document = bson::from_slice(positional_matches_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid positionalMatches BSON: {e}")))?;
+    let out = py
+        .allow_threads(|| {
+            match update::apply_update_with(&doc, &update, is_upsert, &array_filters, &pos) {
+                Ok(new) => encode_doc(&new).map(Some),
+                Err(update::Fallback) => Ok(None),
+            }
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
+}
+
 /// Batched `update.apply_update`: apply one update spec to a whole matched list
 /// in one call (the multi-update hot path), one GIL release for all N. Mirrors
 /// `query_matches_batch`'s seam: `{"d": [doc, ...]}` in, `{"d": [new, ...]}` out,
@@ -422,6 +459,7 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches_batch, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_update_with, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update_batch, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection, m)?)?;
