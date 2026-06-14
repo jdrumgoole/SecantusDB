@@ -223,6 +223,27 @@ def test_sort_combined_with_limit(coll) -> None:
     assert top3 == [9, 8, 7]
 
 
+def test_return_key_replaces_docs_with_index_keys(coll) -> None:
+    """``returnKey`` returns only the keys of the index serving the query.
+    A find sorted by ``_id`` uses the ``_id`` index, so each result is just
+    ``{_id: N}`` — the other fields are stripped. With ``returnKey`` set,
+    ``showRecordId`` adds no ``$recordId``. Mirrors pymongo's
+    test_command_monitoring 'find with showRecordId and returnKey'."""
+    coll.insert_many([{"_id": i, "x": i * 10} for i in range(1, 6)])
+    cursor = coll.find({}, sort=[("_id", 1)], show_record_id=True, return_key=True)
+    got = list(cursor)
+    assert got == [{"_id": i} for i in range(1, 6)]
+
+
+def test_show_record_id_adds_record_id_field(coll) -> None:
+    """``showRecordId`` alone tags each returned doc with a ``$recordId``."""
+    coll.insert_many([{"_id": i, "x": i} for i in range(1, 4)])
+    docs = list(coll.find({}, sort=[("_id", 1)], show_record_id=True))
+    assert all("$recordId" in d for d in docs)
+    assert [d["_id"] for d in docs] == [1, 2, 3]
+    assert all(d["x"] == d["_id"] for d in docs)  # full doc retained
+
+
 def test_projection_inclusion(coll) -> None:
     coll.insert_one({"a": 1, "b": 2, "c": 3})
     doc = coll.find_one({}, {"a": 1, "c": 1})

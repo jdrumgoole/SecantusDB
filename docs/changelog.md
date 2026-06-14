@@ -19,6 +19,21 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `find` honours `returnKey` and `showRecordId`
+
+`find` now supports the `returnKey` and `showRecordId` cursor options. With
+`returnKey: true` each result is reduced to just the keys of the index that
+serves the query — the index's key-pattern fields plus the sort fields (a sort
+by `_id`, served by the document table's natural order, yields `{_id: <value>}`).
+With `showRecordId: true` each document is tagged with a `$recordId`; when
+`returnKey` is also set, `showRecordId` adds nothing, matching `mongod`. Closes
+the pymongo gauge's command-monitoring `find with showRecordId and returnKey`.
+
+#### Added
+
+- `returnKey` (project results down to the serving index's key fields) and
+  `showRecordId` (`$recordId` tag) options on the `find` command.
+
 ### `createIndexes` accepts and ignores the deprecated `dropDups` option
 
 `dropDups` was removed in MongoDB 3.0, but modern `mongod` still accepts it on
