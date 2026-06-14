@@ -19,6 +19,38 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### The Python server is pure Python — no Rust dependency — and preserves numeric types
+
+The `secantus` package no longer imports or calls any Rust component. The
+original in-process engine-swap — where each operator module could delegate to
+the optional `_secantus_core` extension under `SECANTUS_ENGINE=rust` — has been
+retired in favour of the two-separate-servers model: the Python server is the
+pure-Python implementation, end to end, and the Rust engines live only in the
+standalone Rust server (and in the parity-oracle test suites, which import the
+extension directly rather than through this package). `secantus.engine` remains
+as an inert compatibility stub so `SecantusDBServer(engine=...)` keeps working.
+
+Decoupling the engines let the Python operator engines adopt MongoDB's numeric
+type promotion (int32 < int64 < double < decimal128) without being pinned to a
+not-yet-updated Rust port. `$inc`, `$mul`, and the `$sum` accumulator now
+preserve the BSON numeric type of their result — `Int64(5)` incremented by `3`
+stays `Int64(8)` instead of narrowing to int32 on the wire — so a client codec
+that keys on the BSON 64-bit type round-trips correctly. This closes the pymongo
+gauge's `test_custom_types` aggregate/findAndModify decoder cases.
+
+#### Changed
+
+- `secantus` is now pure Python with no Rust import in the request path; the
+  `SECANTUS_ENGINE` in-process accelerator is retired (the Rust engines moved to
+  the standalone Rust server). `secantus.engine.available()` / `enabled()`
+  always report Python.
+
+#### Fixed
+
+- `$inc` / `$mul` / `$sum` preserve the BSON numeric type per mongod's promotion
+  rules (int32 < int64 < double < decimal128) via the new `secantus.numerics`
+  helpers, instead of narrowing 64-bit results to int32.
+
 ### `find` honours `returnKey` and `showRecordId`
 
 `find` now supports the `returnKey` and `showRecordId` cursor options. With

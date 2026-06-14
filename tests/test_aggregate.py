@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 import pytest
+from bson import Int64
 
 from secantus.aggregate import AggregateError, apply_pipeline
+
+
+def test_group_sum_preserves_int64_type() -> None:
+    """$sum over Int64 values stays Int64 (mongod widens int32 < int64),
+    not a bare int that narrows to int32 on the wire."""
+    out = apply_pipeline(
+        [{"q": Int64(10)}, {"q": Int64(10)}],
+        [{"$group": {"_id": None, "t": {"$sum": "$q"}}}],
+    )
+    assert out[0]["t"] == 20 and isinstance(out[0]["t"], Int64)
 
 
 def test_match_filters_docs() -> None:

@@ -7,10 +7,8 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-import bson
-
-from secantus import engine
 from secantus.expressions import evaluate
+from secantus.numerics import bson_add
 from secantus.paths import get_path, set_path, unset_path
 from secantus.query import matches
 
@@ -29,22 +27,6 @@ class AggregateError(Exception):
         super().__init__(message)
         self.code = code
         self.code_name = code_name
-
-
-# The Rust core ports the pure, composing pipeline stages (the leaf engines it
-# reuses are already Rust). It returns None — whole-pipeline fallback — for any
-# stage not ported (storage-backed $lookup/$geoNear/$out/$merge, $sample, and
-# the comparison/equality-heavy $sort/$group/$unwind/...), or any inner
-# expression that defers. Selection is process-wide via secantus.engine. Parity
-# pinned by tests/test_rust_aggregate_parity.py.
-try:
-    import _secantus_core as _rust
-except ImportError:
-    _rust = None
-
-
-def _rust_aggregate_enabled() -> bool:
-    return _rust is not None and engine.enabled("aggregate")
 
 
 @dataclass
@@ -89,27 +71,15 @@ def apply_pipeline(
 ) -> list[dict[str, Any]]:
     ctx = ctx or _NULL_CTX
     # ``$$NOW``: a Date constant for the whole pipeline execution
-    # (mongod semantics). Seeded into vars so both engines resolve it
-    # through the ordinary user-var path; never mutate the shared
-    # module-level null context.
+    # (mongod semantics). Seeded into vars so it resolves through the
+    # ordinary user-var path; never mutate the shared module-level null
+    # context.
     if "NOW" not in ctx.vars:
         now = _dt.datetime.now(_dt.timezone.utc)
         if ctx is _NULL_CTX:
             ctx = PipelineContext(vars={"NOW": now})
         else:
             ctx.vars["NOW"] = now
-    if _rust_aggregate_enabled():
-        try:
-            res = _rust.apply_pipeline(
-                bson.encode({"d": list(docs)}),
-                bson.encode({"p": list(pipeline)}),
-                bson.encode(dict(ctx.vars) if ctx.vars else {}),
-                bson.encode(dict(ctx.collation) if isinstance(ctx.collation, dict) else {}),
-            )
-        except Exception:
-            res = None
-        if res is not None:
-            return bson.decode(res)["d"]
     for stage in pipeline:
         docs = _apply_stage(stage, docs, ctx)
     return docs
@@ -760,7 +730,10 @@ def _acc_sum(
     increment = 1 if arg == 1 else evaluate(arg, doc, vars)
     if increment is None:
         increment = 0
-    bucket[field] = bucket.get(field, 0) + increment
+    # bson_add preserves the BSON numeric type (int32 < int64 < double <
+    # decimal128) so a $sum over Int64 values stays Int64 rather than
+    # narrowing to int32 on the wire.
+    bucket[field] = bson_add(bucket.get(field, 0), increment)
 
 
 def _acc_count(
