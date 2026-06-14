@@ -2277,6 +2277,42 @@ def test_oplog_rs_sort_descending_via_pymongo(client: MongoClient) -> None:
     assert rows[1]["o"]["_id"] == 1
 
 
+def test_oplog_rs_bootstrap_seed_never_empty(client: MongoClient) -> None:
+    """mongod's oplog is never empty — its first entry is the replica set's
+    "initiating set" noop. A fresh server seeds one so a client can tail
+    ``local.oplog.rs`` before any user write."""
+    oplog = client["local"]["oplog.rs"]
+    rows = list(oplog.find().sort("$natural", pymongo.ASCENDING).limit(1))
+    assert len(rows) == 1
+    assert rows[0]["op"] == "n"  # noop bootstrap entry
+    assert "ts" in rows[0]
+
+
+def test_oplog_rs_tailable_await_reads_entries(client: MongoClient) -> None:
+    """A TAILABLE_AWAIT cursor over ``local.oplog.rs`` reads entries the way
+    replication does. Mirrors pymongo's test_cursor.test_to_list_tailable:
+    take the latest ts via $natural DESC, then tail from it."""
+    db = client["oplog_tail_xd"]
+    db["c"].insert_one({"_id": 1})  # ensure at least one real op
+    oplog = client["local"]["oplog.rs"]
+    last = oplog.find().sort("$natural", pymongo.DESCENDING).limit(-1).next()
+    ts = last["ts"]
+    cur = oplog.find(
+        {"ts": {"$gte": ts}},
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+    ).max_await_time_ms(50)
+    try:
+        docs = []
+        deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+        while not docs and dt.datetime.now() < deadline:
+            docs = cur.to_list()
+        assert len(docs) >= 1
+        assert all("ts" in d for d in docs)
+    finally:
+        with contextlib.suppress(Exception):
+            cur.close()
+
+
 def test_oplog_rs_insert_rejected(client: MongoClient) -> None:
     from pymongo.errors import OperationFailure
 
