@@ -20,7 +20,8 @@
 use bson::{doc, Bson, Document};
 
 use crate::util::{
-    as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, write_error,
+    as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, resolve_let_vars,
+    write_error,
 };
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
@@ -115,24 +116,6 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         reply.insert("writeErrors", write_errors);
     }
     Ok(reply)
-}
-
-/// Resolve a command-level `let` field into query vars. Seeds `$$NOW` (a Date
-/// constant for the whole operation) then evaluates each `let` value as an
-/// aggregation expression against an empty doc (so `{n: {$add: [1, 2]}}` binds
-/// `$$n` to 3; scalars pass through). Mirrors `commands._resolve_let_vars`. A
-/// value the expression engine can't evaluate is kept raw (best-effort).
-fn resolve_let_vars(let_field: Option<&Bson>) -> Document {
-    let mut vars = Document::new();
-    vars.insert("NOW", bson::DateTime::now());
-    if let Some(Bson::Document(d)) = let_field {
-        for (name, value) in d {
-            let resolved = secantus_core::expressions::evaluate(&Document::new(), value, &vars)
-                .unwrap_or_else(|_| value.clone());
-            vars.insert(name.clone(), resolved);
-        }
-    }
-    vars
 }
 
 /// `delete` — batch delete, one entry per `{q, limit}` spec.

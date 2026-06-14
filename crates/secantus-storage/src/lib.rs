@@ -3066,7 +3066,7 @@ impl Storage {
     /// Documents matching `filter`, as BSON bytes, in `_id`-natural / index order.
     /// Convenience wrapper for `find_matching_with(.., None, None)`.
     pub fn find_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<Vec<Vec<u8>>> {
-        self.find_matching_with(db, coll, filter, None, None, None)
+        self.find_matching_with(db, coll, filter, None, None, None, &Document::new())
     }
 
     /// Documents matching `filter`, as BSON bytes, ordered per `sort` and routed
@@ -3089,6 +3089,7 @@ impl Storage {
         sort: Option<&Document>,
         hint: Option<&Hint>,
         coll_opt: Option<&Collation>,
+        vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
@@ -3159,11 +3160,11 @@ impl Storage {
         };
 
         // Decode + filter; keep the doc alongside the blob for the post-sort.
-        let vars = Document::new();
+        // `vars` carries command `let` bindings for `$expr` in the filter.
         let mut out: Vec<(Document, Vec<u8>)> = Vec::new();
         for blob in blobs {
             let d = decode_doc(&blob)?;
-            if query_matches(&d, filter, &vars, coll_opt)
+            if query_matches(&d, filter, vars, coll_opt)
                 .map_err(|_| StorageError::QueryUnsupported)?
             {
                 out.push((d, blob));

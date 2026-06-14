@@ -274,7 +274,15 @@ impl RustStorage {
             None
         };
         self.inner
-            .find_matching_with(db, coll, &filter, sort.as_ref(), hint.as_ref(), None)
+            .find_matching_with(
+                db,
+                coll,
+                &filter,
+                sort.as_ref(),
+                hint.as_ref(),
+                None,
+                &Document::new(),
+            )
             .map(|docs| doc_list(py, docs))
             .map_err(to_pyerr)
     }

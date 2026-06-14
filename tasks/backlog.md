@@ -395,9 +395,17 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   **Deferred:** collection-*default* collation (needs `get_collection_options`);
   `$elemMatch` sub-query collation (matcher passes `None`); per-index-collation
   IXSCAN.
+- [x] **`let` on reads (find / aggregate / findAndModify / distinct path).**
+  `find_matching_with` gained a `vars` arg → threaded into the query matcher;
+  the trait's `find_collated` gained a `let_vars` param (default ignores → fakes
+  unaffected), routed by the WT adapter. Handlers resolve `let` via the shared
+  `util::resolve_let_vars` (seeds `$$NOW`, evaluates each value) — this also
+  fixed `aggregate`, which had passed the *raw* (un-evaluated) `let` doc as vars.
+  findAndModify threads `let`+`collation` into its match (upsert-no-match `let`
+  still deferred). **+7 gauge (`test_crud_unified` 275→282).**
 - [ ] **`find` edges** — up-front empty-collection filter validation (needs the
   query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
-  capped-collection poll; `let`. (Tracked in `find.rs` module docs.)
+  capped-collection poll. (Tracked in `find.rs` module docs.)
 - [x] **R2c — `update` command.** Document-, replacement-, and pipeline-form `u`
   all apply; positional operators + `arrayFilters` + `let` + `collation` done;
   sort-rejection (9) + pipeline-stage validation (9 / 168) pre-checks done.

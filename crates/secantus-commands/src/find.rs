@@ -16,15 +16,17 @@
 //! * `tailable: true` (capped-collection poll) — needs the tailable cursor
 //!   machinery + `collection_is_capped`; rejected here as unsupported (capped
 //!   collections aren't creatable through the ported handlers yet anyway).
-//! * `let` (the Rust `find` seam takes none yet). `collation` IS applied —
-//!   filter matching + sort order are collation-aware (COLLSCAN-forced); a
-//!   non-ASCII / numericOrdering collation surfaces as `BadValue`.
+//! * `let` IS applied — command `let` vars (`$$NOW` + evaluated values) are
+//!   visible to `$expr` in the filter, threaded through `find_collated`.
+//!   `collation` IS applied — filter matching + sort order are collation-aware
+//!   (COLLSCAN-forced); a non-ASCII / numericOrdering collation → `BadValue`.
 
 use bson::{doc, Bson, Document};
 
 use crate::cursors::CursorRegistry;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
+    resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
@@ -45,6 +47,8 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .filter(|d| !d.is_empty());
     let hint = doc.get("hint");
     let collation = collation_of(doc);
+    // Command `let` → vars visible to `$expr` in the filter.
+    let let_vars = resolve_let_vars(doc.get("let"));
     // `batchSize` is tri-state: absent ⇒ default, 0 ⇒ empty firstBatch + cursor,
     // explicit positive ⇒ that size.
     let batch_size = match doc.get("batchSize") {
@@ -63,7 +67,15 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let mut docs = storage
-        .find_collated(&ctx.db_name, &coll, &filter, sort, hint, collation.as_ref())
+        .find_collated(
+            &ctx.db_name,
+            &coll,
+            &filter,
+            sort,
+            hint,
+            collation.as_ref(),
+            &let_vars,
+        )
         .map_err(command_error)?;
 
     // skip / limit applied after the sorted fetch (the storage returns the full

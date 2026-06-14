@@ -325,10 +325,12 @@ pub trait Storage: Send + Sync {
         hint: Option<RawHint<'_>>,
     ) -> Result<Vec<Vec<u8>>, StorageError>;
 
-    /// `find` with a `collation` applied to filter comparison + sort order. The
-    /// default forwards to `find` (ignoring collation) so fakes are unaffected;
-    /// the WiredTiger adapter routes to the collation-aware storage path (forcing
-    /// a COLLSCAN + collation-folded in-memory sort). `None` = the default path.
+    /// `find` with a `collation` applied to filter comparison + sort order, plus
+    /// `let_vars` (command `let`) visible to `$expr` in the filter. The default
+    /// forwards to `find` (ignoring both) so fakes are unaffected; the WiredTiger
+    /// adapter routes to the collation-/let-aware storage path (collation forces a
+    /// COLLSCAN + collation-folded in-memory sort). `None` collation = default.
+    #[allow(clippy::too_many_arguments)]
     fn find_collated(
         &self,
         db: &str,
@@ -337,6 +339,7 @@ pub trait Storage: Send + Sync {
         sort: Option<&Document>,
         hint: Option<RawHint<'_>>,
         _collation: Option<&Collation>,
+        _let_vars: &Document,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         self.find(db, coll, filter, sort, hint)
     }

@@ -326,7 +326,15 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         let resolved = hint.map(to_hint);
         self.inner
-            .find_matching_with(db, coll, filter, sort, resolved.as_ref(), None)
+            .find_matching_with(
+                db,
+                coll,
+                filter,
+                sort,
+                resolved.as_ref(),
+                None,
+                &Document::new(),
+            )
             .map_err(map_err)
     }
 
@@ -339,10 +347,19 @@ impl CmdStorage for StorageAdapter {
         sort: Option<&Document>,
         hint: Option<RawHint<'_>>,
         collation: Option<&Collation>,
+        let_vars: &Document,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         let resolved = hint.map(to_hint);
         self.inner
-            .find_matching_with(db, coll, filter, sort, resolved.as_ref(), collation)
+            .find_matching_with(
+                db,
+                coll,
+                filter,
+                sort,
+                resolved.as_ref(),
+                collation,
+                let_vars,
+            )
             .map_err(map_err)
     }
 

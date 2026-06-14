@@ -10,13 +10,16 @@
 //! writer could interleave. Acceptable for the single-node test surrogate;
 //! tracked for a future find-and-modify storage primitive.
 //!
-//! **Deferred:** `arrayFilters`, `let`, `collation`, `bypassDocumentValidation` /
-//! collection `validator` (none are in the `update_matching` seam yet);
-//! `writeConcern`; `_reject_oplog_rs_write`.
+//! `let` (`$expr` in `query`) + `collation` apply to the match (via
+//! `find_collated`); the update/delete is keyed by the matched `_id`.
+//!
+//! **Deferred:** `arrayFilters`; `bypassDocumentValidation` / collection
+//! `validator`; `let` on the no-match `upsert` path (still plain
+//! `update_matching`); `writeConcern`; `_reject_oplog_rs_write`.
 
 use bson::{doc, Bson, Document};
 
-use crate::util::{command_error, doc_field};
+use crate::util::{collation_of, command_error, doc_field, resolve_let_vars};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `findAndModify` / `findandmodify`.
@@ -61,10 +64,22 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     }
 
     let storage = ctx.storage()?;
+    // Command `let` (visible to `$expr` in `query`) + `collation` apply to the
+    // match. The subsequent update/delete is keyed by the matched doc's `_id`.
+    let let_vars = resolve_let_vars(doc.get("let"));
+    let collation = collation_of(doc);
 
     // Find the target (first match in sort order).
     let candidates = storage
-        .find(&ctx.db_name, &coll, &query, sort, None)
+        .find_collated(
+            &ctx.db_name,
+            &coll,
+            &query,
+            sort,
+            None,
+            collation.as_ref(),
+            &let_vars,
+        )
         .map_err(command_error)?;
     let matched = candidates.into_iter().next();
 

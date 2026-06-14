@@ -39,7 +39,9 @@
 use bson::{doc, Bson, Document};
 
 use crate::find::split_into_cursor;
-use crate::util::{as_i64, collation_of, command_error, decode_docs, docs_to_bson, encode_docs};
+use crate::util::{
+    as_i64, collation_of, command_error, decode_docs, docs_to_bson, encode_docs, resolve_let_vars,
+};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
 
@@ -78,11 +80,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64);
-    let vars: Document = doc
-        .get("let")
-        .and_then(Bson::as_document)
-        .cloned()
-        .unwrap_or_default();
+    // Command `let` → resolved query vars ($$NOW seeded, values evaluated),
+    // visible to `$expr` in `$match` and to pipeline expressions.
+    let vars = resolve_let_vars(doc.get("let"));
     let collation = collation_of(doc);
 
     // Fetch the input documents + decide the remaining pipeline.
@@ -97,7 +97,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // pipeline so we don't apply it twice.
                 let (filter, rest) = lift_leading_match(&pipeline);
                 let bytes = storage
-                    .find_collated(&ctx.db_name, c, &filter, None, hint, collation.as_ref())
+                    .find_collated(
+                        &ctx.db_name,
+                        c,
+                        &filter,
+                        None,
+                        hint,
+                        collation.as_ref(),
+                        &vars,
+                    )
                     .map_err(command_error)?;
                 (ns, decode_docs(bytes)?, rest)
             }

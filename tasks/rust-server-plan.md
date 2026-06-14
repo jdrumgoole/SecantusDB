@@ -228,10 +228,13 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       (parses per-statement `arrayFilters`). Parity suite extended (the
       `apply_update_with` binding + 11 arrayFilters cases stay byte-pinned to
       Python).
-    - **`let` ✅ DONE** (update + delete) — `resolve_let_vars` seeds `$$NOW` +
-      evaluates each `let` value (mirrors `commands._resolve_let_vars`), threaded
-      as query vars through the storage matcher via `update_matching_array_filters`
-      / `update_matching_pipeline` / the new `delete_matching_with_let`.
+    - **`let` ✅ DONE** (update + delete + **find / aggregate / findAndModify**) —
+      `resolve_let_vars` (in `util`) seeds `$$NOW` + evaluates each `let` value
+      (mirrors `commands._resolve_let_vars`), threaded as query vars through the
+      storage matcher: writes via `update_matching_array_filters` /
+      `update_matching_pipeline` / `delete_matching_with_let`; reads via
+      `find_matching_with`'s new `vars` arg + the trait's `find_collated`
+      `let_vars`. (Also fixed `aggregate`, which had passed the raw `let` doc.)
     - **`collation` ✅ DONE (server-wide, COLLSCAN-correct)** — a command
       `collation` threads through `find` / `count` / `distinct` / `aggregate`
       (`$match` + `$sort` + lifted fetch) / `update` / `delete`. The storage

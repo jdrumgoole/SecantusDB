@@ -28,7 +28,15 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let collation = collation_of(doc);
     let storage = ctx.storage()?;
     let bytes = storage
-        .find_collated(&ctx.db_name, &coll, &filter, None, None, collation.as_ref())
+        .find_collated(
+            &ctx.db_name,
+            &coll,
+            &filter,
+            None,
+            None,
+            collation.as_ref(),
+            &Document::new(),
+        )
         .map_err(command_error)?;
 
     let mut values: Vec<Bson> = Vec::new();
