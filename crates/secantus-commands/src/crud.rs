@@ -10,15 +10,18 @@
 //! * Collection `validator` / `bypassDocumentValidation` (needs
 //!   `get_collection_options` + the query engine on the write path).
 //! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
-//! * `let`, `collation` on `update`; `let` / `collation` on `delete`;
-//!   view-collection `count` — none are in the Rust storage seam yet (see each
-//!   handler's doc + backlog §7). Pipeline-form `u` applies via
+//! * view-collection `count`, `validator` / `bypassDocumentValidation` — not in
+//!   the Rust storage seam yet (see backlog §7). Pipeline-form `u` applies via
 //!   `Storage::update_matching_pipeline`; positional operators (`$` / `$[]` /
-//!   `$[ident]`) + `arrayFilters` via `Storage::update_matching_array_filters`.
+//!   `$[ident]`) + `arrayFilters` via `Storage::update_matching_array_filters`;
+//!   `let` + `collation` thread through update / delete / count (collation forces
+//!   a COLLSCAN; non-ASCII / numericOrdering collation → `BadValue`).
 
 use bson::{doc, Bson, Document};
 
-use crate::util::{as_i64, bool_field, coll_arg, command_error, doc_field, write_error};
+use crate::util::{
+    as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, write_error,
+};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `insert` — batch document insert.
@@ -146,10 +149,19 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     for (index, spec) in deletes.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
         let filter = doc_field(spec, "q");
+        // `collation` is per-delete-statement (inside each `deletes[]` entry).
+        let collation = collation_of(spec);
         // `limit: 0` ⇒ delete all matches; any positive value ⇒ at most that
         // many (mongod only defines 0 and 1, but we honour the integer).
         let limit = spec.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize;
-        match storage.delete_matching_with_let(&ctx.db_name, &coll, &filter, limit, &let_vars) {
+        match storage.delete_matching_with_let(
+            &ctx.db_name,
+            &coll,
+            &filter,
+            limit,
+            &let_vars,
+            collation.as_ref(),
+        ) {
             Ok(deleted) => n += deleted as i32,
             Err(StorageError::Internal(msg)) => {
                 return Ok(CommandError::new(1, "InternalError", msg).into_reply())
@@ -176,9 +188,10 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "count")?;
     let storage = ctx.storage()?;
     let filter = doc_field(doc, "query");
+    let collation = collation_of(doc);
 
     let mut n = storage
-        .count_matching(&ctx.db_name, &coll, &filter)
+        .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
         .map_err(command_error)? as i64;
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0);
     if skip > 0 {
@@ -211,11 +224,11 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
 ///
 /// Positional update operators (`$` / `$[]` / `$[ident]`) + `arrayFilters` apply
 /// via `Storage::update_matching_array_filters` (`$` resolved from the query
-/// filter, `$[ident]` from the per-statement `arrayFilters`).
+/// filter, `$[ident]` from the per-statement `arrayFilters`); `let` + `collation`
+/// thread through (collation forces a COLLSCAN match).
 ///
-/// **Deferred (tracked in backlog §7):** `let`, `collation`, `validator`,
-/// `writeConcern`, `_reject_oplog_rs_write` (none are in the Rust
-/// `update_matching` seam yet).
+/// **Deferred (tracked in backlog §7):** `validator`, `writeConcern`,
+/// `_reject_oplog_rs_write` (none are in the Rust `update_matching` seam yet).
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
@@ -246,6 +259,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply());
         }
 
+        // `collation` is per-update-statement (inside each `updates[]` entry),
+        // not a command-level field — collation-aware filter matching (COLLSCAN).
+        let collation = collation_of(spec);
         let q = doc_field(spec, "q");
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
@@ -285,6 +301,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 multi,
                 upsert,
                 &let_vars,
+                collation.as_ref(),
             )
         } else {
             let u = doc_field(spec, "u");
@@ -305,6 +322,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 upsert,
                 &array_filters,
                 &let_vars,
+                collation.as_ref(),
             )
         };
 
@@ -503,6 +521,7 @@ mod tests {
             multi: bool,
             _upsert: bool,
             _let_vars: &Document,
+            _collation: Option<&crate::storage::Collation>,
         ) -> Result<UpdateOutcome, StorageError> {
             // Apply the pipeline to each matched doc (the real storage path).
             let mut cols = self.cols.lock().unwrap();

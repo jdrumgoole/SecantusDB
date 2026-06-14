@@ -232,8 +232,17 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       evaluates each `let` value (mirrors `commands._resolve_let_vars`), threaded
       as query vars through the storage matcher via `update_matching_array_filters`
       / `update_matching_pipeline` / the new `delete_matching_with_let`.
-    - **Still deferred (backlog §7):** `collation` (own server-wide
-      COLLSCAN-correct slice) / `validator` / `writeConcern`.
+    - **`collation` ✅ DONE (server-wide, COLLSCAN-correct)** — a command
+      `collation` threads through `find` / `count` / `distinct` / `aggregate`
+      (`$match` + `$sort` + lifted fetch) / `update` / `delete`. The storage
+      query methods take a collation and **force a COLLSCAN** when one is active
+      (the byte-sortable indexes are collation-naive) + a collation-folded
+      in-memory sort. Trait seam: additive `find_collated` / `count_collated`
+      (default → uncollated) + collation params on the update/delete
+      option-methods. Non-ASCII / `numericOrdering` collation → `BadValue`.
+      Deferred: collection-default collation, `$elemMatch` sub-query collation,
+      per-index-collation IXSCAN.
+    - **Still deferred (backlog §7):** `validator` / `writeConcern`.
   - **`aggregate` ✅ DONE** (`secantus-commands::aggregate`, post-merge of PR #31)
     — port of `_aggregate`'s storage-independent path: fetch input via the
     `Storage` trait's `find` (lifting a leading `$match` into the fetch filter +

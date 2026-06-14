@@ -29,6 +29,7 @@ use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use s2::rect::Rect;
 use s2::region::RegionCoverer;
+use secantus_core::collation::Collation;
 use secantus_core::diff::compute_update_description;
 use secantus_core::get_path;
 use secantus_core::query::matches as query_matches;
@@ -698,11 +699,17 @@ fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
 /// The byte-sortable compound key for `doc` under a sort `spec` — the same
 /// encoding the index walk produces, so the COLLSCAN post-sort yields mongod's
 /// cross-type order consistent with the accelerated path.
-fn sort_key(doc: &Document, spec: &[(String, i32)]) -> Result<Vec<u8>> {
+fn sort_key(doc: &Document, spec: &[(String, i32)], coll: Option<&Collation>) -> Result<Vec<u8>> {
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
         let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
-        parts.push(enc_dir(&v, *d)?);
+        // Collation-aware sort: a strength/caseLevel collation folds string keys
+        // before encoding. A collation the encoder can't reproduce (non-ASCII /
+        // numericOrdering) surfaces as UnsupportedValue → command BadValue.
+        parts.push(
+            sortkey::encode_value_directed(&v, *d, coll)
+                .map_err(|_| StorageError::UnsupportedValue)?,
+        );
     }
     Ok(compound_join(&parts))
 }
@@ -3059,7 +3066,7 @@ impl Storage {
     /// Documents matching `filter`, as BSON bytes, in `_id`-natural / index order.
     /// Convenience wrapper for `find_matching_with(.., None, None)`.
     pub fn find_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<Vec<Vec<u8>>> {
-        self.find_matching_with(db, coll, filter, None, None)
+        self.find_matching_with(db, coll, filter, None, None, None)
     }
 
     /// Documents matching `filter`, as BSON bytes, ordered per `sort` and routed
@@ -3073,6 +3080,7 @@ impl Storage {
     /// cross-type order). `hint` forces an index / `$natural` scan. Mirrors
     /// `storage.find_matching` (skip / limit / projection stay in the command
     /// layer).
+    #[allow(clippy::too_many_arguments)]
     pub fn find_matching_with(
         &self,
         db: &str,
@@ -3080,13 +3088,21 @@ impl Storage {
         filter: &Document,
         sort: Option<&Document>,
         hint: Option<&Hint>,
+        coll_opt: Option<&Collation>,
     ) -> Result<Vec<Vec<u8>>> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
         let mut in_sort_order = false;
+        // A collation makes the byte-sortable indexes (collation-naive) unsafe for
+        // both filtering and sort-order, so force a collection scan + in-memory
+        // collation-aware match/sort. (Per-index-collation IXSCAN is a later
+        // optimisation.)
+        let force_collscan = coll_opt.is_some();
 
-        let blobs: Vec<Vec<u8>> = if let Some(h) = hint {
+        let blobs: Vec<Vec<u8>> = if force_collscan {
+            self.scan_blobs(&session, db, coll)?
+        } else if let Some(h) = hint {
             let resolved = self.resolve_hint(&session, db, coll, h)?;
             let (cands, ord) =
                 self.candidates_from_hint(&session, db, coll, &resolved, sort_field, sort_dir)?;
@@ -3147,16 +3163,19 @@ impl Storage {
         let mut out: Vec<(Document, Vec<u8>)> = Vec::new();
         for blob in blobs {
             let d = decode_doc(&blob)?;
-            if query_matches(&d, filter, &vars, None).map_err(|_| StorageError::QueryUnsupported)? {
+            if query_matches(&d, filter, &vars, coll_opt)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
                 out.push((d, blob));
             }
         }
         if !in_sort_order {
             if let Some(spec) = multi_sort_spec(sort) {
-                // Decorate-sort-undecorate on the byte-sortable compound key.
+                // Decorate-sort-undecorate on the byte-sortable compound key
+                // (collation-folded when a collation is active).
                 let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(out.len());
                 for (d, blob) in out {
-                    keyed.push((sort_key(&d, &spec)?, blob));
+                    keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
                 }
                 keyed.sort_by(|a, b| a.0.cmp(&b.0));
                 return Ok(keyed.into_iter().map(|(_, b)| b).collect());
@@ -3176,8 +3195,11 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
+        force_scan: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        if filter.is_empty() {
+        // `force_scan` (a collation is active) bypasses the collation-naive
+        // indexes for a full collection scan + in-memory collation matching.
+        if filter.is_empty() || force_scan {
             return self.scan_docs(session, db, coll);
         }
         if let Some(id_keys) = self.try_index_id_keys(session, db, coll, filter)? {
@@ -3205,7 +3227,13 @@ impl Storage {
     /// Count documents matching `filter` (the whole collection when empty).
     /// Mirrors `storage.count_matching` (base form — `let` / `collation` route
     /// to Python at the engine-selection layer).
-    pub fn count_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<usize> {
+    pub fn count_matching(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<usize> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         if filter.is_empty() {
@@ -3213,9 +3241,11 @@ impl Storage {
         }
         let vars = Document::new();
         let mut n = 0usize;
-        for (_id_k, blob) in self.candidate_docs(&session, db, coll, filter)? {
+        for (_id_k, blob) in self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())? {
             let d = decode_doc(&blob)?;
-            if query_matches(&d, filter, &vars, None).map_err(|_| StorageError::QueryUnsupported)? {
+            if query_matches(&d, filter, &vars, coll_opt)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
                 n += 1;
             }
         }
@@ -3241,19 +3271,22 @@ impl Storage {
         upsert: bool,
         array_filters: &[Document],
         let_vars: &Document,
+        coll_opt: Option<&Collation>,
     ) -> Result<UpdateOutcome> {
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
         // doc in `o`, an operator update a `{$v:2, diff}`. Positional operators
         // resolve per matched doc — `$` from the query filter
         // (`find_positional_matches`), `$[]`/`$[ident]` from `array_filters`.
-        // `let_vars` are visible to `$expr` in the filter (command `let`).
+        // `let_vars` are visible to `$expr` in the filter (command `let`);
+        // `coll_opt` forces a collation-aware COLLSCAN match.
         let is_replacement = !update.keys().any(|k| k.starts_with('$'));
         self.update_matching_core(
             db,
             coll,
             filter,
             let_vars,
+            coll_opt,
             multi,
             upsert,
             is_replacement,
@@ -3272,6 +3305,7 @@ impl Storage {
     /// oplog (`is_replacement = false`) so change streams report
     /// `operationType: "update"` — mirrors `storage.update_matching`'s list branch.
     /// On upsert with no match, the pipeline runs over the filter-seeded doc.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_matching_pipeline(
         &self,
         db: &str,
@@ -3281,12 +3315,14 @@ impl Storage {
         multi: bool,
         upsert: bool,
         let_vars: &Document,
+        coll_opt: Option<&Collation>,
     ) -> Result<UpdateOutcome> {
         self.update_matching_core(
             db,
             coll,
             filter,
             let_vars,
+            coll_opt,
             multi,
             upsert,
             false,
@@ -3307,13 +3343,13 @@ impl Storage {
     /// operator/replacement form and the pipeline form. `transform(doc, is_upsert)`
     /// produces the new doc; `is_replacement` selects the oplog `o` shape.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn update_matching_core(
         &self,
         db: &str,
         coll: &str,
         filter: &Document,
         vars: &Document,
+        coll_opt: Option<&Collation>,
         multi: bool,
         upsert: bool,
         is_replacement: bool,
@@ -3337,10 +3373,10 @@ impl Storage {
         let mut oplog_entries: Vec<Document> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
 
-        let candidates = self.candidate_docs(&session, db, coll, filter)?;
+        let candidates = self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
         for (id_k, blob) in candidates {
             let doc = decode_doc(&blob)?;
-            if !query_matches(&doc, filter, vars, None)
+            if !query_matches(&doc, filter, vars, coll_opt)
                 .map_err(|_| StorageError::QueryUnsupported)?
             {
                 continue;
@@ -3460,6 +3496,7 @@ impl Storage {
         filter: &Document,
         limit: usize,
         let_vars: &Document,
+        coll_opt: Option<&Collation>,
     ) -> Result<usize> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
@@ -3480,10 +3517,10 @@ impl Storage {
         let mut deleted = 0usize;
         let mut oplog_entries: Vec<Document> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
-        let candidates = self.candidate_docs(&session, db, coll, filter)?;
+        let candidates = self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
         for (id_k, blob) in candidates {
             let doc = decode_doc(&blob)?;
-            if !query_matches(&doc, filter, let_vars, None)
+            if !query_matches(&doc, filter, let_vars, coll_opt)
                 .map_err(|_| StorageError::QueryUnsupported)?
             {
                 continue;

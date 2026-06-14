@@ -274,7 +274,7 @@ impl RustStorage {
             None
         };
         self.inner
-            .find_matching_with(db, coll, &filter, sort.as_ref(), hint.as_ref())
+            .find_matching_with(db, coll, &filter, sort.as_ref(), hint.as_ref(), None)
             .map(|docs| doc_list(py, docs))
             .map_err(to_pyerr)
     }
@@ -300,7 +300,7 @@ impl RustStorage {
     fn count_matching(&self, db: &str, coll: &str, filter_bytes: &[u8]) -> PyResult<usize> {
         let filter = decode_doc(filter_bytes)?;
         self.inner
-            .count_matching(db, coll, &filter)
+            .count_matching(db, coll, &filter, None)
             .map_err(to_pyerr)
     }
 
@@ -330,6 +330,7 @@ impl RustStorage {
                 upsert,
                 &[],
                 &Document::new(),
+                None,
             )
             .map_err(to_pyerr)?;
         let mut d = Document::new();
@@ -352,7 +353,7 @@ impl RustStorage {
     ) -> PyResult<usize> {
         let filter = decode_doc(filter_bytes)?;
         self.inner
-            .delete_matching(db, coll, &filter, limit, &Document::new())
+            .delete_matching(db, coll, &filter, limit, &Document::new(), None)
             .map_err(to_pyerr)
     }
 

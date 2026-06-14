@@ -5,6 +5,16 @@ use bson::{doc, Bson, Document};
 
 use crate::{CommandError, StorageError};
 
+/// Parse a command's `collation` sub-document into a [`Collation`]. Returns
+/// `None` when absent or empty (`{}` / `{locale: "simple"}` → no collation). A
+/// collation the engine can't reproduce (non-ASCII / numericOrdering) still
+/// parses here but surfaces as a `BadValue` at query time when it hits real data.
+pub(crate) fn collation_of(doc: &Document) -> Option<secantus_core::collation::Collation> {
+    doc.get("collation")
+        .and_then(Bson::as_document)
+        .and_then(secantus_core::collation::parse)
+}
+
 /// The collection name from a string-valued command field (`doc[cmd]`).
 pub(crate) fn coll_arg(doc: &Document, cmd: &str) -> Result<String, CommandError> {
     match doc.get(cmd) {

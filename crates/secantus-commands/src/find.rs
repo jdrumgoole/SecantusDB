@@ -16,12 +16,16 @@
 //! * `tailable: true` (capped-collection poll) — needs the tailable cursor
 //!   machinery + `collection_is_capped`; rejected here as unsupported (capped
 //!   collections aren't creatable through the ported handlers yet anyway).
-//! * `let` / `collation` (the Rust `find` seam takes neither yet).
+//! * `let` (the Rust `find` seam takes none yet). `collation` IS applied —
+//!   filter matching + sort order are collation-aware (COLLSCAN-forced); a
+//!   non-ASCII / numericOrdering collation surfaces as `BadValue`.
 
 use bson::{doc, Bson, Document};
 
 use crate::cursors::CursorRegistry;
-use crate::util::{as_i64, bool_field, coll_arg, command_error, doc_field, docs_to_bson};
+use crate::util::{
+    as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
+};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
 /// `find` — run a query and open a cursor over the results.
@@ -40,6 +44,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
     let hint = doc.get("hint");
+    let collation = collation_of(doc);
     // `batchSize` is tri-state: absent ⇒ default, 0 ⇒ empty firstBatch + cursor,
     // explicit positive ⇒ that size.
     let batch_size = match doc.get("batchSize") {
@@ -58,7 +63,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let mut docs = storage
-        .find(&ctx.db_name, &coll, &filter, sort, hint)
+        .find_collated(&ctx.db_name, &coll, &filter, sort, hint, collation.as_ref())
         .map_err(command_error)?;
 
     // skip / limit applied after the sorted fetch (the storage returns the full

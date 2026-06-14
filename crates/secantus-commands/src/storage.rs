@@ -13,6 +13,9 @@
 //! `delete_matching` / `count_matching`).
 
 use bson::{Bson, Document};
+// Re-exported so trait implementors (the WT adapter) can name the collation type
+// without a direct `secantus-core` dependency.
+pub use secantus_core::collation::Collation;
 
 /// A query hint at the command seam: the raw `hint` value (a string index name,
 /// a key-spec document, or a sentinel like `"$natural"` / `"_id_"`). The adapter
@@ -230,6 +233,7 @@ pub trait Storage: Send + Sync {
         upsert: bool,
         _array_filters: &[Document],
         _let_vars: &Document,
+        _collation: Option<&Collation>,
     ) -> Result<UpdateOutcome, StorageError> {
         self.update_matching(db, coll, filter, update, multi, upsert)
     }
@@ -250,6 +254,7 @@ pub trait Storage: Send + Sync {
         _multi: bool,
         _upsert: bool,
         _let_vars: &Document,
+        _collation: Option<&Collation>,
     ) -> Result<UpdateOutcome, StorageError> {
         Err(StorageError::WriteError {
             code: 2,
@@ -270,6 +275,7 @@ pub trait Storage: Send + Sync {
     /// The default forwards to `delete_matching` (ignoring `let_vars`) so fakes
     /// are unaffected; the WiredTiger adapter routes to the let-aware
     /// `Storage::delete_matching`.
+    #[allow(clippy::too_many_arguments)]
     fn delete_matching_with_let(
         &self,
         db: &str,
@@ -277,6 +283,7 @@ pub trait Storage: Send + Sync {
         filter: &Document,
         limit: usize,
         _let_vars: &Document,
+        _collation: Option<&Collation>,
     ) -> Result<usize, StorageError> {
         self.delete_matching(db, coll, filter, limit)
     }
@@ -288,6 +295,20 @@ pub trait Storage: Send + Sync {
         coll: &str,
         filter: &Document,
     ) -> Result<usize, StorageError>;
+
+    /// Count with a `collation` applied to string comparison. The default
+    /// forwards to `count_matching` (ignoring collation) so fakes are unaffected;
+    /// the WiredTiger adapter routes to the collation-aware storage path
+    /// (forcing a COLLSCAN). `None` collation = the default path.
+    fn count_collated(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        _collation: Option<&Collation>,
+    ) -> Result<usize, StorageError> {
+        self.count_matching(db, coll, filter)
+    }
 
     /// All documents matching `filter`, in `sort` order (or natural order when
     /// `sort` is `None`), optionally index-`hint`ed. Mirrors
@@ -303,6 +324,22 @@ pub trait Storage: Send + Sync {
         sort: Option<&Document>,
         hint: Option<RawHint<'_>>,
     ) -> Result<Vec<Vec<u8>>, StorageError>;
+
+    /// `find` with a `collation` applied to filter comparison + sort order. The
+    /// default forwards to `find` (ignoring collation) so fakes are unaffected;
+    /// the WiredTiger adapter routes to the collation-aware storage path (forcing
+    /// a COLLSCAN + collation-folded in-memory sort). `None` = the default path.
+    fn find_collated(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        hint: Option<RawHint<'_>>,
+        _collation: Option<&Collation>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.find(db, coll, filter, sort, hint)
+    }
 
     // --- DDL / introspection ------------------------------------------------
     //

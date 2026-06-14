@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use bson::{Bson, Document};
 use secantus_commands::storage::{
-    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, DuplicateKey, RawHint,
+    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, RawHint,
     Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
@@ -197,6 +197,7 @@ impl CmdStorage for StorageAdapter {
                 upsert,
                 &[],
                 &Document::new(),
+                None,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -217,6 +218,7 @@ impl CmdStorage for StorageAdapter {
         upsert: bool,
         array_filters: &[Document],
         let_vars: &Document,
+        collation: Option<&Collation>,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
@@ -229,6 +231,7 @@ impl CmdStorage for StorageAdapter {
                 upsert,
                 array_filters,
                 let_vars,
+                collation,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -238,6 +241,7 @@ impl CmdStorage for StorageAdapter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_matching_pipeline(
         &self,
         db: &str,
@@ -247,10 +251,13 @@ impl CmdStorage for StorageAdapter {
         multi: bool,
         upsert: bool,
         let_vars: &Document,
+        collation: Option<&Collation>,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
-            .update_matching_pipeline(db, coll, filter, pipeline, multi, upsert, let_vars)
+            .update_matching_pipeline(
+                db, coll, filter, pipeline, multi, upsert, let_vars, collation,
+            )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
             matched: o.matched,
@@ -267,10 +274,11 @@ impl CmdStorage for StorageAdapter {
         limit: usize,
     ) -> Result<usize, StorageError> {
         self.inner
-            .delete_matching(db, coll, filter, limit, &Document::new())
+            .delete_matching(db, coll, filter, limit, &Document::new(), None)
             .map_err(map_err)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn delete_matching_with_let(
         &self,
         db: &str,
@@ -278,9 +286,10 @@ impl CmdStorage for StorageAdapter {
         filter: &Document,
         limit: usize,
         let_vars: &Document,
+        collation: Option<&Collation>,
     ) -> Result<usize, StorageError> {
         self.inner
-            .delete_matching(db, coll, filter, limit, let_vars)
+            .delete_matching(db, coll, filter, limit, let_vars, collation)
             .map_err(map_err)
     }
 
@@ -290,7 +299,21 @@ impl CmdStorage for StorageAdapter {
         coll: &str,
         filter: &Document,
     ) -> Result<usize, StorageError> {
-        self.inner.count_matching(db, coll, filter).map_err(map_err)
+        self.inner
+            .count_matching(db, coll, filter, None)
+            .map_err(map_err)
+    }
+
+    fn count_collated(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        collation: Option<&Collation>,
+    ) -> Result<usize, StorageError> {
+        self.inner
+            .count_matching(db, coll, filter, collation)
+            .map_err(map_err)
     }
 
     fn find(
@@ -303,7 +326,23 @@ impl CmdStorage for StorageAdapter {
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         let resolved = hint.map(to_hint);
         self.inner
-            .find_matching_with(db, coll, filter, sort, resolved.as_ref())
+            .find_matching_with(db, coll, filter, sort, resolved.as_ref(), None)
+            .map_err(map_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_collated(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        hint: Option<RawHint<'_>>,
+        collation: Option<&Collation>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let resolved = hint.map(to_hint);
+        self.inner
+            .find_matching_with(db, coll, filter, sort, resolved.as_ref(), collation)
             .map_err(map_err)
     }
 

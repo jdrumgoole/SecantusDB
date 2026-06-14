@@ -376,21 +376,39 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   and evaluates each `let` value, threaded as query vars through
   `update_matching_array_filters` / `update_matching_pipeline` /
   `delete_matching_with_let` → the storage query matcher. **Still deferred:**
-  `collation` (its own server-wide COLLSCAN-correct slice) / `validator`.
+  `validator`.
+- [x] **Collation server-wide (COLLSCAN-correct).** A command `collation` is
+  parsed (`util::collation_of` → `secantus_core::collation::parse`) and threaded
+  through `find` / `count` / `distinct` / `aggregate` (`$match` + `$sort` + lifted
+  fetch) / `update` / `delete`. `secantus-storage::find_matching_with` /
+  `count_matching` / `update_matching` / `delete_matching` take a collation and
+  **force a COLLSCAN** when one is active (the byte-sortable indexes are
+  collation-naive) + a collation-folded in-memory sort (`sort_key` →
+  `encode_value_directed` with collation); the query matcher already honoured
+  collation. Trait seam: additive `find_collated` / `count_collated` (default →
+  uncollated) + collation params on the update/delete option-methods (defaults
+  ignore → fakes unaffected); WT adapter routes. **Conservative:** any collation
+  forces COLLSCAN (per-index-collation IXSCAN is a later optimisation — explain
+  reports COLLSCAN under collation). Non-ASCII / `numericOrdering` collation →
+  `BadValue` (the core engine defers; no Python fallback on the Rust server).
+  **Deferred:** collection-*default* collation (needs `get_collection_options`);
+  `$elemMatch` sub-query collation (matcher passes `None`); per-index-collation
+  IXSCAN.
 - [ ] **`find` edges** — up-front empty-collection filter validation (needs the
   query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
-  capped-collection poll; `let` / `collation`. (Tracked in `find.rs` module docs.)
+  capped-collection poll; `let`. (Tracked in `find.rs` module docs.)
 - [x] **R2c — `update` command.** Document-, replacement-, and pipeline-form `u`
-  all apply; positional operators + `arrayFilters` done; sort-rejection (9) +
-  pipeline-stage validation (9 / 168) pre-checks done. `let` / `collation` /
+  all apply; positional operators + `arrayFilters` + `let` + `collation` done;
+  sort-rejection (9) + pipeline-stage validation (9 / 168) pre-checks done.
   `validator` still deferred (see "update options" above).
 - [ ] **`find` command** — lands with R3 (cursor registry) + `secantus-core`
   projection; first-batch + `getMore`/`killCursors`.
 - [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
   validation + `writeConcernError` attachment; collection `validator` /
   `bypassDocumentValidation` (needs `get_collection_options` + the query engine);
-  `_reject_oplog_rs_write`; `let` / `collation` on `delete`; view-collection
-  `count` (needs the aggregation engine). All tracked in `crud.rs`'s module docs.
+  `_reject_oplog_rs_write`; view-collection `count` (needs the aggregation
+  engine). (`let` / `collation` on update+delete are now done.) All tracked in
+  `crud.rs`'s module docs.
 
 - [x] **Engine selection** — `secantus.engine` is the single source of truth
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six

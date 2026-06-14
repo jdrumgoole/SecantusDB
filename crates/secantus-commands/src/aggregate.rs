@@ -27,13 +27,17 @@
 //!   unique-index validation** are also deferred.
 //! * **`$changeStream`** — handled separately (`changestream::open_change_stream`);
 //!   the standalone-rejection (40573) is honoured here.
-//! * **`collation`**.
+//!
+//! **`collation`** is threaded through `$match` / `$sort` (the storage-free core)
+//! and the lifted-`$match` fetch (COLLSCAN-forced); a collation the engine can't
+//! reproduce (non-ASCII / numericOrdering) surfaces as `BadValue`.
 
 use bson::{doc, Bson, Document};
 
 use crate::find::split_into_cursor;
-use crate::util::{as_i64, command_error, decode_docs, docs_to_bson, encode_docs};
+use crate::util::{as_i64, collation_of, command_error, decode_docs, docs_to_bson, encode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+use secantus_core::collation::Collation;
 
 /// `aggregate` — run a pipeline and return a cursor over the results.
 pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
@@ -75,6 +79,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(Bson::as_document)
         .cloned()
         .unwrap_or_default();
+    let collation = collation_of(doc);
 
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
@@ -88,7 +93,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // pipeline so we don't apply it twice.
                 let (filter, rest) = lift_leading_match(&pipeline);
                 let bytes = storage
-                    .find(&ctx.db_name, c, &filter, None, hint)
+                    .find_collated(&ctx.db_name, c, &filter, None, hint, collation.as_ref())
                     .map_err(command_error)?;
                 (ns, decode_docs(bytes)?, rest)
             }
@@ -108,6 +113,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         coll.as_deref(),
         &vars,
         storage,
+        collation.as_ref(),
     )?;
 
     let (first_batch, cursor_id) =
@@ -149,6 +155,7 @@ fn stage_name(stage: &Bson) -> &str {
 /// through the core engine; each storage-backed stage is applied in between. This
 /// is the Rust analogue of `commands.py`'s `_aggregate`, where every stage —
 /// storage-free or not — dispatches through the same `apply_pipeline`.
+#[allow(clippy::too_many_arguments)]
 fn run_segmented(
     input: Vec<Document>,
     pipeline: &[Bson],
@@ -156,6 +163,7 @@ fn run_segmented(
     coll: Option<&str>,
     vars: &Document,
     storage: &dyn crate::storage::Storage,
+    collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
@@ -163,29 +171,40 @@ fn run_segmented(
         let name = stage_name(stage);
         if is_storage_backed(name) {
             if !buffer.is_empty() {
-                docs = core_run(docs, &buffer, vars)?;
+                docs = core_run(docs, &buffer, vars, collation)?;
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name)).cloned();
-            docs = apply_storage_stage(name, spec.as_ref(), docs, db, coll, vars, storage)?;
+            docs = apply_storage_stage(
+                name,
+                spec.as_ref(),
+                docs,
+                db,
+                coll,
+                vars,
+                storage,
+                collation,
+            )?;
         } else {
             buffer.push(stage.clone());
         }
     }
     if !buffer.is_empty() {
-        docs = core_run(docs, &buffer, vars)?;
+        docs = core_run(docs, &buffer, vars, collation)?;
     }
     Ok(docs)
 }
 
 /// Run a run of storage-free stages through the core engine, mapping the engine's
 /// `Fallback` to the `BadValue` the client sees for unsupported constructs.
+/// `collation` applies to `$match` string comparison + `$sort` order.
 fn core_run(
     docs: Vec<Document>,
     stages: &[Bson],
     vars: &Document,
+    collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
-    secantus_core::aggregate::apply_pipeline(docs, stages, vars, None).map_err(|_| {
+    secantus_core::aggregate::apply_pipeline(docs, stages, vars, collation).map_err(|_| {
         CommandError::new(
             2,
             "BadValue",
@@ -199,6 +218,7 @@ fn bad_value(msg: impl Into<String>) -> CommandError {
 }
 
 /// Dispatch one storage-backed stage.
+#[allow(clippy::too_many_arguments)]
 fn apply_storage_stage(
     name: &str,
     spec: Option<&Bson>,
@@ -207,9 +227,10 @@ fn apply_storage_stage(
     coll: Option<&str>,
     vars: &Document,
     storage: &dyn crate::storage::Storage,
+    collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     match name {
-        "$lookup" => apply_lookup(spec, docs, db, vars, storage),
+        "$lookup" => apply_lookup(spec, docs, db, vars, storage, collation),
         "$sample" => apply_sample(spec, docs),
         "$collStats" => apply_coll_stats(spec, db, coll, storage),
         "$indexStats" => apply_index_stats(db, coll, storage),
@@ -233,6 +254,7 @@ fn apply_lookup(
     db: &str,
     vars: &Document,
     storage: &dyn crate::storage::Storage,
+    collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     let spec = spec
         .and_then(Bson::as_document)
@@ -281,7 +303,15 @@ fn apply_lookup(
                 }
                 _ => foreign.clone(),
             };
-            run_segmented(candidates, sub, db, Some(from), &sub_vars, storage)?
+            run_segmented(
+                candidates,
+                sub,
+                db,
+                Some(from),
+                &sub_vars,
+                storage,
+                collation,
+            )?
         } else {
             // Simple form: localField == foreignField (array-aware).
             let lf = local_field
