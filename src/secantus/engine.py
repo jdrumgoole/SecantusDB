@@ -1,54 +1,42 @@
-"""Engine selection — SecantusDB keeps **both** implementations as first-class,
-permanently-supported modes.
+"""Engine selection — historical shim, now pure-Python only.
 
-The pure-Python engines (the original implementation) are always present and
-are the **default**. The Rust core (``_secantus_core``, an optional compiled
-extension) is an accelerator that reproduces the pure-Python behaviour exactly —
-pinned, operator by operator, by the ``tests/test_rust_*_parity.py`` suites.
-Neither replaces the other: the Python version is not going away.
+The Python server (the ``secantus`` package) is **entirely pure Python and
+depends on no Rust components** — it never imports ``_secantus_core``. The
+original in-process engine-swap (``SECANTUS_ENGINE=rust``, where each operator
+module delegated to the Rust core) has been **retired** in favour of the
+two-separate-servers model (see CLAUDE.md "Engines"): the Rust engines now live
+only in the standalone Rust server and in the ``tests/test_rust_*_parity.py``
+oracle, which imports ``_secantus_core`` directly rather than through this
+package.
 
-Selecting an engine (process-wide):
-
-    SECANTUS_ENGINE=python   # default — original pure-Python engines
-    SECANTUS_ENGINE=rust     # use the Rust core wherever a component is ported,
-                             #   transparently falling back to Python where it
-                             #   isn't (or when the extension isn't installed)
-    SECANTUS_ENGINE=auto     # rust if the extension is importable, else python
-
-Per-component overrides take precedence (for debugging / bisection):
-
-    SECANTUS_RUST_QUERY=1    # force the Rust query matcher on
-    SECANTUS_RUST_QUERY=0    # force it off
-
-Programmatic control mirrors the env var and wins over it::
+This module is kept as an inert compatibility stub so existing call sites keep
+working:
 
     import secantus.engine as engine
-    engine.set_engine("rust")        # process-wide
-    engine.available()               # is the Rust extension importable?
-    engine.selected()                # 'python' | 'rust' | 'auto'
+    engine.available()        # always False — the package never loads Rust
+    engine.enabled("query")   # always False — no component delegates to Rust
+    engine.selected()         # echoes SECANTUS_ENGINE / set_engine(), but inert
+    engine.set_engine(...)    # accepted and recorded, but has no effect
 
-``SecantusDBServer(engine="rust")`` is the same as ``engine.set_engine("rust")``.
-
-The selection is **process-wide**, not per-server: the Rust extension is a
-single shared module and the pure engines read the same global. Running two
-servers in one process with different engines isn't supported (the last
-``set_engine`` / env value wins).
+``SecantusDBServer(engine=...)`` still accepts the argument for backwards
+compatibility; it no longer changes behaviour.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import threading
 
-logger = logging.getLogger(__name__)
-
-try:  # the Rust core is optional — a pure-Python install works without it
-    import _secantus_core  # noqa: F401
-
-    _AVAILABLE = True
-except ImportError:
-    _AVAILABLE = False
+# The Python server is pure Python and depends on **no** Rust components: it
+# never imports ``_secantus_core``. The in-process engine-swap (the original
+# ``SECANTUS_ENGINE=rust`` accelerator) has been retired from the Python server
+# per the two-separate-servers direction (see CLAUDE.md "Engines"). The Rust
+# engines now live only in the standalone Rust server and the
+# ``tests/test_rust_*_parity.py`` oracle, which import ``_secantus_core``
+# directly — not through this package. ``available()`` / ``enabled()`` therefore
+# always report Python; ``selected()`` / ``set_engine()`` remain inert API stubs
+# so callers that still pass ``engine=`` keep working.
+_AVAILABLE = False
 
 # The components the Rust core can accelerate (each pure-Python module has a
 # shim that consults ``enabled(<component>)``).
@@ -66,11 +54,11 @@ _VALID = ("python", "rust", "auto")
 
 _lock = threading.Lock()
 _override: str | None = None  # set by set_engine(); None => read the env var
-_warned_unavailable = False
 
 
 def available() -> bool:
-    """True if the Rust core extension (``_secantus_core``) is importable."""
+    """Always ``False``: the Python server is pure Python and never loads the
+    Rust core. (The Rust engines live in the standalone Rust server.)"""
     return _AVAILABLE
 
 
@@ -97,26 +85,8 @@ def selected() -> str:
 
 
 def enabled(component: str) -> bool:
-    """Whether the Rust implementation should be used for ``component``.
-
-    Resolution order: per-component override (``SECANTUS_RUST_<COMPONENT>``),
-    then the global selection. Always ``False`` when the extension isn't
-    importable — selecting ``rust`` without the extension transparently falls
-    back to the pure-Python engines (with a one-time warning).
-    """
-    override = os.environ.get(f"SECANTUS_RUST_{component.upper()}")
-    want = override == "1" if override is not None else selected() in ("rust", "auto")
-    if want and not _AVAILABLE:
-        _warn_unavailable_once()
-        return False
-    return want
-
-
-def _warn_unavailable_once() -> None:
-    global _warned_unavailable
-    if not _warned_unavailable:
-        _warned_unavailable = True
-        logger.warning(
-            "Rust engine requested but the _secantus_core extension is not "
-            "installed; using the pure-Python engines instead."
-        )
+    """Always ``False`` — the Python server is pure Python and never delegates
+    to a Rust component. Retained so the operator modules' (now historical)
+    shims and any external callers keep importing cleanly. ``component`` is
+    accepted and ignored."""
+    return False

@@ -143,8 +143,6 @@ the change-stream batch. Still open, precisely characterized:
     tailable incl. CappedPositionLost rollover — fixed b37; `test_comment`
     profiler op-class fixed b34.)
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
-  - custom-types decode edges (`test_aggregate_w_custom_type`,
-    `test_find_one_and__w_custom_type`) — driver type-registry round-trips.
   - `test_error_code` / `test_index_filter` rejections (planner index-filter
     command surface).
   - the 3 `test_dbref.py` execnet failures: gauge-harness artifact (xdist
@@ -224,8 +222,21 @@ which builds the abi3 extension `_secantus_core` via maturin (`invoke rust-build
 **Both implementations are permanent (not a replacement).** ~~Selection is
 process-wide via `secantus.engine`.~~ → The pure-Python engines power the **Python
 server**; the Rust engines power the separate **Rust server**. The
-`secantus.engine` in-process selection is transitional and being retired (see the
-banner above + `tasks/rust-server-plan.md` §3).
+`secantus.engine` in-process selection ~~is transitional and being retired~~ has
+been **retired from the Python package** (0.5.3b3): no `src/secantus/**` module
+imports `_secantus_core` any more, and `engine.available()` / `enabled()` always
+report Python. `secantus.engine` survives only as an inert compatibility stub.
+The `tests/test_rust_*_parity.py` oracle still imports `_secantus_core` directly
+to pin the Rust engines against the pure-Python ones.
+
+- [ ] **Rust port owes numeric type preservation.** The Python `$inc` / `$mul` /
+  `$sum` now follow mongod's numeric promotion (int32 < int64 < double <
+  decimal128) via `secantus.numerics` — `Int64` results stay `Int64`. The Rust
+  `secantus-core` update/aggregate engines still narrow to int32, so
+  `tests/test_rust_update_parity.py` normalises int32↔int64 (`_norm_int_width`)
+  to keep the oracle green. Port the same promotion into the Rust engines (and
+  the expression-language `$add`/`$subtract`/`$multiply` for full consistency),
+  then drop the normaliser.
 
 **Rust server build-out (`tasks/rust-server-plan.md` §4).** Done: R1
 (`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /
