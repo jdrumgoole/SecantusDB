@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-14 — SecantusDB 0.5.3b2 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-14 — SecantusDB 0.5.3b4 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -12,7 +12,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_bulk.py` | 31 | 3 | 0 | 4 | 38 | 91.2% |
 | `test_change_stream.py` | 78 | 28 | 0 | 49 | 155 | 73.6% |
 | `test_collation.py` | 15 | 1 | 0 | 0 | 16 | 93.8% |
-| `test_collection.py` | 66 | 21 | 0 | 4 | 91 | 75.9% |
+| `test_collection.py` | 73 | 14 | 0 | 4 | 91 | 83.9% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
@@ -36,9 +36,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **887** | **141** | **0** | **475** | **1503** | **86.3%** |
+| **Overall** | **894** | **134** | **0** | **475** | **1503** | **87.0%** |
 
-## Failures (141)
+## Failures (134)
 
 First 30 failure node-ids for manual triage:
 
@@ -74,7 +74,7 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExp
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_dropIndexes_events_are_reported
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_modify_events_are_reported
 ```
-... and 111 more (see raw JSON).
+... and 104 more (see raw JSON).
 
 ## How this is generated
 

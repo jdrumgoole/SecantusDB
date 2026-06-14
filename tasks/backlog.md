@@ -429,8 +429,14 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   `test_collection` +1).** **Deferred:** `validator` on update/replace (needs the
   post-apply doc in storage); `collMod` TTL-index `index:{expireAfterSeconds}`
   modify; capped-size enforcement.
+- [x] **`writeConcernError` for unsatisfiable `w > 1`.** `dispatch` attaches a
+  `writeConcernError` (code 100, `CannotSatisfyWriteConcern`) when a request
+  carries `writeConcern: {w: int > 1}` and the command succeeded — the single-node
+  `secantus` RS can't satisfy it, but the write still happens (mirrors mongod +
+  the Python server's `_unsatisfiable_wc_error`). One central place covers every
+  write command. **+7 gauge (`test_collection`).**
 - [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
-  validation + `writeConcernError` attachment; `validator` on update/replace;
+  *value validation* (malformed `w`/`wtimeout`); `validator` on update/replace;
   `_reject_oplog_rs_write`; view-collection `count` (needs the aggregation
   engine). All tracked in `crud.rs`'s module docs.
 

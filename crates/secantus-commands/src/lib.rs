@@ -26,12 +26,10 @@
 //!
 //! ## Deferred to later slices
 //!
-//! The cross-cutting machinery `commands.py` threads through dispatch — metrics,
-//! session-TTL touch, `--auth` gating, RBAC privilege checks, failpoints,
-//! profiling, and `writeConcernError` attachment — is **not** in this slice. It
-//! lands with the families that need it (auth/RBAC with R5, etc.). The
-//! [`CommandContext`] only carries what the handshake reads today; it grows as
-//! families are added.
+//! Some cross-cutting machinery `commands.py` threads through dispatch — metrics,
+//! session-TTL touch, profiling, failpoints — is **not** ported yet. (`--auth`
+//! gating + RBAC landed with R5; `writeConcernError` for an unsatisfiable `w > 1`
+//! is attached in [`dispatch`].) The [`CommandContext`] grows as families land.
 
 pub mod admin;
 pub mod aggregate;
@@ -290,8 +288,37 @@ fn lookup(name: &str) -> Option<Handler> {
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let mut reply = dispatch_inner(doc, ctx);
+    attach_write_concern_error(doc, &mut reply);
     attach_cluster_time_gossip(&mut reply, ctx);
     reply
+}
+
+/// Attach a `writeConcernError` when the command carried an integer `w > 1`.
+/// SecantusDB advertises as a single-node `secantus` replica set, so a write
+/// concern wider than one node can never be satisfied — mongod returns the write
+/// result *plus* a `CannotSatisfyWriteConcern` (100) writeConcernError (the write
+/// still happened). Only attaches to a successful reply that carried a write
+/// concern (reads don't send one), mirroring `commands.py`.
+fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
+    if reply.get_f64("ok").unwrap_or(0.0) != 1.0 || reply.contains_key("writeConcernError") {
+        return;
+    }
+    let w = doc
+        .get("writeConcern")
+        .and_then(bson::Bson::as_document)
+        .and_then(|wc| wc.get("w"));
+    let unsatisfiable = match w {
+        Some(bson::Bson::Int32(n)) => *n > 1,
+        Some(bson::Bson::Int64(n)) => *n > 1,
+        _ => false,
+    };
+    if unsatisfiable {
+        let mut wce = Document::new();
+        wce.insert("code", 100i32);
+        wce.insert("codeName", "CannotSatisfyWriteConcern");
+        wce.insert("errmsg", "Not enough data-bearing nodes");
+        reply.insert("writeConcernError", wce);
+    }
 }
 
 fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
@@ -640,6 +667,30 @@ mod tests {
     fn ping_ok() {
         let reply = dispatch(&doc! {"ping": 1}, &mut ctx());
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn write_concern_error_for_unsatisfiable_w() {
+        // w > 1 can't be satisfied by the single-node "secantus" RS → 100.
+        let reply = dispatch(&doc! {"ping": 1, "writeConcern": {"w": 2}}, &mut ctx());
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        let wce = reply.get_document("writeConcernError").unwrap();
+        assert_eq!(wce.get_i32("code").unwrap(), 100);
+        assert_eq!(
+            wce.get_str("codeName").unwrap(),
+            "CannotSatisfyWriteConcern"
+        );
+    }
+
+    #[test]
+    fn no_write_concern_error_for_satisfiable_w() {
+        for wc in [doc! {"w": 1}, doc! {"w": 0}, doc! {"w": "majority"}] {
+            let reply = dispatch(&doc! {"ping": 1, "writeConcern": wc}, &mut ctx());
+            assert!(reply.get("writeConcernError").is_none());
+        }
+        // A read without a writeConcern never gets one.
+        let reply = dispatch(&doc! {"ping": 1}, &mut ctx());
+        assert!(reply.get("writeConcernError").is_none());
     }
 
     #[test]
