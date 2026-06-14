@@ -2673,11 +2673,16 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    # Collect the options this collMod actually changed; the same map
+    # becomes the ``modify`` change event's ``operationDescription`` (a bare
+    # collMod with no options is a valid no-op that still emits an event).
+    description: dict[str, Any] = {}
     pre_post = doc.get("changeStreamPreAndPostImages")
     if isinstance(pre_post, Mapping):
         ctx.storage.set_collection_options(
             ctx.db_name, coll, changeStreamPreAndPostImages=dict(pre_post)
         )
+        description["changeStreamPreAndPostImages"] = dict(pre_post)
     # MongoDB 3.2+ ``validator``: a query predicate that every
     # subsequent insert / update must satisfy. Mongo-java-driver's
     # ``findOneAndUpdate-errorResponse`` test installs a validator
@@ -2687,6 +2692,10 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     validator = doc.get("validator")
     if isinstance(validator, Mapping):
         ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
+        description["validator"] = dict(validator)
+    # Emit the collMod command oplog entry so a change stream with
+    # ``showExpandedEvents`` surfaces a ``modify`` event.
+    ctx.storage.record_collmod(ctx.db_name, coll, description)
     return {"ok": 1.0}
 
 
