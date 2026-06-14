@@ -412,12 +412,23 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   `validator` still deferred (see "update options" above).
 - [ ] **`find` command** — lands with R3 (cursor registry) + `secantus-core`
   projection; first-batch + `getMore`/`killCursors`.
+- [x] **`collMod` + collection options + `validator` (insert).** `collMod` is now
+  a registered command (`secantus-commands::admin::coll_mod`): merges recognised
+  options (`validator` / `validationLevel` / `validationAction` /
+  `changeStreamPreAndPostImages` / `capped`+`size`+`max`) into the collection
+  (`NamespaceNotFound` 26 if missing); `create` persists the same set. Trait seam:
+  `get_collection_options` / `set_collection_options` (defaults no-op/empty →
+  fakes unaffected; WT adapter forwards to the existing storage methods). The
+  `insert` handler enforces `validator` (code 121) unless
+  `bypassDocumentValidation` / `validationAction: warn|off`. **+8 gauge
+  (`test_change_stream` +7 from collMod enabling `changeStreamPreAndPostImages`,
+  `test_collection` +1).** **Deferred:** `validator` on update/replace (needs the
+  post-apply doc in storage); `collMod` TTL-index `index:{expireAfterSeconds}`
+  modify; capped-size enforcement.
 - [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
-  validation + `writeConcernError` attachment; collection `validator` /
-  `bypassDocumentValidation` (needs `get_collection_options` + the query engine);
+  validation + `writeConcernError` attachment; `validator` on update/replace;
   `_reject_oplog_rs_write`; view-collection `count` (needs the aggregation
-  engine). (`let` / `collation` on update+delete are now done.) All tracked in
-  `crud.rs`'s module docs.
+  engine). All tracked in `crud.rs`'s module docs.
 
 - [x] **Engine selection** — `secantus.engine` is the single source of truth
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six

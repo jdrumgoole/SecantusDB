@@ -10,9 +10,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
 | `test_bulk.py` | 31 | 3 | 0 | 4 | 38 | 91.2% |
-| `test_change_stream.py` | 71 | 35 | 0 | 49 | 155 | 67.0% |
+| `test_change_stream.py` | 78 | 28 | 0 | 49 | 155 | 73.6% |
 | `test_collation.py` | 15 | 1 | 0 | 0 | 16 | 93.8% |
-| `test_collection.py` | 65 | 22 | 0 | 4 | 91 | 74.7% |
+| `test_collection.py` | 66 | 21 | 0 | 4 | 91 | 75.9% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
@@ -36,9 +36,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **879** | **149** | **0** | **475** | **1503** | **85.5%** |
+| **Overall** | **887** | **141** | **0** | **475** | **1503** | **86.3%** |
 
-## Failures (149)
+## Failures (141)
 
 First 30 failure node-ids for manual triage:
 
@@ -66,15 +66,15 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when__id_is_projected_out
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when_an_invalid_aggregation_stage_is_passed_in
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:required_with_changeStreamPreAndPostImages_disabled
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:required_with_changeStreamPreAndPostImages_enabled
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_disabled
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_enabled
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:off_with_changeStreamPreAndPostImages_disabled
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:off_with_changeStreamPreAndPostImages_enabled
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:required_with_changeStreamPreAndPostImages_disabled
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:required_with_changeStreamPreAndPostImages_enabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_createIndex_events_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_create_events_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_create_events_on_views_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_dropIndexes_events_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_modify_events_are_reported
 ```
-... and 119 more (see raw JSON).
+... and 111 more (see raw JSON).
 
 ## How this is generated
 

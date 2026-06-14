@@ -239,6 +239,8 @@ fn lookup(name: &str) -> Option<Handler> {
         "getMore" => cursors::get_more,
         "killCursors" => cursors::kill_cursors,
         "create" => admin::create,
+        "collMod" => admin::coll_mod,
+        "collmod" => admin::coll_mod,
         "drop" => admin::drop,
         "listCollections" => admin::list_collections,
         "listIndexes" => admin::list_indexes,

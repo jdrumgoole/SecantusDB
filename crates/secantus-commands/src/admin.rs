@@ -5,9 +5,16 @@
 //!
 //! Ports of the corresponding `commands.py` handlers, scoped to the core paths.
 //!
+//! `create` persists recognised options (`validator` / `validationLevel` /
+//! `validationAction` / `changeStreamPreAndPostImages` / `capped` / `size` /
+//! `max`); `collMod` merges the same set into an existing collection (else
+//! `NamespaceNotFound`). The `insert` handler enforces `validator` (code 121).
+//!
 //! **Deferred (documented so parity is honest):**
-//! * `create` option validation (unknown-field `Location40415`, `capped`,
-//!   `validator`, views) — only the bare create is ported.
+//! * `create` unknown-field validation (`Location40415`); views; capped-size
+//!   enforcement; `collMod`'s TTL-index `index: {expireAfterSeconds}` modify.
+//! * `validator` enforcement on `update` / replace (needs the post-apply doc in
+//!   storage — insert is enforced at the command layer).
 //! * `listCollections` name/filter + the richer per-collection `options` /
 //!   `idIndex` detail (a minimal, faithful-enough entry is returned).
 //! * `listIndexes` `NamespaceNotFound` on a missing collection (returns an empty
@@ -23,7 +30,33 @@ use crate::find::split_into_cursor;
 use crate::util::{as_i64, coll_arg, command_error, docs_to_bson, encode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
-/// `create` — create a collection.
+/// Collection-option keys (from `create` / `collMod`) the Rust server persists.
+/// `validator` + `validationLevel`/`validationAction` drive document validation;
+/// `changeStreamPreAndPostImages` drives pre-image capture; `capped`/`size`/`max`
+/// are reported in stats. (TTL-index `expireAfterSeconds` modification via
+/// `collMod`'s `index` option is deferred.)
+const STORED_COLL_OPTIONS: [&str; 7] = [
+    "validator",
+    "validationLevel",
+    "validationAction",
+    "changeStreamPreAndPostImages",
+    "capped",
+    "size",
+    "max",
+];
+
+/// The subset of a command doc that maps to persisted collection options.
+fn collection_option_subset(doc: &Document) -> Document {
+    let mut out = Document::new();
+    for k in STORED_COLL_OPTIONS {
+        if let Some(v) = doc.get(k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    out
+}
+
+/// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "create")?;
     let storage = ctx.storage()?;
@@ -38,6 +71,48 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
+    let opts = collection_option_subset(doc);
+    if !opts.is_empty() {
+        storage
+            .set_collection_options(&ctx.db_name, &coll, &opts)
+            .map_err(command_error)?;
+    }
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `collMod` — modify a collection's options (`validator` / `validationLevel` /
+/// `validationAction` / `changeStreamPreAndPostImages`). Merges the recognised
+/// options into the collection's stored blob. Errors `NamespaceNotFound` (26)
+/// when the collection doesn't exist. (TTL-index `index` modification deferred.)
+pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let coll = match doc.get("collMod").or_else(|| doc.get("collmod")) {
+        Some(Bson::String(s)) => s.clone(),
+        _ => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "collMod requires a string collection name",
+            ))
+        }
+    };
+    let storage = ctx.storage()?;
+    let exists = storage
+        .list_collections(&ctx.db_name)
+        .map_err(command_error)?
+        .iter()
+        .any(|c| c == &coll);
+    if !exists {
+        return Ok(CommandError::new(
+            26,
+            "NamespaceNotFound",
+            format!("ns does not exist: {}.{}", ctx.db_name, coll),
+        )
+        .into_reply());
+    }
+    let opts = collection_option_subset(doc);
+    storage
+        .set_collection_options(&ctx.db_name, &coll, &opts)
+        .map_err(command_error)?;
     Ok(doc! { "ok": 1.0 })
 }
 
@@ -383,6 +458,8 @@ mod tests {
         cols: Mutex<HashMap<String, Vec<String>>>,
         // (db, coll) -> index names (excluding the implicit _id_)
         idx: Mutex<HashMap<(String, String), Vec<String>>>,
+        // (db, coll) -> stored options blob
+        opts: Mutex<HashMap<(String, String), Document>>,
     }
 
     impl FakeStorage {
@@ -443,6 +520,28 @@ mod tests {
                 .get(db)
                 .cloned()
                 .unwrap_or_default())
+        }
+        fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
+            Ok(self
+                .opts
+                .lock()
+                .unwrap()
+                .get(&(db.to_string(), coll.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn set_collection_options(
+            &self,
+            db: &str,
+            coll: &str,
+            opts: &Document,
+        ) -> Result<(), StorageError> {
+            let mut store = self.opts.lock().unwrap();
+            let cur = store.entry((db.to_string(), coll.to_string())).or_default();
+            for (k, v) in opts {
+                cur.insert(k.clone(), v.clone());
+            }
+            Ok(())
         }
         fn create_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
             let mut cols = self.cols.lock().unwrap();
@@ -575,6 +674,57 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn create_stores_validator() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        let reply = dispatch(
+            &doc! {"create": "c", "validator": {"a": {"$exists": true}}},
+            &mut c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        let stored = s
+            .opts
+            .lock()
+            .unwrap()
+            .get(&("t".to_string(), "c".to_string()))
+            .cloned()
+            .unwrap();
+        assert!(stored.contains_key("validator"));
+    }
+
+    #[test]
+    fn collmod_sets_validator() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        dispatch(&doc! {"create": "c"}, &mut c);
+        let mut c = ctx(s.clone());
+        let reply = dispatch(
+            &doc! {"collMod": "c", "validator": {"n": {"$gt": 0}},
+            "changeStreamPreAndPostImages": {"enabled": true}},
+            &mut c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        let stored = s
+            .opts
+            .lock()
+            .unwrap()
+            .get(&("t".to_string(), "c".to_string()))
+            .cloned()
+            .unwrap();
+        assert!(stored.contains_key("validator"));
+        assert!(stored.contains_key("changeStreamPreAndPostImages"));
+    }
+
+    #[test]
+    fn collmod_missing_ns_is_namespace_not_found() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s);
+        let reply = dispatch(&doc! {"collMod": "nope", "validator": {}}, &mut c);
+        assert_eq!(reply.get_i32("code").unwrap(), 26);
+        assert_eq!(reply.get_str("codeName").unwrap(), "NamespaceNotFound");
     }
 
     #[test]

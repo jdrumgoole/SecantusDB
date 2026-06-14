@@ -371,6 +371,21 @@ impl CmdStorage for StorageAdapter {
         self.inner.create_collection(db, coll).map_err(map_err)
     }
 
+    fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
+        self.inner.get_collection_options(db, coll).map_err(map_err)
+    }
+
+    fn set_collection_options(
+        &self,
+        db: &str,
+        coll: &str,
+        opts: &Document,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .set_collection_options(db, coll, opts)
+            .map_err(map_err)
+    }
+
     fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
         self.inner.drop_collection(db, coll).map_err(map_err)
     }

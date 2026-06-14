@@ -361,6 +361,24 @@ pub trait Storage: Send + Sync {
         Ok(true)
     }
 
+    /// The collection's stored options blob (`validator` / `validationAction` /
+    /// `changeStreamPreAndPostImages` / `capped` / …), empty when none/unknown.
+    /// Default empty (fakes don't track options); the WT adapter forwards.
+    fn get_collection_options(&self, _db: &str, _coll: &str) -> Result<Document, StorageError> {
+        Ok(Document::new())
+    }
+
+    /// Merge `opts` into the collection's stored options (creating it if needed) —
+    /// for `create` with options and `collMod`. Default no-op; WT adapter forwards.
+    fn set_collection_options(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _opts: &Document,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Drop a collection. `true` if it existed.
     fn drop_collection(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
         Ok(false)

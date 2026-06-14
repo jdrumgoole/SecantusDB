@@ -4,18 +4,20 @@
 //! scoped to the paths that map onto the current `secantus-storage` signatures.
 //! (`find` lives in the sibling `find` module.)
 //!
+//! `insert` enforces a collection `validator` (code 121) unless
+//! `bypassDocumentValidation` / `validationAction: warn|off`. Pipeline-form `u`
+//! applies via `Storage::update_matching_pipeline`; positional operators (`$` /
+//! `$[]` / `$[ident]`) + `arrayFilters` via `Storage::update_matching_array_filters`;
+//! `let` + `collation` thread through update / delete / count (collation forces a
+//! COLLSCAN; non-ASCII / numericOrdering collation → `BadValue`).
+//!
 //! **Deferred (documented so parity is honest):**
 //! * `writeConcern` validation and `writeConcernError` attachment (cross-cutting,
 //!   lands with the write-concern slice).
-//! * Collection `validator` / `bypassDocumentValidation` (needs
-//!   `get_collection_options` + the query engine on the write path).
-//! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
-//! * view-collection `count`, `validator` / `bypassDocumentValidation` — not in
-//!   the Rust storage seam yet (see backlog §7). Pipeline-form `u` applies via
-//!   `Storage::update_matching_pipeline`; positional operators (`$` / `$[]` /
-//!   `$[ident]`) + `arrayFilters` via `Storage::update_matching_array_filters`;
-//!   `let` + `collation` thread through update / delete / count (collation forces
-//!   a COLLSCAN; non-ASCII / numericOrdering collation → `BadValue`).
+//! * `validator` enforcement on `update` / replace (needs the post-apply doc in
+//!   storage; `insert` is enforced here at the command layer).
+//! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`); view-collection
+//!   `count`.
 
 use bson::{doc, Bson, Document};
 
@@ -44,6 +46,25 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
     let ordered = bool_field(doc, "ordered", true);
+
+    // Document validation: a collection `validator` rejects non-matching inserts
+    // with code 121 unless `validationAction` is "warn"/"off" or
+    // `bypassDocumentValidation` is set. A validator the query engine can't
+    // evaluate is treated as passing (lenient) rather than wrongly rejecting.
+    let bypass = bool_field(doc, "bypassDocumentValidation", false);
+    let validator = if bypass {
+        None
+    } else {
+        let opts = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map_err(command_error)?;
+        let action = opts.get_str("validationAction").unwrap_or("error");
+        if action == "warn" || action == "off" {
+            None
+        } else {
+            opts.get("validator").and_then(Bson::as_document).cloned()
+        }
+    };
 
     // Per-doc pre-checks (no storage): an `_id` may not carry top-level
     // `$`-prefixed keys. A failure is a per-doc writeError keyed by the doc's
@@ -74,6 +95,20 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     "errmsg": format!(
                         "_id fields may not contain '$'-prefixed fields: {first} is not valid for storage."
                     ),
+                });
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
+        // Collection validator (code 121, DocumentValidationFailure).
+        if let Some(v) = &validator {
+            if !secantus_core::query::matches(d, v, &Document::new(), None).unwrap_or(true) {
+                pre_errors.push(doc! {
+                    "index": index as i32,
+                    "code": 121,
+                    "errmsg": "Document failed validation",
                 });
                 if ordered {
                     break;
@@ -381,6 +416,7 @@ mod tests {
     #[derive(Default)]
     struct FakeStorage {
         cols: Mutex<HashMap<(String, String), Vec<Document>>>,
+        opts: Mutex<HashMap<(String, String), Document>>,
     }
 
     impl FakeStorage {
@@ -392,6 +428,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert((db.to_string(), coll.to_string()), docs);
+        }
+        fn set_options(&self, db: &str, coll: &str, opts: Document) {
+            self.opts
+                .lock()
+                .unwrap()
+                .insert((db.to_string(), coll.to_string()), opts);
         }
     }
 
@@ -580,6 +622,15 @@ mod tests {
                 .map(|b| b.iter().filter(|d| matches(d, filter)).count())
                 .unwrap_or(0))
         }
+        fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
+            Ok(self
+                .opts
+                .lock()
+                .unwrap()
+                .get(&(db.to_string(), coll.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
 
         fn find(
             &self,
@@ -630,6 +681,41 @@ mod tests {
         // too, so count against the same namespace.
         let reply = dispatch(&doc! {"count": "c"}, &mut c);
         assert_eq!(reply.get_i32("n").unwrap(), 2);
+    }
+
+    #[test]
+    fn insert_rejects_validator_violation() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        let db = c.db_name.clone();
+        s.set_options(&db, "c", doc! {"validator": {"a": {"$exists": true}}});
+        // doc 0 violates (no `a`), doc 1 passes.
+        let reply = dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1}, {"_id": 2, "a": 1}],
+            "ordered": false},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "only the valid doc inserts");
+        let we = reply.get_array("writeErrors").unwrap();
+        assert_eq!(we.len(), 1);
+        let e = we[0].as_document().unwrap();
+        assert_eq!(e.get_i32("code").unwrap(), 121);
+        assert_eq!(e.get_i32("index").unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_bypass_document_validation_skips_validator() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        let db = c.db_name.clone();
+        s.set_options(&db, "c", doc! {"validator": {"a": {"$exists": true}}});
+        let reply = dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1}],
+            "bypassDocumentValidation": true},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 1);
+        assert!(reply.get("writeErrors").is_none());
     }
 
     #[test]
