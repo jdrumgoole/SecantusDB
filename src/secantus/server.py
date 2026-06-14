@@ -6,6 +6,7 @@ import logging
 import socket
 import ssl
 import threading
+import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -256,11 +257,43 @@ class SecantusDBServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        # Drain in-flight per-connection handler threads BEFORE touching
+        # WiredTiger. Each connection runs on its own daemon thread; if one is
+        # mid-WT-operation when ``storage.close()`` frees the WT connection,
+        # that's a use-after-free — a native crash (the intermittent xdist
+        # worker death). Close every connection socket so blocked reads return
+        # and the loops exit, wake any tailable getMore blocked on the oplog
+        # condition variable, then wait for the active-connection count to
+        # reach zero so no handler is still using storage.
+        self.connections.close_all()
+        self.storage.signal_shutdown()
+        self._await_connections_drained(timeout=5.0)
         # Roll back open transactions while storage is still usable;
         # ``Storage.close()``'s session sweep would roll them back too,
         # but this releases their WT sessions in an orderly way first.
         self.transactions.abort_all()
         self.storage.close()
+
+    def _await_connections_drained(self, timeout: float) -> None:
+        """Block until every per-connection handler thread has exited (the
+        active-connection counter reaches zero), or ``timeout`` elapses. Run
+        at stop, after the connection sockets are closed and tailable waiters
+        woken, so storage isn't torn down under an in-flight handler."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._active_conns_lock:
+                if self._active_conns == 0:
+                    return
+            time.sleep(0.005)
+        with self._active_conns_lock:
+            remaining = self._active_conns
+        if remaining:
+            logger.warning(
+                "server stop: %d connection thread(s) still active after %.1fs; "
+                "closing storage anyway",
+                remaining,
+                timeout,
+            )
 
     def wait(self) -> None:
         self._stop_event.wait()

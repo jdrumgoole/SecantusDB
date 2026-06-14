@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Fixed a shutdown race that could crash the server process
+
+Stopping a `SecantusDBServer` now drains its in-flight per-connection threads
+before tearing down WiredTiger. Previously `stop()` joined only the accept
+thread and then closed the storage engine — so a connection handler still
+mid-WiredTiger-operation (e.g. a change-stream tailable `getMore` reading the
+oplog) had its WT connection freed underneath it: a use-after-free that surfaced
+as an intermittent native crash (the pytest-xdist worker death seen near the end
+of the full suite under churn). `stop()` now closes every connection socket to
+unblock reads, wakes any tailable `getMore` parked on the oplog condition
+variable, and waits for the active-connection count to reach zero before calling
+`storage.close()`. A 200-iteration stress that reliably tripped the use-after-
+close now runs clean.
+
+#### Fixed
+
+- `SecantusDBServer.stop()` drains in-flight connection threads before closing
+  WiredTiger (via `ConnectionRegistry.close_all` + `Storage.signal_shutdown` +
+  an active-connection drain barrier), eliminating a use-after-free / native
+  crash on teardown under load.
+
 ### Tailable cursors over `local.oplog.rs`
 
 A client can now tail the oplog the way replication does: `local.oplog.rs`

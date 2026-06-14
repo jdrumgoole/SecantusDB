@@ -842,6 +842,11 @@ class Storage:
         self.oplog_max_entries = int(oplog_max_entries)
         self._time = time_func or _time.time
         self._oplog_cv = threading.Condition(threading.Lock())
+        # Set by ``signal_shutdown()`` at server stop so tailable getMore
+        # waiters stop blocking and their connection threads drain *before*
+        # ``close()`` tears down the WT connection — a thread mid-WT-op when
+        # the connection closes is a use-after-free / native crash.
+        self._shutting_down = False
         self._oplog_emit_count = 0
         # Tiny fine-grained lock for seq + timestamp minting. Held in
         # microseconds while reserving the next seq range and bumping
@@ -1849,6 +1854,14 @@ class Storage:
                     seen += 1
                 rc = c.next()
         return out
+
+    def signal_shutdown(self) -> None:
+        """Tell tailable getMore waiters the server is stopping so they wake
+        and return immediately, letting their connection threads drain before
+        :meth:`close` tears down WiredTiger. One-way: only set at stop."""
+        self._shutting_down = True
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
 
     def close(self) -> None:
         # Stop background threads before tearing down WT — both the
