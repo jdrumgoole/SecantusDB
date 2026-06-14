@@ -659,6 +659,22 @@ def test_unique_index_blocks_update_via_pymongo(coll) -> None:
         coll.update_one({"_id": 2}, {"$set": {"email": "a@x"}})
 
 
+def test_create_unique_index_with_dropdups_ignores_option_and_fails_on_dup(coll) -> None:
+    """``dropDups`` was removed in MongoDB 3.0; mongod accepts but ignores it
+    rather than rejecting the spec as an unknown field. So a unique index over
+    duplicate data still fails on the duplicate (DuplicateKeyError), the docs
+    are untouched, and no index is created. Mirrors pymongo's
+    test_collection.test_index_dont_drop_dups."""
+    from pymongo.errors import DuplicateKeyError as PyDup
+
+    coll.insert_many([{"i": 1}, {"i": 2}, {"i": 2}, {"i": 3}])  # duplicate i
+    with pytest.raises(PyDup):
+        coll.create_index([("i", pymongo.ASCENDING)], unique=True, dropDups=False)
+    # The duplicate wasn't dropped, and the unique index was never created.
+    assert coll.count_documents({}) == 4
+    assert len(coll.index_information()) == 1  # only the default _id_ index
+
+
 def test_drop_index_via_pymongo(coll) -> None:
     coll.insert_one({"x": 1})
     coll.create_index("x")
@@ -2149,6 +2165,31 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
     )
     with contextlib.suppress(Exception):
         cur.close()
+
+
+def test_tailable_capped_rollover_kills_cursor(client: MongoClient) -> None:
+    """When a capped collection rolls over and evicts the document a tailable
+    cursor is anchored on, mongod kills the cursor with CappedPositionLost
+    (code 136). pymongo swallows that for tailable cursors, so a subsequent
+    read returns no docs and ``cursor.alive`` is False — it must NOT keep
+    streaming the post-rollover docs. Mirrors pymongo's test_cursor.test_tailable."""
+    db = client["tail_rollover_db"]
+    db.cap.drop()
+    db.create_collection("cap", capped=True, size=4096, max=3)
+
+    cursor = db.cap.find(cursor_type=pymongo.CursorType.TAILABLE)
+    # Walk the cursor forward one doc at a time, anchoring it on x:3.
+    for x in (1, 2, 3):
+        db.cap.insert_one({"x": x})
+        got = [d["x"] for d in cursor]
+        assert got == [x], f"expected [{x}] this round, got {got}"
+
+    # Rollover: max=3, so inserting 4,5,6 evicts 1,2,3 — including x:3, the
+    # doc the cursor was anchored on. The cursor's position is lost.
+    db.cap.insert_many([{"x": i} for i in range(4, 7)])
+    assert cursor.to_list() == []
+    assert cursor.alive is False
+    assert db.cap.count_documents({}) == 3
 
 
 # --- local.oplog.rs wire-surface (pymongo-driven) -------------------------

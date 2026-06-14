@@ -1560,6 +1560,48 @@ def test_partial_filter_query_uses_full_picker_then_index(storage: Storage) -> N
     assert sorted(d["_id"] for d in docs) == [1, 3]
 
 
+def test_partial_filter_range_on_indexed_field_with_residual_uses_index(
+    storage: Storage,
+) -> None:
+    """A RANGE on the indexed field plus a residual field that the partial
+    filter absorbs uses the index. e.g. {x: {$gt: 1}, a: 1} against an index
+    on x partial on {a: {$lte: 1.5}}: x's range rides the index, a:1 is
+    partial-implied. Mirrors pymongo's test_collection.test_index_filter."""
+    storage.create_index(
+        "db", "c", "x_1", {"x": 1}, {"partialFilterExpression": {"a": {"$lte": 1.5}}}
+    )
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "x": 5, "a": 2},  # a > 1.5 → not indexed
+            {"_id": 2, "x": 6, "a": 1},  # a <= 1.5 → indexed
+        ],
+    )
+    plan = storage.explain_plan("db", "c", {"x": {"$gt": 1}, "a": 1})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "x_1"
+    # Equality on the indexed field + partial-implied range residual also uses it.
+    plan2 = storage.explain_plan("db", "c", {"x": 6, "a": {"$lte": 1}})
+    assert plan2["kind"] == "IXSCAN"
+    assert plan2["index_name"] == "x_1"
+    # And the results are exact (only the indexed doc satisfies the filter).
+    docs = storage.find_matching("db", "c", {"x": {"$gt": 1}, "a": 1})
+    assert [d["_id"] for d in docs] == [2]
+
+
+def test_partial_filter_residual_not_implied_stays_collscan(storage: Storage) -> None:
+    """A residual clause the partial filter does NOT imply keeps the query on
+    COLLSCAN. {x: 6, a: {$lte: 1.6}} can't use a {a: {$lte: 1.5}} partial
+    index (1.6 > 1.5), and {x: 6, b: 2} has a non-partial residual."""
+    storage.create_index(
+        "db", "c", "x_1", {"x": 1}, {"partialFilterExpression": {"a": {"$lte": 1.5}}}
+    )
+    storage.insert("db", "c", [{"_id": 1, "x": 6, "a": 1, "b": 2}])
+    assert storage.explain_plan("db", "c", {"x": 6, "a": {"$lte": 1.6}}) == {"kind": "COLLSCAN"}
+    assert storage.explain_plan("db", "c", {"x": 6, "b": 2}) == {"kind": "COLLSCAN"}
+
+
 def test_partial_filter_update_maintains_entries(storage: Storage) -> None:
     """Doc moving from non-matching → matching adds an entry; reverse removes one."""
     storage.create_index(

@@ -1909,7 +1909,17 @@ def _find_tailable(
     state = {"after_id_key": watermark}
 
     def producer() -> list[dict[str, Any]]:
-        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=state["after_id_key"])
+        after = state["after_id_key"]
+        # Capped rollover detection: if the doc this cursor last returned
+        # (``after``) has been evicted — i.e. the collection's smallest
+        # ``id_key`` is now strictly greater than it — the cursor has been
+        # lapped and mongod kills it with ``CappedPositionLost``. A fresh
+        # cursor (``after is None``) has no anchor to lose.
+        if after is not None:
+            min_key = storage.collection_min_id_key(db_name, coll)
+            if min_key is None or min_key > after:
+                raise _CappedPositionLost
+        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=after)
         if not new_rows:
             return []
         state["after_id_key"] = new_rows[-1][0]
@@ -2994,6 +3004,12 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         for _falsy_opt in ("hidden", "sparse", "unique"):
             if _falsy_opt in options and not options[_falsy_opt]:
                 options.pop(_falsy_opt)
+        # ``dropDups`` was removed in MongoDB 3.0; modern mongod accepts it on
+        # the wire but ignores it entirely (it never drops duplicates). Drop it
+        # here so it isn't stored as an index option — a unique index built
+        # over duplicate data then fails on the duplicate (DuplicateKey 11000),
+        # exactly as mongod does. pymongo's test_index_dont_drop_dups pins this.
+        options.pop("dropDups", None)
         # ``partialFilterExpression`` must be a document. Numbers / strings
         # / arrays etc. are rejected by mongod with BadValue.
         pfe = options.get("partialFilterExpression")
@@ -3187,6 +3203,27 @@ def _change_stream_fatal_reply(exc: changestreams.ChangeStreamFatalError) -> dic
     }
 
 
+class _CappedPositionLost(Exception):
+    """Raised by a capped-collection tailable producer when the document the
+    cursor was anchored on (its last-returned ``id_key``) has been evicted by
+    capped rollover. mongod kills such a cursor with code 136
+    ``CappedPositionLost``; pymongo swallows that error for tailable cursors
+    (it's in ``_CURSOR_CLOSED_ERRORS``) so the cursor simply reports
+    ``alive == False`` and the in-flight read returns no documents."""
+
+
+def _capped_position_lost_reply() -> dict[str, Any]:
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            "CollectionScan died due to failure to restore tailable cursor "
+            "position. Last seen record id: RecordId"
+        ),
+        "code": 136,
+        "codeName": "CappedPositionLost",
+    }
+
+
 def _drain_change_stream_producer(entry: Any) -> None:
     """Pull one producer batch into ``entry.remaining`` if it's empty.
 
@@ -3294,6 +3331,9 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     except changestreams.ChangeStreamFatalError as exc:
         ctx.cursors.kill([cursor_id])
         return _change_stream_fatal_reply(exc)
+    except _CappedPositionLost:
+        ctx.cursors.kill([cursor_id])
+        return _capped_position_lost_reply()
     if not entry.remaining and entry.await_data and not entry.invalidated:
         # PyMongo does not always pass maxTimeMS on getMore for change streams;
         # real mongod treats that as "wait indefinitely". We bound the wait so
@@ -3317,6 +3357,9 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         except changestreams.ChangeStreamFatalError as exc:
             ctx.cursors.kill([cursor_id])
             return _change_stream_fatal_reply(exc)
+        except _CappedPositionLost:
+            ctx.cursors.kill([cursor_id])
+            return _capped_position_lost_reply()
     return {
         "cursor": _change_stream_cursor_doc(
             entry, cursor_id, batch_size, ns, batch_key="nextBatch"
@@ -5435,6 +5478,12 @@ _INDEX_SPEC_KNOWN_OPTIONS = frozenset(
         "ns",
         # Haystack (deprecated).
         "bucketSize",
+        # ``dropDups`` — removed in MongoDB 3.0; modern mongod accepts and
+        # silently ignores it (it never drops duplicates) rather than
+        # rejecting the spec. So a unique index built over duplicate data
+        # still fails on the duplicate (DuplicateKey 11000), not on an
+        # unknown-field error. Stripped from the stored options below.
+        "dropDups",
     }
 )
 

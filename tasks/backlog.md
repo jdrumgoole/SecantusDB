@@ -135,9 +135,13 @@ the change-stream batch. Still open, precisely characterized:
   (clean mongod-shaped result + full/background rejection), and upsert with a
   `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
   "no upsert" sentinel). Still open:
-  - `$comment` surfacing in currentOp/profiler (`test_comment`).
-  - tailable cursors on capped collections (`test_tailable`,
-    `test_to_list_tailable`) — non-changestream tailables need capped+tailable.
+  - `test_to_list_tailable` — tails `local.oplog.rs` directly (a
+    `TAILABLE_AWAIT` find with `oplog_replay` + `$natural` sort + a `ts`
+    filter). Needs the internal oplog exposed as a queryable capped collection
+    with mongod's oplog-document shape, not merely listed. Larger,
+    borderline-internal feature; deferred. (`test_tailable` — capped-collection
+    tailable incl. CappedPositionLost rollover — fixed b37; `test_comment`
+    profiler op-class fixed b34.)
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
   - `showRecordId` + `returnKey` combo (`test_A_successful_find_with_showRecordId`)
     — returnKey replaces docs with index keys; fiddly, 1 test.
@@ -145,8 +149,6 @@ the change-stream batch. Still open, precisely characterized:
     `test_find_one_and__w_custom_type`) — driver type-registry round-trips.
   - `test_error_code` / `test_index_filter` rejections (planner index-filter
     command surface).
-  - `dropDups` on createIndexes (`test_index_dont_drop_dups`) — mongod 4.0+
-    also rejects, but with a different shape; we error too aggressively.
   - the 3 `test_dbref.py` execnet failures: gauge-harness artifact (xdist
     can't serialize ObjectId in subtest reports — runner-side, not server).
   - `test_maxtime_ms_message` / `test_to_list_csot_applied`: pymongo CSOT
@@ -154,21 +156,6 @@ the change-stream batch. Still open, precisely characterized:
   Out-of-scope rejections to keep: `$where`, text/hashed indexes (CLAUDE.md).
   Expected-red (single-node topology): the 3 `test_transactions_unified`
   secondary-readPreference tests.
-
-### 3.5 Partial-index range query with residual field
-
-`pymongo test_index_filter` is partly fixed: bad `partialFilterExpression`
-is now rejected, an equality query that implies an operator-form partial
-filter uses the index (sound range-implication in
-`Storage._query_implies_partial`), and `explain` reports `isPartial`. Still
-open: the test's second explain assertion uses a RANGE on the indexed field
-plus a residual equality (`find({x: {$gt: 1}, a: 1})` against a single-field
-index on `x`, partial on `a`). The picker has no "single-field index whose
-leading field has a range, other filter fields residual" path for the >1-field
-case — it only handles all-equality (`_pick_compound_eq_index`) or compound
-indexes (`_pick_compound_range_index`). Adding a single-field-leading-range
-path (in both `_try_index_lookup` and `explain_plan`, threading the partial
-implication) would close it.
 
 ## 4. Out of scope (intentional, with reasoning)
 

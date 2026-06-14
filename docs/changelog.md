@@ -19,6 +19,62 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `createIndexes` accepts and ignores the deprecated `dropDups` option
+
+`dropDups` was removed in MongoDB 3.0, but modern `mongod` still accepts it on
+the wire and silently ignores it rather than rejecting the index spec. SecantusDB
+now matches that: passing `dropDups` no longer trips the unknown-field guard.
+The practical upshot is that building a `unique` index over data that already
+contains a duplicate fails on the duplicate with `DuplicateKey` (11000) — a
+`DuplicateKeyError` to the driver — exactly as a real server does, instead of an
+unrelated "unknown field" error. The collection is left untouched and no index is
+created. Closes the pymongo gauge's `test_collection.test_index_dont_drop_dups`.
+
+#### Changed
+
+- `createIndexes` accepts `dropDups` and strips it from the stored index
+  options (deprecated, ignored — never drops duplicates).
+
+### Partial indexes serve range-on-indexed-field queries with a residual clause
+
+A query that puts a range on a partial index's indexed field and an extra
+clause that the index's partial filter absorbs now uses the index — e.g.
+`find({x: {$gt: 1}, a: 1})` against an index on `x` with
+`partialFilterExpression: {a: {$lte: 1.5}}`. The `x` range rides the index,
+the `a: 1` clause is implied by the partial filter (so the index's existence
+already guarantees it) and is rechecked by the exact post-scan matcher, and
+`explain` reports `IXSCAN` with `isPartial: true`. Previously any multi-field
+filter fell off the single-field index path to a COLLSCAN.
+
+The relaxation is deliberately conservative: only *partial* indexes get this
+treatment, and only when every residual field is a partial-filter field, so a
+non-partial residual still keeps the query on a collection scan. This closes
+the last open assertion in the pymongo gauge's `test_collection.test_index_filter`.
+
+#### Changed
+
+- The single-field index lookup and its `explain` mirror now accept a
+  multi-field filter when the non-indexed fields are absorbed by an implied
+  partial filter, via a shared `_single_field_partial_residual_match` selector.
+
+### Tailable cursors die on capped-collection rollover
+
+A tailable cursor over a capped collection now dies with `CappedPositionLost`
+when the collection rolls over and evicts the document the cursor was anchored
+on — exactly as `mongod` does. Before, the cursor would blithely keep
+streaming the post-rollover documents instead of recognising it had been
+lapped. The server detects this by comparing the cursor's last-returned
+position against the collection's current oldest document; if the anchor has
+been evicted it returns error 136, which `pymongo` swallows for tailable
+cursors (the cursor reports `alive == False` and the in-flight read yields
+nothing). Closes the pymongo gauge's `test_cursor.test_tailable`.
+
+#### Fixed
+
+- Tailable cursors on capped collections now surface `CappedPositionLost`
+  (code 136) when rollover evicts their anchor document, instead of
+  continuing to stream the rolled-over documents.
+
 ### Change streams report create, modify, and richer DDL events
 
 Change streams opened with `showExpandedEvents: true` now surface the full
