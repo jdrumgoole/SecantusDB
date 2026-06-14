@@ -3004,6 +3004,12 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         for _falsy_opt in ("hidden", "sparse", "unique"):
             if _falsy_opt in options and not options[_falsy_opt]:
                 options.pop(_falsy_opt)
+        # ``dropDups`` was removed in MongoDB 3.0; modern mongod accepts it on
+        # the wire but ignores it entirely (it never drops duplicates). Drop it
+        # here so it isn't stored as an index option — a unique index built
+        # over duplicate data then fails on the duplicate (DuplicateKey 11000),
+        # exactly as mongod does. pymongo's test_index_dont_drop_dups pins this.
+        options.pop("dropDups", None)
         # ``partialFilterExpression`` must be a document. Numbers / strings
         # / arrays etc. are rejected by mongod with BadValue.
         pfe = options.get("partialFilterExpression")
@@ -5472,6 +5478,12 @@ _INDEX_SPEC_KNOWN_OPTIONS = frozenset(
         "ns",
         # Haystack (deprecated).
         "bucketSize",
+        # ``dropDups`` — removed in MongoDB 3.0; modern mongod accepts and
+        # silently ignores it (it never drops duplicates) rather than
+        # rejecting the spec. So a unique index built over duplicate data
+        # still fails on the duplicate (DuplicateKey 11000), not on an
+        # unknown-field error. Stripped from the stored options below.
+        "dropDups",
     }
 )
 
