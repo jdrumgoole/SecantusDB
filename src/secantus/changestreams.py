@@ -271,6 +271,11 @@ def project(
             "ns": _ns_doc(ns),
             "documentKey": document_key,
         }
+        # mongod 6.0+ attaches the collection's UUID to CRUD events when the
+        # stream was opened with ``showExpandedEvents``. The oplog row carries
+        # it as ``ui`` (Binary subtype 4).
+        if show_expanded_events and oplog_entry.get("ui") is not None:
+            event["collectionUUID"] = oplog_entry["ui"]
         if isinstance(wall, object) and wall is not None:
             event["wallTime"] = wall
         # Writes that happened inside a multi-document transaction carry
@@ -344,17 +349,66 @@ def project(
                     return None, False
             token = make_resume_token(ResumeTokenData(seq, ts, from_ns, {}))
             to_db, to_coll = _split_ns(to_ns)
+            to_doc = {"db": to_db, "coll": to_coll} if to_coll else {"db": to_db}
             event = {
                 "_id": token,
                 "operationType": "rename",
                 "clusterTime": ts,
                 "ns": _ns_doc(from_ns),
-                "to": {"db": to_db, "coll": to_coll} if to_coll else {"db": to_db},
+                "to": to_doc,
             }
+            if show_expanded_events:
+                # mongod 6.0+ attaches an ``operationDescription`` to expanded
+                # rename events: the ``to`` namespace plus ``dropTarget`` (the
+                # dropped target collection's UUID) when the rename replaced an
+                # existing collection.
+                op_desc: dict[str, Any] = {"to": to_doc}
+                if "dropTarget" in cmd:
+                    op_desc["dropTarget"] = cmd["dropTarget"]
+                event["operationDescription"] = op_desc
             if wall is not None:
                 event["wallTime"] = wall
             invalidates = scope.get("kind") == "coll"
             return event, invalidates
+        if "create" in cmd:
+            if not show_expanded_events:
+                return None, False
+            affected_ns = f"{cmd_db}.{cmd['create']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            # ``operationDescription`` carries the collection-creation options
+            # (idIndex for an ordinary collection, viewOn / pipeline for a
+            # view) — everything in the command spec except the collection
+            # name under ``create``.
+            op_desc = {k: v for k, v in cmd.items() if k != "create"}
+            event = {
+                "_id": token,
+                "operationType": "create",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": op_desc,
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
+        if "collMod" in cmd:
+            if not show_expanded_events:
+                return None, False
+            affected_ns = f"{cmd_db}.{cmd['collMod']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            event = {
+                "_id": token,
+                "operationType": "modify",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": {k: v for k, v in cmd.items() if k != "collMod"},
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
         if "createIndexes" in cmd:
             if not show_expanded_events:
                 return None, False

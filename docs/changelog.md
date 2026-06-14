@@ -19,6 +19,33 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Change streams report create, modify, and richer DDL events
+
+Change streams opened with `showExpandedEvents: true` now surface the full
+set of expanded DDL events that `mongod` 6.0+ emits. A `createCollection`
+(including views) produces a `create` event, a `collMod` produces a
+`modify` event, and `rename` events carry an `operationDescription` with
+the destination namespace and the dropped target's UUID under
+`dropTarget`. CRUD events (insert / update / delete / replace) on an
+expanded stream also carry the watched collection's `collectionUUID`, the
+way a real server tags them.
+
+Previously only `createIndexes` / `dropIndexes` were emitted as expanded
+events; `create` and `modify` had no oplog entry at all, so a stream
+waiting for them blocked indefinitely. This completes the
+`showExpandedEvents` spec surface that single-node SecantusDB can support
+(sharding-only events like `shardCollection` remain out of scope), taking
+the pymongo change-stream gauge from 102 to 106 passing — a clean sweep of
+`test_change_stream.py`.
+
+#### Added
+
+- `create` (createCollection / views) and `modify` (collMod) change-stream
+  events under `showExpandedEvents`, both gated off by default like the
+  other expanded events.
+- `operationDescription.{to,dropTarget}` on expanded `rename` events, and
+  `collectionUUID` on expanded CRUD events.
+
 ### Resumed change streams return their backlog on open
 
 Opening a change stream with `resumeAfter`, `startAfter`, or
