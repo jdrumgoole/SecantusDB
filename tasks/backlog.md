@@ -447,6 +447,21 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   `nReturned`) above `queryPlanner` verbosity, and the aggregate
   `stages: [{$cursor: {queryPlanner, …}}, …]` wrapper drivers look for. Collation /
   collectionless explain forces COLLSCAN.
+- [x] **Query `$regex` / `$options` + bare BSON regex (Rust query engine).**
+  `secantus-core::query` matches regex with the `regex` crate instead of deferring
+  to Python: `field_matches` intercepts `$regex` (reading its sibling `$options`)
+  and a bare `Bson::RegularExpression`; `op_regex` does `re.search`-style
+  unanchored `is_match` over string values + string elements of arrays; flags
+  `i`/`m`/`s`/`x` map to `RegexBuilder` (other flag chars ignored, mirroring
+  Python's `_re_flags`). Patterns the crate can't compile (backreferences,
+  lookaround, `\Z`) or over the 1000-char cap → `Fallback` (defer). Parity suite
+  extended: 16 curated regex cases + a 4000-iteration `test_regex_fuzz_parity`
+  (safe-subset patterns/options/subjects; Rust ≡ Python `re`). **Known divergence
+  (accepted):** the `regex` crate's `$` matches only end-of-haystack, not before a
+  trailing `\n` like Python/PCRE — so `{x:{$regex:"foo$"}}` against `"foo\n"`
+  matches on the Python server but not the Rust server. Rare; documented in
+  `query.rs` module docs. Fuzz subjects are newline-free to avoid spurious parity
+  failures from this gap.
 - [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
   *value validation* (malformed `w`/`wtimeout`); `validator` on update/replace;
   `_reject_oplog_rs_write`; view-collection `count` (needs the aggregation

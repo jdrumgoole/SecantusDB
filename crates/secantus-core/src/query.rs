@@ -6,15 +6,25 @@
 //! which the Python shim turns into "run the pure-Python matcher instead". That
 //! keeps the port strictly correct: the operators handled here match the Python
 //! implementation exactly (pinned by `tests/test_rust_query_parity.py`), and
-//! everything else (`$jsonSchema`, geo, any regex, structural/compound
-//! equality, exotic BSON types) defers to Python. `$expr` is handled via the
-//! Rust expression evaluator; `$all` via its Python-`==`. A `collation` is
-//! threaded through string comparisons and handled for the ASCII-safe cases
-//! (see `crate::collation`), deferring non-ASCII / `numericOrdering` to Python.
+//! everything else (`$jsonSchema`, geo, structural/compound equality, exotic
+//! BSON types) defers to Python. `$expr` is handled via the Rust expression
+//! evaluator; `$all` via its Python-`==`. A `collation` is threaded through
+//! string comparisons and handled for the ASCII-safe cases (see
+//! `crate::collation`), deferring non-ASCII / `numericOrdering` to Python.
+//!
+//! **Regex** (`$regex` + `$options`, and a bare BSON `RegularExpression` value)
+//! is matched with the `regex` crate (`re.search` semantics → unanchored
+//! `is_match`; options `i`/`m`/`s`/`x` map to the builder flags; other flag
+//! chars are ignored, mirroring Python's `_re_flags`). Patterns the crate can't
+//! compile — backreferences, lookaround, `\Z`, etc. — signal `Fallback` (defer
+//! to Python `re`), as do patterns over the 1000-char cap. Known divergence
+//! from Python/PCRE: the crate's `$` matches only the end of the haystack, not
+//! before a trailing `\n` (backlog §7).
 
 use std::cmp::Ordering;
 
 use bson::{Bson, Document};
+use regex::RegexBuilder;
 
 use crate::collation::{self, Collation};
 use crate::{expressions, numeric};
@@ -128,17 +138,94 @@ fn is_operator_dict(d: &Document) -> bool {
 
 fn field_matches(values: &[Option<Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
     match cond {
-        Bson::RegularExpression(_) => Err(Fallback), // regex semantics -> Python `re`
+        // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.
+        Bson::RegularExpression(_) => op_regex(values, cond, None),
         Bson::Document(d) if is_operator_dict(d) => {
             for (op, arg) in d.iter() {
-                if !op_matches(values, op, arg, coll)? {
-                    return Ok(false);
+                match op.as_str() {
+                    // `$options` is a sibling modifier of `$regex`, consumed below.
+                    "$options" if d.contains_key("$regex") => continue,
+                    "$regex" => {
+                        if !op_regex(values, arg, d.get("$options"))? {
+                            return Ok(false);
+                        }
+                    }
+                    _ => {
+                        if !op_matches(values, op, arg, coll)? {
+                            return Ok(false);
+                        }
+                    }
                 }
             }
             Ok(true)
         }
         _ => eq_with_array(values, cond, coll),
     }
+}
+
+/// Hard cap on user-supplied regex pattern length, mirroring
+/// `secantus.query._MAX_REGEX_PATTERN_LEN`. Over the cap, defer to Python
+/// (which raises a `QueryError`).
+const MAX_REGEX_PATTERN_LEN: usize = 1000;
+
+/// `$regex` / bare-regex matching, mirroring `secantus.query._op_regex`:
+/// `re.search` over each string value (and over string elements of array
+/// values). `pattern` is a `String` or a BSON `RegularExpression`; `options`
+/// is the optional sibling `$options` string. Anything the `regex` crate can't
+/// compile, or a non-string pattern/options, signals `Fallback`.
+fn op_regex(values: &[Option<Bson>], pattern: &Bson, options: Option<&Bson>) -> R {
+    let re = build_regex(pattern, options)?;
+    for v in values {
+        match v {
+            Some(Bson::String(s)) if re.is_match(s) => return Ok(true),
+            Some(Bson::Array(arr)) => {
+                for e in arr {
+                    if let Bson::String(s) = e {
+                        if re.is_match(s) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn build_regex(pattern: &Bson, options: Option<&Bson>) -> Result<regex::Regex, Fallback> {
+    let (pat, embedded_flags): (&str, &str) = match pattern {
+        Bson::String(s) => (s.as_str(), ""),
+        Bson::RegularExpression(r) => (r.pattern.as_str(), r.options.as_str()),
+        _ => return Err(Fallback),
+    };
+    let opt_flags: &str = match options {
+        None => "",
+        Some(Bson::String(s)) => s.as_str(),
+        Some(_) => return Err(Fallback),
+    };
+    if pat.len() > MAX_REGEX_PATTERN_LEN {
+        return Err(Fallback);
+    }
+    // i/m/s/x map to builder flags; any other flag char is ignored, mirroring
+    // Python's `_MONGO_FLAG_MAP.get(c, 0)`.
+    let (mut ci, mut ml, mut dotall, mut ext) = (false, false, false, false);
+    for c in embedded_flags.chars().chain(opt_flags.chars()) {
+        match c {
+            'i' => ci = true,
+            'm' => ml = true,
+            's' => dotall = true,
+            'x' => ext = true,
+            _ => {}
+        }
+    }
+    RegexBuilder::new(pat)
+        .case_insensitive(ci)
+        .multi_line(ml)
+        .dot_matches_new_line(dotall)
+        .ignore_whitespace(ext)
+        .build()
+        .map_err(|_| Fallback)
 }
 
 fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson, coll: Option<&Collation>) -> R {
@@ -185,8 +272,9 @@ fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson, coll: Option<&Colla
         "$geoIntersects" => crate::geo::op_geo_intersects(values, arg),
         "$near" => crate::geo::op_geo_near(values, arg, false),
         "$nearSphere" => crate::geo::op_geo_near(values, arg, true),
-        // $regex/$options, $center (Shapely 64-gon), and anything unknown ->
-        // Python (Python raises QueryError for genuinely-unknown operators).
+        // $center (Shapely 64-gon) and anything unknown -> Python (Python raises
+        // QueryError for genuinely-unknown operators). $regex/$options are
+        // intercepted in `field_matches` (they share a condition dict).
         _ => Err(Fallback),
     }
 }
@@ -656,12 +744,62 @@ mod tests {
         ));
     }
 
+    fn re(pattern: &str, options: &str) -> Bson {
+        Bson::RegularExpression(bson::Regex {
+            pattern: pattern.into(),
+            options: options.into(),
+        })
+    }
+
     #[test]
-    fn regex_falls_back() {
+    fn regex_dollar_operator() {
+        // $regex string form, unanchored search.
+        assert!(m(doc! {"item": "paper"}, doc! {"item": {"$regex": "^p"}}));
+        assert!(!m(
+            doc! {"item": "journal"},
+            doc! {"item": {"$regex": "^p"}}
+        ));
+        assert!(m(
+            doc! {"item": "abc123"},
+            doc! {"item": {"$regex": "[0-9]+"}}
+        ));
+        // $options: i (case-insensitive), s (dotall), m (multiline).
+        assert!(m(
+            doc! {"item": "Paper"},
+            doc! {"item": {"$regex": "^p", "$options": "i"}}
+        ));
+        assert!(m(
+            doc! {"x": "a\nb"},
+            doc! {"x": {"$regex": "^b", "$options": "m"}}
+        ));
+        assert!(m(
+            doc! {"x": "foobar"},
+            doc! {"x": {"$regex": "o.b", "$options": "s"}}
+        ));
+        // array element matches.
+        assert!(m(
+            doc! {"tags": ["red", "blank"]},
+            doc! {"tags": {"$regex": "^bl"}}
+        ));
+        assert!(!m(
+            doc! {"tags": ["red", "blank"]},
+            doc! {"tags": {"$regex": "^z"}}
+        ));
+    }
+
+    #[test]
+    fn regex_bare_literal() {
+        assert!(m(doc! {"x": "hello"}, doc! {"x": re("^h", "")}));
+        assert!(m(doc! {"x": "Hello"}, doc! {"x": re("^h", "i")}));
+        assert!(!m(doc! {"x": "Hello"}, doc! {"x": re("^h", "")}));
+    }
+
+    #[test]
+    fn regex_uncompilable_defers() {
+        // A backreference is unsupported by the `regex` crate -> Fallback.
         assert!(matches(
-            &doc! {"n": "x"},
-            &doc! {"n": Bson::RegularExpression(bson::Regex {
-            pattern: "x".into(), options: "".into() })},
+            &doc! {"x": "aa"},
+            &doc! {"x": {"$regex": r"(a)\1"}},
             &Document::new(),
             None,
         )

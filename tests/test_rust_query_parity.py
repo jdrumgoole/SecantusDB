@@ -3,8 +3,10 @@
 Phase 1 net for the second ported leaf engine. For each (doc, query) the Rust
 matcher is run over BSON bytes; when it returns a concrete bool (i.e. it didn't
 defer), that bool must equal the authoritative pure-Python `matches`. When it
-returns None (fallback — collation/$expr/$jsonSchema/geo/regex/$all/compound/…)
-there is nothing to assert: the shim would run pure Python anyway.
+returns None (fallback — collation/$jsonSchema/geo/uncompilable-regex/…) there
+is nothing to assert: the shim would run pure Python anyway. ($regex/$options
+and bare BSON regex are now matched in Rust via the `regex` crate; only patterns
+the crate can't compile defer.)
 
 Import-light: prefers the real `secantus.query`, but if the package can't be
 imported (no WiredTiger extension built, as in a spike environment) it loads
@@ -237,6 +239,24 @@ CURATED = [
     ({"tags": [1, 2, 3]}, {"tags": {"$all": [1.0, 2.0]}}),  # numeric bridge
     ({"tags": []}, {"tags": {"$all": []}}),
     ({"tags": ["a", "b"]}, {"tags": {"$all": [Regex("^a")]}}),  # regex elem -> defer
+    # --- regex ($regex/$options + bare BSON regex) — now handled in Rust ---
+    ({"item": "paper"}, {"item": {"$regex": "^p"}}),
+    ({"item": "journal"}, {"item": {"$regex": "^p"}}),
+    ({"item": "Paper"}, {"item": {"$regex": "^p", "$options": "i"}}),
+    ({"item": "Paper"}, {"item": {"$regex": "^p"}}),
+    ({"name": "abc123"}, {"name": {"$regex": "[0-9]+"}}),
+    ({"name": "abcdef"}, {"name": {"$regex": "[0-9]+"}}),
+    ({"tags": ["red", "blank"]}, {"tags": {"$regex": "^bl"}}),  # array element
+    ({"tags": ["red", "blank"]}, {"tags": {"$regex": "^z"}}),
+    ({"x": "hello"}, {"x": Regex("^h")}),  # bare BSON regex literal
+    ({"x": "Hello"}, {"x": Regex("^h", "i")}),
+    ({"x": "Hello"}, {"x": Regex("^h")}),
+    ({"x": "a\nb"}, {"x": {"$regex": "^b", "$options": "m"}}),  # multiline
+    ({"x": "a\nb"}, {"x": {"$regex": "^b"}}),
+    ({"x": "foobar"}, {"x": {"$regex": "o.b", "$options": "s"}}),
+    ({"x": 5}, {"x": {"$regex": "5"}}),  # non-string value -> no match
+    ({}, {"x": {"$regex": "anything"}}),  # missing field -> no match
+    ({"x": r"(a)\1"}, {"x": {"$regex": r"(a)\1"}}),  # backref pattern -> Rust defers
     # --- geo (slices geo-1 / geo-1b): point docs vs region/near queries ---
     # $geoWithin $box — point inside / outside.
     ({"loc": [5.0, 5.0]}, {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}}),
@@ -442,3 +462,52 @@ def test_batch_matches_parity():
         py = [_pure.matches(d, query) for d in docs]
         assert rust == py, f"batch divergence: rust={rust} pure={py} query={query} docs={docs}"
     assert handled > 500, f"expected many handled batches, only {handled}"
+
+
+# Patterns valid in both Python `re` and the Rust `regex` crate (no
+# backreferences / lookaround / `\Z`, and no trailing-`\n`-sensitive anchoring,
+# since the crate's `$` matches end-of-haystack only). Subjects are
+# newline-free for the same reason.
+_REGEX_PATTERNS = [
+    "^a",
+    "b$",
+    "a.c",
+    "[0-9]+",
+    "[a-c]{2}",
+    "ab|cd",
+    "^.*z",
+    "(ab)+",
+    "x?y",
+    "\\d",
+    "\\w+",
+    "[^abc]",
+    "a{1,3}",
+]
+_REGEX_OPTIONS = ["", "i", "s", "x", "is"]
+_REGEX_SUBJECTS = ["abc", "ABC", "a1b2", "xyz", "aabbcc", "cd", "zzz", "b", "", "Hello9"]
+
+
+def test_regex_fuzz_parity():
+    """Random $regex queries against random subjects: when the Rust matcher
+    returns a concrete bool (didn't defer), it must equal pure-Python `re`."""
+    rng = random.Random(0x5EC0_4E9E)
+    handled = 0
+    for _ in range(4000):
+        pat = rng.choice(_REGEX_PATTERNS)
+        opts = rng.choice(_REGEX_OPTIONS)
+        subj = rng.choice(_REGEX_SUBJECTS)
+        field = "x"
+        if rng.random() < 0.5:
+            query = {field: {"$regex": pat, "$options": opts}}
+        else:
+            query = {field: Regex(pat, opts)}
+        doc = {field: subj}
+        doc = bson.decode(bson.encode(doc))
+        query = bson.decode(bson.encode(query))
+        rust = _rust_match(doc, query)
+        if rust is None:
+            continue
+        handled += 1
+        py = _pure.matches(doc, query)
+        assert rust == py, f"regex divergence: rust={rust} pure={py} query={query} doc={doc}"
+    assert handled > 1000, f"expected many handled regex cases, only {handled}"
