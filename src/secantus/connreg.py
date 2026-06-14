@@ -116,6 +116,18 @@ class ConnectionRegistry:
             sock.shutdown(socket.SHUT_RDWR)
         return True
 
+    def close_all(self) -> None:
+        """Shut down every registered connection socket so blocked reads in
+        the handler threads return and the threads exit. Used at server stop
+        to drain in-flight connections before the storage engine closes (a
+        handler thread mid-WiredTiger-op when the WT connection closes is a
+        use-after-free / native crash)."""
+        with self._lock:
+            socks = list(self._sockets.values())
+        for sock in socks:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
     def record_command(self, conn_id: int, name: str) -> None:
         """Bump ``op_count`` and set ``last_command_name`` / ``last_cmd_at``."""
         with self._lock:

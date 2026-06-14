@@ -3427,7 +3427,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # update / delete. Use the lock-free tail peek; a stale
             # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
-                lambda: ctx.storage.oplog_tail_seq_nolock() > captured_tail or entry.invalidated,
+                lambda: (
+                    ctx.storage.oplog_tail_seq_nolock() > captured_tail
+                    or entry.invalidated
+                    or ctx.storage._shutting_down
+                ),
                 timeout=wait_seconds,
             )
         try:
