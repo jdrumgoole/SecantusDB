@@ -1,7 +1,7 @@
-//! Collection/index DDL + introspection + db-admin commands: `create` / `drop`
-//! / `listCollections` / `listIndexes` / `createIndexes` / `dropIndexes` /
-//! `dropDatabase` / `renameCollection` / `collStats` / `dbStats` /
-//! `serverStatus`.
+//! Collection/index DDL + introspection + db-admin commands: `create` /
+//! `collMod` / `explain` / `drop` / `listCollections` / `listIndexes` /
+//! `createIndexes` / `dropIndexes` / `dropDatabase` / `renameCollection` /
+//! `collStats` / `dbStats` / `serverStatus`.
 //!
 //! Ports of the corresponding `commands.py` handlers, scoped to the core paths.
 //!
@@ -27,8 +27,8 @@
 use bson::{doc, Bson, Document};
 
 use crate::find::split_into_cursor;
-use crate::util::{as_i64, coll_arg, command_error, docs_to_bson, encode_docs};
-use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+use crate::util::{as_i64, coll_arg, collation_of, command_error, docs_to_bson, encode_docs};
+use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SERVER_VERSION};
 
 /// Collection-option keys (from `create` / `collMod`) the Rust server persists.
 /// `validator` + `validationLevel`/`validationAction` drive document validation;
@@ -114,6 +114,175 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .set_collection_options(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
     Ok(doc! { "ok": 1.0 })
+}
+
+/// `explain` — report the query plan (and, above `queryPlanner` verbosity,
+/// execution counts) for a wrapped `find` / `aggregate` / `count` command. Ports
+/// `commands.py::_explain`'s core: lifts a leading `$match` for aggregate, rejects
+/// a journaled / `w:"majority"` writeConcern (72), validates `verbosity` (2),
+/// shapes `queryPlanner.winningPlan` (`FETCH`+`IXSCAN` or `COLLSCAN`) and an
+/// `executionStats` block (run via `find` to count). aggregate adds the
+/// `stages: [{$cursor: …}, …]` wrapper drivers look for. Collation forces COLLSCAN.
+pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let inner = doc
+        .get("explain")
+        .and_then(Bson::as_document)
+        .cloned()
+        .unwrap_or_default();
+    let cmd_name = inner.keys().next().cloned().unwrap_or_default();
+    let coll = match inner.get(&cmd_name) {
+        Some(Bson::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let mut filter = inner
+        .get("filter")
+        .or_else(|| inner.get("query"))
+        .and_then(Bson::as_document)
+        .cloned()
+        .unwrap_or_default();
+    let sort = inner.get("sort").and_then(Bson::as_document);
+    let hint = inner.get("hint");
+    let collation = collation_of(&inner);
+    // Aggregate lifts a leading $match into the fetch — explain reports the same.
+    if cmd_name == "aggregate" && filter.is_empty() {
+        if let Some(Bson::Array(p)) = inner.get("pipeline") {
+            if let Some(Bson::Document(first)) = p.first() {
+                if let Some(Bson::Document(m)) = first.get("$match") {
+                    filter = m.clone();
+                }
+            }
+        }
+    }
+    // explain + a journaled / majority writeConcern is ill-formed (InvalidOptions).
+    for wc in [doc.get("writeConcern"), inner.get("writeConcern")] {
+        if let Some(Bson::Document(wc)) = wc {
+            let journaled = matches!(
+                wc.get("j"),
+                Some(Bson::Boolean(true)) | Some(Bson::Int32(1))
+            );
+            if journaled || wc.get_str("w").ok() == Some("majority") {
+                return Ok(CommandError::new(
+                    72,
+                    "InvalidOptions",
+                    "Command does not support writeConcern when used with explain",
+                )
+                .into_reply());
+            }
+        }
+    }
+    let verbosity = doc.get_str("verbosity").unwrap_or("executionStats");
+    if !["queryPlanner", "executionStats", "allPlansExecution"].contains(&verbosity) {
+        return Ok(CommandError::new(
+            2,
+            "BadValue",
+            format!("verbosity {verbosity:?} not recognized"),
+        )
+        .into_reply());
+    }
+
+    let storage = ctx.storage()?;
+    let ns = if coll.is_empty() {
+        format!("{}.$cmd", ctx.db_name)
+    } else {
+        format!("{}.{}", ctx.db_name, coll)
+    };
+    // A collation (or no collection) forces COLLSCAN — the byte-sortable indexes
+    // are collation-naive (mirrors `find`'s COLLSCAN-forcing under collation).
+    let plan = if coll.is_empty() || collation.is_some() {
+        let mut d = Document::new();
+        d.insert("kind", "COLLSCAN");
+        d
+    } else {
+        storage
+            .explain_plan(&ctx.db_name, &coll, &filter, sort, hint)
+            .map_err(command_error)?
+    };
+    let is_ixscan = plan.get_str("kind").ok() == Some("IXSCAN");
+
+    let (mut n_returned, mut docs_examined, mut keys_examined) = (0i64, 0i64, 0i64);
+    if verbosity != "queryPlanner" && !coll.is_empty() {
+        let res = storage
+            .find_collated(
+                &ctx.db_name,
+                &coll,
+                &filter,
+                sort,
+                hint,
+                collation.as_ref(),
+                &Document::new(),
+            )
+            .map_err(command_error)?;
+        n_returned = res.len() as i64;
+        if is_ixscan {
+            keys_examined = n_returned;
+            docs_examined = n_returned;
+        } else {
+            docs_examined = storage
+                .count_collated(&ctx.db_name, &coll, &Document::new(), None)
+                .map_err(command_error)? as i64;
+        }
+    }
+
+    let winning_plan = if is_ixscan {
+        doc! {
+            "stage": "FETCH",
+            "filter": filter.clone(),
+            "inputStage": {
+                "stage": "IXSCAN",
+                "indexName": plan.get_str("indexName").unwrap_or(""),
+                "keyPattern": plan.get_document("keyPattern").cloned().unwrap_or_default(),
+                "direction": plan.get_str("direction").unwrap_or("forward"),
+            },
+        }
+    } else {
+        doc! { "stage": "COLLSCAN", "filter": filter.clone() }
+    };
+    let query_planner = doc! {
+        "namespace": &ns,
+        "indexFilterSet": false,
+        "parsedQuery": filter.clone(),
+        "winningPlan": winning_plan,
+        "rejectedPlans": [],
+    };
+    let execution_stages = if is_ixscan {
+        doc! {"stage": "FETCH", "nReturned": n_returned, "inputStage": {"stage": "IXSCAN", "nReturned": n_returned}}
+    } else {
+        doc! {"stage": "COLLSCAN", "nReturned": n_returned}
+    };
+    let exec_stats = doc! {
+        "executionSuccess": true,
+        "nReturned": n_returned,
+        "executionTimeMillis": 0_i64,
+        "totalKeysExamined": keys_examined,
+        "totalDocsExamined": docs_examined,
+        "executionStages": execution_stages,
+    };
+    let server_info = doc! {
+        "host": "secantus", "port": 0_i32, "version": SERVER_VERSION, "gitVersion": "0".repeat(40),
+    };
+
+    let mut reply = Document::new();
+    if cmd_name == "aggregate" {
+        let mut cursor = doc! { "queryPlanner": query_planner.clone() };
+        if verbosity != "queryPlanner" {
+            cursor.insert("executionStats", exec_stats.clone());
+        }
+        let mut stages = vec![Bson::Document(doc! { "$cursor": cursor })];
+        if let Some(Bson::Array(p)) = inner.get("pipeline") {
+            for s in p {
+                stages.push(s.clone());
+            }
+        }
+        reply.insert("stages", stages);
+    }
+    reply.insert("queryPlanner", query_planner);
+    if verbosity != "queryPlanner" {
+        reply.insert("executionStats", exec_stats);
+    }
+    reply.insert("command", inner);
+    reply.insert("serverInfo", server_info);
+    reply.insert("ok", 1.0);
+    Ok(reply)
 }
 
 /// `drop` — drop a collection.
@@ -725,6 +894,68 @@ mod tests {
         let reply = dispatch(&doc! {"collMod": "nope", "validator": {}}, &mut c);
         assert_eq!(reply.get_i32("code").unwrap(), 26);
         assert_eq!(reply.get_str("codeName").unwrap(), "NamespaceNotFound");
+    }
+
+    #[test]
+    fn explain_find_collscan_shape() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s);
+        let reply = dispatch(&doc! {"explain": {"find": "c", "filter": {"x": 1}}}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        let qp = reply.get_document("queryPlanner").unwrap();
+        assert_eq!(qp.get_str("namespace").unwrap(), "t.c");
+        let wp = qp.get_document("winningPlan").unwrap();
+        assert_eq!(wp.get_str("stage").unwrap(), "COLLSCAN");
+        // default verbosity (executionStats) includes the stats block.
+        assert!(reply.get_document("executionStats").is_ok());
+    }
+
+    #[test]
+    fn explain_query_planner_verbosity_omits_exec_stats() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"explain": {"find": "c"}, "verbosity": "queryPlanner"},
+            &mut c,
+        );
+        assert!(reply.get_document("queryPlanner").is_ok());
+        assert!(reply.get("executionStats").is_none());
+    }
+
+    #[test]
+    fn explain_invalid_verbosity_is_bad_value() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"explain": {"find": "c"}, "verbosity": "bogus"},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 2);
+        assert_eq!(reply.get_str("codeName").unwrap(), "BadValue");
+    }
+
+    #[test]
+    fn explain_with_majority_write_concern_rejected() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"explain": {"find": "c"}, "writeConcern": {"w": "majority"}},
+            &mut c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 72);
+        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidOptions");
+    }
+
+    #[test]
+    fn explain_aggregate_has_cursor_stages() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"explain": {"aggregate": "c", "pipeline": [{"$match": {"x": 1}}]}},
+            &mut c,
+        );
+        let stages = reply.get_array("stages").unwrap();
+        assert!(stages[0].as_document().unwrap().contains_key("$cursor"));
     }
 
     #[test]

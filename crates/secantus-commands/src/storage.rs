@@ -344,6 +344,23 @@ pub trait Storage: Send + Sync {
         self.find(db, coll, filter, sort, hint)
     }
 
+    /// The plan `find` would use for these args, without executing — the input to
+    /// `explain`'s `winningPlan`. Returns `{kind: "COLLSCAN"}` or
+    /// `{kind: "IXSCAN", indexName, keyPattern, direction}`. Default COLLSCAN; the
+    /// WT adapter mirrors the storage index router.
+    fn explain_plan(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _filter: &Document,
+        _sort: Option<&Document>,
+        _hint: Option<RawHint<'_>>,
+    ) -> Result<Document, StorageError> {
+        let mut d = Document::new();
+        d.insert("kind", "COLLSCAN");
+        Ok(d)
+    }
+
     // --- DDL / introspection ------------------------------------------------
     //
     // These carry default no-op/empty implementations so test fakes that don't
