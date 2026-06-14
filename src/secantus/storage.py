@@ -2463,6 +2463,21 @@ class Storage:
             ]
         return [(id_k, bson.decode(blob)) for id_k, blob in raw]
 
+    def collection_min_id_key(self, db: str, coll: str) -> bytes | None:
+        """Smallest ``id_key`` in the collection — the oldest doc in natural
+        (insertion, for monotonic ``_id``) order — or ``None`` if empty.
+
+        Used to detect capped-collection rollover for tailable cursors: if a
+        cursor's last-returned ``id_key`` is below this, the document it was
+        anchored on has been evicted, and mongod kills the cursor with
+        ``CappedPositionLost``. ``_scan_docs`` yields in ``id_key`` order, so
+        the first row is the minimum — we stop after it.
+        """
+        with self._lock:
+            for id_k, _blob in self._scan_docs(db, coll):
+                return bytes(id_k)
+            return None
+
     def collection_is_capped(self, db: str, coll: str) -> bool:
         """Public predicate: does the collection have ``capped: true`` set?"""
         with self._lock:

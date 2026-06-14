@@ -1909,7 +1909,17 @@ def _find_tailable(
     state = {"after_id_key": watermark}
 
     def producer() -> list[dict[str, Any]]:
-        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=state["after_id_key"])
+        after = state["after_id_key"]
+        # Capped rollover detection: if the doc this cursor last returned
+        # (``after``) has been evicted — i.e. the collection's smallest
+        # ``id_key`` is now strictly greater than it — the cursor has been
+        # lapped and mongod kills it with ``CappedPositionLost``. A fresh
+        # cursor (``after is None``) has no anchor to lose.
+        if after is not None:
+            min_key = storage.collection_min_id_key(db_name, coll)
+            if min_key is None or min_key > after:
+                raise _CappedPositionLost
+        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=after)
         if not new_rows:
             return []
         state["after_id_key"] = new_rows[-1][0]
@@ -3187,6 +3197,27 @@ def _change_stream_fatal_reply(exc: changestreams.ChangeStreamFatalError) -> dic
     }
 
 
+class _CappedPositionLost(Exception):
+    """Raised by a capped-collection tailable producer when the document the
+    cursor was anchored on (its last-returned ``id_key``) has been evicted by
+    capped rollover. mongod kills such a cursor with code 136
+    ``CappedPositionLost``; pymongo swallows that error for tailable cursors
+    (it's in ``_CURSOR_CLOSED_ERRORS``) so the cursor simply reports
+    ``alive == False`` and the in-flight read returns no documents."""
+
+
+def _capped_position_lost_reply() -> dict[str, Any]:
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            "CollectionScan died due to failure to restore tailable cursor "
+            "position. Last seen record id: RecordId"
+        ),
+        "code": 136,
+        "codeName": "CappedPositionLost",
+    }
+
+
 def _drain_change_stream_producer(entry: Any) -> None:
     """Pull one producer batch into ``entry.remaining`` if it's empty.
 
@@ -3294,6 +3325,9 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     except changestreams.ChangeStreamFatalError as exc:
         ctx.cursors.kill([cursor_id])
         return _change_stream_fatal_reply(exc)
+    except _CappedPositionLost:
+        ctx.cursors.kill([cursor_id])
+        return _capped_position_lost_reply()
     if not entry.remaining and entry.await_data and not entry.invalidated:
         # PyMongo does not always pass maxTimeMS on getMore for change streams;
         # real mongod treats that as "wait indefinitely". We bound the wait so
@@ -3317,6 +3351,9 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         except changestreams.ChangeStreamFatalError as exc:
             ctx.cursors.kill([cursor_id])
             return _change_stream_fatal_reply(exc)
+        except _CappedPositionLost:
+            ctx.cursors.kill([cursor_id])
+            return _capped_position_lost_reply()
     return {
         "cursor": _change_stream_cursor_doc(
             entry, cursor_id, batch_size, ns, batch_key="nextBatch"
