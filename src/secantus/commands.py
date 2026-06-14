@@ -1876,6 +1876,11 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "BadValue",
             }
         await_data = bool(doc.get("awaitData", False))
+        # ``local.oplog.rs`` is a synthetic view over the oplog WT table; its
+        # entries have no ``_id``, so it needs a producer that tails by oplog
+        # seq rather than the doc-table id_key path ``_find_tailable`` uses.
+        if ctx.db_name == "local" and coll == "oplog.rs":
+            return _find_tailable_oplog(filter_, docs, batch_size, ns, await_data, ctx)
         return _find_tailable(coll, docs, batch_size, ns, await_data, ctx)
     if single_batch:
         first_batch, cursor_id = docs, 0
@@ -1948,6 +1953,55 @@ def _find_tailable(
             return []
         state["after_id_key"] = new_rows[-1][0]
         return [doc for _id_k, doc in new_rows]
+
+    cursor_id = ctx.cursors.register_tailable(
+        ns,
+        producer,
+        await_data=await_data,
+        initial_remaining=initial_remaining,
+    )
+    return {
+        "cursor": {
+            "firstBatch": first_batch,
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
+        },
+        "ok": 1.0,
+    }
+
+
+def _find_tailable_oplog(
+    filter_: dict[str, Any],
+    initial_docs: list[dict[str, Any]],
+    batch_size: int,
+    ns: str,
+    await_data: bool,
+    ctx: CommandContext,
+) -> dict[str, Any]:
+    """Build a tailable cursor over the synthetic ``local.oplog.rs`` view.
+
+    Oplog entries have no ``_id``, so (unlike ``_find_tailable``) the producer
+    can't anchor on the doc-table id_key. It anchors on the oplog *seq*: the
+    highest seq present when the cursor opens is captured, and each poll reads
+    rows past it via ``read_oplog``, applying the user filter. ``firstBatch``
+    is the already-matched entries from the initial ``find``; the standard
+    ``getMore`` awaitData path blocks on the oplog condition variable, waking
+    on any oplog write. This is what lets a client tail the oplog the way
+    replication does (pymongo's ``test_cursor.test_to_list_tailable``)."""
+    storage = ctx.storage
+    first_batch = initial_docs[:batch_size]
+    initial_remaining = initial_docs[batch_size:]
+    state = {"after_seq": storage.oplog_tail_seq()}
+
+    def producer() -> list[dict[str, Any]]:
+        rows = storage.read_oplog(start_seq=state["after_seq"] + 1, limit=1000)
+        if not rows:
+            return []
+        state["after_seq"] = rows[-1][0]
+        entries = [entry for _seq, entry in rows]
+        if filter_:
+            entries = [e for e in entries if matches(e, filter_)]
+        return entries
 
     cursor_id = ctx.cursors.register_tailable(
         ns,

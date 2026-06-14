@@ -19,6 +19,31 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Tailable cursors over `local.oplog.rs`
+
+A client can now tail the oplog the way replication does: `local.oplog.rs`
+accepts `TAILABLE_AWAIT` find cursors and streams oplog entries as they're
+written. Two pieces landed for this — the synthetic oplog view is now reported
+as a capped collection by `collection_is_capped` (so a tailable cursor isn't
+rejected), and a dedicated oplog tailable producer reads new entries by oplog
+seq (oplog documents have no `_id`, so the ordinary capped-collection tail path
+doesn't apply). `find().sort("$natural", ...)` is honoured against the view —
+the oplog's only meaningful order.
+
+To match mongod — whose oplog is never empty (its first entry is the replica
+set's "initiating set" noop) — a freshly-started server now seeds one bootstrap
+noop into the oplog, so a client can tail `local.oplog.rs` before any user
+write. The seed is an `op: "n"` entry (skipped by change-stream projection, so
+it never surfaces as a change event) and only fires on a truly fresh oplog.
+Closes the pymongo gauge's `test_cursor.test_to_list_tailable`.
+
+#### Added
+
+- `TAILABLE_AWAIT` find over `local.oplog.rs` (via `_find_tailable_oplog`), and
+  `$natural` sort on the oplog view.
+- A bootstrap oplog noop seeded at server start (`Storage.ensure_oplog_bootstrap`)
+  so `local.oplog.rs` is never empty, matching mongod.
+
 ### The Python server is pure Python — no Rust dependency — and preserves numeric types
 
 The `secantus` package no longer imports or calls any Rust component. The

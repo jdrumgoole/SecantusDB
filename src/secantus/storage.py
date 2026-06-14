@@ -1162,7 +1162,17 @@ class Storage:
         if filter:
             rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
         if sort:
-            rows = sort_docs(rows, sort)
+            # ``$natural`` is the oplog's only meaningful order: entries are
+            # already scanned in natural (seq == insertion == ts) order, so
+            # ``$natural: 1`` is the identity and ``$natural: -1`` reverses.
+            # It's a pseudo-field, not a document field, so it must not go
+            # through the generic field-sort (which would see it as missing).
+            natural = sort.get("$natural") if isinstance(sort, Mapping) else None
+            if natural is not None:
+                if int(natural) < 0:
+                    rows = list(reversed(rows))
+            else:
+                rows = sort_docs(rows, sort)
         if skip:
             rows = rows[skip:]
         if limit > 0:
@@ -1963,6 +1973,25 @@ class Storage:
                 # the daemon thread and silently disable expiry.
                 log.exception("ttl sweep failed")
 
+    def ensure_oplog_bootstrap(self) -> None:
+        """Seed a bootstrap noop on a *fresh* oplog so ``local.oplog.rs`` is
+        never empty — mirroring mongod, whose first oplog entry is the replica
+        set's "initiating set" noop. Without it a brand-new server's oplog has
+        zero rows and a client tailing ``local.oplog.rs`` (pymongo's
+        ``test_cursor.test_to_list_tailable``) finds nothing to read.
+
+        Called by :class:`SecantusDBServer` at startup (replica-set initiation
+        is a server/replication concern, not a storage-engine one — bare
+        ``Storage`` instances in unit tests keep a clean empty oplog). A noop
+        (``op: "n"``) is skipped by change-stream projection, so it never
+        surfaces as a change event. Idempotent: fires only when the oplog is
+        enabled and truly fresh (``_next_seq == 1``); reopening a populated
+        oplog is a no-op.
+        """
+        with self._lock:
+            if self.enable_oplog and self._next_seq == 1:
+                self._emit_oplog([{"op": "n", "ns": "", "o": {"msg": "initiating set"}}])
+
     def emit_noop_heartbeat(self) -> int:
         """Append one ``{op: "n"}`` heartbeat to the oplog and return its seq.
 
@@ -2479,8 +2508,15 @@ class Storage:
             return None
 
     def collection_is_capped(self, db: str, coll: str) -> bool:
-        """Public predicate: does the collection have ``capped: true`` set?"""
+        """Public predicate: does the collection have ``capped: true`` set?
+
+        The synthetic ``local.oplog.rs`` view is always capped (mongod models
+        the oplog as a capped collection) even though it isn't materialised in
+        the collections table — so tailable cursors over it are accepted.
+        """
         with self._lock:
+            if self._is_oplog_rs(db, coll):
+                return True
             opts = self._coll_options(db, coll) or {}
             return bool(opts.get("capped"))
 

@@ -135,13 +135,6 @@ the change-stream batch. Still open, precisely characterized:
   (clean mongod-shaped result + full/background rejection), and upsert with a
   `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
   "no upsert" sentinel). Still open:
-  - `test_to_list_tailable` — tails `local.oplog.rs` directly (a
-    `TAILABLE_AWAIT` find with `oplog_replay` + `$natural` sort + a `ts`
-    filter). Needs the internal oplog exposed as a queryable capped collection
-    with mongod's oplog-document shape, not merely listed. Larger,
-    borderline-internal feature; deferred. (`test_tailable` — capped-collection
-    tailable incl. CappedPositionLost rollover — fixed b37; `test_comment`
-    profiler op-class fixed b34.)
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
   - `test_error_code` / `test_index_filter` rejections (planner index-filter
     command surface).

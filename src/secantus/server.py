@@ -173,6 +173,10 @@ class SecantusDBServer:
             session_max=session_max,
             sync_on_commit=sync_on_commit,
         )
+        # Replica-set initiation: seed the bootstrap oplog noop so
+        # ``local.oplog.rs`` is never empty (mongod parity). No-op when the
+        # oplog is disabled or already populated.
+        self.storage.ensure_oplog_bootstrap()
         self.cursors = CursorRegistry()
         # Per-server counters surfaced through `serverStatus`. Started
         # eagerly so `start_monotonic` reflects construction time, not
