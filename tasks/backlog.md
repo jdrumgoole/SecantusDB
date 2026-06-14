@@ -128,16 +128,6 @@ The 2026-06-13 gauge-gaps slice fixed projection `_id`/array semantics,
 `maxBsonObjectSize` enforcement, snapshot readConcern + `$$NOW`, and most of
 the change-stream batch. Still open, precisely characterized:
 
-- [ ] **showExpandedEvents expanded-event shapes** — `createIndexes` /
-  `dropIndexes` events need mongod's `operationDescription` shape (indexes +
-  options), and `collMod` (`modify` events) isn't emitted to the oplog at all.
-  These tests HANG (pymongo's `iterateUntilDocumentOrError` polls getMore
-  forever waiting for the missing event) rather than assert-fail — 120s
-  pytest-timeouts in the gauge. Three of the seven spec tests pass already.
-- [ ] **Change-stream prose tests 13/14** (`test_resumetoken_uniterated_nonempty_batch_*`)
-  — after resuming with resumeAfter/startAfter and inserting docs, the first
-  getMore returns empty (`_has_next()` False). Resume positioning bug:
-  the resume path likely mis-pins `position_seq` relative to the token's seq.
 - [ ] **Cursor/collection misc from the 64-list** (task #14 of the slice).
   Fixed in the gauge-misc slice (2026-06-13): embedded-document equality is
   now order-sensitive + exact (real matcher correctness bug — `query_embedded`

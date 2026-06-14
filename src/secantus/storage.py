@@ -3849,19 +3849,49 @@ class Storage:
                         "o": {"drop": dst_coll},
                     }
                 )
+            rename_o: dict[str, Any] = {
+                "renameCollection": f"{src_db}.{src_coll}",
+                "to": f"{dst_db}.{dst_coll}",
+            }
+            if dst_existed and dst_ui is not None:
+                # mongod records the dropped target's UUID under ``dropTarget``
+                # in the rename oplog entry; the change-stream ``rename`` event
+                # surfaces it under ``operationDescription.dropTarget`` when
+                # ``showExpandedEvents`` is on.
+                rename_o["dropTarget"] = bson.Binary(dst_ui.bytes, subtype=4)
             entries.append(
                 {
                     "op": "c",
                     "ns": f"{src_db}.$cmd",
                     "ui": bson.Binary(ui.bytes, subtype=4),
-                    "o": {
-                        "renameCollection": f"{src_db}.{src_coll}",
-                        "to": f"{dst_db}.{dst_coll}",
-                    },
+                    "o": rename_o,
                 }
             )
             self._emit_oplog(entries)
             return True, None
+
+    def record_collmod(self, db: str, coll: str, description: dict[str, Any]) -> None:
+        """Emit a ``collMod`` command oplog entry so change streams watching
+        ``db`` / ``db.coll`` (with ``showExpandedEvents``) can surface a
+        ``modify`` event. ``description`` carries the changed options (empty
+        for a no-op ``collMod``); it becomes the event's
+        ``operationDescription``. The collection's option mutation has already
+        been applied by the caller via :meth:`set_collection_options`.
+        """
+        with self._lock:
+            if self._coll_options(db, coll) is None:
+                return
+            ui = self._collection_uuid(db, coll)
+            self._emit_oplog(
+                [
+                    {
+                        "op": "c",
+                        "ns": f"{db}.$cmd",
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": {"collMod": coll, **description},
+                    }
+                ]
+            )
 
     def list_collections(self, db: str) -> list[str]:
         self._refresh_read_snapshot()
