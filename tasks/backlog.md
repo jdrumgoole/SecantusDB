@@ -143,8 +143,6 @@ the change-stream batch. Still open, precisely characterized:
     tailable incl. CappedPositionLost rollover — fixed b37; `test_comment`
     profiler op-class fixed b34.)
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
-  - `showRecordId` + `returnKey` combo (`test_A_successful_find_with_showRecordId`)
-    — returnKey replaces docs with index keys; fiddly, 1 test.
   - custom-types decode edges (`test_aggregate_w_custom_type`,
     `test_find_one_and__w_custom_type`) — driver type-registry round-trips.
   - `test_error_code` / `test_index_filter` rejections (planner index-filter
