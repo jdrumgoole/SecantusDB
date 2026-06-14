@@ -19,6 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Tailable cursors die on capped-collection rollover
+
+A tailable cursor over a capped collection now dies with `CappedPositionLost`
+when the collection rolls over and evicts the document the cursor was anchored
+on — exactly as `mongod` does. Before, the cursor would blithely keep
+streaming the post-rollover documents instead of recognising it had been
+lapped. The server detects this by comparing the cursor's last-returned
+position against the collection's current oldest document; if the anchor has
+been evicted it returns error 136, which `pymongo` swallows for tailable
+cursors (the cursor reports `alive == False` and the in-flight read yields
+nothing). Closes the pymongo gauge's `test_cursor.test_tailable`.
+
+#### Fixed
+
+- Tailable cursors on capped collections now surface `CappedPositionLost`
+  (code 136) when rollover evicts their anchor document, instead of
+  continuing to stream the rolled-over documents.
+
 ### Change streams report create, modify, and richer DDL events
 
 Change streams opened with `showExpandedEvents: true` now surface the full

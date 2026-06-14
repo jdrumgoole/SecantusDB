@@ -135,9 +135,13 @@ the change-stream batch. Still open, precisely characterized:
   (clean mongod-shaped result + full/background rejection), and upsert with a
   `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
   "no upsert" sentinel). Still open:
-  - `$comment` surfacing in currentOp/profiler (`test_comment`).
-  - tailable cursors on capped collections (`test_tailable`,
-    `test_to_list_tailable`) — non-changestream tailables need capped+tailable.
+  - `test_to_list_tailable` — tails `local.oplog.rs` directly (a
+    `TAILABLE_AWAIT` find with `oplog_replay` + `$natural` sort + a `ts`
+    filter). Needs the internal oplog exposed as a queryable capped collection
+    with mongod's oplog-document shape, not merely listed. Larger,
+    borderline-internal feature; deferred. (`test_tailable` — capped-collection
+    tailable incl. CappedPositionLost rollover — fixed b37; `test_comment`
+    profiler op-class fixed b34.)
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
   - `showRecordId` + `returnKey` combo (`test_A_successful_find_with_showRecordId`)
     — returnKey replaces docs with index keys; fiddly, 1 test.
