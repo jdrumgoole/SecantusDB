@@ -264,11 +264,18 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       modes, `whenNotMatched` insert/discard/fail). 9 unit tests over a stateful
       `FakeStorage` + a pymongo→Rust→WiredTiger e2e. **+14 on the R8 rust-server
       gauge (809 → 823; `test_crud_unified` 217 → 229), zero regressions.**
-    - **Still deferred:** `$geoNear` / `$graphLookup` (need the geo index planner
-      on the storage seam — still `BadValue`); `$lookup` nested in `$facet`
-      (facet sub-pipelines run inside the storage-free core); `$merge`
-      pipeline-form `whenMatched` + `on`-field unique-index validation;
-      `collation`.
+    - **`$geoNear` ✅ DONE** — brute-force COLLSCAN at the command layer
+      (`secantus_core::geo::point_distance`: haversine metres for spherical /
+      planar otherwise): per-doc distance from `key` to `near`, `query`
+      pre-filter, min/max-distance filter (on the raw distance), ascending sort,
+      `distanceField` (× `distanceMultiplier`) + `includeLocs` attach. GeoJSON
+      `near` ⇒ spherical, legacy `[x,y]` ⇒ planar unless `spherical:true`.
+      Gauge-flat (the curated pymongo set doesn't exercise `$geoNear`) but
+      e2e-verified + 2 unit tests; closes the aggregate-stage surface.
+    - **Still deferred:** `$graphLookup`; `$geoNear` `key`-inference from a geo
+      index (explicit `key` required); `$lookup` nested in `$facet` (facet
+      sub-pipelines run inside the storage-free core); `$merge` pipeline-form
+      `whenMatched` + `on`-field unique-index validation.
   - **`distinct` ✅ DONE** — fetch matching docs via `find`, resolve the dotted
     `key` (flattening one array level), dedup by BSON equality. Collation
     deferred. 5 tests.

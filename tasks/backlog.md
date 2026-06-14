@@ -289,14 +289,17 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   Diagnose before trusting week-over-week go comparisons.
 - [~] **`aggregate` storage-backed stages** — DONE: `$lookup` (simple +
   `let`/`pipeline` forms), `$sample`, `$collStats`, `$indexStats`, `$out`,
-  `$merge` (deep-merge default + replace/keepExisting/delete/fail modes). A
+  `$merge` (deep-merge default + replace/keepExisting/delete/fail modes),
+  `$geoNear` (brute-force COLLSCAN via `secantus_core::geo::point_distance` —
+  near/distanceField/key/query/min+maxDistance/distanceMultiplier/includeLocs/
+  spherical; GeoJSON near ⇒ spherical, legacy `[x,y]` ⇒ planar). A
   `run_segmented` executor in `secantus-commands::aggregate` interleaves the
   storage-free core engine with these command-layer stages; `$lookup` `let`
-  expressions are evaluated. **Still deferred:** `$geoNear` / `$graphLookup`
-  (need the geo index planner on the storage seam); `$lookup` nested inside
-  `$facet` (facet sub-pipelines run in the storage-free core → Fallback);
-  `$merge` pipeline-form `whenMatched` + `on`-field unique-index validation;
-  `collation`.
+  expressions are evaluated; `collation` threads through `$match`/`$sort`.
+  **Still deferred:** `$graphLookup`; `$geoNear` `key`-inference from a geo index
+  (explicit `key` required); `$lookup` nested inside `$facet` (facet sub-pipelines
+  run in the storage-free core → Fallback); `$merge` pipeline-form `whenMatched`
+  + `on`-field unique-index validation.
 - [x] **`distinct` + DDL/introspection** — `distinct`, `create`, `drop`,
   `listCollections`, `listIndexes`, `createIndexes`, `dropIndexes` (the `Storage`
   trait gained the list/DDL methods; the R4b adapter forwards them).

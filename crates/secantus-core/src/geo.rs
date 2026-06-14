@@ -333,6 +333,23 @@ pub fn op_geo_near(values: &[Option<Bson>], arg: &Bson, default_spherical: bool)
     Ok(false)
 }
 
+/// Distance from `near` (lng, lat) to the point geometry in `value`, for
+/// `$geoNear`'s `distanceField`. Metres (great-circle / haversine) when
+/// `spherical`, planar units otherwise. `None` when `value` isn't a point
+/// geometry (GeoJSON `Point` or legacy `[x, y]`). Mirrors `geo.distance` for the
+/// point case. Sort-by-distance is the command layer's job.
+pub fn point_distance(near: (f64, f64), value: &Bson, spherical: bool) -> Option<f64> {
+    let p = match parse_doc_geometry(value) {
+        Some(Geometry::Point(pt)) => (pt.x(), pt.y()),
+        _ => return None,
+    };
+    Some(if spherical {
+        haversine(near.0, near.1, p.0, p.1) * EARTH_RADIUS_METERS
+    } else {
+        ((near.0 - p.0).powi(2) + (near.1 - p.1).powi(2)).sqrt()
+    })
+}
+
 // --- 2d geohash index support (geo-2) -------------------------------------
 //
 // `2d` indexes bucket a planar point into a bit-interleaved (Z-order) geohash.

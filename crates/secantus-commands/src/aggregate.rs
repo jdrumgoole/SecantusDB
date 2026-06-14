@@ -18,9 +18,13 @@
 //! buffered run of storage-free stages through `apply_pipeline`, then applies the
 //! storage-backed stage, repeating.
 //!
+//! `$geoNear` runs here too (brute-force COLLSCAN: distance from each doc's `key`
+//! to `near` via `secantus_core::geo::point_distance`, min/max filter, ascending
+//! sort, `distanceField`/`includeLocs` attach) — `key` must be explicit
+//! (geo-index inference deferred).
+//!
 //! **Deferred (documented so parity is honest):**
-//! * **`$geoNear`** — needs the geo index planner threaded through the storage
-//!   seam; still surfaces as `BadValue`. `$graphLookup` likewise.
+//! * **`$graphLookup`** — not ported; surfaces as `BadValue`.
 //! * **`$lookup` inside `$facet`** — `$facet` sub-pipelines run inside the
 //!   storage-free core, so a storage-backed stage nested in a facet still
 //!   Fallbacks. **`$merge` pipeline-form `whenMatched`** and **`on`-field
@@ -129,14 +133,14 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     })
 }
 
-/// Stages handled at the command layer (they touch storage), rather than by the
-/// storage-free `secantus_core` pipeline engine. Everything else flows through
-/// `apply_pipeline`. `$geoNear` is intentionally absent — it needs the geo index
-/// planner threaded through the storage seam and still surfaces as `BadValue`.
+/// Stages handled at the command layer (they read/write storage or need a
+/// brute-force scan), rather than by the storage-free `secantus_core` pipeline
+/// engine. Everything else flows through `apply_pipeline`. `$graphLookup` is
+/// absent — not ported, so it Fallbacks to `BadValue`.
 fn is_storage_backed(name: &str) -> bool {
     matches!(
         name,
-        "$lookup" | "$sample" | "$collStats" | "$indexStats" | "$out" | "$merge"
+        "$lookup" | "$sample" | "$collStats" | "$indexStats" | "$out" | "$merge" | "$geoNear"
     )
 }
 
@@ -236,6 +240,7 @@ fn apply_storage_stage(
         "$indexStats" => apply_index_stats(db, coll, storage),
         "$out" => apply_out(spec, docs, db, storage),
         "$merge" => apply_merge(spec, docs, db, storage),
+        "$geoNear" => apply_geo_near(spec, docs, vars),
         _ => Err(bad_value(format!(
             "unsupported storage-backed stage {name}"
         ))),
@@ -403,6 +408,110 @@ fn sample_seed() -> Option<u64> {
     std::env::var("SECANTUS_SAMPLE_SEED")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// A BSON number (int32 / int64 / double) as `f64`.
+fn bson_f64(b: &Bson) -> Option<f64> {
+    match b {
+        Bson::Double(d) => Some(*d),
+        Bson::Int32(i) => Some(*i as f64),
+        Bson::Int64(i) => Some(*i as f64),
+        _ => None,
+    }
+}
+
+/// `$geoNear` — proximity search with attached distances. Mirrors
+/// `aggregate._stage_geo_near`: optional `query` pre-filter, distance from each
+/// doc's `key` field to `near` (`secantus_core::geo::point_distance`), drop docs
+/// outside `[minDistance, maxDistance]`, attach the distance (× `distanceMultiplier`)
+/// under `distanceField`, optionally echo the raw geometry under `includeLocs`,
+/// and return ascending by distance. A GeoJSON Point `near` is spherical; a
+/// legacy `[x, y]` is planar unless `spherical: true`.
+///
+/// **Deferred:** `key`-inference from a geo index (we require an explicit `key`,
+/// erroring otherwise — real mongod infers it from the sole geo index).
+fn apply_geo_near(
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    vars: &Document,
+) -> Result<Vec<Document>, CommandError> {
+    let spec = spec
+        .and_then(Bson::as_document)
+        .ok_or_else(|| bad_value("$geoNear requires a document spec"))?;
+    let distance_field = spec
+        .get_str("distanceField")
+        .map_err(|_| bad_value("$geoNear requires a string `distanceField`"))?;
+    let key = spec.get_str("key").map_err(|_| {
+        bad_value("$geoNear requires a string `key` (geo-index inference deferred)")
+    })?;
+    let (spherical, center) = match spec.get("near") {
+        Some(Bson::Document(d)) if d.get_str("type").ok() == Some("Point") => {
+            let coords = d
+                .get_array("coordinates")
+                .map_err(|_| bad_value("$geoNear `near` Point needs coordinates"))?;
+            if coords.len() != 2 {
+                return Err(bad_value("$geoNear `near` Point needs [lng, lat]"));
+            }
+            let (x, y) = (bson_f64(&coords[0]), bson_f64(&coords[1]));
+            (
+                true,
+                (
+                    x.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
+                    y.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
+                ),
+            )
+        }
+        Some(Bson::Array(a)) if a.len() == 2 => {
+            let sph = spec.get_bool("spherical").unwrap_or(false);
+            let (x, y) = (bson_f64(&a[0]), bson_f64(&a[1]));
+            (
+                sph,
+                (
+                    x.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
+                    y.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
+                ),
+            )
+        }
+        _ => {
+            return Err(bad_value(
+                "$geoNear `near` must be a GeoJSON Point or [x, y]",
+            ))
+        }
+    };
+    let pre_filter = spec.get("query").and_then(Bson::as_document);
+    let multiplier = spec
+        .get("distanceMultiplier")
+        .and_then(bson_f64)
+        .unwrap_or(1.0);
+    let max_distance = spec.get("maxDistance").and_then(bson_f64);
+    let min_distance = spec.get("minDistance").and_then(bson_f64);
+    let include_locs = spec.get_str("includeLocs").ok();
+
+    let mut scored: Vec<(f64, Document)> = Vec::new();
+    for doc in docs {
+        if let Some(pf) = pre_filter {
+            if !secantus_core::query::matches(&doc, pf, vars, None).unwrap_or(false) {
+                continue;
+            }
+        }
+        let Some(value) = secantus_core::get_path(&doc, key).cloned() else {
+            continue;
+        };
+        let Some(d) = secantus_core::geo::point_distance(center, &value, spherical) else {
+            continue;
+        };
+        if max_distance.is_some_and(|mx| d > mx) || min_distance.is_some_and(|mn| d < mn) {
+            continue;
+        }
+        let mut out = doc;
+        set_field_path(&mut out, distance_field, Bson::Double(d * multiplier));
+        if let Some(loc_field) = include_locs {
+            set_field_path(&mut out, loc_field, value);
+        }
+        scored.push((d, out));
+    }
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(scored.into_iter().map(|(_, d)| d).collect())
 }
 
 /// `$collStats` — first-stage collection statistics. Minimal but driver-faithful
@@ -978,15 +1087,66 @@ mod tests {
     fn aggregate_unsupported_stage_is_bad_value() {
         let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1}]);
         let mut c = ctx(s);
-        // $geoNear still needs the geo storage seam → the Rust engine Fallbacks.
+        // $graphLookup isn't ported → the Rust engine Fallbacks to BadValue.
         let reply = dispatch(
             &doc! {"aggregate": "c", "pipeline": [
-                {"$geoNear": {"near": [0, 0], "distanceField": "d"}}
+                {"$graphLookup": {"from": "o", "startWith": "$x", "connectFromField": "x", "connectToField": "y", "as": "g"}}
             ], "cursor": {}},
             &mut c,
         );
         assert_eq!(reply.get_i32("code").unwrap(), 2);
         assert_eq!(reply.get_str("codeName").unwrap(), "BadValue");
+    }
+
+    #[test]
+    fn geo_near_sorts_by_distance_and_attaches_field() {
+        let s = FakeStorage::seed(
+            "t",
+            "c",
+            vec![
+                doc! {"_id": 1, "loc": [0.0, 0.0]},
+                doc! {"_id": 2, "loc": [3.0, 4.0]},
+                doc! {"_id": 3, "loc": [1.0, 0.0]},
+            ],
+        );
+        let mut c = ctx(s);
+        // Planar near at origin; ascending by distance → 1 (0), 3 (1), 2 (5).
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$geoNear": {"near": [0.0, 0.0], "key": "loc", "distanceField": "d"}}
+            ], "cursor": {}},
+            &mut c,
+        );
+        let out = docs_of(&reply);
+        let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+        assert_eq!(ids, vec![1, 3, 2]);
+        let dists: Vec<f64> = out.iter().map(|d| d.get_f64("d").unwrap()).collect();
+        assert_eq!(dists, vec![0.0, 1.0, 5.0]);
+    }
+
+    #[test]
+    fn geo_near_max_distance_and_multiplier() {
+        let s = FakeStorage::seed(
+            "t",
+            "c",
+            vec![
+                doc! {"_id": 1, "loc": [0.0, 0.0]},
+                doc! {"_id": 2, "loc": [3.0, 4.0]},
+            ],
+        );
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$geoNear": {"near": [0.0, 0.0], "key": "loc", "distanceField": "d",
+                              "maxDistance": 2.0, "distanceMultiplier": 10.0}}
+            ], "cursor": {}},
+            &mut c,
+        );
+        let out = docs_of(&reply);
+        // only _id:1 within maxDistance 2; distance 0 * 10 = 0.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get_i32("_id").unwrap(), 1);
+        assert_eq!(out[0].get_f64("d").unwrap(), 0.0);
     }
 
     #[test]
