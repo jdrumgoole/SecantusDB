@@ -159,21 +159,6 @@ the change-stream batch. Still open, precisely characterized:
   Expected-red (single-node topology): the 3 `test_transactions_unified`
   secondary-readPreference tests.
 
-### 3.5 Partial-index range query with residual field
-
-`pymongo test_index_filter` is partly fixed: bad `partialFilterExpression`
-is now rejected, an equality query that implies an operator-form partial
-filter uses the index (sound range-implication in
-`Storage._query_implies_partial`), and `explain` reports `isPartial`. Still
-open: the test's second explain assertion uses a RANGE on the indexed field
-plus a residual equality (`find({x: {$gt: 1}, a: 1})` against a single-field
-index on `x`, partial on `a`). The picker has no "single-field index whose
-leading field has a range, other filter fields residual" path for the >1-field
-case — it only handles all-equality (`_pick_compound_eq_index`) or compound
-indexes (`_pick_compound_range_index`). Adding a single-field-leading-range
-path (in both `_try_index_lookup` and `explain_plan`, threading the partial
-implication) would close it.
-
 ## 4. Out of scope (intentional, with reasoning)
 
 These are explicit non-goals. Don't add them without a reason.

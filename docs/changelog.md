@@ -19,6 +19,28 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Partial indexes serve range-on-indexed-field queries with a residual clause
+
+A query that puts a range on a partial index's indexed field and an extra
+clause that the index's partial filter absorbs now uses the index — e.g.
+`find({x: {$gt: 1}, a: 1})` against an index on `x` with
+`partialFilterExpression: {a: {$lte: 1.5}}`. The `x` range rides the index,
+the `a: 1` clause is implied by the partial filter (so the index's existence
+already guarantees it) and is rechecked by the exact post-scan matcher, and
+`explain` reports `IXSCAN` with `isPartial: true`. Previously any multi-field
+filter fell off the single-field index path to a COLLSCAN.
+
+The relaxation is deliberately conservative: only *partial* indexes get this
+treatment, and only when every residual field is a partial-filter field, so a
+non-partial residual still keeps the query on a collection scan. This closes
+the last open assertion in the pymongo gauge's `test_collection.test_index_filter`.
+
+#### Changed
+
+- The single-field index lookup and its `explain` mirror now accept a
+  multi-field filter when the non-indexed fields are absorbed by an implied
+  partial filter, via a shared `_single_field_partial_residual_match` selector.
+
 ### Tailable cursors die on capped-collection rollover
 
 A tailable cursor over a capped collection now dies with `CappedPositionLost`

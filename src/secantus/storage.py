@@ -3242,18 +3242,28 @@ class Storage:
             picked = self._pick_compound_range_index(db, coll, filter, collation=collation)
             if picked is not None:
                 return picked
-        if len(filter) != 1:
-            return None
-        field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
-        if idx_match is None:
-            return None
-        if isinstance(value, dict):
-            if not value or not all(k.startswith("$") for k in value):
+        if len(filter) == 1:
+            field, value = next(iter(filter.items()))
+            idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
+            if idx_match is None:
                 return None
-            if not all(op in self._RANGE_OPS for op in value):
+            if isinstance(value, dict):
+                if not value or not all(k.startswith("$") for k in value):
+                    return None
+                if not all(op in self._RANGE_OPS for op in value):
+                    return None
+            name, _direction, _is_compound = idx_match
+            key_spec = self._key_spec_for(db, coll, name)
+            if key_spec is None:
                 return None
-        name, _direction, _is_compound = idx_match
+            return name, key_spec
+        # Multi-field filter: mirror the lookup's single-field + partial-absorbed
+        # residual path so explain reports IXSCAN (with isPartial) where the
+        # query would actually use the index.
+        match = self._single_field_partial_residual_match(db, coll, filter, collation=collation)
+        if match is None:
+            return None
+        name = match[2][0]
         key_spec = self._key_spec_for(db, coll, name)
         if key_spec is None:
             return None
@@ -4790,6 +4800,49 @@ class Storage:
             return None
         return self._docs_by_id_keys(db, coll, id_keys)
 
+    def _single_field_partial_residual_match(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
+    ) -> tuple[str, Any, tuple[str, int, bool]] | None:
+        """For a *multi-field* filter, find a single-field index whose leading
+        field serves one clause while every **other** filter field is absorbed
+        by the index's (implied) partial filter.
+
+        e.g. ``find({x: {$gt: 1}, a: 1})`` against an index on ``x`` partial on
+        ``{a: {$lte: 1.5}}``: ``x``'s range rides the index, the ``a: 1`` clause
+        is partial-implied (so the index's very existence guarantees it) and is
+        rechecked by the exact ``matches()`` pass in ``find_matching``. Returns
+        ``(field, value, idx_match)`` or ``None``.
+
+        Conservative by design: only *partial* indexes get this treatment, and
+        only when the residual fields are exactly partial-filter fields — a
+        non-partial residual keeps the query on COLLSCAN, mirroring the
+        bare-equality path's ``eff_fields - set(pf)`` philosophy. Shared by the
+        lookup (``_try_index_id_keys``) and explain (``_pick_index_for_filter``)
+        dispatchers so they never diverge.
+        """
+        partials = self._partial_filters(db, coll)
+        for field, value in filter.items():
+            if isinstance(value, dict) and (
+                not value or not all(op in self._RANGE_OPS for op in value)
+            ):
+                continue
+            idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
+            if idx_match is None:
+                continue
+            name = idx_match[0]
+            pf = partials.get(name)
+            if pf is None:
+                continue
+            if not (set(filter) - {field}).issubset(set(pf)):
+                continue
+            return field, value, idx_match
+        return None
+
     def _try_index_id_keys(
         self,
         db: str,
@@ -4844,12 +4897,20 @@ class Storage:
             result = self._try_compound_range_id_keys(db, coll, filter, collation=collation)
             if result is not None:
                 return result
-        if len(filter) != 1:
+        if len(filter) == 1:
+            field, value = next(iter(filter.items()))
+            idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
+            if idx_match is None:
+                return None
+            return self._lookup_id_keys_via_leading_field(
+                db, coll, idx_match, value, collation=collation
+            )
+        # Multi-field filter: a single-field index can still serve it when every
+        # other filter field is absorbed by the index's (implied) partial filter.
+        match = self._single_field_partial_residual_match(db, coll, filter, collation=collation)
+        if match is None:
             return None
-        field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
-        if idx_match is None:
-            return None
+        _field, value, idx_match = match
         return self._lookup_id_keys_via_leading_field(
             db, coll, idx_match, value, collation=collation
         )
