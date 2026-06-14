@@ -24,7 +24,7 @@ use secantus_commands::storage::{
     Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
-use secantus_storage::{Hint, Storage as WtStorage, StorageError as WtError};
+use secantus_storage::{ExplainPlan, Hint, Storage as WtStorage, StorageError as WtError};
 
 /// Wraps a shared WiredTiger-backed `Storage` and presents it as the command
 /// layer's `Storage`. Construct with [`StorageAdapter::new`] and hand the
@@ -373,6 +373,38 @@ impl CmdStorage for StorageAdapter {
 
     fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
         self.inner.get_collection_options(db, coll).map_err(map_err)
+    }
+
+    fn explain_plan(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        hint: Option<RawHint<'_>>,
+    ) -> Result<Document, StorageError> {
+        let resolved = hint.map(to_hint);
+        let plan = self
+            .inner
+            .explain_plan_with(db, coll, filter, sort, resolved.as_ref())
+            .map_err(map_err)?;
+        let mut d = Document::new();
+        match plan {
+            ExplainPlan::CollScan => {
+                d.insert("kind", "COLLSCAN");
+            }
+            ExplainPlan::IxScan {
+                index_name,
+                key_pattern,
+                direction,
+            } => {
+                d.insert("kind", "IXSCAN");
+                d.insert("indexName", index_name);
+                d.insert("keyPattern", Bson::Document(key_pattern));
+                d.insert("direction", direction);
+            }
+        }
+        Ok(d)
     }
 
     fn set_collection_options(

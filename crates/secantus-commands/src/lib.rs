@@ -239,6 +239,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "create" => admin::create,
         "collMod" => admin::coll_mod,
         "collmod" => admin::coll_mod,
+        "explain" => admin::explain,
         "drop" => admin::drop,
         "listCollections" => admin::list_collections,
         "listIndexes" => admin::list_indexes,

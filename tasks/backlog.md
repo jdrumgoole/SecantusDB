@@ -435,6 +435,18 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
   `secantus` RS can't satisfy it, but the write still happens (mirrors mongod +
   the Python server's `_unsatisfiable_wc_error`). One central place covers every
   write command. **+7 gauge (`test_collection`).**
+- [x] **`explain` command.** `secantus-commands::admin::explain` ports
+  `commands._explain`: parses the wrapped `find` / `aggregate` / `count` inner
+  command, lifts a leading `$match` for aggregate, rejects a journaled /
+  `w:"majority"` writeConcern (72 `InvalidOptions`), validates `verbosity`
+  (`queryPlanner` / `executionStats` / `allPlansExecution`, else 2 `BadValue`),
+  shapes `queryPlanner.winningPlan` (`FETCH` wrapping an `IXSCAN` inputStage with
+  `indexName` / `keyPattern` / `direction`, or a bare `COLLSCAN`) via the trait's
+  new `explain_plan` method (default → COLLSCAN; WT adapter converts the storage
+  `ExplainPlan`), plus an `executionStats` block (runs `find_collated` to count
+  `nReturned`) above `queryPlanner` verbosity, and the aggregate
+  `stages: [{$cursor: {queryPlanner, …}}, …]` wrapper drivers look for. Collation /
+  collectionless explain forces COLLSCAN.
 - [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
   *value validation* (malformed `w`/`wtimeout`); `validator` on update/replace;
   `_reject_oplog_rs_write`; view-collection `count` (needs the aggregation

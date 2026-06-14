@@ -245,7 +245,24 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       option-methods. Non-ASCII / `numericOrdering` collation → `BadValue`.
       Deferred: collection-default collation, `$elemMatch` sub-query collation,
       per-index-collation IXSCAN.
-    - **Still deferred (backlog §7):** `validator` / `writeConcern`.
+    - **`validator` ✅ DONE (insert-time)** — `create` / `collMod` persist
+      `validator` + `validationLevel` / `validationAction` (and the other stored
+      collection options) via `set_collection_options`; `insert` enforces the
+      `validator` (code 121 `DocumentValidationFailure`) unless
+      `bypassDocumentValidation` or `validationAction` is `warn` / `off`. Deferred:
+      `update` / replace-time enforcement (needs the post-apply doc in storage).
+    - **`writeConcern` ✅ DONE (writeConcernError attachment)** — `dispatch`
+      attaches `{code:100, codeName:"CannotSatisfyWriteConcern"}` as a
+      `writeConcernError` when a request carries `writeConcern.w > 1` and the reply
+      is `ok:1` (single-node can't satisfy a multi-node concern).
+    - **`collMod` ✅ DONE** — merges the stored collection-option subset into an
+      existing collection (`NamespaceNotFound` 26 if missing).
+    - **`explain` ✅ DONE** — ports `commands._explain`: lifts a leading `$match`
+      for aggregate, rejects journaled / `w:"majority"` writeConcern (72), validates
+      `verbosity` (2), shapes `queryPlanner.winningPlan` (`FETCH`+`IXSCAN` or
+      `COLLSCAN`) via the trait's `explain_plan` + an `executionStats` block, and
+      adds the aggregate `stages: [{$cursor: …}]` wrapper. Collation / collectionless
+      forces COLLSCAN.
   - **`aggregate` ✅ DONE** (`secantus-commands::aggregate`, post-merge of PR #31)
     — port of `_aggregate`'s storage-independent path: fetch input via the
     `Storage` trait's `find` (lifting a leading `$match` into the fetch filter +
