@@ -213,6 +213,26 @@ pub trait Storage: Send + Sync {
         upsert: bool,
     ) -> Result<UpdateOutcome, StorageError>;
 
+    /// Pipeline-form update (`u: [ {$set: …}, … ]`): each matched doc is rewritten
+    /// by running the aggregation pipeline over it, diff-style in the oplog. The
+    /// default rejects it as a `BadValue` write error (test fakes don't implement
+    /// pipeline updates); the WiredTiger adapter forwards to
+    /// `Storage::update_matching_pipeline`.
+    fn update_matching_pipeline(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _filter: &Document,
+        _pipeline: &[Bson],
+        _multi: bool,
+        _upsert: bool,
+    ) -> Result<UpdateOutcome, StorageError> {
+        Err(StorageError::WriteError {
+            code: 2,
+            errmsg: "pipeline-form updates are not supported by this storage backend".into(),
+        })
+    }
+
     /// Delete up to `limit` documents matching `filter` (`0` ⇒ all).
     fn delete_matching(
         &self,

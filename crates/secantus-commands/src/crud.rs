@@ -10,9 +10,10 @@
 //! * Collection `validator` / `bypassDocumentValidation` (needs
 //!   `get_collection_options` + the query engine on the write path).
 //! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
-//! * Pipeline-form `u`, `arrayFilters`, `let`, `collation` on `update`; `let` /
-//!   `collation` on `delete`; view-collection `count` — none are in the Rust
-//!   storage seam yet (see each handler's doc + backlog §7).
+//! * `arrayFilters`, `let`, `collation` on `update`; `let` / `collation` on
+//!   `delete`; view-collection `count` — none are in the Rust storage seam yet
+//!   (see each handler's doc + backlog §7). Pipeline-form `u` is now applied via
+//!   `Storage::update_matching_pipeline` (diff-style oplog).
 
 use bson::{doc, Bson, Document};
 
@@ -181,15 +182,15 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
 ];
 
 /// `update` — batch update, one entry per `{q, u, multi?, upsert?}` spec. Ports
-/// `commands.py::_update`'s document-form path.
+/// `commands.py::_update`. Document-, replacement-, and pipeline-form `u` all
+/// apply (pipeline via `Storage::update_matching_pipeline`, diff-style oplog so
+/// change streams see `operationType: "update"`). A malformed pipeline still
+/// returns the faithful command-level `FailedToParse` (9) / `InvalidPipelineOperator`
+/// (168).
 ///
-/// **Deferred (tracked in backlog §7):** pipeline-form `u` (a valid `[...]`) —
-/// the Rust `update_matching` takes `&Document`, and `secantus-storage` has no
-/// pipeline-update path yet, so a *valid* pipeline surfaces as a per-op
-/// writeError rather than applying (a malformed pipeline still returns the
-/// faithful command-level `FailedToParse` / `InvalidPipelineOperator`). Also
-/// deferred: `arrayFilters`, `let`, `collation`, `validator`, `writeConcern`,
-/// `_reject_oplog_rs_write` (none are in the Rust `update_matching` seam yet).
+/// **Deferred (tracked in backlog §7):** `arrayFilters`, `let`, `collation`,
+/// `validator`, `writeConcern`, `_reject_oplog_rs_write` (none are in the Rust
+/// `update_matching` seam yet).
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
@@ -216,9 +217,14 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply());
         }
 
-        // Pipeline-form `u`: validate the shape up-front (real mongod returns a
-        // command-level error for a malformed/unknown stage, not a writeError).
-        if let Some(Bson::Array(stages)) = spec.get("u") {
+        let q = doc_field(spec, "q");
+        let multi = bool_field(spec, "multi", false);
+        let upsert = bool_field(spec, "upsert", false);
+
+        // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
+        let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
+            // Validate the shape up-front — real mongod returns a command-level
+            // error for a malformed/unknown stage, not a per-op writeError.
             for stage in stages {
                 match stage {
                     Bson::Document(s) if s.len() == 1 => {
@@ -242,23 +248,13 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     }
                 }
             }
-            // A well-formed pipeline update can't be applied yet (deferred).
-            write_errors.push(Bson::Document(doc! {
-                "index": index as i32,
-                "code": 2,
-                "errmsg": "pipeline-form updates are not yet supported by the Rust server",
-            }));
-            if ordered {
-                break;
-            }
-            continue;
-        }
+            storage.update_matching_pipeline(&ctx.db_name, &coll, &q, stages, multi, upsert)
+        } else {
+            let u = doc_field(spec, "u");
+            storage.update_matching(&ctx.db_name, &coll, &q, &u, multi, upsert)
+        };
 
-        let q = doc_field(spec, "q");
-        let u = doc_field(spec, "u");
-        let multi = bool_field(spec, "multi", false);
-        let upsert = bool_field(spec, "upsert", false);
-        match storage.update_matching(&ctx.db_name, &coll, &q, &u, multi, upsert) {
+        match outcome {
             Ok(outcome) => {
                 n += outcome.matched as i32;
                 n_modified += outcome.modified as i32;
@@ -335,6 +331,12 @@ mod tests {
     impl FakeStorage {
         fn arc() -> Arc<FakeStorage> {
             Arc::new(FakeStorage::default())
+        }
+        fn seed(&self, db: &str, coll: &str, docs: Vec<Document>) {
+            self.cols
+                .lock()
+                .unwrap()
+                .insert((db.to_string(), coll.to_string()), docs);
         }
     }
 
@@ -434,6 +436,52 @@ mod tests {
                 matched,
                 modified,
                 upserted_id,
+            })
+        }
+
+        fn update_matching_pipeline(
+            &self,
+            db: &str,
+            coll: &str,
+            filter: &Document,
+            pipeline: &[Bson],
+            multi: bool,
+            _upsert: bool,
+        ) -> Result<UpdateOutcome, StorageError> {
+            // Apply the pipeline to each matched doc (the real storage path).
+            let mut cols = self.cols.lock().unwrap();
+            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
+            let mut matched = 0usize;
+            let mut modified = 0usize;
+            for d in bucket.iter_mut() {
+                if !matches(d, filter) {
+                    continue;
+                }
+                matched += 1;
+                let out = secantus_core::aggregate::apply_pipeline(
+                    vec![d.clone()],
+                    pipeline,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(|_| StorageError::WriteError {
+                    code: 2,
+                    errmsg: "pipeline".into(),
+                })?;
+                if let Some(new) = out.into_iter().next() {
+                    if &new != d {
+                        *d = new;
+                        modified += 1;
+                    }
+                }
+                if !multi {
+                    break;
+                }
+            }
+            Ok(UpdateOutcome {
+                matched,
+                modified,
+                upserted_id: None,
             })
         }
 
@@ -748,16 +796,27 @@ mod tests {
     }
 
     #[test]
-    fn update_valid_pipeline_is_deferred_write_error() {
-        let mut c = ctx(FakeStorage::arc());
+    fn update_valid_pipeline_applies_via_storage() {
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        let db = c.db_name.clone();
+        s.seed(
+            &db,
+            "c",
+            vec![doc! {"_id": 1, "a": 0}, doc! {"_id": 2, "a": 0}],
+        );
         let reply = dispatch(
-            &doc! {"update": "c", "updates": [{"q": {}, "u": [{"$set": {"a": 1}}]}]},
+            &doc! {"update": "c", "updates": [
+                {"q": {}, "u": [{"$set": {"a": 1}}], "multi": true}
+            ]},
             &mut c,
         );
-        // Command still succeeds; the unsupported pipeline is a per-op writeError.
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        let we = reply.get_array("writeErrors").unwrap();
-        assert_eq!(we.len(), 1);
-        assert_eq!(we[0].as_document().unwrap().get_i32("code").unwrap(), 2);
+        assert!(reply.get("writeErrors").is_none(), "pipeline now applies");
+        assert_eq!(reply.get_i32("n").unwrap(), 2);
+        assert_eq!(reply.get_i32("nModified").unwrap(), 2);
+        let cols = s.cols.lock().unwrap();
+        let bucket = cols.get(&(db, "c".to_string())).unwrap();
+        assert!(bucket.iter().all(|d| d.get_i32("a") == Ok(1)));
     }
 }

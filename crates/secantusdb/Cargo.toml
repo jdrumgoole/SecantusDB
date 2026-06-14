@@ -1,6 +1,6 @@
 [package]
 name = "secantusdb"
-version = "0.5.2-beta.17"
+version = "0.5.2-beta.18"
 edition = "2021"
 description = "Standalone SecantusDB server binary (Rust): WiredTiger-backed, MongoDB wire protocol."
 license = "GPL-2.0-only"

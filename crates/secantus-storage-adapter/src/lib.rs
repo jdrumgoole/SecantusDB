@@ -197,6 +197,26 @@ impl CmdStorage for StorageAdapter {
         })
     }
 
+    fn update_matching_pipeline(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        pipeline: &[Bson],
+        multi: bool,
+        upsert: bool,
+    ) -> Result<UpdateOutcome, StorageError> {
+        let o = self
+            .inner
+            .update_matching_pipeline(db, coll, filter, pipeline, multi, upsert)
+            .map_err(map_err)?;
+        Ok(UpdateOutcome {
+            matched: o.matched,
+            modified: o.modified,
+            upserted_id: o.upserted_id,
+        })
+    }
+
     fn delete_matching(
         &self,
         db: &str,

@@ -3240,6 +3240,63 @@ impl Storage {
         multi: bool,
         upsert: bool,
     ) -> Result<UpdateOutcome> {
+        // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
+        // top-level key) drives the oplog shape: a replacement emits the whole
+        // doc in `o`, an operator update a `{$v:2, diff}`.
+        let is_replacement = !update.keys().any(|k| k.starts_with('$'));
+        self.update_matching_core(
+            db,
+            coll,
+            filter,
+            multi,
+            upsert,
+            is_replacement,
+            &|doc, up| apply_update(doc, update, up).map_err(|_| StorageError::QueryUnsupported),
+        )
+    }
+
+    /// Pipeline-form update (`u: [ {$set: …}, … ]`). Each matched doc is rewritten
+    /// by running the aggregation pipeline over it (`apply_pipeline` on the single
+    /// doc); the `_id` is preserved by the pipeline stages (the allowed
+    /// `$set`/`$project`/`$replaceWith`/… never drop it). Always diff-style in the
+    /// oplog (`is_replacement = false`) so change streams report
+    /// `operationType: "update"` — mirrors `storage.update_matching`'s list branch.
+    /// On upsert with no match, the pipeline runs over the filter-seeded doc.
+    pub fn update_matching_pipeline(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        pipeline: &[Bson],
+        multi: bool,
+        upsert: bool,
+    ) -> Result<UpdateOutcome> {
+        self.update_matching_core(db, coll, filter, multi, upsert, false, &|doc, _up| {
+            let out = secantus_core::aggregate::apply_pipeline(
+                vec![doc.clone()],
+                pipeline,
+                &Document::new(),
+                None,
+            )
+            .map_err(|_| StorageError::QueryUnsupported)?;
+            out.into_iter().next().ok_or(StorageError::QueryUnsupported)
+        })
+    }
+
+    /// Shared match → rewrite → write → oplog/index path for both the
+    /// operator/replacement form and the pipeline form. `transform(doc, is_upsert)`
+    /// produces the new doc; `is_replacement` selects the oplog `o` shape.
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_core(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        multi: bool,
+        upsert: bool,
+        is_replacement: bool,
+        transform: &dyn Fn(&Document, bool) -> Result<Document>,
+    ) -> Result<UpdateOutcome> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         ensure_collection(&session, db, coll)?;
@@ -3252,7 +3309,6 @@ impl Storage {
         } else {
             None
         };
-        let is_replacement = !update.keys().any(|k| k.starts_with('$'));
 
         let mut matched = 0usize;
         let mut modified = 0usize;
@@ -3269,8 +3325,7 @@ impl Storage {
                 continue;
             }
             matched += 1;
-            let new =
-                apply_update(&doc, update, false).map_err(|_| StorageError::QueryUnsupported)?;
+            let new = transform(&doc, false)?;
             if new != doc {
                 if let Some(c) =
                     self.unique_conflict(&session, db, coll, &new, &descs, Some(&id_k))?
@@ -3331,8 +3386,7 @@ impl Storage {
                     seed.insert(k.clone(), v.clone());
                 }
             }
-            let mut new =
-                apply_update(&seed, update, true).map_err(|_| StorageError::QueryUnsupported)?;
+            let mut new = transform(&seed, true)?;
             if !new.contains_key("_id") {
                 new.insert("_id", Bson::ObjectId(ObjectId::new()));
             }

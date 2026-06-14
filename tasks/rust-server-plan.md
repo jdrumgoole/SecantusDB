@@ -209,11 +209,17 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     InvalidPipelineOperator 168), `update_matching` per spec with `multi` /
     `upsert`, error mapping (DuplicateKey → 11000, adapter-classified
     WriteError → per-op writeError, Internal → command-level), and the
-    `n` / `nModified` / `upserted` / `writeErrors` reply. 6 update tests (47 crate
-    total). **Deferred (backlog §7):** a *valid* pipeline-form `u` surfaces as a
-    per-op writeError (the Rust `update_matching` takes `&Document`;
-    `secantus-storage` has no pipeline-update path yet); `arrayFilters` / `let` /
-    `collation` / `validator` / `writeConcern` likewise pending storage-seam work.
+    `n` / `nModified` / `upserted` / `writeErrors` reply.
+    - **Pipeline-form `u` ✅ DONE** — `secantus-storage` gained
+      `update_matching_pipeline` (each matched doc rewritten by running the
+      aggregation pipeline over it; shares the match/write/oplog/index path with
+      `update_matching` via a transform closure; **always diff-style oplog** so
+      change streams report `operationType: "update"`, not `"replace"` — the
+      array-truncation spec). Threaded through the command `Storage` trait
+      (default rejects → adapter forwards) + handler; malformed stages still
+      surface 9 / 168 at command level; pipeline upsert seeds from the filter.
+    - **Still deferred (backlog §7):** `arrayFilters` / `let` / `collation` /
+      `validator` / `writeConcern` (pending storage-seam work).
   - **`aggregate` ✅ DONE** (`secantus-commands::aggregate`, post-merge of PR #31)
     — port of `_aggregate`'s storage-independent path: fetch input via the
     `Storage` trait's `find` (lifting a leading `$match` into the fetch filter +

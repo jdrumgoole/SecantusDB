@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-14 — SecantusDB 0.5.2b33 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-14 — SecantusDB 0.5.2b35 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -9,8 +9,8 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | Category | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
-| `test_bulk.py` | 29 | 5 | 0 | 4 | 38 | 85.3% |
-| `test_change_stream.py` | 70 | 36 | 0 | 49 | 155 | 66.0% |
+| `test_bulk.py` | 31 | 3 | 0 | 4 | 38 | 91.2% |
+| `test_change_stream.py` | 71 | 35 | 0 | 49 | 155 | 67.0% |
 | `test_collation.py` | 15 | 1 | 0 | 0 | 16 | 93.8% |
 | `test_collection.py` | 65 | 22 | 0 | 4 | 91 | 74.7% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
@@ -18,7 +18,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 229 | 72 | 0 | 185 | 486 | 76.1% |
+| `test_crud_unified.py` | 247 | 54 | 0 | 185 | 486 | 82.1% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 51 | 16 | 0 | 5 | 72 | 76.1% |
 | `test_custom_types.py` | 46 | 5 | 0 | 0 | 51 | 90.2% |
@@ -36,17 +36,15 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **823** | **205** | **0** | **475** | **1503** | **80.1%** |
+| **Overall** | **844** | **184** | **0** | **475** | **1503** | **82.1%** |
 
-## Failures (205)
+## Failures (184)
 
 First 30 failure node-ids for manual triage:
 
 ```
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_large_inserts_ordered
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_large_inserts_unordered
-vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_update_many_pipeline
-vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_update_one_pipeline
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_upsert_uuid_standard_subdocuments
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_raises_error_on_missing_id_418plus
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_read_concern
@@ -59,7 +57,6 @@ vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after_resume_process_with_changes
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after_resume_process_without_changes
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Change_Stream_should_allow_valid_aggregate_pipeline_stages
-vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_array_truncation
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_modified_structure_in_ns_document_MUST_NOT_err
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_newField_added_in_response_MUST_NOT_err
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_new_structure_in_ns_document_MUST_NOT_err
@@ -73,8 +70,11 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndP
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_disabled
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_enabled
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:off_with_changeStreamPreAndPostImages_disabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:off_with_changeStreamPreAndPostImages_enabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:required_with_changeStreamPreAndPostImages_disabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:required_with_changeStreamPreAndPostImages_enabled
 ```
-... and 175 more (see raw JSON).
+... and 154 more (see raw JSON).
 
 ## How this is generated
 
