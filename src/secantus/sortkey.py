@@ -37,40 +37,6 @@ from typing import Any
 import bson
 from bson import Binary, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
-from secantus import engine
-
-# The Rust core ports this module behind the "fat byte seam" — values cross the
-# boundary as the BSON bytes of a one-key wrapper ``{"v": value}``. Both engines
-# are supported; selection is process-wide via ``secantus.engine`` (see that
-# module / the ``SECANTUS_ENGINE`` env var). The pure-Python implementation
-# below is the default and the fallback. A collation is threaded through to the
-# Rust encoder, which handles the ASCII-safe cases and defers (so this Python
-# path runs) for non-ASCII normalisation — see ``secantus`` Rust ``collation``.
-try:
-    import _secantus_core as _rust
-except ImportError:  # extension not built (e.g. pure-Python install)
-    _rust = None
-
-
-def _rust_enabled() -> bool:
-    return _rust is not None and engine.enabled("sortkey")
-
-
-def _collation_to_bson(collation: Any) -> bytes:
-    # Wire form for the Rust core: {strength, caseLevel, numericOrdering}, or an
-    # empty doc for "no collation". The Rust side handles the ASCII-safe cases
-    # and returns None (-> pure-Python fallback) for non-ASCII normalisation.
-    if collation is None:
-        return bson.encode({})
-    return bson.encode(
-        {
-            "strength": int(collation.strength),
-            "caseLevel": bool(collation.case_level),
-            "numericOrdering": bool(collation.numeric_ordering),
-        }
-    )
-
-
 # Type ranks — must match storage._bson_type_rank.
 RANK_MINKEY = 1
 RANK_NULL = 2
@@ -325,10 +291,6 @@ def encode_value(value: Any, *, collation: Any = None) -> bytes:
     unchanged. Used by index-write and index-lookup paths to keep
     string entries collation-aware.
     """
-    if _rust_enabled():
-        res = _rust.sortkey_encode_value(bson.encode({"v": value}), _collation_to_bson(collation))
-        if res is not None:
-            return res
     rank = _rank(value)
     head = bytes([rank])
     if rank in (RANK_MINKEY, RANK_NULL, RANK_MAXKEY):
@@ -379,12 +341,6 @@ def invert_bytes(b: bytes) -> bytes:
 
 def encode_value_directed(value: Any, direction: int = 1, *, collation: Any = None) -> bytes:
     """Like ``encode_value`` but inverts bytes when ``direction == -1``."""
-    if _rust_enabled():
-        res = _rust.sortkey_encode_value_directed(
-            bson.encode({"v": value}), direction, _collation_to_bson(collation)
-        )
-        if res is not None:
-            return res
     e = encode_value(value, collation=collation)
     return invert_bytes(e) if direction == -1 else e
 

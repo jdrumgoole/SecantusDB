@@ -102,6 +102,24 @@ def test_update_many_with_inc(coll) -> None:
     assert {d["n"] for d in coll.find()} == {1}
 
 
+def test_inc_and_sum_preserve_int64_over_the_wire(coll) -> None:
+    """End-to-end: $inc over an Int64 field and $sum over Int64 values keep the
+    BSON 64-bit type through the wire, so a client codec that keys on Int64
+    round-trips. Mirrors pymongo's test_custom_types decoder tests."""
+    from bson import Int64
+
+    coll.insert_one({"_id": 1, "x": Int64(1)})
+    coll.update_one({"_id": 1}, {"$inc": {"x": 1}})
+    doc = coll.find_one({"_id": 1})
+    assert doc["x"] == 2 and isinstance(doc["x"], Int64)
+
+    coll.insert_many([{"g": "a", "q": Int64(10)}, {"g": "a", "q": Int64(10)}])
+    res = list(
+        coll.aggregate([{"$match": {"g": "a"}}, {"$group": {"_id": "$g", "t": {"$sum": "$q"}}}])
+    )
+    assert res[0]["t"] == 20 and isinstance(res[0]["t"], Int64)
+
+
 def test_update_with_push(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["x"]})
     coll.update_one({"_id": 1}, {"$push": {"tags": "y"}})
