@@ -1829,6 +1829,30 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return {"ok": 0.0, "errmsg": str(exc), "code": 51174, "codeName": "Location51174"}
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    # ``returnKey`` replaces each result with just the keys of the index that
+    # serves the query (filter + sort): the index's key-pattern fields, plus
+    # the sort fields (mongod serves a sort from an index — the ``_id`` order
+    # of the doc table here, which ``explain`` reports as a COLLSCAN). When set
+    # it also suppresses ``showRecordId``'s ``$recordId``. ``showRecordId``
+    # alone tags each doc with a synthetic ``$recordId``.
+    return_key = bool(doc.get("returnKey", False))
+    if return_key:
+        key_fields: list[str] = []
+        try:
+            plan = ctx.storage.explain_plan(
+                ctx.db_name, coll, filter_, sort=sort, hint=hint, collation=collation
+            )
+        except Exception:
+            plan = {"kind": "COLLSCAN"}
+        if plan.get("kind") == "IXSCAN":
+            key_fields = list(plan.get("key_pattern", {}).keys())
+        if isinstance(sort, Mapping):
+            for f in sort:
+                if f not in key_fields:
+                    key_fields.append(f)
+        docs = [{f: d[f] for f in key_fields if f in d} for d in docs]
+    elif bool(doc.get("showRecordId", False)):
+        docs = [{**d, "$recordId": bson.Int64(i + 1)} for i, d in enumerate(docs)]
     ns = _ns(ctx.db_name, coll)
     # Tailable cursor on a (capped) collection. Real mongod rejects
     # ``tailable: true`` on a non-capped collection with code 2
