@@ -1,6 +1,6 @@
 [package]
 name = "secantus-core"
-version = "0.5.3-beta.6"
+version = "0.5.3-beta.7"
 edition = "2021"
 description = "Pure-Rust operator engines for SecantusDB (sort keys, query matcher, update operators, aggregation-expression evaluator, projection, change-stream diff, aggregation pipeline)."
 license = "GPL-2.0-only"
@@ -22,3 +22,8 @@ bson = { workspace = true }
 # query operators — the same OGC lineage as Shapely, so containment semantics
 # line up with the pure-Python geo path.
 geo = "0.28"
+# `$regex` / `$options` + BSON-regex field matching. A linear-time
+# (finite-automaton) engine, so unlike Python's `re` it can't catastrophically
+# backtrack; patterns it can't compile (backreferences / lookaround) signal
+# `Fallback`, matching the "defer to Python `re`" contract for the parity vehicle.
+regex = "1"
