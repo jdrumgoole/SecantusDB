@@ -59,6 +59,10 @@ pub enum StorageError {
     /// An unexpected internal failure — surfaces as a command-level
     /// `InternalError` (`code: 1`), not a per-op write error.
     Internal(String),
+    /// A write lost a `WT_ROLLBACK` race — mongod's `WriteConflict` (112). The
+    /// command layer surfaces it as a command-level error (so the dispatch
+    /// transaction envelope attaches the `TransientTransactionError` label).
+    WriteConflict,
 }
 
 /// A change-stream watch scope (mirrors `secantus_storage::changestreams::Scope`;

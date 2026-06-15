@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-15 — SecantusDB 0.5.3b6 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-15 — SecantusDB 0.5.3b7 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -14,7 +14,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_collation.py` | 1 | 0 | 0 | 15 | 16 | 100.0% |
 | `test_collection.py` | 75 | 12 | 0 | 4 | 91 | 86.2% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
-| `test_command_logging.py` | 17 | 0 | 0 | 19 | 36 | 100.0% |
+| `test_command_logging.py` | 16 | 0 | 0 | 20 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
@@ -32,13 +32,13 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 15 | 1 | 0 | 5 | 21 | 93.8% |
-| `test_transactions_unified.py` | 74 | 16 | 0 | 177 | 267 | 82.2% |
+| `test_transactions_unified.py` | 76 | 14 | 0 | 177 | 267 | 84.4% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 0 | 0 | 0 | 43 | 43 | — |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **823** | **86** | **0** | **594** | **1503** | **90.5%** |
+| **Overall** | **824** | **84** | **0** | **595** | **1503** | **90.7%** |
 
-## Failures (86)
+## Failures (84)
 
 First 30 failure node-ids for manual triage:
 
@@ -74,7 +74,7 @@ vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateLet::test_Ag
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateMergeErrorResponse::test_aggregate_$merge_DuplicateKey_error_is_accessible
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateOutReadConcern::test_readConcern_linearizable_with_out_stage
 ```
-... and 56 more (see raw JSON).
+... and 54 more (see raw JSON).
 
 ## How this is generated
 
