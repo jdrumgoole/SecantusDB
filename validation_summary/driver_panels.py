@@ -143,8 +143,8 @@ SMOKE_PANELS: list[dict[str, str | None]] = [
         "lang": "PHP",
         "kind": "smoke",
         "kind_label": "Feature smokes",
-        "rate_value": "6 / 6",
-        "rate_label": "features verified",
+        "rate_value": "6 features",
+        "rate_label": "smoke-test (not a gauge)",
         "note": (
             "The official high-level PHP library, built on the C-based "
             "<code>ext-mongodb</code> extension. Same six features as the Ruby "
@@ -172,14 +172,20 @@ _COLLECTORS = {
 def _format_rate(stats: GaugeStats) -> str:
     """Headline pass-rate string used in the panel.
 
-    Reports ``actionable`` failures only — the expected_failures
-    classification removes documented gaps from the denominator, so the
-    headline matches what we tell users about conformance.
+    True raw rate: ``passed / ran``, with **no** expected-failure
+    exclusion. Every gauge is scored the same way — a documented
+    divergence still counts against the rate, exactly as it does in the
+    per-driver validation reports (``validation_summary.generate``) and
+    in the pymongo gauge. Excluding "expected" failures from the
+    denominator here (while pymongo carries none) made the secondary
+    drivers read 100% against pymongo's 99.2% for the same kind of
+    documented gap — an apples-to-oranges flatter the panels no longer
+    do. The "N known divergence" count label below still names the
+    documented failure; the rate just no longer hides it.
     """
-    adj_ran = stats.ran - stats.expected_failures
-    if adj_ran <= 0:
+    if stats.ran <= 0:
         return "&mdash;"
-    pct = stats.passed / adj_ran * 100
+    pct = stats.passed / stats.ran * 100
     return f"{pct:.1f}%"
 
 
