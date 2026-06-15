@@ -19,10 +19,10 @@
       <span class="lang">Java</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">100.0%</span>
+      <span class="rate">99.8%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>447</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="counts"><strong>446</strong> tests passed &middot; <strong>1</strong> failed</p>
     <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run a curated subset of <code>driver-sync/src/test/functional/</code> &mdash; integration tests that open a real connection to a SecantusDB daemon (the driver's own BSON codec unit tests are run but not counted here; they never touch the server). Type-strict decoders catch wire-shape divergences pymongo's permissive client accepts silently.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -33,7 +33,7 @@
       <span class="lang">Node.js</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">100.0%</span>
+      <span class="rate">99.7%</span>
       <span class="rate-label">pass rate</span>
     </div>
     <p class="counts"><strong>358</strong> tests passed &middot; <strong>1</strong> known divergence</p>
@@ -61,7 +61,7 @@
       <span class="lang">Ruby</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">100.0%</span>
+      <span class="rate">99.6%</span>
       <span class="rate-label">pass rate</span>
     </div>
     <p class="counts"><strong>258</strong> tests passed &middot; <strong>1</strong> known divergence</p>
@@ -90,8 +90,8 @@
       <span class="kind smoke">Feature smokes</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">6 / 6</span>
-      <span class="rate-label">features verified</span>
+      <span class="rate">6 features</span>
+      <span class="rate-label">smoke-test (not a gauge)</span>
     </div>
     <p class="note">The official high-level PHP library, built on the C-based <code>ext-mongodb</code> extension. Same six features as the Ruby driver &mdash; type fidelity, RBAC, <code>bulkWrite</code>, <code>listDatabases</code> filter, logical sessions, cluster-role bundles &mdash; verified end-to-end via <code>composer install</code> + <code>php &lt;feature&gt;_smoke.php</code>.</p>
   </article>
