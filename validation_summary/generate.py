@@ -358,6 +358,109 @@ def _collect_rust(raw_dir: Path) -> GaugeStats | None:
     )
 
 
+def _collect_php_ext(raw_dir: Path) -> GaugeStats | None:
+    """Walk run-tests.php JUnit XML (``.validation/php-ext-junit.xml``).
+
+    Excludes the ``tests/bson`` directory: those ~440 cases are pure
+    in-process BSON serialization tests that never open a connection to
+    SecantusDB (same rationale as the Java ``:bson:test`` exclusion).
+    Only the wire-protocol directories measure SecantusDB's command
+    surface, which is what the compatibility number should reflect.
+    """
+    f = raw_dir / "php-ext-junit.xml"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for case in root.iter("testcase"):
+        name = case.attrib.get("name", "")
+        # Category is the path component after ``tests/`` in the name.
+        cat = name.split("tests/", 1)[1].split("/", 1)[0] if "tests/" in name else ""
+        if cat == "bson":
+            continue
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed += 1
+            failure_descs.append(name)
+        elif case.find("skipped") is not None:
+            skipped += 1
+        else:
+            passed += 1
+    return GaugeStats(
+        name="mongo-php-driver",
+        language="PHP",
+        driver_version=_read_submodule_head("mongo-php-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated .phpt wire-protocol tests (bson serialization units excluded)",
+    )
+
+
+# php-library categories that open a real connection to SecantusDB. The
+# pure-code units (Builder / Comparator / Functions / Model — query-builder
+# DSL, BSON comparators, helper functions) never touch the server, so they're
+# excluded from the compatibility number the same way Java's bson codec units
+# are.
+_PHP_LIB_SERVER_CATEGORIES = frozenset({"Operation", "Collection", "Database", "Command"})
+
+
+def _collect_php_lib(raw_dir: Path) -> GaugeStats | None:
+    """Walk PHPUnit JUnit XML (``.validation/php-lib-junit.xml``).
+
+    Counts only the server-touching functional categories (see
+    ``_PHP_LIB_SERVER_CATEGORIES``); the pure-code DSL / comparator /
+    helper units are run but not counted, mirroring the Java gauge.
+    """
+    f = raw_dir / "php-lib-junit.xml"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+
+    def _category(case: ET.Element) -> str:
+        file = case.attrib.get("file", "")
+        if "/tests/" in file:
+            return file.split("/tests/", 1)[1].split("/", 1)[0]
+        cls = case.attrib.get("class", "")
+        parts = cls.split("\\")
+        if "Tests" in parts:
+            i = parts.index("Tests")
+            if i + 1 < len(parts):
+                return parts[i + 1]
+        return ""
+
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for case in root.iter("testcase"):
+        if _category(case) not in _PHP_LIB_SERVER_CATEGORIES:
+            continue
+        name = f"{case.attrib.get('class', '?')}::{case.attrib.get('name', '?')}"
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed += 1
+            failure_descs.append(name)
+        elif case.find("skipped") is not None:
+            skipped += 1
+        else:
+            passed += 1
+    return GaugeStats(
+        name="mongo-php-library",
+        language="PHP",
+        driver_version=_read_submodule_head("mongo-php-library"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated functional tests (Operation / Collection / Database / Command)",
+    )
+
+
 _COLLECTORS = (
     _collect_pymongo,
     _collect_java,
@@ -365,6 +468,8 @@ _COLLECTORS = (
     _collect_node,
     _collect_ruby,
     _collect_rust,
+    _collect_php_lib,
+    _collect_php_ext,
 )
 
 

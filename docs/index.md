@@ -80,13 +80,16 @@ client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 
 The conformance evidence: the official test suites for **pymongo**,
 **mongo-go-driver**, **mongo-node-driver**, **mongo-java-driver**,
-**mongo-ruby-driver**, and **mongo-rust-driver** all run against
+**mongo-ruby-driver**, **mongo-rust-driver**, and the **PHP**
+library + extension all run against
 SecantusDB **unmodified** — see the
 [pymongo](validation-report.md), [Go-driver](validation-report-go.md),
 [Node-driver](validation-report-node.md),
 [Java-driver](validation-report-java.md),
-[Ruby-driver](validation-report-ruby.md), and
-[Rust-driver](validation-report-rust.md) validation reports for
+[Ruby-driver](validation-report-ruby.md),
+[Rust-driver](validation-report-rust.md),
+[PHP-library](validation-report-php-lib.md), and
+[PHP-extension](validation-report-php-ext.md) validation reports for
 current pass-rates per feature category.
 
 ## What's in scope
@@ -204,6 +207,8 @@ validation-report-node
 validation-report-java
 validation-report-ruby
 validation-report-rust
+validation-report-php-lib
+validation-report-php-ext
 validation-report-rust-server
 api
 changelog

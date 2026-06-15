@@ -1,7 +1,7 @@
 name: Validate (driver conformance)
 
 # Runs the vendored driver test suites (pymongo, go, node, java,
-# ruby, rust) against SecantusDB and regenerates the per-driver
+# ruby, rust, php-lib, php-ext) against SecantusDB and regenerates the per-driver
 # `docs/validation-report*.md` files. Slow (~10–15 min per driver on
 # a fresh WT build) so this is NOT on every push — it runs weekly on
 # Monday and can be triggered manually.
@@ -33,6 +33,8 @@ jobs:
           - { name: java,    task: validate-java, report: docs/validation-report-java.md }
           - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
           - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
+          - { name: php-lib, task: validate-php-lib, report: docs/validation-report-php-lib.md }
+          - { name: php-ext, task: validate-php-ext, report: docs/validation-report-php-ext.md }
           # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
           # suite as the headline gauge, pointed at the Rust server via
           # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so
@@ -176,6 +178,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Both PHP gauges need PHP + the mongodb extension. setup-php bundles
+      # composer (the lib gauge runs `composer install`) and the php-dev
+      # build files (the ext gauge's run-tests.php). The extension is pinned
+      # to the version the vendored mongo-php-driver submodule is tagged at,
+      # so the .phpt tests stay version-aligned.
+      - name: Set up PHP
+        if: startsWith(matrix.driver.name, 'php-')
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mongodb-2.3.1
+          tools: composer
+
       - name: Run ${{ matrix.driver.name }} validation
         run: uv run python -m invoke ${{ matrix.driver.task }}
 
@@ -247,8 +262,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md
-          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust + pymongo-vs-Rust-server)"
+          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust + php-lib + php-ext + pymongo-vs-Rust-server)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver validation reports, plus the pymongo-vs-Rust-server R8 gate. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test output."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver / php-library / php-extension validation reports, plus the pymongo-vs-Rust-server R8 gate. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php output."
