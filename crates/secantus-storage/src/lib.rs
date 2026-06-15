@@ -87,6 +87,22 @@ pub struct UserTransactionHandle {
     began: bool,
 }
 
+/// mongod's per-document BSON size limit (16 MiB). A document whose encoded size
+/// exceeds this is rejected with `BSONObjectTooLarge` (10334). Mirrors
+/// `storage.py`'s `MAX_BSON_OBJECT_SIZE`.
+const MAX_BSON_OBJECT_SIZE: usize = 16 * 1024 * 1024;
+
+/// The mongod-shaped per-op write error for an over-limit document (10334).
+fn too_large_write_error(index: usize, size: usize) -> Document {
+    bson::doc! {
+        "index": index as i32,
+        "code": 10334,
+        "errmsg": format!(
+            "object to insert too large. size in bytes: {size}, max size: {MAX_BSON_OBJECT_SIZE}"
+        ),
+    }
+}
+
 const COLL_TABLE: &str = "table:secantus_collections";
 const DOC_TABLE: &str = "table:secantus_documents";
 const IDX_TABLE: &str = "table:secantus_indexes";
@@ -415,6 +431,9 @@ pub enum StorageError {
     /// `WriteConflict` (112); inside a transaction it also earns the
     /// `TransientTransactionError` label so drivers retry the whole transaction.
     WriteConflict,
+    /// A document's encoded size exceeds `MAX_BSON_OBJECT_SIZE`. Carries the
+    /// offending size; surfaces as mongod's `BSONObjectTooLarge` (10334).
+    DocumentTooLarge(usize),
 }
 
 impl std::fmt::Display for StorageError {
@@ -441,6 +460,10 @@ impl std::fmt::Display for StorageError {
             StorageError::WriteConflict => write!(
                 f,
                 "WriteConflict error: this operation conflicted with another operation"
+            ),
+            StorageError::DocumentTooLarge(size) => write!(
+                f,
+                "object to insert too large. size in bytes: {size}, max size: {MAX_BSON_OBJECT_SIZE}"
             ),
         }
     }
@@ -1468,6 +1491,9 @@ impl Storage {
         let id = doc.get("_id").expect("_id present").clone();
         let key = id_key(&id)?;
         let blob = encode_doc(&doc)?;
+        if blob.len() > MAX_BSON_OBJECT_SIZE {
+            return Err(StorageError::DocumentTooLarge(blob.len()));
+        }
 
         let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
@@ -1560,6 +1586,13 @@ impl Storage {
                 continue;
             }
             let blob = encode_doc(&doc)?;
+            if blob.len() > MAX_BSON_OBJECT_SIZE {
+                errors.push(too_large_write_error(index, blob.len()));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &key);
             doc_cur.set_value_u(&blob);
@@ -3559,8 +3592,11 @@ impl Storage {
                 {
                     return Err(StorageError::DuplicateKey(Box::new(c)));
                 }
-                modified += 1;
                 let new_blob = encode_doc(&new)?;
+                if new_blob.len() > MAX_BSON_OBJECT_SIZE {
+                    return Err(StorageError::DocumentTooLarge(new_blob.len()));
+                }
+                modified += 1;
                 self.delete_index_entries(&session, db, coll, &doc, &descs)?;
                 let cur = session.open_cursor(DOC_TABLE, None)?;
                 cur.set_key_ssu(db, coll, &id_k);
@@ -3623,6 +3659,9 @@ impl Storage {
             }
             let new_id_key = id_key(&id)?;
             let new_blob = encode_doc(&new)?;
+            if new_blob.len() > MAX_BSON_OBJECT_SIZE {
+                return Err(StorageError::DocumentTooLarge(new_blob.len()));
+            }
             let cur = session.open_cursor(DOC_TABLE, None)?;
             cur.set_key_ssu(db, coll, &new_id_key);
             cur.set_value_u(&new_blob);

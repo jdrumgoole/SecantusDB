@@ -175,6 +175,7 @@ fn code_name_for(code: i32) -> &'static str {
         2 => "BadValue",
         9 => "FailedToParse",
         112 => "WriteConflict",
+        10334 => "BSONObjectTooLarge",
         11000 => "DuplicateKey",
         66 => "ImmutableField",
         _ => "Location",
