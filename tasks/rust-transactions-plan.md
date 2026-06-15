@@ -75,6 +75,63 @@ with data; a seq gap on abort is the only wart — proper buffering is T3).
 - Read-concern validation (snapshot → 246 SnapshotUnavailable outside a txn on
   the relevant commands; accepted inside) + apiVersion validation, at dispatch.
 
+### T2 part 1 — Registry — ✅ DONE (merged in beta.9)
+`secantus-commands::transactions` ported from `transactions.py` (TxnState, error
+replies 251/256/225/50911, `TransactionRegistry` with for_statement / commit /
+abort / abort_in_progress / on_retryable_write / lifetime reaper; storage-agnostic
+injected commit/rollback; injectable clock). 9 unit tests pin every transition.
+Inert until the dispatch wiring below.
+
+### T2 part 2 — Dispatch integration — ✅ DONE (beta.10)
+All 8 steps landed: trait methods (begin/run_in/commit/rollback_user_transaction
+with defaults) + WT adapter overrides (downcast handle → storage
+with/commit/rollback); `CommandContext.transactions` + builder; server-side
+registry (commit/rollback close over storage, `now_secs_f64` clock) wired into
+every `make_context`; the `run_with_txn_envelope` dispatch block (resolve via
+registry, 263 allowlist gate, run inside `run_in_user_transaction`, failed-stmt
+abort + `TransientTransactionError` label, retryable-write `on_retryable_write`);
+real `commitTransaction`/`abortTransaction` handlers; `validate_read_concern`
+accepts `snapshot` inside a txn / on RS reads (else 246). Validated by
+`/tmp/txn_check.py` + the gauge (`test_transactions_unified.py` cluster).
+
+### T2 part 2 — Dispatch integration (original detail)
+Concrete steps:
+1. **`Storage` trait** (`secantus-commands/src/storage.rs`): add
+   `begin_user_transaction(&self) -> Result<Box<dyn Any + Send>, StorageError>`
+   (default: `Ok(Box::new(()))`), `run_in_user_transaction(&self, handle: &mut
+   (dyn Any+Send), f: &mut dyn FnMut() -> HandlerResult) -> HandlerResult`
+   (default: `f()`), `commit_user_transaction` / `rollback_user_transaction(&self,
+   handle: &mut (dyn Any+Send)) -> Result<(), StorageError>` (default `Ok(())`).
+   Defaults keep the command-crate fakes compiling AND make the state machine
+   work (lifecycle/error-label tests) before real WT isolation lands.
+2. **WT adapter** (`secantus-storage-adapter`): override the four — downcast the
+   handle to `secantus_storage::UserTransactionHandle`; `run_in_user_transaction`
+   → `storage.with_user_transaction(handle, f)`.
+3. **`CommandContext`**: add `transactions: Option<Arc<TransactionRegistry>>` +
+   `with_transactions` builder + accessor (mirror `cursors`).
+4. **Server wiring** (`secantus-server` / `-server-py`): create one
+   `TransactionRegistry` per server with commit/rollback callbacks closing over
+   the storage `Arc` (`|txn| storage.commit_user_transaction(txn.handle…)`); pass
+   it into each per-request `CommandContext`.
+5. **Dispatch envelope** (`lib.rs::dispatch_inner`, around the handler call):
+   when `txnNumber` present + `autocommit:false` + name ∉ {commit,abort} →
+   `registry.for_statement(lsid, txn, start)`; on error reply return it; else
+   create the handle lazily (`begin_user_transaction`) if `txn.handle` is None,
+   run the handler via `storage.run_in_user_transaction(handle, &mut || handler)`,
+   then on failure `registry.abort_in_progress` + add `TransientTransactionError`
+   label for transient codes. `autocommit` absent → `on_retryable_write`. Borrow:
+   clone `ctx.storage` Arc so the closure can still borrow `ctx`.
+6. **commit/abort handlers**: replace `diagnostics::ok_transaction` with real
+   `commitTransaction`/`abortTransaction` that pull `(lsid, txnNumber)` from the
+   doc and call `registry.commit` / `registry.abort`.
+7. **Read-concern**: `validate_read_concern` rejects `snapshot` (246
+   SnapshotUnavailable) outside a txn on the relevant commands; accept inside.
+8. **WriteConflict**: a WT-rollback from a write path inside a txn → 112
+   `WriteConflict` + `TransientTransactionError` label.
+Validate: a pymongo e2e (commit persists, abort rolls back, read-your-own-writes,
+NoSuchTransaction/TransactionCommitted lifecycle) + the rust gauge (expect the
+`test_transactions_unified.py` cluster to move). Bump beta.10.
+
 ### T3 — Refinements
 - Oplog buffering during a txn: buffer entries on the handle, flush with one
   shared commit Timestamp + lsid/txnNumber at commit (change-stream-in-txn

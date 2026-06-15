@@ -529,4 +529,46 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         Ok(Vec::new())
     }
+
+    // --- multi-document transactions (T2) ----------------------------------
+    //
+    // The opaque handle is the storage `UserTransactionHandle`, boxed as
+    // `dyn Any + Send` so the command crate (and its test fakes) stay WT-free.
+    // The WiredTiger adapter downcasts it. Defaults make the registry's state
+    // machine run WITHOUT real isolation (writes apply immediately; abort can't
+    // roll back) — enough for the lifecycle / error-label tests; the adapter
+    // override adds real WT isolation.
+
+    /// Open a new multi-document transaction, returning an opaque handle. Default
+    /// returns a unit handle (no real WT transaction).
+    fn begin_user_transaction(&self) -> Result<Box<dyn std::any::Any + Send>, StorageError> {
+        Ok(Box::new(()))
+    }
+
+    /// Run one in-transaction statement `f` with `handle`'s WT session installed,
+    /// so the statement's reads/writes execute inside the transaction. Default
+    /// just runs `f` (no installation). Returns the statement's reply document.
+    fn run_in_user_transaction(
+        &self,
+        _handle: &mut (dyn std::any::Any + Send),
+        f: &mut dyn FnMut() -> Document,
+    ) -> Result<Document, StorageError> {
+        Ok(f())
+    }
+
+    /// Commit the transaction's WT session. Default no-op.
+    fn commit_user_transaction(
+        &self,
+        _handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Roll back the transaction's WT session. Default no-op.
+    fn rollback_user_transaction(
+        &self,
+        _handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
 }

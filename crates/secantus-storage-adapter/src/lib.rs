@@ -24,7 +24,9 @@ use secantus_commands::storage::{
     Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
-use secantus_storage::{ExplainPlan, Hint, Storage as WtStorage, StorageError as WtError};
+use secantus_storage::{
+    ExplainPlan, Hint, Storage as WtStorage, StorageError as WtError, UserTransactionHandle,
+};
 
 /// Wraps a shared WiredTiger-backed `Storage` and presents it as the command
 /// layer's `Storage`. Construct with [`StorageAdapter::new`] and hand the
@@ -56,6 +58,42 @@ impl CmdStorage for StorageAdapter {
                 time: 0,
                 increment: 0,
             })
+    }
+
+    fn begin_user_transaction(&self) -> Result<Box<dyn std::any::Any + Send>, StorageError> {
+        let h = self.inner.begin_user_transaction().map_err(map_err)?;
+        Ok(Box::new(h))
+    }
+
+    fn run_in_user_transaction(
+        &self,
+        handle: &mut (dyn std::any::Any + Send),
+        f: &mut dyn FnMut() -> Document,
+    ) -> Result<Document, StorageError> {
+        let h = handle
+            .downcast_mut::<UserTransactionHandle>()
+            .ok_or_else(|| StorageError::Internal("bad transaction handle".into()))?;
+        self.inner.with_user_transaction(h, || f()).map_err(map_err)
+    }
+
+    fn commit_user_transaction(
+        &self,
+        handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        let h = handle
+            .downcast_mut::<UserTransactionHandle>()
+            .ok_or_else(|| StorageError::Internal("bad transaction handle".into()))?;
+        self.inner.commit_user_transaction(h).map_err(map_err)
+    }
+
+    fn rollback_user_transaction(
+        &self,
+        handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        let h = handle
+            .downcast_mut::<UserTransactionHandle>()
+            .ok_or_else(|| StorageError::Internal("bad transaction handle".into()))?;
+        self.inner.rollback_user_transaction(h).map_err(map_err)
     }
 
     fn change_stream_poll(
