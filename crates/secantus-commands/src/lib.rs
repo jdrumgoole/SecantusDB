@@ -45,6 +45,7 @@ pub mod handshake;
 pub mod rbac;
 pub mod roles;
 pub mod storage;
+pub mod transactions;
 mod util;
 
 use std::sync::{Arc, Mutex};

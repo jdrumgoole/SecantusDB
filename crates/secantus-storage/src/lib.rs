@@ -38,6 +38,49 @@ use secantus_wt::{Connection, Cursor, Session, WtError};
 
 pub mod changestreams;
 
+use std::cell::Cell;
+
+thread_local! {
+    /// The active multi-document-transaction session for the current thread, or
+    /// null when not inside an in-transaction statement. Installed by
+    /// [`Storage::with_user_transaction`] for the duration of a statement so
+    /// [`Storage::op_session`] routes the statement's cursors through the
+    /// transaction's WT session (read-your-own-writes + the pinned snapshot fall
+    /// out for free). Cleared (RAII, panic-safe) before the call returns.
+    static ACTIVE_TXN_SESSION: Cell<*const Session> = const { Cell::new(std::ptr::null()) };
+}
+
+/// The WT session one storage operation runs on: either a borrowed
+/// multi-document-transaction session (left open across the transaction's
+/// statements) or a freshly-opened autocommit session (closed when this drops).
+/// Derefs to `Session` so call sites are identical for both.
+enum OpSession<'a> {
+    Fresh(Session),
+    Txn(&'a Session),
+}
+
+impl std::ops::Deref for OpSession<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        match self {
+            OpSession::Fresh(s) => s,
+            OpSession::Txn(s) => s,
+        }
+    }
+}
+
+/// Opaque handle for a multi-document transaction. Owns a **dedicated** WT
+/// session (NOT the calling thread's per-call session) so the transaction's
+/// statements and its retryable commit can run on different connection threads
+/// — `Session` is `Send`, and the command layer's per-transaction mutex
+/// guarantees the session is never touched by two threads at once. The WT
+/// `begin_transaction` is deferred to the first [`Storage::with_user_transaction`]
+/// so the snapshot pins at the transaction's first statement (mongod semantics).
+pub struct UserTransactionHandle {
+    session: Session,
+    began: bool,
+}
+
 const COLL_TABLE: &str = "table:secantus_collections";
 const DOC_TABLE: &str = "table:secantus_documents";
 const IDX_TABLE: &str = "table:secantus_indexes";
@@ -1287,6 +1330,92 @@ impl Storage {
         Ok(self.oplog.lock().unwrap().next_seq)
     }
 
+    // -- user (multi-document) transactions --------------------------------
+    //
+    // A user transaction owns a dedicated WT session (see `UserTransactionHandle`).
+    // `with_user_transaction` installs that session into a thread-local for the
+    // duration of one statement, so every CRUD path's `op_session()` transparently
+    // routes its cursors through the WT transaction — read-your-own-writes and the
+    // pinned snapshot fall out for free, exactly as `storage.py`'s
+    // `use_user_transaction` swaps the thread-local WT session. The command layer
+    // serializes statements per transaction; these primitives assume no two
+    // threads install the same handle concurrently.
+
+    /// The session a transaction-participating CRUD statement should use: the
+    /// active user-transaction session when one is installed on this thread, else
+    /// a fresh autocommit session. The deliberately cross-thread oplog reads
+    /// (`read_oplog` / `read_preimage` / `oplog_floor_seq` / `find_seq_for_ts`)
+    /// and the cluster-time / meta paths bypass this and stay on a fresh session.
+    fn op_session(&self) -> Result<OpSession<'_>> {
+        let p = ACTIVE_TXN_SESSION.with(|c| c.get());
+        if p.is_null() {
+            Ok(OpSession::Fresh(self.conn.open_session()?))
+        } else {
+            // SAFETY: `with_user_transaction` installs this pointer to a `Session`
+            // it owns, for the strict duration of the closure running on THIS
+            // thread, and clears it before returning — so the referent outlives
+            // every `op_session` call the statement makes. The per-transaction
+            // mutex in the command layer guarantees no concurrent access.
+            Ok(OpSession::Txn(unsafe { &*p }))
+        }
+    }
+
+    /// Open a dedicated WT session for a new multi-document transaction. The WT
+    /// `begin_transaction` is deferred to the first `with_user_transaction`.
+    pub fn begin_user_transaction(&self) -> Result<UserTransactionHandle> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        Ok(UserTransactionHandle {
+            session,
+            began: false,
+        })
+    }
+
+    /// Run `f` with `handle`'s session installed as this thread's transaction
+    /// session (beginning the WT transaction lazily on first entry). Every
+    /// storage call `f` makes routes through that session, so it executes inside
+    /// the WT transaction. The previous thread-local state is restored on return
+    /// — including on panic — so nested / re-entrant use is safe.
+    pub fn with_user_transaction<T>(
+        &self,
+        handle: &mut UserTransactionHandle,
+        f: impl FnOnce() -> T,
+    ) -> Result<T> {
+        if !handle.began {
+            handle.session.begin_transaction(None)?;
+            handle.began = true;
+        }
+        struct Restore(*const Session);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ACTIVE_TXN_SESSION.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
+        ACTIVE_TXN_SESSION.with(|c| c.set(&handle.session as *const Session));
+        Ok(f())
+    }
+
+    /// Commit the transaction's WT session. Idempotent once committed/rolled
+    /// back (no active WT transaction → no-op).
+    pub fn commit_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
+        if handle.began {
+            handle.session.commit_transaction(None)?;
+            handle.began = false;
+        }
+        Ok(())
+    }
+
+    /// Roll back the transaction's WT session. Idempotent. (Dropping the handle
+    /// also rolls back any still-open WT transaction via `Session`'s `Drop`.)
+    pub fn rollback_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
+        if handle.began {
+            handle.session.rollback_transaction(None)?;
+            handle.began = false;
+        }
+        Ok(())
+    }
+
     /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.
     /// Returns the document's `id_key`. A duplicate `_id` yields
     /// `StorageError::DuplicateId`.
@@ -1300,7 +1429,7 @@ impl Storage {
         let key = id_key(&id)?;
         let blob = encode_doc(&doc)?;
 
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
         // Reject unique-index violations before writing anything.
         let descs = self.index_descs(&session, db, coll)?;
@@ -1352,7 +1481,7 @@ impl Storage {
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
         let _g = self.lock.lock().unwrap();
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
         let descs = self.index_descs(&session, db, coll)?;
         let ns = format!("{db}.{coll}");
@@ -1435,7 +1564,7 @@ impl Storage {
     pub fn find_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<Option<Vec<u8>>> {
         let _g = self.lock.lock().unwrap();
         let key = id_key(id)?;
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         let cur = session.open_cursor(DOC_TABLE, None)?;
         cur.set_key_ssu(db, coll, &key);
         match cur.search() {
@@ -1448,7 +1577,7 @@ impl Storage {
     /// All documents of a collection in natural (`_id`) order, as BSON bytes.
     pub fn scan_collection(&self, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
         let _g = self.lock.lock().unwrap();
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         let cur = session.open_cursor(DOC_TABLE, None)?;
         let mut out = Vec::new();
         // Position at the first key >= (db, coll, "") then walk while the
@@ -1488,7 +1617,7 @@ impl Storage {
     ) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
         let key = id_key(id)?;
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
 
         // Existence check — capture the old doc so we can retract its entries.
         let probe = session.open_cursor(DOC_TABLE, None)?;
@@ -1552,7 +1681,7 @@ impl Storage {
     pub fn delete_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
         let key = id_key(id)?;
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         let cur = session.open_cursor(DOC_TABLE, None)?;
         cur.set_key_ssu(db, coll, &key);
         // Read the doc first so we can retract its index entries, then remove.
@@ -1741,7 +1870,7 @@ impl Storage {
     /// `op: "c"` `create` oplog entry. Mirrors `storage.create_collection`.
     pub fn create_collection(&self, db: &str, coll: &str) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         if collection_registered(&session, db, coll)? {
             return Ok(false);
         }
@@ -3092,7 +3221,7 @@ impl Storage {
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
         let _g = self.lock.lock().unwrap();
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
         let mut in_sort_order = false;
         // A collation makes the byte-sortable indexes (collation-naive) unsafe for
@@ -3236,7 +3365,7 @@ impl Storage {
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
         let _g = self.lock.lock().unwrap();
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         if filter.is_empty() {
             return Ok(self.scan_docs(&session, db, coll)?.len());
         }
@@ -3357,7 +3486,7 @@ impl Storage {
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
         let _g = self.lock.lock().unwrap();
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
         let ns = format!("{db}.{coll}");
         let descs = self.index_descs(&session, db, coll)?;
@@ -3500,7 +3629,7 @@ impl Storage {
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
         let _g = self.lock.lock().unwrap();
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         let descs = self.index_descs(&session, db, coll)?;
         let oplog_on = self.enable_oplog;
         let preimages_on = oplog_on && pre_post_images_enabled(&session, db, coll)?;
