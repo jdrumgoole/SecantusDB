@@ -1184,6 +1184,61 @@ def test_explain_find_returns_query_planner(coll) -> None:
     assert "serverInfo" in explanation
 
 
+def test_explain_verbosity_controls_execution_stats(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    db = coll.database
+    inner = {"find": coll.name, "filter": {"n": {"$gte": 2}}}
+
+    # queryPlanner: no executionStats at all.
+    qp = db.command({"explain": inner, "verbosity": "queryPlanner"})
+    assert "queryPlanner" in qp
+    assert "executionStats" not in qp
+
+    # executionStats: executionStats present, but NO allPlansExecution.
+    es = db.command({"explain": inner, "verbosity": "executionStats"})
+    assert "executionStats" in es
+    assert "allPlansExecution" not in es["executionStats"]
+
+    # allPlansExecution: executionStats present WITH an allPlansExecution array.
+    ape = db.command({"explain": inner, "verbosity": "allPlansExecution"})
+    assert "allPlansExecution" in ape["executionStats"]
+    assert isinstance(ape["executionStats"]["allPlansExecution"], list)
+
+
+def test_explain_aggregate_allplansexecution_present(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    inner = {"aggregate": coll.name, "pipeline": [{"$match": {"n": {"$gte": 2}}}], "cursor": {}}
+    res = coll.database.command({"explain": inner, "verbosity": "allPlansExecution"})
+    # Aggregate-explain surfaces executionStats both top-level and per-$cursor.
+    assert "allPlansExecution" in res["executionStats"]
+    cursor_stats = res["stages"][0]["$cursor"]["executionStats"]
+    assert "allPlansExecution" in cursor_stats
+
+
+def test_aggregate_inline_explain_returns_plan_not_data(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(3)])
+    # The legacy inline ``explain: true`` flag on the aggregate command must
+    # return an explain document (stages / queryPlanner), not pipeline output.
+    res = coll.database.command(
+        {"aggregate": coll.name, "pipeline": [{"$match": {"_id": {"$ne": 1}}}], "explain": True}
+    )
+    assert "stages" in res or "queryPlanner" in res
+
+
+def test_aggregate_inline_explain_does_not_run_out(coll, client) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(3)])
+    out_name = "explain_out_things"
+    coll.database.command(
+        {
+            "aggregate": coll.name,
+            "pipeline": [{"$match": {}}, {"$out": out_name}],
+            "explain": True,
+        }
+    )
+    # Explain must NOT execute the $out write stage.
+    assert client["testdb"][out_name].count_documents({}) == 0
+
+
 def test_explain_find_collscan_when_no_index(coll) -> None:
     coll.insert_many([{"_id": i, "n": i} for i in range(5)])
     plan = coll.find({"n": 2}).explain()["queryPlanner"]["winningPlan"]

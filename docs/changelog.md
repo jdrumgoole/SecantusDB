@@ -19,6 +19,34 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b8] — 2026-06-16
+
+### `explain` now speaks `allPlansExecution`, and aggregate's inline explain flag works
+
+`explain` gained the last two pieces the official MongoDB drivers probe for. At
+the most verbose level, `verbosity: "allPlansExecution"`, the reply now carries
+an `allPlansExecution` array inside `executionStats` — empty, because a
+single-node query is always served by a single candidate plan with no rejected
+alternatives, which is exactly what real `mongod` reports when there's no
+multi-planning to summarise. Drivers that assert the key is present (and absent
+at lower verbosities) now see the shape they expect.
+
+The `aggregate` command also learned to honour its legacy inline `explain: true`
+flag — the form drivers send when you call `explain()` on an aggregation rather
+than wrapping it in the top-level `explain` command. SecantusDB previously ran
+the pipeline and returned data; it now returns the explain plan instead, and
+critically does **not** execute a trailing `$out` or `$merge` write stage under
+explain, matching `mongod`'s dry-run behaviour. Together these clear the PHP
+library's entire `ExplainFunctionalTest` and aggregate-explain suite.
+
+#### Fixed
+- `explain` with `verbosity: "allPlansExecution"` now includes an
+  `executionStats.allPlansExecution` array (empty for single-solution plans),
+  on both `find`-style and `aggregate` explains.
+- The `aggregate` command's inline `explain: true` flag now returns the explain
+  document (`stages` / `queryPlanner`) instead of running the pipeline, and
+  suppresses `$out` / `$merge` writes under explain.
+
 ## [0.5.3b7] — 2026-06-15
 
 ### `$exists: true` rides a sparse index instead of scanning the collection
