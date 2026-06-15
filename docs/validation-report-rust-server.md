@@ -9,10 +9,10 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | Category | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
-| `test_bulk.py` | 31 | 3 | 0 | 4 | 38 | 91.2% |
+| `test_bulk.py` | 33 | 1 | 0 | 4 | 38 | 97.1% |
 | `test_change_stream.py` | 42 | 8 | 0 | 105 | 155 | 84.0% |
 | `test_collation.py` | 1 | 0 | 0 | 15 | 16 | 100.0% |
-| `test_collection.py` | 75 | 12 | 0 | 4 | 91 | 86.2% |
+| `test_collection.py` | 76 | 11 | 0 | 4 | 91 | 87.4% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
 | `test_command_logging.py` | 16 | 0 | 0 | 20 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
@@ -36,15 +36,13 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 0 | 0 | 0 | 43 | 43 | — |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **824** | **84** | **0** | **595** | **1503** | **90.7%** |
+| **Overall** | **827** | **81** | **0** | **595** | **1503** | **91.1%** |
 
-## Failures (84)
+## Failures (81)
 
 First 30 failure node-ids for manual triage:
 
 ```
-vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_large_inserts_ordered
-vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_large_inserts_unordered
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_upsert_uuid_standard_subdocuments
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_raises_error_on_missing_id_418plus
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_read_concern
@@ -65,7 +63,6 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_min_query
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_options
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_replace_bypass_document_validation
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_update_bypass_document_validation
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_write_large_document
 vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listCollections_includes_clusteredIndex
 vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listIndexes_returns_the_index
 vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementTimeseriesCollection::test_insertMany_with_duplicate_ids
@@ -73,8 +70,11 @@ vendor/pymongo-tests/test/test_command_monitoring.py::TestCommandMonitoringFind:
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateLet::test_Aggregate_with_let_option
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateMergeErrorResponse::test_aggregate_$merge_DuplicateKey_error_is_accessible
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateOutReadConcern::test_readConcern_linearizable_with_out_stage
+vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedBulkWriteUpdateOnePipeline::test_UpdateOne_in_bulk_write_using_pipelines
+vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedEstimatedDocumentCount::test_estimatedDocumentCount_works_correctly_on_views
+vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedFindOneAndUpdateArrayFilters::test_FindOneAndUpdate_when_multiple_documents_match_arrayFilters
 ```
-... and 54 more (see raw JSON).
+... and 51 more (see raw JSON).
 
 ## How this is generated
 
