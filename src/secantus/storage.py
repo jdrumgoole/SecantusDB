@@ -19,19 +19,20 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import functools
 import os
+import re
 import shutil
 import tempfile
 import threading
 import time as _time
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
 import wiredtiger as wt
-from bson import Decimal128
+from bson.int64 import Int64
 from bson.timestamp import Timestamp
 
 from secantus.diff import compute_update_description
@@ -225,6 +226,14 @@ class DuplicateKeyError(Exception):
         self.doc_id = doc_id
 
 
+def _is_operator_expr(v: Any) -> bool:
+    """True when ``v`` is a query OPERATOR expression (a non-empty dict
+    whose keys all start with ``$``, e.g. ``{$gt: 5}``) — as opposed to
+    a literal subdocument equality value (``{f: 1, f2: 2}``). Used by the
+    upsert seed extraction to tell the two apart."""
+    return isinstance(v, dict) and len(v) > 0 and all(k.startswith("$") for k in v)
+
+
 def _id_key(doc_id: Any) -> bytes:
     """Byte-sortable canonical bytes for an ``_id`` value.
 
@@ -241,6 +250,73 @@ def _id_key(doc_id: Any) -> bytes:
     return encode_value(doc_id)
 
 
+def _is_regex_value(v: Any) -> bool:
+    return isinstance(v, (re.Pattern, bson.Regex))
+
+
+def _id_point_lookup_keys(spec: Any) -> list[bytes] | None:
+    """id_keys for an ``{_id: <spec>}`` equality predicate, or ``None``.
+
+    The documents table is keyed by ``(db, coll, encode_value(_id))``, so
+    an ``_id`` equality is a direct primary-key point lookup rather than a
+    COLLSCAN. This returns the WT key bytes to fetch for:
+
+    * a scalar bare equality (``{_id: 5}``),
+    * ``{_id: {$eq: scalar}}``,
+    * ``{_id: {$in: [scalars]}}``.
+
+    Returns ``None`` (caller falls back to its normal routing / COLLSCAN)
+    for range operators, regex, subdocument or operator-valued equalities,
+    or anything else that isn't a pure point lookup. ``$in`` keys come back
+    deduplicated and in ascending byte (== ``_id``) order so the caller's
+    sort-acceleration can treat the result as already sorted on ``_id``.
+    An empty ``$in`` yields ``[]`` — a valid no-match point lookup.
+    """
+    if isinstance(spec, Mapping):
+        keys = list(spec.keys())
+        if not keys or not all(isinstance(k, str) and k.startswith("$") for k in keys):
+            # Literal subdocument _id — leave to the normal path.
+            return None
+        if keys == ["$eq"]:
+            v = spec["$eq"]
+            if isinstance(v, Mapping) or _is_regex_value(v):
+                return None
+            return [_id_key(v)]
+        if keys == ["$in"]:
+            vals = spec["$in"]
+            if not isinstance(vals, (list, tuple)):
+                return None
+            if any(isinstance(v, Mapping) or _is_regex_value(v) for v in vals):
+                return None
+            return sorted({_id_key(v) for v in vals})
+        return None
+    if _is_regex_value(spec):
+        return None
+    return [_id_key(spec)]
+
+
+def _parse_index_collation(spec: Any) -> Any:
+    """Parse an index's stored ``collation`` option into a Collation.
+
+    Returns ``None`` for falsy / non-dict input, or for collations
+    that don't support index encoding (``numericOrdering``) — the
+    picker treats those as "index isn't usable for collation
+    lookups," falling back to COLLSCAN, while the write path writes
+    raw-codepoint entries unchanged.
+
+    Local import avoids the ``storage → collation → sortkey →
+    storage`` cycle that a top-level import would create.
+    """
+    if not isinstance(spec, dict) or not spec:
+        return None
+    from secantus.collation import parse as _parse_coll
+
+    coll = _parse_coll(spec)
+    if coll is None or not coll.supports_index_encoding:
+        return None
+    return coll
+
+
 def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:
     """True if any field in ``key_spec`` resolves to a list value in ``doc``.
 
@@ -252,7 +328,11 @@ def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> 
 
 
 def _index_key(
-    doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
+    doc: Mapping[str, Any],
+    key_spec: Mapping[str, Any],
+    *,
+    sparse: bool,
+    collation: Any = None,
 ) -> bytes | None:
     """Direction-aware byte-sortable encoding for an index ``key_spec``.
 
@@ -260,6 +340,13 @@ def _index_key(
     (descending) fields get bitwise-inverted bytes, making a forward
     B-tree walk yield values in descending order. Compound keys are
     joined with ``\\x00\\x00`` between components.
+
+    ``collation`` propagates to every string field — when set, string
+    values are normalised (accent-stripped / case-folded per the
+    collation strength) before encoding so the entries table sorts
+    by the collation's rules rather than raw codepoint. Must match
+    the index's stored ``collation`` option; the writers handle
+    that.
 
     For docs whose indexed field is array-valued, this returns the
     whole-array sortkey only — the single canonical "doc-shape" key
@@ -274,13 +361,20 @@ def _index_key(
     fields = list(key_spec)
     if len(fields) == 1:
         d = int(key_spec[fields[0]])
-        return encode_value_directed(get_path(dict(doc), fields[0]), d)
-    parts = [encode_value_directed(get_path(dict(doc), f), int(key_spec[f])) for f in fields]
+        return encode_value_directed(get_path(dict(doc), fields[0]), d, collation=collation)
+    parts = [
+        encode_value_directed(get_path(dict(doc), f), int(key_spec[f]), collation=collation)
+        for f in fields
+    ]
     return COMPOUND_SEP.join(parts)
 
 
 def _index_key_variants(
-    doc: Mapping[str, Any], key_spec: Mapping[str, Any], *, sparse: bool
+    doc: Mapping[str, Any],
+    key_spec: Mapping[str, Any],
+    *,
+    sparse: bool,
+    collation: Any = None,
 ) -> list[bytes]:
     """All byte-keys this doc contributes to an index under ``key_spec``.
 
@@ -326,7 +420,7 @@ def _index_key_variants(
             uniq: list[Any] = []
             d = int(key_spec[field])
             for elem in v:
-                eb = encode_value_directed(elem, d)
+                eb = encode_value_directed(elem, d, collation=collation)
                 if eb in seen:
                     continue
                 seen.add(eb)
@@ -343,7 +437,7 @@ def _index_key_variants(
         keys: list[bytes] = []
         seen_kb: set[bytes] = set()
         for val in per_field[0]:
-            kb = encode_value_directed(val, d)
+            kb = encode_value_directed(val, d, collation=collation)
             if kb in seen_kb:
                 continue
             seen_kb.add(kb)
@@ -357,7 +451,8 @@ def _index_key_variants(
     seen_kb = set()
     for combo in product(*per_field):
         parts = [
-            encode_value_directed(combo[i], int(key_spec[fields[i]])) for i in range(len(fields))
+            encode_value_directed(combo[i], int(key_spec[fields[i]]), collation=collation)
+            for i in range(len(fields))
         ]
         kb = COMPOUND_SEP.join(parts)
         if kb in seen_kb:
@@ -367,139 +462,17 @@ def _index_key_variants(
     return keys
 
 
-def _to_decimal(value: Any) -> Decimal:
-    if isinstance(value, Decimal128):
-        return value.to_decimal()
-    if isinstance(value, float):
-        return Decimal(repr(value))
-    return Decimal(value)
-
-
-def _bson_type_rank(value: Any) -> int:
-    """Rank for MongoDB's cross-type sort order. Lower rank sorts first."""
-    import datetime as _dt
-
-    from bson import Binary, MaxKey, MinKey, ObjectId, Regex, Timestamp
-
-    if isinstance(value, MinKey):
-        return 1
-    if value is None:
-        return 2
-    if isinstance(value, bool):
-        return 9
-    if isinstance(value, (int, float, Decimal128)):
-        return 3
-    if isinstance(value, str):
-        return 4
-    if isinstance(value, Mapping):
-        return 5
-    if isinstance(value, list):
-        return 6
-    if isinstance(value, (bytes, Binary)):
-        return 7
-    if isinstance(value, ObjectId):
-        return 8
-    if isinstance(value, _dt.datetime):
-        return 10
-    if isinstance(value, Timestamp):
-        return 11
-    if isinstance(value, Regex):
-        return 12
-    if isinstance(value, MaxKey):
-        return 13
-    return 5
-
-
-class _SortKey:
-    __slots__ = ("val", "_reverse")
-
-    def __init__(self, val: Any, reverse: bool = False) -> None:
-        self.val = val
-        self._reverse = reverse
-
-    def __lt__(self, other: _SortKey) -> bool:
-        # Swap operands when this key is descending — the same comparison
-        # logic then yields the correct order for desc fields, and the
-        # equal-keys case still returns False on both sides (stable sort
-        # preserves doc order). Both sides of the comparison must agree on
-        # direction (they're in the same column), which our caller
-        # guarantees.
-        if self._reverse:
-            a, b = other.val, self.val
-        else:
-            a, b = self.val, other.val
-        return _bson_lt(a, b)
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, _SortKey) and self.val == other.val
-
-
-def _bson_lt(a: Any, b: Any) -> bool:
-    """BSON sort-order ``<`` for two values.
-
-    Handles the four cases ``__lt__`` used to inline: cross-type rank,
-    Decimal128 widening, native ``<``, and the embedded-document /
-    array recursion — mongo-node-driver's
-    ``Aggregation ... pipeline using array`` test sorts grouped docs
-    by an embedded ``_id`` field and the previous inline ``a < b``
-    raised ``TypeError`` on Python's dicts.
-    """
-    ra = _bson_type_rank(a)
-    rb = _bson_type_rank(b)
-    if ra != rb:
-        return ra < rb
-    if a is None or b is None:
-        return False
-    if isinstance(a, Decimal128) or isinstance(b, Decimal128):
-        try:
-            ad = _to_decimal(a)
-            bd = _to_decimal(b)
-            return bool(ad < bd)
-        except (InvalidOperation, ValueError):
-            pass
-    # Embedded documents: compare field-by-field in insertion order,
-    # first differing pair wins. Real BSON sort recurses; Python's dict
-    # ``<`` raises ``TypeError`` so without this branch sort would be
-    # a no-op on grouped ``_id`` keys.
-    if isinstance(a, Mapping) and isinstance(b, Mapping):
-        a_items = list(a.items())
-        b_items = list(b.items())
-        for (ak, av), (bk, bv) in zip(a_items, b_items, strict=False):
-            if ak != bk:
-                return ak < bk
-            if _bson_lt(av, bv):
-                return True
-            if _bson_lt(bv, av):
-                return False
-        return len(a_items) < len(b_items)
-    # Arrays: lexicographic, element-by-element. Same TypeError trap
-    # as the dict case for arrays-of-mixed-types.
-    if isinstance(a, list) and isinstance(b, list):
-        for av, bv in zip(a, b, strict=False):
-            if _bson_lt(av, bv):
-                return True
-            if _bson_lt(bv, av):
-                return False
-        return len(a) < len(b)
-    try:
-        return bool(a < b)
-    except TypeError:
-        return type(a).__name__ < type(b).__name__
-
-
-def sort_docs(
-    docs: list[dict[str, Any]], sort_spec: Mapping[str, Any] | None
-) -> list[dict[str, Any]]:
-    if not sort_spec:
-        return docs
-    fields = [(f, int(d) == -1) for f, d in sort_spec.items()]
-    # Single sort over a precomputed tuple key rather than N stable passes:
-    # one pass through Timsort, get_path called once per field per doc.
-    return sorted(
-        docs,
-        key=lambda d: tuple(_SortKey(get_path(d, f), reverse=rev) for f, rev in fields),
-    )
-
+# The pure BSON sort comparator lives in ``secantus.ordering`` (no I/O, so it's
+# importable without the WiredTiger extension). Re-exported here for the many
+# existing ``from secantus.storage import sort_docs / _SortKey / _bson_lt`` call
+# sites and ``find_matching``'s internal ``sort_docs`` calls below.
+from secantus.ordering import (  # noqa: E402, F401  (re-exported for back-compat)
+    _bson_lt,
+    _bson_type_rank,
+    _SortKey,
+    _to_decimal,
+    sort_docs,
+)
 
 _ID_INDEX_NAME = "_id_"
 
@@ -525,6 +498,116 @@ class IndexConflict(Exception):
         # don't have the index spec handy.
         self.key_pattern = key_pattern
         self.key_value = key_value
+
+
+class WriteConflictError(Exception):
+    """A WiredTiger WT_ROLLBACK: two transactions touched the same item.
+
+    Inside a user (multi-document) transaction this surfaces to the
+    client as mongod's statement-time ``WriteConflict`` (code 112) with
+    the ``TransientTransactionError`` label, and the transaction is
+    aborted server-side. Outside a transaction the storage layer
+    retries the write briefly (a user transaction holds its uncommitted
+    writes until commit/abort) before giving up with the same error.
+    """
+
+
+def _is_wt_rollback(exc: BaseException) -> bool:
+    """True when a ``WiredTigerError`` is the WT_ROLLBACK conflict signal
+    (as opposed to e.g. WT_DUPLICATE_KEY). The SWIG binding raises a
+    typed ``WiredTigerRollbackError`` subclass; the message match is a
+    fallback for raise-sites that re-wrap into the base class."""
+    if isinstance(exc, wt.WiredTigerRollbackError):
+        return True
+    msg = str(exc)
+    return "WT_ROLLBACK" in msg or "conflict between concurrent operations" in msg
+
+
+# Non-transactional writers that hit a user transaction's uncommitted
+# write retry briefly instead of blocking: mongod blocks such writers
+# until the transaction commits or aborts, which we approximate with a
+# backoff loop bounded by this deadline (the transaction lifetime cap
+# is 60s, but a multi-second stall already covers the overwhelmingly
+# common test patterns; see tasks/backlog.md for the divergence note).
+# mongod's per-document BSON cap (16 MiB). Duplicated from wire.py on
+# purpose: storage must not import the wire layer, and both values pin
+# the same protocol constant.
+MAX_BSON_OBJECT_SIZE = 16 * 1024 * 1024
+
+
+class DocumentTooLargeError(Exception):
+    """A write produced a document over ``MAX_BSON_OBJECT_SIZE``.
+
+    Carries mongod's per-path error code: 10334 (BSONObjectTooLarge)
+    for inserts and update-grown documents, 17420 for upserts. The
+    message is mongod's verbatim wording — drivers' tests assert it.
+    """
+
+    def __init__(self, code: int, errmsg: str) -> None:
+        super().__init__(errmsg)
+        self.code = code
+
+
+_WRITE_CONFLICT_RETRY_DEADLINE_S = 5.0
+_WRITE_CONFLICT_RETRY_DELAY_S = 0.005
+_WRITE_CONFLICT_RETRY_DELAY_MAX_S = 0.02
+
+
+def _retry_write_conflicts(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Retry a whole public write method on WT_ROLLBACK.
+
+    Safe because the failed attempt's ``_batch_transaction`` already
+    rolled everything back and the per-collection lock is released on
+    the way out — the retry re-runs from scratch. Inside a user
+    transaction the conflict is NOT retried: it surfaces immediately so
+    the command layer can abort the transaction with mongod's
+    statement-time ``WriteConflict``.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: Storage, *args: Any, **kwargs: Any) -> Any:
+        deadline: float | None = None
+        delay = _WRITE_CONFLICT_RETRY_DELAY_S
+        while True:
+            try:
+                return fn(self, *args, **kwargs)
+            except (WriteConflictError, wt.WiredTigerError) as exc:
+                if not isinstance(exc, WriteConflictError) and not _is_wt_rollback(exc):
+                    raise
+                if getattr(self._tls, "user_txn", None) is not None:
+                    raise
+                now = _time.monotonic()
+                if deadline is None:
+                    deadline = now + _WRITE_CONFLICT_RETRY_DEADLINE_S
+                if now >= deadline:
+                    if isinstance(exc, WriteConflictError):
+                        raise
+                    raise WriteConflictError(str(exc)) from exc
+                _time.sleep(delay)
+                delay = min(delay * 2, _WRITE_CONFLICT_RETRY_DELAY_MAX_S)
+
+    return wrapper
+
+
+class UserTransactionHandle:
+    """Storage-side state of one multi-document transaction.
+
+    Knows nothing about ``lsid`` / ``txnNumber`` — that's the
+    ``secantus.transactions`` registry's layer. Carries the dedicated
+    WT session, its cursor cache (same ``(table, overwrite)`` keying as
+    the per-thread cache), and the buffered oplog entries + pre-images
+    that ``commit_user_transaction`` flushes.
+    """
+
+    __slots__ = ("session", "cursors", "began", "closed", "oplog_entries", "pre_images")
+
+    def __init__(self, session: Any) -> None:
+        self.session = session
+        self.cursors: dict[tuple[str, bool], Any] = {}
+        self.began = False
+        self.closed = False
+        self.oplog_entries: list[dict[str, Any]] = []
+        self.pre_images: list[bytes | None] = []
 
 
 class DocumentValidationError(Exception):
@@ -580,6 +663,59 @@ class BadHint(Exception):
     """The ``hint`` passed to ``find_matching`` doesn't name an existing index."""
 
 
+class MinMaxKeyError(Exception):
+    """Cursor ``min`` / ``max`` bounds don't match the hinted index key
+    pattern (mongod surfaces this as 51174)."""
+
+
+def _op_implies_bound(qop: str, qv: Any, pop: str, pv: Any) -> bool:
+    """Does a single query constraint ``(qop, qv)`` guarantee the partial
+    bound ``(pop, pv)``? Comparison uses ``encode_value`` so it follows
+    MongoDB's cross-type BSON sort order. Returns ``False`` for any
+    operator pairing it can't prove (soundness over completeness)."""
+    try:
+        a, b = encode_value(qv), encode_value(pv)
+    except Exception:
+        return False
+    le, lt, ge, gt, eq = a <= b, a < b, a >= b, a > b, a == b
+    if pop in ("$lte", "$lt"):
+        # query upper-bounds the field; need its max <= / < pv.
+        if qop == "$eq":
+            return le if pop == "$lte" else lt
+        if qop == "$lte":
+            return le if pop == "$lte" else lt
+        if qop == "$lt":
+            return le  # a < qv <= pv  => a < pv => a <= pv (and a < pv for $lt)
+        return False
+    if pop in ("$gte", "$gt"):
+        if qop == "$eq":
+            return ge if pop == "$gte" else gt
+        if qop == "$gte":
+            return ge if pop == "$gte" else gt
+        if qop == "$gt":
+            return ge
+        return False
+    if pop == "$eq":
+        return qop == "$eq" and eq
+    return False
+
+
+def _clause_implies_bounds(qval: Any, pbound: Mapping[str, Any]) -> bool:
+    """True if the query clause ``qval`` (a bare value or an operator
+    dict) guarantees every constraint in the partial operator dict
+    ``pbound`` (e.g. ``{$lte: 1.5}``)."""
+    if isinstance(qval, Mapping) and qval and all(k.startswith("$") for k in qval):
+        q_constraints = list(qval.items())
+    else:
+        q_constraints = [("$eq", qval)]
+    for pop, pv in pbound.items():
+        if pop not in ("$eq", "$lt", "$lte", "$gt", "$gte"):
+            return False  # partial filter uses an operator we can't reason about
+        if not any(_op_implies_bound(qop, qv, pop, pv) for qop, qv in q_constraints):
+            return False
+    return True
+
+
 class Storage:
     def __init__(
         self,
@@ -603,6 +739,11 @@ class Storage:
         self.enable_oplog = enable_oplog
         self._lock = threading.RLock()
         self._closed = False
+        # Per-insert discriminator counter for timeseries doc keys (see
+        # ``_timeseries_doc_suffix``). Only disambiguates inserts that land
+        # in the same nanosecond; wall-clock restart-safety comes from the
+        # ``time_ns`` prefix.
+        self._ts_suffix_counter = 0
         self._tempdir: str | None = None
         # session_max default is ~120; each client connection thread
         # caches its own session in `threading.local()`, and cross-
@@ -701,6 +842,11 @@ class Storage:
         self.oplog_max_entries = int(oplog_max_entries)
         self._time = time_func or _time.time
         self._oplog_cv = threading.Condition(threading.Lock())
+        # Set by ``signal_shutdown()`` at server stop so tailable getMore
+        # waiters stop blocking and their connection threads drain *before*
+        # ``close()`` tears down the WT connection — a thread mid-WT-op when
+        # the connection closes is a use-after-free / native crash.
+        self._shutting_down = False
         self._oplog_emit_count = 0
         # Tiny fine-grained lock for seq + timestamp minting. Held in
         # microseconds while reserving the next seq range and bumping
@@ -907,6 +1053,21 @@ class Storage:
         self._persist_oplog_meta()
         return ts
 
+    def peek_cluster_time(self) -> Timestamp:
+        """The last minted cluster time WITHOUT advancing the clock.
+
+        Reply gossip (``$clusterTime`` / ``operationTime`` attached to
+        every command reply) observes cluster time; only writes and the
+        explicit ``current_cluster_time`` advance it — matching mongod,
+        where reads gossip the node's known cluster time. A virgin
+        store mints once so the gossiped value is never
+        ``Timestamp(0, 0)``.
+        """
+        with self._oplog_seq_lock:
+            if self._last_ts_secs:
+                return Timestamp(self._last_ts_secs, self._last_ts_ord)
+        return self.current_cluster_time()
+
     def _write_coll_options(self, db: str, coll: str, opts: Mapping[str, Any]) -> None:
         c = self._cursor(_COLL_TABLE)
         # bson can't directly encode a uuid.UUID without a codec, so store as Binary subtype 4.
@@ -1006,6 +1167,82 @@ class Storage:
         if filter:
             rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
         if sort:
+            # ``$natural`` is the oplog's only meaningful order: entries are
+            # already scanned in natural (seq == insertion == ts) order, so
+            # ``$natural: 1`` is the identity and ``$natural: -1`` reverses.
+            # It's a pseudo-field, not a document field, so it must not go
+            # through the generic field-sort (which would see it as missing).
+            natural = sort.get("$natural") if isinstance(sort, Mapping) else None
+            if natural is not None:
+                if int(natural) < 0:
+                    rows = list(reversed(rows))
+            else:
+                rows = sort_docs(rows, sort)
+        if skip:
+            rows = rows[skip:]
+        if limit > 0:
+            rows = rows[:limit]
+        if projection:
+            rows = [apply_projection(r, projection) for r in rows]
+        return rows
+
+    def _is_system_users(self, db: str, coll: str) -> bool:
+        """``admin.system.users`` is the synthetic view onto the user
+        store. Mongod surfaces user records there regardless of which
+        database the user was created against — the per-user ``db``
+        field of each record names the authentication database. Other
+        databases' ``system.users`` namespace exists but is empty (also
+        matches mongod)."""
+        return db == "admin" and coll == "system.users"
+
+    def _scan_user_records(self) -> list[dict[str, Any]]:
+        """Walk every persisted user record across all databases and
+        return the decoded docs. Uses a private short-lived session for
+        the same cross-thread visibility reason as
+        :meth:`_scan_oplog_entries`."""
+        rows: list[dict[str, Any]] = []
+        with self._lock:
+            session = self._conn.open_session()
+            try:
+                c = session.open_cursor(_USERS_TABLE, None)
+                try:
+                    rc = c.next()
+                    while rc == 0:
+                        blob = bytes(c.get_value())
+                        if blob:
+                            rows.append(bson.decode(blob))
+                        rc = c.next()
+                finally:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+        return rows
+
+    def _find_system_users(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        skip: int,
+        limit: int,
+        sort: Mapping[str, Any] | None,
+        projection: Mapping[str, Any] | None,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]]:
+        """Read path for ``admin.system.users``. The user records
+        themselves already carry the mongod-shaped fields (``_id`` =
+        ``<db>.<user>``, ``user``, ``db``, ``credentials``, ``roles``,
+        ``mechanisms``), so the view is the row set unchanged plus the
+        usual filter / sort / skip / limit / projection pipeline."""
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._scan_user_records()
+        if filter:
+            rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
+        if sort:
             rows = sort_docs(rows, sort)
         if skip:
             rows = rows[skip:]
@@ -1014,6 +1251,86 @@ class Storage:
         if projection:
             rows = [apply_projection(r, projection) for r in rows]
         return rows
+
+    def _count_system_users(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._scan_user_records()
+        if not filter:
+            return len(rows)
+        return sum(1 for r in rows if matches(r, filter, vars=let, collation=collation_obj))
+
+    def _is_system_version(self, db: str, coll: str) -> bool:
+        """``admin.system.version`` is the synthetic view that surfaces
+        the user-management auth-schema doc. Mongod stores other
+        cluster-state docs here too (e.g. the version-2-to-3 schema
+        upgrade snapshot from MongoDB 2.6 → 3.0), but in modern
+        deployments the only doc that tooling cares about is
+        ``{_id: "authSchema", currentVersion: 5}`` — the version SCRAM
+        introduced. Surfacing just that doc is what driver tools
+        actually check on startup before issuing user-management
+        commands."""
+        return db == "admin" and coll == "system.version"
+
+    def _system_version_docs(self) -> list[dict[str, Any]]:
+        """The fixed contents of ``admin.system.version``.
+
+        Mongod's ``authSchema`` currentVersion is ``5`` as of MongoDB
+        4.0 — the SCRAM-SHA-256 baseline. We advertise the same number
+        so tools that gate user-management on the schema version
+        proceed (we implement SCRAM-SHA-256 natively, so 5 is honest).
+        """
+        return [{"_id": "authSchema", "currentVersion": 5}]
+
+    def _find_system_version(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        skip: int,
+        limit: int,
+        sort: Mapping[str, Any] | None,
+        projection: Mapping[str, Any] | None,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]]:
+        """Read path for ``admin.system.version`` — synthetic fixed-doc view."""
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._system_version_docs()
+        if filter:
+            rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
+        if sort:
+            rows = sort_docs(rows, sort)
+        if skip:
+            rows = rows[skip:]
+        if limit > 0:
+            rows = rows[:limit]
+        if projection:
+            rows = [apply_projection(r, projection) for r in rows]
+        return rows
+
+    def _count_system_version(
+        self,
+        filter: dict[str, Any] | None,
+        *,
+        let: dict[str, Any] | None,
+        collation: Any,
+    ) -> int:
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        rows = self._system_version_docs()
+        if not filter:
+            return len(rows)
+        return sum(1 for r in rows if matches(r, filter, vars=let, collation=collation_obj))
 
     def _count_oplog_rs(
         self,
@@ -1049,7 +1366,24 @@ class Storage:
         caller's prebuilt ``entries`` list is discarded. The change-stream
         condvar is still notified so any tailable getMore wakes up and
         observes the (empty) state.
+
+        When a user (multi-document) transaction is installed on this
+        thread, entries are **buffered** on the transaction handle and
+        nothing is written or notified: seqs must be minted at commit
+        time, because a statement-time seq could become visible *behind*
+        a concurrent change-stream reader's position and the event would
+        be silently skipped. ``commit_user_transaction`` flushes the
+        buffer through this same method (with the buffering hook
+        disarmed) inside the transaction's WT session.
         """
+        handle = getattr(self._tls, "user_txn", None)
+        if handle is not None:
+            if self.enable_oplog and entries:
+                if pre_images is None:
+                    pre_images = [None] * len(entries)
+                handle.oplog_entries.extend(entries)
+                handle.pre_images.extend(pre_images)
+            return 0
         if not self.enable_oplog:
             with self._oplog_cv:
                 self._oplog_cv.notify_all()
@@ -1521,6 +1855,14 @@ class Storage:
                 rc = c.next()
         return out
 
+    def signal_shutdown(self) -> None:
+        """Tell tailable getMore waiters the server is stopping so they wake
+        and return immediately, letting their connection threads drain before
+        :meth:`close` tears down WiredTiger. One-way: only set at stop."""
+        self._shutting_down = True
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+
     def close(self) -> None:
         # Stop background threads before tearing down WT — both the
         # TTL sweeper and the noop heartbeat acquire ``self._lock``,
@@ -1643,6 +1985,25 @@ class Storage:
                 # Sweeper failures must not propagate — they'd kill
                 # the daemon thread and silently disable expiry.
                 log.exception("ttl sweep failed")
+
+    def ensure_oplog_bootstrap(self) -> None:
+        """Seed a bootstrap noop on a *fresh* oplog so ``local.oplog.rs`` is
+        never empty — mirroring mongod, whose first oplog entry is the replica
+        set's "initiating set" noop. Without it a brand-new server's oplog has
+        zero rows and a client tailing ``local.oplog.rs`` (pymongo's
+        ``test_cursor.test_to_list_tailable``) finds nothing to read.
+
+        Called by :class:`SecantusDBServer` at startup (replica-set initiation
+        is a server/replication concern, not a storage-engine one — bare
+        ``Storage`` instances in unit tests keep a clean empty oplog). A noop
+        (``op: "n"``) is skipped by change-stream projection, so it never
+        surfaces as a change event. Idempotent: fires only when the oplog is
+        enabled and truly fresh (``_next_seq == 1``); reopening a populated
+        oplog is a no-op.
+        """
+        with self._lock:
+            if self.enable_oplog and self._next_seq == 1:
+                self._emit_oplog([{"op": "n", "ns": "", "o": {"msg": "initiating set"}}])
 
     def emit_noop_heartbeat(self) -> int:
         """Append one ``{op: "n"}`` heartbeat to the oplog and return its seq.
@@ -1808,7 +2169,15 @@ class Storage:
         accumulate per-doc errors (e.g. ``ordered=False`` insert)
         should NOT raise out of the block — they handle the per-doc
         errors locally and let the surviving writes commit.
+
+        Inside a user (multi-document) transaction this is a no-op
+        passthrough: WT doesn't nest transactions, and the statement's
+        writes must stay uncommitted in the user transaction until its
+        ``commitTransaction``.
         """
+        if getattr(self._tls, "user_txn", None) is not None:
+            yield self._session()
+            return
         session = self._session()
         # Cached cursors must be reset before begin_transaction so they
         # don't carry a stale snapshot from before the transaction
@@ -1856,6 +2225,10 @@ class Storage:
         ``count_matching``, ``list_*``, ``explain_plan``) so cross-
         connection visibility matches real ``mongod``.
         """
+        if getattr(self._tls, "user_txn", None) is not None:
+            # A user transaction's whole point is the pinned snapshot:
+            # reads inside it must keep seeing the transaction's view.
+            return
         s = getattr(self._tls, "session", None)
         if s is None:
             return
@@ -1865,6 +2238,141 @@ class Storage:
             # (``_batch_transaction`` is write-only), so the exception
             # path is defensive — log via ``suppress`` and move on.
             s.reset_snapshot()
+
+    # -- user (multi-document) transactions --------------------------------
+    #
+    # A user transaction owns a dedicated WT session, NOT the connection
+    # thread's ``threading.local`` one: pymongo can legally send a
+    # transaction's statements and its retryable commit on different
+    # pooled connections (= different server threads). Statements run
+    # with the transaction's session/cursors swapped into ``_tls`` so
+    # every existing storage path (unique probes, index writes,
+    # ``_ensure_collection``, ``find_matching``) transparently executes
+    # inside the WT transaction — read-your-own-writes and the pinned
+    # snapshot fall out for free. The command layer serializes access
+    # per transaction; these primitives assume no two threads install
+    # the same handle concurrently.
+
+    def begin_user_transaction(self) -> UserTransactionHandle:
+        """Open a dedicated WT session for a multi-document transaction.
+
+        The WT ``begin_transaction`` itself happens lazily on the first
+        ``use_user_transaction`` entry so the snapshot pins at the
+        transaction's first statement (mongod semantics).
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("storage is closed")
+            session = self._conn.open_session()
+            # Registered so ``close()``'s sweep rolls back leftovers.
+            self._all_sessions.append(session)
+        return UserTransactionHandle(session)
+
+    @contextlib.contextmanager
+    def use_user_transaction(self, handle: UserTransactionHandle) -> Any:
+        """Run the body with ``handle``'s session installed as this
+        thread's storage session, arming the oplog buffering hook."""
+        if not handle.began:
+            handle.session.begin_transaction()
+            handle.began = True
+        with self._install_txn_session(handle):
+            self._tls.user_txn = handle
+            try:
+                yield
+            finally:
+                self._tls.user_txn = None
+
+    def commit_user_transaction(
+        self,
+        handle: UserTransactionHandle,
+        *,
+        lsid_doc: Mapping[str, Any] | None = None,
+        txn_number: int | None = None,
+    ) -> int:
+        """Flush the buffered oplog + commit the WT transaction.
+
+        All buffered entries get one shared commit ``Timestamp``
+        (mongod stamps every op in a transaction with the commit time)
+        plus ``lsid`` / ``txnNumber`` for change-stream events. The
+        oplog/preimage rows are written through the transaction's own
+        session *before* ``commit_transaction``, so data and oplog
+        become visible atomically. Returns the last oplog seq emitted.
+
+        On failure the transaction is rolled back and the exception
+        propagates — a failed WT commit cannot be retried into success.
+        """
+        last_seq = 0
+        try:
+            if handle.began:
+                entries = handle.oplog_entries
+                pre_images = handle.pre_images
+                if entries and self.enable_oplog:
+                    # Mint the shared commit timestamp before installing
+                    # the txn session: ``current_cluster_time`` persists
+                    # oplog meta through the calling thread's session and
+                    # that write must not ride inside the transaction.
+                    ts = self.current_cluster_time()
+                    wall = _dt.datetime.now(_dt.timezone.utc)
+                    for entry in entries:
+                        entry.setdefault("ts", ts)
+                        entry.setdefault("wall", wall)
+                        if lsid_doc is not None:
+                            entry["lsid"] = dict(lsid_doc)
+                        if txn_number is not None:
+                            entry["txnNumber"] = Int64(txn_number)
+                with self._install_txn_session(handle):
+                    # ``_tls.user_txn`` is deliberately NOT set here, so
+                    # ``_emit_oplog`` takes its real write path on the
+                    # transaction's session instead of re-buffering.
+                    if entries:
+                        last_seq = self._emit_oplog(entries, pre_images)
+                    handle.session.commit_transaction()
+        except Exception:
+            self.abort_user_transaction(handle)
+            raise
+        self._close_user_txn_session(handle)
+        # ``_emit_oplog`` notified before the WT commit (same order as
+        # the non-transactional write path); one more notify after the
+        # commit guarantees tailable getMore waiters re-poll against
+        # the now-visible rows.
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+        return last_seq
+
+    def abort_user_transaction(self, handle: UserTransactionHandle) -> None:
+        """Roll back and release the transaction's WT session. Idempotent."""
+        if handle.closed:
+            return
+        if handle.began:
+            with contextlib.suppress(Exception):
+                handle.session.rollback_transaction()
+        self._close_user_txn_session(handle)
+
+    @contextlib.contextmanager
+    def _install_txn_session(self, handle: UserTransactionHandle) -> Any:
+        tls = self._tls
+        prev_session = getattr(tls, "session", None)
+        prev_cursors = getattr(tls, "cursors", {})
+        tls.session = handle.session
+        tls.cursors = handle.cursors
+        try:
+            yield
+        finally:
+            tls.session = prev_session
+            tls.cursors = prev_cursors
+
+    def _close_user_txn_session(self, handle: UserTransactionHandle) -> None:
+        if handle.closed:
+            return
+        handle.closed = True
+        for c in handle.cursors.values():
+            with contextlib.suppress(Exception):
+                c.close()
+        handle.cursors.clear()
+        with contextlib.suppress(Exception):
+            handle.session.close()
+        with self._lock, contextlib.suppress(ValueError):
+            self._all_sessions.remove(handle.session)
 
     def _cursor(self, table: str, *, overwrite: bool = True) -> Any:
         self._session()
@@ -1887,6 +2395,27 @@ class Storage:
             return None
         blob = bytes(c.get_value())
         return bson.decode(blob) if blob else {}
+
+    def _is_timeseries(self, db: str, coll: str) -> bool:
+        opts = self._coll_options(db, coll)
+        return bool(opts) and "timeseries" in opts
+
+    def _timeseries_doc_suffix(self) -> bytes:
+        """Doc-table key discriminator for timeseries collections.
+
+        Timeseries collections don't enforce ``_id`` uniqueness (mongod
+        buckets measurements by time; ``_id`` is not a key), but our doc
+        table is keyed by ``encode_value(_id)`` — equal ``_id``s would
+        structurally collide. Suffixing the key keeps duplicates adjacent
+        (the sortkey encoding is prefix-free, so grouping by ``_id`` is
+        preserved) in insertion order. ``time_ns`` keeps suffixes unique
+        across store reopens; the counter disambiguates same-nanosecond
+        inserts. Reads decode and filter by content, so the suffix is
+        invisible above storage — but the ``_id`` point-lookup fast path
+        must not be used (it reconstructs the UNsuffixed key).
+        """
+        self._ts_suffix_counter = (self._ts_suffix_counter + 1) % 0x10000
+        return _time.time_ns().to_bytes(8, "big") + self._ts_suffix_counter.to_bytes(2, "big")
 
     def _ensure_collection(self, db: str, coll: str) -> None:
         c = self._cursor(_COLL_TABLE)
@@ -1976,12 +2505,35 @@ class Storage:
             ]
         return [(id_k, bson.decode(blob)) for id_k, blob in raw]
 
-    def collection_is_capped(self, db: str, coll: str) -> bool:
-        """Public predicate: does the collection have ``capped: true`` set?"""
+    def collection_min_id_key(self, db: str, coll: str) -> bytes | None:
+        """Smallest ``id_key`` in the collection — the oldest doc in natural
+        (insertion, for monotonic ``_id``) order — or ``None`` if empty.
+
+        Used to detect capped-collection rollover for tailable cursors: if a
+        cursor's last-returned ``id_key`` is below this, the document it was
+        anchored on has been evicted, and mongod kills the cursor with
+        ``CappedPositionLost``. ``_scan_docs`` yields in ``id_key`` order, so
+        the first row is the minimum — we stop after it.
+        """
         with self._lock:
+            for id_k, _blob in self._scan_docs(db, coll):
+                return bytes(id_k)
+            return None
+
+    def collection_is_capped(self, db: str, coll: str) -> bool:
+        """Public predicate: does the collection have ``capped: true`` set?
+
+        The synthetic ``local.oplog.rs`` view is always capped (mongod models
+        the oplog as a capped collection) even though it isn't materialised in
+        the collections table — so tailable cursors over it are accepted.
+        """
+        with self._lock:
+            if self._is_oplog_rs(db, coll):
+                return True
             opts = self._coll_options(db, coll) or {}
             return bool(opts.get("capped"))
 
+    @_retry_write_conflicts
     def insert(
         self,
         db: str,
@@ -1991,6 +2543,9 @@ class Storage:
         ordered: bool = True,
         journal: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
+        # Materialized so the conflict-retry wrapper can safely re-run
+        # the whole method (a generator would arrive exhausted).
+        docs = list(docs)
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
@@ -2010,10 +2565,15 @@ class Storage:
             indexes = self._all_indexes(db, coll)
             partials = self._partial_filters(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
+            timeseries = self._is_timeseries(db, coll)
             for index, doc in enumerate(docs):
                 if "_id" not in doc:
                     doc["_id"] = bson.ObjectId()
                 key = _id_key(doc["_id"])
+                if timeseries:
+                    # Duplicate _ids are legal in timeseries collections —
+                    # see _timeseries_doc_suffix.
+                    key += self._timeseries_doc_suffix()
                 conflict = self._unique_conflict(
                     db, coll, doc, indexes, exclude_id_key=None, partials=partials
                 )
@@ -2045,12 +2605,33 @@ class Storage:
                         break
                     continue
                 blob = bson.encode(doc)
+                if len(blob) > MAX_BSON_OBJECT_SIZE:
+                    # mongod rejects per-document at insert time with
+                    # BSONObjectTooLarge (10334) and this exact wording.
+                    errors.append(
+                        {
+                            "index": index,
+                            "code": 10334,
+                            "errmsg": (
+                                f"object to insert too large. size in bytes: "
+                                f"{len(blob)}, max size: {MAX_BSON_OBJECT_SIZE}"
+                            ),
+                        }
+                    )
+                    if ordered:
+                        break
+                    continue
                 doc_cur = self._cursor(_DOC_TABLE, overwrite=False)
                 doc_cur.set_key(db, coll, key)
                 doc_cur.set_value(blob)
                 try:
                     doc_cur.insert()
-                except wt.WiredTigerError:
+                except wt.WiredTigerError as exc:
+                    if _is_wt_rollback(exc):
+                        # Concurrency conflict, not a duplicate key —
+                        # surface for transaction/retry handling instead
+                        # of lying with an E11000.
+                        raise WriteConflictError(str(exc)) from exc
                     errors.append(
                         {
                             "index": index,
@@ -2061,7 +2642,7 @@ class Storage:
                     if ordered:
                         break
                     continue
-                self._write_index_entries(db, coll, doc, indexes, partials)
+                self._write_index_entries(db, coll, doc, indexes, partials, id_key_override=key)
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
                 if oplog_on:
@@ -2158,9 +2739,31 @@ class Storage:
         hint: str | Mapping[str, Any] | None = None,
         let: dict[str, Any] | None = None,
         collation: Any = None,
+        min_bound: Mapping[str, Any] | None = None,
+        max_bound: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self._is_oplog_rs(db, coll):
             return self._find_oplog_rs(
+                filter,
+                skip=skip,
+                limit=limit,
+                sort=sort,
+                projection=projection,
+                let=let,
+                collation=collation,
+            )
+        if self._is_system_users(db, coll):
+            return self._find_system_users(
+                filter,
+                skip=skip,
+                limit=limit,
+                sort=sort,
+                projection=projection,
+                let=let,
+                collation=collation,
+            )
+        if self._is_system_version(db, coll):
+            return self._find_system_version(
                 filter,
                 skip=skip,
                 limit=limit,
@@ -2192,21 +2795,17 @@ class Storage:
                 candidates, in_sort_order = self._candidates_from_hint(
                     db, coll, resolved, sort_field, sort_dir
                 )
-            elif collation_obj is not None:
-                # Index entries are byte-encoded under the default
-                # codepoint ordering — they don't carry the collation's
-                # case- or accent-folding. A case-insensitive equality
-                # like ``{x: "PING"}`` would miss an indexed doc with
-                # ``x: "ping"`` because the entries are stored under
-                # the literal bytes of the inserted value. Force a
-                # COLLSCAN so ``matches()`` does the comparison with
-                # the collation in hand. ``mongod`` only honours an
-                # index when its definition's collation matches the
-                # query's; we don't support per-index collation yet,
-                # so the safe path is always-COLLSCAN-when-collation.
-                raw_blobs = [b for _, b in self._scan_docs(db, coll)]
             else:
-                candidates = self._try_index_lookup(db, coll, filter)
+                # Per-index collation: ``_try_index_lookup`` gates indexes
+                # by exact match against ``collation_obj`` (None counts as
+                # "no collation"), so the same code path covers both the
+                # plain and the collation-bearing cases. Same applies to
+                # the sort-acceleration pickers below — they all thread
+                # ``collation_obj`` through so a sort on a collation-
+                # indexed string field walks the index when the query's
+                # collation matches and falls back to a Python sort
+                # otherwise.
+                candidates = self._try_index_lookup(db, coll, filter, collation=collation_obj)
                 if candidates is not None and sort_field is not None:
                     if (
                         len(filter) == 1
@@ -2214,12 +2813,16 @@ class Storage:
                         and next(iter(filter)) == sort_field
                     ):
                         in_sort_order = True
-                        idx = self._find_leading_field_index(db, coll, sort_field, filter)
+                        idx = self._find_leading_field_index(
+                            db, coll, sort_field, filter, collation=collation_obj
+                        )
                         idx_dir = idx[1] if idx else 1
                         if sort_dir != idx_dir:
                             candidates = list(reversed(candidates))
                 elif candidates is None and not filter and sort_field is not None:
-                    idx = self._find_leading_field_index(db, coll, sort_field, filter)
+                    idx = self._find_leading_field_index(
+                        db, coll, sort_field, filter, collation=collation_obj
+                    )
                     if idx is not None:
                         idx_name, idx_dir, _is_compound = idx
                         # If the index direction matches the sort direction,
@@ -2235,7 +2838,9 @@ class Storage:
                 if candidates is None and not filter and sort_field is None and sort:
                     multi_spec = self._multi_sort_spec(sort)
                     if multi_spec is not None and len(multi_spec) > 1:
-                        match = self._compound_index_for_sort(db, coll, multi_spec)
+                        match = self._compound_index_for_sort(
+                            db, coll, multi_spec, collation=collation_obj
+                        )
                         if match is not None:
                             idx_name, reverse = match
                             candidates = self._walk_index_in_order(
@@ -2248,6 +2853,10 @@ class Storage:
             assert raw_blobs is not None
             candidates = [bson.decode(b) for b in raw_blobs]
         out = [d for d in candidates if matches(d, filter, vars=let, collation=collation_obj)]
+        if min_bound is not None or max_bound is not None:
+            out = self._apply_minmax_bounds(
+                db, coll, out, hint, min_bound, max_bound, collation_obj
+            )
         if sort and not in_sort_order:
             out = sort_docs(out, sort)
         if skip:
@@ -2257,6 +2866,75 @@ class Storage:
         if projection:
             out = [apply_projection(d, projection) for d in out]
         return out
+
+    def _apply_minmax_bounds(
+        self,
+        db: str,
+        coll: str,
+        docs: list[dict[str, Any]],
+        hint: str | Mapping[str, Any] | None,
+        min_bound: Mapping[str, Any] | None,
+        max_bound: Mapping[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]]:
+        """Filter ``docs`` by cursor ``min`` / ``max`` index bounds.
+
+        ``max`` is an exclusive upper bound, ``min`` an inclusive lower
+        bound, evaluated on the hinted index's key (mongod semantics).
+        The bound documents must name a leading prefix of the hinted
+        index's key fields, in the same order — otherwise mongod raises
+        51174, which we mirror via ``MinMaxKeyError``. Bounds and docs
+        are encoded with the same ``_index_key`` direction-aware byte
+        encoder, so a byte comparison reflects the index's natural order
+        (cross-type, per-field direction).
+        """
+        if hint is None:
+            raise MinMaxKeyError("min/max requires a hint")
+        resolved = self._resolve_hint(db, coll, hint)
+        key_spec: dict[str, Any] | None = None
+        if resolved == _ID_INDEX_NAME:
+            key_spec = {"_id": 1}
+        else:
+            for name, ks, _sparse, _unique in self._all_indexes(db, coll):
+                if name == resolved:
+                    key_spec = dict(ks)
+                    break
+        if key_spec is None:
+            raise MinMaxKeyError("min/max hint does not correspond to an index")
+        index_fields = list(key_spec)
+
+        def _bound_spec(bound: Mapping[str, Any]) -> dict[str, Any]:
+            bound_fields = list(bound)
+            if bound_fields != index_fields[: len(bound_fields)]:
+                raise MinMaxKeyError(
+                    "The field order of the min/max query option does not "
+                    "match the order of the hinted index's key pattern"
+                )
+            return {f: key_spec[f] for f in bound_fields}
+
+        min_key = (
+            _index_key(dict(min_bound), _bound_spec(min_bound), sparse=False, collation=collation)
+            if min_bound is not None
+            else None
+        )
+        max_key = (
+            _index_key(dict(max_bound), _bound_spec(max_bound), sparse=False, collation=collation)
+            if max_bound is not None
+            else None
+        )
+
+        def _in_bounds(doc: dict[str, Any]) -> bool:
+            if min_key is not None:
+                dk = _index_key(doc, _bound_spec(min_bound), sparse=False, collation=collation)
+                if dk is None or dk < min_key:  # min is inclusive
+                    return False
+            if max_key is not None:
+                dk = _index_key(doc, _bound_spec(max_bound), sparse=False, collation=collation)
+                if dk is None or dk >= max_key:  # max is exclusive
+                    return False
+            return True
+
+        return [d for d in docs if _in_bounds(d)]
 
     def _resolve_hint(self, db: str, coll: str, hint: str | Mapping[str, Any]) -> str:
         """Resolve ``hint`` to an index name (or ``$natural``).
@@ -2370,7 +3048,12 @@ class Storage:
         return out
 
     def _compound_index_for_sort(
-        self, db: str, coll: str, sort_fields: list[tuple[str, int]]
+        self,
+        db: str,
+        coll: str,
+        sort_fields: list[tuple[str, int]],
+        *,
+        collation: Any = None,
     ) -> tuple[str, bool] | None:
         """Find a compound index that satisfies ``sort_fields`` end-to-end.
 
@@ -2389,8 +3072,17 @@ class Storage:
         fields, index has 2) aren't accelerated; the savings on the
         leading prefix are usually less than the cost of the trailing
         Python sort over the materialised set.
+
+        ``collation``: same exact-match gate as the filter pickers — an
+        index is only considered if its stored collation parses to the
+        same :class:`Collation` as the query's (or both None). A
+        no-collation sort against a collation-having index would walk
+        the index in collation order rather than codepoint order, which
+        is wrong for the user; the reverse is also wrong. So mismatched
+        indexes are skipped and the caller falls back to a Python sort.
         """
         multikey = self._multikey_index_names(db, coll)
+        index_options = self._index_options_map(db, coll)
         target = list(sort_fields)
         inverted = [(f, -d) for f, d in target]
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
@@ -2401,6 +3093,9 @@ class Storage:
             except (TypeError, ValueError):
                 continue
             if any(d not in (-1, 1) for _, d in idx_pairs):
+                continue
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
                 continue
             if idx_pairs == target:
                 return name, False
@@ -2451,6 +3146,7 @@ class Storage:
         *,
         sort: Mapping[str, Any] | None = None,
         hint: str | Mapping[str, Any] | None = None,
+        collation: Any = None,
     ) -> dict[str, Any]:
         """Plan summary for what ``find_matching`` would do with these args.
 
@@ -2458,7 +3154,15 @@ class Storage:
         ``{"kind": "COLLSCAN"}`` or ``{"kind": "IXSCAN", "index_name",
         "key_pattern", "direction"}``. ``direction`` is ``"forward"``
         unless a sort spec inverts it relative to the chosen index.
+
+        ``collation``: mirrors the runtime gate — when set, only
+        indexes whose stored ``collation`` matches the query's are
+        considered for string-bearing predicates. Mismatched indexes
+        produce COLLSCAN, same as ``find_matching`` would.
         """
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
         filter = filter or {}
         with self._lock:
             sort_field, sort_dir = self._single_sort_spec(sort)
@@ -2483,12 +3187,14 @@ class Storage:
                 if key_spec is None:
                     return {"kind": "COLLSCAN"}
                 return self._make_ixscan_plan(resolved, key_spec, sort_field, sort_dir)
-            picked = self._pick_index_for_filter(db, coll, filter)
+            picked = self._pick_index_for_filter(db, coll, filter, collation=collation_obj)
             if picked is not None:
                 name, key_spec = picked
                 return self._make_ixscan_plan(name, key_spec, sort_field, sort_dir)
             if not filter and sort_field is not None:
-                idx = self._find_leading_field_index(db, coll, sort_field, filter)
+                idx = self._find_leading_field_index(
+                    db, coll, sort_field, filter, collation=collation_obj
+                )
                 if idx is not None:
                     name, _idx_dir, _is_compound = idx
                     key_spec = self._key_spec_for(db, coll, name)
@@ -2500,7 +3206,9 @@ class Storage:
             if not filter and sort_field is None and sort:
                 multi_spec = self._multi_sort_spec(sort)
                 if multi_spec is not None and len(multi_spec) > 1:
-                    match = self._compound_index_for_sort(db, coll, multi_spec)
+                    match = self._compound_index_for_sort(
+                        db, coll, multi_spec, collation=collation_obj
+                    )
                     if match is not None:
                         name, reverse = match
                         key_spec = self._key_spec_for(db, coll, name)
@@ -2542,37 +3250,76 @@ class Storage:
         return None
 
     def _pick_index_for_filter(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
     ) -> tuple[str, dict[str, Any]] | None:
-        """Mirror ``_try_index_lookup``'s index-selection (no execution)."""
+        """Mirror ``_try_index_lookup``'s index-selection (no execution).
+
+        ``collation`` propagates from the query; when set, only
+        indexes with a matching stored ``collation`` option are
+        considered. Single-field, compound bare-eq, and compound
+        prefix + trailing-operator pickers all collation-match;
+        ``numericOrdering`` queries fall through to COLLSCAN.
+        """
         if not filter:
             return None
         if any(f.startswith("$") for f in filter):
             return None
+        # Mirror the _id point-lookup fast path: report it as an IXSCAN on
+        # the virtual _id_ index (key pattern {_id: 1}), matching mongod.
+        # Timeseries collections fall through to COLLSCAN (suffixed keys).
+        if (
+            len(filter) == 1
+            and "_id" in filter
+            and _id_point_lookup_keys(filter["_id"]) is not None
+            and not self._is_timeseries(db, coll)
+        ):
+            return _ID_INDEX_NAME, {"_id": 1}
         # Mirror `_try_index_id_keys`: geo dispatch first.
         geo_pick = self._pick_geo_index_for_filter(db, coll, filter)
         if geo_pick is not None:
             return geo_pick
         if all(not isinstance(v, dict) for v in filter.values()):
-            picked = self._pick_compound_eq_index(db, coll, filter)
+            picked = self._pick_compound_eq_index(db, coll, filter, collation=collation)
             if picked is not None:
                 return picked
         if len(filter) >= 2:
-            picked = self._pick_compound_range_index(db, coll, filter)
+            picked = self._pick_compound_range_index(db, coll, filter, collation=collation)
             if picked is not None:
                 return picked
-        if len(filter) != 1:
-            return None
-        field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field, filter)
-        if idx_match is None:
-            return None
-        if isinstance(value, dict):
-            if not value or not all(k.startswith("$") for k in value):
+        if len(filter) == 1:
+            field, value = next(iter(filter.items()))
+            # Mirror the lookup: {field: {$exists: true}} → sparse index IXSCAN.
+            if isinstance(value, dict) and len(value) == 1 and value.get("$exists"):
+                name = self._sparse_index_for_exists(db, coll, field)
+                if name is None:
+                    return None
+                key_spec = self._key_spec_for(db, coll, name)
+                return (name, key_spec) if key_spec is not None else None
+            idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
+            if idx_match is None:
                 return None
-            if not all(op in self._RANGE_OPS for op in value):
+            if isinstance(value, dict):
+                if not value or not all(k.startswith("$") for k in value):
+                    return None
+                if not all(op in self._RANGE_OPS for op in value):
+                    return None
+            name, _direction, _is_compound = idx_match
+            key_spec = self._key_spec_for(db, coll, name)
+            if key_spec is None:
                 return None
-        name, _direction, _is_compound = idx_match
+            return name, key_spec
+        # Multi-field filter: mirror the lookup's single-field + partial-absorbed
+        # residual path so explain reports IXSCAN (with isPartial) where the
+        # query would actually use the index.
+        match = self._single_field_partial_residual_match(db, coll, filter, collation=collation)
+        if match is None:
+            return None
+        name = match[2][0]
         key_spec = self._key_spec_for(db, coll, name)
         if key_spec is None:
             return None
@@ -2608,6 +3355,10 @@ class Storage:
     ) -> int:
         if self._is_oplog_rs(db, coll):
             return self._count_oplog_rs(filter, let=let, collation=collation)
+        if self._is_system_users(db, coll):
+            return self._count_system_users(filter, let=let, collation=collation)
+        if self._is_system_version(db, coll):
+            return self._count_system_version(filter, let=let, collation=collation)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -2638,6 +3389,12 @@ class Storage:
         indexes for an accurate ``totalIndexSize``.
         """
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             sizes: dict[str, int] = {}
             id_size = sum(len(id_k) for id_k, _blob in self._scan_docs(db, coll))
             if id_size:
@@ -2649,6 +3406,7 @@ class Storage:
                 sizes[name] = sizes.get(name, 0) + len(packed)
             return sizes
 
+    @_retry_write_conflicts
     def update_matching(
         self,
         db: str,
@@ -2677,6 +3435,7 @@ class Storage:
         matched = 0
         modified = 0
         upserted_id: Any = None
+        did_upsert = False
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
@@ -2729,7 +3488,12 @@ class Storage:
                     # (``bypassDocumentValidation: true``).
                     if validator is not None and not matches(new, validator):
                         raise DocumentValidationError(new.get("_id"))
-                    new_id_key = _id_key(new["_id"])
+                    # _id is immutable, so the row's actual key is the right
+                    # write target. For ordinary collections that equals
+                    # _id_key(new["_id"]); for timeseries the row key carries
+                    # a uniqueness suffix that a recompute would drop —
+                    # writing at the recomputed key would strand the old row.
+                    new_id_key = id_k
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_id_key=id_k, partials=partials
                     )
@@ -2740,18 +3504,35 @@ class Storage:
                     # write happens, otherwise we'd be left with a
                     # half-deleted set of index entries.
                     self._validate_geo_indexes(db, coll, new, indexes, partials)
+                    new_blob = bson.encode(new)
+                    if len(new_blob) > MAX_BSON_OBJECT_SIZE:
+                        raise DocumentTooLargeError(
+                            10334,
+                            "Plan executor error during update :: caused by :: "
+                            f"Resulting document after update is larger than "
+                            f"{MAX_BSON_OBJECT_SIZE}",
+                        )
                     modified += 1
-                    self._delete_index_entries(db, coll, doc, indexes, partials)
+                    self._delete_index_entries(
+                        db, coll, doc, indexes, partials, id_key_override=id_k
+                    )
                     doc_cur = self._cursor(_DOC_TABLE)
-                    doc_cur[db, coll, new_id_key] = bson.encode(new)
-                    self._write_index_entries(db, coll, new, indexes, partials)
+                    doc_cur[db, coll, new_id_key] = new_blob
+                    self._write_index_entries(
+                        db, coll, new, indexes, partials, id_key_override=id_k
+                    )
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
+                    # Pipeline-form updates (a list of stages) are
+                    # diff-style in the oplog — mongod emits op "u" with
+                    # an update description (the unified "array
+                    # truncation" spec asserts operationType "update",
+                    # not "replace").
+                    is_replacement = not isinstance(update, list) and not any(
+                        isinstance(k, str) and k.startswith("$") for k in update
+                    )
                     if oplog_on:
-                        is_replacement = not any(
-                            isinstance(k, str) and k.startswith("$") for k in update
-                        )
                         if is_replacement:
                             o_field: dict[str, Any] = dict(new)
                         else:
@@ -2771,14 +3552,23 @@ class Storage:
             if matched == 0 and upsert:
                 seed: dict[str, Any] = {}
                 for k, v in filter.items():
-                    if not k.startswith("$") and not isinstance(v, dict):
-                        seed[k] = v
+                    # Seed bare-equality predicates into the upserted doc.
+                    # A dict value is only skipped when it's an OPERATOR
+                    # expression ({$gt: 5}); a literal subdocument value
+                    # ({f: ..., f2: ...}, e.g. a compound ``_id``) is a
+                    # real equality and must be seeded — Python's
+                    # ``isinstance(v, dict)`` alone wrongly drops it,
+                    # generating a fresh ObjectId instead.
+                    if k.startswith("$") or _is_operator_expr(v):
+                        continue
+                    seed[k] = v
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
                 if validator is not None and not matches(new, validator):
                     raise DocumentValidationError(new.get("_id"))
                 upserted_id = new["_id"]
+                did_upsert = True
                 conflict = self._unique_conflict(
                     db, coll, new, indexes, exclude_id_key=None, partials=partials
                 )
@@ -2786,8 +3576,15 @@ class Storage:
                     cname, kpat, kval = conflict
                     raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
                 self._validate_geo_indexes(db, coll, new, indexes, partials)
+                upsert_blob = bson.encode(new)
+                if len(upsert_blob) > MAX_BSON_OBJECT_SIZE:
+                    raise DocumentTooLargeError(
+                        17420,
+                        "Plan executor error during update :: caused by :: "
+                        f"Document to upsert is larger than {MAX_BSON_OBJECT_SIZE}",
+                    )
                 doc_cur = self._cursor(_DOC_TABLE)
-                doc_cur[db, coll, _id_key(upserted_id)] = bson.encode(new)
+                doc_cur[db, coll, _id_key(upserted_id)] = upsert_blob
                 self._write_index_entries(db, coll, new, indexes, partials)
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
                 if oplog_on:
@@ -2810,8 +3607,14 @@ class Storage:
                 pre_images.extend(cap_pre)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
-        return {"matched": matched, "modified": modified, "upserted_id": upserted_id}
+        return {
+            "matched": matched,
+            "modified": modified,
+            "upserted_id": upserted_id,
+            "did_upsert": did_upsert,
+        }
 
+    @_retry_write_conflicts
     def delete_matching(
         self,
         db: str,
@@ -2862,7 +3665,7 @@ class Storage:
                 doc = bson.decode(blob)
                 if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
-                self._delete_index_entries(db, coll, doc, indexes, partials)
+                self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
@@ -2943,7 +3746,7 @@ class Storage:
                         break
                 if not expired:
                     continue
-                self._delete_index_entries(db, coll, doc, indexes, partials)
+                self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
@@ -3009,6 +3812,12 @@ class Storage:
 
     def drop_collection(self, db: str, coll: str) -> bool:
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             existed = self._coll_options(db, coll) is not None
             ui = self._collection_uuid(db, coll) if existed else None
             for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
@@ -3033,6 +3842,12 @@ class Storage:
 
     def drop_database(self, db: str) -> None:
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             colls_with_ui: list[tuple[str, _uuid.UUID]] = []
             for c_name in self.list_collections(db):
                 ui = self._collection_uuid(db, c_name)
@@ -3063,6 +3878,12 @@ class Storage:
         drop_target: bool = False,
     ) -> tuple[bool, str | None]:
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             if self._coll_options(src_db, src_coll) is None:
                 return False, f"source namespace does not exist: {src_db}.{src_coll}"
             if (src_db, src_coll) == (dst_db, dst_coll):
@@ -3109,19 +3930,49 @@ class Storage:
                         "o": {"drop": dst_coll},
                     }
                 )
+            rename_o: dict[str, Any] = {
+                "renameCollection": f"{src_db}.{src_coll}",
+                "to": f"{dst_db}.{dst_coll}",
+            }
+            if dst_existed and dst_ui is not None:
+                # mongod records the dropped target's UUID under ``dropTarget``
+                # in the rename oplog entry; the change-stream ``rename`` event
+                # surfaces it under ``operationDescription.dropTarget`` when
+                # ``showExpandedEvents`` is on.
+                rename_o["dropTarget"] = bson.Binary(dst_ui.bytes, subtype=4)
             entries.append(
                 {
                     "op": "c",
                     "ns": f"{src_db}.$cmd",
                     "ui": bson.Binary(ui.bytes, subtype=4),
-                    "o": {
-                        "renameCollection": f"{src_db}.{src_coll}",
-                        "to": f"{dst_db}.{dst_coll}",
-                    },
+                    "o": rename_o,
                 }
             )
             self._emit_oplog(entries)
             return True, None
+
+    def record_collmod(self, db: str, coll: str, description: dict[str, Any]) -> None:
+        """Emit a ``collMod`` command oplog entry so change streams watching
+        ``db`` / ``db.coll`` (with ``showExpandedEvents``) can surface a
+        ``modify`` event. ``description`` carries the changed options (empty
+        for a no-op ``collMod``); it becomes the event's
+        ``operationDescription``. The collection's option mutation has already
+        been applied by the caller via :meth:`set_collection_options`.
+        """
+        with self._lock:
+            if self._coll_options(db, coll) is None:
+                return
+            ui = self._collection_uuid(db, coll)
+            self._emit_oplog(
+                [
+                    {
+                        "op": "c",
+                        "ns": f"{db}.$cmd",
+                        "ui": bson.Binary(ui.bytes, subtype=4),
+                        "o": {"collMod": coll, **description},
+                    }
+                ]
+            )
 
     def list_collections(self, db: str) -> list[str]:
         self._refresh_read_snapshot()
@@ -3260,6 +4111,7 @@ class Storage:
                 seen: dict[bytes, Any] | None = {} if unique else None
                 multikey = False
                 entries = []
+                coll_opt = _parse_index_collation(options.get("collation"))
                 for id_k, blob in self._scan_docs(db, coll):
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
@@ -3267,12 +4119,14 @@ class Storage:
                     if not multikey and _doc_makes_multikey(d, key_spec_dict):
                         multikey = True
                     if seen is not None:
-                        canonical = _index_key(d, key_spec_dict, sparse=sparse)
+                        canonical = _index_key(d, key_spec_dict, sparse=sparse, collation=coll_opt)
                         if canonical is not None:
                             if canonical in seen:
                                 raise IndexConflict(name, d.get("_id"))
                             seen[canonical] = d.get("_id")
-                    for kb in _index_key_variants(d, key_spec_dict, sparse=sparse):
+                    for kb in _index_key_variants(
+                        d, key_spec_dict, sparse=sparse, collation=coll_opt
+                    ):
                         entries.append((kb, id_k))
                 if multikey:
                     options["multikey"] = True
@@ -3336,6 +4190,12 @@ class Storage:
         if name == _ID_INDEX_NAME:
             return False
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             c = self._cursor(_IDX_TABLE)
             c.set_key(db, coll, name)
             if c.search() != 0:
@@ -3358,6 +4218,12 @@ class Storage:
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
         with self._lock:
+            # Mutating scanners read the current rows before deleting/rewriting
+            # them; a snapshot pinned by an earlier positioned cursor on
+            # this connection thread would hide rows committed by other
+            # threads and turn the scan into a silent partial no-op
+            # (the gauge's drop-then-reinsert E11000 cluster).
+            self._refresh_read_snapshot()
             rows = self._collect_prefix(_IDX_TABLE, (db, coll))
             names = [k[2] for k, _ in rows]
             self._delete_keys(_IDX_TABLE, [k for k, _ in rows])
@@ -3399,15 +4265,33 @@ class Storage:
 
     @staticmethod
     def _query_implies_partial(query: Mapping[str, Any], partial: Mapping[str, Any]) -> bool:
-        """True if ``query`` is at least as restrictive as ``partial`` — every
-        key/value pair in ``partial`` appears with the same bare value in
-        ``query``. Conservative: anything more sophisticated (operator-form
-        clauses, $and, etc.) is treated as not implying the partial filter.
+        """True if every document matching ``query`` is guaranteed to be in
+        a partial index whose filter is ``partial`` — i.e. ``query`` is at
+        least as restrictive as ``partial`` on every partial-filter field.
+
+        SOUNDNESS is the rule: using a partial index for a query that could
+        match documents the index doesn't contain returns wrong results, so
+        this errs to ``False`` (skip the index, full scan — correct but
+        slower) for anything it can't prove implied. Supports bare-equality
+        partial values and the ``$eq``/``$lt``/``$lte``/``$gt``/``$gte``
+        range operators on both sides (``{a: {$lte: 1.5}}`` is implied by a
+        query equality ``a: 1`` or ``a: {$lt: 1}``).
         """
-        for key, value in partial.items():
+        for key, pval in partial.items():
             if key not in query:
                 return False
-            if query[key] != value:
+            qval = query[key]
+            p_is_ops = isinstance(pval, Mapping) and pval and all(k.startswith("$") for k in pval)
+            q_is_ops = isinstance(qval, Mapping) and qval and all(k.startswith("$") for k in qval)
+            if p_is_ops:
+                if not _clause_implies_bounds(qval, pval):
+                    return False
+            elif q_is_ops:
+                # bare-value partial, operator-form query: only an exact
+                # ``$eq`` of the same value implies it.
+                if qval.get("$eq") != pval:
+                    return False
+            elif qval != pval:
                 return False
         return True
 
@@ -3464,11 +4348,15 @@ class Storage:
         doc: dict[str, Any],
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         partials: dict[str, dict[str, Any]] | None = None,
+        *,
+        id_key_override: bytes | None = None,
     ) -> None:
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        id_k = _id_key(doc["_id"])
+        # Timeseries doc-table keys carry a uniqueness suffix; entries must
+        # point at the row's ACTUAL key or index lookups would miss it.
+        id_k = id_key_override if id_key_override is not None else _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
@@ -3484,7 +4372,8 @@ class Storage:
                     c.reset()
                     c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
                 continue
-            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+            coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c[db, coll, name, _pack_entry(kb, id_k)] = b""
 
@@ -3495,11 +4384,15 @@ class Storage:
         doc: dict[str, Any],
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         partials: dict[str, dict[str, Any]] | None = None,
+        *,
+        id_key_override: bytes | None = None,
     ) -> None:
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        id_k = _id_key(doc["_id"])
+        # Timeseries doc-table keys carry a uniqueness suffix; entries must
+        # point at the row's ACTUAL key or index lookups would miss it.
+        id_k = id_key_override if id_key_override is not None else _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
@@ -3527,7 +4420,8 @@ class Storage:
                     if c.search() == 0:
                         c.remove()
                 continue
-            for kb in _index_key_variants(doc, key_spec, sparse=sparse):
+            coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c.set_key(db, coll, name, _pack_entry(kb, id_k))
                 if c.search() == 0:
@@ -3597,13 +4491,15 @@ class Storage:
         c = self._cursor(_IDX_ENTRIES_TABLE)
         if partials is None:
             partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         for name, key_spec, sparse, unique in indexes:
             if not unique:
                 continue
             pf = partials.get(name)
             if pf is not None and not matches(candidate_doc, pf):
                 continue
-            kb = _index_key(candidate_doc, key_spec, sparse=sparse)
+            coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            kb = _index_key(candidate_doc, key_spec, sparse=sparse, collation=coll_opt)
             if kb is None:
                 continue
             esc_kb = _escape_kb(kb)
@@ -3663,6 +4559,34 @@ class Storage:
                     break
             elif row_esc != esc_kb:
                 break
+            out.append(row_id)
+            if c.next() != 0:
+                break
+        return out
+
+    def _all_id_keys_for_index(self, db: str, coll: str, name: str) -> list[bytes]:
+        """Every id_key with an entry in index ``name`` — a full index scan.
+
+        Serves ``{field: {$exists: true}}`` via a sparse index: a sparse
+        index's entries table holds an entry for exactly the docs where the
+        indexed field is present (missing-field docs are omitted; present-
+        but-null keeps an entry), so the complete set of entries *is* the
+        ``$exists: true`` match set. id_keys can repeat for multikey arrays
+        (one entry per element); the caller's ``_docs_by_id_keys`` dedups.
+        """
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        c.set_key(db, coll, name, b"")
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return []
+        if rc < 0 and c.next() != 0:
+            return []
+        out: list[bytes] = []
+        while True:
+            k = c.get_key()
+            if (k[0], k[1], k[2]) != (db, coll, name):
+                break
+            _row_esc, row_id = _unpack_entry(bytes(k[3]))
             out.append(row_id)
             if c.next() != 0:
                 break
@@ -3948,22 +4872,97 @@ class Storage:
                 return
 
     def _try_index_lookup(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
     ) -> list[dict[str, Any]] | None:
-        id_keys = self._try_index_id_keys(db, coll, filter)
+        id_keys = self._try_index_id_keys(db, coll, filter, collation=collation)
         if id_keys is None:
             return None
         return self._docs_by_id_keys(db, coll, id_keys)
 
-    def _try_index_id_keys(self, db: str, coll: str, filter: dict[str, Any]) -> list[bytes] | None:
+    def _single_field_partial_residual_match(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
+    ) -> tuple[str, Any, tuple[str, int, bool]] | None:
+        """For a *multi-field* filter, find a single-field index whose leading
+        field serves one clause while every **other** filter field is absorbed
+        by the index's (implied) partial filter.
+
+        e.g. ``find({x: {$gt: 1}, a: 1})`` against an index on ``x`` partial on
+        ``{a: {$lte: 1.5}}``: ``x``'s range rides the index, the ``a: 1`` clause
+        is partial-implied (so the index's very existence guarantees it) and is
+        rechecked by the exact ``matches()`` pass in ``find_matching``. Returns
+        ``(field, value, idx_match)`` or ``None``.
+
+        Conservative by design: only *partial* indexes get this treatment, and
+        only when the residual fields are exactly partial-filter fields — a
+        non-partial residual keeps the query on COLLSCAN, mirroring the
+        bare-equality path's ``eff_fields - set(pf)`` philosophy. Shared by the
+        lookup (``_try_index_id_keys``) and explain (``_pick_index_for_filter``)
+        dispatchers so they never diverge.
+        """
+        partials = self._partial_filters(db, coll)
+        for field, value in filter.items():
+            if isinstance(value, dict) and (
+                not value or not all(op in self._RANGE_OPS for op in value)
+            ):
+                continue
+            idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
+            if idx_match is None:
+                continue
+            name = idx_match[0]
+            pf = partials.get(name)
+            if pf is None:
+                continue
+            if not (set(filter) - {field}).issubset(set(pf)):
+                continue
+            return field, value, idx_match
+        return None
+
+    def _try_index_id_keys(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        collation: Any = None,
+    ) -> list[bytes] | None:
         """Same dispatch as ``_try_index_lookup`` but returns id_keys instead
         of materialised docs. Used by the write paths (update / delete) so
         only matching docs pay ``bson.decode``.
+
+        ``collation`` propagates from the query. When set, only indexes
+        whose stored ``collation`` option matches are considered;
+        non-matching indexes are skipped so the caller falls back to
+        COLLSCAN (the safe semantics). Single-field equality / range /
+        ``$in`` and compound bare-eq / compound prefix + trailing
+        operator all thread collation through. ``numericOrdering``
+        collations never match any index (parse to None at the gate)
+        and fall through to COLLSCAN.
         """
         if not filter:
             return None
         if any(f.startswith("$") for f in filter):
             return None
+        # Fast path: equality on _id alone is a direct primary-key point
+        # lookup on the documents table (keyed by encode_value(_id)), not a
+        # COLLSCAN — the _id_ index is virtual (no entries table), so the
+        # generic pickers below never match it. Timeseries collections are
+        # excluded: their doc keys carry a uniqueness suffix (duplicate
+        # _ids are legal there), so the reconstructed unsuffixed key would
+        # never match a row.
+        if len(filter) == 1 and "_id" in filter and not self._is_timeseries(db, coll):
+            id_keys = _id_point_lookup_keys(filter["_id"])
+            if id_keys is not None:
+                return id_keys
         # Geo dispatch first — a $geoWithin / $geoIntersects / $near clause
         # on a field with a 2dsphere or 2d index uses the cell-covering
         # path. The picker returns None if no geo index covers the query,
@@ -3974,21 +4973,40 @@ class Storage:
         # Bare-equality filters of any size can use a compound index whose
         # leading fields cover the filter set.
         if all(not isinstance(v, dict) for v in filter.values()):
-            result = self._try_compound_eq_id_keys(db, coll, filter)
+            result = self._try_compound_eq_id_keys(db, coll, filter, collation=collation)
             if result is not None:
                 return result
         # Compound prefix + trailing operator field (eq fields then range/in).
         if len(filter) >= 2:
-            result = self._try_compound_range_id_keys(db, coll, filter)
+            result = self._try_compound_range_id_keys(db, coll, filter, collation=collation)
             if result is not None:
                 return result
-        if len(filter) != 1:
+        if len(filter) == 1:
+            field, value = next(iter(filter.items()))
+            # {field: {$exists: true}} rides a sparse single-field index on
+            # ``field`` — every sparse entry is a doc where the field is
+            # present, exactly the $exists:true match set. No value bound:
+            # the whole index scans.
+            if isinstance(value, dict) and len(value) == 1 and value.get("$exists"):
+                name = self._sparse_index_for_exists(db, coll, field)
+                if name is None:
+                    return None
+                return self._all_id_keys_for_index(db, coll, name)
+            idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
+            if idx_match is None:
+                return None
+            return self._lookup_id_keys_via_leading_field(
+                db, coll, idx_match, value, collation=collation
+            )
+        # Multi-field filter: a single-field index can still serve it when every
+        # other filter field is absorbed by the index's (implied) partial filter.
+        match = self._single_field_partial_residual_match(db, coll, filter, collation=collation)
+        if match is None:
             return None
-        field, value = next(iter(filter.items()))
-        idx_match = self._find_leading_field_index(db, coll, field, filter)
-        if idx_match is None:
-            return None
-        return self._lookup_id_keys_via_leading_field(db, coll, idx_match, value)
+        _field, value, idx_match = match
+        return self._lookup_id_keys_via_leading_field(
+            db, coll, idx_match, value, collation=collation
+        )
 
     def _candidates_iter(
         self, db: str, coll: str, filter: dict[str, Any] | None
@@ -4022,6 +5040,8 @@ class Storage:
         coll: str,
         field: str,
         query: Mapping[str, Any] | None = None,
+        *,
+        collation: Any = None,
     ) -> tuple[str, int, bool] | None:
         """Best index whose leading field is ``field``.
 
@@ -4035,8 +5055,16 @@ class Storage:
         the leading field hit at least all true matches. The geo
         ``2dsphere`` / ``2d`` indexes have non-numeric direction values
         and are excluded by the ASC/DESC check below.
+
+        ``collation``: when set, an index is only considered if its
+        stored ``collation`` option produces the same :class:`Collation`
+        as the query's (or both are None). Mismatched indexes are
+        skipped — the caller falls back to COLLSCAN, which uses
+        ``matches()`` with the query's collation. Matches mongod's
+        per-index collation semantics.
         """
         partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         query = query or {}
         compound_fallback: tuple[str, int, bool] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
@@ -4052,6 +5080,16 @@ class Storage:
             # 1 / -1.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
+            # Collation gate: the index's stored collation must equal
+            # the query's effective collation (both None counts as a
+            # match). Indexes with a collation that doesn't support
+            # byte encoding (numericOrdering) parse to None here, so
+            # they're treated as "no collation" — correct for queries
+            # that also don't carry collation, wrong for queries that
+            # do. Conservative: gate by None-vs-None or exact match.
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
+                continue
             d = int(key_spec[field])
             if len(idx_fields) == 1:
                 return name, d, False
@@ -4059,16 +5097,46 @@ class Storage:
                 compound_fallback = (name, d, True)
         return compound_fallback
 
+    def _sparse_index_for_exists(self, db: str, coll: str, field: str) -> str | None:
+        """Name of a sparse single-field index on ``field`` that can serve
+        ``{field: {$exists: true}}`` at IXSCAN, or ``None``.
+
+        Only a **sparse** index qualifies: it omits docs missing the field,
+        so a full scan of its entries yields exactly the ``$exists: true``
+        matches. A non-sparse index has an entry per doc (missing fields
+        included), so it can't distinguish presence. Restricted to
+        single-field indexes — a compound sparse index in mongod drops a
+        doc only when *every* indexed field is missing, so its entries
+        don't line up with ``{leadingField: {$exists: true}}``. Collation-
+        independent: presence doesn't depend on string normalisation, so an
+        index of any collation serves the query (the post-scan ``matches()``
+        is the final arbiter regardless).
+        """
+        for name, key_spec, sparse, _unique in self._all_indexes(db, coll):
+            if not sparse:
+                continue
+            idx_fields = list(key_spec)
+            if len(idx_fields) != 1 or idx_fields[0] != field:
+                continue
+            if key_spec[field] not in (1, -1):
+                continue
+            return name
+        return None
+
     def _lookup_id_keys_via_leading_field(
         self,
         db: str,
         coll: str,
         idx_match: tuple[str, int, bool],
         value: Any,
+        *,
+        collation: Any = None,
     ) -> list[bytes] | None:
         name, direction, is_compound = idx_match
         if not isinstance(value, dict):
-            return self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, value)
+            return self._eq_id_keys_via_leading(
+                db, coll, name, direction, is_compound, value, collation=collation
+            )
         if not value or not all(k.startswith("$") for k in value):
             return None
         if not all(op in self._RANGE_OPS for op in value):
@@ -4081,7 +5149,9 @@ class Storage:
             for v in value["$in"]:
                 if isinstance(v, dict):
                     return None
-                for id_k in self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, v):
+                for id_k in self._eq_id_keys_via_leading(
+                    db, coll, name, direction, is_compound, v, collation=collation
+                ):
                     if id_k not in seen:
                         seen.add(id_k)
                         id_keys.append(id_k)
@@ -4094,8 +5164,10 @@ class Storage:
             if isinstance(bound, dict):
                 return None
             if op == "$eq":
-                return self._eq_id_keys_via_leading(db, coll, name, direction, is_compound, bound)
-            kb = encode_value_directed(bound, direction)
+                return self._eq_id_keys_via_leading(
+                    db, coll, name, direction, is_compound, bound, collation=collation
+                )
+            kb = encode_value_directed(bound, direction, collation=collation)
             # Operator semantics flip when stored bytes are inverted: in a
             # DESC index, "x > 5" means we want stored bytes < enc_desc(5).
             effective_op = op
@@ -4125,14 +5197,16 @@ class Storage:
         direction: int,
         is_compound: bool,
         value: Any,
+        *,
+        collation: Any = None,
     ) -> list[bytes]:
-        kb = encode_value_directed(value, direction)
+        kb = encode_value_directed(value, direction, collation=collation)
         if is_compound:
             return self._scan_index_for_id_keys(db, coll, name, kb + COMPOUND_SEP, prefix=True)
         return self._scan_index_for_id_keys(db, coll, name, kb)
 
     def _pick_compound_eq_index(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> tuple[str, dict[str, Any]] | None:
         """Find the index that ``_try_compound_eq_id_keys`` would walk for ``filter``.
 
@@ -4141,9 +5215,19 @@ class Storage:
         not scan. Multikey indexes are eligible (per-element entries
         cover equality lookups); the ASC/DESC direction check excludes
         geo indexes.
+
+        ``collation``: an index is only considered if its stored
+        ``collation`` parses to the same :class:`Collation` as the
+        query's (or both None). Same exact-match gate as
+        ``_find_leading_field_index``. Indexes whose stored collation
+        is ``numericOrdering`` parse to None here, so they look like
+        no-collation indexes — correct for no-collation queries,
+        wrong for numericOrdering queries; the latter fall through to
+        COLLSCAN regardless.
         """
         filter_fields = set(filter)
         partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             pf = partials.get(name)
@@ -4160,6 +5244,9 @@ class Storage:
             # serve a bare-equality compound lookup.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
                 continue
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
+                continue
             if len(idx_fields) < len(eff_fields):
                 continue
             if set(idx_fields[: len(eff_fields)]) != eff_fields:
@@ -4171,7 +5258,7 @@ class Storage:
         return best
 
     def _try_compound_eq_id_keys(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> list[bytes] | None:
         """Bare-equality filter against a compound (or single-field) index prefix.
 
@@ -4179,8 +5266,12 @@ class Storage:
         fields, and runs an equality (full-cover) or prefix
         (strict-leading-prefix) scan against it. Per-field index direction
         is honoured by encoding each value with ``encode_value_directed``.
+
+        ``collation`` propagates from the query: only collation-matching
+        indexes are picked, and the lookup bytes are built under the same
+        collation so they hit the same row as the index-write side.
         """
-        picked = self._pick_compound_eq_index(db, coll, filter)
+        picked = self._pick_compound_eq_index(db, coll, filter, collation=collation)
         if picked is None:
             return None
         name, key_spec = picked
@@ -4188,7 +5279,10 @@ class Storage:
         # Build kb from the filter fields that are in the index (partial-filter
         # clauses live outside the key and are guaranteed by index population).
         prefix_fields = [f for f in idx_fields if f in filter]
-        parts = [encode_value_directed(filter[f], int(key_spec[f])) for f in prefix_fields]
+        parts = [
+            encode_value_directed(filter[f], int(key_spec[f]), collation=collation)
+            for f in prefix_fields
+        ]
         kb = COMPOUND_SEP.join(parts) if len(parts) > 1 else parts[0]
         if len(prefix_fields) == len(idx_fields):
             return self._scan_index_for_id_keys(db, coll, name, kb)
@@ -4226,9 +5320,15 @@ class Storage:
         return eq_fields, operator_field, operator_ops or {}
 
     def _pick_compound_range_index(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> tuple[str, dict[str, Any]] | None:
-        """Find the index that ``_try_compound_range_id_keys`` would walk."""
+        """Find the index that ``_try_compound_range_id_keys`` would walk.
+
+        ``collation``: an index is only considered if its stored
+        collation parses to the same :class:`Collation` as the query's
+        (or both None). Same exact-match gate as
+        ``_pick_compound_eq_index`` and ``_find_leading_field_index``.
+        """
         parts = self._partition_compound_range_filter(filter)
         if parts is None:
             return None
@@ -4236,6 +5336,7 @@ class Storage:
         eq_set = set(eq_fields)
         target_eq_count = len(eq_set)
         partials = self._partial_filters(db, coll)
+        index_options = self._index_options_map(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
         for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
             pf = partials.get(name)
@@ -4245,6 +5346,9 @@ class Storage:
             # Geo / hashed / text indexes (string direction values) can't
             # serve a compound prefix + trailing-operator lookup.
             if any(key_spec[f] not in (1, -1) for f in idx_fields):
+                continue
+            idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if idx_coll != collation:
                 continue
             if len(idx_fields) <= target_eq_count:
                 continue
@@ -4259,7 +5363,7 @@ class Storage:
         return best
 
     def _try_compound_range_id_keys(
-        self, db: str, coll: str, filter: dict[str, Any]
+        self, db: str, coll: str, filter: dict[str, Any], *, collation: Any = None
     ) -> list[bytes] | None:
         """Compound-prefix lookup with a trailing operator field.
 
@@ -4267,12 +5371,16 @@ class Storage:
         leading bare-equality fields followed by exactly one operator-form
         field) walk the compound index by pinning the prefix from the
         equalities and applying the operator's bounds to the next field.
+
+        ``collation`` propagates from the query: only collation-matching
+        indexes are picked, and every encoded value (prefix equalities
+        and trailing-operator bound) is built under the same collation.
         """
         parts = self._partition_compound_range_filter(filter)
         if parts is None:
             return None
         eq_fields, operator_field, operator_ops = parts
-        picked = self._pick_compound_range_index(db, coll, filter)
+        picked = self._pick_compound_range_index(db, coll, filter, collation=collation)
         if picked is None:
             return None
         name, key_spec = picked
@@ -4280,7 +5388,10 @@ class Storage:
         target_eq_count = len(eq_fields)
         eq_field_names = idx_fields[:target_eq_count]
         op_dir = int(key_spec[operator_field])
-        eq_parts = [encode_value_directed(eq_fields[f], int(key_spec[f])) for f in eq_field_names]
+        eq_parts = [
+            encode_value_directed(eq_fields[f], int(key_spec[f]), collation=collation)
+            for f in eq_field_names
+        ]
         prefix_kb = COMPOUND_SEP.join(eq_parts) if len(eq_parts) > 1 else eq_parts[0]
         prefix_with_sep = prefix_kb + COMPOUND_SEP
         if "$in" in operator_ops:
@@ -4291,7 +5402,7 @@ class Storage:
             for v in operator_ops["$in"]:
                 if isinstance(v, dict):
                     return None
-                kb = prefix_with_sep + encode_value_directed(v, op_dir)
+                kb = prefix_with_sep + encode_value_directed(v, op_dir, collation=collation)
                 use_prefix = len(idx_fields) > target_eq_count + 1
                 inner_kb = kb + COMPOUND_SEP if use_prefix else kb
                 for id_k in self._scan_index_for_id_keys(
@@ -4304,7 +5415,9 @@ class Storage:
         if "$eq" in operator_ops:
             if len(operator_ops) != 1:
                 return None
-            kb = prefix_with_sep + encode_value_directed(operator_ops["$eq"], op_dir)
+            kb = prefix_with_sep + encode_value_directed(
+                operator_ops["$eq"], op_dir, collation=collation
+            )
             use_prefix = len(idx_fields) > target_eq_count + 1
             inner_kb = kb + COMPOUND_SEP if use_prefix else kb
             return self._scan_index_for_id_keys(db, coll, name, inner_kb, prefix=use_prefix)
@@ -4315,7 +5428,7 @@ class Storage:
         for op, bound in operator_ops.items():
             if isinstance(bound, dict):
                 return None
-            full = prefix_with_sep + encode_value_directed(bound, op_dir)
+            full = prefix_with_sep + encode_value_directed(bound, op_dir, collation=collation)
             effective_op = op
             if op_dir == -1:
                 effective_op = {"$gt": "$lt", "$gte": "$lte", "$lt": "$gt", "$lte": "$gte"}[op]

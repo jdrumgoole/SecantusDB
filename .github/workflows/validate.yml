@@ -1,10 +1,10 @@
 name: Validate (driver conformance)
 
-# Runs the vendored driver test suites (pymongo, go, node, java, ruby)
-# against SecantusDB and regenerates the per-driver `docs/validation-
-# report*.md` files. Slow (~10–15 min per driver on a fresh WT build)
-# so this is NOT on every push — it runs weekly on Monday and can be
-# triggered manually.
+# Runs the vendored driver test suites (pymongo, go, node, java,
+# ruby, rust) against SecantusDB and regenerates the per-driver
+# `docs/validation-report*.md` files. Slow (~10–15 min per driver on
+# a fresh WT build) so this is NOT on every push — it runs weekly on
+# Monday and can be triggered manually.
 #
 # Layout: each driver gauge runs as its own matrix entry on a fresh
 # runner with only the toolchain it needs. The `aggregate` job that
@@ -32,13 +32,31 @@ jobs:
           - { name: node,    task: validate-node, report: docs/validation-report-node.md }
           - { name: java,    task: validate-java, report: docs/validation-report-java.md }
           - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
+          - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
+          # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
+          # suite as the headline gauge, pointed at the Rust server via
+          # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so
+          # its sync step builds the wheel with SECANTUS_BUILD_STORAGE_ENGINE=ON
+          # (extra toolchain steps below).
+          - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
       - name: Install swig
         run: sudo apt-get update && sudo apt-get install -y swig
+
+      # The Rust-server gauge builds the _secantus_storage / _secantus_server
+      # extensions inside the wheel build: bindgen needs libclang, the WT
+      # ExternalProject forces Ninja, and the cargo build needs a Rust toolchain.
+      - name: Install storage-engine toolchain
+        if: matrix.driver.name == 'pymongo-rust-server'
+        run: sudo apt-get install -y clang libclang-dev llvm-dev ninja-build
+
+      - name: Install Rust toolchain
+        if: matrix.driver.name == 'pymongo-rust-server'
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -49,17 +67,27 @@ jobs:
         run: uv python install 3.12
 
       - name: Sync dependencies
+        if: matrix.driver.name != 'pymongo-rust-server'
         run: uv sync --extra dev   # builds vendored WT, installs pytest-json-report
+
+      - name: Sync dependencies (storage engine ON)
+        if: matrix.driver.name == 'pymongo-rust-server'
+        # Same sync, but the editable build runs CMake with the storage-engine
+        # flag flipped ON so `import _secantus_server` works in the project
+        # venv — that's what `invoke validate --server rust` launches.
+        env:
+          SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+        run: uv sync --extra dev
 
       - name: Set up Go
         if: matrix.driver.name == 'go'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.25"
 
       - name: Cache Go modules + build
         if: matrix.driver.name == 'go'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/go/pkg/mod
@@ -76,13 +104,13 @@ jobs:
 
       - name: Set up Node.js
         if: matrix.driver.name == 'node'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
 
       - name: Cache node_modules
         if: matrix.driver.name == 'node'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/node-mongodb-native/node_modules
           key: ${{ runner.os }}-node-modules-${{ hashFiles('vendor/node-mongodb-native/package-lock.json') }}
@@ -91,14 +119,14 @@ jobs:
 
       - name: Set up JDK
         if: matrix.driver.name == 'java'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
         if: matrix.driver.name == 'java'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.gradle/caches
@@ -121,12 +149,32 @@ jobs:
 
       - name: Cache Ruby bundle
         if: matrix.driver.name == 'ruby'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/mongo-ruby-driver/.bundle
           key: ${{ runner.os }}-ruby-bundle-${{ hashFiles('vendor/mongo-ruby-driver/Gemfile.lock') }}
           restore-keys: |
             ${{ runner.os }}-ruby-bundle-
+
+      - name: Set up Rust
+        if: matrix.driver.name == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # mongo-rust-driver's MSRV is 1.88; stable on Actions is
+          # ahead of that as of writing.
+          toolchain: stable
+
+      - name: Cache cargo registry + target
+        if: matrix.driver.name == 'rust'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/mongo-rust-driver/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('vendor/mongo-rust-driver/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Run ${{ matrix.driver.name }} validation
         run: uv run python -m invoke ${{ matrix.driver.task }}
@@ -135,7 +183,7 @@ jobs:
         run: head -50 ${{ matrix.driver.report }}
 
       - name: Upload report artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: report-${{ matrix.driver.name }}
           path: ${{ matrix.driver.report }}
@@ -153,24 +201,38 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all report artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
 
       - name: Stage downloaded reports into docs/
         run: |
           # Each artifact is `report-<driver>` and contains the single
-          # `docs/validation-report*.md` it produced (path was preserved
-          # by upload-artifact). Copy into the checkout so a `git diff`
-          # against main captures every gauge's update in one place.
+          # report it produced at the ARTIFACT ROOT — upload-artifact@v4
+          # strips the common parent (`docs/`), so the old
+          # `report-*/docs/...` glob matched nothing and the weekly PR
+          # was silently never opened. `set -u` + an explicit count so an
+          # empty match can never again read as "no change".
           shopt -s nullglob
-          for f in artifacts/report-*/docs/validation-report*.md; do
+          staged=0
+          for f in artifacts/report-*/validation-report*.md; do
             cp "$f" docs/
+            staged=$((staged + 1))
           done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::no validation reports found under artifacts/ — staging glob is broken again"
+            exit 1
+          fi
           ls -la docs/validation-report*.md
+
+      - name: Track new report files
+        # `git diff --quiet` is blind to untracked files (a brand-new
+        # gauge's report, e.g. validation-report-rust-server.md, would be
+        # invisible). Intent-to-add makes them show up in the diff.
+        run: git add --intent-to-add docs/validation-report*.md
 
       - name: Open PR if reports changed
         env:
@@ -185,8 +247,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md
-          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby)"
+          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust + pymongo-vs-Rust-server)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver validation reports. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test output."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver validation reports, plus the pymongo-vs-Rust-server R8 gate. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test output."

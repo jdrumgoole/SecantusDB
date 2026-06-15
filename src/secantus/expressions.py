@@ -7,13 +7,28 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from bson import Decimal128
+import bson
+from bson import Decimal128, Int64
 
 from secantus.paths import get_path
 
 
 class ExpressionError(Exception):
-    pass
+    """Expression-evaluation error surfaced to the client as ``{ok: 0}``.
+
+    ``dispatch`` maps it to ``code: 14 TypeMismatch`` by default — the
+    code mongod uses for most aggregation type errors. Operators whose
+    mongod error carries a different code (``$divide`` by zero is 2
+    BadValue; ``$mod`` uses 16610/16611 Location codes) pass it
+    explicitly.
+    """
+
+    _CODE_NAMES = {14: "TypeMismatch", 2: "BadValue"}
+
+    def __init__(self, msg: str, *, code: int = 14, code_name: str | None = None) -> None:
+        super().__init__(msg)
+        self.code = code
+        self.code_name = code_name or self._CODE_NAMES.get(code, f"Location{code}")
 
 
 @dataclass
@@ -67,6 +82,12 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
         # the field instead of writing it. ``_op_set_field`` checks for
         # this identity to drop the key.
         return _REMOVE_SENTINEL
+    elif base in ("KEEP", "PRUNE", "DESCEND"):
+        # ``$redact`` sentinels. The expression evaluator returns the
+        # ``"$$NAME"`` string literal so the stage handler can dispatch
+        # on equality. Real mongod's ``$redact`` docs show these as the
+        # only legal return values from the stage's expression.
+        value = f"$${base}"
     else:
         raise ExpressionError(f"system variable $${base} is not defined")
     if not rest:
@@ -104,44 +125,140 @@ def _op_concat(arg: Any, ctx: _Ctx) -> str:
     return "".join("" if p is None else str(p) for p in parts)
 
 
+def _bson_type_name(v: Any) -> str:
+    """mongod's type vocabulary for arithmetic error messages."""
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int" if -(2**31) <= v < 2**31 else "long"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, _dt.datetime):
+        return "date"
+    if isinstance(v, Mapping):
+        return "object"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, bson.ObjectId):
+        return "objectId"
+    if v is None:
+        return "null"
+    return type(v).__name__
+
+
+def _is_numeric(v: Any) -> bool:
+    # bool is an int subclass in Python but NOT numeric in BSON arithmetic —
+    # mongod rejects it ("$multiply only supports numeric types, not bool").
+    return isinstance(v, (int, float, Decimal128)) and not isinstance(v, bool)
+
+
+def _fold_numeric(values: list[Any], *, mul: bool) -> Any:
+    """Sum or product over validated numeric operands. Mixing in a
+    Decimal128 promotes the whole fold to decimal, like mongod's
+    type-widening; ``Decimal(float)`` keeps the exact binary expansion
+    mongod's double→decimal conversion produces."""
+    if any(isinstance(v, Decimal128) for v in values):
+        acc = Decimal(1 if mul else 0)
+        for v in values:
+            d = v.to_decimal() if isinstance(v, Decimal128) else Decimal(v)
+            acc = acc * d if mul else acc + d
+        return Decimal128(acc)
+    acc2: Any = 1 if mul else 0
+    for v in values:
+        acc2 = acc2 * v if mul else acc2 + v
+    return acc2
+
+
 def _op_add(arg: Any, ctx: _Ctx) -> Any:
     values = _eval_args(arg, ctx)
     if any(v is None for v in values):
         return None
-    total = values[0]
-    for v in values[1:]:
-        total = total + v
-    return total
+    dates = [v for v in values if isinstance(v, _dt.datetime)]
+    if len(dates) > 1:
+        raise ExpressionError("only one date allowed in an $add expression", code=16612)
+    nums = [v for v in values if not isinstance(v, _dt.datetime)]
+    for v in nums:
+        if not _is_numeric(v):
+            raise ExpressionError(
+                f"$add only supports numeric or date types, not {_bson_type_name(v)}"
+            )
+    if dates:
+        # date + numerics: the numeric sum is a millisecond offset.
+        offset = _fold_numeric(nums, mul=False) if nums else 0
+        if isinstance(offset, Decimal128):
+            offset = float(offset.to_decimal())
+        return dates[0] + _dt.timedelta(milliseconds=offset)
+    if len(values) == 1:
+        return values[0]
+    return _fold_numeric(values, mul=False)
 
 
 def _op_subtract(arg: Any, ctx: _Ctx) -> Any:
     a, b = _eval_args(arg, ctx)
     if a is None or b is None:
         return None
-    return a - b
+    a_date, b_date = isinstance(a, _dt.datetime), isinstance(b, _dt.datetime)
+    if a_date and b_date:
+        return Int64(round((a - b).total_seconds() * 1000))
+    if a_date and _is_numeric(b):
+        ms = float(b.to_decimal()) if isinstance(b, Decimal128) else b
+        return a - _dt.timedelta(milliseconds=ms)
+    if _is_numeric(a) and _is_numeric(b):
+        if isinstance(a, Decimal128) or isinstance(b, Decimal128):
+            da = a.to_decimal() if isinstance(a, Decimal128) else Decimal(a)
+            db = b.to_decimal() if isinstance(b, Decimal128) else Decimal(b)
+            return Decimal128(da - db)
+        return a - b
+    raise ExpressionError(f"can't $subtract {_bson_type_name(b)} from {_bson_type_name(a)}")
 
 
 def _op_multiply(arg: Any, ctx: _Ctx) -> Any:
     values = _eval_args(arg, ctx)
     if any(v is None for v in values):
         return None
-    result = 1
     for v in values:
-        result = result * v
-    return result
+        if not _is_numeric(v):
+            raise ExpressionError(
+                f"$multiply only supports numeric types, not {_bson_type_name(v)}"
+            )
+    return _fold_numeric(values, mul=True)
 
 
 def _op_divide(arg: Any, ctx: _Ctx) -> Any:
     a, b = _eval_args(arg, ctx)
-    if a is None or b is None or b == 0:
+    if a is None or b is None:
         return None
+    if not (_is_numeric(a) and _is_numeric(b)):
+        raise ExpressionError(
+            f"$divide only supports numeric types, not "
+            f"{_bson_type_name(a)} and {_bson_type_name(b)}"
+        )
+    if b == 0:
+        raise ExpressionError("can't $divide by zero", code=2)
+    if isinstance(a, Decimal128) or isinstance(b, Decimal128):
+        da = a.to_decimal() if isinstance(a, Decimal128) else Decimal(a)
+        db = b.to_decimal() if isinstance(b, Decimal128) else Decimal(b)
+        return Decimal128(da / db)
     return a / b
 
 
 def _op_mod(arg: Any, ctx: _Ctx) -> Any:
     a, b = _eval_args(arg, ctx)
-    if a is None or b is None or b == 0:
+    if a is None or b is None:
         return None
+    if not (_is_numeric(a) and _is_numeric(b)):
+        raise ExpressionError(
+            f"$mod only supports numeric types, not {_bson_type_name(a)} and {_bson_type_name(b)}",
+            code=16611,
+        )
+    if b == 0:
+        raise ExpressionError("can't $mod by zero", code=16610)
     return a % b
 
 
@@ -1314,16 +1431,23 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, (int, float)):
             return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.timezone.utc)
     elif code in (16, 18):
+        # 16 = int32, 18 = int64. Wrap as ``Int64`` for code 18 so the
+        # result matches ``$type: "long"`` downstream — the bson decoder
+        # preserves the int32/int64 distinction by type, and ``$convert``
+        # must respect the requested target type.
+        def _wrap(n: int) -> int:
+            return Int64(n) if code == 18 else int(n)
+
         if isinstance(value, bool):
-            return 1 if value else 0
+            return _wrap(1 if value else 0)
         if isinstance(value, int):
-            return value
+            return _wrap(int(value))
         if isinstance(value, float):
-            return int(value)
+            return _wrap(int(value))
         if isinstance(value, Decimal128):
-            return int(value.to_decimal())
+            return _wrap(int(value.to_decimal()))
         if isinstance(value, str):
-            return _safe_int_from_str(value, "$convert (int/long)")
+            return _wrap(_safe_int_from_str(value, "$convert (int/long)"))
     elif code == 19:
         if isinstance(value, Decimal128):
             return value

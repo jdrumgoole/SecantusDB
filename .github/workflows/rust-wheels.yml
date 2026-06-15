@@ -1,0 +1,117 @@
+name: Build secantus-core wheels
+
+# The optional Rust acceleration core (`secantus-core` → the `_secantus_core`
+# extension) is its own package, built with maturin — separate from the
+# scikit-build-core + vendored-WiredTiger wheel that `publish.yml`/`wheels.yml`
+# produce for `secantus`. This workflow builds the abi3 wheels across the same
+# platform matrix and publishes them to PyPI on a matching tag.
+#
+# IMPORTANT (maintainer setup, one-time):
+#   * PyPI must have a Trusted Publisher configured for the `secantus-core`
+#     project pointing at this workflow, mirroring the `secantus` setup.
+#   * Versions are kept in lockstep: `secantus[rust]` pins `secantus-core` to the
+#     exact SecantusDB version, so a release must bump BOTH pyproject versions and
+#     push the tag once. The release skill (/secantusdb-release) needs to publish
+#     this alongside the main wheel — see tasks/backlog.md.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - 'docs/**'
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+b[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - 'docs/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, platform: macos-arm64, target: aarch64-apple-darwin, manylinux: '' }
+          - { os: ubuntu-22.04, platform: linux-x86_64, target: x86_64-unknown-linux-gnu, manylinux: '2014' }
+          - { os: ubuntu-22.04-arm, platform: linux-aarch64, target: aarch64-unknown-linux-gnu, manylinux: '2014' }
+          - { os: windows-2022, platform: windows-x86_64, target: x86_64-pc-windows-msvc, manylinux: '' }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/secantus-core-py
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+
+      - name: Sanity-import the built wheel
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          python -m pip install crates/secantus-core-py/dist/*.whl
+          python -c "import _secantus_core; print('imported', _secantus_core.__doc__[:40])"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: secantus-core-${{ matrix.platform }}
+          path: crates/secantus-core-py/dist/*.whl
+
+  # Source distribution (lets pip fall back to building from source where a
+  # binary wheel isn't published — needs a Rust toolchain on the user's box).
+  sdist:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/secantus-core-py
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: secantus-core-sdist
+          path: crates/secantus-core-py/dist/*.tar.gz
+
+  publish:
+    # Only on a release tag. Trusted publishing (OIDC) — no API token.
+    needs: [build, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify tag matches secantus-core version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          ver=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('crates/secantus-core-py/pyproject.toml').read_text())['project']['version'])")
+          if [ "$tag" != "$ver" ]; then
+            echo "Tag $tag != secantus-core version $ver" >&2; exit 1
+          fi
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: secantus-core-*
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

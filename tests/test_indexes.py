@@ -1246,6 +1246,53 @@ def test_explain_plan_single_field_range_uses_index(storage: Storage) -> None:
     assert plan["index_name"] == "x_1"
 
 
+def test_exists_true_uses_sparse_index(storage: Storage) -> None:
+    # A sparse single-field index has an entry for exactly the docs where
+    # the field is present, so {f: {$exists: true}} rides it at IXSCAN.
+    storage.create_index("db", "c", "f_1", {"f": 1}, {"sparse": True})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "f": 10},
+            {"_id": 2, "f": None},  # present-but-null -> exists
+            {"_id": 3},  # missing -> not exists
+            {"_id": 4, "f": [1, 2]},  # multikey
+            {"_id": 5, "f": []},  # present (empty array)
+            {"_id": 6, "g": 7},  # f missing
+        ],
+    )
+    plan = storage.explain_plan("db", "c", {"f": {"$exists": True}})
+    assert plan == {
+        "kind": "IXSCAN",
+        "index_name": "f_1",
+        "key_pattern": {"f": 1},
+        "direction": "forward",
+    }
+    got = sorted(d["_id"] for d in storage.find_matching("db", "c", {"f": {"$exists": True}}))
+    assert got == [1, 2, 4, 5]
+
+
+def test_exists_true_non_sparse_index_is_collscan(storage: Storage) -> None:
+    # A non-sparse index has an entry per doc (missing fields included), so
+    # it can't serve $exists:true — COLLSCAN, results still correct.
+    storage.create_index("db", "c", "f_1", {"f": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "f": 10}, {"_id": 2}, {"_id": 3, "f": None}])
+    assert storage.explain_plan("db", "c", {"f": {"$exists": True}}) == {"kind": "COLLSCAN"}
+    got = sorted(d["_id"] for d in storage.find_matching("db", "c", {"f": {"$exists": True}}))
+    assert got == [1, 3]
+
+
+def test_exists_false_does_not_use_sparse_index(storage: Storage) -> None:
+    # $exists:false can never use a sparse index (it has no entry for the
+    # absent docs). COLLSCAN, correct results.
+    storage.create_index("db", "c", "f_1", {"f": 1}, {"sparse": True})
+    storage.insert("db", "c", [{"_id": 1, "f": 10}, {"_id": 2}, {"_id": 3, "g": 1}])
+    assert storage.explain_plan("db", "c", {"f": {"$exists": False}}) == {"kind": "COLLSCAN"}
+    got = sorted(d["_id"] for d in storage.find_matching("db", "c", {"f": {"$exists": False}}))
+    assert got == [2, 3]
+
+
 def test_explain_plan_compound_eq_uses_compound_index(storage: Storage) -> None:
     storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
     plan = storage.explain_plan("db", "c", {"a": 1, "b": 2})
@@ -1558,6 +1605,48 @@ def test_partial_filter_query_uses_full_picker_then_index(storage: Storage) -> N
     )
     docs = storage.find_matching("db", "c", {"status": "active", "n": 5})
     assert sorted(d["_id"] for d in docs) == [1, 3]
+
+
+def test_partial_filter_range_on_indexed_field_with_residual_uses_index(
+    storage: Storage,
+) -> None:
+    """A RANGE on the indexed field plus a residual field that the partial
+    filter absorbs uses the index. e.g. {x: {$gt: 1}, a: 1} against an index
+    on x partial on {a: {$lte: 1.5}}: x's range rides the index, a:1 is
+    partial-implied. Mirrors pymongo's test_collection.test_index_filter."""
+    storage.create_index(
+        "db", "c", "x_1", {"x": 1}, {"partialFilterExpression": {"a": {"$lte": 1.5}}}
+    )
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "x": 5, "a": 2},  # a > 1.5 → not indexed
+            {"_id": 2, "x": 6, "a": 1},  # a <= 1.5 → indexed
+        ],
+    )
+    plan = storage.explain_plan("db", "c", {"x": {"$gt": 1}, "a": 1})
+    assert plan["kind"] == "IXSCAN"
+    assert plan["index_name"] == "x_1"
+    # Equality on the indexed field + partial-implied range residual also uses it.
+    plan2 = storage.explain_plan("db", "c", {"x": 6, "a": {"$lte": 1}})
+    assert plan2["kind"] == "IXSCAN"
+    assert plan2["index_name"] == "x_1"
+    # And the results are exact (only the indexed doc satisfies the filter).
+    docs = storage.find_matching("db", "c", {"x": {"$gt": 1}, "a": 1})
+    assert [d["_id"] for d in docs] == [2]
+
+
+def test_partial_filter_residual_not_implied_stays_collscan(storage: Storage) -> None:
+    """A residual clause the partial filter does NOT imply keeps the query on
+    COLLSCAN. {x: 6, a: {$lte: 1.6}} can't use a {a: {$lte: 1.5}} partial
+    index (1.6 > 1.5), and {x: 6, b: 2} has a non-partial residual."""
+    storage.create_index(
+        "db", "c", "x_1", {"x": 1}, {"partialFilterExpression": {"a": {"$lte": 1.5}}}
+    )
+    storage.insert("db", "c", [{"_id": 1, "x": 6, "a": 1, "b": 2}])
+    assert storage.explain_plan("db", "c", {"x": 6, "a": {"$lte": 1.6}}) == {"kind": "COLLSCAN"}
+    assert storage.explain_plan("db", "c", {"x": 6, "b": 2}) == {"kind": "COLLSCAN"}
 
 
 def test_partial_filter_update_maintains_entries(storage: Storage) -> None:

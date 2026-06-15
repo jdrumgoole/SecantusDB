@@ -1,0 +1,452 @@
+# Phase 4 — storage keystone: scoping & status
+
+> ⚠️ **Integration model changed — see `tasks/rust-server-plan.md` (authoritative).**
+> The *storage porting* tracked here (sub-phases 0–5e: the pure-Rust
+> `secantus-storage` crate — CRUD, indexes, geo, oplog/change-streams, users/roles,
+> lifecycle, stats) is **done and still valid**; it is the foundation for the Rust
+> server. What is **superseded** is the §5e cutover target: there is **no** Python
+> `Storage` adapter over `RustStorage`, **no** `secantus.engine` storage selection,
+> and **no** `EngineFallback` routing. Storage is consumed **natively in Rust** by
+> the new Rust server; the only Python-facing surface is a thin server lifecycle
+> handle. The "dual-engine at `Storage` granularity behind one interface" decision
+> in §"Decisions (locked)" is replaced by "two separate servers." Read the §5e
+> "Then" plan and the fat `secantus-storage-py` surface as **retired**.
+
+Phase 4 moves SecantusDB's WiredTiger-backed storage layer into Rust. It is the
+keystone: it unblocks running the whole read hot path (scan → filter → project)
+in Rust under one GIL release, and it is the prerequisite for a standalone Rust
+`secantusdb` binary. Strategy decisions live in `tasks/rust-rewrite-plan.md` §4–5
+and `tasks/rust-rewrite-phase3-scoping.md` §3; this doc tracks the concrete
+build-out.
+
+## Decisions (locked)
+
+- **Engine: WiredTiger FFI (option A).** Keep the same engine MongoDB uses — the
+  product value is "on-disk semantics line up with `mongod`". The FFI is via
+  `bindgen` + `build.rs` linking the vendored `libwiredtiger`. (Option B, a
+  Rust-native KV, remains the escape hatch only if the wheel-matrix link proves
+  prohibitive.)
+- **Dual-engine at `Storage` granularity.** You cannot run half-Python /
+  half-Rust storage on one DB in one process, so there are two whole `Storage`
+  implementations behind one interface, selected process-wide by
+  `secantus.engine`. (Coarser than the per-operator engine selection, but it
+  preserves the "both engines permanent" invariant.)
+- **Concurrency: 1:1 port first.** Global `RLock` → a coarse reentrant mutex,
+  thread-local sessions → `thread_local!`, the change-stream condition → a
+  `Condvar`. Revisit only if a perf gauge demands it. (Note: the WiredTiger
+  C-level write-concurrency ceiling documented in `tasks/wt-bindings-plan.md`
+  still applies — Phase 4's win is the read/query hot path and the standalone
+  binary, not multi-writer scaling.)
+- **On-disk format: reproduce encodings faithfully, no cross-rewrite migration.**
+  Test data is ephemeral. Keep `sortkey` (already ported + golden-pinned) and the
+  geo encodings byte-faithful so the index/geo/sort suites pass unchanged.
+
+## Sub-phases (each gated on its WT-backed suite)
+
+0. **FFI foundation — `crates/secantus-wt`. ✅ DONE (this slice).**
+   bindgen + `build.rs` (WiredTiger resolved via `SECANTUS_WT_INCLUDE` /
+   `SECANTUS_WT_LIB` or probed build dirs); safe `Connection` / `Session` /
+   `Cursor`; the key formats SecantusDB uses (`SS` / `SSu` / `SSS` / `SSSu` /
+   `q` / `S` / `u`); `WT_NOTFOUND` / `WT_DUPLICATE_KEY` / `WT_ROLLBACK`
+   translation; transactions. Verified against real WiredTiger: insert / natural
+   (byte-)order scan / point search / NOTFOUND / update / remove / numeric `q`
+   ordering / commit+rollback / on-disk reopen persistence. `cargo fmt` +
+   `clippy -D warnings` clean.
+1. **CRUD core — `crates/secantus-storage`. ✅ DONE at the Rust level (this
+   slice).** A `Storage` over `secantus-wt` + `secantus-core`'s `sortkey`: the
+   `secantus_collections` + `secantus_documents` tables, `insert_one`
+   (auto-`ObjectId`, duplicate-`_id` rejection), `find_by_id`, `scan_collection`
+   (natural order), `replace_by_id`, `delete_by_id`, collection registry, the
+   coarse serialize-everything lock. `id_key = sortkey.encode_value(_id)`.
+   Verified against real WiredTiger (7 integration tests): cross-type natural
+   order (double/int/long → string → ObjectId), db/coll isolation, reopen
+   persistence; `cargo fmt` + `clippy -D warnings` clean (`invoke
+   rust-storage-test`). **Still pending for the conformance gate:** the PyO3
+   exposure + `secantus.engine` storage selection, then `test_storage.py` /
+   `test_crud.py` under `SECANTUS_ENGINE=rust`.
+   - Found + fixed a real latent use-after-free in `secantus-wt`: WiredTiger
+     references the caller's memory for `S`/`u` columns until the operation, so
+     the `Cursor` now **owns** its key/value buffers (`*_hold` fields) instead of
+     leaving callers to keep temporaries alive.
+2. **Indexes** — `secantus_indexes` + `secantus_index_entries` + the planner
+   (`find_matching` / `explain_plan` / all pickers; single / compound / multikey /
+   partial / TTL). Gate: `test_indexes.py`. **Sliced** (2a → 2f):
+   - **2a ✅ DONE (this slice)** — the registry + `create_index` / `list_indexes`
+     / `drop_index` / `drop_all_indexes`, and index-entry maintenance on
+     insert / replace / delete. Byte-faithful entry packing (`escape_kb` /
+     `pack_entry` / `unpack_entry`), the `index_key_variants` builder (scalar /
+     descending-inverted / multikey per-element + whole-array / compound
+     cartesian product), and create-time multikey-flag detection. Geo / text /
+     hashed rejected (`CreateIndexUnsupported`); re-create-with-conflicting-opts
+     rejected. Pinned by byte-exact unit tests (`crates/secantus-storage/src/
+     lib.rs` `#[cfg(test)]`) + WiredTiger-backed integration tests
+     (`crates/secantus-storage/tests/indexes.rs`). Added `secantus-wt`
+     `get_key_sss` / `get_key_sssu` getters and a `secantus_core::{get_path,
+     has_path}` re-export. **Deferred from 2a:** lazy multikey-flag marking on
+     insert/update (2d); sparse / partial entry-gating, unique enforcement, TTL,
+     collation (2e).
+   - **2b ✅ DONE** — `find_matching` + `explain_plan`: single-field equality /
+     `$eq` / `$in` / range (`$gt`/`$gte`/`$lt`/`$lte`, with DESC operator-flip)
+     routing through the entries table, the `_id` primary-key point-lookup fast
+     path (bare / `$eq` / `$in`), and COLLSCAN fallback — index candidates are
+     re-checked with `secantus_core::query::matches` (which can over-include for
+     multikey). `explain_plan` returns `ExplainPlan::{CollScan, IxScan{...}}`.
+     New WT-backed tests in `tests/query.rs`. **Scoped to single-field indexes**
+     (compound leading-field use is 2c, so the executor and `explain` stay
+     consistent); a `matches()` "defer to Python" construct (e.g. whole-array
+     literal equality) surfaces as `StorageError::QueryUnsupported` for the
+     server's engine-selection layer to route to Python.
+   - **2c ✅ DONE** — compound-index routing: bare-equality prefix (full-cover
+     exact scan + strict-leading-prefix scan, filter-field-order-independent,
+     shortest-covering-index preference), prefix + trailing-operator
+     (`$eq`/`$in`/range on the next column, range pinned to the equality
+     prefix), and mixed-direction compound indexes (per-field
+     `encode_value_directed`, DESC operator-flip). Restored the `prefix` param on
+     `range_scan_index` and added `range_scan_index_leading` (leading-field range
+     with escaped-separator boundary detection); `find_leading_field_index` now
+     returns the compound fallback so a single-field filter can ride a compound
+     index's leading field. Pickers (`pick_compound_eq_index` /
+     `pick_compound_range_index` / `partition_compound_range_filter`) shared by
+     execution and `explain`. New WT-backed tests in `tests/compound.rs`.
+   - **2d ✅ DONE** — lazy multikey marking: `maybe_mark_multikey` rewrites an
+     index's registry options with `multikey: true` when an inserted/replaced doc
+     has an array on an indexed field (sticky — never cleared); wired into
+     `insert_one` / `replace_by_id`. (The sort-acceleration *exclusion* of
+     multikey indexes is part of 2f, where sort lands.) New tests in
+     `tests/indexes.rs` (lazy-mark-on-insert, mark-on-replace, sticky).
+   - **2e ✅ DONE (collation deferred)** — three sub-commits:
+     - **2e-1** — write-path correctness: an `IndexDesc { name, key_spec, sparse,
+       unique, partial }` refactor of the CRUD entry-maintenance paths, the
+       canonical `index_key` (one byte-key per doc, `None` under sparse when a
+       field is missing), `sparse` support in `index_key_variants`, **unique
+       enforcement** (`unique_conflict` prefix-probe on insert / replace /
+       create-over-existing-data → `StorageError::DuplicateKey(Box<UniqueConflict>)`
+       with the mongod-shaped `keyPattern`/`keyValue`), and **partial-index entry
+       gating** (entries written / uniqueness scoped only to docs matching
+       `partialFilterExpression`).
+     - **2e-2** — read-path partial: `query_implies_partial` gates partial indexes
+       in `find_leading_field_index` / `pick_compound_eq_index` (which also strips
+       the partial-filter keys from the effective filter fields) /
+       `pick_compound_range_index`.
+     - **2e-3** — TTL: `prune_ttl(db, coll, now)` deletes docs whose TTL-indexed
+       `DateTime` is older than `now - expireAfterSeconds` (injected clock, no
+       background sweeper; oplog emission is sub-phase 3).
+     - **Collation: deferred.** The Rust `sortkey` / `query` engines defer
+       collation to Python (return the `Fallback` signal), so the canonical-key
+       encoding and `matches()` can't honour a collation at this layer — the
+       picker-level collation gates have nothing to gate against yet. Revisit when
+       the leaf engines grow collation support.
+     - New WT-backed tests: `tests/unique.rs` (9), `tests/partial.rs` (2),
+       `tests/ttl.rs` (3).
+   - **2f ✅ DONE** — sort acceleration + `hint`. `find_matching_with(filter,
+     sort, hint)` / `explain_plan_with(...)` (the 3-arg forms are convenience
+     wrappers): a single-field sort on the filter field, or an empty-filter sort
+     matching a single-field / compound index, is served by walking the index
+     forward / backward (skipping the post-sort); otherwise a COLLSCAN + a
+     byte-sortable-key post-sort (`sort_key` via the same encoder, so order is
+     consistent with the accelerated path). `hint` (`Hint::Name` /
+     `Hint::KeySpec`) resolves to `$natural` / `_id_` / a named index
+     (`resolve_hint` / `candidates_from_hint`); an unresolvable hint is
+     `StorageError::BadHint` in `find` and COLLSCAN in `explain`.
+     `compound_index_for_sort` is strict-shape and **excludes multikey indexes**
+     (the 2d flag's payoff). `explain` now sets `direction` (`forward` /
+     `backward`) via `make_ixscan_plan`. Ported from `storage`'s
+     `_single_sort_spec` / `_multi_sort_spec` / `_compound_index_for_sort` /
+     `_walk_index_in_order` / `_resolve_hint` / `_candidates_from_hint` /
+     `_make_ixscan_plan` and `find_matching`'s sort/hint branches. New WT-backed
+     tests in `tests/sort.rs` (10).
+
+   **Sub-phase 2 complete (collation deferred).** 72 storage tests; the
+   secantus-storage crate now covers the index registry, entry maintenance,
+   single-field + compound + `_id` lookup routing, unique / sparse / partial /
+   TTL, and sort + hint — all byte-faithful to `storage.py` and `clippy
+   -D warnings` clean.
+
+   **CI:** a `rust-storage` job in `.github/workflows/test.yml` builds the
+   vendored WiredTiger via `uv sync` (`build/*/wt-build`, static
+   `libwiredtiger.a`), points `SECANTUS_WT_INCLUDE`/`SECANTUS_WT_LIB` at it, and
+   runs `cargo fmt --check` / `clippy -D warnings` / `cargo test` for the crate
+   on every push-to-main / PR (Linux; cross-platform WT linking stays covered by
+   the `storage-engine` wheel job). Next: sub-phase 3 (oplog / change streams).
+3. **Geo** — `2dsphere` (s2) + `2d` (geohash) index acceleration, golden vectors.
+   Gate: `test_geo_index.py`. The recon found geo is **not** storage-only: the
+   Rust query engine had no geo operators, so a storage geo index is moot until
+   `find_matching`'s post-filter `matches()` can evaluate geo predicates. Sliced
+   geo-1 → geo-4:
+   - **geo-1 ✅ DONE** — geo *query operators* in `secantus-core`. New
+     `secantus_core::geo`: doc/query geometry coercion (GeoJSON / legacy `[x,y]` /
+     `{x,y}`/`{lng,lat}`), planar containment via the `geo` crate's DE-9IM
+     `Relate` (same OGC lineage as Shapely), haversine for `$centerSphere`;
+     `$geoWithin` + `$geoIntersects` wired into `query.rs` `op_matches`. `$center`
+     (Shapely 64-gon buffer — can't reproduce exactly) defers to Python via
+     `Fallback`. Added the `geo = "0.28"` dep.
+   - **geo-1b ✅ DONE** — `$near` / `$nearSphere` field-operator *matching* (within
+     `[$minDistance, $maxDistance]`; sort-by-distance stays in the command layer):
+     GeoJSON `{$geometry: Point, $maxDistance, $minDistance}` (metres) + legacy
+     `[x,y]`/`[x,y,max]` (planar, or radians→metres for `$nearSphere`); the legacy
+     *sibling* `$maxDistance` form falls back automatically ($maxDistance is a
+     separate unknown op in the condition doc). Geo cases added to
+     `test_rust_query_parity.py` — validated locally (built the extension; 105
+     curated cases pass, incl. geo) and re-run by CI's `rust` job under the real
+     extension.
+   - **geo-2 ✅ DONE** — `2d` geohash index in `secantus-storage`. Core helpers in
+     `secantus_core::geo` (`cell_2d` / `covering_2d` / `encode_cell` / `doc_point`
+     / `query_within_bbox`). `IndexDesc.geo_2d` + `parse_geo_2d`; `create_index`
+     accepts a single-field `2d` (flagged `multikey:true` so the numeric pickers
+     skip it; `2dsphere`/text/hashed still rejected) and builds point-only cell
+     entries; `write`/`delete_index_entries` maintain one geohash entry per
+     point-valued doc. `try_geo_2d_id_keys` routes `{field:{$geoWithin: region}}`
+     to the Z-order covering range scan (reusing `range_scan_index`), with
+     `find_matching` re-checking each candidate via `matches()` (geo-1); `explain`
+     reports `IXSCAN {field: "2d"}`. New WT-backed tests in `tests/geo.rs` (box /
+     centerSphere within, point-only, delete/replace upkeep, create-over-existing,
+     other geo types still rejected).
+   - **geo-3 ✅ DONE** — `2dsphere` S2 cell index in `secantus-storage` (via the
+     `s2` crate, kept in `secantus-storage`'s deps, not `secantus-core`, so the
+     shipped core wheel stays lean). `GeoSphere` + `parse_geo_sphere`;
+     `create_index` accepts a single-field `2dsphere` (flagged `multikey:true` so
+     the numeric pickers skip it). Module helpers `s2_coverer` (min 4 / max 16 /
+     64 cells / level_mod 1, mirroring `geo_index._make_coverer`),
+     `cell_with_ancestors`, `s2_cells_for_point` (leaf + ancestors),
+     `s2_cells_for_bbox` (`LatLngRect` covering + ancestors). `GeoSphere.cell_kbs`
+     writes covering cells + ancestors per geometry (point → leaf+ancestors; any
+     other geometry → its bounding rect via `secantus_core::geo::doc_bbox`).
+     `write`/`delete_index_entries` maintain these; `try_geo_sphere_id_keys`
+     routes `{field:{$geoWithin: region}}` to per-cell exact point-lookups over
+     the S2 covering of the query bbox (`query_within_bbox` + `s2_cells_for_bbox`,
+     unioned + deduped), with `find_matching` re-checking each candidate via
+     `matches()`; `explain` reports `IXSCAN {field: "2dsphere"}`. New WT-backed
+     tests in `tests/geo.rs` (box/centerSphere within, polygon docs covered,
+     delete/replace upkeep, create-over-existing). Only text/hashed are now
+     rejected. (`$geoWithin` `$center` and `$near` index routing still COLLSCAN —
+     correct via `matches()`/`Fallback`.)
+   - **geo-4:** `$geoNear` aggregation stage (blocked on the aggregation →
+     storage wiring, like `$lookup` / `$out` / `$merge`).
+4. **Oplog + change-stream storage** — oplog / pre-images / meta tables, cluster
+   time, retention, noop heartbeats; then re-home `$lookup` / `$geoNear` pipeline
+   acceleration here. Gate: `test_change_streams.py`. **Sliced** (3a → 3e):
+   - **3a ✅ DONE** — oplog foundation: `OplogState` (next_seq + last_ts) under a
+     dedicated mutex, strictly-monotonic `mint_ts` / `mint_seq_and_ts`,
+     `current_cluster_time`, `emit_oplog` (stamps `ts` + `wall`), op `"i"`
+     emission wired into `insert_one`, `read_oplog(start, limit)` /
+     `oplog_floor_seq` / `oplog_tail_seq` cross-thread reads (each call opens a
+     fresh session — no sticky snapshot), and seq recovery on open
+     (`load_oplog_meta`: meta row, else fallback scan). `enable_oplog` (default
+     true) + `set_enable_oplog`. New tests in `tests/oplog.rs`. **Deferred:**
+     the collection-UUID `ui` field (3c).
+   - **3b ✅ DONE** — `replace_by_id` emits op `"u"` with `o` = the full new doc
+     (the replacement shape — mongod's `$v:2` diff is only for operator-updates,
+     which the storage layer doesn't expose; that path waits for a future
+     `update_*` method using `secantus-core`'s `diff`), and `delete_by_id` emits
+     op `"d"` with `o`=`o2`=`{_id}`. New tests in `tests/oplog.rs`
+     (replace→`u`+full-doc, delete→`d`, insert/replace/delete → `[i,u,d]`).
+   - **3c ✅ DONE** — collection UUID (`ui`) + pre-images. Collection-options
+     read/write (`coll_options` / `write_coll_options`), `collection_uuid` (16
+     bytes minted from two `ObjectId`s — no `uuid` crate dep — and persisted into
+     the options on first use), the `ui` Binary subtype-4 field on every
+     insert/replace/delete entry, `set_collection_options` (e.g.
+     `{changeStreamPreAndPostImages: {enabled: true}}`), pre-image writes on
+     replace/delete when enabled (`emit_oplog` now threads a parallel
+     `pre_images` vec), and `read_preimage`. New tests in `tests/oplog.rs`
+     (stable per-collection ui, pre-images when enabled, none when disabled).
+   - **3d ✅ DONE (condvar deferred)** — retention `prune_oplog(now)` (drops rows
+     past `oplog_retention_seconds`, then the oldest over `oplog_max_entries`,
+     plus paired pre-images; injected clock, explicit-only like `prune_ttl`),
+     `emit_noop_heartbeat` (op `"n"`), `find_seq_for_ts` (for
+     `startAtOperationTime`), and `set_oplog_retention_seconds` /
+     `set_oplog_max_entries`. New tests in `tests/oplog.rs` (retention prune,
+     keep-recent, entry-cap, pre-image co-deletion, heartbeat shape,
+     find-seq-for-ts). **Deferred:** the change-stream condvar / tailable-wait
+     primitive — it only matters once a tailable cursor exists (server layer) and
+     needs `Storage: Sync` + multithreaded tests; lands with that consumer.
+   - **3e ✅ DONE** — change-stream event projection (`crates/secantus-storage/src/
+     changestreams.rs`, a faithful port of `changestreams.py`): resume tokens
+     (`{_data: hex}` over `{s,t,n,k}`, `make`/`parse`), `Scope`
+     (cluster/db/coll) filtering, `project()` mapping insert/update/replace/
+     delete/drop/dropDatabase/rename/createIndexes/dropIndexes (+
+     `showExpandedEvents` gating) with `clusterTime`/`wallTime`/`ns`/
+     `documentKey`, `updateDescription` (diff vs full-doc → update vs replace),
+     `fullDocument` (incl. `updateLookup` re-fetch via `find_matching`),
+     `fullDocumentBeforeChange` (via `read_preimage`; `required` → code-280
+     `ChangeStreamFatal`), `invalidate_event`, and `stamp_split_event` (16 MB
+     fragment envelope). New `tests/changestreams.rs` (11). The noop heartbeat
+     projects to nothing (advances position only).
+   - Then (follow-on): re-home `$lookup` / `$geoNear` pipeline acceleration onto
+     the Rust storage, and the tailable-cursor / server cutover.
+
+   **Sub-phase 3 complete.** The oplog / change-stream *storage* layer is done —
+   emission (i/u/d), `ui` + pre-images, cluster time, retention, heartbeats,
+   recovery, and event projection — 91 storage tests, `clippy -D warnings` +
+   `fmt` clean. Deferred within the phase: the operator-update diff path (needs a
+   future `update_*` storage method) and the tailable-wait condvar (server layer).
+5. **Server cutover** — expose the *whole* `Storage` surface through PyO3, add a
+   Python adapter selectable by `secantus.engine`, and run the conformance suites
+   under `SECANTUS_ENGINE=rust`. The widest-surface sub-phase; sliced 5a → …:
+   - **5a ✅ DONE** — write-path completion in `secantus-storage`:
+     `update_matching` (operator + replacement, `multi`, `upsert`-with-seed,
+     unique enforcement, index-entry upkeep, multikey marking, **and the deferred
+     3b oplog path** — operator updates emit `o = {$v:2, diff:
+     compute_update_description(pre,post)}`, replacements emit the full new doc),
+     `delete_matching` (filter-routed, `limit`, op `"d"` + pre-images), and
+     `count_matching` (empty-filter fast path + predicate). Shared `candidate_docs`
+     helper (index-routed-deduped else full scan, fully materialised so the
+     write loop can't invalidate a live scan cursor). Public `UpdateOutcome
+     {matched, modified, upserted_id}`. New WT-backed tests in `tests/write.rs`
+     (14). **Deferred to the adapter layer (route to Python):** `array_filters`,
+     positional update operators (`$`/`$[]`), `let`/`collation`, document
+     `validator`, capped-collection bounds, and geo-index validation on update —
+     the Rust signatures take none of these, so the engine-selection layer keeps
+     such ops on the pure-Python `Storage`.
+   - **5b ✅ DONE** — collection / database lifecycle in `secantus-storage`:
+     `create_collection` (register + UUID mint + `op:"c"` `create` w/ `idIndex`),
+     `drop_collection` (purge docs / index registry / index entries + registry
+     row, `op:"c"` `drop`), `drop_database` (purge every collection + a `drop`
+     per collection then a final `dropDatabase:1` command entry, no `ui`),
+     `rename_collection` (move doc / index / entry rows by re-keying, `drop_target`
+     handling, source-missing / target-exists guards returning `(bool, Option<msg>)`,
+     `op:"c"` `renameCollection` — dst re-registered with fresh options, faithful
+     to Python), and `list_databases` (+ synthetic `local` when the oplog is on).
+     Shared `colls_of` / `purge_collection_tables` / `collect_idx_rows` /
+     `collect_entry_rows` helpers. New WT-backed tests in `tests/lifecycle.rs`
+     (10). 144 storage tests; `clippy -D warnings` + `fmt` clean.
+   - **5c ✅ DONE** — collection stats / introspection in `secantus-storage`:
+     `get_collection_options` (`{}` when absent; the synthetic `local.oplog.rs`
+     capped shape; stored `uuid` left as a BSON Binary for the command layer),
+     `collection_is_capped`, `collection_data_size` (summed blob bytes),
+     `index_sizes` (`_id_` = summed `id_key` length + each secondary index's
+     summed packed-entry length, via `collect_entry_rows`), and
+     `scan_docs_after_id_key` (natural-order rows with `id_key > after`, for the
+     tailable producer). New WT-backed tests in `tests/stats.rs` (7);
+     `clippy -D warnings` + `fmt` clean.
+   - **5d ✅ DONE** — full PyO3 surface (`crates/secantus-storage-py`): the
+     `RustStorage` class now exposes the whole `Storage` interface over the BSON
+     byte seam — query (`find_matching` / `find_matching_with` with sort + hint /
+     `explain_plan` / `count_matching`), write (`update_matching` returning a
+     `{matched, modified, upserted_id?}` doc / `delete_matching`), indexes
+     (`create_index` / `list_indexes` / `drop_index` / `drop_all_indexes` /
+     `prune_ttl`), lifecycle (`create`/`drop`/`drop_database`/`rename`/`list_*`),
+     options + stats (`get`/`set_collection_options` / `collection_is_capped` /
+     `collection_data_size` / `index_sizes` / `scan_docs_after_id_key`), and
+     oplog / cluster time (`collection_uuid` / `current_cluster_time` /
+     `read_oplog` / `oplog_floor_seq` / `oplog_tail_seq` / `read_preimage` /
+     `prune_oplog` / `emit_noop_heartbeat` / `find_seq_for_ts`), plus the
+     `set_enable_oplog` / `set_oplog_*` config setters. The **`EngineFallback`**
+     exception (exported from the module) carries the `StorageError::Query
+     Unsupported` "defer to Python" signal for the adapter. Smoke-tested
+     end-to-end against the built wheel (`tests/test_rust_storage_smoke.py`, 5
+     tests; `invoke rust-storage-py`). **Deferred to the adapter slice:** rich
+     E11000 `keyPattern`/`keyValue` propagation (DuplicateKey currently surfaces
+     as a `KeyError` with the index name) and `BadHint`-code mapping.
+   - **5e — server cutover.** A full `SECANTUS_ENGINE=rust` server swap needs the
+     *whole* `Storage` surface in Rust (Python + Rust can't share one WT store,
+     so the adapter must route every data op to one backend). An inventory of the
+     server/command layer found **48 `Storage` methods called, 17 gaps** vs the
+     PyO3 binding. **Decision: port the gaps first, then the adapter + conformance
+     gate.** Gap-closure slices:
+     - **5e-gap-a ✅ DONE** — users / roles / profiling: `add_user` / `get_user` /
+       `drop_user` / `list_users` (+ `add_role` / `get_role` / `drop_role` /
+       `list_roles`) over the `secantus_users` / `secantus_roles` `SS` tables
+       (opaque BSON record blobs, stored verbatim, paginated `db`-filtered list);
+       `get_profile` (mongod defaults) / `set_profile` (level/slowms/sampleRate
+       validation) over the `secantus_profile_settings` `S` table; and
+       `ensure_profile_collection` (capped `<db>.system.profile`). Shared
+       `put_/get_/drop_/list_ss_record` helpers. PyO3 bindings + 6 WT-backed tests
+       (`tests/auth.rs`) + smoke coverage.
+     - **5e-gap-b ✅ DONE** — batch `insert` + `prune_ttl_all_collections`.
+       `insert(db, coll, docs, ordered) -> (inserted, errors)` loops the
+       `insert_one` internals (auto-`_id`, unique-conflict pre-check, dup-`_id`
+       detection, index entries, multikey, batched `op:"i"` oplog) collecting
+       mongod-shaped write-error docs (`{index, code, errmsg, keyPattern?,
+       keyValue?}`); `ordered` stops at the first error, else continues.
+       `prune_ttl_all_collections` walks every namespace and sums `prune_ttl`
+       (per-coll errors suppressed). PyO3 bindings + 7 WT-backed tests
+       (`tests/batch_insert.rs`) + smoke coverage. **Deferred (Rust has no capped
+       support):** capped-collection eviction within `insert`, and geo-index
+       validation on insert — tracked in the backlog.
+     - **5e-gap-c ✅ DONE** — change-stream tailable-wait primitive. A `Condvar`
+       paired with the existing `oplog` mutex (tail = `next_seq - 1`):
+       `wait_for_oplog(after_seq, timeout_ms) -> tail` does one bounded wait
+       (wakes on a new entry / a notify / timeout — the tail check + wait share
+       the mutex, so no lost-wakeup), `notify_oplog_waiters()` wakes blocked
+       waiters without advancing (for `killCursors`), and `emit_oplog` notifies
+       after writing. The PyO3 `wait_for_oplog` releases the GIL
+       (`py.allow_threads`) while blocking (`Connection` is `Send + Sync`). This
+       is the Rust equivalent of `storage._oplog_cv`; `oplog_tail_seq_nolock` is
+       subsumed (the primitive does its own locking). 4 cross-thread WT-backed
+       tests (`tests/condvar.rs`) + a threaded smoke test. **`commands.py`'s
+       tailable getMore is refactored off the raw `_oplog_cv` attribute onto this
+       `wait_for_oplog`/`notify_oplog_waiters` method pair as part of the adapter
+       slice (both engines then share the method).**
+     - **Remaining gaps:** `checkpoint` / `close` / `create_archive` (admin /
+       `fsync` / backup — none block the CRUD / query / change-stream conformance
+       suites; `close` is handled adapter-side by dropping the handle).
+     - **Then:** the `secantus.engine` storage-selection + a Python `Storage`
+       adapter over `RustStorage` (BSON at the seam, `EngineFallback` → Python
+       operators over Rust-scanned docs, E11000 / `BadHint` error translation),
+       then `test_storage.py` / `test_crud.py` + the pymongo gauge under
+       `SECANTUS_ENGINE=rust` — the go/no-go gate.
+
+## PyO3 exposure (done) — `crates/secantus-storage-py`
+
+The Rust storage is exposed to Python as the `_secantus_storage` extension
+(`RustStorage` over the BSON byte seam, `_id` wrapped as `{"v": id}`). As of
+slice 5d the binding covers the **whole** `Storage` surface (query / write /
+indexes / lifecycle / options+stats / oplog / cluster time — see 5d above), not
+just the CRUD core, plus the exported `EngineFallback` exception for the
+dual-engine "defer to Python" signal. The WiredTiger-linking extension builds
+(maturin → abi3 wheel) and imports, and drives the surface end-to-end from
+Python (`tests/test_rust_storage_smoke.py`; `invoke rust-storage-py`). What
+remains for the gate is the cross-platform *packaging* and the Python adapter +
+engine selection (5e), not whether a WT-linking Python extension can work.
+
+Note: this is **not** yet wired into `secantus.engine`'s storage selection.
+Swapping the Rust `Storage` into `SecantusDBServer` needs the *whole* `Storage`
+surface (`find_matching`/indexes/oplog/…), so the server cutover is gated on
+sub-phases 2-4, not just the CRUD core.
+
+## The wheel-matrix gate — decision + status
+
+**Decision (chosen): bundle the extension into the `secantus` wheel behind an
+off-by-default build flag.** The WiredTiger-linking Rust `_secantus_storage`
+extension is built by the main wheel's existing CMake against the SAME vendored
+WiredTiger that wheel already builds — gated behind the
+`SECANTUS_BUILD_STORAGE_ENGINE` CMake option, which defaults **OFF**. With the
+flag OFF (the shipping default) the wheel is byte-for-byte unchanged and needs no
+Rust/clang toolchain; the pure-Python storage path remains the default until
+engine-selection makes the Rust storage engine selectable.
+
+**Why this over a separate companion wheel.** A separate `secantus-storage` wheel
+(building its own static WiredTiger via a `maturin-action` workflow) was
+prototyped first and rejected after CI evidence: it re-derives the entire
+cross-platform WiredTiger build *outside* cibuildwheel (toolchain install,
+Python-dev for WT's CMake, the WT patches, per-platform link flags) — every CI
+failure was something the main wheel's cibuildwheel + CMake build already solves.
+Bundling reuses that proven WT build, so the flag-on path inherits the main
+wheel's cross-platform machinery instead of reimplementing it. The cost — a
+Rust/clang build dep *when the flag is on* — is acceptable precisely because the
+flag is off by default and only flipped on deliberately.
+
+**How it works (root `CMakeLists.txt`).** The `wiredtiger_ext` ExternalProject
+builds WiredTiger static (`libwiredtiger.a` + generated headers under
+`build/{wheel_tag}/wt-build`). When `SECANTUS_BUILD_STORAGE_ENGINE=ON`, a custom
+command runs `cargo build --release` on `crates/secantus-storage-py` with
+`SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB` pointed at that WT output (bindgen finds
+libclang from the environment), renames the cdylib to the platform Python-
+extension filename, and `install(... DESTINATION .)`s it at the wheel root so
+`import _secantus_storage` resolves.
+
+**CI.** The `storage-engine` job in `.github/workflows/test.yml` is a 3-OS matrix
+(Linux / macOS / Windows): each builds the `secantus` wheel with
+`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON`, asserts
+`_secantus_storage` is bundled (hard failure if missing), and runs
+`tests/test_rust_storage_smoke.py` against the installed wheel. The storage
+crate's WiredTiger system-link flags are cfg-gated per target OS in
+`crates/secantus-wt/build.rs` (Linux `pthread`+`rt`+`dl`; macOS `pthread`+`dl`,
+no `librt`; Windows none beyond the MSVC defaults), mirroring what WT's own CMake
+detects.
+
+`secantus-wt` / `secantus-storage` stay excluded from the `crates/Cargo.toml`
+workspace so the green `secantus-core` / `secantus-core-py` build and the `rust` /
+`rust-wheels` CI stay untouched. `crates/secantus-storage-py/pyproject.toml` is
+retained for local dev only (`invoke rust-storage-py` via maturin) — not
+published to PyPI.

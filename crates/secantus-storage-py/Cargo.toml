@@ -1,0 +1,19 @@
+[package]
+name = "secantus-storage-py"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "PyO3 bindings exposing SecantusDB's Rust storage layer (secantus-storage) to Python as the _secantus_storage extension."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+publish = false
+
+[workspace]
+
+[lib]
+name = "_secantus_storage"
+crate-type = ["cdylib"]
+
+[dependencies]
+bson = "2"
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+secantus-storage = { path = "../secantus-storage" }

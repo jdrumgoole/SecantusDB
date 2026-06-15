@@ -1,0 +1,22 @@
+[package]
+name = "secantus-auth"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "Pure-Rust SCRAM-SHA-256 server-side mechanism for the SecantusDB Rust server (R5 auth)."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+publish = false
+
+# Pure Rust, no PyO3 / native deps — builds in the WT-less `rust` CI job. Ports
+# the SCRAM core of `src/secantus/auth.py` (RFC 5802 / 7677). The auth *command*
+# handlers + user storage + per-connection state wire this in (R5b+).
+[lib]
+name = "secantus_auth"
+crate-type = ["rlib"]
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+base64 = "0.22"
+rand = "0.9"

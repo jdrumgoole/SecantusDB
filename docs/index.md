@@ -79,13 +79,15 @@ client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 ```
 
 The conformance evidence: the official test suites for **pymongo**,
-**mongo-go-driver**, **mongo-node-driver**, **mongo-java-driver**, and
-**mongo-ruby-driver** all run against SecantusDB **unmodified** — see
-the [pymongo](validation-report.md), [Go-driver](validation-report-go.md),
+**mongo-go-driver**, **mongo-node-driver**, **mongo-java-driver**,
+**mongo-ruby-driver**, and **mongo-rust-driver** all run against
+SecantusDB **unmodified** — see the
+[pymongo](validation-report.md), [Go-driver](validation-report-go.md),
 [Node-driver](validation-report-node.md),
-[Java-driver](validation-report-java.md), and
-[Ruby-driver](validation-report-ruby.md) validation reports for current
-pass-rates per feature category.
+[Java-driver](validation-report-java.md),
+[Ruby-driver](validation-report-ruby.md), and
+[Rust-driver](validation-report-rust.md) validation reports for
+current pass-rates per feature category.
 
 ## What's in scope
 
@@ -126,8 +128,6 @@ features tangential to single-node operation:
   privileged.
 - Text search (no full-text index).
 - `$where` (no JS runtime).
-- Real transaction rollback (we accept `commitTransaction` /
-  `abortTransaction` but operations take effect immediately).
 
 If your application or test depends on those features, run a real
 `mongod`. SecantusDB is the right tool when you need a single-node
@@ -203,6 +203,8 @@ validation-report-go
 validation-report-node
 validation-report-java
 validation-report-ruby
+validation-report-rust
+validation-report-rust-server
 api
 changelog
 ```

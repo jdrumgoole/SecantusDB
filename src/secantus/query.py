@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
-from bson import Binary, Decimal128, ObjectId, Regex
+from bson import Binary, Decimal128, Int64, ObjectId, Regex
 
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
@@ -43,6 +43,19 @@ def matches(
     if not query:
         return True
     return all(_match_clause(doc, k, v, vars, collation) for k, v in query.items())
+
+
+def matches_batch(
+    docs: list[Mapping[str, Any]],
+    query: Mapping[str, Any],
+    *,
+    vars: dict[str, Any] | None = None,
+    collation: Collation | None = None,
+) -> list[bool]:
+    """Filter ``docs`` against ``query`` in one shot."""
+    if not query:
+        return [True] * len(docs)
+    return [matches(d, query, vars=vars, collation=collation) for d in docs]
 
 
 def _match_clause(
@@ -238,6 +251,26 @@ def _eq_numeric_aware(a: Any, b: Any, collation: Collation | None = None) -> boo
     collation is in effect — ``strength 2`` makes ``"ping" == "PING"``
     so case-insensitive find / update / delete tests pass.
     """
+    # Embedded documents compare for equality field-ORDER-sensitively
+    # and exactly (no subset), recursively — a mongod gotcha that
+    # Python's order-insensitive ``dict ==`` would get wrong. Arrays
+    # compare positionally with numeric-aware leaves.
+    a_map = isinstance(a, Mapping)
+    b_map = isinstance(b, Mapping)
+    if a_map or b_map:
+        if not (a_map and b_map) or len(a) != len(b):
+            return False
+        return all(
+            ka == kb and _eq_numeric_aware(va, vb, collation)
+            for (ka, va), (kb, vb) in zip(a.items(), b.items(), strict=True)
+        )
+    a_list = isinstance(a, list)
+    b_list = isinstance(b, list)
+    if a_list or b_list:
+        if not (a_list and b_list) or len(a) != len(b):
+            return False
+        return all(_eq_numeric_aware(x, y, collation) for x, y in zip(a, b, strict=True))
+
     a_bool = isinstance(a, bool)
     b_bool = isinstance(b, bool)
     if a_bool != b_bool:
@@ -641,16 +674,29 @@ def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
     return False
 
 
-def _is_bson_int(v: Any, *, ranged: tuple[int, int] | None = None) -> bool:
-    if not isinstance(v, int) or isinstance(v, bool):
-        return False
-    if ranged is not None:
-        lo, hi = ranged
-        return lo <= v <= hi
-    return True
+def _is_int32(v: Any) -> bool:
+    """True for BSON int32 — plain Python int, not bool, not Int64.
+
+    pymongo's BSON decoder preserves the int32 / int64 distinction:
+    int32 values come back as plain ``int``, int64 values as
+    :class:`bson.Int64` (a subclass of ``int``). The distinction is
+    by *type*, not by *value range*: ``bson.Int64(5)`` matches
+    ``$type: "long"`` even though its value fits in int32.
+    """
+    return isinstance(v, int) and not isinstance(v, (bool, Int64))
 
 
-_INT32_RANGE = (-(2**31), 2**31 - 1)
+def _is_int64(v: Any) -> bool:
+    """True for BSON int64. ``Int64`` is a subclass of ``int`` so
+    ordinary numeric comparisons still work; this predicate keys on
+    the BSON type tag preserved by the decoder."""
+    return isinstance(v, Int64)
+
+
+def _is_bson_number(v: Any) -> bool:
+    """``$type: "number"`` — any BSON numeric (int32, int64, double,
+    decimal). Excludes ``bool``, which mongod ranks as its own type."""
+    return isinstance(v, (float, Decimal128)) or _is_int32(v) or _is_int64(v)
 
 
 _TYPE_PREDS: dict[Any, Callable[[Any], bool]] = {
@@ -674,13 +720,13 @@ _TYPE_PREDS: dict[Any, Callable[[Any], bool]] = {
     "null": lambda v: v is None,
     11: lambda v: isinstance(v, Regex),
     "regex": lambda v: isinstance(v, Regex),
-    16: lambda v: _is_bson_int(v, ranged=_INT32_RANGE),
-    "int": lambda v: _is_bson_int(v, ranged=_INT32_RANGE),
-    18: lambda v: _is_bson_int(v) and not _is_bson_int(v, ranged=_INT32_RANGE),
-    "long": lambda v: _is_bson_int(v) and not _is_bson_int(v, ranged=_INT32_RANGE),
+    16: _is_int32,
+    "int": _is_int32,
+    18: _is_int64,
+    "long": _is_int64,
     19: lambda v: isinstance(v, Decimal128),
     "decimal": lambda v: isinstance(v, Decimal128),
-    "number": lambda v: isinstance(v, (float, Decimal128)) or _is_bson_int(v),
+    "number": _is_bson_number,
 }
 
 

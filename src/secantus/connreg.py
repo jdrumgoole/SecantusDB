@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -39,6 +40,16 @@ class ConnInfo:
     op_count: int = 0
     user: str | None = None
     last_command_name: str | None = None
+    # Driver self-identification sent in the ``hello`` handshake's
+    # ``client`` subdoc (per the MongoDB Handshake spec): driver
+    # name + version, OS info, platform string, application name.
+    # ``currentOp`` surfaces this as ``clientMetadata`` on each
+    # in-progress op — that's how drivers identify their own
+    # connections in admin tooling. mongo-rust-driver's
+    # ``test::client::metadata_sent_in_handshake`` reads this
+    # subdoc back via ``currentOp``. Stored verbatim; the emit
+    # path doesn't reshape it.
+    client_metadata: dict | None = None
 
 
 class ConnectionRegistry:
@@ -106,6 +117,40 @@ class ConnectionRegistry:
             sock.shutdown(socket.SHUT_RDWR)
         return True
 
+    def close_all(self) -> None:
+        """Wake every registered connection's blocked ``recv`` so the handler
+        threads return and exit. Used at server stop to drain in-flight
+        connections before the storage engine closes (a handler thread
+        mid-WiredTiger-op when the WT connection closes is a use-after-free /
+        native crash). Idempotent — safe to call repeatedly during the drain
+        poll, which is how late-registering connections get caught.
+
+        Platform split, because the primitive that wakes a ``recv`` blocked in
+        *another* thread differs by OS:
+
+          * **POSIX**: ``shutdown(SHUT_RDWR)`` wakes the blocked ``recv``
+            (returns EOF) while leaving the fd valid; the owning handler closes
+            it later via its ``with conn`` block. We must **not** ``close()``
+            here — closing the fd from this thread does not wake the parked
+            ``recv`` (it keeps reading the old fd), and the freed fd number is
+            immediately reusable by another socket / WiredTiger, so the handler
+            ends up blocked forever on a recycled descriptor. ``shutdown``-only
+            is the correct, race-free POSIX wake.
+          * **Windows**: ``shutdown`` does *not* interrupt an already-blocked
+            ``recv`` (it only affects the next call), so the handler would stay
+            parked and the drain barrier would time out. ``closesocket`` is what
+            aborts the in-progress ``recv`` there, and Windows handles aren't
+            recycled under a blocked read the way POSIX fds are, so the
+            reuse hazard above doesn't apply."""
+        with self._lock:
+            socks = list(self._sockets.values())
+        for sock in socks:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            if sys.platform == "win32":
+                with contextlib.suppress(OSError):
+                    sock.close()
+
     def record_command(self, conn_id: int, name: str) -> None:
         """Bump ``op_count`` and set ``last_command_name`` / ``last_cmd_at``."""
         with self._lock:
@@ -123,6 +168,23 @@ class ConnectionRegistry:
             if info is None:
                 return
             info.user = user
+
+    def set_client_metadata(self, conn_id: int, metadata: dict) -> None:
+        """Stash the ``hello.client`` subdoc the driver sent.
+
+        Per the MongoDB Handshake spec, drivers send their
+        self-identification once per connection on the first
+        ``hello`` / ``isMaster`` command. We stash it on the
+        registry so ``currentOp`` can echo it back as
+        ``clientMetadata`` on the corresponding in-progress op.
+        Idempotent — drivers MAY re-send on a later ``hello`` for
+        speculative-auth refresh; we just replace.
+        """
+        with self._lock:
+            info = self._conns.get(conn_id)
+            if info is None:
+                return
+            info.client_metadata = dict(metadata)
 
     def get(self, conn_id: int) -> ConnInfo | None:
         """Return a fresh copy of the ``ConnInfo`` for ``conn_id`` or ``None``.
@@ -143,6 +205,9 @@ class ConnectionRegistry:
                 op_count=info.op_count,
                 user=info.user,
                 last_command_name=info.last_command_name,
+                client_metadata=dict(info.client_metadata)
+                if info.client_metadata is not None
+                else None,
             )
 
     def snapshot(self) -> list[ConnInfo]:
@@ -157,6 +222,9 @@ class ConnectionRegistry:
                     op_count=info.op_count,
                     user=info.user,
                     last_command_name=info.last_command_name,
+                    client_metadata=dict(info.client_metadata)
+                    if info.client_metadata is not None
+                    else None,
                 )
                 for info in sorted(self._conns.values(), key=lambda i: i.conn_id)
             ]

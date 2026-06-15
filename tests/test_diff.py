@@ -116,3 +116,36 @@ def test_diff_replacement_doc() -> None:
     diff = compute_update_description({"_id": 1, "x": 1}, {"_id": 1, "y": 2})
     assert diff["updatedFields"] == {"y": 2}
     assert diff["removedFields"] == ["x"]
+
+
+def test_disambiguated_paths_for_numeric_dict_keys() -> None:
+    """mongod 6.1+: updated paths containing numeric-string FIELD names
+    get a disambiguatedPaths entry mapping the dotted path to typed
+    segments (int = array index, str = field name)."""
+    out = compute_update_description({"a": {"1": 1}}, {"a": {"1": 2}})
+    assert out["updatedFields"] == {"a.1": 2}
+    assert out["disambiguatedPaths"] == {"a.1": ["a", "1"]}
+
+    out = compute_update_description({"a": [{"1": 1}]}, {"a": [{"1": 2}]})
+    assert out["updatedFields"] == {"a.0.1": 2}
+    assert out["disambiguatedPaths"] == {"a.0.1": ["a", 0, "1"]}
+
+
+def test_disambiguated_paths_absent_when_unambiguous() -> None:
+    out = compute_update_description({"a": {"b": 1}}, {"a": {"b": 2}})
+    assert "disambiguatedPaths" not in out
+
+    # Plain array index paths are NOT ambiguous on their own.
+    out = compute_update_description({"a": [1, 2]}, {"a": [9, 2]})
+    assert out["updatedFields"] == {"a.0": 9}
+    assert "disambiguatedPaths" not in out
+
+
+def test_disambiguated_paths_for_removed_and_truncated() -> None:
+    out = compute_update_description({"a": {"1": 1}, "b": 0}, {"b": 0})
+    assert out["removedFields"] == ["a"]
+    assert "disambiguatedPaths" not in out  # "a" itself is unambiguous
+
+    out = compute_update_description({"a": {"2": [1, 2, 3]}}, {"a": {"2": [1]}})
+    assert out["truncatedArrays"] == [{"field": "a.2", "newSize": 1}]
+    assert out["disambiguatedPaths"] == {"a.2": ["a", "2"]}

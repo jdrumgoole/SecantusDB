@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.1b24"
+version = "0.5.3b7"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -64,6 +64,15 @@ admin = [
     # / Activity Monitor say "SecantusDB admin" instead of "Python".
     "setproctitle>=1.3",
 ]
+rust = [
+    # Optional Rust acceleration core (the `_secantus_core` extension). Kept as
+    # a separate companion wheel rather than bundled, pinned in lockstep so the
+    # accelerator always matches this release's behaviour. The pure-Python
+    # engines remain the default; enable with SECANTUS_ENGINE=rust|auto. Built
+    # from the PyO3 bindings crate crates/secantus-core-py/ (which wraps the pure
+    # Rust engines in crates/secantus-core/); see tasks/rust-rewrite-plan.md.
+    "secantus-core==0.5.2b15",
+]
 
 [project.scripts]
 # `secantusdb` is the primary console script, matching the PyPI distribution
@@ -85,6 +94,15 @@ secantusdb-restore-archive = "secantus.restore_cli:main"
 # satisfied by tool.cibuildwheel.{linux,macos,windows} `before-build`.
 requires = ["scikit-build-core>=0.10"]
 build-backend = "scikit_build_core.build"
+
+# Dev-only resolution for the optional `rust` extra: point `secantus-core` at the
+# in-repo crate so `uv lock` / `uv sync` resolve it locally (it isn't on PyPI
+# until a release publishes it in lockstep). This is uv-specific config and is
+# NOT part of the built wheel's metadata — `pip install "secantus[rust]"` reads
+# the `secantus-core==<version>` pin from project.optional-dependencies and
+# resolves it from PyPI as normal.
+[tool.uv.sources]
+secantus-core = { path = "crates/secantus-core-py" }
 
 [tool.scikit-build]
 minimum-version = "0.10"
@@ -176,6 +194,18 @@ testpaths = ["tests"]
 # on a published release, so they belong in `invoke validate-readme`
 # rather than every dev pytest run.
 addopts = "-n auto --dist=loadgroup -m 'not perf and not online and not slow'"
+# Per-test deadline (pytest-timeout, already in the dev extras). A hung
+# test otherwise blocks CI until the runner's 6-hour kill with zero
+# diagnostics — seen once in tests/test_admin_skeleton.py's websocket
+# change-stream tail, which pinned a core for 15+ minutes and never
+# produced a stack. 600s is ~4x the whole suite's wall-clock, so only a
+# genuine hang trips it. `thread` method dumps every thread's stack
+# before killing the worker (the signal method can't interrupt blocking
+# C calls and is unreliable under xdist). Ini keys (not addopts) so the
+# deadline survives runs that override addopts, e.g. the conformance
+# gauges' `-o addopts=`.
+timeout = 600
+timeout_method = "thread"
 markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
     "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",

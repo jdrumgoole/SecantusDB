@@ -1,7 +1,7 @@
 """Turn a pytest-json-report JSON file into docs/validation-report.md.
 
 Usage:
-    python -m pymongo_validation.generate_report <raw.json> <output.md>
+    python -m pymongo_validation.generate_report [--server python|rust] <raw.json> <output.md>
 
 Groups tests by their first-level path component under
 `vendor/pymongo-tests/test/` (e.g. "crud", "test_collection.py",
@@ -21,6 +21,28 @@ from pathlib import Path
 import secantus
 
 VENDOR_PREFIX = "vendor/pymongo-tests/test/"
+
+
+# pymongo's own in-process unit tests (BSON codec, type classes, JSON
+# util, error classes) — verified zero server references, so they pass
+# against any server or none. Excluded from this report so its headline
+# matches the website grid's server-touching number rather than
+# inflating it with tests that don't measure SecantusDB. Kept in sync
+# with ``validation_summary.generate._PYMONGO_NON_SERVER_FILES``.
+_NON_SERVER_FILES = frozenset(
+    {
+        "test_bson.py",
+        "test_bson_corpus.py",
+        "test_objectid.py",
+        "test_son.py",
+        "test_json_util.py",
+        "test_dbref.py",
+        "test_code.py",
+        "test_timestamp.py",
+        "test_default_exports.py",
+        "test_errors.py",
+    }
+)
 
 
 def _category_for(nodeid: str) -> str:
@@ -47,12 +69,14 @@ def _read_pymongo_version() -> str:
     return "unknown"
 
 
-def render(raw: dict, out_path: Path) -> None:
+def render(raw: dict, out_path: Path, *, server: str = "python") -> None:
     by_cat: dict[str, dict[str, int]] = defaultdict(
         lambda: {"passed": 0, "failed": 0, "skipped": 0, "errored": 0}
     )
 
     for test in raw.get("tests", []):
+        if test["nodeid"].split("::")[0].split("/")[-1] in _NON_SERVER_FILES:
+            continue
         cat = _category_for(test["nodeid"])
         outcome = test.get("outcome", "unknown")
         # ``pytest-subtests`` reports the parent test with outcome
@@ -87,12 +111,21 @@ def render(raw: dict, out_path: Path) -> None:
     grand_ran = totals["passed"] + totals["failed"] + totals["errored"]
     grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
 
-    # Top failures for triage.
-    fails = [t for t in raw.get("tests", []) if t.get("outcome") in ("failed", "error")]
+    # Top failures for triage (same non-server exclusion as the counts
+    # above, so the triage list matches the headline).
+    fails = [
+        t
+        for t in raw.get("tests", [])
+        if t.get("outcome") in ("failed", "error")
+        and t["nodeid"].split("::")[0].split("/")[-1] not in _NON_SERVER_FILES
+    ]
     fails.sort(key=lambda t: t["nodeid"])
 
+    rust = server == "rust"
     md: list[str] = []
-    md.append("# pymongo Validation Report")
+    md.append(
+        "# pymongo Validation Report (Rust server)" if rust else "# pymongo Validation Report"
+    )
     md.append("")
     md.append(
         f"Generated {dt.date.today().isoformat()} — SecantusDB "
@@ -100,11 +133,21 @@ def render(raw: dict, out_path: Path) -> None:
         f" (`vendor/pymongo-tests/`)."
     )
     md.append("")
-    md.append(
-        "Run `uv run python -m invoke validate` to refresh. The pass rate is the "
-        "best honest measure of how close SecantusDB is to a complete MongoDB "
-        "surrogate for the in-scope wire-protocol surface; gaps are the to-do list."
-    )
+    if rust:
+        md.append(
+            "Run `uv run python -m invoke validate --server rust` to refresh. "
+            "This is the R8 conformance gate from `tasks/rust-server-plan.md`: "
+            "the same unmodified pymongo suite the headline gauge runs, pointed "
+            "at the **Rust server** instead of the pure-Python one. The gap "
+            "between this pass rate and `docs/validation-report.md` is the "
+            "Rust server's remaining to-do list."
+        )
+    else:
+        md.append(
+            "Run `uv run python -m invoke validate` to refresh. The pass rate is the "
+            "best honest measure of how close SecantusDB is to a complete MongoDB "
+            "surrogate for the in-scope wire-protocol surface; gaps are the to-do list."
+        )
     md.append("")
     md.append("## Summary by category")
     md.append("")
@@ -134,13 +177,24 @@ def render(raw: dict, out_path: Path) -> None:
 
     md.append("## How this is generated")
     md.append("")
+    if rust:
+        server_clause = (
+            "starts an embedded Rust server (`_secantus_server.RustServer("
+            "storage_path=<fresh tempdir>, port=0)` — the in-process Rust "
+            "accept loop over the pure-Rust engines and WiredTiger-backed "
+            "storage; Python is only the launcher)"
+        )
+    else:
+        server_clause = (
+            "starts an embedded `SecantusDBServer(host='127.0.0.1', port=0, "
+            "storage_path=<fresh tempdir>)`"
+        )
     md.append(
         "**pymongo's tests are run unmodified.** The submodule at "
         "`vendor/pymongo-tests/` is checked out at the pinned upstream tag with "
         "zero local edits — `git diff HEAD` inside the submodule is empty. The "
         "integration is entirely external: `pymongo_validation/plugin.py` "
-        "starts an embedded `SecantusDBServer(host='127.0.0.1', port=0, "
-        "storage_path=<fresh tempdir>)` (real on-disk WiredTiger via "
+        f"{server_clause} (real on-disk WiredTiger via "
         "`tempfile.mkdtemp(prefix='secantus-pymongo-gauge-')`, not "
         "`:memory:`) in `pytest_configure` and writes the bound "
         "host/port into `DB_IP` + `DB_PORT` — the env vars pymongo's own "
@@ -166,9 +220,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("raw_json", type=Path)
     parser.add_argument("output_md", type=Path)
+    parser.add_argument(
+        "--server",
+        choices=["python", "rust"],
+        default="python",
+        help="Which SecantusDB server the gauge ran against (adjusts the report prose).",
+    )
     args = parser.parse_args()
     raw = json.loads(args.raw_json.read_text())
-    render(raw, args.output_md)
+    render(raw, args.output_md, server=args.server)
     return 0
 
 

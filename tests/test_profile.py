@@ -138,3 +138,20 @@ def test_profile_entry_shape_is_mongod_faithful(client: MongoClient) -> None:
         assert field in e, f"missing {field} in profile entry: {e}"
     assert e["ns"].startswith("shape.")
     assert isinstance(e["millis"], int)
+
+
+def test_profile_distinct_and_count_record_as_command_op(client: MongoClient) -> None:
+    """mongod's profiler buckets ``distinct`` / ``count`` under ``op:
+    "command"`` (only ``find`` is ``op: "query"``). A ``system.profile``
+    query filtering on ``{op: "command", "command.distinct": ...}`` must
+    find the entry — the shape pymongo's test_cursor.test_comment asserts."""
+    db = client["opbucket"]
+    db.command("profile", 2)
+    db["c"].insert_many([{"type": "a"}, {"type": "b"}])
+    db["c"].distinct("type")
+    db["c"].count_documents({})
+
+    assert db["system.profile"].count_documents({"op": "command", "command.distinct": "c"}) == 1
+    # count_documents goes through aggregate; the legacy `count` command
+    # also buckets to "command". Assert distinct landed as command, not query.
+    assert db["system.profile"].count_documents({"command.distinct": "c", "op": "query"}) == 0

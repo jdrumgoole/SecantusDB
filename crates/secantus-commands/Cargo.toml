@@ -1,0 +1,39 @@
+[package]
+name = "secantus-commands"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "Pure-Rust command dispatch for the SecantusDB Rust server: the dispatch table, the error contract, and command handlers (handshake family in this slice)."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+# Part of the Rust-server build-out (tasks/rust-server-plan.md, R2). Not released
+# to crates.io yet — flips to publish with the standalone server.
+publish = false
+
+# Pure Rust, no PyO3. Handlers take a decoded request `Document` and return a
+# reply `Document` (or a typed `CommandError`); the wire framing (R1) and socket
+# I/O (R4) live in sibling crates. The byte seam keeps *stored* documents as
+# bytes through the engines; the small command envelope is decoded once here, as
+# `commands.py` decodes the OP_MSG body to a dict.
+[lib]
+name = "secantus_commands"
+crate-type = ["rlib"]
+
+[dependencies]
+bson = { workspace = true }
+secantus-wire = { path = "../secantus-wire" }
+# The pure-Rust operator engines — `find` applies projections via
+# `secantus_core::projection`. Pure Rust, no WT, already in the workspace.
+secantus-core = { path = "../secantus-core" }
+# SCRAM-SHA-256 mechanism (R5) for the saslStart / saslContinue handlers.
+secantus-auth = { path = "../secantus-auth" }
+# Cryptographically-unpredictable cursor ids (the registry mints 63-bit random
+# ids so another connection can't enumerate / hijack cursors by guessing).
+rand = "0.9"
+
+# Test-only: the auth-family unit tests drive a SCRAM-SHA-256 *client* to prove
+# the server handshake round-trips end-to-end (same primitives as secantus-auth).
+[dev-dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+base64 = "0.22"

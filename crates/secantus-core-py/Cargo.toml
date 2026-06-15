@@ -1,0 +1,20 @@
+[package]
+name = "secantus-core-py"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "PyO3 bindings for secantus-core: builds the `_secantus_core` abi3 extension (the SecantusDB `secantus-core` Python wheel)."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+publish = false
+
+# cdylib -> the Python extension module. The pure engines live in `secantus-core`
+# (path dependency below); this crate is only the byte-seam marshalling + PyO3
+# glue, so it stays thin and the engines stay reusable without PyO3.
+[lib]
+name = "_secantus_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+bson = { workspace = true }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+secantus-core = { path = "../secantus-core" }

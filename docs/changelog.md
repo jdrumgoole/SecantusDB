@@ -19,8 +19,1653 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-(No entries yet — the next release will be cut from work landing on
-`main` after v0.5.1b24.)
+## [0.5.3b7] — 2026-06-15
+
+### `$exists: true` rides a sparse index instead of scanning the collection
+
+A query of the form `{field: {$exists: true}}` now uses a sparse single-field
+index on `field` when one exists, instead of falling back to a full collection
+scan. A sparse index holds an entry for exactly the documents where the field is
+present — missing-field documents are omitted, present-but-`null` and array
+values keep an entry — so the complete set of index entries *is* the
+`$exists: true` match set. The planner walks the whole index (no value bound),
+and `explain` reports `IXSCAN` accordingly. A non-sparse index still can't serve
+`$exists: true` (it has an entry per document, including the absent ones), and
+`$exists: false` never uses a sparse index — both correctly stay on `COLLSCAN`.
+Results were always correct; this is the missing fast path.
+
+#### Added
+
+- `{field: {$exists: true}}` uses a sparse single-field index (IXSCAN) when one
+  is present, via `Storage._sparse_index_for_exists` + `_all_id_keys_for_index`,
+  mirrored in `explain_plan`. Non-sparse indexes and `$exists: false` stay on
+  COLLSCAN.
+
+#### Fixed
+
+- The three pymongo DBRef-spec tests (`test_dbref.py::TestDBRefSpec`) are now
+  deselected from the gauge. They are pure client-side BSON codec tests that
+  never exercise SecantusDB; they pass under plain unittest but crash the
+  gauge's `-n1` xdist worker because execnet can't pickle the `ObjectId` in
+  their `subTest` params (`DumpError`). Deselecting them keeps the gauge run
+  clean and stops three spurious failures from being attributed to the server.
+
+### Fixed a shutdown race that could crash the server process
+
+Stopping a `SecantusDBServer` now drains its in-flight per-connection threads
+before tearing down WiredTiger. Previously `stop()` joined only the accept
+thread and then closed the storage engine — so a connection handler still
+mid-WiredTiger-operation (e.g. a change-stream tailable `getMore` reading the
+oplog) had its WT connection freed underneath it: a use-after-free that surfaced
+as an intermittent native crash (the pytest-xdist worker death seen near the end
+of the full suite under churn). `stop()` now closes every connection socket to
+unblock reads, wakes any tailable `getMore` parked on the oplog condition
+variable, and waits for the active-connection count to reach zero before calling
+`storage.close()`. A 200-iteration stress that reliably tripped the use-after-
+close now runs clean.
+
+Waking those parked reads is platform-specific, and the first cut got it wrong
+on both ends. On POSIX, `shutdown(SHUT_RDWR)` wakes a `recv` blocked in another
+thread while leaving the descriptor valid; calling `close()` from the stopping
+thread instead does *not* wake the parked `recv` and frees the fd number for
+immediate reuse, leaving the handler blocked forever on a recycled descriptor —
+so the drain barrier timed out. On Windows the opposite holds: `shutdown` does
+not interrupt an already-blocked `recv`, so `closesocket` is required. The wake
+is now `shutdown`-only on POSIX and `shutdown`-then-`close` on Windows. The drain
+barrier also re-runs the socket wake on every poll, not just once up front: the
+accept thread bumps the active-connection count and spawns the handler *before*
+the handler registers its socket, so a connection accepted in the instant before
+`stop()` could register after the initial sweep and never be woken — re-sweeping
+catches it within milliseconds.
+
+#### Fixed
+
+- `SecantusDBServer.stop()` drains in-flight connection threads before closing
+  WiredTiger (via `ConnectionRegistry.close_all` + `Storage.signal_shutdown` +
+  an active-connection drain barrier), eliminating a use-after-free / native
+  crash on teardown under load.
+- The stop-time socket wake is now platform-correct: `shutdown`-only on POSIX
+  (closing the fd from another thread left handlers blocked on a recycled
+  descriptor and timed out the drain), `shutdown`+`close` on Windows (where
+  `shutdown` alone doesn't interrupt a blocked `recv`). The drain barrier
+  re-sweeps each poll so a connection that registers its socket just after
+  `stop()` begins is still woken.
+
+### Tailable cursors over `local.oplog.rs`
+
+A client can now tail the oplog the way replication does: `local.oplog.rs`
+accepts `TAILABLE_AWAIT` find cursors and streams oplog entries as they're
+written. Two pieces landed for this — the synthetic oplog view is now reported
+as a capped collection by `collection_is_capped` (so a tailable cursor isn't
+rejected), and a dedicated oplog tailable producer reads new entries by oplog
+seq (oplog documents have no `_id`, so the ordinary capped-collection tail path
+doesn't apply). `find().sort("$natural", ...)` is honoured against the view —
+the oplog's only meaningful order.
+
+To match mongod — whose oplog is never empty (its first entry is the replica
+set's "initiating set" noop) — a freshly-started server now seeds one bootstrap
+noop into the oplog, so a client can tail `local.oplog.rs` before any user
+write. The seed is an `op: "n"` entry (skipped by change-stream projection, so
+it never surfaces as a change event) and only fires on a truly fresh oplog.
+Closes the pymongo gauge's `test_cursor.test_to_list_tailable`.
+
+#### Added
+
+- `TAILABLE_AWAIT` find over `local.oplog.rs` (via `_find_tailable_oplog`), and
+  `$natural` sort on the oplog view.
+- A bootstrap oplog noop seeded at server start (`Storage.ensure_oplog_bootstrap`)
+  so `local.oplog.rs` is never empty, matching mongod.
+
+### The Python server is pure Python — no Rust dependency — and preserves numeric types
+
+The `secantus` package no longer imports or calls any Rust component. The
+original in-process engine-swap — where each operator module could delegate to
+the optional `_secantus_core` extension under `SECANTUS_ENGINE=rust` — has been
+retired in favour of the two-separate-servers model: the Python server is the
+pure-Python implementation, end to end, and the Rust engines live only in the
+standalone Rust server (and in the parity-oracle test suites, which import the
+extension directly rather than through this package). `secantus.engine` remains
+as an inert compatibility stub so `SecantusDBServer(engine=...)` keeps working.
+
+Decoupling the engines let the Python operator engines adopt MongoDB's numeric
+type promotion (int32 < int64 < double < decimal128) without being pinned to a
+not-yet-updated Rust port. `$inc`, `$mul`, and the `$sum` accumulator now
+preserve the BSON numeric type of their result — `Int64(5)` incremented by `3`
+stays `Int64(8)` instead of narrowing to int32 on the wire — so a client codec
+that keys on the BSON 64-bit type round-trips correctly. This closes the pymongo
+gauge's `test_custom_types` aggregate/findAndModify decoder cases.
+
+#### Changed
+
+- `secantus` is now pure Python with no Rust import in the request path; the
+  `SECANTUS_ENGINE` in-process accelerator is retired (the Rust engines moved to
+  the standalone Rust server). `secantus.engine.available()` / `enabled()`
+  always report Python.
+
+#### Fixed
+
+- `$inc` / `$mul` / `$sum` preserve the BSON numeric type per mongod's promotion
+  rules (int32 < int64 < double < decimal128) via the new `secantus.numerics`
+  helpers, instead of narrowing 64-bit results to int32.
+
+### `find` honours `returnKey` and `showRecordId`
+
+`find` now supports the `returnKey` and `showRecordId` cursor options. With
+`returnKey: true` each result is reduced to just the keys of the index that
+serves the query — the index's key-pattern fields plus the sort fields (a sort
+by `_id`, served by the document table's natural order, yields `{_id: <value>}`).
+With `showRecordId: true` each document is tagged with a `$recordId`; when
+`returnKey` is also set, `showRecordId` adds nothing, matching `mongod`. Closes
+the pymongo gauge's command-monitoring `find with showRecordId and returnKey`.
+
+#### Added
+
+- `returnKey` (project results down to the serving index's key fields) and
+  `showRecordId` (`$recordId` tag) options on the `find` command.
+
+### `createIndexes` accepts and ignores the deprecated `dropDups` option
+
+`dropDups` was removed in MongoDB 3.0, but modern `mongod` still accepts it on
+the wire and silently ignores it rather than rejecting the index spec. SecantusDB
+now matches that: passing `dropDups` no longer trips the unknown-field guard.
+The practical upshot is that building a `unique` index over data that already
+contains a duplicate fails on the duplicate with `DuplicateKey` (11000) — a
+`DuplicateKeyError` to the driver — exactly as a real server does, instead of an
+unrelated "unknown field" error. The collection is left untouched and no index is
+created. Closes the pymongo gauge's `test_collection.test_index_dont_drop_dups`.
+
+#### Changed
+
+- `createIndexes` accepts `dropDups` and strips it from the stored index
+  options (deprecated, ignored — never drops duplicates).
+
+### Partial indexes serve range-on-indexed-field queries with a residual clause
+
+A query that puts a range on a partial index's indexed field and an extra
+clause that the index's partial filter absorbs now uses the index — e.g.
+`find({x: {$gt: 1}, a: 1})` against an index on `x` with
+`partialFilterExpression: {a: {$lte: 1.5}}`. The `x` range rides the index,
+the `a: 1` clause is implied by the partial filter (so the index's existence
+already guarantees it) and is rechecked by the exact post-scan matcher, and
+`explain` reports `IXSCAN` with `isPartial: true`. Previously any multi-field
+filter fell off the single-field index path to a COLLSCAN.
+
+The relaxation is deliberately conservative: only *partial* indexes get this
+treatment, and only when every residual field is a partial-filter field, so a
+non-partial residual still keeps the query on a collection scan. This closes
+the last open assertion in the pymongo gauge's `test_collection.test_index_filter`.
+
+#### Changed
+
+- The single-field index lookup and its `explain` mirror now accept a
+  multi-field filter when the non-indexed fields are absorbed by an implied
+  partial filter, via a shared `_single_field_partial_residual_match` selector.
+
+### Tailable cursors die on capped-collection rollover
+
+A tailable cursor over a capped collection now dies with `CappedPositionLost`
+when the collection rolls over and evicts the document the cursor was anchored
+on — exactly as `mongod` does. Before, the cursor would blithely keep
+streaming the post-rollover documents instead of recognising it had been
+lapped. The server detects this by comparing the cursor's last-returned
+position against the collection's current oldest document; if the anchor has
+been evicted it returns error 136, which `pymongo` swallows for tailable
+cursors (the cursor reports `alive == False` and the in-flight read yields
+nothing). Closes the pymongo gauge's `test_cursor.test_tailable`.
+
+#### Fixed
+
+- Tailable cursors on capped collections now surface `CappedPositionLost`
+  (code 136) when rollover evicts their anchor document, instead of
+  continuing to stream the rolled-over documents.
+
+### Change streams report create, modify, and richer DDL events
+
+Change streams opened with `showExpandedEvents: true` now surface the full
+set of expanded DDL events that `mongod` 6.0+ emits. A `createCollection`
+(including views) produces a `create` event, a `collMod` produces a
+`modify` event, and `rename` events carry an `operationDescription` with
+the destination namespace and the dropped target's UUID under
+`dropTarget`. CRUD events (insert / update / delete / replace) on an
+expanded stream also carry the watched collection's `collectionUUID`, the
+way a real server tags them.
+
+Previously only `createIndexes` / `dropIndexes` were emitted as expanded
+events; `create` and `modify` had no oplog entry at all, so a stream
+waiting for them blocked indefinitely. This completes the
+`showExpandedEvents` spec surface that single-node SecantusDB can support
+(sharding-only events like `shardCollection` remain out of scope), taking
+the pymongo change-stream gauge from 102 to 106 passing — a clean sweep of
+`test_change_stream.py`.
+
+#### Added
+
+- `create` (createCollection / views) and `modify` (collMod) change-stream
+  events under `showExpandedEvents`, both gated off by default like the
+  other expanded events.
+- `operationDescription.{to,dropTarget}` on expanded `rename` events, and
+  `collectionUUID` on expanded CRUD events.
+
+### Resumed change streams return their backlog on open
+
+Opening a change stream with `resumeAfter`, `startAfter`, or
+`startAtOperationTime` now returns the already-committed backlog — the
+events between the resume point and now — in the aggregate's `firstBatch`,
+exactly as `mongod` does. Previously every change-stream open returned an
+empty `firstBatch` and deferred all events to the first `getMore`. That
+was invisible to most consumers, but a driver that inspects the cursor
+for buffered data *before* issuing any `getMore` (pymongo's
+`CommandCursor._has_next()`, which never sends one itself) saw nothing
+and reported the stream as empty.
+
+A fresh tail watch has no backlog, so it still opens with an empty
+`firstBatch` — the change is scoped to the resuming forms. And because a
+non-empty `firstBatch` means pymongo doesn't overwrite its cached resume
+token from the open response, an uniterated resumed stream now correctly
+reports `resume_token` equal to the token the caller passed in. Closes
+the pymongo gauge's `test_resumetoken_uniterated_nonempty_batch_*`
+(change-streams prose test #14), lifting the change-stream gauge from
+100 to 102 passing.
+
+#### Fixed
+
+- Resumed change-stream opens (`resumeAfter` / `startAfter` /
+  `startAtOperationTime`) return their committed backlog in `firstBatch`
+  instead of deferring every event to the first `getMore`, so a driver
+  that checks for buffered data before any `getMore` sees the events and
+  an uniterated resumed stream reports the correct `resume_token`.
+
+### Profiler op-class for `distinct` and `count`
+
+`system.profile` entries for `distinct` and `count` are now recorded
+under `op: "command"`, matching `mongod` — where only `find` carries
+`op: "query"`. The previous bucketing filed both under `op: "query"`, so
+a profile query like `{op: "command", "command.distinct": "<coll>"}`
+found nothing. Monitoring tooling that slices the profiler by operation
+class now sees the same shape it would against a real server.
+
+This closes the pymongo gauge's `test_cursor.test_comment`. The OP_MSG
+exhaust-cursor mid-stream-fault hardening shipped earlier this cycle
+also gained a dedicated regression test (a synthetic mid-stream
+`getMore` fault must terminate the stream with a `moreToCome`-clear
+reply, never drop the connection).
+
+#### Fixed
+
+- `distinct` / `count` profiler entries use `op: "command"` (were
+  `op: "query"`), so `system.profile` queries that filter by operation
+  class find them.
+
+### OP_MSG exhaust cursors
+
+Exhaust cursors (`CursorType.EXHAUST`) now stream over the wire the way
+a real `mongod` does. When a driver sets the OP_MSG `exhaustAllowed`
+flag on a `getMore`, SecantusDB streams every remaining batch back over
+the same socket using the `moreToCome` flag — one round trip instead of
+a `getMore` per batch — and closes the stream with a trailing empty
+reply carrying `id: 0`. That trailing empty batch is what makes a real
+server keep the cursor alive until the client has drained it; pinning it
+faithfully is why pymongo's command monitor sees `find, getMore,
+getMore, getMore` for three documents at `batchSize: 1`, and why
+exhaust-pinned connections return to the pool at exactly the right
+moment.
+
+This closes the last wire-protocol gap behind the pymongo gauge's
+`test_exhaust` / `test_exhaust_cursor_db_set` cases. The streaming is
+driven entirely in the connection loop (`SecantusDBServer._stream_exhaust_getmore`)
+off the existing cursor registry, so no operator engine or storage path
+changed; `find` / `aggregate` replies that open a cursor are still sent
+as a single message (mongod streams only on `getMore`).
+
+#### Added
+
+- OP_MSG exhaust-cursor streaming: a `getMore` with the `exhaustAllowed`
+  flag streams all remaining batches with `moreToCome`, ending in a
+  trailing empty `id: 0` reply (mongod parity). Tailable / awaitData
+  cursors that yield nothing fall back to ordinary `getMore` rather than
+  spin the stream. A mid-stream getMore that raises unexpectedly still
+  terminates the stream with a `moreToCome`-clear reply, so the client
+  never sees "Server ended moreToCome unexpectedly".
+
+### Parse-time update validation, partial-index range implication
+
+`update` now rejects an unknown modifier (`$thismodifierdoesntexist`) at
+parse time with code 9, even against an empty collection — matching
+mongod, which validates the update before matching any document (the
+per-document apply path would never see an unmatched update).
+`createIndexes` rejects a malformed `partialFilterExpression` (a
+non-document, an unknown operator, a logical operator with a non-array
+argument). And a partial index whose filter uses a range operator
+(`{a: {$lte: 1.5}}`) is now used when the query provably implies it (an
+equality `a: 1`, or `a: {$lt: 1}`) — a sound, conservative range
+implication that errs to a full scan rather than risk missing
+documents; `explain` flags such a scan with `isPartial`.
+
+#### Added
+
+- Sound range implication for partial indexes (`$eq`/`$lt`/`$lte`/`$gt`/
+  `$gte`), with `isPartial` in the explain IXSCAN stage.
+
+#### Fixed
+
+- `update` rejects an unknown modifier at parse time (code 9), even on
+  an empty collection.
+- `createIndexes` rejects a malformed `partialFilterExpression`.
+
+### Upsert subdocument _id, and idempotent drop with write concern
+
+Two real correctness fixes. An upsert whose filter pins `_id` to a
+subdocument value (`{_id: {f: ..., f2: ...}}`) now seeds that `_id`
+into the inserted document instead of generating a fresh ObjectId —
+the seed extraction was skipping every dict-valued filter field to
+avoid copying operator expressions (`{$gt: 5}`), but a literal
+subdocument is a real equality and must be kept. And `drop` of a
+non-existent collection now returns `{ok: 1}` (idempotent, as modern
+mongod does) rather than `NamespaceNotFound`, which also lets an
+unsatisfiable write concern surface its `writeConcernError` on the
+reply.
+
+#### Fixed
+
+- Upsert seeds a subdocument `_id` from the filter (operator
+  expressions are still correctly excluded).
+- `drop` of a non-existent collection is idempotent (`{ok: 1}`) and
+  honours an unsatisfiable write concern.
+
+### Cursor min() / max() index bounds
+
+The find command's `min` / `max` cursor options are now honoured: they
+bound a hinted index scan, with `max` an exclusive upper bound and
+`min` an inclusive lower bound on the index key (mongod semantics).
+Bounds and documents are compared with the same direction-aware
+byte-sortable key encoder the indexes use, so cross-type ordering and
+per-field direction are correct. A bound whose field order doesn't
+match the hinted index's key pattern is rejected with mongod's 51174.
+
+#### Added
+
+- Cursor `min` / `max` index-bound options on `find` (oracle-pinned
+  against mongod; 51174 on a key-pattern mismatch).
+- **Rust server:** change streams (R3b-a) — `aggregate` with a leading
+  `$changeStream` now opens a tailable oplog cursor instead of
+  rejecting, and tailable `getMore` projects insert / update / replace /
+  delete events (with `documentKey`, `updateDescription`,
+  `updateLookup` `fullDocument`, pre-images, and a resume token under
+  `_id`). The projector runs behind a new WT-free `Storage` trait seam
+  (`change_stream_poll` / `wait_for_oplog` / oplog accessors) so the
+  command crate stays WiredTiger-free. Measured **+58** on the R8
+  rust-server gauge (936 → 994 of 1713, zero regressions; 52 are
+  `test_change_stream.py`). `awaitData` blocking, resume tokens, and
+  invalidation cursor-close land in R3b-b.
+
+### Clustered collections
+
+The `clusteredIndex` create option is now supported. mongod uses it to
+make `_id` the collection's clustering key — which is exactly
+SecantusDB's WiredTiger layout already (the document table is keyed by
+`_id`), so this is a metadata-and-reporting feature: the option is
+validated at `create` (only `{_id: 1}` with `unique: true`, mongod's
+two rejection codes), echoed in `listCollections.options.clusteredIndex`
+with its `v` and defaulted name, and reported by `listIndexes` as a
+single entry carrying `clustered: true` (a clustered collection has no
+separate `_id_` index). Secondary indexes coexist normally.
+
+#### Added
+
+- `clusteredIndex` create option (`create` / `listCollections` /
+  `listIndexes`), oracle-pinned against mongod.
+
+### Matcher correctness, the validate command, and upsert _id fidelity
+
+Continuing the honest-gauge triage, this slice fixes two genuine
+correctness bugs the gauge surfaced. Embedded-document equality is now
+field-order-sensitive and exact, recursively — `{size: {h: 14, w: 21}}`
+matches a document only when `size` is exactly that, in that key order
+(a documented mongod gotcha that Python's order-insensitive `dict ==`
+got wrong). And an upsert whose resulting `_id` is `None` now reports
+`did_upsert` correctly: `None` was doubling as the "no upsert"
+sentinel, so a legitimate `{_id: null}` upsert looked like a no-op to
+the driver.
+
+The `validate` command is implemented — a clean, mongod-shaped
+consistency report (real record and index counts; SecantusDB's
+WiredTiger-backed storage has nothing to repair), including mongod's
+rejection of `full` + `background` together.
+
+#### Added
+
+- `validate` command (collection consistency check; `full`/`background`/
+  `scandata` options, full+background rejected with InvalidOptions).
+
+#### Fixed
+
+- Embedded-document equality is order-sensitive and exact, recursively,
+  with numeric-bridged leaves (matcher correctness; both query engines —
+  the Rust core already deferred Document/Array equality to Python).
+- Upsert with a `None` `_id` reports `did_upsert` and the upserted `_id`
+  correctly (update and findAndModify paths).
+- **Rust server:** cluster-time gossip — the Rust server now attaches
+  `$clusterTime` (keyless signature) and `operationTime` to every reply
+  when the replica-set persona is on, matching mongod and the Python
+  server (shipped in 0.5.2b19). Reads observe the clock via the new
+  `secantus_storage::Storage::peek_cluster_time` without advancing it;
+  standalone mode stays gossip-free. Measured +6 on the R8 rust-server
+  gauge (930 → 936 of 1713, zero regressions): the `$clusterTime`-gossip,
+  causal-consistency, and transaction-commit tests that read
+  `operationTime`. Closes a documented Rust-server gap (backlog §7).
+
+
+### The honest-gauge triage: projection, size caps, snapshot reads, and change-stream fidelity
+
+The first honest pymongo-gauge run (94.8%) left a 64-failure triage list;
+this slice clears the bulk of it. Projection gained mongod's exact
+semantics for three long-standing divergences — `{_id: 1}`-only specs
+are inclusion projections, dotted paths fan out over arrays (with
+`{}`-skeleton preservation), and `$slice` interacts with explicit `_id`
+correctly — fixed in both the Python and Rust engines with the parity
+corpus extended to pin every oracle-checked case. Writes now enforce
+`maxBsonObjectSize` server-side with mongod's codes and wording (10334
+on insert and update-growth, 17420 on upsert).
+
+Snapshot sessions work end-to-end: `readConcern: {level: snapshot}` is
+accepted on find/aggregate/distinct (and their cursor continuations)
+under the replica-set persona, with `atClusterTime` stamped on replies
+for session pinning — and still rejected like a real standalone when
+the persona is off. The `$$NOW` system variable landed as part of the
+same path, seeded per-operation for every command's `let` scope.
+
+Change streams got the biggest batch: events that project out the
+resume token now fail with mongod's 280 `ChangeStreamFatalError` and
+the `NonResumableChangeStreamError` label instead of being silently
+swallowed; `fullDocument: required/whenAvailable` follow post-image
+semantics (error/null when `changeStreamPreAndPostImages` is off);
+`resumeAfter` rejects invalidate-event tokens (260) while `startAfter`
+accepts them; `readConcern: local` on `$changeStream` is rejected;
+unknown pipeline stages return mongod's 40324 at aggregate time;
+pipeline-form updates emit `update` events (with `truncatedArrays`)
+instead of `replace`; and `updateDescription.disambiguatedPaths` is
+computed for ambiguous numeric-string field names — in both engines,
+parity-pinned.
+
+#### Added
+
+- `$$NOW` aggregation system variable (constant per operation, all
+  command `let` scopes).
+- `updateDescription.disambiguatedPaths` on change-stream update
+  events (Python + Rust diff engines).
+- `atClusterTime` on snapshot-read replies (cursor and top-level).
+
+#### Fixed
+
+- Projection: `_id`-only inclusion, dotted-path array fan-out, dict
+  skeletons, `$slice`+`_id` interaction (both engines).
+- Server-side `maxBsonObjectSize` enforcement (10334 / 17420).
+- Change streams: 280 + non-resumable label for projected-out resume
+  tokens, post-image semantics for required/whenAvailable, invalidate
+  tokens rejected by resumeAfter (260), local readConcern rejected,
+  40324 for unknown stages at create time, pipeline updates as diff
+  events, disambiguatedPaths.
+- `AggregateError` can carry mongod-specific codes (40324).
+
+
+### Real multi-document transactions
+
+`commitTransaction` and `abortTransaction` were the last true stubs in
+the Python server: they returned `{ok: 1}` while every operation
+"inside" a driver transaction took effect immediately and could never
+roll back. They're real now. Each transaction owns a dedicated
+WiredTiger session — not the connection thread's, because pymongo can
+legally send a transaction's statements and its retryable commit on
+different pooled connections — and every statement runs with that
+session swapped into the storage layer, so snapshot isolation,
+read-your-own-writes, and rollback all come straight from the same
+engine mongod uses. Oplog entries are buffered and flushed at commit
+with one shared commit timestamp plus `lsid`/`txnNumber`, so change
+streams never see uncommitted writes and transaction events carry
+their session identity, exactly as in mongod.
+
+The server-side state machine (`secantus.transactions`) pins the
+spec's resolution table: statements against unknown or aborted
+transactions get 251 `NoSuchTransaction` with the
+`TransientTransactionError` label, committed ones get 256, stale
+`txnNumber`s get 225 `TransactionTooOld`, commit is idempotent (driver
+commit retries depend on it), and any failed statement aborts the
+transaction server-side. Write-write conflicts between transactions
+surface as statement-time 112 `WriteConflict` + transient label;
+`count` inside a transaction gets mongod's 263
+`OperationNotSupportedInTransaction`. Transactions idle past 60s
+(`transaction_lifetime_seconds`) are reaped, `endSessions`/
+`killSessions` abort their session's transaction, and `readConcern:
+"snapshot"` is now accepted inside transactions (every in-transaction
+read runs against the pinned WT snapshot anyway).
+
+### The whole MongoDB CLI toolchain now runs against SecantusDB
+
+The MongoDB Database Tools are strict Go-driver clients, and two of
+them couldn't talk to SecantusDB at all: `mongostat` crashed with a Go
+nil-pointer panic because `serverStatus` had no `mem` section (the
+tool dereferences `mem.supported` unguarded), and `mongotop` failed
+outright because the `top` command didn't exist. Both work now —
+`serverStatus` reports a real resident-set size under `mem`, and `top`
+returns mongod's exact per-namespace shape (counters are zero pending
+per-namespace instrumentation; mongotop renders it like an idle
+server).
+
+Every connectable tool in the toolchain is pinned by an end-to-end
+test in the default suite: `mongosh`, `mongodump`/`mongorestore`,
+`mongoimport`/`mongoexport` (NDJSON + CSV, plus canonical-extended-JSON
+type fidelity for ObjectId / datetime / Decimal128 / Int64 / Binary),
+`bsondump`, `mongofiles` (GridFS put/get/list/delete against pymongo's
+gridfs), and single-iteration `mongostat` / `mongotop` probes. The
+Go tools also exposed two connection-lifecycle nits, now fixed: an
+RST-style hang-up (how Go's pool drops connections) no longer dumps a
+traceback through the catch-all handler, and a request racing
+`stop()`'s socket close no longer raises `OSError` reading the server
+address.
+
+Compass gets the same treatment, headlessly: every command the GUI
+issues — the connect-time instance probes, `$collStats` storage
+figures, `$sample` schema analysis, `$indexStats`, both explain
+verbosities, and the performance-tab polls — is pinned by tests. That
+sweep caught `explain`'s `executionStats` reporting hardcoded zeroes
+(Compass would render "0 documents returned" for any query); the
+server now really executes the query at `executionStats` verbosity,
+and aggregate-explain lifts a leading `$match` so it reports the same
+IXSCAN decision the real pipeline run uses.
+
+#### Added
+
+- Multi-document transactions: real `commitTransaction` /
+  `abortTransaction`, per-transaction WiredTiger sessions
+  (`Storage.begin/use/commit/abort_user_transaction`), the
+  `secantus.transactions.TransactionRegistry` state machine
+  (251/256/225/50911/263/112 + `TransientTransactionError` labels,
+  idempotent commit, implicit abort on a newer `txnNumber`, 60s
+  lifetime reaping via `SecantusDBServer(transaction_lifetime_seconds=…)`),
+  oplog buffering with a shared commit timestamp, and `lsid` /
+  `txnNumber` on change-stream events for transactional writes.
+  Conformance: `tests/test_transactions.py`,
+  `tests/test_transaction_registry.py`, `tests/test_storage_user_txn.py`;
+  divergence notes in backlog §3.4.
+- Cluster-time gossip: every command reply in replica-set mode now
+  carries `$clusterTime` (unsigned-cluster placeholder signature, as
+  mongod without auth keys) and `operationTime`, via the non-minting
+  `Storage.peek_cluster_time()`. Drivers track these per session and
+  echo `readConcern.afterClusterTime` on causally consistent reads and
+  transaction starts — the wire shape the transactions /
+  causal-consistency unified specs assert.
+- `top` command — mongod-shaped per-namespace reply (`totals` with
+  `total`/`readLock`/`writeLock`/per-op `{time, count}` sections,
+  RBAC `top` action granted via `clusterMonitor`); counters are zero
+  (no per-namespace timing instrumentation yet, see backlog §2).
+- `serverStatus.mem` section (`bits`/`resident`/`virtual`/`supported`)
+  — `resident` is real (getrusage max-RSS).
+- CLI-tool conformance tests: `tests/test_mongoimport_export.py`,
+  `tests/test_mongofiles.py`, `tests/test_mongostat_mongotop.py`, and
+  a `bsondump` dump-format test in `tests/test_mongodump_restore.py`.
+- Compass headless coverage: `tests/test_compass_commands.py` pins the
+  full command surface MongoDB Compass issues (instance probes,
+  `$collStats`/`$sample`/`$indexStats`, explain at both verbosities,
+  performance-tab polls, `atlasVersion` → CommandNotFound).
+- `serverStatus` now carries a `secantus` subdocument
+  (`{server: "python"|"rust", version: ...}`) on both servers —
+  categorical self-identification that real `mongod` never has. The
+  conformance-gauge tripwire checks it over the wire before any test
+  runs, so the gauge can never again silently measure a foreign server.
+- Cluster-time gossip: every reply (success or error) now carries
+  `$clusterTime` (keyless signature) and `operationTime` when the
+  replica-set persona is on, exactly like a real replica-set mongod;
+  standalone mode stays gossip-free. Reads observe the cluster clock
+  via the new `Storage.peek_cluster_time()` without advancing it.
+  Clears the `startAtOperationTime` / causal-consistency bucket of the
+  honest pymongo gauge (Rust-server port tracked in backlog §7).
+
+#### Changed
+
+- CI: the Linux and macOS test cells install mongosh + MongoDB Database
+  Tools, so the CLI-tool conformance tests run continuously instead of
+  skipping on runners (Windows omitted — mongosh tests skip on win32 by
+  design).
+- CI: all `actions/*` workflow actions bumped to their Node-24 majors
+  (checkout v5, setup-python v6, upload-artifact v6, download-artifact
+  v7, cache v5, setup-go v6, setup-java v5, setup-node v5) ahead of
+  GitHub's June 16th 2026 forced Node 20 → 24 switch.
+
+#### Fixed
+
+- Arithmetic expressions (`$add` / `$subtract` / `$multiply` /
+  `$divide` / `$mod`) now raise mongod's type errors instead of
+  silently producing Python-flavoured results: non-numeric operands
+  error with mongod's exact messages and codes (verified against a
+  real mongod 8.2 oracle), `$divide`/`$mod` by zero error (codes 2 /
+  16610) instead of returning null, bool operands are rejected (BSON
+  arithmetic has no bool), `$add`/`$subtract` date semantics follow
+  mongod (date ± millis, date − date → long, two dates in `$add` →
+  16612), and Decimal128 operands widen the fold to decimal. The Rust
+  engine defers all error-shaped cases to Python (parity corpus
+  extended first; 536 parity tests green).
+- Timeseries collections no longer enforce `_id` uniqueness, matching
+  mongod (measurements are bucketed by time; `_id` is not a key there).
+  Doc-table keys for timeseries rows carry a uniqueness suffix so equal
+  `_id`s coexist; index entries point at the actual row key, updates and
+  deletes preserve it, and the `_id` point-lookup fast path falls back
+  to a collection scan for timeseries. Closes the last E11000 item from
+  the honest-gauge triage.
+- Aggregation-pipeline updates (`update_one(filter, [{"$set": ...}])`)
+  now project as `update` change-stream events with a computed
+  `updateDescription`, matching mongod. The replacement classifier
+  iterated the pipeline list (whose elements are stage documents, not
+  `$`-prefixed keys) and emitted a full-document oplog entry, so
+  pymongo's "Test array truncation" unified spec saw `replace`.
+- Stale WT read snapshots made the mutating scanners
+  (`drop_collection` / `drop_database` / `rename_collection` /
+  `drop_index` / `drop_all_indexes`, plus `index_sizes`) silently miss
+  rows committed by other connection threads — a pinned snapshot from
+  an earlier positioned cursor turned `drop` into a partial or complete
+  no-op, surfacing in the pymongo gauge as drop-then-reinsert E11000
+  duplicate-key errors. All six now refresh the session snapshot on
+  entry, the same discipline the public read paths already had.
+- `mongostat` no longer panics against SecantusDB (missing
+  `serverStatus.mem`); `mongotop` no longer fails with
+  `CommandNotFound`.
+- `explain` with `executionStats` / `allPlansExecution` verbosity now
+  really executes the query and reports actual `nReturned` /
+  `totalDocsExamined` / `totalKeysExamined` / `executionTimeMillis`
+  instead of hardcoded zeroes; aggregate-explain lifts a leading
+  `$match` into the reported plan, matching the real pipeline run's
+  index decision.
+- Abrupt client resets (RST close, routine for Go-driver tools) are
+  treated as normal disconnects instead of logging `unhandled error on
+  connection N` tracebacks.
+- Shutdown race: a request arriving while `stop()` closes the listen
+  socket no longer raises `OSError: Bad file descriptor` from the
+  address probe.
+- **The pymongo conformance gauge was not measuring SecantusDB.**
+  pymongo's test helpers freeze `DB_IP`/`DB_PORT` at conftest-import
+  time, before the gauge plugin's `pytest_configure` wrote them — so
+  local runs silently targeted whatever listened on `localhost:27017`
+  (a real `mongod`, which produced the previous "100.0%" headline) and
+  CI runs, with nothing on 27017, mass-skipped 1100+ tests. The plugin
+  now starts the embedded server in `pytest_load_initial_conftests`
+  (before any conftest import), aborts via tripwire if the helpers
+  captured the wrong address or the target lacks the `secantus`
+  marker, and the regenerated honest report shows the real number.
+- The weekly `validate.yml` aggregate never opened its report PR:
+  `upload-artifact@v4` strips the `docs/` parent from single-file
+  artifacts, so the staging glob matched nothing and untracked new
+  reports were invisible to `git diff`. Staging now fails loudly on an
+  empty match and `git add --intent-to-add`s new report files.
+- The gauge now runs under one xdist worker (`-n1`) with a 120s
+  per-test deadline, so a hung test is recorded as a crash and the run
+  continues, instead of pytest-timeout killing the whole process and
+  losing the JSON report.
+- Editable storage-engine rebuilds shipped stale Rust extensions: the
+  CMake custom command had no dependency on the crate sources, so once
+  the staged `.so` existed cargo never re-ran. The build now always
+  invokes cargo (its own dependency tracking decides freshness) and
+  stages with `copy_if_different`.
+
+## [0.5.2b15] — 2026-05-22
+
+### WT session leak fix unblocks the rust crud unified runner
+
+SecantusDB cached a WiredTiger session per connection thread in
+`threading.local()` but never released it when the thread died.
+Aggressive driver pools (mongo-rust-driver's spec runners are
+the canonical case) opened thousands of short-lived connections;
+once cumulative connections crossed WT's 1024-session pool limit,
+`hello` started failing mid-handshake with `WT_ERROR: out of
+sessions`, which downstream surfaced as a checkpoint stat-error
+on `WiredTigerHS.wt`. This release calls
+`Storage._reset_thread_session()` in `SecantusDBServer._handle_client`'s
+`finally` block, releasing the session/cursors on disconnect so
+the pool stays bounded by the live connection count.
+
+The fix also closes a small `aggregate` validation gap: `$out`
+and `$merge` under `readConcern: "linearizable"` now return
+`InvalidOptions (72)` to match mongod's invariant (the
+`aggregate-out-readConcern` unified spec asserts the rejection).
+
+Together these unblock `test::spec::crud::run_unified` in the
+rust gauge — ~80 subtests across find / insert / update / delete
+/ aggregate / countDocuments / distinct / findOne\* / replaceOne
+/ bypassDocumentValidation / collation / hints / comments / let
+bindings / readConcern levels / dots-and-dollars keys, running
+end-to-end in ~75s. Rust gauge moves from 100 → 101 filters
+passing.
+
+#### Fixed
+- WT session pool exhaustion under high connection churn: per-
+  connection-thread WT session is now released on disconnect
+  instead of leaking until the engine's 1024-session pool fills.
+- `aggregate` with `$out` / `$merge` under `readConcern:
+  "linearizable"` now errors with `InvalidOptions (72)` instead
+  of silently returning an empty array.
+
+#### Changed
+- Rust conformance gauge: `test::spec::crud::run_unified` is now
+  in the include list. `test::spec::collection_management::run_unified`
+  and `test::spec::sessions::run_unified` remain deferred for
+  separate gaps (time-series collections, snapshot read concern
+  under fake replica-set topology).
+
+## [0.5.2b14] — 2026-05-22
+
+### Change-stream split-event implementation: real `{fragment: N, of: M}`
+
+The `splitLargeChangeStreamEvents` opt-in previously stamped every
+event with `{fragment: 1, of: 1}` regardless of size — correct from
+the driver's reassembly perspective for events under 16 MB, but
+wrong for events that genuinely exceed the BSON wire limit (the
+typical case being an `update` with `fullDocumentBeforeChange:
+required` where the pre-image plus a large `$set` value together
+push the projected event past 16 MB).
+
+This slice ships real splitting. When an event's BSON-encoded size
+exceeds 16 MB, `stamp_split_event` distributes any top-level field
+larger than 1 MB into its own fragment; light metadata (resume
+token, operationType, clusterTime, ns, documentKey, wallTime, …)
+is copied verbatim into every fragment so each is a valid change
+event the driver can process independently. Fragments share the
+same `_id` resume token; drivers reassemble by combining fields
+across fragments with matching `_id`. The split is size-based, not
+field-name-based: any heavy field qualifies (in practice
+`fullDocument`, `fullDocumentBeforeChange`, and
+`updateDescription.updatedFields` are the candidates).
+
+Two opt-in paths now both light up the producer flag: the original
+`$changeStream: {splitLargeChangeStreamEvents: true}` spec field
+plus the pipeline-stage form `[{$changeStreamSplitLargeEvent: {}}]`
+that the rust / node / java drivers use from their high-level
+`watch()` APIs. Either signals to the producer that fragmentation
+should run.
+
+mongo-rust-driver's `test::change_stream::split_large_event` —
+which constructs a 10 MB pre-image + 10 MB update value and
+asserts `events[0].splitEvent == {fragment: 1, of: 2}` and
+`events[1].splitEvent == {fragment: 2, of: 2}` — now passes end-
+to-end. The rust gauge moves from 92 → 93 (still 100%).
+
+#### Added
+
+- `src/secantus/aggregate.py`: `$changeStreamSplitLargeEvent`
+  registered in `_STAGES` as a pass-through marker. The stage
+  itself is a no-op in the pipeline (real splitting happens
+  upstream at event-projection time); accepted spec is `{}`.
+- `src/secantus/changestreams.py`:
+  - `_HEAVY_FIELD_BYTES = 1 MB` and `_SPLIT_THRESHOLD_BYTES = 16 MB`.
+  - `stamp_split_event(event) -> list[dict]` rewritten to compute
+    the event's BSON size, identify heavy top-level fields by
+    per-field encoding, and emit one fragment per heavy field
+    with light metadata duplicated. Returns one event (no split)
+    when the original is under 16 MB.
+- `src/secantus/commands.py`: change-stream aggregate handler
+  detects the `$changeStreamSplitLargeEvent` pipeline stage and
+  sets `cs_spec.split_large_events = True` so the producer
+  fragments on that opt-in path too. Producer call sites
+  changed from `events.append(stamp_split_event(ev))` to
+  `events.extend(stamp_split_event(ev))`.
+- `tests/test_change_stream_split_stage.py` (5 tests):
+  pipeline parses cleanly; bad-spec rejected standalone; stage
+  works outside change-stream context (no-op pass-through);
+  10 MB pre-image + 10 MB `$set` value produces two fragments
+  with correct `{fragment: N, of: 2}` envelopes and shared
+  resume token, heavy fields distributed one per fragment;
+  small event with opt-in still produces single
+  `{fragment: 1, of: 1}` fragment.
+
+#### Changed
+
+- `rust_validation/include_paths.py` adds
+  `test::change_stream::split_large_event` to `INCLUDE` (rust
+  gauge 92 → 93). The previous EXCLUDED entry's rationale is
+  removed.
+
+### Point lookups by `_id` stop scanning the whole collection
+
+Every MongoDB collection has an `_id` index, and looking a document up
+by its `_id` is the single most common read an application makes. In
+SecantusDB that lookup was quietly walking the entire collection: the
+`_id_` index is virtual — the documents table is itself keyed by the
+encoded `_id`, so there's no separate entries table for it — and the
+query planner's index pickers only ever consulted the stored secondary
+indexes. With nothing matching `_id`, every `find({_id: …})` fell back
+to a COLLSCAN that got linearly slower as the collection grew.
+
+`find`, `findOne`, `updateOne`, and `deleteOne` filtered on `_id` now
+take a direct primary-key point lookup on the documents table instead.
+On a 5,000-document collection that turns a 45 ms read into a 0.6 ms
+read — about 74× faster — and the gap widens with collection size.
+`explain` reports the lookup honestly as an `IXSCAN` on the `_id_`
+index. Equality (`{_id: x}`), `{_id: {$eq: x}}`, and `{_id: {$in: […]}}`
+are all accelerated; range, regex, and multi-field filters keep their
+existing routing. The cross-numeric `_id` collision (`1 == 1.0 ==
+Decimal128("1")`) is preserved because the fast path encodes the query
+value with the same `encode_value` used for the stored key.
+
+#### Fixed
+
+- `find` / `findAndModify` / single-document `update` / `delete`
+  filtered on `_id` equality (`{_id: v}`, `{_id: {$eq: v}}`,
+  `{_id: {$in: [...]}}`) now do an O(1) primary-key point lookup on the
+  documents table instead of a COLLSCAN, and `explain` reports `IXSCAN`
+  on the `_id_` index. Discovered with the new `bench/rw_harness.py`
+  concurrent read/write validator, whose interleaved `_id` read-backs
+  collapsed throughput on growing collections.
+
+## [0.5.2b7] — 2026-05-21
+
+### Rust driver gauge — 6th conformance gauge alongside the rest
+
+mongo-rust-driver is now the 6th driver gauge alongside pymongo / go
+/ node / java / ruby. The runner spawns SecantusDB on an ephemeral
+port and runs ``cargo test --lib -p mongodb`` against a curated
+include set with ``MONGODB_URI`` explicitly overridden in the
+subprocess env — the rust driver's fallback chain
+(``$MONGODB_URI`` → ``~/.mongodb_uri`` → ``localhost:27017``) is
+short-circuited at the first step so a stray ambient URI in the
+user's shell can't route the gauge at a real mongod. A
+belt-and-braces ``hello.setName == "secantus"`` probe at runner
+start adds a second layer of confirmation.
+
+Initial baseline: 12 curated handshake + single-collection CRUD
+filters expand to 24 actual test runs (libtest substring matching
+fans ``test::coll::find`` out across ``find_allow_disk_use`` etc.).
+The first cut surfaced two real conformance gaps; both fixed in the
+same release:
+
+* ``listDatabases`` now populates ``sizeOnDisk`` per database (sum
+  of bson-encoded doc bytes across the db's collections — same
+  accounting ``collStats`` / ``dbStats`` use). ``empty`` is derived
+  from the size (``size == 0``). ``totalSize`` reports the actual
+  sum across all dbs. Previously every entry carried a placeholder
+  ``sizeOnDisk: 0`` and ``empty: false``.
+* ``hello.client`` subdoc captured per connection in the registry
+  and surfaced back via ``currentOp`` as ``clientMetadata``. Drivers
+  use it to identify their own connections in admin tooling — they
+  send the subdoc on handshake and expect to read it back. Previously
+  we threw the subdoc away on hello and ``currentOp`` emitted no
+  ``clientMetadata`` field.
+
+After the fixes the rust gauge runs **24/24 (100%)**.
+
+#### Added
+
+- ``rust_validation/`` package — ``__init__.py`` /
+  ``include_paths.py`` / ``runner.py`` / ``generate_report.py``,
+  mirrors the ``ruby_validation/`` shape.
+- ``vendor/mongo-rust-driver`` submodule (7th vendored driver).
+- ``invoke validate-rust`` task; ``validate-all`` GAUGES extended
+  with the 6th entry.
+- ``.github/workflows/validate.yml`` matrix entry for rust;
+  toolchain via ``dtolnay/rust-toolchain@stable``; cargo cache key
+  on ``vendor/mongo-rust-driver/Cargo.lock``.
+- ``validation_summary`` integration — ``_collect_rust``,
+  ``PANEL_PROSE`` entry, stale "pending" marker removed.
+- ``docs/validation-report-rust.md`` (new) + toctree entry +
+  index.md prose update referencing all six drivers.
+- ``tests/test_list_databases_size.py`` (4 tests): populated db
+  has non-zero ``sizeOnDisk`` + ``empty: false``; ``totalSize``
+  sums per-db sizes; ``nameOnly`` skips the size walk; ``filter``
+  scopes against the full descriptor.
+- ``tests/test_hello_client_metadata.py`` (2 tests): pymongo's
+  driver / OS / appname metadata round-trips through hello →
+  currentOp; clientMetadata is a dict shape when present.
+
+#### Changed
+
+- ``commands._list_databases``: computes ``sizeOnDisk`` per db as
+  ``sum(collection_data_size(...) for coll in list_collections)``;
+  ``empty`` derived from size; ``totalSize`` is real.
+- ``commands._hello``: captures ``doc.get("client")`` and stashes
+  via ``ctx.connections.set_client_metadata(...)``.
+- ``commands._current_op``: emits ``clientMetadata`` on each
+  in-progress op when the connection's registry entry has it.
+- ``connreg.ConnInfo`` grows ``client_metadata: dict | None``;
+  ``ConnectionRegistry.set_client_metadata(conn_id, metadata)``
+  added; ``get()`` and ``snapshot()`` thread the new field
+  through their fresh-copy semantics.
+
+## [0.5.2b5] — 2026-05-21
+
+### `$setWindowFields` rank functions — `$rank` / `$denseRank` / `$documentNumber`
+
+Closes one of the explicit deferred surfaces from the b35
+`$setWindowFields` minimum-viable subset. Driver test suites probe
+all three regularly; the previous wire-level response was an
+explicit "rank functions and time-series operators are not yet
+implemented" `AggregateError`.
+
+The three functions share one linear walk per partition. They sit
+in `output: {<field>: {$rank: {}}}` alongside the accumulator
+functions but evaluate differently — no window argument (mongod
+rejects it), no function argument (the spec is just `{$rank: {}}`),
+and the value is computed once per partition slot rather than
+rolled up over a windowed subset.
+
+* `$documentNumber` — 1-indexed position within the partition.
+  Independent of ties; happy with or without `sortBy`.
+* `$rank` — 1-indexed position with **gaps** after ties: tied rows
+  share the lower rank, next non-tied row jumps by the number of
+  ties (`[10, 20, 20, 30]` → `[1, 2, 2, 4]`). Requires `sortBy`.
+* `$denseRank` — 1-indexed position **without gaps**: tied rows
+  share, next row is +1 (`[10, 20, 20, 30]` → `[1, 2, 2, 3]`).
+  Requires `sortBy`.
+
+Tie detection is sort-key tuple equality: compound `sortBy` specs
+work uniformly. Rank counters reset at every partition boundary,
+same as the accumulator functions.
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_RANK_FUNCS` frozenset; the
+  validation branch in `_stage_set_window_fields` recognises the
+  three rank ops, rejects `window` / non-empty arg, and requires
+  `sortBy` for `$rank` / `$denseRank`. The per-row loop branches:
+  rank functions look up a precomputed array, accumulators take
+  the existing windowed path.
+- `_compute_rank_state` helper does one linear walk over each
+  partition's sort-key tuples and emits per-slot vectors for
+  whichever of the three functions are referenced. `_sort_key_values`
+  extracts the tuple the tie comparison runs on.
+- `tests/test_window_rank_functions.py` (13 new tests) — covers
+  `$documentNumber` with and without sort, per-partition reset,
+  `$rank` gaps with ties, `$rank == $documentNumber` without ties,
+  compound sort tie detection, `$denseRank` no-gap semantics, all
+  three together in one stage, partition-resets, plus four
+  validation tests (window rejected, sortBy required for `$rank` /
+  `$denseRank`, non-empty arg rejected).
+
+#### Changed
+
+- `_stage_set_window_fields` docstring rewritten to document the
+  rank-function surface.
+- `tests/test_set_window_fields.py`: the b35 placeholder test
+  `test_unsupported_rank_function_raises` is replaced by
+  `test_unsupported_time_series_function_raises`, which now probes
+  with `$derivative` to keep the deferred-surface guard alive.
+
+### `apiStrict: true` rejects `distinct` (narrow command-name gate)
+
+The Stable API v1 contract rejects a list of commands when
+`apiStrict: true` is set. SecantusDB already rejected non-v1
+aggregation **stages** inside `aggregate` pipelines (lights up
+mongo-java-driver's `versioned-api/aggregate on database` test
+that probes with `$listLocalSessions`). The matching command-name
+gate had been intentionally left off in a previous attempt: a
+broader whitelist invert reportedly caused 6 cascade failures via
+`MongoConnectionPoolClearedException`.
+
+A focused Java-gauge run with a narrow gate
+(`_API_V1_REJECTED_BY_NAME = {"distinct"}`) tells a different
+story. Rejecting only `distinct` produces **+1 pass** for the
+canary `crud-api-version-1-strict.yml` `distinct appends declared
+API version` test and **zero** new failures across the 900-test
+mongo-java-driver suite — no pool-clear symptoms anywhere in the
+JUnit XML. The cascade the previous attempt observed was not
+pool-clear semantics; it was the broader invert also rejecting
+`count` (used internally by `estimatedDocumentCount`) and other
+handshake-adjacent internal commands. The narrow gate sidesteps
+that mechanism entirely.
+
+#### Added
+
+- `src/secantus/commands.py`: `_API_V1_REJECTED_BY_NAME`
+  frozenset (one entry: `distinct`); the `dispatch` apiStrict
+  block grew a command-name check that runs before the
+  aggregation-stage check. The rejection's `errmsg` matches
+  mongod's `"Provided command distinct is not in API Version 1"`
+  so the unified test runner's `errorContains` assertion fires
+  cleanly.
+- `tests/test_api_strict.py` (5 new tests): `distinct` rejected
+  under `apiStrict: true` with code 323; `distinct` allowed
+  without `apiStrict`; `count` still allowed under `apiStrict`
+  (the cascade-avoidance check); `find` still allowed; `aggregate`
+  with a v1 stage still allowed (gates compose).
+
+#### Changed
+
+- Backlog §5 entry on `apiStrict` pool-clear struck through with
+  the empirical resolution path. The previous theory turned out
+  to be wrong about the mechanism — narrow rejection works.
+
+### Pymongo gauge: +80 passing tests from five newly-includable files
+
+Cross-gauge audit of currently-excluded test files against the work
+shipped in this development cycle (0.5.2b1 + the rank-functions
+and apiStrict slices above) identified five pymongo test files
+that pass cleanly now and had been excluded purely because the
+supporting features hadn't shipped. Adding them to
+`pymongo_validation/include_paths.py` bumps the gauge from **959 →
+1039 passing** with zero new failures, +25 new skips (genuine
+feature gaps the suite self-skips on), overall pass rate stays at
+100%.
+
+* `test_collation.py` (16 new tests) — unlocked by per-index
+  collation work (single-field, compound, sort acceleration).
+* `test_versioned_api.py` (4 tests) + `test_versioned_api_integration.py`
+  (36 tests) — unlocked by the apiStrict aggregation-stage gate
+  and the new `distinct` command-name gate.
+* `test_command_logging.py` (20 tests) + `test_logger.py` (4 tests)
+  — command monitoring / logging format conformance; no
+  SecantusDB-specific blocker.
+
+The audit also confirmed no flip-worthy candidates in the go /
+node / java / ruby gauges — every remaining exclusion in those
+gauges is a feature genuinely out of scope (replica sets,
+transactions, encryption, text indexes, GridFS, time-series,
+etc.).
+
+#### Changed
+
+- `pymongo_validation/include_paths.py` — five test files added
+  to `INCLUDE`. Inline comments name the slice that unlocked each.
+
+## [0.5.2b1] — 2026-05-20
+
+### MONGODB-X509 auth — cert subject DN as the username
+
+The natural sequel to the b22 mTLS slice. mTLS gives you a
+transport-layer "approved client" gate; MONGODB-X509 turns the
+client cert's subject DN into the user identity directly, no SCRAM
+step. Same flow MongoDB Atlas X509 deployments use: create the user
+on `$external` with `mechanisms: ["MONGODB-X509"]` and the cert DN
+as the username, connect with
+`?authMechanism=MONGODB-X509&authSource=$external`, the server
+matches the DN from the verified cert against the user record. No
+password to rotate, no SCRAM round-trip, no shared secret on disk.
+
+Mixed mechanisms work too — a user record can carry both
+`SCRAM-SHA-256` and `MONGODB-X509` in `mechanisms` for migration or
+to keep a SCRAM fallback. The driver picks per-connection from
+`saslSupportedMechs`.
+
+Closes the "transport-layer gate only" caveat the production +
+configuration docs called out when mTLS shipped; documentation
+updated to point at the worked X509 example as the alternative to
+SCRAM-on-top.
+
+#### Added
+
+- `secantus.auth.MONGODB_X509` constant, `X509_CREDENTIAL_MARKER`
+  for the user record's `credentials` doc (no password to hash —
+  the credential IS the cert), and
+  `secantus.auth.subject_dn_from_peercert()` which converts
+  Python's `ssl.SSLSocket.getpeercert()` tuple-of-tuples into the
+  mongod-style RFC 4514 DN string (short attribute names,
+  most-specific-first, special-char escaping).
+- `CommandContext.peer_cert_dn` — server captures the verified
+  client cert's DN once per connection (right after the TLS
+  handshake in `_handle_client`), replays it into every
+  `CommandContext` so the auth handlers can read it.
+- `_sasl_start_x509` and the legacy `authenticate` command handler
+  — pymongo / Java / Go / Node all use the legacy command path for
+  X509, not `saslStart`. Both are wired up and refuse cleanly on
+  plaintext connections / non-X509 users / payload-DN mismatch.
+- `createUser` accepts `mechanisms=["MONGODB-X509"]` with no
+  password (cert IS the credential). Mixed
+  `["SCRAM-SHA-256", "MONGODB-X509"]` works too — SCRAM creds are
+  derived from `pwd`, X509 marker is written alongside.
+- `tests/test_x509_auth.py` — 9 tests: DN extraction unit tests
+  (reversal, short names, escaping, empty), end-to-end happy path
+  via pymongo, refused-with-no-matching-user, refused-for-SCRAM-only
+  user, SCRAM still works on mTLS-required server, X509 refused on
+  plaintext connection.
+
+#### Changed
+
+- `saslSupportedMechs` now includes `MONGODB-X509` when a user has
+  that mechanism in its `credentials` doc. SCRAM is still listed
+  first when both are available (drivers pick the strongest).
+- `_PRE_AUTH_COMMANDS` includes `authenticate` so the legacy X509
+  command path bypasses the require-auth gate (same as
+  `saslStart` / `saslContinue` already did for SCRAM).
+- `docs/authentication.md` — new MONGODB-X509 section with the
+  provisioning + connection examples; the stale "what's not here
+  yet" list rewritten (RBAC, updateUser, grantRolesToUser, TLS,
+  SCRAM-SHA-1 all shipped slices ago and shouldn't have been
+  listed as gaps).
+- `docs/production.md` + `docs/configuration.md` — mTLS sections
+  now offer two routes (SCRAM-on-top vs MONGODB-X509) instead of
+  the "transport-layer only, MONGODB-X509 is a follow-on" caveat.
+
+### Per-index collation — case- and accent-insensitive lookups at IXSCAN
+
+The last entry on the compatibility doc's "Deferred" list is gone.
+Before this slice, the per-query collation infrastructure already
+honoured `collation` for `find` / `count` / `distinct` /
+`findAndModify` via `matches()` — but any query that carried a
+`collation` argument fell through to COLLSCAN by design, because
+index entries were written in raw BSON codepoint order. The
+storage-layer comment said as much: "we don't support per-index
+collation yet, so the safe path is always-COLLSCAN-when-collation."
+
+That comment is gone. `createIndexes` with a `collation` option
+now writes index entries under collation-normalised bytes —
+strings that compare-equal under the collation produce the same
+key, so a query carrying a matching `collation` hits the same row
+at IXSCAN. Strength 1/2/3 + `caseLevel` are supported;
+`numericOrdering` still falls back to COLLSCAN (would need a
+length-prefixed digit-run encoding to stay byte-sortable, deferred
+until a workload needs it).
+
+Two indexes on the same field with different collations are
+allowed — the picker walks every candidate and uses the one whose
+collation exactly matches the query's. Useful for collections that
+mix case-sensitive and case-insensitive lookups against the same
+column. Unique indexes with a collation enforce uniqueness
+*under* the collation: two docs differing only by case collide
+against a `strength: 2` unique index. Only the single-field
+equality / range / `$in` picker threads collation through today;
+multi-field filters combined with a collation still fall back to
+COLLSCAN. Worth widening case-by-case when a workload needs it.
+
+#### Added
+
+- `sortkey.encode_value(value, *, collation=None)`,
+  `encode_value_directed`, `encode_compound`, and the bound
+  helpers (`gt_bound` / `gte_bound` / `lt_bound` / `lte_bound`) all
+  take an optional `collation` kwarg. When set and the value is a
+  string, normalisation runs through
+  `secantus.collation.normalize_for_index_bytes` before encoding,
+  so equal-under-collation strings produce equal bytes.
+- `Collation.supports_index_encoding` — True for strength 1/2/3 +
+  `caseLevel`, False for `numericOrdering`. The picker treats
+  numericOrdering as "no index available for this collation."
+- `secantus.collation.normalize_for_index_bytes(s, collation)` —
+  bytes form of the collation-normalised string (strips accents
+  for strength 1, casefolds for strength ≤ 2, UTF-8 encodes).
+- `_parse_index_collation` helper in `storage.py` — reads an
+  index's stored collation option blob into a `Collation`,
+  returning `None` for collations that don't support index
+  encoding.
+- `tests/test_per_index_collation.py` — 11 tests covering routing
+  (matching collation → IXSCAN, mismatch → COLLSCAN, no-collation
+  query against collation-having index → COLLSCAN), correctness on
+  equality / range / `$in` / `update_one`, `numericOrdering`
+  fallback, unique-index-under-collation, and two indexes on the
+  same field with different collations.
+
+#### Changed
+
+- `_index_key` / `_index_key_variants` (the byte-key builders for
+  index writes) accept a `collation` kwarg; the storage writers
+  load it from the index's stored options and pass it through.
+- `_find_leading_field_index` + `_pick_index_for_filter` +
+  `_try_index_lookup` + `_try_index_id_keys` thread a `collation`
+  kwarg. Indexes whose stored collation doesn't exactly equal the
+  query's are skipped — the caller falls back to COLLSCAN, which
+  is the safe semantics. `_pick_compound_eq_index` /
+  `_pick_compound_range_index` skip collation-having indexes
+  entirely; compound pickers don't yet support collation, and
+  picking a collation-having index for a no-collation multi-field
+  filter would return wrong rows.
+- `explain_plan` takes a `collation` kwarg, and the `explain`
+  command extracts it from the wrapped command. Mismatched
+  collations report COLLSCAN in `winningPlan`; matched ones
+  report `IXSCAN` with the index name.
+- `find_matching`'s "if collation present, always COLLSCAN" gate
+  has been rewritten — now tries the collation-aware index path
+  first, falls back to COLLSCAN only when no matching index
+  exists.
+- `docs/compatibility.md` field-options table: `collation` is now
+  Honoured rather than Accepted-but-ignored. The Deferred list is
+  now empty.
+- `docs/indexes.md`: new "Per-index collation" section with
+  examples and rules; the "What's still missing" list updated to
+  call out compound-index collation as the next widening.
+- `tasks/backlog.md` §2: the per-index-collation stopgap entry is
+  struck through with a one-line summary of what shipped and the
+  remaining compound-index limitation.
+
+### Compound-index collation — multi-field filters light up under matching collation
+
+The b25 per-index collation slice closed the single-field path
+but left the compound pickers
+(`_pick_compound_eq_index` / `_pick_compound_range_index`) skipping
+any collation-having index — a multi-field filter combined with a
+`collation` argument fell back to COLLSCAN even when a compound
+collation index could have served it. This slice closes that gap.
+
+Both compound pickers now thread `collation` through and gate by
+exact match against each index's stored collation, the same rule
+the single-field path already used. The lookup builders thread
+collation into every `encode_value_directed` call (leading-equality
+prefix bytes and the trailing operator's bound bytes), so the
+lookup hits the same byte rows the index-write path produced.
+Strength 1/2/3 + `caseLevel` apply uniformly across single- and
+compound-field indexes; `numericOrdering` still falls back to
+COLLSCAN at every level. The unique-probe path now reads the
+index's stored collation too, so a unique compound index with
+`{strength: 2}` correctly rejects a second insert whose values
+collide under the collation.
+
+After this slice, every CRUD pattern that the single-field
+collation path covers — equality / range / `$in` / `update` /
+unique enforcement — covers under compound indexes too.
+
+#### Changed
+
+- `_pick_compound_eq_index` + `_try_compound_eq_id_keys` thread
+  `collation` through; the compound-eq lookup builds the prefix
+  bytes under the same collation as the index.
+- `_pick_compound_range_index` + `_try_compound_range_id_keys`
+  thread `collation` through; the trailing operator's `$eq` /
+  `$in` / `$gt` / `$gte` / `$lt` / `$lte` bounds are all encoded
+  under the collation.
+- `_try_index_id_keys` no longer short-circuits compound pickers
+  when `collation` is set — they're called with the collation kwarg
+  and use the exact-match gate.
+- `_pick_index_for_filter` (the explain planner) mirrors the same
+  threading, so `explain` reports `IXSCAN` for collation-matching
+  multi-field queries.
+- `_unique_conflict` reads each index's stored collation via
+  `_parse_index_collation` and threads it to `_index_key`, so the
+  unique probe collides on byte-equal canonical keys (the bug
+  that let `("Alice","Boston")` and `("ALICE","BOSTON")` both land
+  in a unique strength-2 compound index).
+- `docs/indexes.md` "Per-index collation" section rewritten to
+  cover the compound case with examples; "What's still missing"
+  drops the compound-collation entry.
+- `tests/test_compound_index_collation.py` (10 new tests): compound
+  bare-eq IXSCAN under matching collation, leading-prefix-only
+  scan, mismatch → COLLSCAN, no-collation-vs-collation index
+  selection across two indexes on the same fields, compound
+  prefix + trailing-operator (`$gt`, `$in`) under collation,
+  update via compound collation index, unique compound collation
+  enforcement, `numericOrdering` fallback.
+
+### Sort acceleration with collation — index walk replaces Python sort
+
+The third collation slice closes a quieter gap left by the
+preceding two. The b25 + b27 slices wired up filter-side
+collation routing — equality / range / `$in` / compound bare-eq /
+compound prefix + trailing-operator all light up at IXSCAN when
+the query's `collation` matches an index's stored collation. But
+the sort path stayed on COLLSCAN + Python `sort_docs`: any query
+carrying a `collation` argument fell into a single branch that
+never tried sort acceleration, even when an index whose collation
+matched the query's would have given the requested order for free
+just by walking it.
+
+That branch is gone. The collation and non-collation paths through
+`find_matching` are now unified, and every sort-picker call
+(`_find_leading_field_index` for single-field sorts,
+`_compound_index_for_sort` for multi-field) threads
+`collation_obj` through with the same exact-match gate as the
+filter side. A `find().sort("name", 1).collation({strength: 2})`
+walks a `{name: 1}` strength-2 collation index forward; `-1` walks
+it backward; multi-field sorts that exactly match (or fully
+invert) a compound collation index's key spec walk it forward or
+backward respectively, and no Python sort runs in either case.
+The same gate keeps no-collation sorts off collation indexes
+(walking would give the wrong order) and vice versa.
+
+After this slice the collation domain is structurally complete:
+every CRUD pattern that hits an index without collation — filter
+lookup, range, `$in`, multi-field filter, sort, compound sort,
+unique enforcement — hits the index when a matching collation is
+in play, and falls back to COLLSCAN + `matches()` + `sort_docs`
+when no matching index exists.
+
+#### Changed
+
+- `find_matching`'s `elif collation_obj is not None: ...` branch
+  removed; the no-collation branch's sort logic now runs for both
+  cases, with `collation=collation_obj` (which is `None` when no
+  collation set) threaded through every picker call. Single-field
+  sort + filter on the sort field, single-field sort with empty
+  filter, and multi-field sort (compound key match) all
+  collation-gate.
+- `_compound_index_for_sort` takes an optional `collation` kwarg
+  and gates by exact match against each index's stored collation
+  (same rule as `_find_leading_field_index` and the compound
+  filter pickers). Multikey indexes are still excluded from
+  sort acceleration regardless of collation.
+- `explain_plan` mirrors the threading: `_find_leading_field_index`
+  and `_compound_index_for_sort` both receive `collation=collation_obj`,
+  so `explain` reports IXSCAN with the right direction for
+  collation-matching sort queries and COLLSCAN otherwise.
+- `docs/indexes.md` "Per-index collation" section grows a "sort
+  acceleration honours the same gate" subsection with worked
+  forward / backward / mismatch examples.
+- `tests/test_sort_with_collation.py` (8 new tests): single-field
+  ASC + DESC sort with matching collation walks index forward /
+  backward; no-collation sort against collation index → COLLSCAN;
+  strength-2 index + strength-3 query → COLLSCAN; filter on sort
+  field with matching collation hits index in order; multi-field
+  sort that matches a compound collation index walks forward; the
+  full-inverse sort walks backward; multi-field mismatch falls
+  back to Python sort.
+
+### `$type: "int"` / `"long"` distinguishes by BSON type tag, not value range
+
+A quieter long-standing bug in the `$type` query operator. The
+`_TYPE_PREDS` table used a Python value-range check
+(`-2**31 <= v <= 2**31 - 1`) to distinguish int32 from int64. A
+doc inserted as `Int64(5)` — value fits in int32 numerically, but
+its BSON tag is int64 — was matched by `$type: "int"` instead of
+`$type: "long"`, contradicting mongod.
+
+pymongo's BSON decoder already preserves the int32/int64
+distinction by class: int32 round-trips as plain `int`, int64
+round-trips as `bson.Int64` (a subclass of `int`). The fix keys
+on `isinstance(v, bson.Int64)` for "long" and
+`isinstance(v, int) and not isinstance(v, (bool, Int64))` for
+"int" — type-tag-faithful, no value-range arithmetic.
+
+`$convert: {to: "long"}` had a paired bug: it returned a plain
+`int` so its output couldn't be matched by `$type: "long"` on a
+downstream `$match`. Now wraps the result in `Int64` for code 18
+(int64); `to: "int"` (code 16) still returns plain `int`.
+
+#### Changed
+
+- `src/secantus/query.py`: replaced `_is_bson_int(... ranged=...)`
+  + `_INT32_RANGE` with three named predicates (`_is_int32`,
+  `_is_int64`, `_is_bson_number`). `_TYPE_PREDS` entries for
+  `int` / `16` / `long` / `18` / `number` now route through them.
+- `src/secantus/expressions.py`: `_convert_value` code 18 path
+  wraps its result in `Int64` (codes 16 and 18 share the input
+  coercion logic but the wrapper diverges).
+- `tests/test_type_int32_int64.py` (8 new tests): `Int64(5)` →
+  `$type: "long"` (not `int`); plain `int(5)` → `$type: "int"`;
+  large int (`2**40`) round-trips as Int64 → `long`;
+  `$type: "number"` accepts both; numeric `$type` codes (16, 18)
+  agree with their string aliases; array-form `$type` matches
+  either; `$convert: {to: "long"}` output matches `$type: "long"`;
+  `$convert: {to: "int"}` output matches `$type: "int"`.
+
+### `$unionWith` aggregation stage
+
+A v1 stable-API stage that wasn't yet wired up. `$unionWith`
+concatenates docs from a second collection — optionally filtered
+through a sub-pipeline — onto the current pipeline's input. Driver
+test suites probe it routinely; the prior wire-level response was
+a generic "unsupported aggregation stage" error.
+
+Both spec shapes ship:
+
+* Shorthand: `{$unionWith: "<coll>"}`
+* Full form: `{$unionWith: {coll: "<coll>", pipeline: [...]}}`
+
+Outer docs land first, then the union docs in the order the
+sub-pipeline produced them. No deduplication — duplicates across
+the boundary survive, matching mongod. The sub-pipeline runs in a
+fresh :class:`PipelineContext`; outer `$lookup let` variables are
+deliberately not visible (mongod doesn't accept a `let` field on
+`$unionWith`). Chained `$unionWith` stages accumulate; downstream
+`$sort` / `$group` / `$count` / `$limit` see the combined set.
+
+A non-existent target collection is treated as empty (mongod's
+behaviour). Bad specs (non-string shorthand, missing `coll`,
+non-array `pipeline`) surface as `AggregateError` to the client.
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_stage_union_with` handler;
+  wired into `_STAGES` next to `$geoNear`. ~30 LOC + docstring.
+- `tests/test_union_with.py` (11 new tests): shorthand form;
+  full form with and without sub-pipeline; outer-first ordering;
+  no-dedup across boundary; chained `$unionWith`; downstream
+  `$group` / `$sort+$limit`; missing collection treated as empty;
+  empty outer + non-empty union; bad-spec rejection (numeric
+  spec, missing `coll`, non-array `pipeline`).
+- `docs/aggregation.md` stages table grows a row.
+
+### `admin.system.users` is a synthetic read-only view onto the user store
+
+Credentials live in a dedicated WT table (`secantus_users`) that
+`createUser` / `updateUser` / `dropUser` / `usersInfo` own. But
+`find` / `aggregate` / `count` against `admin.system.users` —
+mongod's canonical user-storage namespace — searched the empty
+regular doc table and returned nothing. Tools and a few driver
+tests that introspect the user list via `db.system.users.find()`
+saw an empty collection on SecantusDB even after a `createUser`
+landed.
+
+This slice mirrors the oplog pattern (`local.oplog.rs` is a
+synthetic view onto `secantus_oplog`). `admin.system.users` is now
+read-only-surfaced: `find` / `aggregate` / `count` route through
+`_find_system_users` / `_count_system_users`, which scan the user
+table on a fresh WT session for cross-thread visibility and apply
+the standard filter / sort / skip / limit / projection /
+collation pipeline against the decoded records.
+
+The stored records already carry the mongod-shaped fields
+(`_id` = `<db>.<user>`, `user`, `db`, `credentials`, `roles`,
+`mechanisms`), so the view requires no schema synthesis. Users
+created against any database all surface under
+`admin.system.users` (matching mongod — every user record lives
+in `admin.system.users` regardless of its auth db, and the
+per-record `db` field names the auth database). Querying any
+other db's `system.users` returns empty rows (also mongod's
+behaviour).
+
+Writes are rejected with code 13 (`Unauthorized`) and a clear
+errmsg pointing users at `createUser` / `updateUser` / `dropUser`.
+The existing `_reject_oplog_rs_write` helper grew a clause for
+`admin.system.users` — it was already wired into every write
+command (`insert` / `update` / `delete` / `findAndModify` / `drop`
+/ `create` / `createIndexes`) so the rejection lands everywhere
+implicitly. Function name kept (`_reject_oplog_rs_write`) for
+churn reasons, with the docstring updated to cover both views.
+
+#### Added
+
+- `storage._is_system_users` / `_scan_user_records` /
+  `_find_system_users` / `_count_system_users` — the synthetic
+  view helpers, modelled directly on the oplog view's pattern.
+- `storage.find_matching` + `count_matching` route through the
+  new helpers when `(db, coll) == ("admin", "system.users")`.
+- `tests/test_system_users_view.py` (13 new tests): find /
+  count / projection / aggregate against the view; users created
+  across multiple databases all visible; filter on `db` field;
+  other-db `system.users` is empty; write rejection on insert /
+  update / delete / drop with code 13; `dropUser` /
+  `updateUser` mutations reflected in the view.
+
+#### Changed
+
+- `commands._reject_oplog_rs_write` grew a second case for
+  `admin.system.users`. Docstring rewritten to cover both views.
+  Existing call sites pick up the new behaviour with no further
+  edits.
+
+### `$redact` aggregation stage
+
+The largest v1 stable-API aggregation stage still missing. `$redact`
+implements content-based document and sub-document pruning — the
+pipeline analogue of mongod's field-level access control. The
+stage's expression evaluates against each (sub-)doc and returns one
+of three sentinel strings; the result drives include / exclude /
+recurse behaviour. Driver test suites probe it routinely.
+
+* `"$$KEEP"` — include the sub-doc as-is, no recursion into nested
+  sub-docs. Useful for "trusted" sub-docs whose interior shouldn't
+  be re-evaluated.
+* `"$$PRUNE"` — drop the sub-doc. At the top level the doc leaves
+  the pipeline entirely; in a nested context the sub-doc is removed
+  from its parent field, or from its array element slot (with the
+  surrounding array preserved).
+* `"$$DESCEND"` — recurse into every dict-valued field and every
+  dict-valued list element. Non-dict scalars and non-dict list
+  elements pass through unchanged.
+
+The three sentinels are wired into the expression evaluator as
+system variables (alongside `$$ROOT`, `$$CURRENT`, `$$REMOVE`);
+their resolved value is the literal `"$$NAME"` string the stage
+handler dispatches on. Returning anything else from the expression
+raises `AggregateError` — matches mongod.
+
+The stage uses the standard `$cond` / `$switch` / `$let` /
+`$ifNull` plumbing that the rest of the expression engine already
+provides, so the typical pipeline shape works straight out:
+
+```python
+[{"$redact": {
+    "$cond": {
+        "if": {"$eq": [{"$ifNull": ["$classified", False]}, True]},
+        "then": "$$PRUNE",
+        "else": "$$DESCEND",
+    },
+}}]
+```
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_stage_redact` handler + private
+  `_redact_subdoc` / `_redact_descend` recursive helpers, wired
+  into `_STAGES` next to `$unionWith`. The `_redact_descend` walker
+  preserves non-dict scalars and non-dict list elements; pruned
+  sub-docs are dropped from their parent field or array.
+- `src/secantus/expressions.py`: `_resolve_var` recognises
+  `$$KEEP` / `$$PRUNE` / `$$DESCEND` and returns the literal
+  `"$$NAME"` string — same pattern as `$$REMOVE` for `$setField`.
+- `tests/test_redact.py` (11 new tests): unconditional KEEP and
+  PRUNE; conditional KEEP-vs-PRUNE access-control canon; DESCEND
+  with nested sub-doc pruning; DESCEND into arrays of sub-docs
+  with non-dict elements preserved; multi-level deep recursion;
+  KEEP short-circuits descent (nested PRUNE never fires); chained
+  with `$match`; non-sentinel return rejected; null / empty
+  expression rejected; array-element KEEP preserves nested
+  sub-docs unchanged.
+
+### `admin.system.version` returns the auth-schema doc
+
+The companion to the b31 `admin.system.users` view. Some
+user-management tools (and a handful of driver tests) read
+`admin.system.version.find({_id: "authSchema"})` on startup to gate
+which user-management features they offer; pre-slice that namespace
+was empty and tools either skipped features or assumed the lowest
+schema version.
+
+The view returns one hard-coded doc:
+
+```python
+{"_id": "authSchema", "currentVersion": 5}
+```
+
+`currentVersion: 5` is the SCRAM-SHA-256 baseline (MongoDB 4.0+),
+which is what SecantusDB actually implements — so the answer is
+honest, not just placating. Other databases' `system.version` still
+returns empty. Writes are rejected with code 13 (`Unauthorized`)
+via the same `_reject_oplog_rs_write` helper that gates
+`admin.system.users` and `local.oplog.rs`.
+
+#### Added
+
+- `storage._is_system_version` / `_system_version_docs` /
+  `_find_system_version` / `_count_system_version` — same pattern
+  as the b31 `admin.system.users` view; the doc set is fixed at
+  one entry rather than scanned from a table.
+- `storage.find_matching` + `count_matching` route through the
+  new helpers when `(db, coll) == ("admin", "system.version")`.
+- `commands._reject_oplog_rs_write` grew a third case for
+  `admin.system.version`; existing call sites pick up the
+  rejection with no further edits.
+- `tests/test_system_version_view.py` (10 new tests): find /
+  find_one / count / aggregate read paths; non-matching filter
+  returns empty; other-db `system.version` is empty; write
+  rejection on insert / update / delete / drop with code 13.
+
+### `renameCollection` cross-process safety — pinned by `WiredTiger.lock`
+
+A backlog item ("renameCollection: atomic per the storage RLock,
+but no protection against concurrent writers across worktrees")
+turns out to be structurally addressed by WiredTiger itself.
+`wiredtiger_open` takes an exclusive lock on the data directory at
+open time; a second open on the same path fails with
+``WT_ERROR Resource busy`` before any state is touched, so the
+"concurrent writers across processes" scenario can't exist in the
+first place.
+
+Within-process atomicity is the storage `RLock`. Cross-process
+exclusion is `WiredTiger.lock`. The two layers compose: rename is
+safe under both. The backlog entry is struck through.
+
+#### Added
+
+- `tests/test_storage_exclusion.py` (2 new tests) pinning the
+  guarantee: a second `Storage(path=...)` on the same on-disk
+  directory raises a `WiredTigerError` whose message contains
+  `"busy"`; the first instance keeps working unaffected.
+  `rename_collection` survives a close + reopen round-trip — the
+  renamed namespace is visible to a fresh `Storage` instance.
+
+### `$setWindowFields` aggregation stage — minimum viable subset
+
+The largest v1 stable-API stage that wasn't yet wired up.
+`$setWindowFields` is mongod's windowed-analytics surface — running
+totals, rolling averages, per-partition rankings — all expressed
+as a partition + sort + per-row windowed accumulator over the
+input. Driver test suites probe it heavily.
+
+Spec shape::
+
+    {
+        partitionBy: <expression>,         # optional; default = single partition
+        sortBy: <sort spec>,               # optional; default = input order
+        output: {
+            <field>: {
+                <$accumulator>: <expr>,
+                window: {documents: [<lower>, <upper>]},  # optional
+            },
+        },
+    }
+
+For each output field, the accumulator runs over the rows inside
+that row's window — within the row's partition, in the partition's
+sorted order. Original input order is preserved in the result; the
+partition / sort dance is purely internal to compute the new
+fields.
+
+#### Shipped (first-cut subset)
+
+* The nine `$group` accumulators: `$sum`, `$avg`, `$min`, `$max`,
+  `$first`, `$last`, `$push`, `$addToSet`, `$count`. The dispatch
+  reuses `_ACC_DISPATCH` from `$group` — same per-doc accumulator
+  semantics, just applied over a per-row windowed subset.
+* Position-based windows via `window: {documents: [<lower>, <upper>]}`.
+  Bound forms: integer offsets relative to the current row,
+  `"current"` (= 0), and `"unbounded"` (partition edge).
+* Default window (omit `window`) covers the whole partition.
+  `[unbounded, current]` gives running-total semantics;
+  `[-1, 1]` gives a 3-doc rolling window; etc.
+* Empty-window output values: 0 for `$sum`/`$count`, [] for
+  `$push`/`$addToSet`, null for the rest (matches mongod).
+
+#### Deferred (raise `AggregateError` with a clear message)
+
+* Range-based windows (`window: {range: [...]}`, optionally with
+  `unit:` for date ranges). Needs value-based bounds + date
+  arithmetic; out of scope for the first cut.
+* Time-series functions: `$derivative`, `$integral`, `$linearFill`,
+  `$locf`, `$shift`, `$expMovingAvg`. Each is its own slice and
+  not in the common driver-test surface.
+* Rank functions: `$rank`, `$denseRank`, `$documentNumber`. These
+  need sort-key equality detection (tied rows get the same rank).
+  Worth a dedicated slice when a workload needs them.
+
+#### Added
+
+- `src/secantus/aggregate.py`: `_stage_set_window_fields` handler
+  + helpers `_window_bounds` (resolves
+  `documents: [<lower>, <upper>]` to inclusive partition indices,
+  with clamping to partition edges) and `_empty_window_value`
+  (mongod-matching defaults). Wired into `_STAGES`. Reuses
+  `_ACC_DISPATCH` + `_finalize` from `$group` so the accumulator
+  semantics stay aligned across the two stages.
+- `tests/test_set_window_fields.py` (15 new tests): no-partition
+  totals; partitionBy splits totals correctly; rolling 3-doc sum
+  with edge clamping; `[unbounded, current]` running total;
+  `[unbounded, unbounded]` per-partition total; `$avg` / `$min` /
+  `$max` / `$first` / `$last` over `[-1, 1]`; `$count` over
+  `[-1, 1]`; `$push` / `$addToSet` accumulating across rows;
+  sortBy controls running-total order independently of input
+  order; original input order preserved on output; rank function
+  raises; range window raises; missing output rejected; multiple
+  accumulators in one output rejected; empty input → empty out.
 
 ## [0.5.1b24] — 2026-05-19
 

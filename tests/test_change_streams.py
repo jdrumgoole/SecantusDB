@@ -140,6 +140,57 @@ def test_resume_after_token_picks_up_subsequent_events(client: MongoClient) -> N
     assert keys == [3, 4]
 
 
+@pytest.mark.parametrize("resume_option", ["resume_after", "start_after"])
+def test_resumed_open_returns_backlog_in_first_batch(
+    client: MongoClient, resume_option: str
+) -> None:
+    """A resumed open (resumeAfter / startAfter) must return the already-
+    committed backlog events in the aggregate's firstBatch, so a driver that
+    checks the cursor for buffered data *before* issuing any getMore sees
+    them — pymongo's ``CommandCursor._has_next()`` never sends a getMore.
+    And because firstBatch is non-empty, pymongo doesn't overwrite the
+    cached resume token from the open response's postBatchResumeToken, so an
+    uniterated resumed stream still reports ``resume_token == <the token
+    passed in>`` (pymongo change-streams prose test #14)."""
+    db = client["csdb_backlog"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs1 = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.insert_one({"_id": 0})
+    resume_point = _drain(cs1, target=1)[-1]["_id"]
+    cs1.close()
+
+    # Commit a backlog the resumed stream must surface on open.
+    coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
+
+    cs2 = coll.watch(**{resume_option: resume_point}, max_await_time_ms=2000)
+    # firstBatch is populated: buffered data is visible without a getMore.
+    assert cs2._cursor._has_next() is True
+    # Uniterated: the cached resume token is still the one we passed in.
+    assert cs2.resume_token == resume_point
+    keys = [e["documentKey"]["_id"] for e in _drain(cs2, target=3)]
+    cs2.close()
+    assert keys == [1, 2, 3]
+
+
+def test_fresh_watch_has_empty_first_batch(client: MongoClient) -> None:
+    """A fresh (non-resuming) watch positions at the oplog tail: there is no
+    backlog, so firstBatch stays empty and the cursor has no buffered data
+    until a write arrives. Guards against the resumed-open backlog drain
+    leaking into the common tail-watch path."""
+    db = client["csdb_fresh"]
+    coll = db["c"]
+    db.create_collection("c")
+    cs = coll.watch(max_await_time_ms=2000)
+    assert cs._cursor._has_next() is False
+    coll.insert_one({"_id": 1})
+    keys = [e["documentKey"]["_id"] for e in _drain(cs, target=1)]
+    cs.close()
+    assert keys == [1]
+
+
 def test_start_at_operation_time_picks_up_new_events(client: MongoClient) -> None:
     db = client["csdb_sat"]
     coll = db["c"]
@@ -407,6 +458,88 @@ def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
     assert e["operationDescription"]["indexes"] == [{"name": "x_1"}]
 
 
+def test_create_collection_emits_change_event(client: MongoClient) -> None:
+    """A `create` (createCollection) surfaces with operationType=create
+    on a db-scoped stream WHEN show_expanded_events is set."""
+    db = client["csdb_create_coll"]
+    db.create_collection("seed")  # ensure the db exists before watching
+    cs = db.watch(max_await_time_ms=2000, show_expanded_events=True)
+    time.sleep(0.3)
+    db.create_collection("foo")
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    e = events[0]
+    assert e["operationType"] == "create"
+    assert e["ns"] == {"db": "csdb_create_coll", "coll": "foo"}
+
+
+def test_collmod_emits_modify_change_event(client: MongoClient) -> None:
+    """A `collMod` surfaces with operationType=modify WHEN
+    show_expanded_events is set; suppressed otherwise."""
+    db = client["csdb_collmod"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
+    time.sleep(0.3)
+    db.command({"collMod": "c"})
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    assert events[0]["operationType"] == "modify"
+    assert events[0]["ns"] == {"db": "csdb_collmod", "coll": "c"}
+
+
+def test_rename_event_has_operation_description_and_collection_uuid(
+    client: MongoClient,
+) -> None:
+    """With show_expanded_events, a rename that drops an existing target
+    carries operationDescription.{to,dropTarget}, and CRUD events on the
+    watched collection carry collectionUUID (mongod 6.0+ expanded fields)."""
+    db = client["csdb_rename_expand"]
+    coll = db["c"]
+    db.create_collection("c")
+    db.create_collection("dst")  # rename target to drop
+
+    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
+    time.sleep(0.3)
+    coll.insert_one({"a": 1})
+    coll.rename("dst", dropTarget=True)
+
+    events = _drain(cs, target=2)
+    cs.close()
+    insert_ev, rename_ev = events[0], events[1]
+    assert insert_ev["operationType"] == "insert"
+    assert "collectionUUID" in insert_ev
+    assert rename_ev["operationType"] == "rename"
+    assert rename_ev["to"] == {"db": "csdb_rename_expand", "coll": "dst"}
+    op_desc = rename_ev["operationDescription"]
+    assert op_desc["to"] == {"db": "csdb_rename_expand", "coll": "dst"}
+    assert "dropTarget" in op_desc
+
+
+def test_create_and_modify_suppressed_without_show_expanded_events(
+    client: MongoClient,
+) -> None:
+    """Default watch (no showExpandedEvents) suppresses create / modify
+    DDL events — only the stable v1 event set surfaces."""
+    db = client["csdb_no_expand_ddl"]
+    db.create_collection("seed")
+    cs = db.watch(max_await_time_ms=1000)
+    time.sleep(0.3)
+    db.create_collection("foo")  # would be a create event if expanded
+    db.command({"collMod": "foo"})  # would be a modify event if expanded
+    db["seed"].insert_one({"_id": 1})  # the only event a default stream sees
+
+    events = _drain(cs, target=1)
+    cs.close()
+    assert len(events) == 1
+    assert events[0]["operationType"] == "insert"
+
+
 def test_create_indexes_suppressed_without_show_expanded_events(client: MongoClient) -> None:
     """Default ``coll.watch()`` (no ``showExpandedEvents``) suppresses
     DDL "expanded" events like createIndexes / dropIndexes — matches
@@ -494,3 +627,27 @@ def test_split_large_change_stream_events_omitted_by_default(client: MongoClient
     events = _drain(cs, target=1)
     cs.close()
     assert "splitEvent" not in events[0]
+
+
+def test_pipeline_update_is_update_event_with_truncated_arrays(client: MongoClient) -> None:
+    """An aggregation-pipeline update ([{$set: ...}]) is an "update" event
+    with a computed updateDescription — never "replace". Regression: the
+    replacement classifier iterated the pipeline LIST (whose elements are
+    stage dicts, not $-prefixed keys) and emitted a full-doc oplog entry,
+    so pymongo's "Test array truncation" unified spec saw "replace".
+    Mirrors that spec's shape: shrinking an array surfaces only in
+    updateDescription.truncatedArrays."""
+    db = client["csdb_pipeline_update"]
+    coll = db["c"]
+    db.create_collection("c")
+    coll.insert_one({"_id": 1, "a": 1, "array": ["foo", {"a": "bar"}, 1, 2, 3]})
+    cs = coll.watch(max_await_time_ms=2000)
+    time.sleep(0.3)
+    coll.update_one({"_id": 1}, [{"$set": {"array": ["foo", {"a": "bar"}]}}])
+    events = _drain(cs, target=1)
+    cs.close()
+    assert events[0]["operationType"] == "update"
+    desc = events[0]["updateDescription"]
+    assert desc["updatedFields"] == {}
+    assert desc["removedFields"] == []
+    assert desc["truncatedArrays"] == [{"field": "array", "newSize": 2}]

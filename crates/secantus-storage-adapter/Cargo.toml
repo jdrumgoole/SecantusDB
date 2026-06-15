@@ -1,0 +1,30 @@
+[package]
+name = "secantus-storage-adapter"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "Adapts the WiredTiger-backed secantus-storage Storage to the secantus-commands Storage trait for the Rust server."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+publish = false
+
+# Links WiredTiger (via secantus-storage), so — like secantus-storage itself —
+# this crate is EXCLUDED from the `crates` workspace and is NOT built by the
+# WT-less `rust` CI job or this dev sandbox. It is compiled + tested only where
+# WiredTiger is available (the `rust-storage` CI job / a WT machine). It is the
+# R4b bridge: the Rust server (R4a, generic over `secantus_commands::Storage`)
+# runs against real WiredTiger by wrapping a `secantus_storage::Storage` in the
+# `StorageAdapter` here.
+
+# Standalone (own [workspace]) so `cargo` invoked inside this dir — as the
+# rust-storage CI job does — isn't pulled into the parent `crates` workspace
+# (where it's excluded), matching secantus-storage / secantus-server-py.
+[workspace]
+
+[lib]
+name = "secantus_storage_adapter"
+crate-type = ["rlib"]
+
+[dependencies]
+bson = "2"
+secantus-storage = { path = "../secantus-storage" }
+secantus-commands = { path = "../secantus-commands" }

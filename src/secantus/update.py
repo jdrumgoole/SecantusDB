@@ -5,11 +5,74 @@ import datetime as _dt
 from collections.abc import Mapping
 from typing import Any
 
+from secantus.numerics import bson_add, bson_mul
 from secantus.paths import get_path, has_path, set_path, unset_path
 
 
 class UpdateError(Exception):
     pass
+
+
+# The update modifiers ``_apply_op`` knows how to apply. Used by
+# ``validate_update_doc`` to reject an unknown modifier at parse time
+# (mongod validates the update before matching any documents, so an
+# unknown operator errors even against an empty collection).
+_KNOWN_UPDATE_OPS = frozenset(
+    {
+        "$set",
+        "$setOnInsert",
+        "$unset",
+        "$currentDate",
+        "$inc",
+        "$mul",
+        "$min",
+        "$max",
+        "$push",
+        "$addToSet",
+        "$pull",
+        "$pop",
+        "$rename",
+        "$bit",
+    }
+)
+
+
+def validate_update_doc(update: Any) -> None:
+    """Parse-time validation of an update document's top-level operators.
+
+    Raises ``UpdateError`` for an unknown modifier or a mix of operators
+    and replacement fields. Does NOT apply the update (so positional /
+    arrayFilter operators don't need a match context here). Pipeline
+    (list) updates and pure replacements are accepted — their own
+    validation happens elsewhere.
+    """
+    if isinstance(update, list) or not isinstance(update, Mapping):
+        return
+    keys = list(update)
+    if not any(k.startswith("$") for k in keys):
+        return  # replacement-style update
+    for op in keys:
+        if not op.startswith("$"):
+            raise UpdateError("update document cannot mix operators with replacement fields")
+        if op not in _KNOWN_UPDATE_OPS:
+            raise UpdateError(
+                f"Unknown modifier: {op}. Expected a valid update modifier "
+                "(e.g. $set, $unset, $inc, ...)"
+            )
+
+
+def apply_update_batch(
+    docs: list[dict[str, Any]],
+    update: Mapping[str, Any] | list[Mapping[str, Any]],
+    *,
+    is_upsert: bool = False,
+) -> list[dict[str, Any]]:
+    """Apply one operator/replacement ``update`` to every doc in ``docs``.
+
+    A thin convenience over the per-doc ``apply_update``; pipeline /
+    array-filter / positional updates are applied per doc the same way.
+    """
+    return [apply_update(d, update, is_upsert=is_upsert) for d in docs]
 
 
 def apply_update(
@@ -268,14 +331,17 @@ def _apply_op(
                 current = get_path(doc, concrete, default=0)
                 if current is None:
                     current = 0
-                set_path(doc, concrete, current + delta)
+                # bson_add preserves the BSON numeric type (mongod widens
+                # int32 < int64 < double < decimal128) — Int64(5) + 3 → Int64(8),
+                # not a bare int that narrows to int32 on the wire.
+                set_path(doc, concrete, bson_add(current, delta))
     elif op == "$mul":
         for path, factor in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 current = get_path(doc, concrete, default=0)
                 if current is None:
                     current = 0
-                set_path(doc, concrete, current * factor)
+                set_path(doc, concrete, bson_mul(current, factor))
     elif op == "$min":
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):

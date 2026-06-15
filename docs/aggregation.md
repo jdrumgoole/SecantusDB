@@ -32,6 +32,9 @@ applied in order; each stage gets the documents emitted by the previous one.
 | `$graphLookup` | Recursive lookup with `maxDepth` |
 | `$documents` | Inline document source (5.1+) |
 | `$changeStream` | Pipeline-form change-stream entry point |
+| `$unionWith` | Concatenate docs from another collection. Shorthand `{$unionWith: "coll"}` or full form `{$unionWith: {coll, pipeline}}` with an optional sub-pipeline that runs in a fresh context (outer `let`/vars are not visible). Outer docs first, then union docs; no deduplication |
+| `$redact` | Content-based document / sub-document pruning. Expression must return `"$$KEEP"`, `"$$PRUNE"`, or `"$$DESCEND"`. Top-level `$$PRUNE` drops the doc; `$$DESCEND` recurses into every dict-valued field and every dict-valued list element; `$$KEEP` short-circuits descent. Non-sentinel return raises `AggregateError` |
+| `$setWindowFields` | Partition + sort + per-row windowed accumulators. `partitionBy` (expression, optional), `sortBy` (sort spec, optional), `output: {<field>: {<acc>: <expr>, window: {documents: [<lower>, <upper>]}}}`. Supported accumulators: the nine `$group` accumulators (`$sum` / `$avg` / `$min` / `$max` / `$first` / `$last` / `$push` / `$addToSet` / `$count`). Window bounds: int offsets, `"current"`, `"unbounded"`. Default window (missing `window`) = whole partition. Rank functions (`$rank` / `$denseRank` / `$documentNumber`) also supported — take empty `{}` arg, no `window`; `$rank` / `$denseRank` require `sortBy`. **Deferred**: range-based windows (`window: {range: [...]}`) and time-series functions (`$derivative`, `$integral`, `$linearFill`, `$locf`, `$shift`, `$expMovingAvg`) raise `AggregateError` with a clear message |
 
 ### `$group` accumulators
 

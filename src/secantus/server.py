@@ -6,13 +6,16 @@ import logging
 import socket
 import ssl
 import threading
+import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
+
+import bson
 
 if TYPE_CHECKING:
     from typing import Self
 
-from secantus.auth import ConnectionAuth
+from secantus.auth import ConnectionAuth, subject_dn_from_peercert
 from secantus.commands import CommandContext, dispatch
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorRegistry
@@ -21,7 +24,9 @@ from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.sessions import SessionRegistry
 from secantus.storage import Storage
+from secantus.transactions import Transaction, TransactionRegistry
 from secantus.wire import (
+    OP_MSG_FLAG_EXHAUST_ALLOWED,
     OP_MSG_FLAG_MORE_TO_COME,
     ConnectionClosed,
     MalformedBodyError,
@@ -78,11 +83,20 @@ class SecantusDBServer:
         cache_size: str = "1G",
         session_max: int = 1000,
         sync_on_commit: bool = False,
+        transaction_lifetime_seconds: float = 60.0,
         tls_cert_file: str | None = None,
         tls_key_file: str | None = None,
         tls_ca_file: str | None = None,
         tls_require_client_cert: bool = False,
+        engine: str | None = None,
     ) -> None:
+        # Engine selection is process-wide (see ``secantus.engine``). ``None``
+        # leaves the current selection (SECANTUS_ENGINE env / default Python)
+        # untouched; "python" / "rust" / "auto" set it for the whole process.
+        if engine is not None:
+            from secantus import engine as _engine
+
+            _engine.set_engine(engine)
         self.host = host
         self.port = port
         self.replica_set_name = replica_set_name
@@ -160,6 +174,10 @@ class SecantusDBServer:
             session_max=session_max,
             sync_on_commit=sync_on_commit,
         )
+        # Replica-set initiation: seed the bootstrap oplog noop so
+        # ``local.oplog.rs`` is never empty (mongod parity). No-op when the
+        # oplog is disabled or already populated.
+        self.storage.ensure_oplog_bootstrap()
         self.cursors = CursorRegistry()
         # Per-server counters surfaced through `serverStatus`. Started
         # eagerly so `start_monotonic` reflects construction time, not
@@ -182,6 +200,25 @@ class SecantusDBServer:
         # errors at the wire (failCommand → errorCode / writeConcernError).
         # See ``secantus.failpoints`` for the supported subset.
         self.failpoints = FailPointRegistry()
+        # Multi-document transaction state machine. The WT work is
+        # bound here so the registry itself stays storage-agnostic;
+        # ``txn.handle`` is None when the transaction never executed a
+        # statement (the WT session is created lazily at the first one).
+        self.transactions = TransactionRegistry(
+            commit_func=self._commit_txn_handle,
+            rollback_func=self._rollback_txn_handle,
+            lifetime_seconds=transaction_lifetime_seconds,
+        )
+
+    def _commit_txn_handle(self, txn: Transaction) -> None:
+        if txn.handle is not None:
+            self.storage.commit_user_transaction(
+                txn.handle, lsid_doc=txn.lsid_doc, txn_number=txn.txn_number
+            )
+
+    def _rollback_txn_handle(self, txn: Transaction) -> None:
+        if txn.handle is not None:
+            self.storage.abort_user_transaction(txn.handle)
 
     @property
     def address(self) -> tuple[str, int]:
@@ -220,7 +257,53 @@ class SecantusDBServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        # Drain in-flight per-connection handler threads BEFORE touching
+        # WiredTiger. Each connection runs on its own daemon thread; if one is
+        # mid-WT-operation when ``storage.close()`` frees the WT connection,
+        # that's a use-after-free — a native crash (the intermittent xdist
+        # worker death). Close every connection socket so blocked reads return
+        # and the loops exit, wake any tailable getMore blocked on the oplog
+        # condition variable, then wait for the active-connection count to
+        # reach zero so no handler is still using storage.
+        self.connections.close_all()
+        self.storage.signal_shutdown()
+        self._await_connections_drained(timeout=5.0)
+        # Roll back open transactions while storage is still usable;
+        # ``Storage.close()``'s session sweep would roll them back too,
+        # but this releases their WT sessions in an orderly way first.
+        self.transactions.abort_all()
         self.storage.close()
+
+    def _await_connections_drained(self, timeout: float) -> None:
+        """Block until every per-connection handler thread has exited (the
+        active-connection counter reaches zero), or ``timeout`` elapses. Run
+        at stop, after the connection sockets are closed and tailable waiters
+        woken, so storage isn't torn down under an in-flight handler.
+
+        ``close_all`` is re-run on every poll, not just once before this loop.
+        The accept thread bumps ``_active_conns`` and spawns the handler
+        *before* the handler registers its socket via ``connections.open``; a
+        connection accepted in the instant before ``stop`` can therefore
+        register its socket *after* the initial ``close_all`` snapshot, leaving
+        its blocking ``recv`` un-woken and the drain stuck until the idle
+        timeout. Re-snapshotting each poll closes such late arrivals within
+        5ms (every call is idempotent — already-closed sockets are no-ops)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._active_conns_lock:
+                if self._active_conns == 0:
+                    return
+            self.connections.close_all()
+            time.sleep(0.005)
+        with self._active_conns_lock:
+            remaining = self._active_conns
+        if remaining:
+            logger.warning(
+                "server stop: %d connection thread(s) still active after %.1fs; "
+                "closing storage anyway",
+                remaining,
+                timeout,
+            )
 
     def wait(self) -> None:
         self._stop_event.wait()
@@ -279,12 +362,127 @@ class SecantusDBServer:
             )
             handler.start()
 
+    def _stream_exhaust_getmore(
+        self,
+        conn: socket.socket,
+        response_to: int,
+        reply_ids: itertools.count[int],
+        body: dict[str, Any],
+        ctx: CommandContext,
+        first_doc: dict[str, Any],
+    ) -> bool:
+        """Stream the rest of an exhaust cursor over one socket.
+
+        Called when a getMore arrives with the OP_MSG ``exhaustAllowed``
+        flag set. ``first_doc`` is the reply the getMore handler already
+        produced. We send that batch (and every subsequent one) with the
+        ``moreToCome`` flag set, pulling further batches with synthetic
+        getMores, until the cursor drains — then a final reply with
+        ``id: 0`` and ``moreToCome`` clear closes the stream. mongod keeps
+        the cursor alive until a getMore returns an empty batch, so even a
+        cursor that drains exactly on a non-empty batch gets a trailing
+        empty reply (this is what makes pymongo's command-monitoring see
+        ``find, getMore, getMore, getMore`` for three docs at batchSize 1).
+
+        Returns True if the whole stream was written (connection survives),
+        False if a socket write failed (caller should drop the connection).
+        """
+        target_id = bson.Int64(int(body["getMore"]))
+        coll = body.get("collection", "")
+        ns = first_doc["cursor"].get("ns", f"{ctx.db_name}.{coll}")
+        db = body.get("$db", ctx.db_name)
+
+        def send(doc: dict[str, Any], *, more: bool) -> bool:
+            flags = OP_MSG_FLAG_MORE_TO_COME if more else 0
+            try:
+                conn.sendall(
+                    build_op_msg_reply(
+                        response_to=response_to,
+                        request_id=next(reply_ids),
+                        body=doc,
+                        flags=flags,
+                    )
+                )
+            except OSError:
+                return False
+            return True
+
+        doc = first_doc
+        while True:
+            cursor = doc.get("cursor")
+            if not isinstance(cursor, dict):
+                # An error reply (ok: 0) mid-stream — deliver it without
+                # moreToCome and end the stream.
+                return send(doc, more=False)
+            batch = cursor.get("nextBatch", cursor.get("firstBatch", []))
+            drained = int(cursor.get("id", 0)) == 0
+            if drained:
+                if batch and not send(
+                    {
+                        "cursor": {"nextBatch": batch, "id": target_id, "ns": ns},
+                        "ok": 1.0,
+                    },
+                    more=True,
+                ):
+                    return False
+                return send(
+                    {
+                        "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
+                        "ok": 1.0,
+                    },
+                    more=False,
+                )
+            if not batch:
+                # A live cursor that yielded nothing this round — a
+                # tailable / awaitData getMore whose wait expired. Don't
+                # keep streaming (that would spin forever); deliver this
+                # empty batch without moreToCome and let the client fall
+                # back to ordinary getMores. Normal cursors never reach
+                # here (an empty batch always drains the cursor to id 0).
+                return send(doc, more=False)
+            if not send(doc, more=True):
+                return False
+            getmore: dict[str, Any] = {"getMore": target_id, "collection": coll}
+            if "batchSize" in body:
+                getmore["batchSize"] = body["batchSize"]
+            if "maxTimeMS" in body:
+                getmore["maxTimeMS"] = body["maxTimeMS"]
+            getmore["$db"] = db
+            try:
+                doc = dispatch(getmore, ctx)
+            except Exception:
+                # We've already sent a `moreToCome` reply this round, so the
+                # client is waiting for the rest of the stream. If the next
+                # getMore blows up unexpectedly, terminate the stream with a
+                # final `moreToCome`-clear reply rather than letting the
+                # exception drop the connection mid-stream (which the client
+                # surfaces as "Server ended moreToCome unexpectedly").
+                logger.exception("error streaming exhaust getMore on cursor %d", int(target_id))
+                return send(
+                    {
+                        "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
+                        "ok": 1.0,
+                    },
+                    more=False,
+                )
+
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         # Register the socket alongside the conn_id so killOp can
         # shut it down from another thread.
         connection_id = self.connections.open((addr[0], addr[1]), sock=conn)
         reply_ids = itertools.count(1)
         connection_auth = ConnectionAuth()
+        # Capture the verified client cert's subject DN once per
+        # connection — MONGODB-X509 needs it to look up the user.
+        # ``getpeercert()`` returns ``{}`` when the peer didn't present
+        # a cert (CERT_OPTIONAL mode with a plain client), or the
+        # parsed cert dict otherwise. ``getpeercert`` raises on
+        # non-SSL sockets; plain TCP connections bypass this branch.
+        peer_cert_dn: str | None = None
+        if isinstance(conn, ssl.SSLSocket):
+            with contextlib.suppress(ssl.SSLError, OSError, ValueError):
+                cert = conn.getpeercert()
+                peer_cert_dn = subject_dn_from_peercert(cert)
         self.metrics.connection_opened()
         logger.debug("client %d connected from %s", connection_id, addr)
         self.logs.append(
@@ -297,10 +495,26 @@ class SecantusDBServer:
                         message = read_message(conn)
                     except ConnectionClosed:
                         return
+                    except ConnectionResetError:
+                        # Abrupt hang-up (RST instead of FIN) — the Go
+                        # driver's tools (mongodump, mongostat, ...) close
+                        # pooled connections this way routinely. A normal
+                        # disconnect, not an error worth a traceback.
+                        logger.debug("client %d reset connection", connection_id)
+                        return
                     except TimeoutError:
                         # Idle timeout fired — drop the connection so the
                         # thread can be reaped instead of pinned forever.
                         logger.debug("client %d idle timeout, closing", connection_id)
+                        return
+                    except OSError as exc:
+                        # The socket was closed / aborted under us — usually
+                        # ``stop()`` closing this connection to drain it (on
+                        # Windows that surfaces as ConnectionAbortedError /
+                        # BrokenPipeError, WinError 10053/10058), or the peer
+                        # hanging up abruptly. A clean disconnect, not a fault:
+                        # exit the loop so the handler thread is reaped.
+                        logger.debug("client %d connection closed: %s", connection_id, exc)
                         return
                     except MalformedBodyError as exc:
                         # Body bytes failed BSON validation. Build a
@@ -334,7 +548,10 @@ class SecantusDBServer:
                     op = message.op
                     try:
                         server_addr = self.address if self._socket is not None else None
-                    except RuntimeError:
+                    except (RuntimeError, OSError):
+                        # OSError: stop() closed the listen socket between
+                        # the None check and getsockname() — shutdown race,
+                        # treat the same as "not started".
                         server_addr = None
                     if isinstance(op, OpMsg):
                         body = _merge_op_msg_body(op)
@@ -352,6 +569,8 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            transactions=self.transactions,
+                            peer_cert_dn=peer_cert_dn,
                         )
                         try:
                             response_doc = dispatch(body, ctx)
@@ -374,6 +593,30 @@ class SecantusDBServer:
                         # connection with a responseTo/requestId mismatch.
                         if op.flags & OP_MSG_FLAG_MORE_TO_COME:
                             continue
+                        # OP_MSG exhaust: when the client sets the
+                        # `exhaustAllowed` flag on a getMore, the server
+                        # streams every remaining batch back over the same
+                        # socket using the `moreToCome` flag, instead of
+                        # waiting for a getMore per batch. mongod only
+                        # streams on getMore (the find/aggregate reply that
+                        # opens the cursor is sent normally), so we mirror
+                        # that — find replies fall through to the single
+                        # reply below.
+                        if (
+                            op.flags & OP_MSG_FLAG_EXHAUST_ALLOWED
+                            and "getMore" in body
+                            and isinstance(response_doc.get("cursor"), dict)
+                        ):
+                            if self._stream_exhaust_getmore(
+                                conn,
+                                message.header.request_id,
+                                reply_ids,
+                                body,
+                                ctx,
+                                response_doc,
+                            ):
+                                continue
+                            return
                         reply = build_op_msg_reply(
                             response_to=message.header.request_id,
                             request_id=next(reply_ids),
@@ -394,6 +637,8 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            transactions=self.transactions,
+                            peer_cert_dn=peer_cert_dn,
                         )
                         try:
                             response_doc = dispatch(op.query, ctx)
@@ -423,6 +668,15 @@ class SecantusDBServer:
             self.connections.close(connection_id)
             with self._active_conns_lock:
                 self._active_conns -= 1
+            # Release the WT session cached on this connection thread so
+            # the engine's session pool (default 1024) isn't leaked when
+            # client churn opens many short-lived connections. Without
+            # this, an aggressive driver pool (mongo-rust-driver's spec
+            # runners are the canonical case) saturates the pool after
+            # ~1k connections and every subsequent ``hello`` errors with
+            # ``WT_ERROR: out of sessions`` mid-handshake.
+            with contextlib.suppress(Exception):
+                self.storage._reset_thread_session()
             logger.debug("client %d disconnected", connection_id)
 
     def __enter__(self) -> Self:

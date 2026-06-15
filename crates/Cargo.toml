@@ -1,0 +1,51 @@
+# Cargo workspace for the SecantusDB Rust side:
+#   * secantus-core    — the pure-Rust operator engines (no PyO3). Publishable to
+#                        crates.io and reusable by a future standalone secantusdb
+#                        server binary.
+#   * secantus-core-py — the thin PyO3 bindings that wrap secantus-core and build
+#                        the `_secantus_core` abi3 extension (the `secantus-core`
+#                        Python wheel, via maturin). This is the package the
+#                        `secantus[rust]` extra pulls in.
+#   * secantus-wire    — pure-Rust MongoDB wire-protocol framing (R1 of the Rust
+#                        server, tasks/rust-server-plan.md). No PyO3, no native
+#                        deps beyond `bson`, so it builds in the same `rust` CI job.
+#   * secantus-commands — pure-Rust command dispatch + handlers (R2). Depends on
+#                        secantus-wire; no PyO3 / native deps, same `rust` CI job.
+#   * secantus-server  — the TCP accept/connection loop (R4), generic over the
+#                        command Storage trait. WT-free, runs over real TCP in the
+#                        same `rust` CI job; the WT adapter lands separately.
+#   * secantus-auth    — pure-Rust SCRAM-SHA-256 mechanism (R5). No PyO3 / native
+#                        deps; same `rust` CI job.
+[workspace]
+resolver = "2"
+members = [
+    "secantus-core",
+    "secantus-core-py",
+    "secantus-wire",
+    "secantus-commands",
+    "secantus-server",
+    "secantus-auth",
+]
+# secantus-wt (the WiredTiger FFI / storage foundation, Phase 4) is intentionally
+# NOT a workspace member yet: it links the vendored WiredTiger C library, which
+# isn't present in the maturin manylinux build containers or wired into the
+# default `cargo test`/`clippy` CI job. Keeping it excluded means the existing
+# `secantus-core` / `secantus-core-py` build + the green rust/rust-wheels CI are
+# untouched. It builds standalone (`cargo` invoked inside its dir); see its
+# README + tasks/rust-rewrite-phase4-scoping.md. Folding it into the shipped
+# wheel matrix is the phase's explicit go/no-go gate, handled later.
+exclude = [
+    "secantus-wt",
+    "secantus-storage",
+    "secantus-storage-py",
+    # R4b: links WiredTiger via secantus-storage, so it's excluded for the same
+    # reason — built / tested only where WiredTiger is available (rust-storage CI).
+    "secantus-storage-adapter",
+    # R6: the PyO3 embedded handle — links WiredTiger transitively, excluded too.
+    "secantus-server-py",
+    # R7: the standalone server binary — links WiredTiger transitively, excluded too.
+    "secantusdb",
+]
+
+[workspace.dependencies]
+bson = "2"

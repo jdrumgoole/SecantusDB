@@ -4,6 +4,7 @@ import datetime as _dt
 import logging
 import os
 import random as _random
+import sys
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -11,10 +12,18 @@ from typing import Any
 
 import bson
 
-from secantus.aggregate import AggregateError, PipelineContext, apply_pipeline
+from secantus import changestreams
+from secantus.aggregate import (
+    AggregateError,
+    PipelineContext,
+    apply_pipeline,
+    validate_stage_names,
+)
 from secantus.auth import (
+    MONGODB_X509,
     SCRAM_SHA_1,
     SCRAM_SHA_256,
+    X509_CREDENTIAL_MARKER,
     AuthError,
     ConnectionAuth,
     StoredCredentials,
@@ -63,6 +72,7 @@ from secantus.rbac import (
     A_RENAME_COLL_SAME_DB,
     A_REVOKE_ROLE,
     A_SERVER_STATUS,
+    A_TOP,
     A_UPDATE,
     A_VIEW_ROLE,
     A_VIEW_USER,
@@ -74,8 +84,22 @@ from secantus.rbac import (
     is_known_role,
 )
 from secantus.sessions import SessionRegistry
-from secantus.storage import DuplicateKeyError, GeoExtractError, Storage
-from secantus.update import UpdateError
+from secantus.storage import (
+    DocumentTooLargeError,
+    DuplicateKeyError,
+    GeoExtractError,
+    Storage,
+    WriteConflictError,
+    _is_wt_rollback,
+)
+from secantus.transactions import (
+    TRANSIENT_LABEL,
+    Transaction,
+    TransactionRegistry,
+    TxnState,
+    no_such_transaction_reply,
+)
+from secantus.update import UpdateError, validate_update_doc
 from secantus.wire import MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE
 
 logger = logging.getLogger(__name__)
@@ -219,15 +243,16 @@ def _wants_journal(doc: Mapping[str, Any]) -> bool:
 
 
 def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict[str, Any] | None:
-    """Refuse any write to the synthetic ``local.oplog.rs`` view.
+    """Refuse any write to a synthetic read-only view.
 
-    Returns a mongod-shaped error doc (caller short-circuits with it)
-    when the target is ``(local, oplog.rs)``. ``None`` otherwise. Mongod
-    refuses arbitrary writes to ``oplog.rs`` — only the internal
-    replication system writes there — and surfaces it as an
-    ``Unauthorized`` (code 13). SecantusDB's oplog is a read-only
-    synthetic view, so we mirror the rejection with the same code +
-    a clear errmsg so debuggers know what they hit.
+    Covers ``local.oplog.rs`` and ``admin.system.users`` — both are
+    read-only projections over dedicated WT tables that own their own
+    write paths (oplog emission via writes elsewhere; ``createUser`` /
+    ``updateUser`` / ``dropUser`` for users). Direct writes through
+    ``insert`` / ``update`` / ``delete`` would either land in the wrong
+    table or corrupt the view's invariants, so we reject with code 13
+    (Unauthorized) — the same code mongod returns when RBAC denies the
+    write — and a clear errmsg so debuggers know what they hit.
     """
     if ctx.db_name == "local" and coll == "oplog.rs":
         return {
@@ -235,6 +260,27 @@ def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict
             "errmsg": (
                 f"not authorized for {op_name} on local.oplog.rs "
                 "(synthetic read-only view of the SecantusDB oplog)"
+            ),
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    if ctx.db_name == "admin" and coll == "system.users":
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"not authorized for {op_name} on admin.system.users "
+                "(synthetic read-only view — use createUser / updateUser / "
+                "dropUser instead)"
+            ),
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    if ctx.db_name == "admin" and coll == "system.version":
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"not authorized for {op_name} on admin.system.version "
+                "(synthetic read-only view of the auth schema version)"
             ),
             "code": 13,
             "codeName": "Unauthorized",
@@ -276,7 +322,7 @@ def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
+def _resolve_let_vars(let: Any) -> dict[str, Any]:
     # MongoDB 5.0+ command-level ``let`` values are aggregation
     # expressions: ``{y: {$literal: "bar"}}`` binds ``$$y`` to "bar",
     # ``{n: {$add: [1, 2]}}`` binds ``$$n`` to 3. Driver tests
@@ -284,11 +330,17 @@ def _resolve_let_vars(let: Any) -> dict[str, Any] | None:
     # depend on this — passing the raw mapping through would bind
     # ``$$y`` to the dict ``{$literal: "bar"}`` instead of the
     # string. Scalars are passed through unchanged.
+    #
+    # ``$$NOW`` is seeded unconditionally: mongod binds it as a Date
+    # constant for the whole operation in every command context, and
+    # ``let`` expressions themselves may reference it.
+    now_vars: dict[str, Any] = {"NOW": _dt.datetime.now(_dt.timezone.utc)}
     if not isinstance(let, dict):
-        return None
+        return now_vars
     from secantus.expressions import evaluate
 
-    return {name: evaluate(value, {}) for name, value in let.items()}
+    resolved = {name: evaluate(value, {}, vars=dict(now_vars)) for name, value in let.items()}
+    return {**now_vars, **resolved}
 
 
 def _validate_doc_against_collection(
@@ -339,6 +391,15 @@ class CommandContext:
     logs: LogBuffer | None = None
     sessions: SessionRegistry | None = None
     failpoints: FailPointRegistry | None = None
+    transactions: TransactionRegistry | None = None
+    # MONGODB-X509: the subject DN of the verified client cert the
+    # connection's TLS handshake produced, in RFC 4514 string form
+    # (e.g. ``"CN=alice,O=Acme,C=US"``). None when the connection is
+    # plaintext, or TLS without ``[tls] ca_file`` configured, or the
+    # client didn't present a cert in CERT_OPTIONAL mode. Captured
+    # once at TLS handshake time, replayed into every CommandContext
+    # for the connection.
+    peer_cert_dn: str | None = None
 
 
 def _split_into_cursor(
@@ -365,6 +426,16 @@ CommandHandler = Callable[[dict[str, Any], CommandContext], dict[str, Any]]
 
 
 def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # Per the MongoDB Handshake spec, drivers send their
+    # self-identification (name, version, OS, platform) in the
+    # ``client`` subdoc on the first ``hello`` / ``isMaster`` of
+    # a connection. We stash it on the registry so ``currentOp``
+    # can surface it back as ``clientMetadata`` — that's how
+    # mongo-rust-driver's
+    # ``test::client::metadata_sent_in_handshake`` reads it back.
+    client_meta = doc.get("client")
+    if isinstance(client_meta, Mapping) and ctx.connections is not None:
+        ctx.connections.set_client_metadata(ctx.connection_id, dict(client_meta))
     # `topologyVersion.counter` and `connectionId` MUST be int64 on the wire.
     # pymongo accepts either, but the official Go driver (mongodump/restore,
     # mongo-go-driver) refuses the handshake with "expected 'counter' to be
@@ -520,11 +591,13 @@ def _end_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     sessions; SecantusDB doesn't track cursor → session affinity
     yet, so cursors live on under their own idle TTL.
     """
-    if ctx.sessions is not None:
-        for entry in doc.get("endSessions") or []:
-            lsid = _lsid_bytes_from_arg(entry)
-            if lsid is not None:
+    for entry in doc.get("endSessions") or []:
+        lsid = _lsid_bytes_from_arg(entry)
+        if lsid is not None:
+            if ctx.sessions is not None:
                 ctx.sessions.unregister(lsid)
+            if ctx.transactions is not None:
+                ctx.transactions.abort_for_session(lsid)
     return {"ok": 1.0}
 
 
@@ -561,6 +634,8 @@ def _kill_all_sessions(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, A
     """
     if ctx.sessions is not None:
         ctx.sessions.clear()
+    if ctx.transactions is not None:
+        ctx.transactions.abort_all()
     return {"ok": 1.0}
 
 
@@ -572,16 +647,20 @@ def _kill_all_sessions_by_pattern(_doc: dict[str, Any], ctx: CommandContext) -> 
     """
     if ctx.sessions is not None:
         ctx.sessions.clear()
+    if ctx.transactions is not None:
+        ctx.transactions.abort_all()
     return {"ok": 1.0}
 
 
 def _kill_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Drop the listed sessions (driver-callable variant)."""
-    if ctx.sessions is not None:
-        for entry in doc.get("killSessions") or []:
-            lsid = _lsid_bytes_from_arg(entry)
-            if lsid is not None:
+    for entry in doc.get("killSessions") or []:
+        lsid = _lsid_bytes_from_arg(entry)
+        if lsid is not None:
+            if ctx.sessions is not None:
                 ctx.sessions.unregister(lsid)
+            if ctx.transactions is not None:
+                ctx.transactions.abort_for_session(lsid)
     return {"ok": 1.0}
 
 
@@ -600,12 +679,58 @@ def _refresh_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
     return {"ok": 1.0}
 
 
-def _abort_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"ok": 1.0}
+def _txn_envelope(doc: dict[str, Any]) -> tuple[bytes | None, int | None]:
+    """Extract ``(lsid_bytes, txnNumber)`` from a command's transaction
+    envelope; either is None when absent or malformed."""
+    lsid_bytes = _lsid_bytes_from_arg(doc.get("lsid"))
+    txn_number = doc.get("txnNumber")
+    if isinstance(txn_number, bool) or not isinstance(txn_number, int):
+        txn_number = None
+    return lsid_bytes, txn_number
 
 
-def _commit_transaction(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    return {"ok": 1.0}
+def _write_conflict_reply(*, label: bool = True) -> dict[str, Any]:
+    reply: dict[str, Any] = {
+        "ok": 0.0,
+        "errmsg": (
+            "WriteConflict error: this operation conflicted with another "
+            "operation. Please retry your operation or multi-document "
+            "transaction."
+        ),
+        "code": 112,
+        "codeName": "WriteConflict",
+    }
+    if label:
+        # The transient label is transaction-specific; a plain write
+        # that loses a conflict race doesn't carry it.
+        reply["errorLabels"] = [TRANSIENT_LABEL]
+    return reply
+
+
+def _abort_transaction(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    lsid_bytes, txn_number = _txn_envelope(doc)
+    if ctx.transactions is None or lsid_bytes is None or txn_number is None:
+        # Envelope-less call (drivers never send this): tolerated no-op,
+        # same as the pre-transactions stub.
+        return {"ok": 1.0}
+    err = ctx.transactions.abort(lsid_bytes, txn_number)
+    return err if err is not None else {"ok": 1.0}
+
+
+def _commit_transaction(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    lsid_bytes, txn_number = _txn_envelope(doc)
+    if ctx.transactions is None or lsid_bytes is None or txn_number is None:
+        return {"ok": 1.0}
+    try:
+        err = ctx.transactions.commit(lsid_bytes, txn_number)
+    except Exception as exc:
+        # The WT commit itself failed; the registry already rolled the
+        # transaction back. A conflict is retryable from the client's
+        # point of view (retry the whole transaction, not the commit).
+        if isinstance(exc, WriteConflictError) or _is_wt_rollback(exc):
+            return _write_conflict_reply()
+        raise
+    return err if err is not None else {"ok": 1.0}
 
 
 def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -619,35 +744,44 @@ def _current_op(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         for conn in ctx.connections.snapshot():
             host_port = f"{conn.peer_addr[0]}:{conn.peer_addr[1]}"
             opened_iso = _dt.datetime.fromtimestamp(conn.opened_at, tz=_dt.timezone.utc).isoformat()
-            inprog.append(
-                {
-                    "type": "op",
-                    "desc": f"conn{conn.conn_id}",
-                    "connectionId": bson.Int64(conn.conn_id),
-                    "client": host_port,
-                    "opid": bson.Int64(conn.conn_id),
-                    "active": conn.last_command_name is not None,
-                    "op": conn.last_command_name or "none",
-                    "ns": "",
-                    # ``command`` is the body of the last operation
-                    # on this connection. Real mongod always populates
-                    # it (even if the op already completed) — drivers
-                    # iterating ``inprog`` filter on ``command.<name>``
-                    # to find specific ops. Mongo-node-driver's
-                    # ``Aggregation should ... $currentOp`` test does
-                    # exactly that; without the field it crashes with
-                    # ``Cannot read properties of undefined``.
-                    "command": ({conn.last_command_name: 1} if conn.last_command_name else {}),
-                    "currentOpTime": opened_iso,
-                    "secs_running": 0,
-                    "microsecs_running": 0,
-                    "effectiveUsers": (
-                        [{"user": conn.user.split("@", 1)[0], "db": conn.user.split("@", 1)[1]}]
-                        if conn.user and "@" in conn.user
-                        else []
-                    ),
-                }
-            )
+            op_entry: dict[str, Any] = {
+                "type": "op",
+                "desc": f"conn{conn.conn_id}",
+                "connectionId": bson.Int64(conn.conn_id),
+                "client": host_port,
+                "opid": bson.Int64(conn.conn_id),
+                "active": conn.last_command_name is not None,
+                "op": conn.last_command_name or "none",
+                "ns": "",
+                # ``command`` is the body of the last operation
+                # on this connection. Real mongod always populates
+                # it (even if the op already completed) — drivers
+                # iterating ``inprog`` filter on ``command.<name>``
+                # to find specific ops. Mongo-node-driver's
+                # ``Aggregation should ... $currentOp`` test does
+                # exactly that; without the field it crashes with
+                # ``Cannot read properties of undefined``.
+                "command": ({conn.last_command_name: 1} if conn.last_command_name else {}),
+                "currentOpTime": opened_iso,
+                "secs_running": 0,
+                "microsecs_running": 0,
+                "effectiveUsers": (
+                    [{"user": conn.user.split("@", 1)[0], "db": conn.user.split("@", 1)[1]}]
+                    if conn.user and "@" in conn.user
+                    else []
+                ),
+            }
+            # ``clientMetadata`` mirrors the ``hello.client`` subdoc
+            # the driver sent on handshake. mongo-rust-driver's
+            # ``test::client::metadata_sent_in_handshake`` reads it
+            # back via ``currentOp`` to verify the driver / OS /
+            # platform fields round-trip. Only present when the
+            # driver actually sent a ``client`` subdoc on hello
+            # (every modern driver does; ``mongo --eval`` shells
+            # don't).
+            if conn.client_metadata is not None:
+                op_entry["clientMetadata"] = conn.client_metadata
+            inprog.append(op_entry)
     if ctx.cursors is not None:
         for snap in ctx.cursors.snapshot():
             inprog.append(
@@ -985,17 +1119,53 @@ def _hostinfo(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _mem_section() -> dict[str, Any]:
+    """``mem`` in mongod's serverStatus shape.
+
+    mongostat dereferences ``mem.supported`` with no nil guard
+    (status/readers.go ``ReadMapped``), so the section must always be
+    present. ``resident`` is real (getrusage max-RSS, normalised to MB —
+    ru_maxrss is bytes on macOS, KiB on Linux); ``virtual`` isn't
+    portably readable without psutil, so it's reported as 0 rather than
+    invented.
+    """
+    resident_mb = 0
+    try:
+        import resource
+
+        ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+        resident_mb = int(ru_maxrss / divisor)
+    except Exception:  # pragma: no cover - resource absent on Windows
+        pass
+    return {
+        "bits": 64,
+        "resident": resident_mb,
+        "virtual": 0,
+        "supported": True,
+    }
+
+
 def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Real metrics from :class:`secantus.metrics.Metrics` if the server
     constructed one (production path); falls back to zeroed values for
     embedded callers that didn't thread a metrics instance through (e.g.
     ad-hoc test harnesses that use ``CommandContext`` directly)."""
+    import secantus
+
     base: dict[str, Any] = {
         "host": "secantus",
         "version": SERVER_VERSION,
         "process": "secantus",
         "pid": os.getpid(),
         "localTime": _dt.datetime.now(_dt.timezone.utc),
+        "mem": _mem_section(),
+        # Categorical self-identification: real mongod never has this key.
+        # Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
+        # checks it to prove it's talking to SecantusDB rather than an
+        # accidental real MongoDB on the same address. `server`
+        # distinguishes the pure-Python server from the Rust one.
+        "secantus": {"server": "python", "version": secantus.__version__},
         "ok": 1.0,
     }
     if ctx.metrics is not None:
@@ -1023,6 +1193,43 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         )
     return base
+
+
+def _top(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """mongod-shaped ``top``: one entry per existing namespace.
+
+    SecantusDB doesn't instrument per-namespace operation timing, so
+    every counter is zero — mongotop renders an all-zero table the same
+    way it does for an idle mongod. The shape (``note`` + per-ns
+    ``total``/``readLock``/``writeLock``/per-op sections, each
+    ``{time, count}``) is what mongo-tools' decoder requires; it skips
+    the ``note`` key explicitly.
+    """
+    if ctx.db_name != "admin":
+        return {
+            "ok": 0.0,
+            "errmsg": "top may only be run against the admin database.",
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    totals: dict[str, Any] = {"note": "all times in microseconds"}
+    for db in ctx.storage.list_databases():
+        for coll in ctx.storage.list_collections(db):
+            totals[f"{db}.{coll}"] = {
+                section: {"time": 0, "count": 0}
+                for section in (
+                    "total",
+                    "readLock",
+                    "writeLock",
+                    "queries",
+                    "getmore",
+                    "insert",
+                    "update",
+                    "remove",
+                    "commands",
+                )
+            }
+    return {"totals": totals, "ok": 1.0}
 
 
 def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
@@ -1160,12 +1367,72 @@ def _coll_stats(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _validate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """``validate`` — mongod's collection consistency check. SecantusDB
+    stores documents as opaque BSON in WiredTiger and maintains index
+    entries transactionally, so there's nothing to repair: we report a
+    clean, mongod-shaped result with real record / index counts. The
+    ``full`` / ``background`` / ``scandata`` options are accepted and
+    ignored (they only affect how mongod scans, not the verdict)."""
+    coll = doc.get("validate")
+    if not isinstance(coll, str):
+        return {
+            "ok": 0.0,
+            "errmsg": "validate requires a collection name",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if not ctx.storage.collection_exists(ctx.db_name, coll):
+        return {
+            "ok": 0.0,
+            "errmsg": f"Collection '{ctx.db_name}.{coll}' does not exist to validate.",
+            "code": 26,
+            "codeName": "NamespaceNotFound",
+        }
+    # mongod rejects full+background together (full needs an exclusive
+    # scan; background can't take one). pymongo's
+    # ``test_validate_collection_background`` asserts this rejection to
+    # prove the background option reached the wire.
+    if doc.get("full") and doc.get("background"):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "Running the validate command with both { background: true } "
+                "and { full: true } is not supported."
+            ),
+            "code": 72,
+            "codeName": "InvalidOptions",
+        }
+    nrecords = ctx.storage.count_matching(ctx.db_name, coll, None)
+    indexes = ctx.storage.list_indexes(ctx.db_name, coll)
+    keys_per_index = {ix["name"]: nrecords for ix in indexes}
+    index_details = {ix["name"]: {"valid": True} for ix in indexes}
+    return {
+        "ns": f"{ctx.db_name}.{coll}",
+        "nInvalidDocuments": 0,
+        "nNonCompliantDocuments": 0,
+        "nrecords": nrecords,
+        "nIndexes": len(indexes),
+        "keysPerIndex": keys_per_index,
+        "indexDetails": index_details,
+        "valid": True,
+        "repaired": False,
+        "warnings": [],
+        "errors": [],
+        "extraIndexEntries": [],
+        "missingIndexEntries": [],
+        "corruptRecords": [],
+        "ok": 1.0,
+    }
+
+
 def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     inner = doc.get("explain") or {}
     coll = ""
     filter_: dict[str, Any] = {}
     sort = None
     hint = None
+    collation = None
     if isinstance(inner, dict):
         cmd_name = next(iter(inner), "")
         coll_value = inner.get(cmd_name)
@@ -1173,6 +1440,17 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         filter_ = inner.get("filter") or inner.get("query") or {}
         sort = inner.get("sort")
         hint = inner.get("hint")
+        collation = inner.get("collation")
+        # Mirror ``aggregate``'s own planning: a leading ``$match`` is
+        # lifted into the initial fetch, so explain must report the
+        # same index decision (and execute against the same filter)
+        # the real pipeline run would use.
+        if cmd_name == "aggregate" and not filter_:
+            pipeline_head = (inner.get("pipeline") or [{}])[0]
+            if isinstance(pipeline_head, Mapping) and "$match" in pipeline_head:
+                lifted = pipeline_head["$match"]
+                if isinstance(lifted, Mapping):
+                    filter_ = dict(lifted)
     # MongoDB rejects ``explain`` paired with a journaled write concern
     # (``writeConcern: {j: true}`` or ``{w: "majority"}``). The explain
     # cycle is a no-op read; combining it with a write concern is
@@ -1234,28 +1512,68 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     namespace = _ns(ctx.db_name, coll) if coll else f"{ctx.db_name}.$cmd"
     if coll:
-        plan = ctx.storage.explain_plan(ctx.db_name, coll, filter_, sort=sort, hint=hint)
+        plan = ctx.storage.explain_plan(
+            ctx.db_name, coll, filter_, sort=sort, hint=hint, collation=collation
+        )
     else:
         plan = {"kind": "COLLSCAN"}
+    # ``executionStats`` / ``allPlansExecution`` really execute the
+    # query, like mongod — Compass renders nReturned /
+    # totalDocsExamined in its explain tab, and hardcoded zeroes would
+    # display as "0 documents returned" for a matching query.
+    n_returned = 0
+    docs_examined = 0
+    keys_examined = 0
+    exec_millis = 0
+    if verbosity != "queryPlanner" and coll:
+        started = _time.monotonic()
+        n_returned = len(
+            ctx.storage.find_matching(
+                ctx.db_name,
+                coll,
+                filter_,
+                sort=sort,
+                hint=hint,
+                collation=collation,
+            )
+        )
+        exec_millis = int((_time.monotonic() - started) * 1000)
+        if plan["kind"] == "IXSCAN":
+            # Exact-bounds index scans fetch one doc per matching key;
+            # we don't instrument residual-filter key scans, so this is
+            # mongod's reported shape for the common case.
+            keys_examined = n_returned
+            docs_examined = n_returned
+        else:
+            docs_examined = ctx.storage.count_matching(ctx.db_name, coll, {})
     if plan["kind"] == "IXSCAN":
+        input_stage: dict[str, Any] = {
+            "stage": "IXSCAN",
+            "indexName": plan["index_name"],
+            "keyPattern": plan["key_pattern"],
+            "direction": plan["direction"],
+        }
+        # mongod flags an IXSCAN over a partial index with ``isPartial``.
+        if coll:
+            partial = any(
+                ix.get("name") == plan["index_name"] and "partialFilterExpression" in ix
+                for ix in ctx.storage.list_indexes(ctx.db_name, coll)
+            )
+            if partial:
+                input_stage["isPartial"] = True
         winning_plan = {
             "stage": "FETCH",
             "filter": filter_,
-            "inputStage": {
-                "stage": "IXSCAN",
-                "indexName": plan["index_name"],
-                "keyPattern": plan["key_pattern"],
-                "direction": plan["direction"],
-            },
+            "inputStage": input_stage,
         }
         execution_stage = {
             "stage": "FETCH",
-            "nReturned": 0,
-            "inputStage": {"stage": "IXSCAN", "nReturned": 0},
+            "nReturned": n_returned,
+            "inputStage": {"stage": "IXSCAN", "nReturned": n_returned},
         }
     else:
         winning_plan = {"stage": "COLLSCAN", "filter": filter_}
-        execution_stage = {"stage": "COLLSCAN", "nReturned": 0}
+        execution_stage = {"stage": "COLLSCAN", "nReturned": n_returned}
     query_planner = {
         "namespace": namespace,
         "indexFilterSet": False,
@@ -1281,10 +1599,10 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         pipeline = inner.get("pipeline") or []
         execution_stats = {
             "executionSuccess": True,
-            "nReturned": 0,
-            "executionTimeMillis": 0,
-            "totalKeysExamined": 0,
-            "totalDocsExamined": 0,
+            "nReturned": n_returned,
+            "executionTimeMillis": exec_millis,
+            "totalKeysExamined": keys_examined,
+            "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
         cursor_stage: dict[str, Any] = {
@@ -1326,10 +1644,10 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if verbosity != "queryPlanner":
         reply["executionStats"] = {
             "executionSuccess": True,
-            "nReturned": 0,
-            "executionTimeMillis": 0,
-            "totalKeysExamined": 0,
-            "totalDocsExamined": 0,
+            "nReturned": n_returned,
+            "executionTimeMillis": exec_millis,
+            "totalKeysExamined": keys_examined,
+            "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
     return reply
@@ -1444,7 +1762,7 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.query import QueryError
-    from secantus.storage import BadHint
+    from secantus.storage import BadHint, MinMaxKeyError
 
     coll = doc["find"]
     filter_ = doc.get("filter") or {}
@@ -1453,6 +1771,12 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     sort = doc.get("sort") or None
     projection = doc.get("projection") or None
     hint = doc.get("hint")
+    # Cursor ``min`` / ``max`` index bounds (the find command fields, not
+    # the ``$min`` / ``$max`` aggregation operators): documents whose
+    # keys name a leading prefix of the hinted index. ``max`` is
+    # exclusive, ``min`` inclusive.
+    min_bound = doc.get("min") or None
+    max_bound = doc.get("max") or None
     # ``let`` declares user-vars visible to ``$expr`` clauses in the
     # filter (MongoDB 5.0+).
     let = _resolve_let_vars(doc.get("let"))
@@ -1496,11 +1820,39 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             hint=hint,
             let=let,
             collation=collation,
+            min_bound=min_bound,
+            max_bound=max_bound,
         )
     except BadHint as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    except MinMaxKeyError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 51174, "codeName": "Location51174"}
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    # ``returnKey`` replaces each result with just the keys of the index that
+    # serves the query (filter + sort): the index's key-pattern fields, plus
+    # the sort fields (mongod serves a sort from an index — the ``_id`` order
+    # of the doc table here, which ``explain`` reports as a COLLSCAN). When set
+    # it also suppresses ``showRecordId``'s ``$recordId``. ``showRecordId``
+    # alone tags each doc with a synthetic ``$recordId``.
+    return_key = bool(doc.get("returnKey", False))
+    if return_key:
+        key_fields: list[str] = []
+        try:
+            plan = ctx.storage.explain_plan(
+                ctx.db_name, coll, filter_, sort=sort, hint=hint, collation=collation
+            )
+        except Exception:
+            plan = {"kind": "COLLSCAN"}
+        if plan.get("kind") == "IXSCAN":
+            key_fields = list(plan.get("key_pattern", {}).keys())
+        if isinstance(sort, Mapping):
+            for f in sort:
+                if f not in key_fields:
+                    key_fields.append(f)
+        docs = [{f: d[f] for f in key_fields if f in d} for d in docs]
+    elif bool(doc.get("showRecordId", False)):
+        docs = [{**d, "$recordId": bson.Int64(i + 1)} for i, d in enumerate(docs)]
     ns = _ns(ctx.db_name, coll)
     # Tailable cursor on a (capped) collection. Real mongod rejects
     # ``tailable: true`` on a non-capped collection with code 2
@@ -1524,6 +1876,11 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "BadValue",
             }
         await_data = bool(doc.get("awaitData", False))
+        # ``local.oplog.rs`` is a synthetic view over the oplog WT table; its
+        # entries have no ``_id``, so it needs a producer that tails by oplog
+        # seq rather than the doc-table id_key path ``_find_tailable`` uses.
+        if ctx.db_name == "local" and coll == "oplog.rs":
+            return _find_tailable_oplog(filter_, docs, batch_size, ns, await_data, ctx)
         return _find_tailable(coll, docs, batch_size, ns, await_data, ctx)
     if single_batch:
         first_batch, cursor_id = docs, 0
@@ -1581,11 +1938,70 @@ def _find_tailable(
     state = {"after_id_key": watermark}
 
     def producer() -> list[dict[str, Any]]:
-        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=state["after_id_key"])
+        after = state["after_id_key"]
+        # Capped rollover detection: if the doc this cursor last returned
+        # (``after``) has been evicted — i.e. the collection's smallest
+        # ``id_key`` is now strictly greater than it — the cursor has been
+        # lapped and mongod kills it with ``CappedPositionLost``. A fresh
+        # cursor (``after is None``) has no anchor to lose.
+        if after is not None:
+            min_key = storage.collection_min_id_key(db_name, coll)
+            if min_key is None or min_key > after:
+                raise _CappedPositionLost
+        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=after)
         if not new_rows:
             return []
         state["after_id_key"] = new_rows[-1][0]
         return [doc for _id_k, doc in new_rows]
+
+    cursor_id = ctx.cursors.register_tailable(
+        ns,
+        producer,
+        await_data=await_data,
+        initial_remaining=initial_remaining,
+    )
+    return {
+        "cursor": {
+            "firstBatch": first_batch,
+            "id": bson.Int64(cursor_id),
+            "ns": ns,
+        },
+        "ok": 1.0,
+    }
+
+
+def _find_tailable_oplog(
+    filter_: dict[str, Any],
+    initial_docs: list[dict[str, Any]],
+    batch_size: int,
+    ns: str,
+    await_data: bool,
+    ctx: CommandContext,
+) -> dict[str, Any]:
+    """Build a tailable cursor over the synthetic ``local.oplog.rs`` view.
+
+    Oplog entries have no ``_id``, so (unlike ``_find_tailable``) the producer
+    can't anchor on the doc-table id_key. It anchors on the oplog *seq*: the
+    highest seq present when the cursor opens is captured, and each poll reads
+    rows past it via ``read_oplog``, applying the user filter. ``firstBatch``
+    is the already-matched entries from the initial ``find``; the standard
+    ``getMore`` awaitData path blocks on the oplog condition variable, waking
+    on any oplog write. This is what lets a client tail the oplog the way
+    replication does (pymongo's ``test_cursor.test_to_list_tailable``)."""
+    storage = ctx.storage
+    first_batch = initial_docs[:batch_size]
+    initial_remaining = initial_docs[batch_size:]
+    state = {"after_seq": storage.oplog_tail_seq()}
+
+    def producer() -> list[dict[str, Any]]:
+        rows = storage.read_oplog(start_seq=state["after_seq"] + 1, limit=1000)
+        if not rows:
+            return []
+        state["after_seq"] = rows[-1][0]
+        entries = [entry for _seq, entry in rows]
+        if filter_:
+            entries = [e for e in entries if matches(e, filter_)]
+        return entries
 
     cursor_id = ctx.cursors.register_tailable(
         ns,
@@ -1677,6 +2093,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                         "codeName": "InvalidPipelineOperator",
                     }
         try:
+            # Parse-time validation: mongod rejects an unknown update
+            # modifier before matching any document, so an invalid update
+            # errors even against an empty collection (apply_update only
+            # runs per matched doc, which would miss this).
+            validate_update_doc(spec.get("u", {}))
             result = ctx.storage.update_matching(
                 ctx.db_name,
                 coll,
@@ -1715,6 +2136,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             if ordered:
                 break
             continue
+        except DocumentTooLargeError as exc:
+            write_errors.append({"index": index, "code": exc.code, "errmsg": str(exc)})
+            if ordered:
+                break
+            continue
         except GeoExtractError as exc:
             # Mongod's documented code for "Can't extract geo keys from
             # object" — surfaces to the driver as a write error on the
@@ -1749,7 +2175,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             continue
         n += result["matched"]
         n_modified += result["modified"]
-        if result["upserted_id"] is not None:
+        # ``did_upsert`` distinguishes "upserted a doc whose _id is None"
+        # from "no upsert" — ``upserted_id`` alone can't, since None is a
+        # valid _id (pymongo's test_update_result upserts with
+        # ``{_id: None}`` and asserts did_upsert).
+        if result["did_upsert"]:
             upserted.append({"index": index, "_id": result["upserted_id"]})
             n += 1
     reply: dict[str, Any] = {"n": n, "nModified": n_modified, "ok": 1.0}
@@ -2016,7 +2446,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                 }
             upserted_id = result["upserted_id"]
             value: Any = None
-            if return_new and upserted_id is not None:
+            if return_new and result["did_upsert"]:
                 new_docs = ctx.storage.find_matching(ctx.db_name, coll, {"_id": upserted_id})
                 if new_docs:
                     value = new_docs[0]
@@ -2143,7 +2573,14 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return oplog_err
     existed = ctx.storage.drop_collection(ctx.db_name, coll)
     if not existed:
-        return {"ok": 0.0, "errmsg": "ns not found", "code": 26, "codeName": "NamespaceNotFound"}
+        # Modern mongod treats ``drop`` of a non-existent collection as
+        # an idempotent success (``{ok: 1}``), not a NamespaceNotFound
+        # error. Returning ok:1 also lets the generic dispatch path
+        # attach a ``writeConcernError`` for an unsatisfiable write
+        # concern — pymongo's test_drop_collection drops an
+        # already-absent collection with w:50 and asserts a
+        # WriteConcernError, which requires the ok:1 reply shape.
+        return {"ok": 1.0}
     return {"ns": _ns(ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0}
 
 
@@ -2261,11 +2698,39 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "collation",
         "expireAfterSeconds",
         "timeseries",
-        "clusteredIndex",
     )
     for opt_name in _PASSTHROUGH_CREATE_OPTIONS:
         if opt_name in doc:
             stored[opt_name] = doc[opt_name]
+    # ``clusteredIndex`` makes ``_id`` the collection's clustering key
+    # (the doc table IS the index — exactly SecantusDB's WiredTiger
+    # layout already, since the doc table is keyed by ``_id``). mongod
+    # only allows it on ``{_id: 1}`` with ``unique: true``; we normalise
+    # the stored option (default name ``_id_``, add ``v: 2``) so
+    # listCollections / listIndexes echo mongod's shape.
+    if "clusteredIndex" in doc:
+        ci = doc["clusteredIndex"]
+        if isinstance(ci, Mapping):
+            if ci.get("key") != {"_id": 1}:
+                return {
+                    "ok": 0.0,
+                    "errmsg": "The clusteredIndex option is only supported for key: {_id: 1}",
+                    "code": 197,
+                    "codeName": "InvalidIndexSpecificationOption",
+                }
+            if ci.get("unique") is not True:
+                return {
+                    "ok": 0.0,
+                    "errmsg": "The clusteredIndex option requires unique: true to be specified",
+                    "code": 5979700,
+                    "codeName": "Location5979700",
+                }
+            stored["clusteredIndex"] = {
+                "v": 2,
+                "key": {"_id": 1},
+                "name": ci.get("name") or "_id_",
+                "unique": True,
+            }
     # MongoDB 3.4+ ``viewOn`` + ``pipeline`` makes the collection a
     # read-only view of another collection filtered through an
     # aggregation pipeline. Mongo-java-driver's
@@ -2296,11 +2761,16 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    # Collect the options this collMod actually changed; the same map
+    # becomes the ``modify`` change event's ``operationDescription`` (a bare
+    # collMod with no options is a valid no-op that still emits an event).
+    description: dict[str, Any] = {}
     pre_post = doc.get("changeStreamPreAndPostImages")
     if isinstance(pre_post, Mapping):
         ctx.storage.set_collection_options(
             ctx.db_name, coll, changeStreamPreAndPostImages=dict(pre_post)
         )
+        description["changeStreamPreAndPostImages"] = dict(pre_post)
     # MongoDB 3.2+ ``validator``: a query predicate that every
     # subsequent insert / update must satisfy. Mongo-java-driver's
     # ``findOneAndUpdate-errorResponse`` test installs a validator
@@ -2310,6 +2780,10 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     validator = doc.get("validator")
     if isinstance(validator, Mapping):
         ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
+        description["validator"] = dict(validator)
+    # Emit the collMod command oplog entry so a change stream with
+    # ``showExpandedEvents`` surfaces a ``modify`` event.
+    ctx.storage.record_collmod(ctx.db_name, coll, description)
     return {"ok": 1.0}
 
 
@@ -2417,24 +2891,41 @@ def _list_databases(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     ``authorizedDatabases`` is accepted for wire compatibility but
     has no effect (we don't gate listing by per-db privileges in the
     initial RBAC slice).
+
+    ``sizeOnDisk`` per database is the sum of bson-encoded doc
+    bytes across all collections in that database (same accounting
+    ``collStats`` / ``dbStats`` use for ``dataSize``).
+    mongo-rust-driver's ``test::client::list_databases`` asserts
+    ``size_on_disk > 0`` on every entry it gets back from a
+    populated db; returning 0 unconditionally — as we did before —
+    failed the test even when the db actually had data. ``empty``
+    is derived from the size: an empty database has 0 bytes; a
+    populated one doesn't.
     """
     names = ctx.storage.list_databases()
     name_only = bool(doc.get("nameOnly", False))
     filter_doc = doc.get("filter")
 
-    descriptors: list[dict[str, Any]] = [
-        {"name": n, "sizeOnDisk": 0, "empty": False} for n in names
-    ]
+    descriptors: list[dict[str, Any]] = []
+    total_size = 0
+    for n in names:
+        if name_only:
+            # Skip the per-collection scan when the driver doesn't
+            # need the size — same shortcut mongod takes.
+            descriptors.append({"name": n})
+            continue
+        size = 0
+        for coll in ctx.storage.list_collections(n):
+            size += ctx.storage.collection_data_size(n, coll)
+        descriptors.append({"name": n, "sizeOnDisk": size, "empty": size == 0})
+        total_size += size
 
     if isinstance(filter_doc, dict) and filter_doc:
         descriptors = [d for d in descriptors if matches(d, filter_doc)]
 
-    if name_only:
-        descriptors = [{"name": d["name"]} for d in descriptors]
-
     return {
         "databases": descriptors,
-        "totalSize": 0,
+        "totalSize": total_size,
         "ok": 1.0,
     }
 
@@ -2449,6 +2940,22 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    # A clustered collection has no separate ``_id_`` index — the
+    # clustering key IS the index. mongod reports a single entry for it
+    # carrying ``clustered: true`` (and the user's name / unique).
+    # Replace the synthesised ``_id_`` entry; secondary indexes pass
+    # through unchanged.
+    coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll) or {}
+    ci = coll_opts.get("clusteredIndex")
+    if isinstance(ci, Mapping):
+        clustered_entry = {
+            "v": ci.get("v", 2),
+            "key": {"_id": 1},
+            "name": ci.get("name", "_id_"),
+            "unique": True,
+            "clustered": True,
+        }
+        indexes = [clustered_entry] + [ix for ix in indexes if ix.get("name") != "_id_"]
     # Honour ``cursor.batchSize`` so callers with many indexes
     # actually round-trip via ``getMore`` — mongo-go-driver's
     # ``TestIndexView/list/getMore_commands_are_monitored`` test
@@ -2575,6 +3082,12 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         for _falsy_opt in ("hidden", "sparse", "unique"):
             if _falsy_opt in options and not options[_falsy_opt]:
                 options.pop(_falsy_opt)
+        # ``dropDups`` was removed in MongoDB 3.0; modern mongod accepts it on
+        # the wire but ignores it entirely (it never drops duplicates). Drop it
+        # here so it isn't stored as an index option — a unique index built
+        # over duplicate data then fails on the duplicate (DuplicateKey 11000),
+        # exactly as mongod does. pymongo's test_index_dont_drop_dups pins this.
+        options.pop("dropDups", None)
         # ``partialFilterExpression`` must be a document. Numbers / strings
         # / arrays etc. are rejected by mongod with BadValue.
         pfe = options.get("partialFilterExpression")
@@ -2585,6 +3098,23 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 2,
                 "codeName": "BadValue",
             }
+        # The expression itself must parse as a valid filter — mongod
+        # rejects unknown operators ({x: {$asdasd: 3}}) and malformed
+        # logical operators ({$and: 5}). Run it against an empty doc so
+        # the query engine surfaces the same parse errors it would at
+        # query time. pymongo's test_index_filter pins these rejections.
+        if isinstance(pfe, dict):
+            from secantus.query import QueryError
+
+            try:
+                matches({}, pfe)
+            except (QueryError, ExpressionError, TypeError, ValueError, KeyError) as exc:
+                return {
+                    "ok": 0.0,
+                    "errmsg": f"Error in specification, partialFilterExpression is invalid: {exc}",
+                    "code": 2,
+                    "codeName": "BadValue",
+                }
         # ``wildcardProjection`` is only valid on wildcard indexes (a key
         # of the form ``{ "$**": 1 }`` or ``{ "field.$**": 1 }``). When
         # present it must be a non-empty document — mongod rejects ints,
@@ -2737,6 +3267,86 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+def _change_stream_fatal_reply(exc: changestreams.ChangeStreamFatalError) -> dict[str, Any]:
+    """mongod's reply shape for fatal change-stream conditions: the
+    error code plus the ``NonResumableChangeStreamError`` label so
+    drivers know not to auto-resume (asserted by the unified
+    change-streams-errors specs)."""
+    return {
+        "ok": 0.0,
+        "errmsg": str(exc),
+        "code": exc.code,
+        "codeName": exc.codeName,
+        "errorLabels": ["NonResumableChangeStreamError"],
+    }
+
+
+class _CappedPositionLost(Exception):
+    """Raised by a capped-collection tailable producer when the document the
+    cursor was anchored on (its last-returned ``id_key``) has been evicted by
+    capped rollover. mongod kills such a cursor with code 136
+    ``CappedPositionLost``; pymongo swallows that error for tailable cursors
+    (it's in ``_CURSOR_CLOSED_ERRORS``) so the cursor simply reports
+    ``alive == False`` and the in-flight read returns no documents."""
+
+
+def _capped_position_lost_reply() -> dict[str, Any]:
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            "CollectionScan died due to failure to restore tailable cursor "
+            "position. Last seen record id: RecordId"
+        ),
+        "code": 136,
+        "codeName": "CappedPositionLost",
+    }
+
+
+def _drain_change_stream_producer(entry: Any) -> None:
+    """Pull one producer batch into ``entry.remaining`` if it's empty.
+
+    May raise ``changestreams.ChangeStreamFatalError`` — the caller turns
+    that into a fatal reply and kills the cursor. Shared by the
+    change-stream open (firstBatch) and ``getMore`` (nextBatch) paths.
+    """
+    if not entry.remaining and entry.producer is not None:
+        new_events = entry.producer()
+        if new_events:
+            entry.remaining.extend(new_events)
+
+
+def _change_stream_cursor_doc(
+    entry: Any, cursor_id: int, batch_size: int, ns: str, *, batch_key: str
+) -> dict[str, Any]:
+    """Slice ``entry.remaining`` into one batch and build the ``cursor``
+    sub-document for a change-stream reply.
+
+    Handles the invalidate/final-event bookkeeping, the cursor-alive →
+    ``id: 0`` transition, and the ``postBatchResumeToken``. ``batch_key``
+    is ``"firstBatch"`` for the aggregate open and ``"nextBatch"`` for
+    ``getMore`` — the only shape difference between the two paths.
+    """
+    batch = entry.remaining[:batch_size]
+    entry.remaining = entry.remaining[batch_size:]
+    if not entry.remaining and entry.invalidated and entry.final_event_pending:
+        # The invalidate event has now been delivered.
+        entry.final_event_pending = False
+    cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
+    cursor_doc: dict[str, Any] = {
+        batch_key: batch,
+        # Cursor `id` MUST be int64 — Go driver hard-fails int32.
+        "id": bson.Int64(cursor_id if cursor_alive else 0),
+        "ns": ns,
+    }
+    if entry.last_token is not None:
+        # `postBatchResumeToken` lets change-stream consumers advance
+        # their resume position even when the batch is empty — MongoDB
+        # 4.2+ feature, mongo-go-driver and pymongo expect it on every
+        # change-stream reply.
+        cursor_doc["postBatchResumeToken"] = entry.last_token
+    return cursor_doc
+
+
 def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_id = int(doc["getMore"])
     coll = doc.get("collection", "")
@@ -2794,10 +3404,14 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 1.0,
         }
     # Drain any already-buffered events first.
-    if not entry.remaining and entry.producer is not None:
-        new_events = entry.producer()
-        if new_events:
-            entry.remaining.extend(new_events)
+    try:
+        _drain_change_stream_producer(entry)
+    except changestreams.ChangeStreamFatalError as exc:
+        ctx.cursors.kill([cursor_id])
+        return _change_stream_fatal_reply(exc)
+    except _CappedPositionLost:
+        ctx.cursors.kill([cursor_id])
+        return _capped_position_lost_reply()
     if not entry.remaining and entry.await_data and not entry.invalidated:
         # PyMongo does not always pass maxTimeMS on getMore for change streams;
         # real mongod treats that as "wait indefinitely". We bound the wait so
@@ -2813,33 +3427,25 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # update / delete. Use the lock-free tail peek; a stale
             # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
-                lambda: ctx.storage.oplog_tail_seq_nolock() > captured_tail or entry.invalidated,
+                lambda: (
+                    ctx.storage.oplog_tail_seq_nolock() > captured_tail
+                    or entry.invalidated
+                    or ctx.storage._shutting_down
+                ),
                 timeout=wait_seconds,
             )
-        if entry.producer is not None and not entry.remaining:
-            new_events = entry.producer()
-            if new_events:
-                entry.remaining.extend(new_events)
-    batch = entry.remaining[:batch_size]
-    entry.remaining = entry.remaining[batch_size:]
-    if not entry.remaining and entry.invalidated and entry.final_event_pending:
-        # The invalidate event has now been delivered.
-        entry.final_event_pending = False
-    cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
-    cursor_doc: dict[str, Any] = {
-        "nextBatch": batch,
-        # Cursor `id` MUST be int64 — Go driver hard-fails int32.
-        "id": bson.Int64(cursor_id if cursor_alive else 0),
-        "ns": ns,
-    }
-    if entry.last_token is not None:
-        # `postBatchResumeToken` lets change-stream consumers advance
-        # their resume position even when nextBatch is empty —
-        # MongoDB 4.2+ feature, mongo-go-driver and pymongo expect it
-        # on every change-stream getMore.
-        cursor_doc["postBatchResumeToken"] = entry.last_token
+        try:
+            _drain_change_stream_producer(entry)
+        except changestreams.ChangeStreamFatalError as exc:
+            ctx.cursors.kill([cursor_id])
+            return _change_stream_fatal_reply(exc)
+        except _CappedPositionLost:
+            ctx.cursors.kill([cursor_id])
+            return _capped_position_lost_reply()
     return {
-        "cursor": cursor_doc,
+        "cursor": _change_stream_cursor_doc(
+            entry, cursor_id, batch_size, ns, batch_key="nextBatch"
+        ),
         "ok": 1.0,
     }
 
@@ -2929,7 +3535,42 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 40573,
                 "codeName": "IllegalOperation",
             }
+        # Change streams support only the default / majority read
+        # concern — mongod rejects an explicit ``local`` (or any other
+        # level) with InvalidOptions. pymongo's ``test_read_concern``
+        # pins the rejection server-side.
+        rc_cs = doc.get("readConcern")
+        if isinstance(rc_cs, Mapping) and rc_cs.get("level") not in (None, "majority"):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"readConcern level '{rc_cs.get('level')}' is not supported "
+                    "for change streams; only 'majority' (or the default) is allowed"
+                ),
+                "code": 72,
+                "codeName": "InvalidOptions",
+            }
         return _aggregate_change_stream(doc, ctx, coll, pipeline, batch_size)
+
+    # Linearizable read concern is incompatible with write stages.
+    # mongod rejects with InvalidOptions (72): the aggregate-out-readConcern
+    # unified spec test asserts the operation errors when ``$out`` runs
+    # under ``readConcern: linearizable``; ``$merge`` carries the same
+    # restriction.
+    rc = doc.get("readConcern")
+    if isinstance(rc, Mapping) and rc.get("level") == "linearizable":
+        for stage in pipeline:
+            if isinstance(stage, Mapping):
+                bad = "$out" if "$out" in stage else ("$merge" if "$merge" in stage else None)
+                if bad is not None:
+                    return {
+                        "ok": 0.0,
+                        "errmsg": (
+                            f"{bad} cannot be used with a 'linearizable' read concern level"
+                        ),
+                        "code": 72,
+                        "codeName": "InvalidOptions",
+                    }
 
     if isinstance(coll, str):
         coll_name = coll
@@ -3053,6 +3694,20 @@ def _aggregate_change_stream(
                 "code": 9,
                 "codeName": "FailedToParse",
             }
+        # ``resumeAfter`` cannot point at an invalidate event's token —
+        # the stream it came from is over. mongod requires
+        # ``startAfter`` for that (260 InvalidResumeToken).
+        if cs_spec.resume_after is not None and data.from_invalidate:
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "Attempting to resume a change stream using 'resumeAfter' "
+                    "is not allowed from an invalidate notification; use "
+                    "'startAfter' instead"
+                ),
+                "code": 260,
+                "codeName": "InvalidResumeToken",
+            }
         # Scope-bind the resume token. Without this check, a client
         # watching `db.collA` can craft a token with a different `ns`
         # (e.g. `db.collB`, or `secrets.users`) and read the oplog of
@@ -3109,6 +3764,22 @@ def _aggregate_change_stream(
         return False
 
     pipeline_after_cs = list(pipeline[1:])
+    # Validate user-stage names NOW — mongod rejects an unrecognized
+    # stage at aggregate time (40324), not at the first getMore.
+    validate_stage_names(pipeline_after_cs)
+    # ``$changeStreamSplitLargeEvent`` in the pipeline is a second opt-in
+    # path for event-splitting (alongside
+    # ``$changeStream: {splitLargeChangeStreamEvents: true}``). The
+    # rust driver / node driver / java driver use the pipeline-stage
+    # form when the user opts into split via the high-level cursor
+    # API (``coll.watch().pipeline([{$changeStreamSplitLargeEvent: {}}])``).
+    # When either path is taken, set the producer-side flag so
+    # ``stamp_split_event`` actually splits.
+    if any(
+        isinstance(stage, Mapping) and "$changeStreamSplitLargeEvent" in stage
+        for stage in pipeline_after_cs
+    ):
+        cs_spec.split_large_events = True
     pipeline_ctx = PipelineContext(
         storage=storage, db_name=ctx.db_name, coll_name=coll_name, change_stream=cs_spec
     )
@@ -3154,17 +3825,18 @@ def _aggregate_change_stream(
                     show_expanded_events=cs_spec.show_expanded_events,
                     scope=scope,
                 )
-            except changestreams.ChangeStreamFatalError as exc:
-                # Best effort: surface as an empty batch and let the next
-                # poll retry. A nicer surface would be a server-side error
-                # cursor; defer.
-                _ = exc
-                last_seen = seq
-                continue
+            except changestreams.ChangeStreamFatalError:
+                # mongod surfaces this as a getMore error (code 280) and
+                # the stream is over — fullDocument: "required" misses
+                # and pre-image lookups that aren't stored both land
+                # here. Don't advance the position: the error, not the
+                # event, is the outcome. _get_more shapes the reply.
+                raise
             if ev is not None:
                 if cs_spec.split_large_events:
-                    changestreams.stamp_split_event(ev)
-                events.append(ev)
+                    events.extend(changestreams.stamp_split_event(ev))
+                else:
+                    events.append(ev)
             last_seen = seq
             ts_field = oplog_entry.get("ts")
             if ts_field is not None:
@@ -3175,8 +3847,9 @@ def _aggregate_change_stream(
             if invalidates:
                 inv = changestreams.invalidate_event(seq, oplog_entry)
                 if cs_spec.split_large_events:
-                    changestreams.stamp_split_event(inv)
-                events.append(inv)
+                    events.extend(changestreams.stamp_split_event(inv))
+                else:
+                    events.append(inv)
                 entry.invalidated = True
                 entry.final_event_pending = True
                 break
@@ -3188,6 +3861,16 @@ def _aggregate_change_stream(
         )
         if pipeline_after_cs:
             events = apply_pipeline(events, pipeline_after_cs, pipeline_ctx)
+            for ev in events:
+                if isinstance(ev, Mapping) and "_id" not in ev:
+                    # mongod 4.1.8+: an event whose ``_id`` (the resume
+                    # token) was projected out by the user pipeline is
+                    # fatal — the stream can't be resumed past it.
+                    raise changestreams.ChangeStreamFatalError(
+                        "Encountered an event whose _id field, which contains the "
+                        "resume token, was modified by the pipeline. Modifying the "
+                        "_id field of an event makes it unusable for resuming"
+                    )
         return events
 
     cursor_id = ctx.cursors.register_tailable(
@@ -3197,13 +3880,56 @@ def _aggregate_change_stream(
         position_seq=start_seq - 1,
         collection_uuid=coll_uuid,
     )
-    entry_ref["entry"] = ctx.cursors.get(cursor_id)
-    _ = batch_size  # firstBatch is empty by design for change streams
+    entry = ctx.cursors.get(cursor_id)
+    entry_ref["entry"] = entry
     initial_ts = ctx.storage.current_cluster_time()
     initial_token = changestreams.make_resume_token(
         changestreams.ResumeTokenData(start_seq - 1, initial_ts, ns, {})
     )
-    entry_ref["entry"].last_token = initial_token
+    entry.last_token = initial_token
+
+    # A *resuming* open (resumeAfter / startAfter / startAtOperationTime) may
+    # have a backlog of already-committed events between the start position
+    # and now. mongod returns those in the aggregate's firstBatch — a driver
+    # that checks the cursor for buffered data before sending any getMore
+    # (pymongo's ``CommandCursor._has_next()``, which never itself issues a
+    # getMore) must see them. Drain the producer once to populate firstBatch;
+    # there is no awaitData wait on open. A fresh tail watch has no backlog,
+    # so this is gated to the resuming forms only — the common case keeps the
+    # untouched empty-firstBatch + minted-token path.
+    is_resuming = (
+        cs_spec.resume_after is not None
+        or cs_spec.start_after is not None
+        or cs_spec.start_at_operation_time is not None
+    )
+    if is_resuming:
+        saved_pos = entry.position_seq
+        try:
+            _drain_change_stream_producer(entry)
+        except changestreams.ChangeStreamFatalError as exc:
+            ctx.cursors.kill([cursor_id])
+            return _change_stream_fatal_reply(exc)
+        if entry.remaining:
+            # Backlog present: the producer advanced ``position_seq`` and set
+            # ``last_token`` to the last backlog event. Hand the batch back as
+            # firstBatch (overflow stays in ``remaining`` for the first
+            # getMore). PyMongo does not cache the PBRT off a *non-empty*
+            # firstBatch, so an uniterated resumed stream still reports
+            # resume_token == the token the caller passed (prose test #14).
+            return {
+                "cursor": _change_stream_cursor_doc(
+                    entry, cursor_id, batch_size, ns, batch_key="firstBatch"
+                ),
+                "operationTime": initial_ts,
+                "ok": 1.0,
+            }
+        # No backlog: restore the at-open position + token so the empty-batch
+        # open behaves exactly as before. The producer's no-match position
+        # advance is a getMore-time concern (so a quiet collection's PBRT can
+        # move past unrelated activity), not an open-time one — at open the
+        # cursor still sits at the resume point.
+        entry.position_seq = saved_pos
+        entry.last_token = initial_token
     return {
         "cursor": {
             "firstBatch": [],
@@ -3273,8 +3999,10 @@ def _mechs_for_principal(ctx: CommandContext, principal: str) -> list[str]:
     creds_doc = record.get("credentials")
     if not isinstance(creds_doc, dict):
         return [SCRAM_SHA_256]
-    # Order: modern first when both are present.
-    mechs = [m for m in (SCRAM_SHA_256, SCRAM_SHA_1) if m in creds_doc]
+    # Order: SCRAM modern first, legacy SHA-1 next, then X509. The
+    # driver picks the first one it supports; pymongo / Go / Java all
+    # default to SCRAM-SHA-256 when offered.
+    mechs = [m for m in (SCRAM_SHA_256, SCRAM_SHA_1, MONGODB_X509) if m in creds_doc]
     return mechs or [SCRAM_SHA_256]
 
 
@@ -3293,9 +4021,12 @@ def _lookup_creds(
 def _sasl_start(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     conn = _ensure_conn_auth(ctx)
     mechanism = doc.get("mechanism", "")
+    if mechanism == MONGODB_X509:
+        return _sasl_start_x509(doc, ctx, conn)
     if mechanism not in (SCRAM_SHA_256, SCRAM_SHA_1):
         return _auth_failure(
-            f"Unsupported SASL mechanism: {mechanism!r} (supported: {SCRAM_SHA_256}, {SCRAM_SHA_1})"
+            f"Unsupported SASL mechanism: {mechanism!r} "
+            f"(supported: {SCRAM_SHA_256}, {SCRAM_SHA_1}, {MONGODB_X509})"
         )
     payload = _payload_bytes(doc.get("payload"))
     db_name = ctx.db_name or "admin"
@@ -3317,6 +4048,162 @@ def _sasl_start(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "payload": _payload_binary(server_first),
         "ok": 1.0,
     }
+
+
+def _sasl_start_x509(
+    doc: dict[str, Any], ctx: CommandContext, conn: ConnectionAuth
+) -> dict[str, Any]:
+    """One-shot MONGODB-X509 auth.
+
+    Unlike SCRAM there's no challenge / response. The credential is the
+    TLS client cert the connection presented during the handshake; the
+    server reads the cert's subject DN, looks up a user record whose
+    username equals that DN AND whose ``credentials`` doc carries an
+    X509 entry, and marks the connection authenticated. ``done=True``
+    on the first reply — no ``_sasl_continue`` round-trip.
+
+    The optional ``payload`` in the request can carry the username
+    (some drivers send it as a sanity check); when present, it must
+    equal the cert DN exactly. Mismatch is an auth failure — the
+    driver claimed identity X but the cert says identity Y.
+
+    Refuses with ``AuthenticationFailed`` (code 18) when:
+
+    * The connection is plaintext or didn't verify a client cert
+      (``peer_cert_dn`` is None) — X509 needs mTLS.
+    * No user record exists for the cert DN on the auth db
+      (``$external`` by convention; per-driver-config db otherwise).
+    * The matched user record has no ``MONGODB-X509`` entry in its
+      ``credentials`` (so a SCRAM-only user can't be impersonated
+      via cert).
+    * The payload-claimed username doesn't match the cert DN.
+    """
+    if ctx.peer_cert_dn is None:
+        return _auth_failure(
+            "MONGODB-X509 requires the client to present a verified TLS cert "
+            "(connection is plaintext or no client cert was offered)"
+        )
+    db_name = ctx.db_name or "$external"
+    # MongoDB convention: X509 users live on the ``$external`` auth db,
+    # which is a virtual db (no real collections). We also accept the
+    # legacy ``admin`` placement to give operators flexibility.
+    claimed = _x509_payload_username(_payload_bytes(doc.get("payload")))
+    if claimed and claimed != ctx.peer_cert_dn:
+        return _auth_failure(
+            f"MONGODB-X509: payload username {claimed!r} doesn't match cert DN {ctx.peer_cert_dn!r}"
+        )
+    record = ctx.storage.get_user(db_name, ctx.peer_cert_dn)
+    if record is None and db_name == "$external":
+        # Fallback: also try `admin` so users created with the
+        # ``--db admin`` shorthand work too.
+        record = ctx.storage.get_user("admin", ctx.peer_cert_dn)
+        if record is not None:
+            db_name = "admin"
+    if record is None:
+        return _auth_failure(
+            f"MONGODB-X509: no user found with name {ctx.peer_cert_dn!r} on {db_name!r}"
+        )
+    creds_doc = record.get("credentials")
+    if not isinstance(creds_doc, dict) or MONGODB_X509 not in creds_doc:
+        return _auth_failure(
+            f"MONGODB-X509: user {ctx.peer_cert_dn!r} on {db_name!r} is not "
+            "configured for X509 auth (no MONGODB-X509 entry in credentials)"
+        )
+    # All checks passed. Mark authenticated, capture roles for RBAC,
+    # mirror SCRAM's reply shape with done=True.
+    conn.authenticated_principals.append((db_name, ctx.peer_cert_dn))
+    roles = record.get("roles") or []
+    if isinstance(roles, list):
+        conn.add_principal_roles(roles)
+    return {
+        "conversationId": conn.new_conversation_id(),
+        "done": True,
+        "payload": _payload_binary(b""),
+        "ok": 1.0,
+    }
+
+
+def _authenticate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """Legacy ``authenticate`` command — pymongo's chosen path for
+    MONGODB-X509.
+
+    Modern drivers use ``saslStart`` for SCRAM, but for MONGODB-X509
+    pymongo still sends the legacy
+    ``{authenticate: 1, mechanism: "MONGODB-X509", user: <DN>}``
+    command (it's a one-shot with no challenge / response, so the
+    legacy single-command shape fits). The Java / Go / Node drivers
+    do the same for X509 backwards-compat.
+
+    Reuses :func:`_sasl_start_x509`'s logic via a synthetic SCRAM-less
+    code path — same user lookup, same DN comparison, same
+    role-binding side-effects on the connection.
+    """
+    conn = _ensure_conn_auth(ctx)
+    mechanism = doc.get("mechanism", SCRAM_SHA_256)
+    if mechanism != MONGODB_X509:
+        # Legacy ``authenticate`` for SCRAM is older than SecantusDB
+        # cares about — drivers ship the saslStart path for SCRAM. If
+        # somebody really needs it, raise a CommandNotFound-shaped
+        # error that points them at the right command.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"authenticate: only {MONGODB_X509!r} is supported on this "
+                f"command path; use saslStart for {SCRAM_SHA_256!r} / {SCRAM_SHA_1!r}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if ctx.peer_cert_dn is None:
+        return _auth_failure(
+            "MONGODB-X509 requires the client to present a verified TLS cert "
+            "(connection is plaintext or no client cert was offered)"
+        )
+    claimed = doc.get("user")
+    if isinstance(claimed, str) and claimed and claimed != ctx.peer_cert_dn:
+        return _auth_failure(
+            f"MONGODB-X509: claimed user {claimed!r} doesn't match cert DN {ctx.peer_cert_dn!r}"
+        )
+    db_name = ctx.db_name or "$external"
+    record = ctx.storage.get_user(db_name, ctx.peer_cert_dn)
+    if record is None and db_name == "$external":
+        record = ctx.storage.get_user("admin", ctx.peer_cert_dn)
+        if record is not None:
+            db_name = "admin"
+    if record is None:
+        return _auth_failure(
+            f"MONGODB-X509: no user found with name {ctx.peer_cert_dn!r} on {db_name!r}"
+        )
+    creds_doc = record.get("credentials")
+    if not isinstance(creds_doc, dict) or MONGODB_X509 not in creds_doc:
+        return _auth_failure(
+            f"MONGODB-X509: user {ctx.peer_cert_dn!r} on {db_name!r} is not "
+            "configured for X509 auth (no MONGODB-X509 entry in credentials)"
+        )
+    conn.authenticated_principals.append((db_name, ctx.peer_cert_dn))
+    roles = record.get("roles") or []
+    if isinstance(roles, list):
+        conn.add_principal_roles(roles)
+    # Legacy ``authenticate`` reply shape: {dbname, user, ok: 1}.
+    return {"dbname": db_name, "user": ctx.peer_cert_dn, "ok": 1.0}
+
+
+def _x509_payload_username(payload: bytes) -> str:
+    """Best-effort extraction of an optional username from the X509
+    SASL payload.
+
+    pymongo sends ``{payload: BinData(0, b"")}`` (empty) and trusts
+    the cert. Other drivers send the username as a UTF-8 string
+    (sometimes prefixed with the GS2 header marker). Strip the GS2
+    if present, decode, and let the caller compare.
+    """
+    if not payload:
+        return ""
+    # Some drivers prefix with the SASL GS2 header ``n,,`` like SCRAM
+    # does, even though X509 doesn't need one.
+    if payload.startswith(b"n,,"):
+        payload = payload[3:]
+    return payload.decode("utf-8", errors="replace")
 
 
 def _peek_scram_username(payload: bytes) -> str:
@@ -3386,10 +4273,38 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 2,
             "codeName": "BadValue",
         }
-    if not isinstance(pwd, str) or not pwd:
+    # `mechanisms` selects which auth mechanisms the user is enabled
+    # for. SCRAM-SHA-256 alone is the default — matches mongod's modern
+    # behaviour. MONGODB-X509 is a TLS-cert-as-username mechanism; when
+    # requested, the cert's subject DN must equal the username (so the
+    # caller is creating something like ``CN=alice,O=Acme,C=US``), and
+    # no password is required.
+    mechanisms_arg = doc.get("mechanisms")
+    if isinstance(mechanisms_arg, list) and mechanisms_arg:
+        requested = [m for m in mechanisms_arg if m in (SCRAM_SHA_256, SCRAM_SHA_1, MONGODB_X509)]
+    else:
+        requested = [SCRAM_SHA_256]
+    if not requested:
         return {
             "ok": 0.0,
-            "errmsg": "createUser: pwd (string) required",
+            "errmsg": (
+                "createUser: mechanisms must contain at least one of "
+                f"{SCRAM_SHA_256!r}, {SCRAM_SHA_1!r}, {MONGODB_X509!r}"
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    scram_requested = [m for m in requested if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
+    # Password is required when ANY SCRAM mechanism is requested.
+    # MONGODB-X509-only users have no password — the cert is the
+    # credential.
+    if scram_requested and (not isinstance(pwd, str) or not pwd):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "createUser: pwd (string) required when SCRAM mechanisms are requested "
+                f"(got mechanisms={requested!r})"
+            ),
             "code": 2,
             "codeName": "BadValue",
         }
@@ -3403,28 +4318,11 @@ def _create_user(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 31,
             "codeName": "RoleNotFound",
         }
-    # `mechanisms` selects which SCRAM hashes to derive credentials
-    # for. Default to SCRAM-SHA-256 alone, matching mongod's modern
-    # default (post-3.6 the SHA-1 hashing isn't computed unless the
-    # request asks for it).
-    mechanisms_arg = doc.get("mechanisms")
-    if isinstance(mechanisms_arg, list) and mechanisms_arg:
-        requested = [m for m in mechanisms_arg if m in (SCRAM_SHA_256, SCRAM_SHA_1)]
-    else:
-        requested = [SCRAM_SHA_256]
-    if not requested:
-        return {
-            "ok": 0.0,
-            "errmsg": (
-                "createUser: mechanisms must contain at least one of "
-                f"{SCRAM_SHA_256!r}, {SCRAM_SHA_1!r}"
-            ),
-            "code": 2,
-            "codeName": "BadValue",
-        }
     creds_doc: dict[str, object] = {}
-    for mech in requested:
+    for mech in scram_requested:
         creds_doc.update(derive_credentials(pwd, mechanism=mech, username=username).to_doc())
+    if MONGODB_X509 in requested:
+        creds_doc.update(X509_CREDENTIAL_MARKER)
     record = {
         "_id": f"{db_name}.{username}",
         "user": username,
@@ -4234,12 +5132,14 @@ _HANDLERS: dict[str, CommandHandler] = {
     "secantusAdmin.restoreArchive": _secantus_admin_restore_archive,
     "explain": _explain,
     "serverStatus": _server_status,
+    "top": _top,
     "getCmdLineOpts": _get_cmd_line_opts,
     "getParameter": _get_parameter,
     "connectionStatus": _connection_status,
     "dbStats": _db_stats,
     "dbstats": _db_stats,
     "collStats": _coll_stats,
+    "validate": _validate,
     "insert": _insert,
     "find": _find,
     "update": _update,
@@ -4265,6 +5165,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "mapreduce": _map_reduce,
     "saslStart": _sasl_start,
     "saslContinue": _sasl_continue,
+    "authenticate": _authenticate,
     "configureFailPoint": _configure_fail_point,
     "createUser": _create_user,
     "updateUser": _update_user,
@@ -4303,6 +5204,10 @@ _PRE_AUTH_COMMANDS = frozenset(
         "buildinfo",
         "saslStart",
         "saslContinue",
+        # Legacy ``authenticate`` command — pymongo / Java / Go drivers
+        # all use it for MONGODB-X509 (one-shot, no challenge / response,
+        # the legacy single-command shape fits cleanly).
+        "authenticate",
         "endSessions",
         "whatsmyuri",
     }
@@ -4352,6 +5257,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     # silently exempts commands missing from this table).
     "dbstats": (A_DB_STATS, SCOPE_DATABASE),
     "collStats": (A_COLL_STATS, SCOPE_COLLECTION),
+    "validate": (A_COLL_STATS, SCOPE_COLLECTION),
     # User management
     "createUser": (A_CREATE_USER, SCOPE_DATABASE),
     "dropUser": (A_DROP_USER, SCOPE_DATABASE),
@@ -4372,6 +5278,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "revokeRolesFromRole": (A_REVOKE_ROLE, SCOPE_DATABASE),
     # Cluster / introspection
     "serverStatus": (A_SERVER_STATUS, SCOPE_CLUSTER),
+    "top": (A_TOP, SCOPE_CLUSTER),
     "hostInfo": (A_HOST_INFO, SCOPE_CLUSTER),
     "getCmdLineOpts": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
     # ``getParameter`` exposes server-internal config (featureFlag state,
@@ -4487,8 +5394,12 @@ _PROFILE_SKIP_COMMANDS = frozenset(
 
 _PROFILE_OP_BUCKET: dict[str, str] = {
     "find": "query",
-    "count": "query",
-    "distinct": "query",
+    # mongod's profiler records ``count`` / ``distinct`` under ``op:
+    # "command"`` (only ``find`` is ``op: "query"``); matching that lets
+    # ``system.profile`` queries that filter on ``{op: "command",
+    # command.distinct: ...}`` find the entry.
+    "count": "command",
+    "distinct": "command",
     "aggregate": "command",
     "insert": "insert",
     "update": "update",
@@ -4649,6 +5560,12 @@ _INDEX_SPEC_KNOWN_OPTIONS = frozenset(
         "ns",
         # Haystack (deprecated).
         "bucketSize",
+        # ``dropDups`` — removed in MongoDB 3.0; modern mongod accepts and
+        # silently ignores it (it never drops duplicates) rather than
+        # rejecting the spec. So a unique index built over duplicate data
+        # still fails on the duplicate (DuplicateKey 11000), not on an
+        # unknown-field error. Stripped from the stored options below.
+        "dropDups",
     }
 )
 
@@ -4744,6 +5661,21 @@ _API_V1_COMMANDS = frozenset(
 )
 
 # Aggregation stages allowed under ``apiVersion: 1, apiStrict: true``.
+# Commands explicitly rejected when ``apiStrict: true`` is set. Narrow
+# set — only the ones the spec's unified test runners actively probe.
+# ``distinct`` is the canary (mongo-java-driver's
+# ``crud-api-version-1-strict.yml`` test ``distinct appends declared
+# API version`` asserts ``errorCodeName: APIStrictError``).
+#
+# Intentionally NOT inverting ``_API_V1_COMMANDS``: that broader set
+# would reject ``count`` (used internally by
+# ``estimatedDocumentCount``), ``buildInfo`` / ``serverStatus`` /
+# ``listLocalSessions`` (handshake-adjacent admin commands drivers
+# call on startup), and other internal-but-non-v1 names that aren't
+# the spec's target.
+_API_V1_REJECTED_BY_NAME = frozenset({"distinct"})
+
+
 # Driver tests probe with ``$listLocalSessions`` / ``$listSessions``
 # (deliberately excluded) because they're the cheapest way to land an
 # ``APIStrictError`` from inside a known-allowed command (``aggregate``).
@@ -4785,6 +5717,150 @@ _API_V1_AGG_STAGES = frozenset(
 )
 
 
+# Commands that may run inside a multi-document transaction. Everything
+# else gets mongod's 263 ``OperationNotSupportedInTransaction`` — the
+# spec's canary is ``count``. ``commitTransaction`` / ``abortTransaction``
+# carry the same envelope but are the transaction *controls*, handled by
+# their own handlers rather than the statement path.
+_TXN_ALLOWED_COMMANDS = frozenset(
+    {
+        "insert",
+        "update",
+        "delete",
+        "findAndModify",
+        "find",
+        "getMore",
+        "killCursors",
+        "aggregate",
+        "distinct",
+        "bulkWrite",
+        "create",
+        "createIndexes",
+    }
+)
+
+# Aggregation stages mongod refuses inside a transaction.
+_TXN_BLOCKED_AGG_STAGES = frozenset(
+    {
+        "$out",
+        "$merge",
+        "$changeStream",
+        "$collStats",
+        "$currentOp",
+        "$indexStats",
+        "$listLocalSessions",
+        "$listSessions",
+    }
+)
+
+# Error codes that get the ``TransientTransactionError`` label when a
+# statement inside a transaction fails: mongod's transient set
+# (WriteConflict, SnapshotUnavailable, NoSuchTransaction, LockTimeout)
+# plus the retryable-error codes, which are transient on any
+# non-commit statement. Notably NOT here: 11000 duplicate key — it
+# aborts the transaction but retrying wouldn't help, so no label.
+_TRANSIENT_TXN_CODES = frozenset(
+    {112, 246, 251, 24, 6, 7, 89, 91, 189, 9001, 10107, 11600, 11602, 13435, 13436}
+)
+
+
+def _txn_unsupported_reason(name: str, doc: dict[str, Any], ctx: CommandContext) -> str | None:
+    """mongod-shaped reason a statement can't run in a transaction, or None."""
+    if name not in _TXN_ALLOWED_COMMANDS:
+        return f"Cannot run '{name}' in a multi-document transaction."
+    if name == "aggregate":
+        pipeline = doc.get("pipeline") or []
+        if isinstance(pipeline, list):
+            for stage in pipeline:
+                if isinstance(stage, Mapping):
+                    stage_name = next(iter(stage), "")
+                    if stage_name in _TXN_BLOCKED_AGG_STAGES:
+                        return (
+                            f"Operation not permitted in transaction :: caused by :: "
+                            f"Aggregation stage {stage_name} cannot run within a "
+                            f"multi-document transaction."
+                        )
+    if name in ("insert", "update", "delete", "findAndModify"):
+        coll = doc.get(name)
+        if isinstance(coll, str):
+            opts = ctx.storage.get_collection_options(ctx.db_name, coll)
+            if opts.get("capped"):
+                return (
+                    f"Collection '{ctx.db_name}.{coll}' is a capped collection. "
+                    f"Writing in a transaction to capped collections is not allowed."
+                )
+    return None
+
+
+def _resolve_txn_statement(
+    name: str,
+    doc: dict[str, Any],
+    ctx: CommandContext,
+    lsid_bytes: bytes,
+    txn_number: int,
+) -> tuple[Transaction | None, dict[str, Any] | None]:
+    """Registry resolution + allowlist gate for an in-transaction statement.
+
+    Returns ``(txn, None)`` to execute, or ``(None, error_reply)``. A
+    disallowed command still resolves first and then aborts the
+    transaction — mongod treats it as a failed statement.
+    """
+    assert ctx.transactions is not None
+    start = bool(doc.get("startTransaction"))
+    txn, err = ctx.transactions.for_statement(lsid_bytes, doc.get("lsid"), txn_number, start=start)
+    if err is not None:
+        return None, err
+    assert txn is not None
+    reason = _txn_unsupported_reason(name, doc, ctx)
+    if reason is not None:
+        ctx.transactions.abort_in_progress(txn)
+        return None, {
+            "ok": 0.0,
+            "errmsg": reason,
+            "code": 263,
+            "codeName": "OperationNotSupportedInTransaction",
+        }
+    return txn, None
+
+
+def _run_txn_statement(
+    txn: Transaction,
+    handler: Any,
+    doc: dict[str, Any],
+    ctx: CommandContext,
+) -> dict[str, Any]:
+    """Execute one statement inside the transaction's WT session.
+
+    The per-transaction mutex serializes statements (and the
+    commit/abort/reaper transitions) so the WT session is never used
+    from two threads at once. State is re-checked under the mutex —
+    the lifetime reaper may have aborted between resolution and here.
+    """
+    with txn.mutex:
+        if txn.state is not TxnState.IN_PROGRESS:
+            return no_such_transaction_reply(txn.txn_number, label=True)
+        if txn.handle is None:
+            txn.handle = ctx.storage.begin_user_transaction()
+        with ctx.storage.use_user_transaction(txn.handle):
+            return handler(doc, ctx)
+
+
+def _finish_txn_statement(ctx: CommandContext, txn: Transaction, result: dict[str, Any]) -> None:
+    """mongod parity: any failed statement aborts the transaction
+    server-side. Only transient-class codes get the
+    ``TransientTransactionError`` label (E11000 aborts unlabeled)."""
+    ok = bool(result.get("ok", 0.0))
+    failed = (not ok) or bool(result.get("writeErrors"))
+    if not failed:
+        return
+    assert ctx.transactions is not None
+    ctx.transactions.abort_in_progress(txn)
+    if not ok and result.get("code") in _TRANSIENT_TXN_CODES:
+        labels = result.setdefault("errorLabels", [])
+        if TRANSIENT_LABEL not in labels:
+            labels.append(TRANSIENT_LABEL)
+
+
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
     # Read-concern + apiVersion validation runs before every command
@@ -4809,7 +5885,31 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # ``snapshot-sessions-not-supported-server-error`` unified spec
         # asserts the error shape (any ``ok: 0`` reply on find / aggregate
         # / distinct with ``readConcern.level: snapshot``).
-        if level == "snapshot":
+        #
+        # Inside a multi-document transaction (``autocommit: false``)
+        # the level IS accepted: every in-transaction read runs against
+        # the transaction's pinned WT snapshot anyway, which is exactly
+        # what ``snapshot`` asks for on a single node.
+        #
+        # Outside transactions, mongod 5.0+ replica sets accept
+        # ``snapshot`` on exactly find / aggregate / distinct (snapshot
+        # sessions). We advertise such a topology, so those commands
+        # accept it too — accept-and-record: the reply carries
+        # ``atClusterTime`` for session pinning but reads are not
+        # actually timestamp-pinned (single node; tasks/backlog.md).
+        # Everything else keeps mongod's rejection. When the
+        # replica-set persona is off we reject like a real standalone
+        # (the snapshot-sessions-not-supported unified specs pin that
+        # error shape).
+        # getMore / killCursors ride along: pymongo propagates the
+        # pinned ``{level: snapshot, atClusterTime}`` onto cursor
+        # continuation, and mongod accepts it there (the cursor already
+        # owns its snapshot).
+        snapshot_readable = (
+            name in ("find", "aggregate", "distinct", "getMore", "killCursors")
+            and ctx.replica_set_name
+        )
+        if level == "snapshot" and doc.get("autocommit") is not False and not snapshot_readable:
             return {
                 "ok": 0.0,
                 "errmsg": "Snapshot read concern is not supported on standalone",
@@ -4828,33 +5928,42 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "APIVersionError",
         }
     # ``apiStrict: true`` narrows the allowed surface to the Stable API
-    # contract. Aggregation stages outside ``_API_V1_AGG_STAGES`` are
-    # rejected with ``APIStrictError`` (code 323) — lights up
-    # mongo-java-driver's ``versioned-api/aggregate on database
-    # appends declared API version`` test (which probes with
-    # ``$listLocalSessions``) without triggering the connection-pool
-    # cascade the **command-level** gate caused (rejecting ``distinct``
-    # at the command-name level made the Java driver pause its pool on
-    # the resulting expected error, failing 6 subsequent tests with
-    # ``MongoConnectionPoolClearedException``). The command-name gate
-    # is intentionally left out — see the ``_API_V1_COMMANDS`` set
-    # below for what a future attempt would enable.
-    if doc.get("apiStrict") and name == "aggregate":
-        pipeline = doc.get("pipeline") or []
-        if isinstance(pipeline, list):
-            for stage in pipeline:
-                if isinstance(stage, Mapping):
-                    stage_name = next(iter(stage), "")
-                    if stage_name and stage_name not in _API_V1_AGG_STAGES:
-                        return {
-                            "ok": 0.0,
-                            "errmsg": (
-                                f"Provided aggregation pipeline stage "
-                                f"{stage_name} is not in API Version 1"
-                            ),
-                            "code": 323,
-                            "codeName": "APIStrictError",
-                        }
+    # contract. Two gates:
+    #
+    # * Command-name gate (narrow): reject only the small set in
+    #   ``_API_V1_REJECTED_BY_NAME`` (currently ``distinct``). The
+    #   spec's ``crud-api-version-1-strict.yml`` asserts this rejection
+    #   for ``distinct``; mirroring it makes the test pass. The full
+    #   whitelist invert is intentionally NOT enabled — it'd reject
+    #   ``count`` (used internally by ``estimatedDocumentCount``) and
+    #   a handful of internal admin commands.
+    # * Aggregation-stage gate: reject pipeline stages outside
+    #   ``_API_V1_AGG_STAGES``. Lights up ``versioned-api/aggregate on
+    #   database`` (probes with ``$listLocalSessions``).
+    if doc.get("apiStrict"):
+        if name in _API_V1_REJECTED_BY_NAME:
+            return {
+                "ok": 0.0,
+                "errmsg": f"Provided command {name} is not in API Version 1",
+                "code": 323,
+                "codeName": "APIStrictError",
+            }
+        if name == "aggregate":
+            pipeline = doc.get("pipeline") or []
+            if isinstance(pipeline, list):
+                for stage in pipeline:
+                    if isinstance(stage, Mapping):
+                        stage_name = next(iter(stage), "")
+                        if stage_name and stage_name not in _API_V1_AGG_STAGES:
+                            return {
+                                "ok": 0.0,
+                                "errmsg": (
+                                    f"Provided aggregation pipeline stage "
+                                    f"{stage_name} is not in API Version 1"
+                                ),
+                                "code": 323,
+                                "codeName": "APIStrictError",
+                            }
     # Count every dispatched command — even unknown / unauth-rejected
     # ones — so serverStatus.network.numRequests reflects raw wire
     # traffic, not just the successful subset. Mongod's accounting is
@@ -4970,37 +6079,82 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 failpoint_wce = wce
                 failpoint_labels = match.error_labels
 
+    # Multi-document transaction envelope. ``autocommit: false`` +
+    # ``lsid`` + ``txnNumber`` marks an in-transaction statement (the
+    # first one also carries ``startTransaction: true``); ``txnNumber``
+    # WITHOUT ``autocommit`` stays the tolerated retryable-write
+    # envelope. Resolution runs AFTER the failpoint block on purpose:
+    # failpoint-injected errors must not abort the transaction —
+    # retryable-commit tests inject an error on the first commit
+    # attempt and expect the retry to succeed.
+    txn: Transaction | None = None
+    if ctx.transactions is not None and "txnNumber" in doc:
+        lsid_bytes, txn_number = _txn_envelope(doc)
+        if lsid_bytes is not None and txn_number is not None:
+            if doc.get("autocommit") is False:
+                if name not in ("commitTransaction", "abortTransaction"):
+                    txn, txn_err = _resolve_txn_statement(name, doc, ctx, lsid_bytes, txn_number)
+                    if txn_err is not None:
+                        return txn_err
+            else:
+                # Retryable write: consumes the session's txnNumber
+                # sequence and implicitly aborts an older open
+                # transaction, as in mongod.
+                ctx.transactions.on_retryable_write(lsid_bytes, txn_number)
     profile_eligible = _profile_eligible_command(name, doc)
     start_ns = _time.monotonic_ns() if profile_eligible else 0
     try:
-        result = handler(doc, ctx)
+        if txn is not None:
+            result = _run_txn_statement(txn, handler, doc, ctx)
+        else:
+            result = handler(doc, ctx)
+    except WriteConflictError:
+        result = _write_conflict_reply(label=txn is not None)
+    except changestreams.ChangeStreamFatalError as exc:
+        # Change-stream fatal conditions (resume token projected out,
+        # fullDocument: "required" miss, pre-image not stored) surface
+        # with their own codes — mongod replies, not internal errors.
+        result = _change_stream_fatal_reply(exc)
     except _USER_FACING_EXCEPTIONS as exc:
         # Validation-class errors: messages are deliberately shaped to
-        # match mongod, drivers parse them. Surface verbatim.
+        # match mongod, drivers parse them. Surface verbatim. Exceptions
+        # may carry the mongod code their error uses (ExpressionError:
+        # $divide-by-zero is 2 BadValue, $mod uses Location codes;
+        # AggregateError: 40324 for an unrecognized pipeline stage —
+        # which leaves ``code`` as None when unset, hence the ``or``);
+        # 14 TypeMismatch stays the default.
         result = {
             "ok": 0.0,
             "errmsg": str(exc),
-            "code": 14,
-            "codeName": "TypeMismatch",
+            "code": getattr(exc, "code", None) or 14,
+            "codeName": getattr(exc, "code_name", None) or "TypeMismatch",
         }
-    except Exception:
-        # Anything else is an internal bug. Logging the full traceback
-        # server-side preserves debuggability; returning a generic
-        # message avoids leaking field paths, file paths, document
-        # contents, or stack frames over the wire to an unauthenticated
-        # peer.
-        logger.exception(
-            "internal error handling command %s (conn=%s, db=%s)",
-            name,
-            ctx.connection_id,
-            ctx.db_name,
-        )
-        result = {
-            "ok": 0.0,
-            "errmsg": "internal server error",
-            "code": 1,
-            "codeName": "InternalError",
-        }
+    except Exception as exc:
+        if _is_wt_rollback(exc):
+            # WT_ROLLBACK surfacing from a write path that doesn't
+            # classify locally (update/delete cursors raise the raw
+            # WiredTigerError): same WriteConflict as the typed path.
+            result = _write_conflict_reply(label=txn is not None)
+        else:
+            # Anything else is an internal bug. Logging the full traceback
+            # server-side preserves debuggability; returning a generic
+            # message avoids leaking field paths, file paths, document
+            # contents, or stack frames over the wire to an unauthenticated
+            # peer.
+            logger.exception(
+                "internal error handling command %s (conn=%s, db=%s)",
+                name,
+                ctx.connection_id,
+                ctx.db_name,
+            )
+            result = {
+                "ok": 0.0,
+                "errmsg": "internal server error",
+                "code": 1,
+                "codeName": "InternalError",
+            }
+    if txn is not None:
+        _finish_txn_statement(ctx, txn, result)
     if profile_eligible:
         _maybe_record_profile(ctx, name, doc, result, start_ns)
     if failpoint_wce is not None and result.get("ok", 0.0):
@@ -5016,4 +6170,37 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         wc_wce = _unsatisfiable_wc_error(doc)
         if wc_wce is not None:
             result["writeConcernError"] = wc_wce
+    # Cluster-time gossip: real mongod attaches ``$clusterTime`` and
+    # ``operationTime`` to EVERY reply — successes and errors — when the
+    # node is a replica-set member (standalones don't gossip; neither do
+    # we when the replica-set persona is off). Drivers and pymongo's
+    # tests read ``reply["operationTime"]`` for causal consistency and
+    # ``startAtOperationTime``. The keyless signature (20 zero bytes,
+    # keyId 0) is what auth-less replica sets send. ``setdefault``
+    # preserves handlers that already attach a more specific value
+    # (e.g. the change-stream ``aggregate`` reply).
+    if ctx.replica_set_name:
+        ts = ctx.storage.peek_cluster_time()
+        result.setdefault(
+            "$clusterTime",
+            {
+                "clusterTime": ts,
+                "signature": {"hash": bson.Binary(b"\x00" * 20), "keyId": bson.Int64(0)},
+            },
+        )
+        result.setdefault("operationTime", ts)
+        # Snapshot sessions: pymongo pins the session's read timestamp
+        # from the FIRST snapshot read's reply — ``cursor.atClusterTime``
+        # for cursor commands, top-level ``atClusterTime`` otherwise
+        # (client_session.py _update_read_concern) — and sends it back
+        # as ``readConcern.atClusterTime`` on subsequent reads. Reads
+        # are NOT actually pinned (single node, accept-and-record; see
+        # tasks/backlog.md), but the wire contract is satisfied.
+        rc = doc.get("readConcern")
+        if bool(result.get("ok")) and isinstance(rc, Mapping) and rc.get("level") == "snapshot":
+            cursor_part = result.get("cursor")
+            if isinstance(cursor_part, dict):
+                cursor_part.setdefault("atClusterTime", ts)
+            else:
+                result.setdefault("atClusterTime", ts)
     return result

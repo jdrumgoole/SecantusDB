@@ -304,3 +304,29 @@ def test_gt_decimal128_vs_int() -> None:
 def test_lte_decimal128_vs_float() -> None:
     assert matches({"x": Decimal128("3.5")}, {"x": {"$lte": 4.0}})
     assert not matches({"x": Decimal128("4.1")}, {"x": {"$lte": 4.0}})
+
+
+def test_embedded_document_equality_is_ordered_and_exact() -> None:
+    """Full embedded-document equality is field-ORDER-sensitive and
+    exact (no subset), recursively — a mongod gotcha. Oracle-pinned
+    against a real mongod 2026-06-13."""
+    doc = {"size": {"h": 14, "w": 21, "uom": "cm"}}
+    assert matches(doc, {"size": {"h": 14, "w": 21, "uom": "cm"}})  # same order
+    assert not matches(doc, {"size": {"w": 21, "h": 14, "uom": "cm"}})  # reordered
+    assert not matches(doc, {"size": {"h": 14, "w": 21}})  # subset
+    assert matches(doc, {"size.h": 14})  # dotted still works
+
+    # Numeric bridge applies to leaf values inside the embedded doc.
+    assert matches(doc, {"size": {"h": 14.0, "w": 21, "uom": "cm"}})
+    # ...but bool stays distinct.
+    assert not matches({"s": {"h": 14}}, {"s": {"h": True}})
+
+    # Nested embedded docs are ordered recursively.
+    nested = {"a": {"b": {"x": 1, "y": 2}}}
+    assert matches(nested, {"a": {"b": {"x": 1, "y": 2}}})
+    assert not matches(nested, {"a": {"b": {"y": 2, "x": 1}}})
+
+    # Arrays inside embedded docs are positional (order-sensitive).
+    arr = {"s": {"a": [1, 2], "b": 3}}
+    assert matches(arr, {"s": {"a": [1, 2], "b": 3}})
+    assert not matches(arr, {"s": {"a": [2, 1], "b": 3}})

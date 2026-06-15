@@ -102,6 +102,24 @@ def test_update_many_with_inc(coll) -> None:
     assert {d["n"] for d in coll.find()} == {1}
 
 
+def test_inc_and_sum_preserve_int64_over_the_wire(coll) -> None:
+    """End-to-end: $inc over an Int64 field and $sum over Int64 values keep the
+    BSON 64-bit type through the wire, so a client codec that keys on Int64
+    round-trips. Mirrors pymongo's test_custom_types decoder tests."""
+    from bson import Int64
+
+    coll.insert_one({"_id": 1, "x": Int64(1)})
+    coll.update_one({"_id": 1}, {"$inc": {"x": 1}})
+    doc = coll.find_one({"_id": 1})
+    assert doc["x"] == 2 and isinstance(doc["x"], Int64)
+
+    coll.insert_many([{"g": "a", "q": Int64(10)}, {"g": "a", "q": Int64(10)}])
+    res = list(
+        coll.aggregate([{"$match": {"g": "a"}}, {"$group": {"_id": "$g", "t": {"$sum": "$q"}}}])
+    )
+    assert res[0]["t"] == 20 and isinstance(res[0]["t"], Int64)
+
+
 def test_update_with_push(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["x"]})
     coll.update_one({"_id": 1}, {"$push": {"tags": "y"}})
@@ -221,6 +239,27 @@ def test_sort_combined_with_limit(coll) -> None:
     coll.insert_many([{"n": i} for i in range(10)])
     top3 = [d["n"] for d in coll.find().sort("n", -1).limit(3)]
     assert top3 == [9, 8, 7]
+
+
+def test_return_key_replaces_docs_with_index_keys(coll) -> None:
+    """``returnKey`` returns only the keys of the index serving the query.
+    A find sorted by ``_id`` uses the ``_id`` index, so each result is just
+    ``{_id: N}`` — the other fields are stripped. With ``returnKey`` set,
+    ``showRecordId`` adds no ``$recordId``. Mirrors pymongo's
+    test_command_monitoring 'find with showRecordId and returnKey'."""
+    coll.insert_many([{"_id": i, "x": i * 10} for i in range(1, 6)])
+    cursor = coll.find({}, sort=[("_id", 1)], show_record_id=True, return_key=True)
+    got = list(cursor)
+    assert got == [{"_id": i} for i in range(1, 6)]
+
+
+def test_show_record_id_adds_record_id_field(coll) -> None:
+    """``showRecordId`` alone tags each returned doc with a ``$recordId``."""
+    coll.insert_many([{"_id": i, "x": i} for i in range(1, 4)])
+    docs = list(coll.find({}, sort=[("_id", 1)], show_record_id=True))
+    assert all("$recordId" in d for d in docs)
+    assert [d["_id"] for d in docs] == [1, 2, 3]
+    assert all(d["x"] == d["_id"] for d in docs)  # full doc retained
 
 
 def test_projection_inclusion(coll) -> None:
@@ -659,6 +698,22 @@ def test_unique_index_blocks_update_via_pymongo(coll) -> None:
         coll.update_one({"_id": 2}, {"$set": {"email": "a@x"}})
 
 
+def test_create_unique_index_with_dropdups_ignores_option_and_fails_on_dup(coll) -> None:
+    """``dropDups`` was removed in MongoDB 3.0; mongod accepts but ignores it
+    rather than rejecting the spec as an unknown field. So a unique index over
+    duplicate data still fails on the duplicate (DuplicateKeyError), the docs
+    are untouched, and no index is created. Mirrors pymongo's
+    test_collection.test_index_dont_drop_dups."""
+    from pymongo.errors import DuplicateKeyError as PyDup
+
+    coll.insert_many([{"i": 1}, {"i": 2}, {"i": 2}, {"i": 3}])  # duplicate i
+    with pytest.raises(PyDup):
+        coll.create_index([("i", pymongo.ASCENDING)], unique=True, dropDups=False)
+    # The duplicate wasn't dropped, and the unique index was never created.
+    assert coll.count_documents({}) == 4
+    assert len(coll.index_information()) == 1  # only the default _id_ index
+
+
 def test_drop_index_via_pymongo(coll) -> None:
     coll.insert_one({"x": 1})
     coll.create_index("x")
@@ -769,6 +824,49 @@ def test_coll_stats_storage_stats_surfaces_capped_bounds(client: MongoClient) ->
     assert "maxSize" not in cs[0]["storageStats"]
 
 
+def test_replies_gossip_cluster_time(client: MongoClient) -> None:
+    # Real mongod attaches ``$clusterTime`` + ``operationTime`` to every
+    # reply on a replica set. pymongo's change-stream tests read
+    # ``reply["operationTime"]`` for ``startAtOperationTime``; causal
+    # consistency reads ``$clusterTime``. Both must be present on reads,
+    # writes, and admin commands alike.
+    from bson import Timestamp
+
+    db = client["gossip_test"]
+    for reply in (
+        client.admin.command("ping"),
+        db.command("insert", "c", documents=[{"_id": 1}]),
+        db.command("find", "c"),
+    ):
+        ct = reply["$clusterTime"]
+        assert isinstance(ct["clusterTime"], Timestamp)
+        assert ct["signature"]["keyId"] == 0
+        assert isinstance(reply["operationTime"], Timestamp)
+
+    # A write advances the cluster clock; its reply's operationTime must
+    # be at least the pre-write gossiped time (causal ordering).
+    before = client.admin.command("ping")["operationTime"]
+    after = db.command("insert", "c", documents=[{"_id": 2}])["operationTime"]
+    assert after >= before
+
+
+def test_no_cluster_time_gossip_on_standalone(tmp_path) -> None:
+    # Standalone mongod does not gossip cluster time; neither do we when
+    # the replica-set persona is switched off.
+    standalone_srv = SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "nogossip"), replica_set_name=None
+    )
+    standalone_srv.start()
+    try:
+        mc = MongoClient(standalone_srv.uri, serverSelectionTimeoutMS=2000, directConnection=True)
+        reply = mc.admin.command("ping")
+        assert "$clusterTime" not in reply
+        assert "operationTime" not in reply
+        mc.close()
+    finally:
+        standalone_srv.stop()
+
+
 def test_change_stream_rejected_on_standalone(tmp_path) -> None:
     # When SecantusDB is booted in standalone mode (no replica-set
     # advertisement in ``hello``), opening a change stream must
@@ -846,30 +944,102 @@ def test_get_parameter_advertises_only_scram_auth_mechanism(client: MongoClient)
         assert unsupported not in reply["authenticationMechanisms"]
 
 
-def test_snapshot_read_concern_rejected_on_standalone(client: MongoClient) -> None:
-    # Snapshot read concern requires a real replica set with
-    # majority-committed snapshots; mongod rejects with code 246
-    # (SnapshotUnavailable) on standalone. mongo-java-driver's
-    # ``snapshot-sessions-not-supported-server-error`` unified spec
-    # asserts the error on find / aggregate / distinct.
+def test_snapshot_read_concern_accepted_on_replica_set_persona(client: MongoClient) -> None:
+    # mongod 5.0+ replica sets accept ``snapshot`` on exactly
+    # find / aggregate / distinct (snapshot sessions); the reply
+    # carries ``atClusterTime`` so pymongo can pin the session.
+    # Other commands keep mongod's rejection.
     from pymongo.errors import OperationFailure
 
     db = client["snapshot_rc_db"]
     db.create_collection("things")
 
-    for cmd in (
-        {"find": "things", "readConcern": {"level": "snapshot"}},
-        {"aggregate": "things", "pipeline": [], "cursor": {}, "readConcern": {"level": "snapshot"}},
-        {"distinct": "things", "key": "x", "readConcern": {"level": "snapshot"}},
-    ):
-        with pytest.raises(OperationFailure) as exc:
-            db.command(cmd)
-        assert exc.value.code == 246
-        assert "snapshot" in str(exc.value).lower()
+    reply = db.command({"find": "things", "readConcern": {"level": "snapshot"}})
+    assert reply["cursor"]["atClusterTime"] is not None
+    reply = db.command(
+        {"aggregate": "things", "pipeline": [], "cursor": {}, "readConcern": {"level": "snapshot"}}
+    )
+    assert reply["cursor"]["atClusterTime"] is not None
+    reply = db.command({"distinct": "things", "key": "x", "readConcern": {"level": "snapshot"}})
+    assert reply["atClusterTime"] is not None
 
-    # Other levels still accepted.
-    reply = db.command({"find": "things", "readConcern": {"level": "majority"}})
-    assert reply["ok"] == 1.0
+    with pytest.raises(OperationFailure) as exc:
+        db.command({"count": "things", "readConcern": {"level": "snapshot"}})
+    assert exc.value.code == 246
+    assert "snapshot" in str(exc.value).lower()
+
+
+def test_snapshot_read_concern_rejected_on_standalone(tmp_path) -> None:
+    # With the replica-set persona off, mongod-on-standalone semantics
+    # apply: snapshot is rejected with 246 SnapshotUnavailable on every
+    # command. The mongo-java-driver
+    # ``snapshot-sessions-not-supported-server-error`` unified spec
+    # asserts this error shape.
+    from pymongo.errors import OperationFailure
+
+    with SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "wt-standalone"), replica_set_name=None
+    ) as server:
+        mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000, directConnection=True)
+        try:
+            db = mc["snapshot_rc_db"]
+            db.create_collection("things")
+            for cmd in (
+                {"find": "things", "readConcern": {"level": "snapshot"}},
+                {
+                    "aggregate": "things",
+                    "pipeline": [],
+                    "cursor": {},
+                    "readConcern": {"level": "snapshot"},
+                },
+                {"distinct": "things", "key": "x", "readConcern": {"level": "snapshot"}},
+            ):
+                with pytest.raises(OperationFailure) as exc:
+                    db.command(cmd)
+                assert exc.value.code == 246
+                assert "snapshot" in str(exc.value).lower()
+            # Other levels still accepted.
+            reply = db.command({"find": "things", "readConcern": {"level": "majority"}})
+            assert reply["ok"] == 1.0
+        finally:
+            mc.close()
+
+
+def test_aggregate_linearizable_rc_rejects_write_stage(client: MongoClient) -> None:
+    # mongod rejects aggregate with `$out` or `$merge` under
+    # `readConcern: linearizable` with InvalidOptions (72). The
+    # mongo-rust-driver `aggregate-out-readConcern` unified spec
+    # asserts the operation errors. SecantusDB pretends to be a
+    # replica-set primary so the unified runner doesn't skip the
+    # test on topology; we must mirror mongod's rejection.
+    from pymongo.errors import OperationFailure
+
+    db = client["agg_lin_rc_db"]
+    db.create_collection("src")
+    db["src"].insert_many([{"_id": 1, "x": 11}, {"_id": 2, "x": 22}])
+
+    for stage in ({"$out": "dst"}, {"$merge": {"into": "dst"}}):
+        with pytest.raises(OperationFailure) as exc:
+            db.command(
+                {
+                    "aggregate": "src",
+                    "pipeline": [stage],
+                    "cursor": {},
+                    "readConcern": {"level": "linearizable"},
+                }
+            )
+        assert exc.value.code == 72
+        assert "linearizable" in str(exc.value).lower()
+
+    # Same pipelines run cleanly under non-linearizable readConcern.
+    db.command(
+        {
+            "aggregate": "src",
+            "pipeline": [{"$out": "dst"}],
+            "cursor": {},
+            "readConcern": {"level": "majority"},
+        }
+    )
 
 
 def test_list_indexes_rejects_negative_batch_size(client: MongoClient) -> None:
@@ -1033,6 +1203,27 @@ def test_explain_find_ixscan_when_indexed(coll) -> None:
     assert inner["direction"] == "forward"
 
 
+def test_explain_find_exists_true_uses_sparse_index(coll) -> None:
+    coll.create_index("f", sparse=True)
+    coll.insert_many(
+        [
+            {"_id": 1, "f": 10},
+            {"_id": 2, "f": None},
+            {"_id": 3},
+            {"_id": 4, "f": [1, 2]},
+            {"_id": 5},
+        ]
+    )
+    # Correct results: present-but-null and arrays count as existing.
+    got = sorted(d["_id"] for d in coll.find({"f": {"$exists": True}}))
+    assert got == [1, 2, 4]
+    # And the plan rides the sparse index at IXSCAN.
+    plan = coll.find({"f": {"$exists": True}}).explain()["queryPlanner"]["winningPlan"]
+    assert plan["stage"] == "FETCH"
+    assert plan["inputStage"]["stage"] == "IXSCAN"
+    assert plan["inputStage"]["indexName"] == "f_1"
+
+
 def test_explain_find_ixscan_with_compound_index(coll) -> None:
     coll.create_index([("a", 1), ("b", 1)])
     coll.insert_many([{"_id": i, "a": i, "b": i * 10} for i in range(5)])
@@ -1040,6 +1231,31 @@ def test_explain_find_ixscan_with_compound_index(coll) -> None:
     assert plan["stage"] == "FETCH"
     assert plan["inputStage"]["stage"] == "IXSCAN"
     assert plan["inputStage"]["keyPattern"] == {"a": 1, "b": 1}
+
+
+def test_explain_find_id_equality_uses_id_index(coll) -> None:
+    # Regression: `find({_id: x})` must be a primary-key point lookup
+    # (IXSCAN on the implicit _id_ index), not a COLLSCAN.
+    coll.insert_many([{"_id": i, "n": i} for i in range(20)])
+    plan = coll.find({"_id": 7}).explain()["queryPlanner"]["winningPlan"]
+    assert plan["stage"] == "FETCH"
+    inner = plan["inputStage"]
+    assert inner["stage"] == "IXSCAN"
+    assert inner["indexName"] == "_id_"
+    assert inner["keyPattern"] == {"_id": 1}
+
+
+def test_find_by_id_returns_correct_doc(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i * 2} for i in range(20)])
+    assert coll.find_one({"_id": 5}) == {"_id": 5, "n": 10}
+    assert coll.find_one({"_id": {"$eq": 5}}) == {"_id": 5, "n": 10}
+    # $in by _id: results in ascending _id order, missing ids dropped.
+    assert list(coll.find({"_id": {"$in": [5, 1, 99, 3]}})) == [
+        {"_id": 1, "n": 2},
+        {"_id": 3, "n": 6},
+        {"_id": 5, "n": 10},
+    ]
+    assert coll.find_one({"_id": 12345}) is None
 
 
 def test_explain_find_with_hint_uses_hinted_index(coll) -> None:
@@ -2011,6 +2227,31 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
         cur.close()
 
 
+def test_tailable_capped_rollover_kills_cursor(client: MongoClient) -> None:
+    """When a capped collection rolls over and evicts the document a tailable
+    cursor is anchored on, mongod kills the cursor with CappedPositionLost
+    (code 136). pymongo swallows that for tailable cursors, so a subsequent
+    read returns no docs and ``cursor.alive`` is False — it must NOT keep
+    streaming the post-rollover docs. Mirrors pymongo's test_cursor.test_tailable."""
+    db = client["tail_rollover_db"]
+    db.cap.drop()
+    db.create_collection("cap", capped=True, size=4096, max=3)
+
+    cursor = db.cap.find(cursor_type=pymongo.CursorType.TAILABLE)
+    # Walk the cursor forward one doc at a time, anchoring it on x:3.
+    for x in (1, 2, 3):
+        db.cap.insert_one({"x": x})
+        got = [d["x"] for d in cursor]
+        assert got == [x], f"expected [{x}] this round, got {got}"
+
+    # Rollover: max=3, so inserting 4,5,6 evicts 1,2,3 — including x:3, the
+    # doc the cursor was anchored on. The cursor's position is lost.
+    db.cap.insert_many([{"x": i} for i in range(4, 7)])
+    assert cursor.to_list() == []
+    assert cursor.alive is False
+    assert db.cap.count_documents({}) == 3
+
+
 # --- local.oplog.rs wire-surface (pymongo-driven) -------------------------
 
 
@@ -2055,6 +2296,42 @@ def test_oplog_rs_sort_descending_via_pymongo(client: MongoClient) -> None:
     rows = list(oplog.find({"op": "i", "ns": "oplog_rs_sort_xd.c"}).sort("ts", -1).limit(2))
     assert rows[0]["o"]["_id"] == 2
     assert rows[1]["o"]["_id"] == 1
+
+
+def test_oplog_rs_bootstrap_seed_never_empty(client: MongoClient) -> None:
+    """mongod's oplog is never empty — its first entry is the replica set's
+    "initiating set" noop. A fresh server seeds one so a client can tail
+    ``local.oplog.rs`` before any user write."""
+    oplog = client["local"]["oplog.rs"]
+    rows = list(oplog.find().sort("$natural", pymongo.ASCENDING).limit(1))
+    assert len(rows) == 1
+    assert rows[0]["op"] == "n"  # noop bootstrap entry
+    assert "ts" in rows[0]
+
+
+def test_oplog_rs_tailable_await_reads_entries(client: MongoClient) -> None:
+    """A TAILABLE_AWAIT cursor over ``local.oplog.rs`` reads entries the way
+    replication does. Mirrors pymongo's test_cursor.test_to_list_tailable:
+    take the latest ts via $natural DESC, then tail from it."""
+    db = client["oplog_tail_xd"]
+    db["c"].insert_one({"_id": 1})  # ensure at least one real op
+    oplog = client["local"]["oplog.rs"]
+    last = oplog.find().sort("$natural", pymongo.DESCENDING).limit(-1).next()
+    ts = last["ts"]
+    cur = oplog.find(
+        {"ts": {"$gte": ts}},
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+    ).max_await_time_ms(50)
+    try:
+        docs = []
+        deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+        while not docs and dt.datetime.now() < deadline:
+            docs = cur.to_list()
+        assert len(docs) >= 1
+        assert all("ts" in d for d in docs)
+    finally:
+        with contextlib.suppress(Exception):
+            cur.close()
 
 
 def test_oplog_rs_insert_rejected(client: MongoClient) -> None:
@@ -2220,3 +2497,329 @@ def test_backup_archive_rejects_missing_output_path(client) -> None:
     with pytest.raises(OperationFailure) as exc_info:
         client.admin.command("secantusAdmin.backupArchive")
     assert exc_info.value.code == 14
+
+
+def test_oversized_documents_rejected_server_side(tmp_path) -> None:
+    """mongod enforces maxBsonObjectSize per document server-side:
+    insert -> 10334 BSONObjectTooLarge, upsert -> 17420, update that
+    grows a doc over the cap -> 10334. Just-under documents succeed.
+    Wording oracle-pinned against real mongod."""
+    import pytest
+    from pymongo import MongoClient
+    from pymongo.errors import BulkWriteError, OperationFailure
+
+    from secantus import SecantusDBServer
+
+    max_size = 16 * 1024 * 1024
+    big = "x" * max_size
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["shop"]["big"]
+
+            with pytest.raises(OperationFailure) as exc:
+                coll.insert_one({"foo": big})
+            assert exc.value.code == 10334
+            assert "object to insert too large" in str(exc.value)
+
+            with pytest.raises(BulkWriteError) as bexc:
+                coll.insert_many([{"_id": 1, "x": 1}, {"foo": big}])
+            assert bexc.value.details["nInserted"] == 1
+            assert bexc.value.details["writeErrors"][0]["code"] == 10334
+
+            with pytest.raises(OperationFailure) as uexc:
+                coll.replace_one({"missing": 1}, {"foo": big}, upsert=True)
+            assert uexc.value.code == 17420
+
+            coll.insert_one({"_id": 2, "bar": "x"})
+            with pytest.raises(OperationFailure) as gexc:
+                coll.replace_one({"_id": 2}, {"bar": "x" * (max_size - 14)})
+            assert gexc.value.code == 10334
+            assert "Resulting document after update" in str(gexc.value)
+
+            # Just under the cap succeeds end-to-end.
+            coll.replace_one({"_id": 2}, {"bar": "x" * (max_size - 64)})
+            fetched = coll.find_one({"_id": 2})
+            assert fetched is not None and len(fetched["bar"]) == max_size - 64
+        finally:
+            client.close()
+
+
+def test_upsert_with_none_id_reports_did_upsert(tmp_path) -> None:
+    """An upsert whose resulting _id is None must still report the
+    upsert — None is a valid _id, not a 'no upsert' sentinel.
+    Oracle-pinned: pymongo's test_update_result asserts did_upsert."""
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["test"]
+            r = coll.update_one({"_id": None, "x": 0}, {"$inc": {"x": 1}}, upsert=True)
+            assert r.did_upsert is True
+            assert r.upserted_id is None
+            assert coll.find_one({"_id": None}) == {"_id": None, "x": 1}
+
+            # A plain non-upserting update reports did_upsert False.
+            r2 = coll.update_one({"_id": None}, {"$inc": {"x": 1}})
+            assert r2.did_upsert is False
+
+            # findOneAndUpdate upsert with _id None + return new.
+            from pymongo import ReturnDocument
+
+            doc = client["db"]["fam"].find_one_and_update(
+                {"_id": None},
+                {"$set": {"v": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            assert doc == {"_id": None, "v": 1}
+        finally:
+            client.close()
+
+
+def test_cursor_min_max_index_bounds(tmp_path) -> None:
+    """Cursor min()/max() bound a hinted index scan: max is an exclusive
+    upper bound, min an inclusive lower bound. Oracle-pinned against a
+    real mongod 2026-06-13."""
+    from pymongo import MongoClient
+    from pymongo.errors import OperationFailure
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            t = client["db"]["t"]
+            t.create_index([("j", 1)])
+            t.insert_many([{"j": j, "k": j} for j in range(10)])
+
+            # max exclusive: j < 3 -> 3 docs.
+            assert len(t.find().max([("j", 3)]).hint([("j", 1)]).to_list()) == 3
+            # min inclusive: j >= 3 -> 7 docs.
+            assert len(t.find().min([("j", 3)]).hint([("j", 1)]).to_list()) == 7
+            # min + max: 2 <= j < 5 -> j in {2,3,4}.
+            got = t.find().min([("j", 2)]).max([("j", 5)]).hint([("j", 1)]).to_list()
+            assert sorted(d["j"] for d in got) == [2, 3, 4]
+
+            # Compound index, full key.
+            t.create_index([("j", 1), ("k", 1)])
+            assert len(t.find().max([("j", 3), ("k", 3)]).hint([("j", 1), ("k", 1)]).to_list()) == 3
+
+            # Wrong field order vs the hinted index -> OperationFailure.
+            with pytest.raises(OperationFailure):
+                t.find().max([("k", 3), ("j", 3)]).hint([("j", 1), ("k", 1)]).to_list()
+
+            # Hint that doesn't correspond to an index -> OperationFailure.
+            with pytest.raises(OperationFailure):
+                t.find().max([("k", 3)]).hint("nonexistent").to_list()
+        finally:
+            client.close()
+
+
+def test_upsert_with_subdocument_id(tmp_path) -> None:
+    """An upsert whose filter pins ``_id`` to a SUBDOCUMENT value must
+    seed that _id, not generate a fresh ObjectId. The seed extraction
+    must distinguish a literal subdocument value ({f, f2}) from an
+    operator expression ({$gt: 5}). Oracle-pinned (pymongo's
+    test_upsert_uuid_standard_subdocuments)."""
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    sub_id = {"f": b"x", "f2": 7}
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["t"]
+            r = coll.update_one({"_id": sub_id}, {"$set": {"a": 0}}, upsert=True)
+            assert r.did_upsert is True
+            assert r.upserted_id == sub_id
+            assert coll.find_one({"_id": sub_id}) == {"_id": sub_id, "a": 0}
+
+            # Operator-expression filter fields are still NOT seeded.
+            r2 = coll.update_one({"n": {"$gt": 5}}, {"$set": {"b": 1}}, upsert=True)
+            doc = coll.find_one({"_id": r2.upserted_id})
+            assert "n" not in doc and doc["b"] == 1
+        finally:
+            client.close()
+
+
+def test_drop_collection_honors_unsatisfiable_write_concern(tmp_path) -> None:
+    """``drop`` with an unsatisfiable write concern (w > member count)
+    raises a WriteConcernError, like other write commands on the
+    single-node replica-set persona. Oracle: pymongo's
+    test_drop_collection with IMPOSSIBLE_WRITE_CONCERN."""
+    import pytest as _pytest
+    from pymongo import MongoClient
+    from pymongo.errors import WriteConcernError
+    from pymongo.write_concern import WriteConcern
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            client["db"]["t"].insert_one({"x": 1})
+            db_wc = client.get_database("db", write_concern=WriteConcern(w=50))
+            with _pytest.raises(WriteConcernError):
+                db_wc.drop_collection("t")
+        finally:
+            client.close()
+
+
+def test_unknown_update_operator_rejected_on_empty_collection(tmp_path) -> None:
+    """An unknown update modifier is rejected at parse time — even when
+    no documents match (mongod validates before matching). Oracle:
+    pymongo test_error_code expects code in (9, 10147, 16840, 17009)."""
+    from pymongo import MongoClient
+    from pymongo.errors import OperationFailure
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["empty"]  # no documents
+            with pytest.raises(OperationFailure) as exc:
+                coll.update_many({}, {"$thismodifierdoesntexist": 1})
+            assert exc.value.code in (9, 10147, 16840, 17009)
+            assert exc.value.details is not None
+        finally:
+            client.close()
+
+
+def test_bad_partial_filter_expression_rejected(tmp_path) -> None:
+    """createIndexes rejects malformed partialFilterExpression: a
+    non-document, an unknown operator, and a logical operator with a
+    non-array argument. Oracle: pymongo test_index_filter."""
+    from pymongo import MongoClient
+    from pymongo.errors import OperationFailure
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            coll = client["db"]["t"]
+            for bad in (5, {"x": {"$asdasd": 3}}, {"$and": 5}):
+                with pytest.raises(OperationFailure):
+                    coll.create_index("x", partialFilterExpression=bad)
+            # A valid partial filter still works.
+            assert (
+                coll.create_index([("x", 1)], partialFilterExpression={"a": {"$lte": 1.5}}) == "x_1"
+            )
+        finally:
+            client.close()
+
+
+def test_partial_index_range_implication_is_sound(tmp_path) -> None:
+    """A partial index on {a: {$lte: 1.5}} is used only when the query
+    GUARANTEES a <= 1.5 (equality a:1, or a:{$lt:1}); a query that could
+    match docs outside the partial filter must NOT use it (correctness)
+    and must return all matching docs via a full scan."""
+    from pymongo import MongoClient
+
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as server:
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+        try:
+            t = client["db"]["t"]
+            t.create_index([("x", 1)], partialFilterExpression={"a": {"$lte": 1.5}})
+            t.insert_many([{"x": 6, "a": 1}, {"x": 7, "a": 5}])  # a=5 not in index
+
+            # Implying query: uses the partial index, correct result.
+            assert t.count_documents({"x": 6, "a": 1}) == 1
+            plan = t.find({"x": 6, "a": 1}).explain()["queryPlanner"]["winningPlan"]
+            assert plan["inputStage"]["indexName"] == "x_1"
+            assert plan["inputStage"]["isPartial"] is True
+
+            # Non-implying query (a < 10 doesn't guarantee a <= 1.5):
+            # must NOT use the partial index, must still find the a=5 doc.
+            assert t.count_documents({"a": {"$lt": 10}}) == 2
+        finally:
+            client.close()
+
+
+def test_exhaust_cursor_streams_all_documents(coll) -> None:
+    """CursorType.EXHAUST: the server streams every remaining batch over
+    the same socket using OP_MSG moreToCome, without the driver sending a
+    getMore per batch. Mirrors pymongo's own test_cursor.test_exhaust."""
+    from pymongo import CursorType
+
+    coll.insert_many({"_id": i} for i in range(200))
+    cursor = coll.find(cursor_type=CursorType.EXHAUST, batch_size=10)
+    got = [d["_id"] for d in cursor]
+    assert got == list(range(200))
+
+
+def test_exhaust_raw_batches_round_trip(server: SecantusDBServer) -> None:
+    """find_raw_batches under EXHAUST returns the full result set decoded
+    from the streamed raw batches (the exact shape pymongo's gauge asserts)."""
+    from bson import decode_all
+    from pymongo import CursorType, MongoClient
+
+    client = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        c = client["db"]["test"]
+        c.insert_many({"_id": i} for i in range(200))
+        result = b"".join(c.find_raw_batches(cursor_type=CursorType.EXHAUST).to_list())
+        assert decode_all(result) == [{"_id": i} for i in range(200)]
+    finally:
+        client.close()
+
+
+def test_exhaust_cursor_single_batch_no_stream(coll) -> None:
+    """When the whole result fits in firstBatch (cursor id 0), exhaust is a
+    no-op: one reply, no moreToCome streaming, correct docs."""
+    from pymongo import CursorType
+
+    coll.insert_many({"_id": i} for i in range(5))
+    cursor = coll.find(cursor_type=CursorType.EXHAUST)
+    assert [d["_id"] for d in cursor] == list(range(5))
+
+
+def test_exhaust_midstream_getmore_fault_terminates_cleanly(coll, monkeypatch) -> None:
+    """If a synthetic mid-stream getMore raises unexpectedly after a
+    ``moreToCome`` reply has already gone out, the server must close the
+    stream with a final ``moreToCome``-clear reply (empty batch, id 0)
+    rather than dropping the connection — which the client would surface as
+    "Server ended moreToCome unexpectedly". Regression for the b33 hardening
+    in ``SecantusDBServer._stream_exhaust_getmore``."""
+    from pymongo import CursorType
+
+    import secantus.server as server_mod
+
+    coll.insert_many({"_id": i} for i in range(5))
+
+    real_dispatch = server_mod.dispatch
+    getmore_calls = {"n": 0}
+
+    def faulting_dispatch(body, ctx):
+        # Only meddle with getMores against this test's collection; every
+        # other command (incl. other servers in this worker) passes through
+        # untouched. The first getMore — the client's own exhaustAllowed
+        # request that opens the stream — succeeds and produces a non-empty
+        # ``moreToCome`` batch. The second getMore is the server's synthetic
+        # mid-stream pull; raise there to exercise the fault path.
+        if body.get("getMore") is not None and body.get("collection") == coll.name:
+            getmore_calls["n"] += 1
+            if getmore_calls["n"] >= 2:
+                raise RuntimeError("injected mid-stream getMore fault")
+        return real_dispatch(body, ctx)
+
+    monkeypatch.setattr(server_mod, "dispatch", faulting_dispatch)
+
+    # batchSize 1 guarantees the cursor stays alive past the first getMore,
+    # so the stream emits at least one moreToCome reply before the fault.
+    cursor = coll.find(cursor_type=CursorType.EXHAUST, batch_size=1)
+    # No MongoUnexpectedServerResponseError: the stream ends cleanly. We got
+    # the docs delivered before the fault (find's firstBatch + one streamed
+    # batch); the tail is dropped, but the wire stays well-formed.
+    got = [d["_id"] for d in cursor]
+    assert got == [0, 1]
+    assert getmore_calls["n"] >= 2
+
+    # The connection survives — a fresh command on the same client works.
+    assert coll.count_documents({}) == 5

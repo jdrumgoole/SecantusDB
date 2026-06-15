@@ -44,7 +44,7 @@ jobs:
         # (4 Pythons × 3 OSes = 12 cells).
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive  # vendor/wiredtiger is needed by the build
 
@@ -63,6 +63,28 @@ jobs:
         # refreshes that drop it. Same line cibuildwheel uses for
         # publish-time wheel builds.
         run: choco install -y swig
+
+      - name: Install MongoDB CLI tools (Linux)
+        if: runner.os == 'Linux'
+        # mongosh + Database Tools so the CLI-tool conformance tests
+        # (tests/test_mongosh.py, test_mongodump_restore.py,
+        # test_mongoimport_export.py, test_mongofiles.py,
+        # test_mongostat_mongotop.py) run instead of skipping — they
+        # skipif the binaries are absent. Windows is intentionally
+        # omitted: the mongosh tests skip on win32 by design
+        # (PowerShell --eval quoting), leaving only marginal coverage
+        # for a slow, flake-prone choco install.
+        run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+          sudo apt-get update
+          sudo apt-get install -y mongodb-mongosh mongodb-database-tools
+
+      - name: Install MongoDB CLI tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew tap mongodb/brew
+          brew install mongosh mongodb-database-tools
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -104,11 +126,259 @@ jobs:
       - name: Tests
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
         # exceeded hangs (test body busy-loops or blocks on a stuck
-        # producer). ``--max-worker-restart=0`` makes xdist fail
-        # immediately when a worker SUBPROCESS dies (native segfault,
-        # OOM, etc.) instead of silently entering a hung state where
-        # the parent waits forever for results from a dead worker —
-        # which is what was happening on the recent main runs that
-        # appeared to "hang at 97%". With this flag we get the
-        # crashed test's name in the pytest output instead.
-        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=0
+        # producer) — independently of worker restarts.
+        #
+        # ``--max-worker-restart=3``: a few subprocess/threading-heavy tests
+        # (admin websocket change-streams, cross-driver smokes) intermittently
+        # crash their xdist worker on a teardown race (native "node down: not
+        # properly terminated"). With ``=0`` that fatally fails the whole run
+        # ~half the time, blocking every PR on an unrelated flake. A bounded
+        # restart budget lets xdist restart the dead worker and re-run the
+        # crashed test, so a *transient* crash retries to green; a
+        # *deterministic* crash re-crashes on retry and exhausts the budget,
+        # still failing loudly with the test's name. The original ``=0`` was
+        # set to avoid a silent "hang at 97%" where the parent waited forever
+        # on a dead worker — but that hang mode is now caught by the
+        # ``--timeout`` above regardless, so the restart budget is safe.
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
+
+  # The matrix above runs the default pure-Python engines. This job builds the
+  # optional Rust accelerator core (``_secantus_core``) and validates it two
+  # ways: the engine-parity suites (pure-Python vs Rust, byte-for-byte) and the
+  # FULL pytest suite under ``SECANTUS_ENGINE=rust`` — so the Rust engine is
+  # differentially validated against real WiredTiger-backed behaviour through
+  # pymongo. (The Rust engines reproduce the pure path exactly or fall back to
+  # it, so the full suite is expected green under either engine.)
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive  # vendor/wiredtiger is needed by the build
+
+      - name: Install swig
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin  # also builds vendored WT
+
+      - name: Cargo fmt / clippy / unit tests
+        # Run across the whole Rust workspace (the pure-engine `secantus-core`
+        # lib crate + the `secantus-core-py` PyO3 bindings crate).
+        working-directory: crates
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Build & install the Rust core
+        run: |
+          uvx maturin build --release \
+            --manifest-path crates/secantus-core-py/Cargo.toml --out dist-rust
+          uv pip install dist-rust/secantus_core-*.whl
+
+      - name: Engine-parity suites (pure-Python vs Rust)
+        run: >-
+          uv run python -m pytest
+          tests/test_engine.py
+          tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py
+          tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py
+          tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py
+          tests/test_rust_aggregate_parity.py
+
+      - name: Full suite under the Rust engine
+        env:
+          SECANTUS_ENGINE: rust
+        # ``--max-worker-restart=3`` for the same transient-worker-crash flake
+        # as the pure-Python ``test`` job above (the timeout still guards hangs).
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
+
+  # The WiredTiger-linking Rust storage crate (`secantus-storage`, Phase 4) — the
+  # secondary-index + CRUD storage layer. It's excluded from the `crates/`
+  # workspace (it links the vendored WiredTiger C library and needs libclang), so
+  # the `rust` job above doesn't cover it. Here we build the vendored WiredTiger
+  # exactly as the wheel does (`uv sync` → scikit-build-core → `build/*/wt-build`,
+  # static `libwiredtiger.a` from `-DENABLE_STATIC=ON`), point `secantus-wt`'s
+  # build script at it, and run fmt / clippy / the crate's WT-backed test suite.
+  # Linux-only — cross-platform WiredTiger *linking* is already proven by the
+  # `storage-engine` 3-OS wheel build below.
+  rust-storage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive  # vendor/wiredtiger is needed by the build
+
+      # swig builds WT's Python module; clang/libclang for secantus-wt's bindgen;
+      # ninja is the generator the WT ExternalProject forces.
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        # Builds the vendored WiredTiger into build/<wheel_tag>/wt-build
+        # (scikit-build-core's build-dir), the same output the wheel ships.
+        run: uv sync --extra dev
+
+      - name: Point secantus-wt at the vendored WiredTiger
+        # Resolve the build-dir WT output explicitly rather than relying on
+        # build.rs's probe, and fail loudly if the build didn't produce it.
+        run: |
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ] || [ ! -f "$wt/libwiredtiger.a" ]; then
+            echo "vendored WiredTiger not found under build/*/wt-build" >&2
+            ls -R build 2>/dev/null | head -50 >&2 || true
+            exit 1
+          fi
+          echo "SECANTUS_WT_INCLUDE=$wt/include" >> "$GITHUB_ENV"
+          echo "SECANTUS_WT_LIB=$wt" >> "$GITHUB_ENV"
+          echo "Using WiredTiger at $wt"
+
+      - name: Cargo fmt / clippy / test (secantus-storage)
+        working-directory: crates/secantus-storage
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Cargo fmt / clippy / build (secantus-storage-adapter, R4b)
+        # The WiredTiger → command-`Storage` adapter (R4b). Like secantus-storage
+        # it links WiredTiger and is excluded from the workspace, so it's built
+        # here against the vendored WT resolved above. clippy/build also settle
+        # whether `secantus_storage::Storage` is `Send + Sync` (the command
+        # `Storage` trait's supertrait). It has no tests of its own.
+        working-directory: crates/secantus-storage-adapter
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo build
+
+  # Builds the main `secantus` wheel with the off-by-default storage-engine flag
+  # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
+  # extension links the SAME bundled WiredTiger this wheel already builds and
+  # ships inside it. Proves the "bundle behind a build flag" packaging end to end
+  # across Linux / macOS / Windows. The DEFAULT wheel build (flag OFF, no
+  # Rust/clang needed) is covered by the `test` matrix and wheels.yml.
+  storage-engine:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive  # vendor/wiredtiger is needed by the build
+
+      # bindgen needs libclang; the WT ExternalProject forces the Ninja
+      # generator; swig builds WT's (unused-here but configured) Python module.
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        # clang/libclang come from the Xcode command line tools already on the
+        # runner; just add swig + ninja.
+        run: brew install swig ninja
+
+      - name: Install toolchain (Windows)
+        if: runner.os == 'Windows'
+        run: choco install -y swig ninja llvm
+
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        # clang-sys doesn't always find choco's LLVM on PATH within the same job;
+        # pin it explicitly for the build step below.
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Build the secantus wheel with the storage engine ON
+        # scikit-build-core forwards SKBUILD_CMAKE_DEFINE entries as -D defines,
+        # so this flips the CMake option ON for this build only. The cargo build
+        # of the extension runs inside CMake, linking the WiredTiger built above.
+        env:
+          SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+        run: uv build --wheel --out-dir dist-storage
+
+      - name: Assert the extensions are bundled in the wheel
+        # importorskip in the smoke tests would silently pass if an extension
+        # were missing — the whole point here is that they're PRESENT, so fail
+        # hard. Both the storage engine (_secantus_storage) and the Rust server
+        # handle (_secantus_server, R6) are built by CMake under the flag.
+        # bash on all three OSes (git-bash on Windows) for the glob expansion.
+        shell: bash
+        run: >-
+          uv run --no-project --with "$(ls dist-storage/*.whl)"
+          python -c "import _secantus_storage, _secantus_server;
+          print('bundled OK:', _secantus_storage.__file__, _secantus_server.__file__)"
+
+      - name: Storage + Rust-server smoke tests
+        # test_rust_storage_smoke.py drives the storage engine; test_rust_server
+        # _smoke.py drives the embedded Rust server (R6) end-to-end via pymongo —
+        # the first pymongo → Rust → WiredTiger conformance check.
+        shell: bash
+        run: >-
+          uv run --no-project --with pymongo --with pytest
+          --with "$(ls dist-storage/*.whl)"
+          python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
+          -o addopts= -p no:cacheprovider -q
+
+      - name: Build + smoke the standalone secantusdb binary (R7)
+        # The bin crate links the SAME vendored WiredTiger the wheel build above
+        # produced under build/*/wt-build (scikit-build-core's build-dir), via
+        # build.rs's SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB override. Windows is
+        # skipped: build.rs probes libwiredtiger.a/.so, which the MSVC build
+        # doesn't produce — the Windows artifact ships via the wheel's CMake
+        # path only (tracked in tasks/backlog.md §7).
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
+            echo "vendored WiredTiger not found under build/*/wt-build" >&2
+            exit 1
+          fi
+          export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+          cargo build --manifest-path crates/secantusdb/Cargo.toml
+          uv run --no-project --with pymongo --with pytest \
+            python -m pytest tests/test_rust_binary_smoke.py \
+            -o addopts= -p no:cacheprovider -q

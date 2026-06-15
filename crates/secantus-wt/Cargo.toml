@@ -1,0 +1,21 @@
+[package]
+name = "secantus-wt"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "Safe Rust bindings over the vendored WiredTiger C library — the storage foundation for SecantusDB's Rust engine (Phase 4)."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+publish = false
+
+# Standalone (own [workspace] table) so it isn't pulled into the secantus-core
+# workspace's default cargo build — it needs the WiredTiger C library, which the
+# core crates and their CI don't.
+[workspace]
+
+[lib]
+name = "secantus_wt"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.70"

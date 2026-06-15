@@ -120,3 +120,117 @@ install(DIRECTORY ${WT_SOURCE_DIR}/lang/python/wiredtiger/
         PATTERN "*.py"
         PATTERN "init.py" EXCLUDE
 )
+
+# -----------------------------------------------------------------------------
+# Optional: the Rust storage engine extension (`_secantus_storage`).
+#
+# This is the "bundle behind a build flag" packaging (chosen over a separate
+# companion wheel): the extension links the SAME vendored WiredTiger this wheel
+# already builds above (no second WT build), so when the flag is ON it ships
+# inside the `secantus` wheel. It is OFF by default — the pure-Python storage
+# path is the shipping default until engine-selection (Phase 4+) makes the Rust
+# storage engine selectable. With the flag OFF, the wheel is byte-for-byte the
+# same as before and the build needs no Rust/clang toolchain.
+#
+# `crates/secantus-wt/build.rs` resolves WiredTiger from SECANTUS_WT_INCLUDE /
+# SECANTUS_WT_LIB (set below to this CMake build's WT output dir), and bindgen
+# needs libclang (set LIBCLANG_PATH in the build environment if it isn't auto-
+# discovered). cargo builds the PyO3 abi3 cdylib; we rename it to the platform's
+# Python-extension filename and install it at the wheel root so `import
+# _secantus_storage` resolves.
+# -----------------------------------------------------------------------------
+option(SECANTUS_BUILD_STORAGE_ENGINE
+    "Build the Rust storage extension (_secantus_storage) against the bundled \
+WiredTiger and ship it in the wheel (OFF by default; needs a Rust + libclang \
+toolchain when ON)."
+    OFF)
+
+if(SECANTUS_BUILD_STORAGE_ENGINE)
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+
+    set(STORAGE_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantus-storage-py)
+    set(STORAGE_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/storage-target)
+
+    # cdylib output name (cargo) vs the Python-importable extension filename we
+    # install. abi3 means one filename per platform covers every CPython >=3.10.
+    if(WIN32)
+        set(STORAGE_CARGO_OUT "_secantus_storage.dll")
+        set(STORAGE_EXT_NAME  "_secantus_storage.pyd")
+    elseif(APPLE)
+        set(STORAGE_CARGO_OUT "lib_secantus_storage.dylib")
+        set(STORAGE_EXT_NAME  "_secantus_storage.abi3.so")
+    else()
+        set(STORAGE_CARGO_OUT "lib_secantus_storage.so")
+        set(STORAGE_EXT_NAME  "_secantus_storage.abi3.so")
+    endif()
+
+    set(STORAGE_EXT_BUILT  ${STORAGE_TARGET_DIR}/release/${STORAGE_CARGO_OUT})
+    set(STORAGE_EXT_STAGED ${CMAKE_CURRENT_BINARY_DIR}/${STORAGE_EXT_NAME})
+
+    # Point the crate's build.rs at THIS build's WiredTiger (built above by the
+    # wiredtiger_ext ExternalProject). `cmake -E env` inherits the rest of the
+    # environment (PATH, LIBCLANG_PATH, RUSTUP_* ...), so libclang discovery and
+    # the rust toolchain are picked up from the build environment.
+    #
+    # A custom TARGET (not add_custom_command OUTPUT): the command must run on
+    # every build so cargo's own dependency tracking decides freshness. The
+    # OUTPUT form had no DEPENDS on the crate sources, so once the staged file
+    # existed, ninja skipped cargo entirely and editable rebuilds shipped a
+    # STALE extension. copy_if_different keeps the no-change case cheap.
+    add_custom_target(secantus_storage_ext ALL
+        COMMAND ${CMAKE_COMMAND} -E env
+            SECANTUS_WT_INCLUDE=${WT_BINARY_DIR}/include
+            SECANTUS_WT_LIB=${WT_BINARY_DIR}
+            CARGO_TARGET_DIR=${STORAGE_TARGET_DIR}
+            ${CARGO_EXECUTABLE} build --release
+                --manifest-path ${STORAGE_CRATE_DIR}/Cargo.toml
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${STORAGE_EXT_BUILT} ${STORAGE_EXT_STAGED}
+        DEPENDS wiredtiger_ext
+        COMMENT "Building Rust storage extension (_secantus_storage) against bundled WiredTiger"
+        VERBATIM
+    )
+
+    # Wheel root, alongside the other top-level extensions — `import
+    # _secantus_storage` resolves from site-packages.
+    install(FILES ${STORAGE_EXT_STAGED} DESTINATION . OPTIONAL)
+
+    # -------------------------------------------------------------------------
+    # The Rust server extension (`_secantus_server`, R6) — the embedded Python
+    # lifecycle handle over the standalone Rust server. It links the SAME
+    # vendored WiredTiger (transitively via secantus-storage-adapter →
+    # secantus-storage), so it builds under the same flag, the same way as
+    # `_secantus_storage` above. `import _secantus_server` → `RustServer`.
+    # -------------------------------------------------------------------------
+    set(SERVER_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantus-server-py)
+    set(SERVER_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/server-target)
+
+    if(WIN32)
+        set(SERVER_CARGO_OUT "_secantus_server.dll")
+        set(SERVER_EXT_NAME  "_secantus_server.pyd")
+    elseif(APPLE)
+        set(SERVER_CARGO_OUT "lib_secantus_server.dylib")
+        set(SERVER_EXT_NAME  "_secantus_server.abi3.so")
+    else()
+        set(SERVER_CARGO_OUT "lib_secantus_server.so")
+        set(SERVER_EXT_NAME  "_secantus_server.abi3.so")
+    endif()
+
+    set(SERVER_EXT_BUILT  ${SERVER_TARGET_DIR}/release/${SERVER_CARGO_OUT})
+    set(SERVER_EXT_STAGED ${CMAKE_CURRENT_BINARY_DIR}/${SERVER_EXT_NAME})
+
+    # Same always-run custom-target shape as secantus_storage_ext above —
+    # see the staleness note there.
+    add_custom_target(secantus_server_ext ALL
+        COMMAND ${CMAKE_COMMAND} -E env
+            SECANTUS_WT_INCLUDE=${WT_BINARY_DIR}/include
+            SECANTUS_WT_LIB=${WT_BINARY_DIR}
+            CARGO_TARGET_DIR=${SERVER_TARGET_DIR}
+            ${CARGO_EXECUTABLE} build --release
+                --manifest-path ${SERVER_CRATE_DIR}/Cargo.toml
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SERVER_EXT_BUILT} ${SERVER_EXT_STAGED}
+        DEPENDS wiredtiger_ext
+        COMMENT "Building Rust server extension (_secantus_server) against bundled WiredTiger"
+        VERBATIM
+    )
+    install(FILES ${SERVER_EXT_STAGED} DESTINATION . OPTIONAL)
+endif()

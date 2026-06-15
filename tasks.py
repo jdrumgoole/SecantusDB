@@ -71,6 +71,163 @@ def fmt(c: Context) -> None:
     c.run("uv run ruff check --fix src tests", pty=True)
 
 
+# --- Rust core (Phase 1 of the Python -> Rust rewrite) --------------------
+# The Rust side is a Cargo workspace under crates/:
+#   * crates/secantus-core    — the pure-Rust operator engines (no PyO3).
+#   * crates/secantus-core-py — the PyO3 bindings that wrap it and build the abi3
+#                               extension `_secantus_core` (the `secantus-core`
+#                               wheel) via maturin.
+# It is additive: the engine shims delegate to it only when the matching
+# component is enabled. See tasks/rust-rewrite-plan.md and
+# tasks/rust-rewrite-spike-findings.md.
+
+_RUST_WORKSPACE_DIR = "crates"
+_RUST_BINDINGS_DIR = "crates/secantus-core-py"
+
+
+@task(name="rust-test")
+def rust_test(c: Context) -> None:
+    """cargo fmt --check, clippy (warnings-as-errors), unit tests (whole workspace)."""
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt --check", pty=True)
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo test", pty=True)
+
+
+@task(name="rust-build")
+def rust_build(c: Context) -> None:
+    """Build the abi3 wheel for the Rust core into target/wheels/."""
+    c.run(
+        f"cd {_RUST_BINDINGS_DIR} && uv tool run maturin build --release",
+        pty=True,
+        env={"VIRTUAL_ENV": ""},
+    )
+
+
+@task(name="rust-parity")
+def rust_parity(c: Context) -> None:
+    """Build the Rust core and run the leaf-engine parity suites against it.
+
+    Builds the extension, then runs the parity tests (sortkey + query) in an
+    isolated interpreter (pymongo + the freshly built wheel) so they do not
+    require the WiredTiger C extension to be installed. This mirrors how the
+    parity gate runs in a WiredTiger-less environment; full CI also runs them
+    via the normal pytest suite once the project wheel is built.
+
+    ``--reinstall-package`` busts uv's cache: the wheel keeps the same
+    name/version across rebuilds, so without it a stale build would be reused.
+    """
+    import glob
+
+    c.run(
+        f"cd {_RUST_BINDINGS_DIR} && uv tool run maturin build --release --out dist",
+        pty=True,
+    )
+    wheels = sorted(glob.glob(f"{_RUST_BINDINGS_DIR}/dist/*.whl"))
+    if not wheels:
+        raise SystemExit("no wheel produced by maturin")
+    c.run(
+        "uv run --no-project --reinstall-package secantus-core "
+        f"--with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
+        "python -m pytest tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py "
+        "tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py "
+        "tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py "
+        "tests/test_rust_aggregate_parity.py "
+        "-o addopts= -p no:cacheprovider -q",
+        pty=True,
+    )
+
+
+# The WiredTiger FFI / storage foundation (Phase 4) is a standalone crate outside
+# the secantus-core workspace because it links the vendored WiredTiger C library.
+_RUST_WT_DIR = "crates/secantus-wt"
+
+
+@task(name="rust-wt-test")
+def rust_wt_test(c: Context) -> None:
+    """fmt/clippy/test the secantus-wt WiredTiger FFI crate.
+
+    Needs WiredTiger present: either set SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB,
+    or have it under build/*/wt-build (the project CMake output) or /tmp/wt-build.
+    bindgen needs libclang (set LIBCLANG_PATH if not auto-found).
+    """
+    c.run(f"cd {_RUST_WT_DIR} && cargo fmt --check", pty=True)
+    c.run(f"cd {_RUST_WT_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
+    c.run(f"cd {_RUST_WT_DIR} && cargo test", pty=True)
+
+
+# The Rust storage layer (Phase 4 sub-phase 1+), built on secantus-wt +
+# secantus-core. Also standalone (links WiredTiger transitively via secantus-wt).
+_RUST_STORAGE_DIR = "crates/secantus-storage"
+
+
+@task(name="rust-storage-test")
+def rust_storage_test(c: Context) -> None:
+    """fmt/clippy/test the secantus-storage crate (the Rust Storage layer).
+
+    Same WiredTiger / libclang prerequisites as ``rust-wt-test`` (it links
+    WiredTiger transitively through secantus-wt).
+    """
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo fmt --check", pty=True)
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo test", pty=True)
+
+
+# The PyO3 bindings that expose the Rust storage layer to Python as the
+# WiredTiger-linking _secantus_storage extension.
+_RUST_STORAGE_PY_DIR = "crates/secantus-storage-py"
+
+
+@task(name="rust-storage-py")
+def rust_storage_py(c: Context) -> None:
+    """Build the _secantus_storage extension and run its Python smoke test.
+
+    Builds the WiredTiger-linking wheel with maturin, then runs the smoke test in
+    an isolated interpreter (pymongo + the freshly built wheel) so it doesn't need
+    the project's own WiredTiger extension installed. Same WiredTiger / libclang
+    prerequisites as ``rust-wt-test``.
+    """
+    import glob
+
+    c.run(
+        f"cd {_RUST_STORAGE_PY_DIR} && uv tool run maturin build --release --out dist",
+        pty=True,
+    )
+    wheels = sorted(glob.glob(f"{_RUST_STORAGE_PY_DIR}/dist/*.whl"))
+    if not wheels:
+        raise SystemExit("no wheel produced by maturin")
+    c.run(
+        "uv run --no-project --reinstall-package secantus-storage "
+        f"--with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
+        "python -m pytest tests/test_rust_storage_smoke.py "
+        "-o addopts= -p no:cacheprovider -q",
+        pty=True,
+    )
+
+
+# The standalone Rust server binary (R7), over the same crates the embedded
+# _secantus_server handle uses. Links WiredTiger, so it lives outside the clean
+# workspace like secantus-storage-adapter.
+_RUST_BINARY_DIR = "crates/secantusdb"
+
+
+@task(name="rust-binary-test")
+def rust_binary_test(c: Context) -> None:
+    """Build the standalone ``secantusdb`` binary and run its smoke test.
+
+    Builds the WiredTiger-linking bin crate, then launches it from
+    tests/test_rust_binary_smoke.py (ephemeral port, pymongo round-trip,
+    clean SIGTERM exit) in an isolated interpreter. Same WiredTiger /
+    libclang prerequisites as ``rust-wt-test``.
+    """
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build", pty=True)
+    c.run(
+        "uv run --no-project --with pymongo --with pytest "
+        "python -m pytest tests/test_rust_binary_smoke.py "
+        "-o addopts= -p no:cacheprovider -q",
+        pty=True,
+    )
+
+
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(
@@ -209,6 +366,55 @@ def concurrency(
 
 
 @task(
+    name="rw-harness",
+    help={
+        "workers": "Number of independent reader/writer processes (default: 4).",
+        "count": "Documents each worker writes then stops (default: 1000).",
+        "duration": "Run each worker N seconds instead of a fixed count (overrides --count).",
+        "server": "Server hosting: daemon (default) | embedded | external.",
+        "uri": "Server URI when --server external (default: mongodb://127.0.0.1:27018/).",
+        "payload-bytes": "Random payload size per document (default: 256).",
+        "sync-on-commit": "Start the server with --sync-on-commit (fsync every commit).",
+    },
+)
+def rw_harness(
+    c: Context,
+    workers: int = 4,
+    count: int = 1000,
+    duration: float = 0.0,
+    server: str = "daemon",
+    uri: str = "mongodb://127.0.0.1:27018/",
+    payload_bytes: int = 256,
+    sync_on_commit: bool = False,
+) -> None:
+    """Concurrent read/write validation harness.
+
+    Spawns ``--workers`` independent processes that simultaneously read
+    and write a shared collection with the highest write/read safety
+    (w:majority, j:true, readConcern:majority, retryWrites/Reads). Every
+    read is checksum-validated in flight; a final paginated sweep
+    re-verifies every document and reconciles per-worker counts. The
+    server can be hosted as a daemon subprocess (default), embedded
+    in-process, or pointed at an external URI for differential testing.
+    """
+    cmd = (
+        "uv run --no-sync python -m bench.rw_harness"
+        f" --workers {int(workers)}"
+        f" --server {shlex.quote(server)}"
+        f" --payload-bytes {int(payload_bytes)}"
+    )
+    if duration > 0:
+        cmd += f" --duration {float(duration)}"
+    else:
+        cmd += f" --count {int(count)}"
+    if server == "external":
+        cmd += f" --uri {shlex.quote(uri)}"
+    if sync_on_commit:
+        cmd += " --sync-on-commit"
+    c.run(cmd, pty=True)
+
+
+@task(
     help={
         "uri": "MongoDB URI to administer.",
         "port": "Local HTTP port (0 = pick a free one).",
@@ -272,16 +478,37 @@ def docs_serve(c: Context, port: int = 8000) -> None:
     )
 
 
-@task
-def validate(c: Context) -> None:
+@task(
+    help={
+        "server": (
+            "Which SecantusDB server the gauge runs against: 'python' (the "
+            "pure-Python SecantusDBServer; the headline gauge, default) or "
+            "'rust' (the Rust server via the _secantus_server embedded "
+            "handle; the R8 conformance gate)."
+        ),
+    }
+)
+def validate(c: Context, server: str = "python") -> None:
     """Run pymongo's vendored test suite against an embedded SecantusDB.
 
     Generates docs/validation-report.md with a per-category pass / fail /
     skip / pass-rate breakdown — the "MongoDB compatibility" gauge.
+
+    ``--server rust`` runs the same unmodified suite against the Rust
+    server instead and writes docs/validation-report-rust-server.md (the
+    R8 gate from tasks/rust-server-plan.md). It needs the WT-linking
+    ``_secantus_server`` extension importable in the project venv — build
+    it into the editable install with::
+
+        SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON \\
+            uv sync --extra dev --reinstall-package SecantusDB
     """
     import pathlib
 
     from pymongo_validation.include_paths import DESELECT_TESTS, INCLUDE
+
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
 
     if not pathlib.Path("vendor/pymongo-tests/test").exists():
         c.run("git submodule update --init --recursive", pty=True)
@@ -289,10 +516,21 @@ def validate(c: Context) -> None:
     pathlib.Path(".validation").mkdir(exist_ok=True)
     paths = " ".join(INCLUDE)
     deselect = " ".join(f"--deselect={t}" for t in DESELECT_TESTS)
+    suffix = "" if server == "python" else "-rust-server"
+    raw_json = f".validation/raw{suffix}.json"
+    report = f"docs/validation-report{suffix}.md"
     # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
-    # `-p no:xdist -o addopts=`: pymongo's tests aren't xdist-safe (shared DBs);
-    #   override the project-wide `addopts="-n auto"` from pyproject.toml.
-    # `-p pymongo_validation.plugin`: load our embedded-server bootstrap.
+    # `-n1 -o addopts=`: pymongo's tests aren't parallel-safe (shared DBs), so
+    #   exactly ONE xdist worker — serial semantics, but a pytest-timeout
+    #   process kill on a hung test only takes out the worker (xdist records
+    #   the crash, restarts the worker, and the json report survives). A bare
+    #   no-xdist run would lose the whole report to the first hang.
+    #   `--max-worker-restart=200`: don't let repeated hangs end the run.
+    # `-o timeout=120`: tighter than the project-wide 600s — a gauge test
+    #   that blocks >2 min against SecantusDB is a conformance failure worth
+    #   recording, and at 600s a handful of hangs would add hours.
+    # `-p pymongo_validation.plugin`: load our embedded-server bootstrap (the
+    #   CONTROLLER starts the server pre-conftest; workers inherit the env).
     # `--continue-on-collection-errors`: a collection failure in one file
     #   shouldn't abort the whole run — we want every category measured.
     # `-c pyproject.toml` forces pytest to use OUR config; without it pytest
@@ -302,22 +540,24 @@ def validate(c: Context) -> None:
     # from our pyproject; this run uses positional paths.
     # PYTHONPATH=. so pytest can import our `pymongo_validation` plugin.
     c.run(
+        f"SECANTUS_GAUGE_SERVER={server} "
         "PYTHONPATH=. uv run --no-sync python -m pytest "
         "-c pyproject.toml "
-        "-o addopts= -o testpaths= "
-        "-p no:cacheprovider -p no:xdist -p pymongo_validation.plugin "
+        "-o addopts= -o testpaths= -o timeout=120 "
+        "-n1 --max-worker-restart=200 "
+        "-p no:cacheprovider -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
-        "--json-report --json-report-file=.validation/raw.json "
+        f"--json-report --json-report-file={raw_json} "
         f"--no-header --tb=no -q {deselect} {paths}",
         pty=True,
         warn=True,
     )
     c.run(
         "uv run --no-sync python -m pymongo_validation.generate_report "
-        ".validation/raw.json docs/validation-report.md",
+        f"--server {server} {raw_json} {report}",
         pty=True,
     )
-    print("\nWrote docs/validation-report.md")
+    print(f"\nWrote {report}")
 
 
 @task(name="validate-go")
@@ -451,15 +691,47 @@ def validate_java(c: Context) -> None:
     print("\nWrote docs/validation-report-java.md")
 
 
+@task(name="validate-rust")
+def validate_rust(c: Context) -> None:
+    """Run mongo-rust-driver's tests against an embedded SecantusDB.
+
+    Generates docs/validation-report-rust.md with a per-module pass /
+    fail / ignored / pass-rate breakdown — the Rust-driver analogue of
+    the pymongo / Go / Node / Java / Ruby gauges. Requires Rust
+    (>= 1.88) on PATH (``brew install rust`` on macOS; ``rustup`` on
+    linux). First run does a one-time cargo build (~1-2 min) inside
+    vendor/mongo-rust-driver/; subsequent runs reuse ``target/`` and
+    complete in seconds for the curated include set.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/mongo-rust-driver/Cargo.toml").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m rust_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m rust_validation.generate_report "
+        ".validation/rust-raw.json docs/validation-report-rust.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-rust.md")
+
+
 @task(name="validate-all")
 def validate_all(c: Context) -> None:
-    """Run all five driver gauges in parallel.
+    """Run all six driver gauges in parallel.
 
     Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
     fans out ``invoke validate / validate-go / validate-node /
-    validate-java / validate-ruby`` across a 5-wide thread pool. Each
-    gauge spawns its own SecantusDB daemon on a kernel-assigned
-    ephemeral port + its own tempdir, so they don't collide.
+    validate-java / validate-ruby / validate-rust`` across a 6-wide
+    thread pool. Each gauge spawns its own SecantusDB daemon on a
+    kernel-assigned ephemeral port + its own tempdir, so they don't
+    collide.
 
     Wall-clock is the slowest single gauge (usually node or java); on
     a dev laptop ~5x faster than the previous serial run. Output from
@@ -477,6 +749,7 @@ def validate_all(c: Context) -> None:
         ("node", "validate-node"),
         ("java", "validate-java"),
         ("ruby", "validate-ruby"),
+        ("rust", "validate-rust"),
     ]
 
     def _run(name_task: tuple[str, str]) -> tuple[str, int]:

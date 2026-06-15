@@ -1,0 +1,29 @@
+[package]
+name = "secantus-core"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "Pure-Rust operator engines for SecantusDB (sort keys, query matcher, update operators, aggregation-expression evaluator, projection, change-stream diff, aggregation pipeline)."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+# Not yet released to crates.io — that's a tracked follow-up (tasks/backlog.md).
+# Flip to publish once the public API is settled and the standalone server lands.
+publish = false
+
+# Pure Rust: no PyO3, no Python. The engines operate on `bson` values only, so
+# this crate links into anything (the PyO3 bindings crate today; a standalone
+# Rust server binary tomorrow). The PyO3 boundary lives in `secantus-core-py`.
+[lib]
+name = "secantus_core"
+crate-type = ["rlib"]
+
+[dependencies]
+bson = { workspace = true }
+# Planar geometry (DE-9IM `Relate`) for the `$geoWithin` / `$geoIntersects`
+# query operators — the same OGC lineage as Shapely, so containment semantics
+# line up with the pure-Python geo path.
+geo = "0.28"
+# `$regex` / `$options` + BSON-regex field matching. A linear-time
+# (finite-automaton) engine, so unlike Python's `re` it can't catastrophically
+# backtrack; patterns it can't compile (backreferences / lookaround) signal
+# `Fallback`, matching the "defer to Python `re`" contract for the parity vehicle.
+regex = "1"

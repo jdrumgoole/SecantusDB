@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 import pytest
+from bson import Int64
 
 from secantus.aggregate import AggregateError, apply_pipeline
+
+
+def test_group_sum_preserves_int64_type() -> None:
+    """$sum over Int64 values stays Int64 (mongod widens int32 < int64),
+    not a bare int that narrows to int32 on the wire."""
+    out = apply_pipeline(
+        [{"q": Int64(10)}, {"q": Int64(10)}],
+        [{"$group": {"_id": None, "t": {"$sum": "$q"}}}],
+    )
+    assert out[0]["t"] == 20 and isinstance(out[0]["t"], Int64)
 
 
 def test_match_filters_docs() -> None:
@@ -1302,3 +1313,15 @@ def test_fill_linear_dates_interpolate_via_timedelta() -> None:
         [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}],
     )
     assert [d["v"] for d in out] == [0, 10, 20, 30]
+
+
+def test_now_system_variable() -> None:
+    """$$NOW is a Date constant across the pipeline (mongod semantics)."""
+    import datetime
+
+    docs = [{"_id": 1}, {"_id": 2}]
+    out = apply_pipeline(docs, [{"$addFields": {"t": "$$NOW"}}])
+    assert all(isinstance(d["t"], datetime.datetime) for d in out)
+    assert out[0]["t"] == out[1]["t"]
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    assert abs((now - out[0]["t"].replace(tzinfo=None)).total_seconds()) < 60

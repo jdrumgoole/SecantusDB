@@ -8,6 +8,7 @@ from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
 from secantus.expressions import evaluate
+from secantus.numerics import bson_add
 from secantus.paths import get_path, set_path, unset_path
 from secantus.query import matches
 
@@ -16,7 +17,16 @@ if TYPE_CHECKING:
 
 
 class AggregateError(Exception):
-    pass
+    """Pipeline-validation error. ``code``/``code_name`` default to the
+    generic user-facing mapping (14 TypeMismatch) but raise sites may
+    pin mongod's specific code (e.g. 40324 for unrecognized stages)."""
+
+    def __init__(
+        self, message: str, *, code: int | None = None, code_name: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.code_name = code_name
 
 
 @dataclass
@@ -60,6 +70,16 @@ def apply_pipeline(
     ctx: PipelineContext | None = None,
 ) -> list[dict[str, Any]]:
     ctx = ctx or _NULL_CTX
+    # ``$$NOW``: a Date constant for the whole pipeline execution
+    # (mongod semantics). Seeded into vars so it resolves through the
+    # ordinary user-var path; never mutate the shared module-level null
+    # context.
+    if "NOW" not in ctx.vars:
+        now = _dt.datetime.now(_dt.timezone.utc)
+        if ctx is _NULL_CTX:
+            ctx = PipelineContext(vars={"NOW": now})
+        else:
+            ctx.vars["NOW"] = now
     for stage in pipeline:
         docs = _apply_stage(stage, docs, ctx)
     return docs
@@ -75,7 +95,13 @@ def _apply_stage(
     name, spec = next(iter(stage.items()))
     handler = _STAGES.get(name)
     if handler is None:
-        raise AggregateError(f"unsupported aggregation stage: {name}")
+        # mongod's exact shape: 40324 with this wording (the unified
+        # change-streams-errors spec pins the code).
+        raise AggregateError(
+            f"Unrecognized pipeline stage name: '{name}'",
+            code=40324,
+            code_name="Location40324",
+        )
     return handler(spec, docs, ctx)
 
 
@@ -111,7 +137,7 @@ def _stage_skip(
 def _stage_sort(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    from secantus.storage import sort_docs
+    from secantus.ordering import sort_docs
 
     return sort_docs(list(docs), spec)
 
@@ -704,7 +730,10 @@ def _acc_sum(
     increment = 1 if arg == 1 else evaluate(arg, doc, vars)
     if increment is None:
         increment = 0
-    bucket[field] = bucket.get(field, 0) + increment
+    # bson_add preserves the BSON numeric type (int32 < int64 < double <
+    # decimal128) so a $sum over Int64 values stays Int64 rather than
+    # narrowing to int32 on the wire.
+    bucket[field] = bson_add(bucket.get(field, 0), increment)
 
 
 def _acc_count(
@@ -1578,6 +1607,33 @@ def _stage_change_stream(
     return []
 
 
+def _stage_change_stream_split_large_event(
+    spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$changeStreamSplitLargeEvent`` — pass-through marker.
+
+    Drivers (mongo-rust-driver, mongo-node-driver, …) insert this
+    stage into the change-stream pipeline when the user opts into
+    ``splitLargeChangeStreamEvents``. SecantusDB already handles
+    the split envelope at projection time: every event the
+    change-stream producer emits with ``splitLargeChangeStreamEvents``
+    set carries a ``splitEvent: {fragment: 1, of: 1}`` sub-doc
+    (events are never large enough to actually need splitting in
+    our single-node surrogate, but the field is present when the
+    user opts in — per ``CLAUDE.md``).
+
+    Because the split envelope is applied during event projection
+    upstream, the pipeline stage itself is a no-op: it accepts an
+    empty doc spec and passes docs through unchanged. Mongod's
+    real implementation also passes events through unchanged
+    unless an event genuinely exceeds the 16 MB BSON limit, which
+    our oplog projection never produces.
+    """
+    if spec is not None and not isinstance(spec, Mapping):
+        raise AggregateError("$changeStreamSplitLargeEvent spec must be a document or {}")
+    return docs
+
+
 def _stage_documents(
     spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1590,6 +1646,364 @@ def _stage_documents(
             raise AggregateError("$documents entries must evaluate to documents")
         out.append(dict(evaluated))
     return out
+
+
+_RANK_FUNCS = frozenset({"$rank", "$denseRank", "$documentNumber"})
+
+
+def _stage_set_window_fields(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$setWindowFields`` — partition + sort + per-row windowed accumulators.
+
+    Spec shape::
+
+        {
+            partitionBy: <expression>,  # optional; missing = single partition
+            sortBy: <sort spec>,        # optional for accumulators; required for $rank/$denseRank
+            output: {
+                <field>: {
+                    <$accumulator>: <expr>,
+                    window: {documents: [<lower>, <upper>]},  # optional
+                }
+            },
+        }
+
+    For accumulator output fields, the op runs over the rows inside
+    that row's window (within the row's partition, in the partition's
+    sorted order). Window bounds are integer offsets relative to the
+    current row, or the strings ``"current"`` / ``"unbounded"``.
+    Missing ``window`` defaults to the whole partition. Original input
+    order is preserved in the result — the partition / sort dance
+    happens only to compute the new fields.
+
+    Supported output functions:
+
+    * The nine ``$group`` accumulators (``$sum`` / ``$avg`` / ``$min``
+      / ``$max`` / ``$first`` / ``$last`` / ``$push`` / ``$addToSet``
+      / ``$count``) over the position-based ``documents`` window.
+    * The three rank functions (``$rank`` / ``$denseRank`` /
+      ``$documentNumber``), evaluated per-row across the whole sorted
+      partition. They take an empty ``{}`` arg and reject ``window``
+      (mongod's rule); ``$rank`` and ``$denseRank`` require
+      ``sortBy``.
+
+    Range-based windows (``window: {range: [...]}``, optionally with
+    ``unit``) and the time-series functions (``$derivative`` /
+    ``$integral`` / ``$linearFill`` / ``$locf`` / ``$shift`` /
+    ``$expMovingAvg``) raise ``AggregateError`` so the gap is visible
+    rather than silently wrong.
+    """
+    from secantus.storage import sort_docs as _sort_docs
+
+    if not isinstance(spec, Mapping):
+        raise AggregateError("$setWindowFields requires a doc spec")
+    partition_by = spec.get("partitionBy")
+    sort_by = spec.get("sortBy")
+    output = spec.get("output")
+    if not isinstance(output, Mapping) or not output:
+        raise AggregateError("$setWindowFields requires a non-empty output doc")
+
+    compiled: list[tuple[str, str, Any, Mapping[str, Any] | None]] = []
+    for field, field_spec in output.items():
+        if not isinstance(field_spec, Mapping):
+            raise AggregateError(f"$setWindowFields output[{field!r}] must be a doc")
+        op_keys = [k for k in field_spec if k.startswith("$")]
+        if len(op_keys) != 1:
+            raise AggregateError(
+                f"$setWindowFields output[{field!r}] requires exactly one accumulator"
+            )
+        op = op_keys[0]
+        arg = field_spec[op]
+        window = field_spec.get("window")
+        if window is not None and not isinstance(window, Mapping):
+            raise AggregateError(f"$setWindowFields output[{field!r}].window must be a doc")
+        if op in _RANK_FUNCS:
+            # Rank functions take no arg and don't accept a window. Mongod
+            # surfaces both violations as parse errors; mirror.
+            if arg not in ({}, None):
+                raise AggregateError(f"$setWindowFields {op} takes no argument (got {arg!r})")
+            if window is not None:
+                raise AggregateError(f"$setWindowFields {op} does not accept a window")
+            if op in ("$rank", "$denseRank") and not sort_by:
+                raise AggregateError(f"$setWindowFields {op} requires sortBy")
+            compiled.append((field, op, arg, window))
+            continue
+        if op not in _ACC_DISPATCH:
+            raise AggregateError(
+                f"$setWindowFields: unsupported function {op!r} "
+                "(time-series operators are not yet implemented)"
+            )
+        compiled.append((field, op, arg, window))
+
+    docs_list = list(docs)
+    partitions: dict[Any, list[tuple[int, dict[str, Any]]]] = {}
+    partition_order: list[Any] = []
+    for i, doc in enumerate(docs_list):
+        key = None if partition_by is None else evaluate(partition_by, doc, ctx.vars)
+        hkey = _hashable(key)
+        if hkey not in partitions:
+            partitions[hkey] = []
+            partition_order.append(hkey)
+        partitions[hkey].append((i, doc))
+
+    out_docs: list[dict[str, Any]] = [dict(d) for d in docs_list]
+
+    for pkey in partition_order:
+        members = partitions[pkey]
+        if sort_by:
+            sorted_docs = _sort_docs([doc for _, doc in members], sort_by)
+            idx_lookup = {id(doc): orig_i for orig_i, doc in members}
+            members = [(idx_lookup[id(doc)], doc) for doc in sorted_docs]
+        partition_docs = [doc for _, doc in members]
+        n = len(partition_docs)
+        # Precompute per-partition rank vectors only when a rank function
+        # is referenced. One linear walk covers all three.
+        rank_state = _compute_rank_state(partition_docs, sort_by, compiled)
+        for slot, (orig_i, _) in enumerate(members):
+            target = out_docs[orig_i]
+            for field, op, arg, window in compiled:
+                if op in _RANK_FUNCS:
+                    target[field] = rank_state[op][slot]
+                    continue
+                low, high = _window_bounds(slot, n, window)
+                if high < low:
+                    target[field] = _empty_window_value(op)
+                    continue
+                window_docs = partition_docs[low : high + 1]
+                bucket: dict[str, Any] = {}
+                handler = _ACC_DISPATCH[op]
+                for wdoc in window_docs:
+                    handler(bucket, field, arg, wdoc, ctx.vars)
+                _finalize(bucket)
+                target[field] = bucket.get(field, _empty_window_value(op))
+    return out_docs
+
+
+def _compute_rank_state(
+    partition_docs: list[dict[str, Any]],
+    sort_by: Mapping[str, Any] | None,
+    compiled: list[tuple[str, str, Any, Mapping[str, Any] | None]],
+) -> dict[str, list[int]]:
+    """Per-partition rank vectors for whichever rank functions appear
+    in ``compiled``. Returns ``{op: [per-slot value]}``; empty dict
+    when no rank function is referenced.
+
+    All three computations share one linear walk:
+
+    * ``$documentNumber`` — 1-indexed slot position. Independent of
+      ties; ignores sortBy comparisons.
+    * ``$rank`` — 1-indexed position with **gaps** after ties: tied
+      rows share the lower rank; the next non-tied row jumps by the
+      number of ties (``[10, 20, 20, 30]`` → ``[1, 2, 2, 4]``).
+    * ``$denseRank`` — 1-indexed position **without gaps**: tied rows
+      share, next row is +1 (``[10, 20, 20, 30]`` → ``[1, 2, 2, 3]``).
+
+    Ties are detected by sort-key tuple equality. Without ``sortBy``
+    only ``$documentNumber`` is allowed (validated at the compile
+    step), so the no-sort branch never needs key comparisons.
+    """
+    needed = {op for _f, op, _a, _w in compiled if op in _RANK_FUNCS}
+    if not needed:
+        return {}
+    n = len(partition_docs)
+    state: dict[str, list[int]] = {op: [0] * n for op in needed}
+    if n == 0:
+        return state
+    keys = [_sort_key_values(doc, sort_by) for doc in partition_docs] if sort_by else [None] * n
+
+    rank = 1
+    dense = 1
+    if "$documentNumber" in needed:
+        state["$documentNumber"][0] = 1
+    if "$rank" in needed:
+        state["$rank"][0] = 1
+    if "$denseRank" in needed:
+        state["$denseRank"][0] = 1
+    for i in range(1, n):
+        if "$documentNumber" in needed:
+            state["$documentNumber"][i] = i + 1
+        tied = sort_by is not None and keys[i] == keys[i - 1]
+        if not tied:
+            rank = i + 1
+            dense += 1
+        if "$rank" in needed:
+            state["$rank"][i] = rank
+        if "$denseRank" in needed:
+            state["$denseRank"][i] = dense
+    return state
+
+
+def _sort_key_values(doc: Mapping[str, Any], sort_by: Mapping[str, Any]) -> tuple:
+    """Tuple of raw sort-by field values, in spec order. Used for
+    tie detection in rank computation — equal tuples → tied rows."""
+    from secantus.paths import get_path
+
+    return tuple(get_path(dict(doc), field, default=None) for field in sort_by)
+
+
+def _window_bounds(slot: int, n: int, window: Mapping[str, Any] | None) -> tuple[int, int]:
+    """Resolve a window spec for a given row position.
+
+    Returns inclusive ``(lower, upper)`` indices into the partition.
+    ``window=None`` or missing ``documents`` → the whole partition
+    (matches mongod's default window).
+    """
+    if window is None or "documents" not in window:
+        if window is not None and "range" in window:
+            raise AggregateError("$setWindowFields range-based windows are not yet implemented")
+        return 0, n - 1
+    bounds = window["documents"]
+    if not isinstance(bounds, list) or len(bounds) != 2:
+        raise AggregateError("$setWindowFields window.documents must be a [lower, upper] pair")
+
+    def resolve(b: Any, is_lower: bool) -> int:
+        if b == "unbounded":
+            return 0 if is_lower else n - 1
+        if b == "current":
+            return slot
+        if isinstance(b, bool) or not isinstance(b, int):
+            raise AggregateError(
+                f"$setWindowFields window.documents bound {b!r} must be an int "
+                "or 'unbounded' / 'current'"
+            )
+        return slot + b
+
+    low = max(0, resolve(bounds[0], is_lower=True))
+    high = min(n - 1, resolve(bounds[1], is_lower=False))
+    return low, high
+
+
+def _empty_window_value(op: str) -> Any:
+    """The value to use when the window is empty for this row.
+
+    Matches mongod: ``$sum`` / ``$count`` → 0, ``$push`` /
+    ``$addToSet`` → [], everything else → null.
+    """
+    if op in ("$sum", "$count"):
+        return 0
+    if op in ("$push", "$addToSet"):
+        return []
+    return None
+
+
+def _stage_redact(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$redact`` — content-based document / sub-document pruning.
+
+    The expression is evaluated against each (sub-)document, with the
+    current sub-doc bound as ``$$CURRENT``. It must return one of
+    three sentinel strings — ``"$$KEEP"`` (include the sub-doc as-is,
+    no recursion), ``"$$PRUNE"`` (drop the sub-doc), or
+    ``"$$DESCEND"`` (recurse into nested sub-docs and arrays-of-
+    sub-docs). The sentinels are returned by the expression evaluator
+    when the user writes ``"$$KEEP"`` / ``"$$PRUNE"`` / ``"$$DESCEND"``
+    inside a ``$cond`` / ``$switch`` / ``$let`` etc.
+
+    Behaviour follows mongod:
+
+    * Top-level ``$$PRUNE`` drops the doc from the pipeline.
+    * ``$$DESCEND`` recurses into every dict-valued field and every
+      list-element that is a dict; scalar and non-dict-list values
+      pass through unchanged. Pruned sub-docs are removed from their
+      arrays (the array stays, the element disappears).
+    * Empty list spec, missing expression, or a non-sentinel result
+      raises ``AggregateError``.
+    """
+    if spec is None or (isinstance(spec, Mapping) and not spec):
+        raise AggregateError("$redact requires an expression")
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        result = _redact_subdoc(doc, spec, ctx)
+        if result is not None:
+            out.append(result)
+    return out
+
+
+def _redact_subdoc(
+    doc: Mapping[str, Any], spec: Any, ctx: PipelineContext
+) -> dict[str, Any] | None:
+    decision = evaluate(spec, dict(doc), ctx.vars)
+    if decision == "$$KEEP":
+        return dict(doc)
+    if decision == "$$PRUNE":
+        return None
+    if decision == "$$DESCEND":
+        return _redact_descend(doc, spec, ctx)
+    raise AggregateError(
+        f"$redact expression must return $$KEEP, $$PRUNE, or $$DESCEND, got {decision!r}"
+    )
+
+
+def _redact_descend(doc: Mapping[str, Any], spec: Any, ctx: PipelineContext) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in doc.items():
+        if isinstance(v, Mapping):
+            sub = _redact_subdoc(v, spec, ctx)
+            if sub is not None:
+                out[k] = sub
+        elif isinstance(v, list):
+            new_list: list[Any] = []
+            for elem in v:
+                if isinstance(elem, Mapping):
+                    redacted = _redact_subdoc(elem, spec, ctx)
+                    if redacted is not None:
+                        new_list.append(redacted)
+                else:
+                    new_list.append(elem)
+            out[k] = new_list
+        else:
+            out[k] = v
+    return out
+
+
+def _stage_union_with(
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+) -> list[dict[str, Any]]:
+    """``$unionWith`` — concatenate docs from another collection after
+    optionally running them through a sub-pipeline.
+
+    Two spec shapes (per mongod):
+
+    * Shorthand: ``{$unionWith: "<coll>"}`` — equivalent to
+      ``{$unionWith: {coll: "<coll>"}}``, no sub-pipeline.
+    * Full form: ``{$unionWith: {coll: "<coll>", pipeline: [...]}}``.
+
+    The sub-pipeline runs in a *fresh* :class:`PipelineContext` — outer
+    ``let`` / ``vars`` are not visible inside, matching mongod's
+    semantics (``$unionWith`` does not accept a ``let`` field). Outer
+    docs come first, then the union docs in the order the sub-pipeline
+    produced them; mongod imposes no ordering guarantee between the
+    two sets, but appending the union docs is the documented
+    implementation. No deduplication — duplicates across the boundary
+    survive.
+    """
+    if isinstance(spec, str):
+        from_coll = spec
+        sub_pipeline: list[dict[str, Any]] | None = None
+    elif isinstance(spec, Mapping):
+        from_coll = spec.get("coll")
+        sub_pipeline = spec.get("pipeline")
+        if not isinstance(from_coll, str):
+            raise AggregateError("$unionWith requires 'coll' (string)")
+        if sub_pipeline is not None and not isinstance(sub_pipeline, list):
+            raise AggregateError("$unionWith 'pipeline' must be an array")
+    else:
+        raise AggregateError("$unionWith requires a collection name or {coll, pipeline} doc")
+    if ctx.storage is None:
+        raise AggregateError("$unionWith requires storage context")
+
+    foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
+    if sub_pipeline:
+        sub_ctx = PipelineContext(
+            storage=ctx.storage,
+            db_name=ctx.db_name,
+            coll_name=from_coll,
+            collation=ctx.collation,
+        )
+        foreign_docs = apply_pipeline(foreign_docs, sub_pipeline, sub_ctx)
+    return list(docs) + list(foreign_docs)
 
 
 def _stage_geo_near(
@@ -1746,5 +2160,25 @@ _STAGES = {
     "$graphLookup": _stage_graph_lookup,
     "$documents": _stage_documents,
     "$changeStream": _stage_change_stream,
+    "$changeStreamSplitLargeEvent": _stage_change_stream_split_large_event,
     "$geoNear": _stage_geo_near,
+    "$unionWith": _stage_union_with,
+    "$redact": _stage_redact,
+    "$setWindowFields": _stage_set_window_fields,
 }
+
+
+def validate_stage_names(pipeline: list[Any]) -> None:
+    """Upfront stage-name validation (mongod validates at parse time,
+    before any document flows — change streams need the 40324 at
+    ``aggregate`` time, not lazily at the first ``getMore``)."""
+    for stage in pipeline:
+        if not isinstance(stage, Mapping) or len(stage) != 1:
+            raise AggregateError("each pipeline stage must have exactly one key")
+        name = next(iter(stage))
+        if name not in _STAGES:
+            raise AggregateError(
+                f"Unrecognized pipeline stage name: '{name}'",
+                code=40324,
+                code_name="Location40324",
+            )

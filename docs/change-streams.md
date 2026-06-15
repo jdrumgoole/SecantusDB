@@ -193,7 +193,8 @@ cursor id `0`, signalling end-of-stream to the client.
 See [`tasks/backlog.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/tasks/backlog.md)
 "Change-stream limitations" for the canonical list. Highlights:
 
-- No transaction state on events (`txnNumber` / `lsid` never present).
+- Transactional writes DO carry `txnNumber` / `lsid` on their events
+  (all events from one transaction share the commit `clusterTime`).
 - `splitLargeChangeStreamEvents` is honoured at the envelope level —
   every event carries `{splitEvent: {fragment:1, of:1}}` when the
   flag is set — but events never actually split (oplog entries cap

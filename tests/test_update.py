@@ -1,8 +1,23 @@
 from __future__ import annotations
 
 import pytest
+from bson import Int64
 
 from secantus.update import UpdateError, apply_update
+
+
+def test_inc_preserves_int64_type() -> None:
+    out = apply_update({"a": Int64(5)}, {"$inc": {"a": 3}})
+    assert out["a"] == 8
+    assert isinstance(out["a"], Int64)
+    # A pure int32 field stays int32 (no spurious widening).
+    out32 = apply_update({"a": 5}, {"$inc": {"a": 3}})
+    assert out32["a"] == 8 and not isinstance(out32["a"], Int64)
+
+
+def test_mul_preserves_int64_type() -> None:
+    out = apply_update({"a": Int64(4)}, {"$mul": {"a": 2}})
+    assert out["a"] == 8 and isinstance(out["a"], Int64)
 
 
 def test_set_top_level() -> None:

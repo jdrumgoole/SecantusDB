@@ -43,6 +43,7 @@ from validation_summary.generate import (
     _collect_node,
     _collect_pymongo,
     _collect_ruby,
+    _collect_rust,
 )
 
 # Prose notes per validated driver. The numbers come from the
@@ -53,8 +54,13 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
         "title": "pymongo",
         "lang": "Python",
         "note": (
-            "The official MongoDB Python driver. The pymongo conformance "
-            "suite is the primary gauge for SecantusDB &mdash; we run "
+            "The official MongoDB Python driver, and the deepest suite we "
+            "run &mdash; so it surfaces the long tail. The remaining "
+            "failures are features outside a single node's scope (text / "
+            "hashed indexes, server-side <code>$where</code> JavaScript), "
+            "tests that assume a multi-node cluster, and a few driver-side "
+            "harness artifacts &mdash; not gaps in the CRUD, aggregation, or "
+            "change-stream surface that test and dev rely on. We run "
             "pymongo's own tests, unmodified, against an embedded SecantusDB."
         ),
         "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report.html"),
@@ -65,10 +71,12 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
         "note": (
             "The driver enterprise MongoDB consumers most often use, and the "
             "foundation for many JVM-language wrappers. We run a curated "
-            "subset of <code>driver-sync/src/test/functional/</code> plus the "
-            "BSON unit tests against an embedded SecantusDB daemon. Type-strict "
-            "decoders catch wire-shape divergences pymongo's permissive client "
-            "accepts silently."
+            "subset of <code>driver-sync/src/test/functional/</code> &mdash; "
+            "integration tests that open a real connection to a SecantusDB "
+            "daemon (the driver's own BSON codec unit tests are run but not "
+            "counted here; they never touch the server). Type-strict decoders "
+            "catch wire-shape divergences pymongo's permissive client accepts "
+            "silently."
         ),
         "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-java.html"),
     },
@@ -110,6 +118,21 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
         ),
         "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html"),
     },
+    "mongo-rust-driver": {
+        "title": "mongo-rust-driver",
+        "lang": "Rust",
+        "note": (
+            "The official MongoDB Rust driver &mdash; the basis for "
+            "Tokio-async MongoDB consumers in Rust. We run a curated set of "
+            "<code>driver/src/test/</code> in-tree tests via <code>cargo "
+            "test --lib -p mongodb</code> with <code>MONGODB_URI</code> "
+            "explicitly overridden in the subprocess env, so the rust "
+            "driver's fallback chain (<code>$MONGODB_URI</code> &rarr; "
+            "<code>~/.mongodb_uri</code> &rarr; <code>localhost:27017</code>) "
+            "can't accidentally route to a real mongod."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-rust.html"),
+    },
 }
 
 # Trailing panels that aren't backed by ``.validation/`` raw data —
@@ -133,24 +156,6 @@ SMOKE_PANELS: list[dict[str, str | None]] = [
         ),
         "report_url": None,
     },
-    {
-        "title": "mongo-rust-driver",
-        "lang": "Rust",
-        "kind": "pending",
-        "kind_label": "Pending",
-        "rate_value": None,
-        "rate_label": None,
-        "note": (
-            "A type-fidelity smoke is staged in "
-            "<code>tests/cross_driver/rust/</code>. Activation is gated on "
-            "mongo-rust-driver upstream catching up with the current "
-            "<code>tokio</code> / Rust toolchain &mdash; the 2.x line doesn't "
-            "compile against tokio 1.40+ and 3.x trips on a "
-            "<code>Runtime</code> API change with Rust 1.95. The smoke will "
-            "flip on once a stable build path lands."
-        ),
-        "report_url": None,
-    },
 ]
 
 
@@ -160,6 +165,7 @@ _COLLECTORS = {
     "mongo-node-driver": _collect_node,
     "mongo-go-driver": _collect_go,
     "mongo-ruby-driver": _collect_ruby,
+    "mongo-rust-driver": _collect_rust,
 }
 
 
@@ -180,11 +186,21 @@ def _format_rate(stats: GaugeStats) -> str:
 def _render_validation_panel(name: str, stats: GaugeStats) -> str:
     prose = PANEL_PROSE[name]
     rate = _format_rate(stats)
-    expected_note = ""
-    if stats.expected_failures > 0:
-        word = "failure" if stats.expected_failures == 1 else "failures"
-        expected_note = (
-            f" &middot; <strong>{stats.expected_failures}</strong> documented {word} (see report)"
+    if stats.expected_failures > 0 and stats.actionable_failures == 0:
+        # Clean panel with a known, report-documented divergence. Fold it
+        # in plainly ("N known divergence") rather than spelling out the
+        # rate accounting ("0 unexpected failures · ... excluded from the
+        # rate"), which reads defensively on a marketing card — the report
+        # carries the detail.
+        word = "known divergence" if stats.expected_failures == 1 else "known divergences"
+        counts = (
+            f"<strong>{stats.passed}</strong> tests passed &middot; "
+            f"<strong>{stats.expected_failures}</strong> {word}"
+        )
+    else:
+        counts = (
+            f"<strong>{stats.passed}</strong> tests passed &middot; "
+            f"<strong>{stats.actionable_failures}</strong> failed"
         )
     return (
         f'  <article class="driver">\n'
@@ -196,11 +212,7 @@ def _render_validation_panel(name: str, stats: GaugeStats) -> str:
         f'      <span class="rate">{rate}</span>\n'
         f'      <span class="rate-label">pass rate</span>\n'
         f"    </div>\n"
-        f'    <p class="counts">'
-        f"<strong>{stats.passed}</strong> tests passed &middot; "
-        f"<strong>{stats.actionable_failures}</strong> failed"
-        f"{expected_note}"
-        f"</p>\n"
+        f'    <p class="counts">{counts}</p>\n'
         f'    <p class="note">{prose["note"]}</p>\n'
         f'    <a class="report" href="{prose["report_url"]}" rel="noopener">'
         f"Read the report &rarr;</a>\n"

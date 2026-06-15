@@ -290,6 +290,77 @@ def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
             mc.close()
 
 
+def test_id_equality_uses_index_not_collscan(storage: Storage) -> None:
+    """`{_id: value}` is a primary-key point lookup, reported as IXSCAN.
+
+    The documents table is keyed by encode_value(_id), so an _id-equality
+    filter must not fall back to a COLLSCAN. Regression for the bug where
+    the virtual `_id_` index was invisible to the planner.
+    """
+    storage.insert("db", "c", [{"_id": i, "x": i * 10} for i in range(50)])
+
+    for filt in ({"_id": 7}, {"_id": {"$eq": 7}}, {"_id": {"$in": [7, 3, 1]}}):
+        plan = storage.explain_plan("db", "c", filt)
+        assert plan["kind"] == "IXSCAN", filt
+        assert plan["index_name"] == "_id_"
+        assert plan["key_pattern"] == {"_id": 1}
+
+    assert storage.find_matching("db", "c", {"_id": 7}) == [{"_id": 7, "x": 70}]
+    assert storage.find_matching("db", "c", {"_id": {"$eq": 7}}) == [{"_id": 7, "x": 70}]
+    # $in comes back in ascending _id order, missing ids dropped.
+    assert storage.find_matching("db", "c", {"_id": {"$in": [7, 3, 99, 1]}}) == [
+        {"_id": 1, "x": 10},
+        {"_id": 3, "x": 30},
+        {"_id": 7, "x": 70},
+    ]
+    assert storage.find_matching("db", "c", {"_id": {"$in": []}}) == []
+    assert storage.find_matching("db", "c", {"_id": 12345}) == []
+
+
+def test_id_non_point_lookups_stay_collscan(storage: Storage) -> None:
+    """Range / regex / compound / subdocument _id filters are not point lookups.
+
+    They must keep their existing (correct) routing rather than being
+    mis-served by the equality fast path.
+    """
+    from bson import Regex
+
+    storage.insert("db", "c", [{"_id": i, "x": i} for i in range(10)])
+
+    # Range operator on _id: COLLSCAN (no _id entries table to range-scan).
+    plan = storage.explain_plan("db", "c", {"_id": {"$gt": 5}})
+    assert plan["kind"] == "COLLSCAN"
+    assert storage.count_matching("db", "c", {"_id": {"$gt": 5}}) == 4
+
+    # Multi-field filter that happens to include _id: not a single-field
+    # point lookup, so it stays COLLSCAN — but still returns correctly.
+    plan = storage.explain_plan("db", "c", {"_id": 4, "x": 4})
+    assert plan["kind"] == "COLLSCAN"
+    assert storage.find_matching("db", "c", {"_id": 4, "x": 4}) == [{"_id": 4, "x": 4}]
+
+    # A regex _id is a pattern match, never an equality point lookup
+    # (pymongo delivers regex query values as bson.Regex).
+    storage.insert("db", "c2", [{"_id": "alpha"}, {"_id": "beta"}])
+    plan = storage.explain_plan("db", "c2", {"_id": Regex("^al")})
+    assert plan["kind"] == "COLLSCAN"
+    assert storage.find_matching("db", "c2", {"_id": Regex("^al")}) == [{"_id": "alpha"}]
+
+
+def test_id_point_lookup_cross_numeric_collision(storage: Storage) -> None:
+    """An int _id is found by a float / Decimal128 equality (and vice versa).
+
+    The fast path encodes the query value with the same `encode_value`
+    used as the primary key, so the documented cross-numeric collision
+    (1 == 1.0 == Decimal128("1")) holds for point lookups too.
+    """
+    from bson import Decimal128
+
+    storage.insert("db", "c", [{"_id": 1, "v": "a"}])
+    assert storage.find_matching("db", "c", {"_id": 1.0}) == [{"_id": 1, "v": "a"}]
+    assert storage.find_matching("db", "c", {"_id": Decimal128("1")}) == [{"_id": 1, "v": "a"}]
+    assert storage.explain_plan("db", "c", {"_id": 1.0})["kind"] == "IXSCAN"
+
+
 def test_checkpoint_persists_inserts(tmp_path) -> None:
     """Forcing a checkpoint flushes pending writes; subsequent close+reopen sees them."""
     storage = Storage(str(tmp_path))
@@ -579,5 +650,85 @@ def test_create_archive_creates_parent_directory(tmp_path) -> None:
         result = s.create_archive(str(out))
         assert out.exists()
         assert result["sizeBytes"] > 0
+    finally:
+        s.close()
+
+
+def test_drop_collection_sees_writes_from_other_threads(tmp_path) -> None:
+    """drop_collection must see rows committed by other threads.
+
+    Companion to the snapshot-refresh fix in the mutating scanners
+    (drop_collection / drop_database / rename_collection / drop_index /
+    drop_all_indexes): a pinned read snapshot on the dropping thread made
+    the prefix-scan miss other threads' rows, surfacing in the pymongo
+    gauge as drop-then-reinsert E11000. The full pin needs server-layer
+    state and is covered by the gauge (test_cursor.py: TestCursor +
+    TestRawBatchCommandCursor); this pins the storage-level contract."""
+    import threading
+
+    s = Storage(str(tmp_path))
+    try:
+        # Pin this thread's snapshot: a FAILED duplicate insert leaves the
+        # overwrite=False doc-table cursor positioned on the conflicting
+        # row, and no later operation on this thread resets that cursor
+        # variant — the session's read snapshot stays pinned from here on.
+        # (pymongo's TestCursor runs duplicate-insert tests, which is how
+        # the gauge's shared-client thread got pinned in the wild.)
+        s.insert("db", "pin", [{"_id": 1}])
+        _, dup_errors = s.insert("db", "pin", [{"_id": 1}], ordered=False)
+        assert dup_errors and dup_errors[0]["code"] == 11000
+
+        # Another thread commits docs this thread's snapshot predates.
+        def writer() -> None:
+            s.insert("db", "c", [{"_id": i} for i in range(3)])
+
+        t = threading.Thread(target=writer)
+        t.start()
+        t.join()
+
+        # The drop on the pinned thread must still see and delete them.
+        s.drop_collection("db", "c")
+
+        survivors: list[dict] = []
+
+        def reader() -> None:
+            survivors.extend(s.find_matching("db", "c", {}))
+
+        t2 = threading.Thread(target=reader)
+        t2.start()
+        t2.join()
+        assert survivors == []
+
+        # And a re-insert of the same ids must not collide.
+        inserted, errors = s.insert("db", "c", [{"_id": i} for i in range(3)])
+        assert errors == []
+        assert inserted == 3
+    finally:
+        s.close()
+
+
+def test_timeseries_allows_duplicate_ids(tmp_path) -> None:
+    """Timeseries collections don't enforce _id uniqueness (mongod buckets
+    measurements by time; _id is not a key). Pins the doc-key suffix
+    scheme: duplicates coexist, find/count see both, _id-filter reads work
+    (fast path gated off), delete removes both rows."""
+    import datetime as dt
+
+    s = Storage(str(tmp_path))
+    try:
+        s.create_collection("ts", "m")
+        s.set_collection_options("ts", "m", timeseries={"timeField": "time"})
+        t0 = dt.datetime(2019, 3, 18, 22, 53, 50)
+        inserted, errors = s.insert(
+            "ts", "m", [{"_id": 1, "time": t0}, {"_id": 1, "time": t0.replace(second=51)}]
+        )
+        assert (inserted, errors) == (2, [])
+        docs = list(s.find_matching("ts", "m", {}))
+        assert len(docs) == 2
+        assert [d["_id"] for d in docs] == [1, 1]
+        by_id = list(s.find_matching("ts", "m", {"_id": 1}))
+        assert len(by_id) == 2
+        assert s.delete_matching("ts", "m", {"_id": 1}) == 2
+        assert list(s.find_matching("ts", "m", {})) == []
     finally:
         s.close()

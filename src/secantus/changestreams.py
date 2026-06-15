@@ -58,17 +58,24 @@ class ResumeTokenData:
     ts: Timestamp
     ns: str
     document_key: dict[str, Any]
+    # True when the token came from an invalidate event. mongod encodes
+    # ``fromInvalidate`` in its keystring tokens; ``resumeAfter``
+    # rejects such tokens (only ``startAfter`` may pass one).
+    from_invalidate: bool = False
 
 
 def make_resume_token(data: ResumeTokenData) -> dict[str, str]:
-    inner = bson.encode(
-        {
-            "s": data.seq,
-            "t": data.ts,
-            "n": data.ns,
-            "k": data.document_key,
-        }
-    )
+    inner_doc: dict[str, Any] = {
+        "s": data.seq,
+        "t": data.ts,
+        "n": data.ns,
+        "k": data.document_key,
+    }
+    if data.from_invalidate:
+        # Only stamped when set so pre-existing tokens stay parseable
+        # and byte-identical.
+        inner_doc["i"] = True
+    inner = bson.encode(inner_doc)
     return {"_data": inner.hex()}
 
 
@@ -87,6 +94,7 @@ def parse_resume_token(token: Mapping[str, Any]) -> ResumeTokenData:
         ts=ts,
         ns=str(inner["n"]),
         document_key=dict(inner.get("k", {})),
+        from_invalidate=bool(inner.get("i", False)),
     )
 
 
@@ -154,6 +162,26 @@ def _attach_full_document(
         ns = str(oplog_entry.get("ns", ""))
         db, coll = _split_ns(ns)
         doc_id = oplog_entry.get("o2", {}).get("_id")
+        # ``required`` / ``whenAvailable`` read the stored POST-image
+        # (mongod 6.0 semantics): the collection must have
+        # ``changeStreamPreAndPostImages`` enabled, else ``required``
+        # errors and ``whenAvailable`` yields null. Only
+        # ``updateLookup`` does a live point-in-time-less lookup. With
+        # images enabled we approximate the post-image with the live
+        # lookup — exact on a single node unless later writes already
+        # changed the doc (recorded divergence, tasks/backlog.md).
+        if full_document_mode in (
+            FULL_DOC_REQUIRED,
+            FULL_DOC_WHEN_AVAILABLE,
+        ) and not storage._pre_post_images_enabled(db, coll):
+            if full_document_mode == FULL_DOC_REQUIRED:
+                raise ChangeStreamFatalError(
+                    "the 'fullDocument: required' option requires "
+                    "changeStreamPreAndPostImages to be enabled on the "
+                    f"collection {ns}"
+                )
+            event["fullDocument"] = None
+            return
         looked_up = _do_lookup(storage, db, coll, doc_id) if doc_id is not None else None
         if looked_up is not None:
             event["fullDocument"] = looked_up
@@ -243,8 +271,20 @@ def project(
             "ns": _ns_doc(ns),
             "documentKey": document_key,
         }
+        # mongod 6.0+ attaches the collection's UUID to CRUD events when the
+        # stream was opened with ``showExpandedEvents``. The oplog row carries
+        # it as ``ui`` (Binary subtype 4).
+        if show_expanded_events and oplog_entry.get("ui") is not None:
+            event["collectionUUID"] = oplog_entry["ui"]
         if isinstance(wall, object) and wall is not None:
             event["wallTime"] = wall
+        # Writes that happened inside a multi-document transaction carry
+        # the session/transaction identity on their oplog entries; mongod
+        # surfaces both on the change event.
+        if "lsid" in oplog_entry:
+            event["lsid"] = dict(oplog_entry["lsid"])
+        if "txnNumber" in oplog_entry:
+            event["txnNumber"] = oplog_entry["txnNumber"]
         if op == "u" and op_type == "update":
             o = oplog_entry.get("o", {})
             diff = o.get("diff") if isinstance(o, Mapping) else None
@@ -309,17 +349,66 @@ def project(
                     return None, False
             token = make_resume_token(ResumeTokenData(seq, ts, from_ns, {}))
             to_db, to_coll = _split_ns(to_ns)
+            to_doc = {"db": to_db, "coll": to_coll} if to_coll else {"db": to_db}
             event = {
                 "_id": token,
                 "operationType": "rename",
                 "clusterTime": ts,
                 "ns": _ns_doc(from_ns),
-                "to": {"db": to_db, "coll": to_coll} if to_coll else {"db": to_db},
+                "to": to_doc,
             }
+            if show_expanded_events:
+                # mongod 6.0+ attaches an ``operationDescription`` to expanded
+                # rename events: the ``to`` namespace plus ``dropTarget`` (the
+                # dropped target collection's UUID) when the rename replaced an
+                # existing collection.
+                op_desc: dict[str, Any] = {"to": to_doc}
+                if "dropTarget" in cmd:
+                    op_desc["dropTarget"] = cmd["dropTarget"]
+                event["operationDescription"] = op_desc
             if wall is not None:
                 event["wallTime"] = wall
             invalidates = scope.get("kind") == "coll"
             return event, invalidates
+        if "create" in cmd:
+            if not show_expanded_events:
+                return None, False
+            affected_ns = f"{cmd_db}.{cmd['create']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            # ``operationDescription`` carries the collection-creation options
+            # (idIndex for an ordinary collection, viewOn / pipeline for a
+            # view) — everything in the command spec except the collection
+            # name under ``create``.
+            op_desc = {k: v for k, v in cmd.items() if k != "create"}
+            event = {
+                "_id": token,
+                "operationType": "create",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": op_desc,
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
+        if "collMod" in cmd:
+            if not show_expanded_events:
+                return None, False
+            affected_ns = f"{cmd_db}.{cmd['collMod']}"
+            if not _scope_matches(affected_ns, scope):
+                return None, False
+            token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+            event = {
+                "_id": token,
+                "operationType": "modify",
+                "clusterTime": ts,
+                "ns": _ns_doc(affected_ns),
+                "operationDescription": {k: v for k, v in cmd.items() if k != "collMod"},
+            }
+            if wall is not None:
+                event["wallTime"] = wall
+            return event, False
         if "createIndexes" in cmd:
             if not show_expanded_events:
                 return None, False
@@ -387,7 +476,7 @@ def invalidate_event(seq: int, oplog_entry: Mapping[str, Any]) -> dict[str, Any]
         affected_ns = str(cmd["renameCollection"])
     else:
         affected_ns = ns
-    token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}))
+    token = make_resume_token(ResumeTokenData(seq, ts, affected_ns, {}, from_invalidate=True))
     event = {
         "_id": token,
         "operationType": "invalidate",
@@ -437,21 +526,75 @@ def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
     return out
 
 
-def stamp_split_event(event: dict[str, Any]) -> dict[str, Any]:
-    """Attach a ``splitEvent: {fragment: 1, of: 1}`` envelope.
+_SPLIT_THRESHOLD_BYTES = 16 * 1024 * 1024
+_HEAVY_FIELD_BYTES = 1024 * 1024
 
-    Real ``mongod`` splits change-stream events larger than 16 MB into
-    multiple fragments when the user sets
-    ``splitLargeChangeStreamEvents: true``; each fragment carries its
-    position via ``splitEvent: {fragment: N, of: M}``. SecantusDB's
-    events are never that large in practice (oplog entries cap well
-    below 16 MB), so we always emit a single-fragment envelope —
-    correct from the driver's reassembly perspective. The user's
-    opt-in is honoured by the *presence* of the ``splitEvent`` field;
+
+def stamp_split_event(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split ``event`` into fragments when its BSON-encoded size
+    exceeds 16 MB; tag each fragment with ``splitEvent: {fragment:
+    N, of: M}``. Returns a list of one event (no split needed) or
+    N events (split). Always returns at least one event.
+
+    Real mongod splits change events larger than 16 MB when the
+    user sets ``splitLargeChangeStreamEvents: true``; each fragment
+    is itself a valid change-stream event the driver can process
+    independently or reassemble (drivers identify fragments by
+    shared ``_id`` resume token and combine fields).
+
+    Strategy is size-based, not field-name-based: any single
+    top-level field whose BSON size exceeds ``_HEAVY_FIELD_BYTES``
+    (1 MB) is a "heavy" field that goes into its own fragment.
+    All "light" fields (resume token, operationType, clusterTime,
+    ns, documentKey, wallTime, …) are copied verbatim into every
+    fragment so each is a valid change-stream event.
+
+    The practical event shapes that trigger this:
+
+    * ``update`` with ``fullDocumentBeforeChange: required`` and a
+      large pre-image PLUS a large ``$set`` value — both
+      ``fullDocumentBeforeChange`` (~10 MB) and
+      ``updateDescription.updatedFields`` (~10 MB) qualify as heavy,
+      so the event splits into 2 fragments.
+    * ``update`` with both ``fullDocument`` and
+      ``fullDocumentBeforeChange`` present and large.
+
+    When the event is small enough, no split: a single fragment is
+    emitted with ``{fragment: 1, of: 1}`` — the user's opt-in is
+    honoured by the *presence* of the ``splitEvent`` field;
     drivers don't get back a ``splitEvent`` when the option is off.
     """
-    event["splitEvent"] = {"fragment": 1, "of": 1}
-    return event
+    encoded_size = len(bson.encode(event))
+    if encoded_size <= _SPLIT_THRESHOLD_BYTES:
+        event["splitEvent"] = {"fragment": 1, "of": 1}
+        return [event]
+
+    # Identify heavy fields by per-field BSON encoding.
+    heavy: list[str] = []
+    light: list[str] = []
+    for k, v in event.items():
+        if len(bson.encode({k: v})) > _HEAVY_FIELD_BYTES:
+            heavy.append(k)
+        else:
+            light.append(k)
+
+    if not heavy:
+        # Event > 16 MB but no individual heavy field — punt with
+        # a single fragment (driver may surface an OverBson16M
+        # error, but we've done what we can).
+        event["splitEvent"] = {"fragment": 1, "of": 1}
+        return [event]
+
+    light_metadata = {k: event[k] for k in light}
+    fragments: list[dict[str, Any]] = []
+    for hf in heavy:
+        frag = dict(light_metadata)
+        frag[hf] = event[hf]
+        fragments.append(frag)
+    total = len(fragments)
+    for i, frag in enumerate(fragments, 1):
+        frag["splitEvent"] = {"fragment": i, "of": total}
+    return fragments
 
 
 __all__ = [

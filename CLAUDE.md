@@ -70,9 +70,9 @@ Unique enforcement is a prefix probe on the entries table, not a full scan.
 
 Multi-field sort acceleration: a sort spec whose `(field, direction)` tuple list exactly matches — or fully inverts — a compound index's key spec walks the index in forward / backward order and skips the Python post-sort entirely. Picker is strict-shape only (partial-prefix sorts, mixed-direction mismatches, and multikey indexes fall back to COLLSCAN + Python sort). `_compound_index_for_sort` lives in `storage.py` next to `_single_field_index_for`; the planner mirrors the same rules in `explain_plan`.
 
-Still missing: `collation`.
+Per-index collation shipped (strength 1/2/3 + `caseLevel` across single-field and compound indexes; `numericOrdering` still falls back to COLLSCAN — see `tasks/backlog.md` §2 and `docs/indexes.md` "Per-index collation").
 
-Out of scope regardless: text / hashed / wildcard indexes, collation.
+Out of scope regardless: text / hashed / wildcard indexes.
 
 **Geo support**: `$geoWithin`, `$geoIntersects`, `$near`, `$nearSphere` field operators and `$geoNear` aggregation stage live in `secantus.geo` + `secantus.query` + `secantus.aggregate`. Doc-side accepts GeoJSON (`{type:"Point|Polygon|...", coordinates: ...}`), legacy `[x, y]` pairs, and `{x, y}` / `{lng, lat}` maps. Query-side accepts `$geometry` (GeoJSON), `$box`, `$polygon`, `$center` (planar disk), `$centerSphere` (great-circle cap, radius in radians). Containment and intersection delegate to Shapely (planar — Shapely 2.x); spherical-circle containment uses haversine in `secantus.geo._great_circle_radians` directly. Distance returns meters when spherical (mean-radius `EARTH_RADIUS_METERS = 6_378_100.0` matching `mongod`'s constant) and planar units otherwise. `$geoNear` sorts ascending by distance and attaches the value under `distanceField`. **Index acceleration lives in `secantus.geo_index`**: `2dsphere` indexes use S2 cell coverings (s2sphere library) — each indexed geometry writes its covering cells *plus every ancestor back to level 0*, mirroring real-mongo's S2 scheme. Queries compute their own covering+ancestors and do exact point-lookups against the entries table; the candidate verifier filters false positives via Shapely / haversine. `2d` indexes use bit-interleaved geohash buckets at the user's `bits` precision (default 26), with a single `(lo, hi)` bbox range scan per query. Picker (`_pick_geo_index_for_filter` / `_try_geo_index_id_keys`) lives next to the compound-index pickers; `explain` reports `IXSCAN` with the full `keyPattern: {field: "2dsphere"}` shape. Geo indexes are flagged `multikey: True` at creation so the regular pickers skip them for non-geo queries. Cell IDs are encoded with `geo_index.encode_cell` (fixed-width 8-byte big-endian uint64) so the WT B-tree gives lex byte ordering aligned with cell-ID order.
 
@@ -103,6 +103,89 @@ Event projection lives in `secantus/changestreams.py`: `project(seq, oplog_entry
 Documents are stored as **opaque BSON blobs**. All filtering, projection, sorting, and updates happen in Python after `bson.decode`. The storage layer never inspects document content. This is deliberate: SecantusDB's whole point is that `pymongo` cannot tell us apart from `mongod`, and any lossy intermediate representation (JSON, native column types, etc.) would break that for ObjectId / Decimal128 / int32-vs-int64 / Date-with-tz / Binary / Regex.
 
 When secondary indexes land they will be WT indexes over typed sort-key columns derived from BSON values — not JSON, not coerced numerics.
+
+### Engines: pure-Python and Rust both ship → as TWO SEPARATE SERVERS
+
+**Direction (current):** SecantusDB ships **two completely separate servers**,
+and a user runs **one or the other** — never a per-operator/per-`Storage`
+selection inside one request path:
+
+- **The Python server** — the *original* `SecantusDBServer` (pure-Python `server` /
+  `wire` / `commands` / `Storage` / operator engines). No Rust in the request path.
+- **The Rust server** — a whole, self-contained Rust server (its own wire /
+  dispatch / cursors / accept loop over the pure-Rust `secantus-core` +
+  `secantus-storage` + `secantus-wt` crates). No Python in the request path. Its
+  Python ergonomic is a **thin embedded lifecycle handle** (`start`/`stop`/
+  `address`) — the accept loop runs on a GIL-released Rust thread in-process and
+  `pymongo` connects over real TCP; Python is only the launcher, never an operator.
+
+#### Versioning: the two servers version independently
+
+The Python server and the Rust server are **separate deliverables with separate
+version lines** — they **diverged at `0.5.2`** (Python `0.5.2b33` / Rust crates
+`0.5.2-beta.15`) and advance independently from there. A change that touches only
+one server bumps only that server's version:
+
+- **Python server version** — `pyproject.toml` `version` + `src/secantus/__init__.py`
+  `__version__` (`0.5.2bN`, PEP 440). This is the **PyPI package** version. Bump it
+  for Python-server changes (`src/secantus/**`).
+- **Rust server version** — the `version` field in **every** `crates/*/Cargo.toml`,
+  kept in **lockstep** across all crates (`0.MAJOR.PATCH-beta.N`, SemVer
+  pre-release). Most slices just increment `N`. **Bumping the patch (or
+  minor/major) component resets the beta label to 0** — e.g. `0.5.2-beta.20` →
+  `0.5.3-beta.0`, never `0.5.3-beta.21`.
+  Bump it for Rust-server changes (`crates/**`). There is no single
+  `[workspace.package]` source because the WiredTiger-linked crates
+  (`secantus-storage` / `-wt` / `-storage-adapter` / `-server-py` / `-storage-py` /
+  `secantusdb`) are **excluded** from the clean workspace and can't inherit a
+  workspace version — so all twelve `Cargo.toml` (and their `Cargo.lock`) carry the
+  number and are bumped together (e.g. `find crates -maxdepth 2 -name Cargo.toml
+  -o -name Cargo.lock | xargs sed -i '' 's/0.5.2-beta.N/0.5.2-beta.N+1/'`). The
+  canonical embedded value is `secantus_server::VERSION`
+  (`env!("CARGO_PKG_VERSION")`); the Rust server **embeds and surfaces** it in
+  `buildInfo.secantusVersion` (over the wire), the `secantusdb` binary's
+  `--version`, the embedded Python handle's `RustServer.version` getter, and the
+  `_secantus_server.__version__` module attribute.
+
+A change that genuinely touches both servers (e.g. an operator-semantics change
+landed in the Python module *and* its Rust port) bumps both. Don't bump the Python
+package version for Rust-only work just because the Rust extension is currently
+bundled into the `secantus` wheel — the two numbers are decoupled by intent.
+
+**The authoritative plan is `tasks/rust-server-plan.md`.** It supersedes the
+earlier *in-process selectable-engine* model (`SECANTUS_ENGINE` process-wide
+selection / the `secantus.engine` per-component shims / the "5e Python `Storage`
+adapter + `EngineFallback`"). Read it before doing Rust-side work.
+
+The Rust side is a Cargo workspace under `crates/`: `secantus-core` (pure-Rust
+engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backed
+`Storage`, pure-Rust), `secantus-wt` (the WT FFI), plus thin PyO3 binding crates
+(`secantus-core-py` → the `_secantus_core` abi3 extension). The PyO3-free split is
+exactly what lets the Rust server / standalone `secantusdb` binary reuse the
+engines.
+
+- **Current code vs direction.** Today the code still contains the transitional
+  in-process selection (`src/secantus/engine.py`: `selected()` / `enabled()` and
+  the `query`/`update`/`expressions`/`projection`/`diff`/`sortkey`/`aggregate`
+  shims that delegate to `_secantus_core` when enabled; `SECANTUS_ENGINE=python|
+  rust|auto`). **This is being retired** in favour of the two-server model: the
+  Python server reverts to pure-Python, and `_secantus_core` is kept **only as the
+  parity-test vehicle**. Don't build new in-process selection surface; build the
+  Rust server (`tasks/rust-server-plan.md` §4, R1–R8).
+- **Parity suites stay (the operator oracle).** Each Rust engine is pinned
+  byte-for-byte to its pure-Python counterpart by a `tests/test_rust_*_parity.py`
+  suite (curated corpus + randomised fuzz); the Rust side returns a "defer to
+  Python" signal for constructs it can't reproduce exactly (regex → Python `re`,
+  collation, Decimal128 edges, non-ASCII case, etc.). When porting/widening a Rust
+  engine, **extend the parity suite first**; never let the two engines drift.
+- **Implication for changes:** a change to an operator's semantics must land in
+  *both* the Python module and the Rust port (or the Rust port must explicitly
+  defer that case), and the parity suite must stay green. Both servers must keep
+  the pymongo + driver gauges non-regressing. Plan / phase status / per-engine
+  fallback lists: `tasks/rust-server-plan.md` (north star), `tasks/rust-rewrite-
+  plan.md`, `tasks/rust-rewrite-phase4-scoping.md`, `tasks/rust-rewrite-spike-
+  findings.md`, `tasks/backlog.md` §7. Tooling: `invoke rust-test` / `rust-build`
+  / `rust-parity`.
 
 ## Tooling
 

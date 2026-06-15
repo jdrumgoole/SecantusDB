@@ -1,0 +1,47 @@
+# The Rust accelerator ships as its **own optional package**, not bundled into
+# the top-level SecantusDB wheel. `pip install secantus` is pure-Python +
+# vendored WiredTiger as always; `pip install "secantus[rust]"` additionally
+# pulls this `secantus-core` wheel, which provides the `_secantus_core`
+# extension the engine shims pick up at runtime (selected via SECANTUS_ENGINE).
+#
+# This directory (`crates/secantus-core-py`) is the thin PyO3 **bindings** crate
+# only — the byte-seam marshalling + `#[pyfunction]` glue. The pure operator
+# engines live in the sibling `crates/secantus-core` Rust lib crate (no PyO3),
+# so they stay reusable by a future standalone `secantusdb` server binary. The
+# two are a Cargo workspace (`crates/Cargo.toml`); maturin builds this crate.
+#
+# Version is kept in lockstep with the SecantusDB release it accelerates (the
+# `secantus[rust]` extra pins it exactly), so the release process must bump and
+# publish both together — see tasks/rust-rewrite-plan.md and tasks/backlog.md.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "secantus-core"
+version = "0.5.2b15"
+description = "Optional Rust acceleration core for SecantusDB (the _secantus_core extension)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Joe Drumgoole", email = "joe@joedrumgoole.com" }]
+license = "GPL-2.0-only"
+keywords = ["mongodb", "wiredtiger", "rust", "pyo3", "secantus"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/jdrumgoole/SecantusDB"
+Repository = "https://github.com/jdrumgoole/SecantusDB"
+Issues = "https://github.com/jdrumgoole/SecantusDB/issues"
+
+[tool.maturin]
+module-name = "_secantus_core"
+# Build a single abi3 wheel valid for CPython 3.10+ (matches the project's
+# requires-python), so we don't need a wheel per interpreter version.
+features = ["pyo3/abi3-py310"]

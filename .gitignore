@@ -76,7 +76,17 @@ website/infra/aws-state.json
 website/secantus-data/
 website/__pycache__/
 xunit-results/
-# Playwright MCP browser-session artefacts — Claude sessions write
-# them to repo root when capturing screenshots / DOM dumps. Always
-# untracked, never shipped.
+
+# WT-linked crate build artifacts from a LOCAL `cargo check`/`build` against the
+# vendored WiredTiger (SECANTUS_WT_INCLUDE/LIB). These crates are excluded from
+# the clean workspace and built only by CI's CMake path (CARGO_TARGET_DIR points
+# elsewhere), so a stray per-crate target/ + Cargo.lock should never be committed.
+crates/secantus-storage-adapter/target/
+crates/secantus-storage-adapter/Cargo.lock
+crates/secantus-storage/target/
+crates/secantus-server-py/target/
+crates/secantus-server-py/Cargo.lock
+
+# Playwright MCP browser-session artefacts — Claude sessions write them to repo
+# root when capturing screenshots / DOM dumps. Always untracked, never shipped.
 .playwright-mcp/

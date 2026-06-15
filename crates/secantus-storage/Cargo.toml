@@ -1,0 +1,20 @@
+[package]
+name = "secantus-storage"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "SecantusDB's storage layer in Rust (Phase 4): WiredTiger-backed collections/documents over secantus-wt, with id_key sort encoding from secantus-core."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+publish = false
+
+# Standalone (own [workspace]) so it isn't pulled into the secantus-core
+# workspace's default build — it links WiredTiger transitively via secantus-wt.
+[workspace]
+
+[dependencies]
+bson = "2"
+secantus-wt = { path = "../secantus-wt" }
+secantus-core = { path = "../secantus-core" }
+# S2 cell coverings for `2dsphere` index acceleration (geo-3). Kept here, not in
+# secantus-core, so the shipped `secantus-core` wheel stays lean.
+s2 = "0.0.12"

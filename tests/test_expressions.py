@@ -34,7 +34,59 @@ def test_arithmetic() -> None:
 
 def test_arithmetic_with_null_returns_null() -> None:
     assert evaluate({"$add": ["$missing", 5]}, {}) is None
-    assert evaluate({"$divide": [5, 0]}, {}) is None
+    # Null propagates BEFORE type checks, matching mongod.
+    assert evaluate({"$multiply": [None, "x"]}, {}) is None
+
+
+def test_arithmetic_rejects_non_numeric() -> None:
+    """mongod raises on non-numeric arithmetic operands; message and code
+    shapes verified against mongod 8.2 (2026-06-12 oracle probe)."""
+    with pytest.raises(
+        ExpressionError, match=r"\$multiply only supports numeric types, not string"
+    ):
+        evaluate({"$multiply": [2, "x"]}, {})
+    with pytest.raises(ExpressionError, match=r"\$multiply only supports numeric types, not bool"):
+        evaluate({"$multiply": [2, True]}, {})
+    with pytest.raises(ExpressionError, match=r"\$add only supports numeric or date types"):
+        evaluate({"$add": [2, "x"]}, {})
+    # Single-arg forms type-check too.
+    with pytest.raises(ExpressionError, match=r"\$add only supports"):
+        evaluate({"$add": ["x"]}, {})
+    with pytest.raises(ExpressionError, match=r"can't \$subtract string from int"):
+        evaluate({"$subtract": [2, "x"]}, {})
+    with pytest.raises(
+        ExpressionError, match=r"\$divide only supports numeric types, not int and string"
+    ):
+        evaluate({"$divide": [2, "x"]}, {})
+    with pytest.raises(ExpressionError, match=r"\$mod only supports numeric types") as exc_info:
+        evaluate({"$mod": [2, "x"]}, {})
+    assert exc_info.value.code == 16611
+
+
+def test_divide_and_mod_by_zero_raise() -> None:
+    with pytest.raises(ExpressionError, match=r"can't \$divide by zero") as div_exc:
+        evaluate({"$divide": [5, 0]}, {})
+    assert div_exc.value.code == 2
+    assert div_exc.value.code_name == "BadValue"
+    with pytest.raises(ExpressionError, match=r"can't \$mod by zero") as mod_exc:
+        evaluate({"$mod": [5, 0]}, {})
+    assert mod_exc.value.code == 16610
+
+
+def test_arithmetic_date_semantics() -> None:
+    import datetime as dt
+
+    from bson import Int64
+
+    d = dt.datetime(2020, 1, 1)
+    assert evaluate({"$add": ["$d", 1000]}, {"d": d}) == d + dt.timedelta(seconds=1)
+    assert evaluate({"$subtract": ["$d", 1000]}, {"d": d}) == d - dt.timedelta(seconds=1)
+    diff = evaluate({"$subtract": ["$d2", "$d"]}, {"d": d, "d2": d + dt.timedelta(seconds=2)})
+    assert diff == Int64(2000)
+    with pytest.raises(ExpressionError, match=r"only one date allowed in an \$add"):
+        evaluate({"$add": ["$d", "$d"]}, {"d": d})
+    with pytest.raises(ExpressionError, match=r"can't \$subtract date from int"):
+        evaluate({"$subtract": [1000, "$d"]}, {"d": d})
 
 
 def test_concat() -> None:

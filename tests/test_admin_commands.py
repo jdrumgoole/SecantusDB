@@ -178,3 +178,71 @@ def test_host_info_memory_size_nonzero_on_posix(tmp_path) -> None:
             assert out["system"]["memSizeMB"] > 0
         finally:
             mc.close()
+
+
+# ---- serverStatus.mem (mongostat) -------------------------------------------
+
+
+def test_server_status_has_mem_section(client: MongoClient) -> None:
+    """mongostat dereferences ``mem.supported`` with no nil guard
+    (mongo-tools status/readers.go ``ReadMapped``) — the section must
+    always be present and mongod-shaped."""
+    out = client.admin.command("serverStatus")
+    mem = out["mem"]
+    assert mem["supported"] is True
+    assert mem["bits"] == 64
+    assert mem["resident"] >= 0
+    assert mem["virtual"] >= 0
+
+
+# ---- top ---------------------------------------------------------------------
+
+
+def test_top_reports_namespaces_in_mongod_shape(client: MongoClient) -> None:
+    client["shop"]["items"].insert_one({"x": 1})
+    out = client.admin.command("top")
+    totals = out["totals"]
+    assert totals["note"] == "all times in microseconds"
+    ns = totals["shop.items"]
+    for section in (
+        "total",
+        "readLock",
+        "writeLock",
+        "queries",
+        "getmore",
+        "insert",
+        "update",
+        "remove",
+        "commands",
+    ):
+        assert set(ns[section]) == {"time", "count"}, section
+
+
+def test_top_rejected_outside_admin(client: MongoClient) -> None:
+    client["shop"]["items"].insert_one({"x": 1})
+    with pytest.raises(OperationFailure) as exc:
+        client["shop"].command("top")
+    assert exc.value.code == 13
+
+
+# ---- validate ---------------------------------------------------------------
+
+
+def test_validate_collection_reports_clean(client: MongoClient) -> None:
+    coll = client["valdb"]["things"]
+    coll.insert_many([{"_id": i} for i in range(5)])
+    coll.create_index([("x", 1)])
+
+    out = client["valdb"].validate_collection("things")
+    assert out["valid"] is True
+    assert out["nrecords"] == 5
+    assert out["nIndexes"] == 2
+    assert set(out["keysPerIndex"]) == {"_id_", "x_1"}
+    # full / scandata are accepted and ignored.
+    assert client["valdb"].validate_collection("things", scandata=True, full=True)["valid"]
+
+
+def test_validate_nonexistent_collection_errors(client: MongoClient) -> None:
+    with pytest.raises(OperationFailure) as exc:
+        client["valdb"].validate_collection("nope")
+    assert exc.value.code == 26

@@ -106,6 +106,35 @@ def _ensure_bundle_built() -> int:
     return proc.returncode
 
 
+def _verify_secantus_identity(host: str, port: int, gauge: str) -> None:
+    """Abort unless the daemon at ``host:port`` is SecantusDB.
+
+    SecantusDB's ``serverStatus`` carries a ``secantus`` subdocument that
+    a real ``mongod`` never emits, so a stray ``mongod`` (or any foreign
+    server) can never sit silently behind the gauge — mirrors the pymongo
+    plugin's tripwire. Runs against the unauthenticated phase-1 daemon
+    (before ``--auth``), so ``serverStatus`` needs no credentials.
+    """
+    import pymongo
+
+    client = pymongo.MongoClient(
+        f"mongodb://{host}:{port}/", directConnection=True, serverSelectionTimeoutMS=10_000
+    )
+    try:
+        status = client.admin.command("serverStatus")
+    finally:
+        client.close()
+    marker = status.get("secantus")
+    if not isinstance(marker, dict) or "server" not in marker:
+        raise SystemExit(
+            f"{gauge}: the server at {host}:{port} is not SecantusDB "
+            f"(serverStatus has no 'secantus' marker — "
+            f"process={status.get('process')!r}, version={status.get('version')!r}). "
+            "Refusing to run the gauge against a foreign server."
+        )
+    print(f"{gauge}: target verified — secantus {marker['server']} server", file=sys.stderr)
+
+
 def main() -> int:
     if shutil.which("node") is None or shutil.which("npm") is None:
         print(
@@ -158,6 +187,7 @@ def main() -> int:
     daemon = _spawn_daemon(with_auth=False)
     try:
         _wait_for_listener(host, port)
+        _verify_secantus_identity(host, port, "node_validation")
         print("node_validation: seeding root-user", file=sys.stderr)
         import pymongo
         client = pymongo.MongoClient(

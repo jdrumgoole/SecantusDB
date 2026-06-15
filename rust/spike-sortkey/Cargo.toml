@@ -1,0 +1,12 @@
+[package]
+name = "spike-sortkey"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bson = { workspace = true }
+
+[[bin]]
+name = "goldencheck"
+path = "src/goldencheck.rs"

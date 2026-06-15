@@ -1,0 +1,25 @@
+# PyO3 bindings for the Rust storage layer (secantus-storage). UNLIKE
+# secantus-core, this extension links the vendored WiredTiger C library, so it is
+# NOT a standalone wheel. It is built INTO the main `secantus` wheel by that
+# wheel's CMake — against the WiredTiger that wheel already builds — gated behind
+# the off-by-default `SECANTUS_BUILD_STORAGE_ENGINE` flag (see the root
+# CMakeLists.txt and tasks/rust-rewrite-phase4-scoping.md).
+#
+# This pyproject is kept for LOCAL dev only: `invoke rust-storage-py` (maturin)
+# builds an importable extension for the smoke test where WiredTiger is present
+# (set SECANTUS_WT_INCLUDE/_LIB or use a probed build dir; bindgen needs libclang
+# via LIBCLANG_PATH). It is not published to PyPI.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "secantus-storage"
+version = "0.5.2b15"
+description = "Rust storage layer for SecantusDB (the _secantus_storage extension)"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+
+[tool.maturin]
+module-name = "_secantus_storage"
+features = ["pyo3/abi3-py310"]

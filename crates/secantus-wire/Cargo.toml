@@ -1,0 +1,22 @@
+[package]
+name = "secantus-wire"
+version = "0.5.3-beta.9"
+edition = "2021"
+description = "Pure-Rust MongoDB wire-protocol framing for SecantusDB: message header, OP_MSG (2013) / legacy OP_QUERY (2004) parse, OP_MSG / OP_REPLY build."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+# Part of the Rust-server build-out (tasks/rust-server-plan.md, R1). Not released
+# to crates.io yet — flips to publish with the standalone server.
+publish = false
+
+# Pure Rust: no PyO3, no sockets. The wire layer is framing only — bytes in,
+# borrowed byte slices out — so it links into the future Rust server (R4) and the
+# standalone binary (R7) alike. The socket I/O and the connection loop live above
+# it; the BSON byte seam keeps parsed documents as borrowed slices, never owned
+# dicts (cf. the "fat byte seam" in tasks/rust-rewrite-plan.md §3).
+[lib]
+name = "secantus_wire"
+crate-type = ["rlib"]
+
+[dependencies]
+bson = { workspace = true }
