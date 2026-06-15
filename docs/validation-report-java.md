@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-06-12 — SecantusDB 0.5.2b18 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-06-15 — SecantusDB 0.5.3b6 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -13,8 +13,17 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `driver-core` | 10 | 0 | 0 | 10 | 100.0% |
-| `driver-sync` | 437 | 0 | 453 | 890 | 100.0% |
-| **Overall** | **447** | **0** | **453** | **900** | **100.0%** |
+| `driver-sync` | 435 | 2 | 453 | 890 | 99.5% |
+| **Overall** | **445** | **2** | **453** | **900** | **99.6%** |
+
+## Failures (2)
+
+First 30 failed tests for triage:
+
+```
+driver-sync :: com.mongodb.client.unified.CommandMonitoringTest#deleteOne: A successful deleteOne with write errors
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#bulkWrite-errorResponse: bulkWrite operations support errorResponse assertions
+```
 
 ## How this is generated
 

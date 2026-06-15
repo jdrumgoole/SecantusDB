@@ -1,6 +1,6 @@
 # mongo-rust-driver Validation Report
 
-Generated 2026-06-12 — SecantusDB 0.5.2b18 vs mongo-rust-driver 12dd49b (`vendor/mongo-rust-driver/`).
+Generated 2026-06-15 — SecantusDB 0.5.3b6 vs mongo-rust-driver 12dd49b (`vendor/mongo-rust-driver/`).
 
 Run `uv run python -m invoke validate-rust` to refresh. The Rust-driver analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges — the language MongoDB consumers reach for when they want native performance + async.
 
@@ -25,7 +25,7 @@ First 30 failed tests for triage:
 
 ```
 test::change_stream::tracks_resume_token
-    thread 'test::change_stream::tracks_resume_token' (12062) panicked at driver/src/test/change_stream.rs:109:5:
+    thread 'test::change_stream::tracks_resume_token' (12051) panicked at driver/src/test/change_stream.rs:109:5:
 ```
 
 ## How this is generated
