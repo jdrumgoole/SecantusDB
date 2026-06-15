@@ -678,11 +678,23 @@ def validate_java(c: Context) -> None:
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
+    result = c.run(
         "PYTHONPATH=. uv run --no-sync python -m java_validation.runner",
         pty=True,
         warn=True,
     )
+    # Fail loudly instead of regenerating a stale/empty report. The runner
+    # wipes prior JUnit XML up front, so a non-zero exit means the build
+    # didn't actually run any tests this invocation (common cause: no
+    # Gradle-supported JDK — needs 8-23, JDK 24+ aborts the build). Re-
+    # emitting the report here would otherwise carry forward a previous
+    # run's numbers as if they were current.
+    if result.exited != 0:
+        raise SystemExit(
+            f"java_validation.runner failed (exit {result.exited}); not regenerating "
+            "docs/validation-report-java.md from stale/empty results. See the runner "
+            "output above (a JDK 24+ default is the usual cause — install openjdk@17)."
+        )
     c.run(
         "uv run --no-sync python -m java_validation.generate_report "
         ".validation/java-results docs/validation-report-java.md",
