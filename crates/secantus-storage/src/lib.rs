@@ -411,6 +411,10 @@ pub enum StorageError {
     /// An internal invariant failure (e.g. a transaction operation on an
     /// already-closed handle). Surfaces as a command-level `InternalError`.
     Internal(String),
+    /// A write lost a `WT_ROLLBACK` race (write conflict). Surfaces as mongod's
+    /// `WriteConflict` (112); inside a transaction it also earns the
+    /// `TransientTransactionError` label so drivers retry the whole transaction.
+    WriteConflict,
 }
 
 impl std::fmt::Display for StorageError {
@@ -434,13 +438,25 @@ impl std::fmt::Display for StorageError {
             StorageError::BadHint(m) => write!(f, "{m}"),
             StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
             StorageError::Internal(m) => write!(f, "{m}"),
+            StorageError::WriteConflict => write!(
+                f,
+                "WriteConflict error: this operation conflicted with another operation"
+            ),
         }
     }
 }
 impl std::error::Error for StorageError {}
 impl From<WtError> for StorageError {
     fn from(e: WtError) -> Self {
-        StorageError::Wt(e)
+        // A `WT_ROLLBACK` means the write lost a concurrency race — surface it as
+        // a dedicated `WriteConflict` so the command layer can map it to mongod's
+        // 112 (+ the transient label inside a transaction) rather than a generic
+        // internal error.
+        if e.is_rollback() {
+            StorageError::WriteConflict
+        } else {
+            StorageError::Wt(e)
+        }
     }
 }
 

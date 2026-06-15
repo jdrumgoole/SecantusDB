@@ -184,6 +184,10 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Err(StorageError::Internal(msg)) => {
                 return Ok(CommandError::new(1, "InternalError", msg).into_reply())
             }
+            // A write conflict fails the whole statement command-level (mongod
+            // semantics), so the dispatch txn envelope attaches the transient
+            // label and drivers retry the transaction.
+            Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
                 write_errors.push(Bson::Document(write_error(index, e)));
                 if ordered {
@@ -356,6 +360,10 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Err(StorageError::Internal(msg)) => {
                 return Ok(CommandError::new(1, "InternalError", msg).into_reply())
             }
+            // A write conflict fails the whole statement command-level (mongod
+            // semantics), so the dispatch txn envelope attaches the transient
+            // label and drivers retry the transaction.
+            Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
                 write_errors.push(Bson::Document(write_error(index, e)));
                 if ordered {

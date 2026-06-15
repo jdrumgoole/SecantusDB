@@ -132,7 +132,24 @@ Validate: a pymongo e2e (commit persists, abort rolls back, read-your-own-writes
 NoSuchTransaction/TransactionCommitted lifecycle) + the rust gauge (expect the
 `test_transactions_unified.py` cluster to move). Bump beta.10.
 
-### T3 — Refinements
+### T3a — WriteConflict (112) mapping — ✅ DONE (beta.11)
+A `WT_ROLLBACK` (lost write-conflict race) was falling through `From<WtError>` →
+`StorageError::Wt` → adapter `InternalError(1)`. Now: storage `From<WtError>`
+detects `is_rollback()` → `StorageError::WriteConflict`; adapter maps it to the
+command-crate `StorageError::WriteConflict`; `command_error` → `112 WriteConflict`
+(+ `code_name_for(112)`); the `update`/`delete` handlers route it command-level
+(`insert` already did) so the dispatch envelope's `finish_txn_statement` attaches
+`TransientTransactionError` (112 is in the transient set). Recovers
+`test_write_conflict_abort`/`commit`. Validated by `/tmp/wc_check.py` (112 +
+transient label, winner commits). **Note:** non-txn writes still surface 112
+without the Python server's transparent retry wrapper — a separate enhancement.
+
+### T3 — Refinements (deferred — topology-inherent / niche)
+The remaining txn-cluster fails are topology-inherent (`secondary`/`nearest`
+readPref on a single-node RS — no secondary to select) or change-stream OOM
+(`test_split_large_change`), not transaction-logic gaps. Oplog-buffering
+(change-stream-in-txn atomicity) is correctness polish with no current gauge
+lever. Original refinement list:
 - Oplog buffering during a txn: buffer entries on the handle, flush with one
   shared commit Timestamp + lsid/txnNumber at commit (change-stream-in-txn
   atomicity), mirroring `commit_user_transaction`.
