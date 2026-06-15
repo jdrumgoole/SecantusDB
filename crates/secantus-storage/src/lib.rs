@@ -2522,7 +2522,11 @@ impl Storage {
             }
         }
 
-        let session = self.conn.open_session()?;
+        // `op_session` (not a fresh session) so `createIndexes` inside a
+        // multi-document transaction runs on the transaction's WT session — a
+        // fresh session would deadlock against the same transaction's
+        // uncommitted writes (e.g. a collection created earlier in the txn).
+        let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
 
         let c = session.open_cursor(IDX_TABLE, None)?;
