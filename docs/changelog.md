@@ -19,6 +19,35 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$exists: true` rides a sparse index instead of scanning the collection
+
+A query of the form `{field: {$exists: true}}` now uses a sparse single-field
+index on `field` when one exists, instead of falling back to a full collection
+scan. A sparse index holds an entry for exactly the documents where the field is
+present — missing-field documents are omitted, present-but-`null` and array
+values keep an entry — so the complete set of index entries *is* the
+`$exists: true` match set. The planner walks the whole index (no value bound),
+and `explain` reports `IXSCAN` accordingly. A non-sparse index still can't serve
+`$exists: true` (it has an entry per document, including the absent ones), and
+`$exists: false` never uses a sparse index — both correctly stay on `COLLSCAN`.
+Results were always correct; this is the missing fast path.
+
+#### Added
+
+- `{field: {$exists: true}}` uses a sparse single-field index (IXSCAN) when one
+  is present, via `Storage._sparse_index_for_exists` + `_all_id_keys_for_index`,
+  mirrored in `explain_plan`. Non-sparse indexes and `$exists: false` stay on
+  COLLSCAN.
+
+#### Fixed
+
+- The three pymongo DBRef-spec tests (`test_dbref.py::TestDBRefSpec`) are now
+  deselected from the gauge. They are pure client-side BSON codec tests that
+  never exercise SecantusDB; they pass under plain unittest but crash the
+  gauge's `-n1` xdist worker because execnet can't pickle the `ObjectId` in
+  their `subTest` params (`DumpError`). Deselecting them keeps the gauge run
+  clean and stops three spurious failures from being attributed to the server.
+
 ### Fixed a shutdown race that could crash the server process
 
 Stopping a `SecantusDBServer` now drains its in-flight per-connection threads

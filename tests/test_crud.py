@@ -1203,6 +1203,27 @@ def test_explain_find_ixscan_when_indexed(coll) -> None:
     assert inner["direction"] == "forward"
 
 
+def test_explain_find_exists_true_uses_sparse_index(coll) -> None:
+    coll.create_index("f", sparse=True)
+    coll.insert_many(
+        [
+            {"_id": 1, "f": 10},
+            {"_id": 2, "f": None},
+            {"_id": 3},
+            {"_id": 4, "f": [1, 2]},
+            {"_id": 5},
+        ]
+    )
+    # Correct results: present-but-null and arrays count as existing.
+    got = sorted(d["_id"] for d in coll.find({"f": {"$exists": True}}))
+    assert got == [1, 2, 4]
+    # And the plan rides the sparse index at IXSCAN.
+    plan = coll.find({"f": {"$exists": True}}).explain()["queryPlanner"]["winningPlan"]
+    assert plan["stage"] == "FETCH"
+    assert plan["inputStage"]["stage"] == "IXSCAN"
+    assert plan["inputStage"]["indexName"] == "f_1"
+
+
 def test_explain_find_ixscan_with_compound_index(coll) -> None:
     coll.create_index([("a", 1), ("b", 1)])
     coll.insert_many([{"_id": i, "a": i, "b": i * 10} for i in range(5)])

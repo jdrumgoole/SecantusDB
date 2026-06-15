@@ -1246,6 +1246,53 @@ def test_explain_plan_single_field_range_uses_index(storage: Storage) -> None:
     assert plan["index_name"] == "x_1"
 
 
+def test_exists_true_uses_sparse_index(storage: Storage) -> None:
+    # A sparse single-field index has an entry for exactly the docs where
+    # the field is present, so {f: {$exists: true}} rides it at IXSCAN.
+    storage.create_index("db", "c", "f_1", {"f": 1}, {"sparse": True})
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "f": 10},
+            {"_id": 2, "f": None},  # present-but-null -> exists
+            {"_id": 3},  # missing -> not exists
+            {"_id": 4, "f": [1, 2]},  # multikey
+            {"_id": 5, "f": []},  # present (empty array)
+            {"_id": 6, "g": 7},  # f missing
+        ],
+    )
+    plan = storage.explain_plan("db", "c", {"f": {"$exists": True}})
+    assert plan == {
+        "kind": "IXSCAN",
+        "index_name": "f_1",
+        "key_pattern": {"f": 1},
+        "direction": "forward",
+    }
+    got = sorted(d["_id"] for d in storage.find_matching("db", "c", {"f": {"$exists": True}}))
+    assert got == [1, 2, 4, 5]
+
+
+def test_exists_true_non_sparse_index_is_collscan(storage: Storage) -> None:
+    # A non-sparse index has an entry per doc (missing fields included), so
+    # it can't serve $exists:true — COLLSCAN, results still correct.
+    storage.create_index("db", "c", "f_1", {"f": 1}, {})
+    storage.insert("db", "c", [{"_id": 1, "f": 10}, {"_id": 2}, {"_id": 3, "f": None}])
+    assert storage.explain_plan("db", "c", {"f": {"$exists": True}}) == {"kind": "COLLSCAN"}
+    got = sorted(d["_id"] for d in storage.find_matching("db", "c", {"f": {"$exists": True}}))
+    assert got == [1, 3]
+
+
+def test_exists_false_does_not_use_sparse_index(storage: Storage) -> None:
+    # $exists:false can never use a sparse index (it has no entry for the
+    # absent docs). COLLSCAN, correct results.
+    storage.create_index("db", "c", "f_1", {"f": 1}, {"sparse": True})
+    storage.insert("db", "c", [{"_id": 1, "f": 10}, {"_id": 2}, {"_id": 3, "g": 1}])
+    assert storage.explain_plan("db", "c", {"f": {"$exists": False}}) == {"kind": "COLLSCAN"}
+    got = sorted(d["_id"] for d in storage.find_matching("db", "c", {"f": {"$exists": False}}))
+    assert got == [2, 3]
+
+
 def test_explain_plan_compound_eq_uses_compound_index(storage: Storage) -> None:
     storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
     plan = storage.explain_plan("db", "c", {"a": 1, "b": 2})

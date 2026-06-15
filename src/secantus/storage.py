@@ -3293,6 +3293,13 @@ class Storage:
                 return picked
         if len(filter) == 1:
             field, value = next(iter(filter.items()))
+            # Mirror the lookup: {field: {$exists: true}} → sparse index IXSCAN.
+            if isinstance(value, dict) and len(value) == 1 and value.get("$exists"):
+                name = self._sparse_index_for_exists(db, coll, field)
+                if name is None:
+                    return None
+                key_spec = self._key_spec_for(db, coll, name)
+                return (name, key_spec) if key_spec is not None else None
             idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
             if idx_match is None:
                 return None
@@ -4557,6 +4564,34 @@ class Storage:
                 break
         return out
 
+    def _all_id_keys_for_index(self, db: str, coll: str, name: str) -> list[bytes]:
+        """Every id_key with an entry in index ``name`` — a full index scan.
+
+        Serves ``{field: {$exists: true}}`` via a sparse index: a sparse
+        index's entries table holds an entry for exactly the docs where the
+        indexed field is present (missing-field docs are omitted; present-
+        but-null keeps an entry), so the complete set of entries *is* the
+        ``$exists: true`` match set. id_keys can repeat for multikey arrays
+        (one entry per element); the caller's ``_docs_by_id_keys`` dedups.
+        """
+        c = self._cursor(_IDX_ENTRIES_TABLE)
+        c.set_key(db, coll, name, b"")
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return []
+        if rc < 0 and c.next() != 0:
+            return []
+        out: list[bytes] = []
+        while True:
+            k = c.get_key()
+            if (k[0], k[1], k[2]) != (db, coll, name):
+                break
+            _row_esc, row_id = _unpack_entry(bytes(k[3]))
+            out.append(row_id)
+            if c.next() != 0:
+                break
+        return out
+
     def _docs_by_id_keys(self, db: str, coll: str, id_keys: list[bytes]) -> list[dict[str, Any]]:
         if not id_keys:
             return []
@@ -4948,6 +4983,15 @@ class Storage:
                 return result
         if len(filter) == 1:
             field, value = next(iter(filter.items()))
+            # {field: {$exists: true}} rides a sparse single-field index on
+            # ``field`` — every sparse entry is a doc where the field is
+            # present, exactly the $exists:true match set. No value bound:
+            # the whole index scans.
+            if isinstance(value, dict) and len(value) == 1 and value.get("$exists"):
+                name = self._sparse_index_for_exists(db, coll, field)
+                if name is None:
+                    return None
+                return self._all_id_keys_for_index(db, coll, name)
             idx_match = self._find_leading_field_index(db, coll, field, filter, collation=collation)
             if idx_match is None:
                 return None
@@ -5052,6 +5096,32 @@ class Storage:
             if compound_fallback is None:
                 compound_fallback = (name, d, True)
         return compound_fallback
+
+    def _sparse_index_for_exists(self, db: str, coll: str, field: str) -> str | None:
+        """Name of a sparse single-field index on ``field`` that can serve
+        ``{field: {$exists: true}}`` at IXSCAN, or ``None``.
+
+        Only a **sparse** index qualifies: it omits docs missing the field,
+        so a full scan of its entries yields exactly the ``$exists: true``
+        matches. A non-sparse index has an entry per doc (missing fields
+        included), so it can't distinguish presence. Restricted to
+        single-field indexes — a compound sparse index in mongod drops a
+        doc only when *every* indexed field is missing, so its entries
+        don't line up with ``{leadingField: {$exists: true}}``. Collation-
+        independent: presence doesn't depend on string normalisation, so an
+        index of any collation serves the query (the post-scan ``matches()``
+        is the final arbiter regardless).
+        """
+        for name, key_spec, sparse, _unique in self._all_indexes(db, coll):
+            if not sparse:
+                continue
+            idx_fields = list(key_spec)
+            if len(idx_fields) != 1 or idx_fields[0] != field:
+                continue
+            if key_spec[field] not in (1, -1):
+                continue
+            return name
+        return None
 
     def _lookup_id_keys_via_leading_field(
         self,
