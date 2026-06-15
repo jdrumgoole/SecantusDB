@@ -74,6 +74,7 @@ struct Shared {
     config: ServerConfig,
     storage: Arc<dyn Storage>,
     cursors: Arc<CursorRegistry>,
+    transactions: Arc<secantus_commands::transactions::TransactionRegistry>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
@@ -127,6 +128,17 @@ impl Drop for RunningServer {
 /// Bind `addr` (e.g. `"127.0.0.1:0"`), start the accept loop on a background
 /// thread, and return the running server. The accept loop spawns one thread per
 /// connection.
+/// Monotonic-ish wall-clock seconds for the transaction lifetime reaper
+/// (injected as the registry's clock). Drift is irrelevant — only elapsed time
+/// since a transaction's last use matters.
+fn now_secs_f64() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 pub fn bind(
     addr: &str,
     config: ServerConfig,
@@ -144,10 +156,33 @@ pub fn bind(
         None => None,
     };
 
+    // The multi-document-transaction registry: commit/rollback close over the
+    // storage so the registry can drive the WT transaction for each handle.
+    let transactions = {
+        use secantus_commands::transactions::{Transaction, TransactionRegistry};
+        let s_commit = storage.clone();
+        let s_rollback = storage.clone();
+        Arc::new(TransactionRegistry::new(
+            Box::new(move |txn: &mut Transaction| {
+                if let Some(h) = txn.handle.as_mut() {
+                    let _ = s_commit.commit_user_transaction(h.as_mut());
+                }
+            }),
+            Box::new(move |txn: &mut Transaction| {
+                if let Some(h) = txn.handle.as_mut() {
+                    let _ = s_rollback.rollback_user_transaction(h.as_mut());
+                }
+            }),
+            secantus_commands::transactions::DEFAULT_LIFETIME_SECONDS,
+            Box::new(now_secs_f64),
+        ))
+    };
+
     let shared = Arc::new(Shared {
         config,
         storage,
         cursors,
+        transactions,
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
@@ -411,6 +446,7 @@ fn make_context(
     let mut ctx = CommandContext::new(conn_id)
         .with_storage(shared.storage.clone())
         .with_cursors(shared.cursors.clone())
+        .with_transactions(shared.transactions.clone())
         .with_conn_auth(conn_auth.clone());
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
