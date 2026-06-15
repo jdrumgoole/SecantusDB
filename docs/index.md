@@ -204,6 +204,7 @@ validation-report-node
 validation-report-java
 validation-report-ruby
 validation-report-rust
+validation-report-rust-server
 api
 changelog
 ```

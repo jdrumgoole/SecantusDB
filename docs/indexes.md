@@ -114,10 +114,17 @@ The semantics that matter at query time — and where the engines diverge:
   otherwise never use an index at all. Drop the `$exists` clause and the
   sparse index goes unused even for queries on the same field.
 
-**SecantusDB today:** sparse entries are written and pruned correctly, but
-the query planner does not yet route `$exists: true` through a sparse index
-— it falls back to a COLLSCAN + `matches()`. Results are correct; the
-IXSCAN fast-path is the gap (see [What's still missing](#whats-still-missing)).
+**SecantusDB:** a `{field: {$exists: true}}` query rides a sparse
+single-field index on `field` at IXSCAN when one exists — the planner walks
+the whole index (no value bound), since the sparse index holds an entry for
+exactly the docs where the field is present. A **non-sparse** index, or
+`{field: {$exists: false}}`, correctly stays on COLLSCAN, matching MongoDB.
+`explain` reports the `IXSCAN` accordingly.
+
+```python
+coll.create_index("phone", sparse=True)
+coll.find({"phone": {"$exists": True}}).explain()  # IXSCAN on phone_1
+```
 
 > Background: Franck Pachot, ["`$exists` and non-sparse indexes in MongoDB
 > and in other DocumentDB"](https://dev.to/franckpachot/exists-and-non-sparse-indexes-in-mongodb-and-in-other-documentdb-19e3).
@@ -348,13 +355,6 @@ list(coll.find().sort("name", 1))   # COLLSCAN
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
   cadence sweeper. Real mongod runs one; for an in-process test
   surrogate the explicit-call ergonomics suit the audience better.
-- **`$exists: true` IXSCAN via a sparse index** — `mongod` serves
-  `{f: {$exists: true}}` from a sparse (or `$exists`-partial) index;
-  SecantusDB writes the sparse entries but the planner doesn't yet pick
-  the index for `$exists`, so it COLLSCANs. Correct results, missing
-  fast-path. (DocumentDB-style engines make the sparse index the *only*
-  index path for `$exists: true` — see [Sparse indexes and
-  `$exists`](#sparse-indexes-and-exists).)
 - **Text / hashed indexes** — out of scope (no full-text engine; no
   practical workload pulling hashed shard-key behaviour into an
   in-process surrogate).
