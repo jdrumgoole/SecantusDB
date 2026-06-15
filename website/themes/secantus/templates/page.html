@@ -4,17 +4,13 @@
 {% block description %}{{ page.summary | striptags | default('SecantusDB — the SQLite of document databases.') }}{% endblock %}
 {% block canonical_path %}{{ page.url }}{% endblock %}
 
+{% block top_banner %}{% endblock %}
+
 {% block content %}
 {% if page.template == 'home' or page.slug == 'home' %}
   {% include 'partials/hero.html' %}
 
-  <section class="section alt">
-    <div class="wrap">
-      <h2>Why SecantusDB</h2>
-      <p class="section-lead">Build for full production use (eventually) right now use it as a cheap and easy clone for test and dev environments.</p>
-      {% include 'partials/benefits_grid.html' %}
-    </div>
-  </section>
+  {% include 'partials/beta_banner.html' %}
 
   <section class="section code-example">
     <div class="wrap">
@@ -27,6 +23,25 @@
         <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}" rel="noopener">Read the docs</a>
         <a class="btn btn-secondary" href="{{ SECANTUS_PYPI_URL }}" rel="noopener"><code>pip install SecantusDB</code></a>
       </div>
+    </div>
+  </section>
+
+  <section class="section alt">
+    <div class="wrap">
+      <h2>Why SecantusDB</h2>
+      <p class="section-lead">Production-grade engineering &mdash; real wire protocol, real WiredTiger storage &mdash; scoped today to test and dev environments. Each panel links to the reference docs.</p>
+      {% include 'partials/benefits_grid.html' %}
+      <h3 class="perf-heading">Performance</h3>
+      <p class="perf-note">A like-for-like benchmark currently has SecantusDB <strong>~8&times;&ndash;46&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency &mdash; for ephemeral test and dev data, the wall-clock difference rarely matters. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Benchmark &amp; methodology &rarr;</a></p>
+    </div>
+  </section>
+
+  <section class="section drivers-section">
+    <div class="wrap">
+      <h2>Every major MongoDB driver works</h2>
+      <p class="section-lead">SecantusDB is validated against the official driver test suites, <strong>unmodified</strong> &mdash; the same tests the driver maintainers run against a real <code>mongod</code>. Six driver suites &mdash; Python, Java, Node.js, Go, Ruby, Rust &mdash; plus PHP feature smokes. One wire protocol. <strong>pymongo is the headline gauge</strong>: it runs the broadest in-scope set, so it's the only one below 100% and the most honest single number. The other five run curated, in-scope subsets in each driver's own language &mdash; their job is to catch wire-protocol bugs pymongo's permissive client accepts silently (cursor IDs that must be int64, strict type decoding), not to pile up a bigger count.</p>
+      {% include 'partials/drivers_grid.html' %}
+      <p class="drivers-foot">A note on the license: SecantusDB is <strong>GPL-2.0-only</strong>. The GPL's obligations apply when you distribute SecantusDB or a derivative of it &mdash; not when you run it. Your application talks to it through a standard MongoDB driver over the wire protocol, and a test/dev dependency you don't ship leaves your application's license untouched.</p>
     </div>
   </section>
 {% else %}

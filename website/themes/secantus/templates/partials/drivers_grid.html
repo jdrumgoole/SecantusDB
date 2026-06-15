@@ -1,0 +1,107 @@
+<div class="drivers">
+  <article class="driver">
+    <header>
+      <h3>pymongo</h3>
+      <span class="lang">Python</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">99.2%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>1021</strong> tests passed &middot; <strong>8</strong> failed</p>
+    <p class="note">The official MongoDB Python driver, and the deepest suite we run &mdash; so it surfaces the long tail. The remaining failures are features outside a single node's scope (text / hashed indexes, server-side <code>$where</code> JavaScript), tests that assume a multi-node cluster, and a few driver-side harness artifacts &mdash; not gaps in the CRUD, aggregation, or change-stream surface that test and dev rely on. We run pymongo's own tests, unmodified, against an embedded SecantusDB.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-java-driver</h3>
+      <span class="lang">Java</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>447</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run a curated subset of <code>driver-sync/src/test/functional/</code> &mdash; integration tests that open a real connection to a SecantusDB daemon (the driver's own BSON codec unit tests are run but not counted here; they never touch the server). Type-strict decoders catch wire-shape divergences pymongo's permissive client accepts silently.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-node-driver</h3>
+      <span class="lang">Node.js</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>358</strong> tests passed &middot; <strong>1</strong> known divergence</p>
+    <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. We run a curated <code>test/integration/</code> spec set via <code>mocha --config test/mocha_mongodb.js</code> &mdash; real wire commands against an embedded SecantusDB daemon.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-node.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-go-driver</h3>
+      <span class="lang">Go</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>401</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-ruby-driver</h3>
+      <span class="lang">Ruby</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>258</strong> tests passed &middot; <strong>1</strong> known divergence</p>
+    <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x), the gem the Rails / Sinatra ecosystem builds on. We run a curated set of integration spec files end-to-end against an embedded SecantusDB daemon &mdash; every test opens a real <code>Mongo::Client</code>, SCRAM-authenticates as a pre-provisioned <code>root-user</code>, and exchanges wire commands.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-rust-driver</h3>
+      <span class="lang">Rust</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>101</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The official MongoDB Rust driver &mdash; the basis for Tokio-async MongoDB consumers in Rust. We run a curated set of <code>driver/src/test/</code> in-tree tests via <code>cargo test --lib -p mongodb</code> with <code>MONGODB_URI</code> explicitly overridden in the subprocess env, so the rust driver's fallback chain (<code>$MONGODB_URI</code> &rarr; <code>~/.mongodb_uri</code> &rarr; <code>localhost:27017</code>) can't accidentally route to a real mongod.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-rust.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-php-library</h3>
+      <span class="lang">PHP</span>
+      <span class="kind smoke">Feature smokes</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">6 / 6</span>
+      <span class="rate-label">features verified</span>
+    </div>
+    <p class="note">The official high-level PHP library, built on the C-based <code>ext-mongodb</code> extension. Same six features as the Ruby driver &mdash; type fidelity, RBAC, <code>bulkWrite</code>, <code>listDatabases</code> filter, logical sessions, cluster-role bundles &mdash; verified end-to-end via <code>composer install</code> + <code>php &lt;feature&gt;_smoke.php</code>.</p>
+  </article>
+</div>
+
+<p class="drivers-foot">
+  Plus a <strong>cross-driver feature matrix</strong>: every shipped feature
+  (auth, change streams, custom roles, sessions, geo, bulk writes, type
+  fidelity&hellip;) is verified end-to-end through the Python / Java /
+  Node / Go / Ruby / PHP drivers via dedicated smoke tests &mdash; so a
+  wire-shape divergence that one driver is permissive about gets caught
+  by another.
+</p>

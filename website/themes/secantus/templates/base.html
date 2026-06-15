@@ -14,8 +14,8 @@
   {% endif %}
 
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Embeddable Document Database compatible with MongoDB.">
-  <meta property="og:description" content="Embeddable Document Database compatible with MongoDB.">
+  <meta property="og:title" content="SecantusDB — the SQLite of document databases">
+  <meta property="og:description" content="Embeddable document database compatible with MongoDB.">
   <meta property="og:url" content="{{ FEED_DOMAIN }}/{{ self.canonical_path() }}">
   <meta property="og:image" content="{{ FEED_DOMAIN }}/{{ THEME_STATIC_DIR }}/img/og-image.png">
   <meta property="og:image:type" content="image/png">
@@ -24,14 +24,14 @@
   <meta property="og:image:alt" content="SecantusDB — Embeddable Document Database compatible with MongoDB.">
   <meta property="og:site_name" content="{{ SITENAME }}">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Embeddable Document Database compatible with MongoDB.">
-  <meta name="twitter:description" content="Embeddable Document Database compatible with MongoDB.">
+  <meta name="twitter:title" content="SecantusDB — the SQLite of document databases">
+  <meta name="twitter:description" content="Embeddable document database compatible with MongoDB.">
   <meta name="twitter:image" content="{{ FEED_DOMAIN }}/{{ THEME_STATIC_DIR }}/img/og-image.png">
   <meta name="twitter:image:alt" content="SecantusDB — Embeddable Document Database compatible with MongoDB.">
+  <script data-goatcounter="https://secantusdb.goatcounter.com/count"
+          async src="//gc.zgo.at/count.js"></script>
 </head>
 <body>
-
-{% include 'partials/beta_banner.html' %}
 
 <header class="site-header">
   <div class="wrap">
@@ -49,13 +49,15 @@
   </div>
 </header>
 
+{% block top_banner %}{% include 'partials/beta_banner.html' %}{% endblock %}
+
 <main>
 {% block content %}{% endblock %}
 </main>
 
 <footer class="site-footer">
   <div class="wrap">
-    <span>SecantusDB v{{ SECANTUS_VERSION }} · beta · GPL-2.0-only (code) + CC-BY-4.0 (content)</span>
+    <span>SecantusDB · beta · current version on <a href="{{ SECANTUS_PYPI_URL }}" rel="noopener">PyPI</a> · GPL-2.0-only (code) + CC-BY-4.0 (content)</span>
     <span>
       <a href="{{ SECANTUS_DOCS_URL }}">Docs</a> ·
       <a href="{{ SECANTUS_PYPI_URL }}">PyPI</a> ·

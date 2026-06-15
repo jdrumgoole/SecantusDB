@@ -64,23 +64,27 @@ pre code { background: transparent; padding: 0; }
 
 .wrap { max-width: var(--max-width); margin: 0 auto; padding: 0 32px; }
 
-/* ---- Beta banner ---- */
+/* ---- Beta callout ---- */
+/* An inline notice card, not a page band — it sits mid-flow (below the
+   hero on home, below the nav elsewhere) and must not read as a header. */
 
 .beta-banner {
-  background: var(--slate-900);
-  color: var(--slate-100);
-  border-bottom: 2px solid var(--cyan-500);
   font-size: 14px;
+  padding: 28px 0;
 }
-.beta-banner .wrap {
+.beta-banner .callout {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 12px;
-  padding-top: 12px;
-  padding-bottom: 12px;
+  background: white;
+  border: 1px solid var(--slate-200);
+  border-left: 4px solid var(--cyan-500);
+  border-radius: 10px;
+  padding: 12px 20px;
+  color: var(--slate-700);
 }
-.beta-banner strong { color: var(--cyan-400); letter-spacing: 0.04em; }
+.beta-banner strong { color: var(--cyan-700); letter-spacing: 0.04em; }
 .beta-banner .badge {
   display: inline-block;
   background: var(--cyan-500);
@@ -92,7 +96,6 @@ pre code { background: transparent; padding: 0; }
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
-.beta-banner a { color: var(--cyan-300); }
 
 /* ---- Site header / nav ---- */
 
@@ -272,6 +275,153 @@ pre code { background: transparent; padding: 0; }
   color: var(--slate-600);
   line-height: 1.55;
 }
+
+/* Trailing CTA link in each benefit panel — reads as
+   "summary → deep dive" rather than a dead-end blurb. */
+.benefit p + p.benefit-cta {
+  margin-top: 14px;
+  font-size: 14px;
+}
+.benefit-cta a {
+  color: var(--cyan-500);
+  font-weight: 500;
+  text-decoration: none;
+}
+.benefit-cta a:hover {
+  text-decoration: underline;
+}
+
+/* ---- Drivers section ---- */
+
+.drivers-section { background: white; }
+
+.drivers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 24px;
+}
+.driver {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--slate-50, #f8fafc);
+  border: 1px solid var(--slate-200);
+  border-radius: 12px;
+  padding: 24px;
+  transition: border-color 0.12s, transform 0.12s;
+}
+.driver:hover {
+  border-color: var(--cyan-500);
+  transform: translateY(-2px);
+}
+.driver header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.driver h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--slate-900);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+.driver .lang {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--slate-500);
+  background: var(--slate-100, #f1f5f9);
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.driver .kind {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  border-radius: 999px;
+  margin-left: 8px;
+}
+.driver .kind.smoke {
+  color: #115e59;
+  background: #ccfbf1;
+}
+.driver .kind.pending {
+  color: #92400e;
+  background: #fef3c7;
+}
+.driver .pass-rate {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.driver .rate {
+  font-size: 36px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--cyan-600, #0891b2);
+  line-height: 1;
+}
+.driver .rate-label {
+  font-size: 13px;
+  color: var(--slate-500);
+  letter-spacing: 0.02em;
+}
+.driver .counts {
+  margin: 0;
+  font-size: 14px;
+  color: var(--slate-700);
+}
+.driver .counts strong { color: var(--slate-900); }
+.driver .note {
+  margin: 0;
+  font-size: 14px;
+  color: var(--slate-600);
+  line-height: 1.55;
+  flex: 1;
+}
+.driver .report {
+  display: inline-block;
+  align-self: flex-start;
+  margin-top: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--cyan-600, #0891b2);
+  text-decoration: none;
+}
+.driver .report:hover { text-decoration: underline; }
+
+.drivers-foot {
+  margin: 36px auto 0;
+  max-width: 72ch;
+  text-align: center;
+  font-size: 15px;
+  color: var(--slate-600);
+  line-height: 1.6;
+}
+.drivers-foot strong { color: var(--slate-900); }
+
+/* Honest-performance note under the benefits grid. */
+.perf-heading {
+  margin: 44px auto 0;
+  max-width: 72ch;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--slate-900);
+}
+.perf-note {
+  margin: 10px auto 0;
+  max-width: 72ch;
+  font-size: 15px;
+  color: var(--slate-600);
+  line-height: 1.6;
+}
+.perf-note strong { color: var(--slate-900); }
 
 /* ---- Code example block on home ---- */
 

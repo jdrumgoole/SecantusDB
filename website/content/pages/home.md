@@ -1,9 +1,9 @@
-Title: SecantusDB — drop-in MongoDB for single-node Python
+Title: SecantusDB — the SQLite of document databases
 Slug: home
 Save_as: index.html
 URL:
 Status: hidden
-Summary: Embeddable Document Database compatible with MongoDB.
+Summary: The SQLite of document databases — embeddable, MongoDB-compatible, backed by WiredTiger.
 
 ```python
 from pymongo import MongoClient
