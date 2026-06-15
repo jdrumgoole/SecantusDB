@@ -10,11 +10,11 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
 | `test_bulk.py` | 33 | 1 | 0 | 4 | 38 | 97.1% |
-| `test_change_stream.py` | 42 | 8 | 0 | 105 | 155 | 84.0% |
-| `test_collation.py` | 1 | 0 | 0 | 15 | 16 | 100.0% |
+| `test_change_stream.py` | 78 | 28 | 0 | 49 | 155 | 73.6% |
+| `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 76 | 11 | 0 | 4 | 91 | 87.4% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
-| `test_command_logging.py` | 16 | 0 | 0 | 20 | 36 | 100.0% |
+| `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
@@ -32,13 +32,13 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 15 | 1 | 0 | 5 | 21 | 93.8% |
-| `test_transactions_unified.py` | 76 | 14 | 0 | 177 | 267 | 84.4% |
+| `test_transactions_unified.py` | 92 | 3 | 0 | 172 | 267 | 96.8% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_versioned_api_integration.py` | 0 | 0 | 0 | 43 | 43 | — |
+| `test_versioned_api_integration.py` | 37 | 1 | 0 | 5 | 43 | 97.4% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **829** | **79** | **0** | **595** | **1503** | **91.3%** |
+| **Overall** | **939** | **89** | **0** | **475** | **1503** | **91.3%** |
 
-## Failures (79)
+## Failures (89)
 
 First 30 failure node-ids for manual triage:
 
@@ -49,32 +49,32 @@ vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::tes
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_resumeafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_startafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_split_large_change
+vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_after
+vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_update_resume_token
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after_resume_process_with_changes
 vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after_resume_process_without_changes
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Change_Stream_should_allow_valid_aggregate_pipeline_stages
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_modified_structure_in_ns_document_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_newField_added_in_response_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_new_structure_in_ns_document_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_projection_in_change_stream_returns_expected_fields
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_server_error_on_projecting_out__id
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreams::test_Test_unknown_operationType_MUST_NOT_err
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when__id_is_projected_out
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsErrors::test_Change_Stream_should_error_when_an_invalid_aggregation_stage_is_passed_in
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:required_with_changeStreamPreAndPostImages_disabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocument:whenAvailable_with_changeStreamPreAndPostImages_disabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsPreAndPostImages::test_fullDocumentBeforeChange:required_with_changeStreamPreAndPostImages_disabled
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_createIndex_events_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_create_events_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_create_events_on_views_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_dropIndexes_events_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_modify_events_are_reported
+vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_new_fields_on_change_stream_events_are_handled_appropriately
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_bypass_document_validation_bulk_write
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_error_code
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_exhaust
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_filter
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_large_limit
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_min_query
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_options
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_replace_bypass_document_validation
-vendor/pymongo-tests/test/test_collection.py::TestCollection::test_update_bypass_document_validation
-vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listCollections_includes_clusteredIndex
-vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listIndexes_returns_the_index
-vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementTimeseriesCollection::test_insertMany_with_duplicate_ids
-vendor/pymongo-tests/test/test_command_monitoring.py::TestCommandMonitoringFind::test_A_successful_find_with_showRecordId_and_returnKey
-vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateLet::test_Aggregate_with_let_option
-vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateMergeErrorResponse::test_aggregate_$merge_DuplicateKey_error_is_accessible
-vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateOutReadConcern::test_readConcern_linearizable_with_out_stage
-vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedBulkWriteUpdateOnePipeline::test_UpdateOne_in_bulk_write_using_pipelines
-vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedEstimatedDocumentCount::test_estimatedDocumentCount_works_correctly_on_views
-vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedFindOneAndUpdateArrayFilters::test_FindOneAndUpdate_when_multiple_documents_match_arrayFilters
 ```
-... and 49 more (see raw JSON).
+... and 59 more (see raw JSON).
 
 ## How this is generated
 
