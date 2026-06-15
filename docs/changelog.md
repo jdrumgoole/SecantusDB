@@ -33,12 +33,32 @@ variable, and waits for the active-connection count to reach zero before calling
 `storage.close()`. A 200-iteration stress that reliably tripped the use-after-
 close now runs clean.
 
+Waking those parked reads is platform-specific, and the first cut got it wrong
+on both ends. On POSIX, `shutdown(SHUT_RDWR)` wakes a `recv` blocked in another
+thread while leaving the descriptor valid; calling `close()` from the stopping
+thread instead does *not* wake the parked `recv` and frees the fd number for
+immediate reuse, leaving the handler blocked forever on a recycled descriptor —
+so the drain barrier timed out. On Windows the opposite holds: `shutdown` does
+not interrupt an already-blocked `recv`, so `closesocket` is required. The wake
+is now `shutdown`-only on POSIX and `shutdown`-then-`close` on Windows. The drain
+barrier also re-runs the socket wake on every poll, not just once up front: the
+accept thread bumps the active-connection count and spawns the handler *before*
+the handler registers its socket, so a connection accepted in the instant before
+`stop()` could register after the initial sweep and never be woken — re-sweeping
+catches it within milliseconds.
+
 #### Fixed
 
 - `SecantusDBServer.stop()` drains in-flight connection threads before closing
   WiredTiger (via `ConnectionRegistry.close_all` + `Storage.signal_shutdown` +
   an active-connection drain barrier), eliminating a use-after-free / native
   crash on teardown under load.
+- The stop-time socket wake is now platform-correct: `shutdown`-only on POSIX
+  (closing the fd from another thread left handlers blocked on a recycled
+  descriptor and timed out the drain), `shutdown`+`close` on Windows (where
+  `shutdown` alone doesn't interrupt a blocked `recv`). The drain barrier
+  re-sweeps each poll so a connection that registers its socket just after
+  `stop()` begins is still woken.
 
 ### Tailable cursors over `local.oplog.rs`
 

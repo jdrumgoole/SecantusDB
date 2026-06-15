@@ -278,12 +278,22 @@ class SecantusDBServer:
         """Block until every per-connection handler thread has exited (the
         active-connection counter reaches zero), or ``timeout`` elapses. Run
         at stop, after the connection sockets are closed and tailable waiters
-        woken, so storage isn't torn down under an in-flight handler."""
+        woken, so storage isn't torn down under an in-flight handler.
+
+        ``close_all`` is re-run on every poll, not just once before this loop.
+        The accept thread bumps ``_active_conns`` and spawns the handler
+        *before* the handler registers its socket via ``connections.open``; a
+        connection accepted in the instant before ``stop`` can therefore
+        register its socket *after* the initial ``close_all`` snapshot, leaving
+        its blocking ``recv`` un-woken and the drain stuck until the idle
+        timeout. Re-snapshotting each poll closes such late arrivals within
+        5ms (every call is idempotent — already-closed sockets are no-ops)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._active_conns_lock:
                 if self._active_conns == 0:
                     return
+            self.connections.close_all()
             time.sleep(0.005)
         with self._active_conns_lock:
             remaining = self._active_conns
@@ -496,6 +506,15 @@ class SecantusDBServer:
                         # Idle timeout fired — drop the connection so the
                         # thread can be reaped instead of pinned forever.
                         logger.debug("client %d idle timeout, closing", connection_id)
+                        return
+                    except OSError as exc:
+                        # The socket was closed / aborted under us — usually
+                        # ``stop()`` closing this connection to drain it (on
+                        # Windows that surfaces as ConnectionAbortedError /
+                        # BrokenPipeError, WinError 10053/10058), or the peer
+                        # hanging up abruptly. A clean disconnect, not a fault:
+                        # exit the loop so the handler thread is reaped.
+                        logger.debug("client %d connection closed: %s", connection_id, exc)
                         return
                     except MalformedBodyError as exc:
                         # Body bytes failed BSON validation. Build a
