@@ -434,6 +434,9 @@ pub enum StorageError {
     /// A document's encoded size exceeds `MAX_BSON_OBJECT_SIZE`. Carries the
     /// offending size; surfaces as mongod's `BSONObjectTooLarge` (10334).
     DocumentTooLarge(usize),
+    /// The post-apply document failed the collection `validator`. Surfaces as
+    /// mongod's `DocumentValidationFailure` (121).
+    DocumentValidationFailure,
 }
 
 impl std::fmt::Display for StorageError {
@@ -465,6 +468,7 @@ impl std::fmt::Display for StorageError {
                 f,
                 "object to insert too large. size in bytes: {size}, max size: {MAX_BSON_OBJECT_SIZE}"
             ),
+            StorageError::DocumentValidationFailure => write!(f, "Document failed validation"),
         }
     }
 }
@@ -3479,6 +3483,7 @@ impl Storage {
         array_filters: &[Document],
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome> {
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
@@ -3497,6 +3502,7 @@ impl Storage {
             multi,
             upsert,
             is_replacement,
+            validator,
             &|doc, up| {
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
@@ -3523,6 +3529,7 @@ impl Storage {
         upsert: bool,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome> {
         self.update_matching_core(
             db,
@@ -3533,6 +3540,7 @@ impl Storage {
             multi,
             upsert,
             false,
+            validator,
             &|doc, _up| {
                 let out = secantus_core::aggregate::apply_pipeline(
                     vec![doc.clone()],
@@ -3560,6 +3568,7 @@ impl Storage {
         multi: bool,
         upsert: bool,
         is_replacement: bool,
+        validator: Option<&Document>,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
         let _g = self.lock.lock().unwrap();
@@ -3591,6 +3600,15 @@ impl Storage {
             matched += 1;
             let new = transform(&doc, false)?;
             if new != doc {
+                // Collection validator on the post-apply doc (mongod rejects an
+                // update that would leave a document failing validation). A
+                // validator the query engine can't evaluate is treated as
+                // passing (lenient), matching the insert path.
+                if let Some(v) = validator {
+                    if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                        return Err(StorageError::DocumentValidationFailure);
+                    }
+                }
                 if let Some(c) =
                     self.unique_conflict(&session, db, coll, &new, &descs, Some(&id_k))?
                 {
@@ -3656,6 +3674,12 @@ impl Storage {
             let mut new = transform(&seed, true)?;
             if !new.contains_key("_id") {
                 new.insert("_id", Bson::ObjectId(ObjectId::new()));
+            }
+            // Validator on an upsert-inserted document, too.
+            if let Some(v) = validator {
+                if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                    return Err(StorageError::DocumentValidationFailure);
+                }
             }
             let id = new.get("_id").cloned().unwrap();
             if let Some(c) = self.unique_conflict(&session, db, coll, &new, &descs, None)? {

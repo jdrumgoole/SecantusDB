@@ -13,13 +13,14 @@
 //! `let` (`$expr` in `query`) + `collation` apply to the match (via
 //! `find_collated`); the update/delete is keyed by the matched `_id`.
 //!
-//! **Deferred:** `arrayFilters`; `bypassDocumentValidation` / collection
-//! `validator`; `let` on the no-match `upsert` path (still plain
-//! `update_matching`); `writeConcern`; `_reject_oplog_rs_write`.
+//! Collection `validator` is enforced on the update/upsert path (code 121,
+//! bypassable via `bypassDocumentValidation`), via `update_matching_array_filters`.
+//!
+//! **Deferred:** `arrayFilters`; `writeConcern`; `_reject_oplog_rs_write`.
 
 use bson::{doc, Bson, Document};
 
-use crate::util::{collation_of, command_error, doc_field, resolve_let_vars};
+use crate::util::{bool_field, collation_of, command_error, doc_field, resolve_let_vars};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `findAndModify` / `findandmodify`.
@@ -69,6 +70,29 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     let let_vars = resolve_let_vars(doc.get("let"));
     let collation = collation_of(doc);
 
+    // Collection validator on the post-apply doc (code 121) unless
+    // `bypassDocumentValidation` / `validationAction: warn|off`, mirroring the
+    // `update` handler. Threaded into the update via `update_matching_array_filters`.
+    // The `findAndModify` command is unusual in that the canonical wire field is
+    // the snake_case `bypass_document_validation` (what pymongo's
+    // `find_one_and_*` helpers emit); accept the camelCase spelling too for
+    // raw-command callers.
+    let bypass = bool_field(doc, "bypassDocumentValidation", false)
+        || bool_field(doc, "bypass_document_validation", false);
+    let validator = if bypass {
+        None
+    } else {
+        let opts = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map_err(command_error)?;
+        let action = opts.get_str("validationAction").unwrap_or("error");
+        if action == "warn" || action == "off" {
+            None
+        } else {
+            opts.get("validator").and_then(Bson::as_document).cloned()
+        }
+    };
+
     // Find the target (first match in sort order).
     let candidates = storage
         .find_collated(
@@ -90,11 +114,21 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 .and_then(Bson::as_document)
                 .cloned()
                 .unwrap_or_default();
-            let outcome =
-                match storage.update_matching(&ctx.db_name, &coll, &query, &upd, false, true) {
-                    Ok(o) => o,
-                    Err(e) => return Ok(storage_err_reply(e)),
-                };
+            let outcome = match storage.update_matching_array_filters(
+                &ctx.db_name,
+                &coll,
+                &query,
+                &upd,
+                false,
+                true,
+                &[],
+                &let_vars,
+                collation.as_ref(),
+                validator.as_ref(),
+            ) {
+                Ok(o) => o,
+                Err(e) => return Ok(storage_err_reply(e)),
+            };
             let upserted_id = outcome.upserted_id.unwrap_or(Bson::Null);
             let value = if return_new && upserted_id != Bson::Null {
                 fetch_projected(storage, &ctx.db_name, &coll, &upserted_id, fields)?
@@ -136,7 +170,18 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         .and_then(Bson::as_document)
         .cloned()
         .unwrap_or_default();
-    if let Err(e) = storage.update_matching(&ctx.db_name, &coll, &id_filter, &upd, false, false) {
+    if let Err(e) = storage.update_matching_array_filters(
+        &ctx.db_name,
+        &coll,
+        &id_filter,
+        &upd,
+        false,
+        false,
+        &[],
+        &let_vars,
+        collation.as_ref(),
+        validator.as_ref(),
+    ) {
         return Ok(storage_err_reply(e));
     }
 

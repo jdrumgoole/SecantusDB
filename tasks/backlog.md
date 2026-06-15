@@ -41,6 +41,19 @@ SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/sasl
 
 Single-node change streams are implemented and conformant for typical pymongo `watch()` flows, but the following are deferred or intentionally diverge from real `mongod`:
 
+- [ ] **Rust server: DDL change-stream events not emitted (`showExpandedEvents`).**
+  The Rust server's `create_index` / `drop_index` (and `collMod`) write no oplog
+  `c` entry, so a `showExpandedEvents: true` change stream that awaits a
+  `createIndexes` / `dropIndexes` / `modify` event never sees one and pymongo's
+  `next()` spins on empty getMores until the gauge's 120s `pytest-timeout`
+  SIGKILLs the worker (the remaining `test_change_stream.py` worker crashes —
+  `test_when_showExpandedEvents_is_true,_*_events_are_reported`). `create_collection`
+  / `drop_collection` DO emit oplog. Fix = emit oplog `c` for index/collMod DDL +
+  project the events when `showExpandedEvents` is on (a change-stream feature
+  slice). Also still open: **`test_split_large_change`** — a >16 MB change event
+  (10 MB pre-image + 10 MB post-image) the Rust server can't return (no real
+  event splitting; `of` is always 1), which OOMs/errors under parallel load.
+  Both are change-stream territory (coordinate with the change-stream owner).
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
