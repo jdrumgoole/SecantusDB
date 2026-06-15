@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -117,16 +118,38 @@ class ConnectionRegistry:
         return True
 
     def close_all(self) -> None:
-        """Shut down every registered connection socket so blocked reads in
-        the handler threads return and the threads exit. Used at server stop
-        to drain in-flight connections before the storage engine closes (a
-        handler thread mid-WiredTiger-op when the WT connection closes is a
-        use-after-free / native crash)."""
+        """Wake every registered connection's blocked ``recv`` so the handler
+        threads return and exit. Used at server stop to drain in-flight
+        connections before the storage engine closes (a handler thread
+        mid-WiredTiger-op when the WT connection closes is a use-after-free /
+        native crash). Idempotent — safe to call repeatedly during the drain
+        poll, which is how late-registering connections get caught.
+
+        Platform split, because the primitive that wakes a ``recv`` blocked in
+        *another* thread differs by OS:
+
+          * **POSIX**: ``shutdown(SHUT_RDWR)`` wakes the blocked ``recv``
+            (returns EOF) while leaving the fd valid; the owning handler closes
+            it later via its ``with conn`` block. We must **not** ``close()``
+            here — closing the fd from this thread does not wake the parked
+            ``recv`` (it keeps reading the old fd), and the freed fd number is
+            immediately reusable by another socket / WiredTiger, so the handler
+            ends up blocked forever on a recycled descriptor. ``shutdown``-only
+            is the correct, race-free POSIX wake.
+          * **Windows**: ``shutdown`` does *not* interrupt an already-blocked
+            ``recv`` (it only affects the next call), so the handler would stay
+            parked and the drain barrier would time out. ``closesocket`` is what
+            aborts the in-progress ``recv`` there, and Windows handles aren't
+            recycled under a blocked read the way POSIX fds are, so the
+            reuse hazard above doesn't apply."""
         with self._lock:
             socks = list(self._sockets.values())
         for sock in socks:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
+            if sys.platform == "win32":
+                with contextlib.suppress(OSError):
+                    sock.close()
 
     def record_command(self, conn_id: int, name: str) -> None:
         """Bump ``op_count`` and set ``last_command_name`` / ``last_cmd_at``."""
