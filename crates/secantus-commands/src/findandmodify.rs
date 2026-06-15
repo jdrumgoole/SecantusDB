@@ -73,7 +73,13 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // Collection validator on the post-apply doc (code 121) unless
     // `bypassDocumentValidation` / `validationAction: warn|off`, mirroring the
     // `update` handler. Threaded into the update via `update_matching_array_filters`.
-    let validator = if bool_field(doc, "bypassDocumentValidation", false) {
+    // The `findAndModify` command is unusual in that the canonical wire field is
+    // the snake_case `bypass_document_validation` (what pymongo's
+    // `find_one_and_*` helpers emit); accept the camelCase spelling too for
+    // raw-command callers.
+    let bypass = bool_field(doc, "bypassDocumentValidation", false)
+        || bool_field(doc, "bypass_document_validation", false);
+    let validator = if bypass {
         None
     } else {
         let opts = storage

@@ -236,6 +236,7 @@ impl CmdStorage for StorageAdapter {
                 &[],
                 &Document::new(),
                 None,
+                None,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {

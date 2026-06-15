@@ -339,6 +339,7 @@ impl RustStorage {
                 &[],
                 &Document::new(),
                 None,
+                None,
             )
             .map_err(to_pyerr)?;
         let mut d = Document::new();
