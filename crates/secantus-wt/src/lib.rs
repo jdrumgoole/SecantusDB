@@ -156,6 +156,14 @@ pub struct Session {
     ptr: *mut sys::WT_SESSION,
 }
 
+// A `Session` can be **moved** between threads (it owns its `WT_SESSION`), but
+// WiredTiger forbids *concurrent* use from two threads. We mark it `Send` (not
+// `Sync`) so a multi-document transaction's dedicated session can travel across
+// the connection threads that carry the transaction's statements + its
+// retryable commit — the per-transaction mutex in the command layer's
+// `TransactionRegistry` guarantees only one thread ever touches it at a time.
+unsafe impl Send for Session {}
+
 impl Session {
     /// Create a table / index object, e.g.
     /// `create("table:secantus_documents", "key_format=SSu,value_format=u")`.
@@ -378,7 +386,13 @@ impl Cursor {
             (ptr::null(), ptr::null(), ptr::null());
         let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
         check(unsafe {
-            cur_fn!(self, get_key)(self.ptr, &mut a, &mut b, &mut c, &mut it as *mut sys::WT_ITEM)
+            cur_fn!(self, get_key)(
+                self.ptr,
+                &mut a,
+                &mut b,
+                &mut c,
+                &mut it as *mut sys::WT_ITEM,
+            )
         })?;
         Ok((owned(a), owned(b), owned(c), unsafe { item_bytes(&it) }))
     }
