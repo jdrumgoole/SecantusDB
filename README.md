@@ -195,10 +195,9 @@ from pymongo import MongoClient
 client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 ```
 
-The conformance gauges back this up: pymongo's own test suite and
-mongo-go-driver's own test suite run **unmodified** against SecantusDB —
-see [pymongo validation report](https://secantusdb.readthedocs.io/en/latest/validation-report.html) and
-[Go-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-go.html).
+The conformance gauges back this up: the official driver test suites
+run **unmodified** against SecantusDB — see the
+[conformance validation summary](https://secantusdb.readthedocs.io/en/latest/validation-summary.html).
 
 ## Examples
 
@@ -259,8 +258,8 @@ with SecantusDBServer(port=0, storage_path=":memory:") as server:
 
 ## Documentation
 
-Full docs are in `docs/`; build them with `uv run python -m invoke docs`
-and open `docs/_build/html/index.html`. Highlights:
+Full docs are on [Read the Docs](https://secantusdb.readthedocs.io/en/latest/).
+Highlights:
 
 - [Quickstart](https://secantusdb.readthedocs.io/en/latest/quickstart.html) — embedding in tests, running standalone.
 - [Architecture](https://secantusdb.readthedocs.io/en/latest/architecture.html) — the layered design.
@@ -270,46 +269,13 @@ and open `docs/_build/html/index.html`. Highlights:
   expression operators.
 - [Compatibility](https://secantusdb.readthedocs.io/en/latest/compatibility.html) — the divergences you should know
   about before you point an application at SecantusDB.
-- [pymongo validation report](https://secantusdb.readthedocs.io/en/latest/validation-report.html) — per-category
-  pass / fail / skip rate from running **pymongo's own test suite,
-  unmodified**, against SecantusDB. The submodule at
-  `vendor/pymongo-tests/` is checked out at the pinned upstream tag with
-  zero local edits; a pytest plugin starts an embedded server and points
-  pymongo's `DB_IP`/`DB_PORT` at it.
-- [Go-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-go.html) —
-  same shape against **mongo-go-driver's own test suite, unmodified**.
-  Spawns a standalone SecantusDB daemon and runs `go test` with
-  `MONGODB_URI` pointed at it. The Go driver underpins `mongodump` /
-  `mongorestore` and most non-Python tooling, so this gauge catches
-  type-strict wire bugs (int32 vs int64) that pymongo accepts silently.
-- [Node-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-node.html) —
-  same shape against **mongo-node-driver's own test suite, unmodified**.
-  Spawns a standalone SecantusDB daemon and runs mocha with
-  `MONGODB_URI` pointed at it. Initial baseline is restricted to
-  the import-clean subset of unit tests because of an unrelated
-  ESM/TypeScript loader quirk in node-mongodb-native v7.2.0; see
-  `node_validation/include_paths.py` for the rationale.
-- [Java-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-java.html) —
-  same shape against **mongo-java-driver's own test suite, unmodified**.
-  Spawns a standalone SecantusDB daemon and invokes the driver's
-  bundled `./gradlew` with `-Dorg.mongodb.test.uri=mongodb://...`.
-  Initial baseline is the `:bson:test` module (BSON serialization,
-  ~289 test files); the JDBC-style integration modules can be added
-  to `java_validation/include_modules.py` as we widen.
-- [Ruby-driver validation report](https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html) —
-  same shape against **mongo-ruby-driver's own test suite, unmodified**.
-  Spawns a standalone SecantusDB daemon and runs `bundle exec rspec`
-  with `MONGODB_URI` pointed at it. Initial baseline is the lite-spec
-  subset — 90 files under `spec/mongo/` and 9 YAML-runner files under
-  `spec/spec_tests/` that `require 'lite_spec_helper'`. Covers BSON,
-  URI parsing, SCRAM-SHA-1/256 conversation framing, retry /
-  heartbeat protocols, CMAP, error-class encoding, plus the
-  cross-driver spec-test corpus for connection strings, server
-  selection, SDAM, auth mechanisms, max-staleness, and
-  read/write-concern document shapes. No real-mongod connection
-  required — SecantusDB doesn't have to satisfy any cluster
-  machinery for these. Auto-discovered by
-  `ruby_validation/include_paths.discover_lite()`.
+- [Conformance validation](https://secantusdb.readthedocs.io/en/latest/validation-summary.html) — every
+  supported driver's own test suite (pymongo, Go, Node, Java, Ruby,
+  Rust, and the PHP library + extension) run **unmodified** against
+  SecantusDB, with a cross-driver summary table and a per-driver report
+  for each. The other-language gauges catch wire-protocol bugs that
+  pymongo's permissive client accepts silently (e.g. int32-vs-int64
+  cursor ids).
 
 ## Development
 
