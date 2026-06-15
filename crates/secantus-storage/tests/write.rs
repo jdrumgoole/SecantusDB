@@ -61,6 +61,10 @@ fn update_operator_single_match() {
                 &doc! {"$set": {"y": 9}},
                 false,
                 false,
+                &[],
+                &bson::Document::new(),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -98,6 +102,10 @@ fn update_operator_multi() {
                 &doc! {"$inc": {"x": 10}},
                 true,
                 false,
+                &[],
+                &bson::Document::new(),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(out.matched, 2);
@@ -121,6 +129,10 @@ fn update_no_op_when_unchanged() {
                 &doc! {"$set": {"x": 5}},
                 false,
                 false,
+                &[],
+                &bson::Document::new(),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(out.matched, 1);
@@ -133,7 +145,18 @@ fn update_replacement_preserves_id() {
     with_db(|st| {
         seed(st, &[doc! {"_id": 1, "x": 1, "y": 2}]);
         let out = st
-            .update_matching("app", "c", &doc! {"_id": 1}, &doc! {"z": 99}, false, false)
+            .update_matching(
+                "app",
+                "c",
+                &doc! {"_id": 1},
+                &doc! {"z": 99},
+                false,
+                false,
+                &[],
+                &bson::Document::new(),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(out.modified, 1);
         let d = get_doc(st, 1);
@@ -154,6 +177,10 @@ fn update_upsert_inserts_when_no_match() {
                 &doc! {"$set": {"n": 1}},
                 false,
                 true,
+                &[],
+                &bson::Document::new(),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(out.matched, 0);
@@ -181,6 +208,10 @@ fn update_maintains_index_entries() {
             &doc! {"$set": {"x": 20}},
             false,
             false,
+            &[],
+            &bson::Document::new(),
+            None,
+            None,
         )
         .unwrap();
         // The index now finds the doc at its new value, not the old one.
@@ -209,6 +240,10 @@ fn update_rejects_unique_conflict() {
             &doc! {"$set": {"x": 1}},
             false,
             false,
+            &[],
+            &bson::Document::new(),
+            None,
+            None,
         );
         assert!(err.is_err());
         // The collision left _id:2 unchanged.
@@ -228,6 +263,10 @@ fn update_operator_emits_v2_diff_oplog() {
             &doc! {"$set": {"y": 7}},
             false,
             false,
+            &[],
+            &bson::Document::new(),
+            None,
+            None,
         )
         .unwrap();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
@@ -253,8 +292,19 @@ fn update_replacement_emits_full_doc_oplog() {
     with_db(|st| {
         seed(st, &[doc! {"_id": 1, "x": 1}]);
         let floor = st.oplog_tail_seq();
-        st.update_matching("app", "c", &doc! {"_id": 1}, &doc! {"z": 5}, false, false)
-            .unwrap();
+        st.update_matching(
+            "app",
+            "c",
+            &doc! {"_id": 1},
+            &doc! {"z": 5},
+            false,
+            false,
+            &[],
+            &bson::Document::new(),
+            None,
+            None,
+        )
+        .unwrap();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
         let e = decode(&rows[0].1);
         assert_eq!(e.get_str("op").unwrap(), "u");
@@ -279,18 +329,26 @@ fn delete_matching_single_and_multi() {
         );
         // limit=1 deletes one of the two x:1 docs.
         assert_eq!(
-            st.delete_matching("app", "c", &doc! {"x": 1}, 1).unwrap(),
+            st.delete_matching("app", "c", &doc! {"x": 1}, 1, &bson::Document::new(), None)
+                .unwrap(),
             1
         );
-        assert_eq!(st.count_matching("app", "c", &doc! {"x": 1}).unwrap(), 1);
+        assert_eq!(
+            st.count_matching("app", "c", &doc! {"x": 1}, None).unwrap(),
+            1
+        );
         // limit=0 deletes the rest of the x:1 docs.
         assert_eq!(
-            st.delete_matching("app", "c", &doc! {"x": 1}, 0).unwrap(),
+            st.delete_matching("app", "c", &doc! {"x": 1}, 0, &bson::Document::new(), None)
+                .unwrap(),
             1
         );
-        assert_eq!(st.count_matching("app", "c", &doc! {"x": 1}).unwrap(), 0);
+        assert_eq!(
+            st.count_matching("app", "c", &doc! {"x": 1}, None).unwrap(),
+            0
+        );
         // The x:2 doc is untouched.
-        assert_eq!(st.count_matching("app", "c", &doc! {}).unwrap(), 1);
+        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1);
     });
 }
 
@@ -305,7 +363,8 @@ fn delete_maintains_index_entries() {
             1
         );
         assert_eq!(
-            st.delete_matching("app", "c", &doc! {"x": 7}, 0).unwrap(),
+            st.delete_matching("app", "c", &doc! {"x": 7}, 0, &bson::Document::new(), None)
+                .unwrap(),
             1
         );
         // No stale index entry survives the delete.
@@ -322,8 +381,15 @@ fn delete_emits_oplog_delete_entry() {
     with_db(|st| {
         seed(st, &[doc! {"_id": 42, "x": 1}]);
         let floor = st.oplog_tail_seq();
-        st.delete_matching("app", "c", &doc! {"_id": 42}, 0)
-            .unwrap();
+        st.delete_matching(
+            "app",
+            "c",
+            &doc! {"_id": 42},
+            0,
+            &bson::Document::new(),
+            None,
+        )
+        .unwrap();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
         assert_eq!(rows.len(), 1);
         let e = decode(&rows[0].1);
@@ -344,10 +410,13 @@ fn count_matching_empty_filter_and_predicate() {
                 doc! {"_id": 3, "x": 2},
             ],
         );
-        assert_eq!(st.count_matching("app", "c", &doc! {}).unwrap(), 3);
-        assert_eq!(st.count_matching("app", "c", &doc! {"x": 2}).unwrap(), 2);
+        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 3);
         assert_eq!(
-            st.count_matching("app", "c", &doc! {"x": {"$gt": 1}})
+            st.count_matching("app", "c", &doc! {"x": 2}, None).unwrap(),
+            2
+        );
+        assert_eq!(
+            st.count_matching("app", "c", &doc! {"x": {"$gt": 1}}, None)
                 .unwrap(),
             2
         );
@@ -370,6 +439,10 @@ fn update_skips_oplog_when_disabled() {
                 &doc! {"$set": {"x": 2}},
                 false,
                 false,
+                &[],
+                &bson::Document::new(),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(out.modified, 1);

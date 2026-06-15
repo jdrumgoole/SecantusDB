@@ -40,11 +40,19 @@ fn id_of(blob: &[u8]) -> i32 {
 
 /// Result `_id`s in result order (no re-sort) for a filter+sort+hint query.
 fn ids(st: &Storage, filter: Document, sort: Option<Document>, hint: Option<Hint>) -> Vec<i32> {
-    st.find_matching_with("app", "c", &filter, sort.as_ref(), hint.as_ref())
-        .unwrap()
-        .iter()
-        .map(|b| id_of(b))
-        .collect()
+    st.find_matching_with(
+        "app",
+        "c",
+        &filter,
+        sort.as_ref(),
+        hint.as_ref(),
+        None,
+        &bson::Document::new(),
+    )
+    .unwrap()
+    .iter()
+    .map(|b| id_of(b))
+    .collect()
 }
 
 fn plan(st: &Storage, filter: Document, sort: Option<Document>, hint: Option<Hint>) -> ExplainPlan {
@@ -288,7 +296,15 @@ fn bad_hint_errors_in_find_collscans_in_explain() {
     with_db(|st| {
         seed_a(st);
         let err = st
-            .find_matching_with("app", "c", &doc! {}, None, Some(&Hint::Name("nope".into())))
+            .find_matching_with(
+                "app",
+                "c",
+                &doc! {},
+                None,
+                Some(&Hint::Name("nope".into())),
+                None,
+                &bson::Document::new(),
+            )
             .unwrap_err();
         assert!(matches!(err, StorageError::BadHint(_)));
         // explain degrades a bad hint to COLLSCAN.
