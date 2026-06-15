@@ -617,6 +617,13 @@ fn map_err(e: WtError) -> StorageError {
         // A lost WT_ROLLBACK race → mongod's WriteConflict (112). Routed
         // command-level by the write handlers so the txn envelope labels it.
         WtError::WriteConflict => StorageError::WriteConflict,
+        // An over-limit document → mongod's BSONObjectTooLarge (10334).
+        WtError::DocumentTooLarge(size) => StorageError::WriteError {
+            code: 10334,
+            errmsg: format!(
+                "object to insert too large. size in bytes: {size}, max size: 16777216"
+            ),
+        },
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.
         WtError::BadHint(m) => StorageError::WriteError { code: 2, errmsg: m },
