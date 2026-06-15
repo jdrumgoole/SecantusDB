@@ -410,6 +410,29 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether `(db, coll)` exists. Default `false` (test fakes track no
+    /// collections); the WiredTiger adapter forwards to the registry.
+    fn collection_exists(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Per-database profiling state `{level, slowms, sampleRate}` (mongod's
+    /// `profile` shape). Default: profiling off.
+    fn get_profile(&self, _db: &str) -> Result<Document, StorageError> {
+        Ok(bson::doc! { "level": 0i32, "slowms": 100i32, "sampleRate": 1.0 })
+    }
+
+    /// Set per-database profiling state. Default no-op (fakes don't persist it).
+    fn set_profile(
+        &self,
+        _db: &str,
+        _level: i32,
+        _slowms: i32,
+        _sample_rate: f64,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Create an index. `true` if newly created (`false` e.g. for `_id_`).
     fn create_index(
         &self,

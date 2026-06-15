@@ -464,6 +464,26 @@ impl CmdStorage for StorageAdapter {
         self.inner.list_indexes(db, coll).map_err(map_err)
     }
 
+    fn collection_exists(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+        self.inner.collection_exists(db, coll).map_err(map_err)
+    }
+
+    fn get_profile(&self, db: &str) -> Result<Document, StorageError> {
+        self.inner.get_profile(db).map_err(map_err)
+    }
+
+    fn set_profile(
+        &self,
+        db: &str,
+        level: i32,
+        slowms: i32,
+        sample_rate: f64,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .set_profile(db, level, slowms, sample_rate)
+            .map_err(map_err)
+    }
+
     fn create_index(
         &self,
         db: &str,

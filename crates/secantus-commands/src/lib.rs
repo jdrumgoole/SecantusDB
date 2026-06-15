@@ -266,6 +266,8 @@ fn lookup(name: &str) -> Option<Handler> {
         "collStats" => admin::coll_stats,
         "dbStats" => admin::db_stats,
         "serverStatus" => admin::server_status,
+        "validate" => admin::validate,
+        "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
         "endSessions"
         | "refreshSessions"
@@ -357,7 +359,14 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if let Err(e) = authorize(name, doc, ctx) {
                 return e.into_reply();
             }
-            run_with_txn_envelope(name, handler, doc, ctx)
+            // Time profile-eligible commands so dispatch can record a
+            // `system.profile` entry when the per-database level requires it.
+            let start = profile_eligible(name, doc).then(std::time::Instant::now);
+            let reply = run_with_txn_envelope(name, handler, doc, ctx);
+            if let Some(start) = start {
+                maybe_record_profile(name, doc, &reply, start, ctx);
+            }
+            reply
         }
         None => CommandError::command_not_found(name).into_reply(),
     }
@@ -387,6 +396,112 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             Some(reply) => Ok(reply),
         },
         _ => Ok(doc! { "ok": 1.0 }),
+    }
+}
+
+/// Commands dispatch never profiles (handshake / auth / session / cursor
+/// framing + `profile` itself), mirroring `commands.py::_PROFILE_SKIP_COMMANDS`.
+fn profile_skip_command(name: &str) -> bool {
+    matches!(
+        name,
+        "hello"
+            | "isMaster"
+            | "ismaster"
+            | "ping"
+            | "buildInfo"
+            | "buildinfo"
+            | "whatsmyuri"
+            | "saslStart"
+            | "saslContinue"
+            | "logout"
+            | "connectionStatus"
+            | "startSession"
+            | "endSessions"
+            | "refreshSessions"
+            | "getMore"
+            | "killCursors"
+            | "profile"
+    )
+}
+
+/// Whether dispatch should time + maybe record this command in `system.profile`.
+/// Excludes framing commands and any op against `system.profile` itself (a
+/// recursion / unbounded-growth guard). Mirrors `_profile_eligible_command`.
+fn profile_eligible(name: &str, doc: &Document) -> bool {
+    if profile_skip_command(name) {
+        return false;
+    }
+    !matches!(doc.get(name), Some(Bson::String(s)) if s == "system.profile")
+}
+
+/// mongod's profiler `op` bucket for a command (`find` → `query`, writes →
+/// `insert`/`update`/`remove`, everything else → `command`).
+fn profile_op_label(name: &str) -> &'static str {
+    match name {
+        "find" => "query",
+        "insert" => "insert",
+        "update" => "update",
+        "delete" => "remove",
+        _ => "command",
+    }
+}
+
+/// The mongod-shaped `system.profile` entry for a finished command, recorded
+/// when the per-database profiling level requires it. Ports
+/// `commands.py::_maybe_record_profile` (sample-rate skipping omitted — the
+/// gauge uses the default rate of 1.0). Failures are swallowed: the command
+/// already produced its reply.
+fn maybe_record_profile(
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    start: std::time::Instant,
+    ctx: &CommandContext,
+) {
+    let Some(storage) = ctx.storage.clone() else {
+        return;
+    };
+    let db = ctx.db_name.clone();
+    let Ok(settings) = storage.get_profile(&db) else {
+        return;
+    };
+    let level = settings.get_i32("level").unwrap_or(0);
+    if level == 0 {
+        return;
+    }
+    let duration_ms = start.elapsed().as_millis() as i64;
+    let slowms = settings.get_i32("slowms").unwrap_or(100) as i64;
+    if level == 1 && duration_ms < slowms {
+        return;
+    }
+    // `ns`: db.coll when the command names a collection, else db.
+    let ns = match doc.get(name) {
+        Some(Bson::String(c)) if !c.is_empty() => format!("{db}.{c}"),
+        _ => db.clone(),
+    };
+    // `command`: the request minus framing fields.
+    let mut command = doc.clone();
+    for k in ["$db", "$clusterTime", "lsid", "$readPreference"] {
+        command.remove(k);
+    }
+    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let mut entry = doc! {
+        "ts": bson::DateTime::now(),
+        "op": profile_op_label(name),
+        "ns": ns,
+        "command": command,
+        "millis": duration_ms as i32,
+        "ok": if ok { 1.0 } else { 0.0 },
+        "client": "",
+    };
+    if !ok {
+        if let Ok(em) = reply.get_str("errmsg") {
+            entry.insert("errMsg", em.to_string());
+        }
+    }
+    let mut bytes = Vec::new();
+    if entry.to_writer(&mut bytes).is_ok() {
+        let _ = storage.insert(&db, "system.profile", vec![bytes], true);
     }
 }
 
