@@ -86,3 +86,6 @@ crates/secantus-storage-adapter/Cargo.lock
 crates/secantus-storage/target/
 crates/secantus-server-py/target/
 crates/secantus-server-py/Cargo.lock
+
+# Playwright MCP browser session artifacts
+.playwright-mcp/
