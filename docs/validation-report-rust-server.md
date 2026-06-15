@@ -18,11 +18,11 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 282 | 19 | 0 | 185 | 486 | 93.7% |
+| `test_crud_unified.py` | 286 | 15 | 0 | 185 | 486 | 95.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 55 | 12 | 0 | 5 | 72 | 82.1% |
 | `test_custom_types.py` | 46 | 5 | 0 | 0 | 51 | 90.2% |
-| `test_database.py` | 28 | 7 | 0 | 1 | 36 | 80.0% |
+| `test_database.py` | 30 | 5 | 0 | 1 | 36 | 85.7% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_examples.py` | 12 | 6 | 0 | 2 | 20 | 66.7% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
@@ -34,11 +34,11 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_run_command.py` | 15 | 1 | 0 | 5 | 21 | 93.8% |
 | `test_transactions_unified.py` | 69 | 26 | 0 | 172 | 267 | 72.6% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_versioned_api_integration.py` | 36 | 2 | 0 | 5 | 43 | 94.7% |
+| `test_versioned_api_integration.py` | 37 | 1 | 0 | 5 | 43 | 97.4% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **902** | **126** | **0** | **475** | **1503** | **87.7%** |
+| **Overall** | **909** | **119** | **0** | **475** | **1503** | **88.4%** |
 
-## Failures (126)
+## Failures (119)
 
 First 30 failure node-ids for manual triage:
 
@@ -74,7 +74,7 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExp
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_dropIndexes_events_are_reported
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_modify_events_are_reported
 ```
-... and 96 more (see raw JSON).
+... and 89 more (see raw JSON).
 
 ## How this is generated
 
