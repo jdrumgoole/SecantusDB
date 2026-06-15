@@ -13,8 +13,10 @@
 //! **Deferred (documented so parity is honest):**
 //! * `create` unknown-field validation (`Location40415`); views; capped-size
 //!   enforcement; `collMod`'s TTL-index `index: {expireAfterSeconds}` modify.
-//! * `validator` enforcement on `update` / replace (needs the post-apply doc in
-//!   storage — insert is enforced at the command layer).
+//! * `validator` enforcement on `findAndModify` (insert / `update` / replace are
+//!   enforced — the command layer reads the validator and the storage update
+//!   checks the post-apply doc; code 121, bypassable via
+//!   `bypassDocumentValidation`).
 //! * `listCollections` name/filter + the richer per-collection `options` /
 //!   `idIndex` detail (a minimal, faithful-enough entry is returned).
 //! * `listIndexes` `NamespaceNotFound` on a missing collection (returns an empty

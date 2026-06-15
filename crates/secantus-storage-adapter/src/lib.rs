@@ -257,6 +257,7 @@ impl CmdStorage for StorageAdapter {
         array_filters: &[Document],
         let_vars: &Document,
         collation: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
@@ -270,6 +271,7 @@ impl CmdStorage for StorageAdapter {
                 array_filters,
                 let_vars,
                 collation,
+                validator,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -290,11 +292,12 @@ impl CmdStorage for StorageAdapter {
         upsert: bool,
         let_vars: &Document,
         collation: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
             .update_matching_pipeline(
-                db, coll, filter, pipeline, multi, upsert, let_vars, collation,
+                db, coll, filter, pipeline, multi, upsert, let_vars, collation, validator,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -643,6 +646,11 @@ fn map_err(e: WtError) -> StorageError {
             errmsg: format!(
                 "object to insert too large. size in bytes: {size}, max size: 16777216"
             ),
+        },
+        // Post-apply validator failure → mongod's DocumentValidationFailure (121).
+        WtError::DocumentValidationFailure => StorageError::WriteError {
+            code: 121,
+            errmsg: "Document failed validation".to_string(),
         },
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.

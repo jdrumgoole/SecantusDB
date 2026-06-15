@@ -238,6 +238,7 @@ pub trait Storage: Send + Sync {
         _array_filters: &[Document],
         _let_vars: &Document,
         _collation: Option<&Collation>,
+        _validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         self.update_matching(db, coll, filter, update, multi, upsert)
     }
@@ -259,6 +260,7 @@ pub trait Storage: Send + Sync {
         _upsert: bool,
         _let_vars: &Document,
         _collation: Option<&Collation>,
+        _validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         Err(StorageError::WriteError {
             code: 2,
