@@ -19,6 +19,8 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b7] — 2026-06-15
+
 ### `$exists: true` rides a sparse index instead of scanning the collection
 
 A query of the form `{field: {$exists: true}}` now uses a sparse single-field
