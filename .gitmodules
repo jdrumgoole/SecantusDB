@@ -19,3 +19,9 @@
 [submodule "vendor/mongo-rust-driver"]
 	path = vendor/mongo-rust-driver
 	url = https://github.com/mongodb/mongo-rust-driver.git
+[submodule "vendor/mongo-php-library"]
+	path = vendor/mongo-php-library
+	url = https://github.com/mongodb/mongo-php-library.git
+[submodule "vendor/mongo-php-driver"]
+	path = vendor/mongo-php-driver
+	url = https://github.com/mongodb/mongo-php-driver.git

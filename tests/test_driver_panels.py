@@ -38,16 +38,20 @@ def _stats(passed: int, failed: int, skipped: int, expected: int = 0) -> GaugeSt
     return s
 
 
-def test_format_rate_uses_adjusted_denominator() -> None:
-    # 100 passed, 1 actionable + 1 expected → adjusted = 100/101 = 99.0%
+def test_format_rate_uses_raw_denominator() -> None:
+    # True raw rate: passed / ran, no expected-failure exclusion.
+    # 100 passed, 2 failed → 100/102 = 98.0%.
     s = _stats(passed=100, failed=2, skipped=0, expected=1)
-    assert _format_rate(s) == "99.0%"
+    assert _format_rate(s) == "98.0%"
 
 
-def test_format_rate_100_percent_when_only_expected_failures() -> None:
-    # 100 passed, 0 actionable + 2 expected → adjusted = 100/100 = 100.0%
+def test_format_rate_does_not_exclude_expected_failures() -> None:
+    # The anti-trimming invariant: even when every failure is a documented
+    # ("expected") divergence, the raw rate still counts them against the
+    # denominator — the panel never flatters a gauge by excluding them.
+    # 100 passed, 2 failed (both expected) → 100/102 = 98.0%, not 100%.
     s = _stats(passed=100, failed=2, skipped=0, expected=2)
-    assert _format_rate(s) == "100.0%"
+    assert _format_rate(s) == "98.0%"
 
 
 def test_format_rate_empty_returns_em_dash() -> None:
