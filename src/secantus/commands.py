@@ -1605,6 +1605,11 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
+        # ``allPlansExecution`` verbosity adds per-candidate-plan stats under
+        # ``executionStats``. With a single solution (no multi-planning — our
+        # ``rejectedPlans`` is always empty) mongod emits an empty array.
+        if verbosity == "allPlansExecution":
+            execution_stats["allPlansExecution"] = []
         cursor_stage: dict[str, Any] = {
             "$cursor": {
                 "queryPlanner": query_planner,
@@ -1642,7 +1647,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "ok": 1.0,
     }
     if verbosity != "queryPlanner":
-        reply["executionStats"] = {
+        exec_stats: dict[str, Any] = {
             "executionSuccess": True,
             "nReturned": n_returned,
             "executionTimeMillis": exec_millis,
@@ -1650,6 +1655,11 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
+        # See the aggregate path: ``allPlansExecution`` verbosity carries an
+        # (empty, single-solution) per-plan stats array under executionStats.
+        if verbosity == "allPlansExecution":
+            exec_stats["allPlansExecution"] = []
+        reply["executionStats"] = exec_stats
     return reply
 
 
@@ -3551,6 +3561,19 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "InvalidOptions",
             }
         return _aggregate_change_stream(doc, ctx, coll, pipeline, batch_size)
+
+    # Inline ``explain: true`` on the aggregate command — the legacy flag,
+    # distinct from the top-level ``explain`` command wrapper. mongod returns
+    # the explain plan instead of running the pipeline, and crucially does NOT
+    # execute ``$out`` / ``$merge`` writes. Delegate to ``_explain`` (which
+    # lists the pipeline stages without executing them) before any write stage
+    # can run. Default verbosity for the inline flag is ``queryPlanner``.
+    if doc.get("explain") is True:
+        inner = {k: v for k, v in doc.items() if k != "explain"}
+        return _explain(
+            {"explain": inner, "verbosity": doc.get("verbosity", "queryPlanner")},
+            ctx,
+        )
 
     # Linearizable read concern is incompatible with write stages.
     # mongod rejects with InvalidOptions (72): the aggregate-out-readConcern
