@@ -138,4 +138,18 @@ DESELECT_TESTS: list[str] = [
     # converted to an exception, so the assertion fails. The test
     # verifies a pymongo-internal deprecation, not server behaviour.
     "vendor/pymongo-tests/test/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated",
+    # The DBRef spec tests are pure client-side BSON encode/decode — they
+    # exercise pymongo's `bson.DBRef` codec, never SecantusDB's wire
+    # protocol or storage, so they don't measure server compatibility.
+    # They pass cleanly under plain unittest, but the gauge runs `-n1`
+    # (xdist) and these iterate `with self.subTest(doc=doc)` over docs
+    # containing `ObjectId`; pytest-xdist's execnet serialization can't
+    # pickle an `ObjectId` in the subtest params when reporting outcomes
+    # across the worker boundary, so the run dies with
+    # `execnet DumpError: can't serialize <class 'bson.objectid.ObjectId'>`.
+    # That's an xdist/execnet limitation, not a SecantusDB failure —
+    # counting them red understates real compatibility.
+    "vendor/pymongo-tests/test/test_dbref.py::TestDBRefSpec::test_decoding_1_2_3",
+    "vendor/pymongo-tests/test/test_dbref.py::TestDBRefSpec::test_decoding_4_5",
+    "vendor/pymongo-tests/test/test_dbref.py::TestDBRefSpec::test_encoding_1_2",
 ]
