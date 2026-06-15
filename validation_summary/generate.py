@@ -472,6 +472,19 @@ _COLLECTORS = (
     _collect_php_ext,
 )
 
+# Gauge name -> its per-driver report page (relative to docs/). Used by the
+# "Per-driver reports" link list; a gauge without an entry is omitted.
+_REPORT_LINKS = {
+    "pymongo": "./validation-report.md",
+    "mongo-java-driver": "./validation-report-java.md",
+    "mongo-go-driver": "./validation-report-go.md",
+    "mongo-node-driver": "./validation-report-node.md",
+    "mongo-ruby-driver": "./validation-report-ruby.md",
+    "mongo-rust-driver": "./validation-report-rust.md",
+    "mongo-php-library": "./validation-report-php-lib.md",
+    "mongo-php-driver": "./validation-report-php-ext.md",
+}
+
 
 # Map gauge ``name`` to the matching expected-failures list.
 _EXPECTED_FAILURES_BY_GAUGE: dict[str, list[ef_module.ExpectedFailure]] = {
@@ -520,7 +533,7 @@ def render(raw_dir: Path, out_path: Path) -> None:
         f"Generated {dt.date.today().isoformat()} — SecantusDB {secantus.__version__}. "
         "Each per-driver gauge runs the driver vendor's own integration test suite "
         "(unmodified) against a SecantusDB daemon and emits its raw output to "
-        "`.validation/`. This summary normalises on **test count** so the five gauges "
+        f"`.validation/`. This summary normalises on **test count** so the {len(gauges)} gauges "
         "compare like for like — every row counts one assertion outcome, "
         "whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, "
         "a `go test` event, or a pytest collected item."
@@ -599,16 +612,15 @@ def render(raw_dir: Path, out_path: Path) -> None:
         "one whose pass / fail counts you want to dig into:"
     )
     md.append("")
-    md.append("- [pymongo](./validation-report.md)")
-    md.append("- [mongo-java-driver](./validation-report-java.md)")
-    md.append("- [mongo-go-driver](./validation-report-go.md)")
-    md.append("- [mongo-node-driver](./validation-report-node.md)")
-    md.append("- [mongo-ruby-driver](./validation-report-ruby.md)")
+    for g in gauges:
+        report = _REPORT_LINKS.get(g.name)
+        if report:
+            md.append(f"- [{g.name}]({report})")
     md.append("")
     md.append("## Refreshing")
     md.append("")
     md.append(
-        "Run all five gauges plus this summary:\n"
+        f"Run all {len(gauges)} gauges plus this summary:\n"
         "\n"
         "```\n"
         "uv run python -m invoke validate-all\n"
