@@ -20,9 +20,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_crud_unified.py` | 286 | 15 | 0 | 185 | 486 | 95.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
-| `test_cursor.py` | 55 | 12 | 0 | 5 | 72 | 82.1% |
+| `test_cursor.py` | 56 | 11 | 0 | 5 | 72 | 83.6% |
 | `test_custom_types.py` | 46 | 5 | 0 | 0 | 51 | 90.2% |
-| `test_database.py` | 30 | 5 | 0 | 1 | 36 | 85.7% |
+| `test_database.py` | 31 | 4 | 0 | 1 | 36 | 88.6% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_examples.py` | 14 | 4 | 0 | 2 | 20 | 77.8% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
@@ -36,9 +36,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 0 | 0 | 0 | 43 | 43 | — |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **827** | **81** | **0** | **595** | **1503** | **91.1%** |
+| **Overall** | **829** | **79** | **0** | **595** | **1503** | **91.3%** |
 
-## Failures (81)
+## Failures (79)
 
 First 30 failure node-ids for manual triage:
 
@@ -74,7 +74,7 @@ vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedBulkWriteUpdateOnePip
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedEstimatedDocumentCount::test_estimatedDocumentCount_works_correctly_on_views
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedFindOneAndUpdateArrayFilters::test_FindOneAndUpdate_when_multiple_documents_match_arrayFilters
 ```
-... and 51 more (see raw JSON).
+... and 49 more (see raw JSON).
 
 ## How this is generated
 
