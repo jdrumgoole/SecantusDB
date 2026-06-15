@@ -76,8 +76,14 @@ impl std::ops::Deref for OpSession<'_> {
 /// guarantees the session is never touched by two threads at once. The WT
 /// `begin_transaction` is deferred to the first [`Storage::with_user_transaction`]
 /// so the snapshot pins at the transaction's first statement (mongod semantics).
+///
+/// `session` is `Some` while the transaction is open and `None` once committed /
+/// rolled back — committing or aborting **closes** the dedicated WT session so it
+/// doesn't accumulate (the registry keeps the `Transaction` metadata around for
+/// idempotent re-commit, but the WT resource is released). Mirrors
+/// `storage._close_user_txn_session`.
 pub struct UserTransactionHandle {
-    session: Session,
+    session: Option<Session>,
     began: bool,
 }
 
@@ -402,6 +408,9 @@ pub enum StorageError {
     /// A `fullDocument` / `fullDocumentBeforeChange: "required"` change-stream
     /// lookup missed (mongod code 280, `ChangeStreamFatalError`).
     ChangeStreamFatal(String),
+    /// An internal invariant failure (e.g. a transaction operation on an
+    /// already-closed handle). Surfaces as a command-level `InternalError`.
+    Internal(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -424,6 +433,7 @@ impl std::fmt::Display for StorageError {
             }
             StorageError::BadHint(m) => write!(f, "{m}"),
             StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
+            StorageError::Internal(m) => write!(f, "{m}"),
         }
     }
 }
@@ -1366,7 +1376,7 @@ impl Storage {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         Ok(UserTransactionHandle {
-            session,
+            session: Some(session),
             began: false,
         })
     }
@@ -1381,8 +1391,12 @@ impl Storage {
         handle: &mut UserTransactionHandle,
         f: impl FnOnce() -> T,
     ) -> Result<T> {
+        let session = handle
+            .session
+            .as_ref()
+            .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
         if !handle.began {
-            handle.session.begin_transaction(None)?;
+            session.begin_transaction(None)?;
             handle.began = true;
         }
         struct Restore(*const Session);
@@ -1392,26 +1406,36 @@ impl Storage {
             }
         }
         let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
-        ACTIVE_TXN_SESSION.with(|c| c.set(&handle.session as *const Session));
+        ACTIVE_TXN_SESSION.with(|c| c.set(session as *const Session));
         Ok(f())
     }
 
-    /// Commit the transaction's WT session. Idempotent once committed/rolled
-    /// back (no active WT transaction → no-op).
+    /// Commit the transaction's WT session, then **close** it (releasing the WT
+    /// resource). Idempotent: a handle whose session is already closed is a
+    /// no-op. A commit failure still closes the session (its `Drop` rolls back
+    /// the uncommitted transaction).
     pub fn commit_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
-        if handle.began {
-            handle.session.commit_transaction(None)?;
+        if let Some(session) = handle.session.take() {
+            let began = handle.began;
             handle.began = false;
+            if began {
+                session.commit_transaction(None)?;
+            }
+            // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
     }
 
-    /// Roll back the transaction's WT session. Idempotent. (Dropping the handle
-    /// also rolls back any still-open WT transaction via `Session`'s `Drop`.)
+    /// Roll back the transaction's WT session, then **close** it. Idempotent;
+    /// best-effort rollback (closing the session also rolls back).
     pub fn rollback_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
-        if handle.began {
-            handle.session.rollback_transaction(None)?;
+        if let Some(session) = handle.session.take() {
+            let began = handle.began;
             handle.began = false;
+            if began {
+                let _ = session.rollback_transaction(None);
+            }
+            // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
     }

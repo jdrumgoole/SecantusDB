@@ -633,7 +633,8 @@ fn map_err(e: WtError) -> StorageError {
         // map them to a command-level internal error if they ever surface here.
         WtError::CreateIndexUnsupported(m)
         | WtError::IndexOptionsConflict(m)
-        | WtError::ChangeStreamFatal(m) => StorageError::Internal(m),
+        | WtError::ChangeStreamFatal(m)
+        | WtError::Internal(m) => StorageError::Internal(m),
         WtError::Wt(err) => StorageError::Internal(format!("WiredTiger error: {err:?}")),
         WtError::Bson(m) => StorageError::Internal(format!("BSON error: {m}")),
     }
