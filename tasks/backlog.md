@@ -213,6 +213,55 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.1 Rust server performance and security review (2026-06-16)
+
+Items identified during a security/performance audit of the Rust server. Fixed in
+0.5.3-beta.19: SCRAM timing oracle (`subtle::ConstantTimeEq`), mutex poisoning
+panics (graceful error returns), double BSON decode in wire layer (length-only
+check), response buffer pre-allocation, compound multikey cap (10k). The items
+below remain open.
+
+#### Security (remaining)
+
+- [ ] **No SASLprep for non-ASCII passwords** (`secantus-auth/src/lib.rs:56-60`).
+  Non-ASCII passwords bypass normalization → hash differently than a
+  SASLprep-compliant client. Needs RFC 4013 implementation. Low priority (ASCII
+  passwords are the common case; tracked in the auth module docs too).
+- [ ] **No per-connection idle timeout** (`secantus-server/src/lib.rs:40`). The
+  250ms `READ_POLL` is for shutdown detection, not security. A slow-read client
+  sending 1 byte per 250ms ties up a thread indefinitely. Add an aggregate idle
+  timeout (e.g. 10 minutes no complete message → drop connection).
+- [ ] **No concurrent message allocation budget** (`secantus-server/src/lib.rs:297`).
+  `MAX_MESSAGE_SIZE` (48 MB) is validated per-message, but there's no cap on
+  concurrent in-flight allocations across connections. Under load, many large
+  messages could exhaust heap. Consider a global or per-connection memory budget.
+
+#### Performance (remaining)
+
+- [ ] **Global storage lock held during full oplog scans**
+  (`secantus-storage/src/lib.rs:1185,1280`). `read_oplog` and `prune_oplog` hold
+  the global `Mutex` for their entire duration, blocking all writes. WiredTiger
+  provides MVCC — acquire the lock only for metadata mutation, not read iterations.
+- [ ] **Document cloning in aggregation stages**
+  (`secantus-core/src/aggregate.rs:151,246-280,328`). `$unwind`, `$facet`,
+  `$addFields` all `doc.clone()` per element/sub-pipeline. O(n*m) for large
+  arrays. Refactor to path-based mutation or copy-on-write.
+- [ ] **Oplog clones every written document**
+  (`secantus-storage/src/lib.rs:1531,1628,1750`). Every insert/update/delete
+  clones the full document into the oplog entry. Could pass raw BSON bytes instead.
+- [ ] **Nested lock for timestamp minting**
+  (`secantus-storage/src/lib.rs:1132-1139`). Global lock + oplog mutex for every
+  timestamp mint. Consider `AtomicI64` for the sequence counter.
+- [ ] **Query path resolution clones** (`secantus-core/src/query.rs:108-133`).
+  `resolve_path` clones every BSON value at every path component, called per field
+  per document. Use borrowed references instead.
+- [ ] **Encode/decode round-trips in the find→cursor→client path**
+  (`secantus-commands/src/util.rs:93-123`). Documents go: storage bytes → Document
+  → process → Document → bytes → cursor → bytes → client. Keep as bytes until
+  projection requires deserialization.
+
+---
+
 - [ ] **CI red: `rust-storage` job — `secantus-storage` `write` test won't compile** (2026-06-16, [issue #57](https://github.com/jdrumgoole/SecantusDB/issues/57)). Pre-existing since the `rust-next2` merge (`b079c53`); methods gained a trailing `Option<&Collation>` arg but `crates/secantus-storage/tests/write.rs` callsites weren't updated → 20× `E0061`. Fix: append the new arg (e.g. `, None`) to the flagged callsites (`count_matching` etc., `src/lib.rs:3437`). Only CI's `rust-storage` job catches it because `secantus-storage` is excluded from the clean workspace. Not fixed by `848bd7b` (different issue).
 
 > ⚠️ **Direction changed — authoritative plan is now `tasks/rust-server-plan.md`.**
