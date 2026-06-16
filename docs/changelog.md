@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b10] — 2026-06-16
+
+### `collMod` can retune a TTL index's expiry
+
+`collMod` now handles its `index` modification form: pass
+`{collMod: "<coll>", index: {keyPattern: {...}, expireAfterSeconds: N}}` (or
+`{index: {name: "<idx>", expireAfterSeconds: N}}`) and SecantusDB rewrites the
+TTL index's expiry in place, returning the `expireAfterSeconds_old` and
+`expireAfterSeconds_new` pair that `mongod` echoes. The new value takes effect
+immediately — `prune_ttl` reads the expiry from the same index options — so a
+retuned TTL window applies on the next prune.
+
+Previously `collMod` accepted the command but ignored the `index` form,
+returning a bare `{ok: 1}` with neither the old nor new expiry. The PHP
+library's `ModifyCollection` and `Database::modifyCollection` tests assert both
+values; both now pass.
+
+#### Added
+- `collMod` `index` form for TTL retuning: resolves the target index by
+  `keyPattern` or `name`, updates `expireAfterSeconds`, and returns
+  `expireAfterSeconds_old` / `expireAfterSeconds_new`. Backed by a new
+  `Storage.set_index_expiry`.
+
 ## [0.5.3b9] — 2026-06-16
 
 ### Duplicate-key errors now read exactly like `mongod`

@@ -4272,6 +4272,29 @@ class Storage:
             )
             return True
 
+    def set_index_expiry(self, db: str, coll: str, name: str, seconds: int) -> bool:
+        """Update an existing index's ``expireAfterSeconds`` option in place.
+
+        Read-modify-write of the index's stored ``{key, options}`` blob. The
+        new value is honoured by ``prune_ttl``, which reads ``expireAfterSeconds``
+        from the same options map. Returns ``True`` when the index existed and
+        was updated, ``False`` otherwise. Backs ``collMod {index: {...},
+        expireAfterSeconds: N}``.
+        """
+        with self._lock:
+            self._refresh_read_snapshot()
+            c = self._cursor(_IDX_TABLE)
+            c.set_key(db, coll, name)
+            if c.search() != 0:
+                return False
+            payload = bson.decode(bytes(c.get_value()))
+            options = payload.get("options", {})
+            options["expireAfterSeconds"] = seconds
+            payload["options"] = options
+            c.reset()
+            c[db, coll, name] = bson.encode(payload)
+            return True
+
     def drop_all_indexes(self, db: str, coll: str) -> int:
         with self._lock:
             # Mutating scanners read the current rows before deleting/rewriting

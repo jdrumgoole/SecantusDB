@@ -2791,10 +2791,40 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if isinstance(validator, Mapping):
         ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
         description["validator"] = dict(validator)
+    # ``collMod {index: {keyPattern|name, expireAfterSeconds}}`` retunes a TTL
+    # index. mongod resolves the index by key pattern or name, writes the new
+    # expiry, and echoes ``expireAfterSeconds_old`` / ``expireAfterSeconds_new``
+    # (the PHP library's ModifyCollection / Database test asserts both).
+    reply: dict[str, Any] = {"ok": 1.0}
+    index_spec = doc.get("index")
+    if isinstance(index_spec, Mapping):
+        indexes = ctx.storage.list_indexes(ctx.db_name, coll)
+        target = None
+        if index_spec.get("name") is not None:
+            target = next((ix for ix in indexes if ix.get("name") == index_spec["name"]), None)
+        elif isinstance(index_spec.get("keyPattern"), Mapping):
+            want = {k: int(v) for k, v in index_spec["keyPattern"].items()}
+            target = next(
+                (ix for ix in indexes if {k: int(v) for k, v in ix.get("key", {}).items()} == want),
+                None,
+            )
+        if target is None:
+            return {
+                "ok": 0.0,
+                "errmsg": f"cannot find index for ns {ctx.db_name}.{coll}",
+                "code": 27,
+                "codeName": "IndexNotFound",
+            }
+        new_expiry = index_spec.get("expireAfterSeconds")
+        if new_expiry is not None:
+            reply["expireAfterSeconds_old"] = target.get("expireAfterSeconds")
+            reply["expireAfterSeconds_new"] = new_expiry
+            ctx.storage.set_index_expiry(ctx.db_name, coll, target["name"], new_expiry)
+            description["index"] = {"name": target["name"], "expireAfterSeconds": new_expiry}
     # Emit the collMod command oplog entry so a change stream with
     # ``showExpandedEvents`` surfaces a ``modify`` event.
     ctx.storage.record_collmod(ctx.db_name, coll, description)
-    return {"ok": 1.0}
+    return reply
 
 
 def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:

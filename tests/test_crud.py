@@ -200,6 +200,40 @@ def test_duplicate_key_errmsg_on_unique_index_uses_field_value(coll) -> None:
     assert re.search(r'index: email_1 dup key: \{ email: "a@b\.com" \}', we["errmsg"]), we["errmsg"]
 
 
+def test_collmod_retunes_ttl_index_expiry(coll) -> None:
+    coll.create_index([("lastAccess", 1)], expireAfterSeconds=3)
+    res = coll.database.command(
+        "collMod",
+        coll.name,
+        index={"keyPattern": {"lastAccess": 1}, "expireAfterSeconds": 1000},
+    )
+    # mongod echoes the before/after expiry on a TTL retune.
+    assert res["expireAfterSeconds_old"] == 3
+    assert res["expireAfterSeconds_new"] == 1000
+    # The new value is what listIndexes now reports.
+    ix = next(i for i in coll.list_indexes() if i["name"] == "lastAccess_1")
+    assert ix["expireAfterSeconds"] == 1000
+
+
+def test_collmod_by_index_name(coll) -> None:
+    coll.create_index([("lastAccess", 1)], expireAfterSeconds=5, name="ttl_idx")
+    res = coll.database.command(
+        "collMod", coll.name, index={"name": "ttl_idx", "expireAfterSeconds": 60}
+    )
+    assert res["expireAfterSeconds_old"] == 5
+    assert res["expireAfterSeconds_new"] == 60
+
+
+def test_collmod_unknown_index_errors(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"x": 1})
+    with pytest.raises(OperationFailure):
+        coll.database.command(
+            "collMod", coll.name, index={"keyPattern": {"nope": 1}, "expireAfterSeconds": 10}
+        )
+
+
 def test_drop_collection_via_pymongo(client: MongoClient) -> None:
     db = client["dropdb"]
     db["things"].insert_one({"x": 1})
