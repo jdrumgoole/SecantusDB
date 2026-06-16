@@ -324,7 +324,13 @@ impl TransactionRegistry {
 
     /// `endSessions` / `killSessions`: abort the session's in-progress txn.
     pub fn abort_for_session(&self, lsid_bytes: &[u8]) {
-        let cur = self.inner.lock().unwrap_or_else(|e| e.into_inner()).txns.get(lsid_bytes).cloned();
+        let cur = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .txns
+            .get(lsid_bytes)
+            .cloned();
         if let Some(c) = cur {
             self.abort_locked(&c);
         }
@@ -332,7 +338,14 @@ impl TransactionRegistry {
 
     /// `killAllSessions` / shutdown: abort everything.
     pub fn abort_all(&self) {
-        let txns: Vec<_> = self.inner.lock().unwrap_or_else(|e| e.into_inner()).txns.values().cloned().collect();
+        let txns: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .txns
+            .values()
+            .cloned()
+            .collect();
         for c in txns {
             self.abort_locked(&c);
         }
