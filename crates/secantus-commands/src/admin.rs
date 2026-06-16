@@ -356,6 +356,88 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 }
 
 /// `createIndexes` — create one or more indexes (auto-creating the collection).
+/// Field-level query operators a `partialFilterExpression` may use. A `$`-key in
+/// a field clause outside this set is an unknown operator (rejected).
+const KNOWN_FIELD_OPS: &[&str] = &[
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$exists",
+    "$type",
+    "$regex",
+    "$options",
+    "$mod",
+    "$size",
+    "$all",
+    "$elemMatch",
+    "$not",
+    "$bitsAllSet",
+    "$bitsAnySet",
+    "$bitsAllClear",
+    "$bitsAnyClear",
+    "$geoWithin",
+    "$geoIntersects",
+    "$near",
+    "$nearSphere",
+    "$comment",
+    "$maxDistance",
+    "$minDistance",
+    "$geometry",
+    "$center",
+    "$centerSphere",
+    "$box",
+    "$polygon",
+];
+
+/// Document-level query operators accepted in a `partialFilterExpression` (the
+/// logical / expression operators; `$and`/`$or`/`$nor` are recursed below).
+const KNOWN_DOC_OPS: &[&str] = &["$expr", "$comment", "$text", "$where", "$jsonSchema"];
+
+/// A conservative filter-validity check for `partialFilterExpression`:
+/// `Some(reason)` for a clearly-invalid construct (a malformed `$and`/`$or`/`$nor`
+/// or an unknown operator), else `None`. Deliberately lenient — it only rejects
+/// operators outside the known sets, so a valid filter is never wrongly refused.
+fn invalid_partial_filter(filter: &Document) -> Option<String> {
+    for (k, v) in filter {
+        if let Some(stripped) = k.strip_prefix('$') {
+            match k.as_str() {
+                "$and" | "$or" | "$nor" => match v {
+                    Bson::Array(arr) => {
+                        for elem in arr {
+                            match elem {
+                                Bson::Document(sub) => {
+                                    if let Some(r) = invalid_partial_filter(sub) {
+                                        return Some(r);
+                                    }
+                                }
+                                _ => return Some(format!("{k} elements must be documents")),
+                            }
+                        }
+                    }
+                    _ => return Some(format!("{k} must be an array")),
+                },
+                _ if KNOWN_DOC_OPS.contains(&k.as_str()) => {}
+                _ => return Some(format!("unknown top-level operator ${stripped}")),
+            }
+        } else if let Bson::Document(opd) = v {
+            // A field clause whose value is an operator document: every `$`-key
+            // must be a known field operator.
+            if let Some(bad) = opd
+                .keys()
+                .find(|kk| kk.starts_with('$') && !KNOWN_FIELD_OPS.contains(&kk.as_str()))
+            {
+                return Some(format!("unknown operator {bad}"));
+            }
+        }
+    }
+    None
+}
+
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "createIndexes")?;
     let storage = ctx.storage()?;
@@ -385,6 +467,32 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .and_then(Bson::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| default_index_name(&key));
+        // `partialFilterExpression` must be a document and a parseable filter —
+        // mongod rejects a non-document, unknown operators (`{x: {$asdasd: 3}}`),
+        // and malformed logical operators (`{$and: 5}`). (pymongo's
+        // `test_index_filter` pins these.)
+        if let Some(pfe) = s.get("partialFilterExpression") {
+            match pfe {
+                Bson::Document(f) => {
+                    if let Some(reason) = invalid_partial_filter(f) {
+                        return Ok(CommandError::new(
+                            2,
+                            "BadValue",
+                            format!("Error in specification, partialFilterExpression is invalid: {reason}"),
+                        )
+                        .into_reply());
+                    }
+                }
+                _ => {
+                    return Ok(CommandError::new(
+                        2,
+                        "BadValue",
+                        "partialFilterExpression must be a document",
+                    )
+                    .into_reply())
+                }
+            }
+        }
         storage
             .create_index(&ctx.db_name, &coll, &name, &key, s)
             .map_err(command_error)?;
