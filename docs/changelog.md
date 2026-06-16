@@ -19,6 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b11] — 2026-06-16
+
+### `serverStatus` reports a live open-cursor count
+
+`serverStatus` now includes `metrics.cursor.open.total` — the number of cursors
+currently registered on the server. It rises by one when a batched query leaves
+a cursor open for `getMore` and returns to its baseline once the cursor is
+exhausted or killed (via `killCursors`, which drivers send when a cursor object
+is destroyed). Tools and drivers that watch cursor lifecycle — including the PHP
+extension's cursor-destruct test — can now see cursors open and close.
+
+The value is read live from the server's `CursorRegistry`, so it reflects the
+true set of not-yet-exhausted, not-killed cursors at the moment of the call.
+
+#### Added
+- `serverStatus.metrics.cursor.open.total` (live open-cursor count from the
+  `CursorRegistry`).
+
 ## [0.5.3b10] — 2026-06-16
 
 ### `collMod` can retune a TTL index's expiry

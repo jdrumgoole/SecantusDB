@@ -1192,6 +1192,16 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "network": {"numRequests": 0, "bytesIn": 0, "bytesOut": 0},
             }
         )
+    # Live open-cursor count for ``metrics.cursor.open.total`` — the field
+    # drivers poll to track cursor lifecycle. ``ctx.cursors`` is the live
+    # ``CursorRegistry``; its ``__len__`` returns the count of registered
+    # (not-yet-exhausted, not-killed) cursors, so the number rises by one when
+    # a batched cursor is open and returns to baseline after ``killCursors``
+    # (mongo-php-driver's ``cursor-destruct-001`` asserts exactly that).
+    open_total = len(ctx.cursors)
+    metrics_section = base.setdefault("metrics", {})
+    if isinstance(metrics_section, dict):
+        metrics_section["cursor"] = {"open": {"total": open_total, "pinned": 0, "noTimeout": 0}}
     return base
 
 
