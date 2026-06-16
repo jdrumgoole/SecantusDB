@@ -241,6 +241,23 @@ fn apply_min_max(
         )
     })?;
     let key_spec = resolve_index_key(storage, db, coll, hint)?;
+    // Each bound's fields must be a leading prefix of the hinted index's key,
+    // in the same order — else mongod rejects with 51174 (the "wrong order"
+    // case in pymongo's test_min/test_max).
+    let index_fields: Vec<&String> = key_spec.keys().collect();
+    for bound in [min, max].into_iter().flatten() {
+        let bf: Vec<&String> = bound.keys().collect();
+        let prefix_match =
+            bf.len() <= index_fields.len() && (0..bf.len()).all(|i| bf[i] == index_fields[i]);
+        if !prefix_match {
+            return Err(CommandError::new(
+                51174,
+                "Location51174",
+                "The field order of the min/max query option does not match the order of the \
+                 hinted index's key pattern",
+            ));
+        }
+    }
     let mut out = Vec::with_capacity(docs.len());
     for bytes in docs {
         let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
