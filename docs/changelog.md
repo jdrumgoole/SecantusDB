@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b9] — 2026-06-16
+
+### Duplicate-key errors now read exactly like `mongod`
+
+When a write hits a unique-index collision, the `E11000` error message now
+matches `mongod` verbatim: `E11000 duplicate key error collection: <db>.<coll>
+index: <indexName> dup key: { <field>: <value> }`. Previously SecantusDB emitted
+a terser, non-standard form (`… in index <name>: _id=<value>`) that worked for
+permissive drivers but failed the type-strict ones that pin the message text —
+the PHP extension's `WriteError::getMessage()` and `WriteResult::getWriteErrors()`
+assert the full string, down to the shell-formatted `dup key` fragment.
+
+The structured fields drivers parse — `code`, `index`, `keyPattern`, `keyValue`
+— were already correct; this is purely the human-readable message catching up,
+across every path that can raise a duplicate key (batch insert, update/upsert,
+and unique-index builds). The fix clears the PHP extension's `writeError` and
+`writeResult` suites.
+
+#### Fixed
+- Duplicate-key (`E11000`) error messages now use `mongod`'s exact wording,
+  including the `collection: <ns> index: <name> dup key: { … }` shape with
+  shell-formatted key values, consistently across all duplicate-key raise sites.
+
 ## [0.5.3b8] — 2026-06-16
 
 ### `explain` now speaks `allPlansExecution`, and aggregate's inline explain flag works

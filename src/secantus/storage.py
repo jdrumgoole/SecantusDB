@@ -477,6 +477,45 @@ from secantus.ordering import (  # noqa: E402, F401  (re-exported for back-compa
 _ID_INDEX_NAME = "_id_"
 
 
+def _shell_value(v: Any) -> str:
+    """Format a scalar BSON value the way the mongo shell prints it.
+
+    Used inside the ``dup key: { … }`` fragment of an E11000 message so the
+    text matches ``mongod`` (drivers like the PHP extension pin the message
+    verbatim). Only the value kinds that show up as index keys need exact
+    handling; anything else falls back to ``repr``-free ``str``.
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return f'"{v}"'
+    if isinstance(v, bson.ObjectId):
+        return f"ObjectId('{v}')"
+    if v is None:
+        return "null"
+    return str(v)
+
+
+def format_dup_key_errmsg(
+    namespace: str, index_name: str, key_value: dict[str, Any] | None
+) -> str:
+    """Build mongod's E11000 duplicate-key ``errmsg`` string.
+
+    ``E11000 duplicate key error collection: <ns> index: <name> dup key: { <k>: <v>, … }``
+    — the exact shape ``mongod`` returns and drivers (e.g. the PHP extension's
+    ``WriteError::getMessage()``) assert against.
+    """
+    if key_value:
+        inner = ", ".join(f"{k}: {_shell_value(v)}" for k, v in key_value.items())
+        dup = "{ " + inner + " }"
+    else:
+        dup = "{ }"
+    return (
+        f"E11000 duplicate key error collection: {namespace} "
+        f"index: {index_name} dup key: {dup}"
+    )
+
+
 class IndexConflict(Exception):
     def __init__(
         self,
@@ -485,10 +524,18 @@ class IndexConflict(Exception):
         *,
         key_pattern: dict[str, Any] | None = None,
         key_value: dict[str, Any] | None = None,
+        namespace: str | None = None,
     ) -> None:
-        super().__init__(f"E11000 duplicate key error in index {index_name}: _id={doc_id!r}")
+        # Build mongod's exact E11000 text when we know the namespace; fall
+        # back to ``_id``-derived key for legacy raise sites that pass only a
+        # doc id, and to a namespace-less form when even that's unavailable.
+        kv = key_value
+        if kv is None:
+            kv = {"_id": doc_id} if doc_id is not None else None
+        super().__init__(format_dup_key_errmsg(namespace or "", index_name, kv))
         self.index_name = index_name
         self.doc_id = doc_id
+        self.namespace = namespace
         # Real mongod returns ``keyPattern`` (the index spec) and
         # ``keyValue`` (the conflicting field values) in the dup-key
         # error response. Drivers expose them as ``errorResponse``
@@ -2583,9 +2630,7 @@ class Storage:
                         {
                             "index": index,
                             "code": 11000,
-                            "errmsg": (
-                                f"E11000 duplicate key error in index {cname}: _id={doc['_id']!r}"
-                            ),
+                            "errmsg": format_dup_key_errmsg(f"{db}.{coll}", cname, kval),
                             "keyPattern": kpat,
                             "keyValue": kval,
                         }
@@ -2636,7 +2681,11 @@ class Storage:
                         {
                             "index": index,
                             "code": 11000,
-                            "errmsg": f"E11000 duplicate key error: _id {doc['_id']!r}",
+                            "errmsg": format_dup_key_errmsg(
+                                f"{db}.{coll}", "_id_", {"_id": doc["_id"]}
+                            ),
+                            "keyPattern": {"_id": 1},
+                            "keyValue": {"_id": doc["_id"]},
                         }
                     )
                     if ordered:
@@ -3499,7 +3548,13 @@ class Storage:
                     )
                     if conflict is not None:
                         cname, kpat, kval = conflict
-                        raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
+                        raise IndexConflict(
+                            cname,
+                            new["_id"],
+                            key_pattern=kpat,
+                            key_value=kval,
+                            namespace=f"{db}.{coll}",
+                        )
                     # Geo validation must reject the update before any
                     # write happens, otherwise we'd be left with a
                     # half-deleted set of index entries.
@@ -3574,7 +3629,13 @@ class Storage:
                 )
                 if conflict is not None:
                     cname, kpat, kval = conflict
-                    raise IndexConflict(cname, new["_id"], key_pattern=kpat, key_value=kval)
+                    raise IndexConflict(
+                        cname,
+                        new["_id"],
+                        key_pattern=kpat,
+                        key_value=kval,
+                        namespace=f"{db}.{coll}",
+                    )
                 self._validate_geo_indexes(db, coll, new, indexes, partials)
                 upsert_blob = bson.encode(new)
                 if len(upsert_blob) > MAX_BSON_OBJECT_SIZE:
@@ -4122,7 +4183,7 @@ class Storage:
                         canonical = _index_key(d, key_spec_dict, sparse=sparse, collation=coll_opt)
                         if canonical is not None:
                             if canonical in seen:
-                                raise IndexConflict(name, d.get("_id"))
+                                raise IndexConflict(name, d.get("_id"), namespace=f"{db}.{coll}")
                             seen[canonical] = d.get("_id")
                     for kb in _index_key_variants(
                         d, key_spec_dict, sparse=sparse, collation=coll_opt
