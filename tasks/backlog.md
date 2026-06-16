@@ -147,8 +147,6 @@ the change-stream batch. Still open, precisely characterized:
   `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
   "no upsert" sentinel). Still open:
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
-  - `test_error_code` / `test_index_filter` rejections (planner index-filter
-    command surface).
   - the 3 `test_dbref.py` execnet failures: gauge-harness artifact (xdist
     can't serialize ObjectId in subtest reports — runner-side, not server).
   - `test_maxtime_ms_message` / `test_to_list_csot_applied`: pymongo CSOT
