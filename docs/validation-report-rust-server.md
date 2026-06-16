@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-16 — SecantusDB 0.5.3b8 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-16 — SecantusDB 0.5.3b9 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -12,7 +12,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_bulk.py` | 33 | 1 | 0 | 4 | 38 | 97.1% |
 | `test_change_stream.py` | 78 | 28 | 0 | 49 | 155 | 73.6% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
-| `test_collection.py` | 80 | 7 | 0 | 4 | 91 | 92.0% |
+| `test_collection.py` | 81 | 6 | 0 | 4 | 91 | 93.1% |
 | `test_collection_management.py` | 4 | 3 | 0 | 0 | 7 | 57.1% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
@@ -20,7 +20,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_crud_unified.py` | 286 | 15 | 0 | 185 | 486 | 95.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
-| `test_cursor.py` | 56 | 11 | 0 | 5 | 72 | 83.6% |
+| `test_cursor.py` | 58 | 9 | 0 | 5 | 72 | 86.6% |
 | `test_custom_types.py` | 46 | 5 | 0 | 0 | 51 | 90.2% |
 | `test_database.py` | 31 | 4 | 0 | 1 | 36 | 88.6% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
@@ -36,9 +36,9 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 37 | 1 | 0 | 5 | 43 | 97.4% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **943** | **85** | **0** | **475** | **1503** | **91.7%** |
+| **Overall** | **946** | **82** | **0** | **475** | **1503** | **92.0%** |
 
-## Failures (85)
+## Failures (82)
 
 First 30 failure node-ids for manual triage:
 
@@ -74,7 +74,7 @@ vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExp
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_new_fields_on_change_stream_events_are_handled_appropriately
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_exhaust
 ```
-... and 55 more (see raw JSON).
+... and 52 more (see raw JSON).
 
 ## How this is generated
 
