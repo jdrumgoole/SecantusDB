@@ -632,14 +632,25 @@ fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Resu
     }
 
     // Compound: cartesian product across the per-field candidate lists.
+    // Cap the product size to avoid exponential blowup when multiple fields are
+    // array-valued (real mongod rejects compound multikey on >1 array field;
+    // we accept it but bound the work).
+    const MAX_COMPOUND_KEYS: usize = 10_000;
     let mut combos: Vec<Vec<&Bson>> = vec![Vec::new()];
     for cand in &per_field {
-        let mut next: Vec<Vec<&Bson>> = Vec::with_capacity(combos.len() * cand.len());
+        let new_size = combos.len().saturating_mul(cand.len());
+        let mut next: Vec<Vec<&Bson>> = Vec::with_capacity(new_size.min(MAX_COMPOUND_KEYS + 1));
         for combo in &combos {
             for v in cand {
+                if next.len() >= MAX_COMPOUND_KEYS {
+                    break;
+                }
                 let mut c = combo.clone();
                 c.push(v);
                 next.push(c);
+            }
+            if next.len() >= MAX_COMPOUND_KEYS {
+                break;
             }
         }
         combos = next;
