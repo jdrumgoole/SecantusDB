@@ -17,6 +17,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 /// MongoDB's default SCRAM-SHA-256 iteration count.
 pub const DEFAULT_ITERATIONS: u32 = 15_000;
@@ -264,12 +265,10 @@ fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
 }
 
 /// Constant-time byte-slice equality (guards the proof check against timing
-/// oracles even when the user doesn't exist).
+/// oracles even when the user doesn't exist). Delegates to the `subtle` crate
+/// so both the length comparison and the content comparison are constant-time.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.ct_eq(b).into()
 }
 
 /// Peek the username (`n=`) out of a SCRAM client-first payload, so the caller

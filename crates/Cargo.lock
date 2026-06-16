@@ -965,6 +965,7 @@ dependencies = [
  "pbkdf2",
  "rand",
  "sha2",
+ "subtle",
 ]
 
 [[package]]

@@ -474,7 +474,7 @@ fn write_op_msg<S: Write>(
     shared: &Arc<Shared>,
     reply: &Document,
 ) -> io::Result<()> {
-    let mut body_bytes = Vec::new();
+    let mut body_bytes = Vec::with_capacity(256);
     reply
         .to_writer(&mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -488,7 +488,7 @@ fn write_op_reply<S: Write>(
     shared: &Arc<Shared>,
     reply: &Document,
 ) -> io::Result<()> {
-    let mut body_bytes = Vec::new();
+    let mut body_bytes = Vec::with_capacity(256);
     reply
         .to_writer(&mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
