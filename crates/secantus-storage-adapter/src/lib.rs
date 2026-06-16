@@ -24,7 +24,9 @@ use secantus_commands::storage::{
     Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
-use secantus_storage::{ExplainPlan, Hint, Storage as WtStorage, StorageError as WtError};
+use secantus_storage::{
+    ExplainPlan, Hint, Storage as WtStorage, StorageError as WtError, UserTransactionHandle,
+};
 
 /// Wraps a shared WiredTiger-backed `Storage` and presents it as the command
 /// layer's `Storage`. Construct with [`StorageAdapter::new`] and hand the
@@ -56,6 +58,42 @@ impl CmdStorage for StorageAdapter {
                 time: 0,
                 increment: 0,
             })
+    }
+
+    fn begin_user_transaction(&self) -> Result<Box<dyn std::any::Any + Send>, StorageError> {
+        let h = self.inner.begin_user_transaction().map_err(map_err)?;
+        Ok(Box::new(h))
+    }
+
+    fn run_in_user_transaction(
+        &self,
+        handle: &mut (dyn std::any::Any + Send),
+        f: &mut dyn FnMut() -> Document,
+    ) -> Result<Document, StorageError> {
+        let h = handle
+            .downcast_mut::<UserTransactionHandle>()
+            .ok_or_else(|| StorageError::Internal("bad transaction handle".into()))?;
+        self.inner.with_user_transaction(h, f).map_err(map_err)
+    }
+
+    fn commit_user_transaction(
+        &self,
+        handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        let h = handle
+            .downcast_mut::<UserTransactionHandle>()
+            .ok_or_else(|| StorageError::Internal("bad transaction handle".into()))?;
+        self.inner.commit_user_transaction(h).map_err(map_err)
+    }
+
+    fn rollback_user_transaction(
+        &self,
+        handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        let h = handle
+            .downcast_mut::<UserTransactionHandle>()
+            .ok_or_else(|| StorageError::Internal("bad transaction handle".into()))?;
+        self.inner.rollback_user_transaction(h).map_err(map_err)
     }
 
     fn change_stream_poll(
@@ -198,6 +236,7 @@ impl CmdStorage for StorageAdapter {
                 &[],
                 &Document::new(),
                 None,
+                None,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -219,6 +258,7 @@ impl CmdStorage for StorageAdapter {
         array_filters: &[Document],
         let_vars: &Document,
         collation: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
@@ -232,6 +272,7 @@ impl CmdStorage for StorageAdapter {
                 array_filters,
                 let_vars,
                 collation,
+                validator,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -252,11 +293,12 @@ impl CmdStorage for StorageAdapter {
         upsert: bool,
         let_vars: &Document,
         collation: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
             .update_matching_pipeline(
-                db, coll, filter, pipeline, multi, upsert, let_vars, collation,
+                db, coll, filter, pipeline, multi, upsert, let_vars, collation, validator,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -426,6 +468,26 @@ impl CmdStorage for StorageAdapter {
         self.inner.list_indexes(db, coll).map_err(map_err)
     }
 
+    fn collection_exists(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+        self.inner.collection_exists(db, coll).map_err(map_err)
+    }
+
+    fn get_profile(&self, db: &str) -> Result<Document, StorageError> {
+        self.inner.get_profile(db).map_err(map_err)
+    }
+
+    fn set_profile(
+        &self,
+        db: &str,
+        level: i32,
+        slowms: i32,
+        sample_rate: f64,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .set_profile(db, level, slowms, sample_rate)
+            .map_err(map_err)
+    }
+
     fn create_index(
         &self,
         db: &str,
@@ -576,6 +638,21 @@ fn map_err(e: WtError) -> StorageError {
             code: 11000,
             errmsg: "E11000 duplicate key error".to_string(),
         },
+        // A lost WT_ROLLBACK race → mongod's WriteConflict (112). Routed
+        // command-level by the write handlers so the txn envelope labels it.
+        WtError::WriteConflict => StorageError::WriteConflict,
+        // An over-limit document → mongod's BSONObjectTooLarge (10334).
+        WtError::DocumentTooLarge(size) => StorageError::WriteError {
+            code: 10334,
+            errmsg: format!(
+                "object to insert too large. size in bytes: {size}, max size: 16777216"
+            ),
+        },
+        // Post-apply validator failure → mongod's DocumentValidationFailure (121).
+        WtError::DocumentValidationFailure => StorageError::WriteError {
+            code: 121,
+            errmsg: "Document failed validation".to_string(),
+        },
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.
         WtError::BadHint(m) => StorageError::WriteError { code: 2, errmsg: m },
@@ -595,7 +672,8 @@ fn map_err(e: WtError) -> StorageError {
         // map them to a command-level internal error if they ever surface here.
         WtError::CreateIndexUnsupported(m)
         | WtError::IndexOptionsConflict(m)
-        | WtError::ChangeStreamFatal(m) => StorageError::Internal(m),
+        | WtError::ChangeStreamFatal(m)
+        | WtError::Internal(m) => StorageError::Internal(m),
         WtError::Wt(err) => StorageError::Internal(format!("WiredTiger error: {err:?}")),
         WtError::Bson(m) => StorageError::Internal(format!("BSON error: {m}")),
     }

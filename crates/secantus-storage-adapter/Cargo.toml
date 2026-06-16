@@ -1,6 +1,6 @@
 [package]
 name = "secantus-storage-adapter"
-version = "0.5.3-beta.9"
+version = "0.5.3-beta.21"
 edition = "2021"
 description = "Adapts the WiredTiger-backed secantus-storage Storage to the secantus-commands Storage trait for the Rust server."
 license = "GPL-2.0-only"

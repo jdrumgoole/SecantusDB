@@ -199,7 +199,9 @@ pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let creds = lookup_creds(ctx, &db_name, &username);
 
     let auth = conn_auth(ctx)?;
-    let mut auth = auth.lock().expect("conn auth mutex poisoned");
+    let mut auth = auth
+        .lock()
+        .map_err(|_| CommandError::new(1, "InternalError", "connection auth state corrupted"))?;
     let conversation_id = auth.new_conversation_id();
     let (server_first, state) = begin_scram(conversation_id, &db_name, &payload, creds)
         .map_err(|e| auth_failure(e.to_string()))?;
@@ -219,7 +221,9 @@ pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     let incoming_id = doc.get_i32("conversationId").ok();
 
     let auth = conn_auth(ctx)?;
-    let mut auth = auth.lock().expect("conn auth mutex poisoned");
+    let mut auth = auth
+        .lock()
+        .map_err(|_| CommandError::new(1, "InternalError", "connection auth state corrupted"))?;
     let Some(mut state) = auth.scram.take() else {
         return Err(auth_failure("No SCRAM conversation in progress"));
     };
@@ -313,7 +317,9 @@ fn verify_x509(
         )));
     }
     if let Some(auth) = &ctx.conn_auth {
-        let mut auth = auth.lock().expect("conn auth mutex poisoned");
+        let mut auth = auth.lock().map_err(|_| {
+            CommandError::new(1, "InternalError", "connection auth state corrupted")
+        })?;
         let principal = (db_name.clone(), dn.clone());
         if !auth.authenticated.contains(&principal) {
             auth.authenticated.push(principal);
@@ -534,7 +540,9 @@ pub fn drop_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     // Drop any active auth state for this principal on the calling connection.
     if let Some(auth) = &ctx.conn_auth {
-        let mut auth = auth.lock().expect("conn auth mutex poisoned");
+        let mut auth = auth.lock().map_err(|_| {
+            CommandError::new(1, "InternalError", "connection auth state corrupted")
+        })?;
         auth.authenticated
             .retain(|(d, u)| !(d == &db_name && u == &username));
     }
@@ -546,7 +554,7 @@ pub fn drop_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// `commands.py::_refresh_effective_roles`.
 fn refresh_effective_roles(ctx: &CommandContext) {
     let Some(auth) = &ctx.conn_auth else { return };
-    let mut auth = auth.lock().expect("conn auth mutex poisoned");
+    let Ok(mut auth) = auth.lock() else { return };
     let principals = auth.authenticated.clone();
     auth.effective_roles.clear();
     for (db, user) in principals {
@@ -656,7 +664,9 @@ pub fn drop_all_users_from_database(_doc: &Document, ctx: &mut CommandContext) -
         }
     }
     if let Some(auth) = &ctx.conn_auth {
-        let mut auth = auth.lock().expect("conn auth mutex poisoned");
+        let mut auth = auth.lock().map_err(|_| {
+            CommandError::new(1, "InternalError", "connection auth state corrupted")
+        })?;
         auth.authenticated.retain(|(d, _)| d != &db_name);
     }
     refresh_effective_roles(ctx);

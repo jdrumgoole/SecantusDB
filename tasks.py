@@ -678,11 +678,23 @@ def validate_java(c: Context) -> None:
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
+    result = c.run(
         "PYTHONPATH=. uv run --no-sync python -m java_validation.runner",
         pty=True,
         warn=True,
     )
+    # Fail loudly instead of regenerating a stale/empty report. The runner
+    # wipes prior JUnit XML up front, so a non-zero exit means the build
+    # didn't actually run any tests this invocation (common cause: no
+    # Gradle-supported JDK — needs 8-23, JDK 24+ aborts the build). Re-
+    # emitting the report here would otherwise carry forward a previous
+    # run's numbers as if they were current.
+    if result.exited != 0:
+        raise SystemExit(
+            f"java_validation.runner failed (exit {result.exited}); not regenerating "
+            "docs/validation-report-java.md from stale/empty results. See the runner "
+            "output above (a JDK 24+ default is the usual cause — install openjdk@17)."
+        )
     c.run(
         "uv run --no-sync python -m java_validation.generate_report "
         ".validation/java-results docs/validation-report-java.md",
@@ -722,16 +734,77 @@ def validate_rust(c: Context) -> None:
     print("\nWrote docs/validation-report-rust.md")
 
 
+@task(name="validate-php-lib")
+def validate_php_lib(c: Context) -> None:
+    """Run mongo-php-library's PHPUnit suite against an embedded SecantusDB.
+
+    Generates docs/validation-report-php-lib.md with a per-category pass /
+    fail / skipped / pass-rate breakdown — the high-level PHP-library
+    analogue of the pymongo / Go / Node / Java / Ruby / Rust gauges.
+    Requires PHP (>= 8.1) with the `mongodb` extension (>= 2.3) loaded and
+    `composer` on PATH (`brew install php composer` on macOS). First run does
+    a one-time `composer install` inside vendor/mongo-php-library/.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/mongo-php-library/composer.json").exists():
+        c.run("git submodule update --init vendor/mongo-php-library", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m php_lib_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m php_lib_validation.generate_report "
+        ".validation/php-lib-junit.xml docs/validation-report-php-lib.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-php-lib.md")
+
+
+@task(name="validate-php-ext")
+def validate_php_ext(c: Context) -> None:
+    """Run mongo-php-driver's .phpt suite against an embedded SecantusDB.
+
+    Generates docs/validation-report-php-ext.md with a per-category pass /
+    fail / skipped / pass-rate breakdown — the low-level PHP-extension
+    analogue of the other gauges, and (with the Go gauge) the strictest
+    wire-protocol check. Requires PHP (>= 8.1) with the `mongodb` extension
+    loaded; runs against the already-installed extension via PHP's
+    `run-tests.php` (no rebuild). The submodule is pinned to the installed
+    extension's version (`php --ri mongodb`) to avoid test version skew.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/mongo-php-driver/tests/utils/basic.inc").exists():
+        c.run("git submodule update --init vendor/mongo-php-driver", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m php_ext_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m php_ext_validation.generate_report "
+        ".validation/php-ext-junit.xml docs/validation-report-php-ext.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-php-ext.md")
+
+
 @task(name="validate-all")
 def validate_all(c: Context) -> None:
-    """Run all six driver gauges in parallel.
+    """Run all eight driver gauges in parallel.
 
     Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
     fans out ``invoke validate / validate-go / validate-node /
-    validate-java / validate-ruby / validate-rust`` across a 6-wide
-    thread pool. Each gauge spawns its own SecantusDB daemon on a
-    kernel-assigned ephemeral port + its own tempdir, so they don't
-    collide.
+    validate-java / validate-ruby / validate-rust / validate-php-lib /
+    validate-php-ext`` across a thread pool. Each gauge spawns its own
+    SecantusDB daemon on a kernel-assigned ephemeral port + its own
+    tempdir, so they don't collide.
 
     Wall-clock is the slowest single gauge (usually node or java); on
     a dev laptop ~5x faster than the previous serial run. Output from
@@ -750,6 +823,8 @@ def validate_all(c: Context) -> None:
         ("java", "validate-java"),
         ("ruby", "validate-ruby"),
         ("rust", "validate-rust"),
+        ("php-lib", "validate-php-lib"),
+        ("php-ext", "validate-php-ext"),
     ]
 
     def _run(name_task: tuple[str, str]) -> tuple[str, int]:

@@ -33,8 +33,6 @@
 //! first and pairs it with a recoverable error itself, so this crate never needs
 //! to own it.
 
-use std::io::Cursor;
-
 /// `OP_REPLY` — legacy reply opcode, used only for the `OP_QUERY` handshake.
 pub const OP_REPLY: i32 = 1;
 /// `OP_QUERY` — legacy query opcode; pymongo emits exactly one (the handshake).
@@ -449,17 +447,28 @@ fn check_doc_len(doc_len: i32, at: usize, end: usize, where_: &str) -> Result<()
     Ok(())
 }
 
-/// Deep-validate a BSON document slice, matching `bson.decode`'s accept/reject
-/// (the Python wire layer fully decodes each section, so a structurally bad
-/// document is rejected at parse time as a recoverable `BadValue`). We decode to
-/// an owned `Document` and discard it — the parsed [`OpMsg`] still hands the
-/// caller the borrowed slice to decode once more into its own representation.
-/// (A future optimisation: return the validated owned doc so dispatch needn't
-/// re-decode — see tasks/rust-server-plan.md R2.)
+/// Validate a BSON document's declared length against its slice — a quick
+/// structural sanity check without a full decode. The caller (`merge_op_msg_body`
+/// in the server) performs the authoritative `Document::from_reader` decode that
+/// catches deeper BSON encoding faults; doing a full decode here too was a
+/// redundant double-parse (the earlier `validate_bson` decoded the doc and
+/// discarded the result). Keeping the length check at the wire layer means
+/// obviously-truncated docs are caught early (recoverable `BadValue`).
 fn validate_bson(slice: &[u8], where_: &str) -> Result<(), WireError> {
-    bson::Document::from_reader(&mut Cursor::new(slice))
-        .map(|_| ())
-        .map_err(|e| WireError::MalformedBody(format!("{where_}: invalid BSON: {e}")))
+    if slice.len() < 5 {
+        return Err(WireError::MalformedBody(format!(
+            "{where_}: BSON too short ({} bytes)",
+            slice.len()
+        )));
+    }
+    let declared = i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+    if declared as usize != slice.len() {
+        return Err(WireError::MalformedBody(format!(
+            "{where_}: BSON declared length {declared} != slice length {}",
+            slice.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Find the next `\x00` in `buf[start..limit]`, returning its absolute index.
@@ -484,6 +493,7 @@ fn rd_u32(buf: &[u8], at: usize) -> u32 {
 mod tests {
     use super::*;
     use bson::doc;
+    use std::io::Cursor;
 
     fn enc(d: &bson::Document) -> Vec<u8> {
         let mut v = Vec::new();
@@ -646,15 +656,19 @@ mod tests {
     }
 
     /// A doc whose declared length fits the buffer but whose contents are not
-    /// valid BSON must still be rejected (recoverably), matching `bson.decode`.
+    /// valid BSON passes the wire layer's structural check (length-only). The
+    /// full BSON decode happens in the server's `merge_op_msg_body`, which
+    /// surfaces the error as a recoverable `BadValue` reply. The wire layer
+    /// intentionally avoids a full decode to eliminate the double-parse overhead.
     #[test]
-    fn invalid_bson_content_is_recoverable() {
+    fn invalid_bson_content_passes_wire_layer() {
         // length=8 (matches the slice, so framing is fine), but element type code
-        // 0x14 is not a valid BSON type — bson.decode / Document::from_reader reject.
+        // 0x14 is not a valid BSON type. The wire layer accepts it; the server
+        // layer's `merge_op_msg_body` will reject it.
         let doc_bytes = [8u8, 0, 0, 0, 0x14, b'x', 0x00, 0x00];
         let frame = op_msg_body(&doc_bytes);
-        let err = parse_op_msg(&frame).unwrap_err();
-        assert!(err.is_recoverable(), "got {err:?}");
+        let msg = parse_op_msg(&frame).unwrap();
+        assert_eq!(msg.body, doc_bytes.as_slice());
     }
 
     #[test]

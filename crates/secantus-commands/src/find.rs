@@ -78,6 +78,22 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .map_err(command_error)?;
 
+    // Cursor `min` / `max` index bounds (inclusive lower / exclusive upper),
+    // evaluated on the hinted index's key — applied to the index-ordered fetch
+    // before skip/limit. (pymongo translates the legacy `$min`/`$max`/`$query`
+    // filter wrapper into these top-level fields.)
+    let min_b = doc
+        .get("min")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+    let max_b = doc
+        .get("max")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+    if min_b.is_some() || max_b.is_some() {
+        docs = apply_min_max(docs, min_b, max_b, hint, storage, &ctx.db_name, &coll)?;
+    }
+
     // skip / limit applied after the sorted fetch (the storage returns the full
     // ordered match set).
     if skip > 0 {
@@ -137,6 +153,134 @@ pub(crate) fn split_into_cursor(
         .register(ns, remaining)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((docs, cursor_id))
+}
+
+/// Resolve a `hint` (index-name string or key-spec document) to the index's key
+/// pattern (field → direction), for evaluating `min`/`max` bounds.
+fn resolve_index_key(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    hint: &Bson,
+) -> Result<Document, CommandError> {
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    match hint {
+        Bson::String(name) => indexes
+            .iter()
+            .find(|ix| ix.get_str("name").ok() == Some(name.as_str()))
+            .and_then(|ix| ix.get_document("key").ok().cloned())
+            .ok_or_else(|| {
+                CommandError::new(
+                    2,
+                    "BadValue",
+                    format!("hint {name} does not match an index"),
+                )
+            }),
+        Bson::Document(kd) => indexes
+            .iter()
+            .find(|ix| ix.get_document("key").ok() == Some(kd))
+            .map(|_| kd.clone())
+            .ok_or_else(|| CommandError::new(2, "BadValue", "hint does not match an index")),
+        _ => Err(CommandError::new(
+            2,
+            "BadValue",
+            "min/max requires a valid hint",
+        )),
+    }
+}
+
+/// Compare `doc`'s key tuple against `bound` over the bound's fields, in the
+/// index's per-field direction. `None` ⇒ the doc is missing a bound field (it
+/// has no index key, so it's outside any bound). `Some(Ordering)` is the tuple
+/// comparison (`Equal` when the doc matches the bound on every bound field).
+fn bound_cmp(
+    doc: &Document,
+    bound: &Document,
+    key_spec: &Document,
+) -> Result<Option<std::cmp::Ordering>, CommandError> {
+    use std::cmp::Ordering;
+    for (field, bval) in bound {
+        let dir = match key_spec.get(field) {
+            Some(Bson::Int32(n)) => *n,
+            Some(Bson::Int64(n)) => *n as i32,
+            Some(Bson::Double(d)) => *d as i32,
+            _ => 1,
+        };
+        let Some(dval) = secantus_core::get_path(doc, field) else {
+            return Ok(None);
+        };
+        let enc = |v: &Bson| {
+            secantus_core::sortkey::encode_value_directed(v, dir, None)
+                .map_err(|_| CommandError::new(2, "BadValue", "min/max value not comparable"))
+        };
+        match enc(dval)?.cmp(&enc(bval)?) {
+            Ordering::Equal => continue,
+            other => return Ok(Some(other)),
+        }
+    }
+    Ok(Some(Ordering::Equal))
+}
+
+/// Filter `docs` (already index-ordered) by the `min` (inclusive) / `max`
+/// (exclusive) index bounds. Mirrors `storage._apply_minmax_bounds`.
+fn apply_min_max(
+    docs: Vec<Vec<u8>>,
+    min: Option<&Document>,
+    max: Option<&Document>,
+    hint: Option<&Bson>,
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+) -> Result<Vec<Vec<u8>>, CommandError> {
+    use std::cmp::Ordering;
+    let hint = hint.ok_or_else(|| {
+        CommandError::new(
+            51173,
+            "Location51173",
+            "When using min()/max() a hint of which index to use must be provided",
+        )
+    })?;
+    let key_spec = resolve_index_key(storage, db, coll, hint)?;
+    // Each bound's fields must be a leading prefix of the hinted index's key,
+    // in the same order — else mongod rejects with 51174 (the "wrong order"
+    // case in pymongo's test_min/test_max).
+    let index_fields: Vec<&String> = key_spec.keys().collect();
+    for bound in [min, max].into_iter().flatten() {
+        let bf: Vec<&String> = bound.keys().collect();
+        let prefix_match =
+            bf.len() <= index_fields.len() && (0..bf.len()).all(|i| bf[i] == index_fields[i]);
+        if !prefix_match {
+            return Err(CommandError::new(
+                51174,
+                "Location51174",
+                "The field order of the min/max query option does not match the order of the \
+                 hinted index's key pattern",
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(docs.len());
+    for bytes in docs {
+        let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
+            CommandError::new(
+                1,
+                "InternalError",
+                format!("failed to decode document: {e}"),
+            )
+        })?;
+        // min is inclusive (doc >= min ⇒ cmp != Less); max is exclusive (doc < max).
+        let keep_min = match min {
+            Some(m) => matches!(bound_cmp(&d, m, &key_spec)?, Some(o) if o != Ordering::Less),
+            None => true,
+        };
+        let keep_max = match max {
+            Some(m) => bound_cmp(&d, m, &key_spec)? == Some(Ordering::Less),
+            None => true,
+        };
+        if keep_min && keep_max {
+            out.push(bytes);
+        }
+    }
+    Ok(out)
 }
 
 /// Apply a projection spec to each result doc via `secantus_core::projection`.

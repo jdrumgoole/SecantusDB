@@ -106,6 +106,7 @@ impl RustServer {
             replica_set_name,
             require_auth,
             tls,
+            ..ServerConfig::default()
         };
         let addr = format!("{host}:{port}");
         let running = bind(&addr, config, adapter, cursors)

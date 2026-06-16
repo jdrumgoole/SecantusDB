@@ -162,6 +162,133 @@ def test_duplicate_id_raises(coll) -> None:
         coll.insert_one({"_id": 1, "x": 2})
 
 
+def test_duplicate_key_errmsg_matches_mongod_shape(coll) -> None:
+    import re
+
+    from pymongo import InsertOne
+    from pymongo.errors import BulkWriteError
+
+    coll.insert_one({"_id": 1})
+    with pytest.raises(BulkWriteError) as ei:
+        coll.bulk_write([InsertOne({"_id": 1})])
+    we = ei.value.details["writeErrors"][0]
+    # mongod's exact wording: "E11000 duplicate key error collection: <ns>
+    # index: <name> dup key: { _id: 1 }". The PHP extension (and other
+    # type-strict drivers) pin this message verbatim.
+    assert re.fullmatch(
+        r"E11000 duplicate key error collection: \w+\.things index: _id_ dup key: \{ _id: 1 \}",
+        we["errmsg"],
+    ), we["errmsg"]
+    assert we["code"] == 11000
+    assert we["keyPattern"] == {"_id": 1}
+    assert we["keyValue"] == {"_id": 1}
+
+
+def test_duplicate_key_errmsg_on_unique_index_uses_field_value(coll) -> None:
+    import re
+
+    from pymongo import InsertOne
+    from pymongo.errors import BulkWriteError
+
+    coll.create_index("email", unique=True)
+    coll.insert_one({"_id": 1, "email": "a@b.com"})
+    with pytest.raises(BulkWriteError) as ei:
+        coll.bulk_write([InsertOne({"_id": 2, "email": "a@b.com"})])
+    we = ei.value.details["writeErrors"][0]
+    # Non-_id unique index: the dup-key fragment carries the indexed field's
+    # value, string-quoted the way the mongo shell prints it.
+    assert re.search(r'index: email_1 dup key: \{ email: "a@b\.com" \}', we["errmsg"]), we["errmsg"]
+
+
+def test_collmod_retunes_ttl_index_expiry(coll) -> None:
+    coll.create_index([("lastAccess", 1)], expireAfterSeconds=3)
+    res = coll.database.command(
+        "collMod",
+        coll.name,
+        index={"keyPattern": {"lastAccess": 1}, "expireAfterSeconds": 1000},
+    )
+    # mongod echoes the before/after expiry on a TTL retune.
+    assert res["expireAfterSeconds_old"] == 3
+    assert res["expireAfterSeconds_new"] == 1000
+    # The new value is what listIndexes now reports.
+    ix = next(i for i in coll.list_indexes() if i["name"] == "lastAccess_1")
+    assert ix["expireAfterSeconds"] == 1000
+
+
+def test_collmod_by_index_name(coll) -> None:
+    coll.create_index([("lastAccess", 1)], expireAfterSeconds=5, name="ttl_idx")
+    res = coll.database.command(
+        "collMod", coll.name, index={"name": "ttl_idx", "expireAfterSeconds": 60}
+    )
+    assert res["expireAfterSeconds_old"] == 5
+    assert res["expireAfterSeconds_new"] == 60
+
+
+def test_collmod_unknown_index_errors(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"x": 1})
+    with pytest.raises(OperationFailure):
+        coll.database.command(
+            "collMod", coll.name, index={"keyPattern": {"nope": 1}, "expireAfterSeconds": 10}
+        )
+
+
+def test_server_status_open_cursor_count(coll) -> None:
+    def open_cursors() -> int:
+        return coll.database.command("serverStatus")["metrics"]["cursor"]["open"]["total"]
+
+    coll.insert_many([{"_id": i} for i in range(3)])
+    baseline = open_cursors()
+
+    # A batched find over 3 docs leaves the server cursor alive (1 pending)
+    # after the first batch of 2 — the open count rises by exactly one.
+    cur = coll.find({}, batch_size=2)
+    next(cur)
+    assert cur.alive  # 1 doc still pending server-side
+    assert open_cursors() == baseline + 1
+
+    # Closing the cursor sends killCursors; the count returns to baseline.
+    cur.close()
+    assert open_cursors() == baseline
+
+
+def test_count_hint_sparse_index(coll) -> None:
+    coll.insert_many([{"x": 1}, {"x": 2}, {"y": 3}])
+    coll.create_index("x", sparse=True, name="sparse_x")
+    coll.create_index("y", name="y_1")
+    # Hinting the sparse x-index counts only the docs that HAVE x (2 of 3).
+    assert coll.count_documents({}, hint="sparse_x") == 2
+    assert coll.count_documents({}, hint=[("x", 1)]) == 2
+    # A non-sparse index has an entry for every doc (missing field -> null),
+    # so it counts them all.
+    assert coll.count_documents({}, hint="y_1") == 3
+
+
+def test_index_info_reports_2dsphere_version(coll) -> None:
+    coll.create_index([("pos", "2dsphere")])
+    info = next(i for i in coll.list_indexes() if i["name"] == "pos_2dsphere")
+    # mongod stamps every 2dsphere index with its format version (>= 3).
+    assert info.get("2dsphereIndexVersion", 0) >= 3
+
+
+def test_find_no_sort_returns_insertion_order(coll) -> None:
+    from bson import ObjectId
+
+    # Mixed / non-monotonic _id types where BSON sort order != insertion order.
+    docs = [
+        {"_id": 1, "x": 11},
+        {"_id": ObjectId(), "x": 22},
+        {"_id": "foo", "x": 33},
+        {"_id": "bar", "x": 44},
+    ]
+    coll.insert_many(docs)
+    # find() with no sort returns insertion order, like mongod — NOT _id order.
+    assert [d["x"] for d in coll.find({})] == [11, 22, 33, 44]
+    # $natural hint is the same insertion order.
+    assert [d["x"] for d in coll.find({}).hint([("$natural", 1)])] == [11, 22, 33, 44]
+
+
 def test_drop_collection_via_pymongo(client: MongoClient) -> None:
     db = client["dropdb"]
     db["things"].insert_one({"x": 1})
@@ -1182,6 +1309,61 @@ def test_explain_find_returns_query_planner(coll) -> None:
     assert explanation["queryPlanner"]["namespace"].endswith(".things")
     assert "winningPlan" in explanation["queryPlanner"]
     assert "serverInfo" in explanation
+
+
+def test_explain_verbosity_controls_execution_stats(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    db = coll.database
+    inner = {"find": coll.name, "filter": {"n": {"$gte": 2}}}
+
+    # queryPlanner: no executionStats at all.
+    qp = db.command({"explain": inner, "verbosity": "queryPlanner"})
+    assert "queryPlanner" in qp
+    assert "executionStats" not in qp
+
+    # executionStats: executionStats present, but NO allPlansExecution.
+    es = db.command({"explain": inner, "verbosity": "executionStats"})
+    assert "executionStats" in es
+    assert "allPlansExecution" not in es["executionStats"]
+
+    # allPlansExecution: executionStats present WITH an allPlansExecution array.
+    ape = db.command({"explain": inner, "verbosity": "allPlansExecution"})
+    assert "allPlansExecution" in ape["executionStats"]
+    assert isinstance(ape["executionStats"]["allPlansExecution"], list)
+
+
+def test_explain_aggregate_allplansexecution_present(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(5)])
+    inner = {"aggregate": coll.name, "pipeline": [{"$match": {"n": {"$gte": 2}}}], "cursor": {}}
+    res = coll.database.command({"explain": inner, "verbosity": "allPlansExecution"})
+    # Aggregate-explain surfaces executionStats both top-level and per-$cursor.
+    assert "allPlansExecution" in res["executionStats"]
+    cursor_stats = res["stages"][0]["$cursor"]["executionStats"]
+    assert "allPlansExecution" in cursor_stats
+
+
+def test_aggregate_inline_explain_returns_plan_not_data(coll) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(3)])
+    # The legacy inline ``explain: true`` flag on the aggregate command must
+    # return an explain document (stages / queryPlanner), not pipeline output.
+    res = coll.database.command(
+        {"aggregate": coll.name, "pipeline": [{"$match": {"_id": {"$ne": 1}}}], "explain": True}
+    )
+    assert "stages" in res or "queryPlanner" in res
+
+
+def test_aggregate_inline_explain_does_not_run_out(coll, client) -> None:
+    coll.insert_many([{"_id": i, "n": i} for i in range(3)])
+    out_name = "explain_out_things"
+    coll.database.command(
+        {
+            "aggregate": coll.name,
+            "pipeline": [{"$match": {}}, {"$out": out_name}],
+            "explain": True,
+        }
+    )
+    # Explain must NOT execute the $out write stage.
+    assert client["testdb"][out_name].count_documents({}) == 0
 
 
 def test_explain_find_collscan_when_no_index(coll) -> None:

@@ -358,6 +358,109 @@ def _collect_rust(raw_dir: Path) -> GaugeStats | None:
     )
 
 
+def _collect_php_ext(raw_dir: Path) -> GaugeStats | None:
+    """Walk run-tests.php JUnit XML (``.validation/php-ext-junit.xml``).
+
+    Excludes the ``tests/bson`` directory: those ~440 cases are pure
+    in-process BSON serialization tests that never open a connection to
+    SecantusDB (same rationale as the Java ``:bson:test`` exclusion).
+    Only the wire-protocol directories measure SecantusDB's command
+    surface, which is what the compatibility number should reflect.
+    """
+    f = raw_dir / "php-ext-junit.xml"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for case in root.iter("testcase"):
+        name = case.attrib.get("name", "")
+        # Category is the path component after ``tests/`` in the name.
+        cat = name.split("tests/", 1)[1].split("/", 1)[0] if "tests/" in name else ""
+        if cat == "bson":
+            continue
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed += 1
+            failure_descs.append(name)
+        elif case.find("skipped") is not None:
+            skipped += 1
+        else:
+            passed += 1
+    return GaugeStats(
+        name="mongo-php-driver",
+        language="PHP",
+        driver_version=_read_submodule_head("mongo-php-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated .phpt wire-protocol tests (bson serialization units excluded)",
+    )
+
+
+# php-library categories that open a real connection to SecantusDB. The
+# pure-code units (Builder / Comparator / Functions / Model — query-builder
+# DSL, BSON comparators, helper functions) never touch the server, so they're
+# excluded from the compatibility number the same way Java's bson codec units
+# are.
+_PHP_LIB_SERVER_CATEGORIES = frozenset({"Operation", "Collection", "Database", "Command"})
+
+
+def _collect_php_lib(raw_dir: Path) -> GaugeStats | None:
+    """Walk PHPUnit JUnit XML (``.validation/php-lib-junit.xml``).
+
+    Counts only the server-touching functional categories (see
+    ``_PHP_LIB_SERVER_CATEGORIES``); the pure-code DSL / comparator /
+    helper units are run but not counted, mirroring the Java gauge.
+    """
+    f = raw_dir / "php-lib-junit.xml"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+
+    def _category(case: ET.Element) -> str:
+        file = case.attrib.get("file", "")
+        if "/tests/" in file:
+            return file.split("/tests/", 1)[1].split("/", 1)[0]
+        cls = case.attrib.get("class", "")
+        parts = cls.split("\\")
+        if "Tests" in parts:
+            i = parts.index("Tests")
+            if i + 1 < len(parts):
+                return parts[i + 1]
+        return ""
+
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for case in root.iter("testcase"):
+        if _category(case) not in _PHP_LIB_SERVER_CATEGORIES:
+            continue
+        name = f"{case.attrib.get('class', '?')}::{case.attrib.get('name', '?')}"
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed += 1
+            failure_descs.append(name)
+        elif case.find("skipped") is not None:
+            skipped += 1
+        else:
+            passed += 1
+    return GaugeStats(
+        name="mongo-php-library",
+        language="PHP",
+        driver_version=_read_submodule_head("mongo-php-library"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated functional tests (Operation / Collection / Database / Command)",
+    )
+
+
 _COLLECTORS = (
     _collect_pymongo,
     _collect_java,
@@ -365,7 +468,22 @@ _COLLECTORS = (
     _collect_node,
     _collect_ruby,
     _collect_rust,
+    _collect_php_lib,
+    _collect_php_ext,
 )
+
+# Gauge name -> its per-driver report page (relative to docs/). Used by the
+# "Per-driver reports" link list; a gauge without an entry is omitted.
+_REPORT_LINKS = {
+    "pymongo": "./validation-report.md",
+    "mongo-java-driver": "./validation-report-java.md",
+    "mongo-go-driver": "./validation-report-go.md",
+    "mongo-node-driver": "./validation-report-node.md",
+    "mongo-ruby-driver": "./validation-report-ruby.md",
+    "mongo-rust-driver": "./validation-report-rust.md",
+    "mongo-php-library": "./validation-report-php-lib.md",
+    "mongo-php-driver": "./validation-report-php-ext.md",
+}
 
 
 # Map gauge ``name`` to the matching expected-failures list.
@@ -415,7 +533,7 @@ def render(raw_dir: Path, out_path: Path) -> None:
         f"Generated {dt.date.today().isoformat()} — SecantusDB {secantus.__version__}. "
         "Each per-driver gauge runs the driver vendor's own integration test suite "
         "(unmodified) against a SecantusDB daemon and emits its raw output to "
-        "`.validation/`. This summary normalises on **test count** so the five gauges "
+        f"`.validation/`. This summary normalises on **test count** so the {len(gauges)} gauges "
         "compare like for like — every row counts one assertion outcome, "
         "whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, "
         "a `go test` event, or a pytest collected item."
@@ -494,16 +612,15 @@ def render(raw_dir: Path, out_path: Path) -> None:
         "one whose pass / fail counts you want to dig into:"
     )
     md.append("")
-    md.append("- [pymongo](./validation-report.md)")
-    md.append("- [mongo-java-driver](./validation-report-java.md)")
-    md.append("- [mongo-go-driver](./validation-report-go.md)")
-    md.append("- [mongo-node-driver](./validation-report-node.md)")
-    md.append("- [mongo-ruby-driver](./validation-report-ruby.md)")
+    for g in gauges:
+        report = _REPORT_LINKS.get(g.name)
+        if report:
+            md.append(f"- [{g.name}]({report})")
     md.append("")
     md.append("## Refreshing")
     md.append("")
     md.append(
-        "Run all five gauges plus this summary:\n"
+        f"Run all {len(gauges)} gauges plus this summary:\n"
         "\n"
         "```\n"
         "uv run python -m invoke validate-all\n"

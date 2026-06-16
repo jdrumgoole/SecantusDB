@@ -1,7 +1,7 @@
 //! Collection/index DDL + introspection + db-admin commands: `create` /
 //! `collMod` / `explain` / `drop` / `listCollections` / `listIndexes` /
 //! `createIndexes` / `dropIndexes` / `dropDatabase` / `renameCollection` /
-//! `collStats` / `dbStats` / `serverStatus`.
+//! `collStats` / `dbStats` / `serverStatus` / `validate` / `profile`.
 //!
 //! Ports of the corresponding `commands.py` handlers, scoped to the core paths.
 //!
@@ -13,8 +13,10 @@
 //! **Deferred (documented so parity is honest):**
 //! * `create` unknown-field validation (`Location40415`); views; capped-size
 //!   enforcement; `collMod`'s TTL-index `index: {expireAfterSeconds}` modify.
-//! * `validator` enforcement on `update` / replace (needs the post-apply doc in
-//!   storage — insert is enforced at the command layer).
+//! * `validator` enforcement on `findAndModify` (insert / `update` / replace are
+//!   enforced — the command layer reads the validator and the storage update
+//!   checks the post-apply doc; code 121, bypassable via
+//!   `bypassDocumentValidation`).
 //! * `listCollections` name/filter + the richer per-collection `options` /
 //!   `idIndex` detail (a minimal, faithful-enough entry is returned).
 //! * `listIndexes` `NamespaceNotFound` on a missing collection (returns an empty
@@ -27,7 +29,9 @@
 use bson::{doc, Bson, Document};
 
 use crate::find::split_into_cursor;
-use crate::util::{as_i64, coll_arg, collation_of, command_error, docs_to_bson, encode_docs};
+use crate::util::{
+    as_i64, bool_field, coll_arg, collation_of, command_error, docs_to_bson, encode_docs,
+};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SERVER_VERSION};
 
 /// Collection-option keys (from `create` / `collMod`) the Rust server persists.
@@ -352,6 +356,88 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 }
 
 /// `createIndexes` — create one or more indexes (auto-creating the collection).
+/// Field-level query operators a `partialFilterExpression` may use. A `$`-key in
+/// a field clause outside this set is an unknown operator (rejected).
+const KNOWN_FIELD_OPS: &[&str] = &[
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$exists",
+    "$type",
+    "$regex",
+    "$options",
+    "$mod",
+    "$size",
+    "$all",
+    "$elemMatch",
+    "$not",
+    "$bitsAllSet",
+    "$bitsAnySet",
+    "$bitsAllClear",
+    "$bitsAnyClear",
+    "$geoWithin",
+    "$geoIntersects",
+    "$near",
+    "$nearSphere",
+    "$comment",
+    "$maxDistance",
+    "$minDistance",
+    "$geometry",
+    "$center",
+    "$centerSphere",
+    "$box",
+    "$polygon",
+];
+
+/// Document-level query operators accepted in a `partialFilterExpression` (the
+/// logical / expression operators; `$and`/`$or`/`$nor` are recursed below).
+const KNOWN_DOC_OPS: &[&str] = &["$expr", "$comment", "$text", "$where", "$jsonSchema"];
+
+/// A conservative filter-validity check for `partialFilterExpression`:
+/// `Some(reason)` for a clearly-invalid construct (a malformed `$and`/`$or`/`$nor`
+/// or an unknown operator), else `None`. Deliberately lenient — it only rejects
+/// operators outside the known sets, so a valid filter is never wrongly refused.
+fn invalid_partial_filter(filter: &Document) -> Option<String> {
+    for (k, v) in filter {
+        if let Some(stripped) = k.strip_prefix('$') {
+            match k.as_str() {
+                "$and" | "$or" | "$nor" => match v {
+                    Bson::Array(arr) => {
+                        for elem in arr {
+                            match elem {
+                                Bson::Document(sub) => {
+                                    if let Some(r) = invalid_partial_filter(sub) {
+                                        return Some(r);
+                                    }
+                                }
+                                _ => return Some(format!("{k} elements must be documents")),
+                            }
+                        }
+                    }
+                    _ => return Some(format!("{k} must be an array")),
+                },
+                _ if KNOWN_DOC_OPS.contains(&k.as_str()) => {}
+                _ => return Some(format!("unknown top-level operator ${stripped}")),
+            }
+        } else if let Bson::Document(opd) = v {
+            // A field clause whose value is an operator document: every `$`-key
+            // must be a known field operator.
+            if let Some(bad) = opd
+                .keys()
+                .find(|kk| kk.starts_with('$') && !KNOWN_FIELD_OPS.contains(&kk.as_str()))
+            {
+                return Some(format!("unknown operator {bad}"));
+            }
+        }
+    }
+    None
+}
+
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "createIndexes")?;
     let storage = ctx.storage()?;
@@ -381,6 +467,32 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .and_then(Bson::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| default_index_name(&key));
+        // `partialFilterExpression` must be a document and a parseable filter —
+        // mongod rejects a non-document, unknown operators (`{x: {$asdasd: 3}}`),
+        // and malformed logical operators (`{$and: 5}`). (pymongo's
+        // `test_index_filter` pins these.)
+        if let Some(pfe) = s.get("partialFilterExpression") {
+            match pfe {
+                Bson::Document(f) => {
+                    if let Some(reason) = invalid_partial_filter(f) {
+                        return Ok(CommandError::new(
+                            2,
+                            "BadValue",
+                            format!("Error in specification, partialFilterExpression is invalid: {reason}"),
+                        )
+                        .into_reply());
+                    }
+                }
+                _ => {
+                    return Ok(CommandError::new(
+                        2,
+                        "BadValue",
+                        "partialFilterExpression must be a document",
+                    )
+                    .into_reply())
+                }
+            }
+        }
         storage
             .create_index(&ctx.db_name, &coll, &name, &key, s)
             .map_err(command_error)?;
@@ -583,6 +695,129 @@ pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
         "secantus": { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
         "ok": 1.0,
     })
+}
+
+/// `validate` — mongod's collection consistency check. SecantusDB stores
+/// documents as opaque BSON and maintains index entries transactionally, so
+/// there's nothing to repair: report a clean, mongod-shaped result with real
+/// record / index counts. `full` / `background` / `scandata` are accepted and
+/// ignored (they only affect how mongod scans, not the verdict). Ports
+/// `commands.py::_validate`.
+pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let coll = match doc.get("validate") {
+        Some(Bson::String(s)) => s.clone(),
+        _ => {
+            return Ok(
+                CommandError::new(14, "TypeMismatch", "validate requires a collection name")
+                    .into_reply(),
+            )
+        }
+    };
+    let storage = ctx.storage()?;
+    if !storage
+        .collection_exists(&ctx.db_name, &coll)
+        .map_err(command_error)?
+    {
+        return Ok(CommandError::new(
+            26,
+            "NamespaceNotFound",
+            format!(
+                "Collection '{}.{}' does not exist to validate.",
+                ctx.db_name, coll
+            ),
+        )
+        .into_reply());
+    }
+    // mongod rejects full+background together (full needs an exclusive scan).
+    if bool_field(doc, "full", false) && bool_field(doc, "background", false) {
+        return Ok(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Running the validate command with both { background: true } and { full: true } is \
+             not supported.",
+        )
+        .into_reply());
+    }
+    let nrecords = storage
+        .count_matching(&ctx.db_name, &coll, &Document::new())
+        .map_err(command_error)? as i64;
+    let indexes = storage
+        .list_indexes(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    let mut keys_per_index = Document::new();
+    let mut index_details = Document::new();
+    let mut n_indexes = 0i32;
+    for ix in &indexes {
+        if let Ok(name) = ix.get_str("name") {
+            keys_per_index.insert(name, nrecords);
+            index_details.insert(name, doc! { "valid": true });
+            n_indexes += 1;
+        }
+    }
+    Ok(doc! {
+        "ns": format!("{}.{}", ctx.db_name, coll),
+        "nInvalidDocuments": 0i64,
+        "nNonCompliantDocuments": 0i64,
+        "nrecords": nrecords,
+        "nIndexes": n_indexes,
+        "keysPerIndex": keys_per_index,
+        "indexDetails": index_details,
+        "valid": true,
+        "repaired": false,
+        "warnings": Bson::Array(vec![]),
+        "errors": Bson::Array(vec![]),
+        "extraIndexEntries": Bson::Array(vec![]),
+        "missingIndexEntries": Bson::Array(vec![]),
+        "corruptRecords": Bson::Array(vec![]),
+        "ok": 1.0,
+    })
+}
+
+/// `profile` — get / set per-database profiling level. `{profile: -1}` reads;
+/// `{profile: 0|1|2, slowms, sampleRate}` updates. The reply carries the
+/// PREVIOUS values under `was` / `slowms` / `sampleRate`. Ports
+/// `commands.py::_profile`. (SecantusDB records the level but does no actual
+/// slow-op profiling — `system.profile` stays a faithful stub.)
+pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let db = ctx.db_name.clone();
+    let storage = ctx.storage()?;
+    let prev = storage.get_profile(&db).map_err(command_error)?;
+    let prev_level = prev.get_i32("level").unwrap_or(0);
+    let prev_slowms = prev.get_i32("slowms").unwrap_or(100);
+    let prev_rate = prev.get_f64("sampleRate").unwrap_or(1.0);
+    let was = doc! {
+        "was": prev_level,
+        "slowms": prev_slowms,
+        "sampleRate": prev_rate,
+        "ok": 1.0,
+    };
+    let arg = match doc.get("profile") {
+        Some(Bson::Int32(n)) => Some(*n),
+        Some(Bson::Int64(n)) => Some(*n as i32),
+        Some(Bson::Double(d)) if d.fract() == 0.0 => Some(*d as i32),
+        _ => None,
+    };
+    match arg {
+        Some(-1) => Ok(was),
+        Some(level) if (0..=2).contains(&level) => {
+            let slowms = doc
+                .get("slowms")
+                .and_then(as_i64)
+                .map(|n| n as i32)
+                .unwrap_or(prev_slowms);
+            let rate = doc
+                .get("sampleRate")
+                .and_then(Bson::as_f64)
+                .unwrap_or(prev_rate);
+            storage
+                .set_profile(&db, level, slowms, rate)
+                .map_err(command_error)?;
+            Ok(was)
+        }
+        _ => Ok(
+            CommandError::new(14, "TypeMismatch", "profile must be -1, 0, 1, or 2").into_reply(),
+        ),
+    }
 }
 
 /// Split a `db.coll` namespace into `(db, coll)`.

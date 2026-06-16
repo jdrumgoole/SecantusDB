@@ -184,6 +184,10 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Err(StorageError::Internal(msg)) => {
                 return Ok(CommandError::new(1, "InternalError", msg).into_reply())
             }
+            // A write conflict fails the whole statement command-level (mongod
+            // semantics), so the dispatch txn envelope attaches the transient
+            // label and drivers retry the transaction.
+            Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
                 write_errors.push(Bson::Document(write_error(index, e)));
                 if ordered {
@@ -233,6 +237,45 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
     "$replaceWith",
 ];
 
+/// Update modifiers mongod accepts (`secantus.update._KNOWN_UPDATE_OPS`). A
+/// top-level `$`-key outside this set is an "Unknown modifier" parse error.
+const KNOWN_UPDATE_OPS: [&str; 14] = [
+    "$set",
+    "$setOnInsert",
+    "$unset",
+    "$currentDate",
+    "$inc",
+    "$mul",
+    "$min",
+    "$max",
+    "$push",
+    "$addToSet",
+    "$pull",
+    "$pop",
+    "$rename",
+    "$bit",
+];
+
+/// Parse-time check of an operator-form update document, mirroring
+/// `secantus.update.validate_update_doc`: `Some(errmsg)` for an unknown modifier
+/// or a mix of operators and replacement fields, else `None` (a pure replacement
+/// or a valid operator update). Surfaces as a `FailedToParse` (9) write error.
+fn unsupported_update_modifier(u: &Document) -> Option<String> {
+    if !u.keys().any(|k| k.starts_with('$')) {
+        return None; // replacement-style update
+    }
+    if !u.keys().all(|k| k.starts_with('$')) {
+        return Some("update document cannot mix operators with replacement fields".to_string());
+    }
+    u.keys()
+        .find(|k| !KNOWN_UPDATE_OPS.contains(&k.as_str()))
+        .map(|k| {
+            format!(
+                "Unknown modifier: {k}. Expected a valid update modifier (e.g. $set, $unset, $inc, ...)"
+            )
+        })
+}
+
 /// `update` — batch update, one entry per `{q, u, multi?, upsert?}` spec. Ports
 /// `commands.py::_update`. Document-, replacement-, and pipeline-form `u` all
 /// apply (pipeline via `Storage::update_matching_pipeline`, diff-style oplog so
@@ -262,6 +305,24 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // (and to pipeline-form `u` expressions). Resolved once for the batch.
     let let_vars = resolve_let_vars(doc.get("let"));
 
+    // Collection validator on the POST-APPLY document (code 121) unless
+    // `bypassDocumentValidation` or `validationAction: warn|off`. The validator
+    // is read once here (no storage lock held) and threaded into the storage
+    // update so it can check the rewritten doc before writing.
+    let validator = if bool_field(doc, "bypassDocumentValidation", false) {
+        None
+    } else {
+        let opts = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map_err(command_error)?;
+        let action = opts.get_str("validationAction").unwrap_or("error");
+        if action == "warn" || action == "off" {
+            None
+        } else {
+            opts.get("validator").and_then(Bson::as_document).cloned()
+        }
+    };
+
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
 
@@ -283,6 +344,22 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let q = doc_field(spec, "q");
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
+
+        // Parse-time validation of an operator-form `u`: an unknown modifier (or
+        // mixing operators with replacement fields) is rejected at parse time —
+        // mongod errors even against an empty / no-match collection, where the
+        // apply-time engine would never run. Pipeline-form `u` is validated below.
+        if !matches!(spec.get("u"), Some(Bson::Array(_))) {
+            if let Some(errmsg) = unsupported_update_modifier(&doc_field(spec, "u")) {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32, "code": 9, "errmsg": errmsg,
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
@@ -320,6 +397,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 upsert,
                 &let_vars,
                 collation.as_ref(),
+                validator.as_ref(),
             )
         } else {
             let u = doc_field(spec, "u");
@@ -341,6 +419,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &array_filters,
                 &let_vars,
                 collation.as_ref(),
+                validator.as_ref(),
             )
         };
 
@@ -356,6 +435,10 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Err(StorageError::Internal(msg)) => {
                 return Ok(CommandError::new(1, "InternalError", msg).into_reply())
             }
+            // A write conflict fails the whole statement command-level (mongod
+            // semantics), so the dispatch txn envelope attaches the transient
+            // label and drivers retry the transaction.
+            Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
                 write_errors.push(Bson::Document(write_error(index, e)));
                 if ordered {
@@ -547,6 +630,7 @@ mod tests {
             _upsert: bool,
             _let_vars: &Document,
             _collation: Option<&crate::storage::Collation>,
+            _validator: Option<&Document>,
         ) -> Result<UpdateOutcome, StorageError> {
             // Apply the pipeline to each matched doc (the real storage path).
             let mut cols = self.cols.lock().unwrap();

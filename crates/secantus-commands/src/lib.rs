@@ -96,6 +96,10 @@ pub struct CommandContext {
     /// The per-server cursor registry (drives `getMore` / `killCursors`). `None`
     /// until the server wires one in.
     pub cursors: Option<Arc<CursorRegistry>>,
+    /// The per-server multi-document-transaction registry (drives the
+    /// `autocommit: false` envelope + `commitTransaction` / `abortTransaction`).
+    /// `None` until the server wires one in (and on standalone-less test paths).
+    pub transactions: Option<Arc<transactions::TransactionRegistry>>,
     /// Per-connection authentication state (SCRAM conversation + authenticated
     /// principals), shared across the requests on one socket. `None` until the
     /// server (R4) wires one in; the auth family needs it.
@@ -123,6 +127,7 @@ impl CommandContext {
             },
             storage: None,
             cursors: None,
+            transactions: None,
             conn_auth: None,
             peer_cert_dn: None,
         }
@@ -137,6 +142,16 @@ impl CommandContext {
     /// Attach a cursor registry (builder-style; used by the server and tests).
     pub fn with_cursors(mut self, cursors: Arc<CursorRegistry>) -> Self {
         self.cursors = Some(cursors);
+        self
+    }
+
+    /// Attach a transaction registry (builder-style; used by the server and
+    /// tests). Drives the multi-document-transaction envelope.
+    pub fn with_transactions(
+        mut self,
+        transactions: Arc<transactions::TransactionRegistry>,
+    ) -> Self {
+        self.transactions = Some(transactions);
         self
     }
 
@@ -251,13 +266,16 @@ fn lookup(name: &str) -> Option<Handler> {
         "collStats" => admin::coll_stats,
         "dbStats" => admin::db_stats,
         "serverStatus" => admin::server_status,
+        "validate" => admin::validate,
+        "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
         "endSessions"
         | "refreshSessions"
         | "killSessions"
         | "killAllSessions"
         | "killAllSessionsByPattern" => diagnostics::ok_session_noop,
-        "commitTransaction" | "abortTransaction" => diagnostics::ok_transaction,
+        "commitTransaction" => commit_transaction,
+        "abortTransaction" => abort_transaction,
         "saslStart" => auth::sasl_start,
         "saslContinue" => auth::sasl_continue,
         "authenticate" => auth::authenticate,
@@ -326,7 +344,7 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
 fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     let name = command_name(doc);
 
-    if let Err(e) = validate_read_concern(doc) {
+    if let Err(e) = validate_read_concern(doc, name, ctx) {
         return e.into_reply();
     }
     if let Err(e) = validate_api(doc, name) {
@@ -341,12 +359,354 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if let Err(e) = authorize(name, doc, ctx) {
                 return e.into_reply();
             }
-            match handler(doc, ctx) {
-                Ok(reply) => reply,
-                Err(e) => e.into_reply(),
+            // Time profile-eligible commands so dispatch can record a
+            // `system.profile` entry when the per-database level requires it.
+            let start = profile_eligible(name, doc).then(std::time::Instant::now);
+            let reply = run_with_txn_envelope(name, handler, doc, ctx);
+            if let Some(start) = start {
+                maybe_record_profile(name, doc, &reply, start, ctx);
             }
+            reply
         }
         None => CommandError::command_not_found(name).into_reply(),
+    }
+}
+
+/// `commitTransaction` — commit the session's transaction via the registry
+/// (idempotent; an envelope-less call is a tolerated no-op). Mirrors
+/// `commands.py::_commit_transaction`.
+fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let (lsid, txn_number) = txn_envelope(doc);
+    match (&ctx.transactions, lsid, txn_number) {
+        (Some(reg), Some(lsid), Some(n)) => match reg.commit(&lsid, n) {
+            None => Ok(doc! { "ok": 1.0 }),
+            Some(reply) => Ok(reply),
+        },
+        _ => Ok(doc! { "ok": 1.0 }),
+    }
+}
+
+/// `abortTransaction` — roll back the session's transaction via the registry.
+/// Mirrors `commands.py::_abort_transaction`.
+fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let (lsid, txn_number) = txn_envelope(doc);
+    match (&ctx.transactions, lsid, txn_number) {
+        (Some(reg), Some(lsid), Some(n)) => match reg.abort(&lsid, n) {
+            None => Ok(doc! { "ok": 1.0 }),
+            Some(reply) => Ok(reply),
+        },
+        _ => Ok(doc! { "ok": 1.0 }),
+    }
+}
+
+/// Commands dispatch never profiles (handshake / auth / session / cursor
+/// framing + `profile` itself), mirroring `commands.py::_PROFILE_SKIP_COMMANDS`.
+fn profile_skip_command(name: &str) -> bool {
+    matches!(
+        name,
+        "hello"
+            | "isMaster"
+            | "ismaster"
+            | "ping"
+            | "buildInfo"
+            | "buildinfo"
+            | "whatsmyuri"
+            | "saslStart"
+            | "saslContinue"
+            | "logout"
+            | "connectionStatus"
+            | "startSession"
+            | "endSessions"
+            | "refreshSessions"
+            | "getMore"
+            | "killCursors"
+            | "profile"
+    )
+}
+
+/// Whether dispatch should time + maybe record this command in `system.profile`.
+/// Excludes framing commands and any op against `system.profile` itself (a
+/// recursion / unbounded-growth guard). Mirrors `_profile_eligible_command`.
+fn profile_eligible(name: &str, doc: &Document) -> bool {
+    if profile_skip_command(name) {
+        return false;
+    }
+    !matches!(doc.get(name), Some(Bson::String(s)) if s == "system.profile")
+}
+
+/// mongod's profiler `op` bucket for a command (`find` → `query`, writes →
+/// `insert`/`update`/`remove`, everything else → `command`).
+fn profile_op_label(name: &str) -> &'static str {
+    match name {
+        "find" => "query",
+        "insert" => "insert",
+        "update" => "update",
+        "delete" => "remove",
+        _ => "command",
+    }
+}
+
+/// The mongod-shaped `system.profile` entry for a finished command, recorded
+/// when the per-database profiling level requires it. Ports
+/// `commands.py::_maybe_record_profile` (sample-rate skipping omitted — the
+/// gauge uses the default rate of 1.0). Failures are swallowed: the command
+/// already produced its reply.
+fn maybe_record_profile(
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    start: std::time::Instant,
+    ctx: &CommandContext,
+) {
+    let Some(storage) = ctx.storage.clone() else {
+        return;
+    };
+    let db = ctx.db_name.clone();
+    let Ok(settings) = storage.get_profile(&db) else {
+        return;
+    };
+    let level = settings.get_i32("level").unwrap_or(0);
+    if level == 0 {
+        return;
+    }
+    let duration_ms = start.elapsed().as_millis() as i64;
+    let slowms = settings.get_i32("slowms").unwrap_or(100) as i64;
+    if level == 1 && duration_ms < slowms {
+        return;
+    }
+    // `ns`: db.coll when the command names a collection, else db.
+    let ns = match doc.get(name) {
+        Some(Bson::String(c)) if !c.is_empty() => format!("{db}.{c}"),
+        _ => db.clone(),
+    };
+    // `command`: the request minus framing fields.
+    let mut command = doc.clone();
+    for k in ["$db", "$clusterTime", "lsid", "$readPreference"] {
+        command.remove(k);
+    }
+    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let mut entry = doc! {
+        "ts": bson::DateTime::now(),
+        "op": profile_op_label(name),
+        "ns": ns,
+        "command": command,
+        "millis": duration_ms as i32,
+        "ok": if ok { 1.0 } else { 0.0 },
+        "client": "",
+    };
+    if !ok {
+        if let Ok(em) = reply.get_str("errmsg") {
+            entry.insert("errMsg", em.to_string());
+        }
+    }
+    let mut bytes = Vec::new();
+    if entry.to_writer(&mut bytes).is_ok() {
+        let _ = storage.insert(&db, "system.profile", vec![bytes], true);
+    }
+}
+
+/// Run `handler`, mapping its `Err` into the standard error reply.
+fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Document {
+    match handler(doc, ctx) {
+        Ok(reply) => reply,
+        Err(e) => e.into_reply(),
+    }
+}
+
+/// Commands permitted as statements inside a multi-document transaction
+/// (`commands.py::_TXN_ALLOWED_COMMANDS`). `commitTransaction` / `abortTransaction`
+/// are the controls, handled by their own handlers, not the statement path.
+fn txn_allowed_command(name: &str) -> bool {
+    matches!(
+        name,
+        "insert"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
+            | "find"
+            | "getMore"
+            | "killCursors"
+            | "aggregate"
+            | "distinct"
+            | "bulkWrite"
+            | "create"
+            | "createIndexes"
+    )
+}
+
+/// Aggregation stages mongod refuses inside a transaction.
+fn txn_blocked_agg_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "$out"
+            | "$merge"
+            | "$changeStream"
+            | "$collStats"
+            | "$currentOp"
+            | "$indexStats"
+            | "$listLocalSessions"
+            | "$listSessions"
+    )
+}
+
+/// Error codes that earn the `TransientTransactionError` label when a statement
+/// inside a transaction fails (`commands.py::_TRANSIENT_TXN_CODES`). Notably NOT
+/// 11000 duplicate key — it aborts the transaction but retrying wouldn't help.
+fn is_transient_txn_code(code: i32) -> bool {
+    matches!(
+        code,
+        112 | 246 | 251 | 24 | 6 | 7 | 89 | 91 | 189 | 9001 | 10107 | 11600 | 11602 | 13435 | 13436
+    )
+}
+
+/// The mongod-shaped reason a statement can't run in a transaction, or `None`.
+fn txn_unsupported_reason(name: &str, doc: &Document) -> Option<String> {
+    if !txn_allowed_command(name) {
+        return Some(format!(
+            "Cannot run '{name}' in a multi-document transaction."
+        ));
+    }
+    if name == "aggregate" {
+        if let Some(Bson::Array(pipeline)) = doc.get("pipeline") {
+            for stage in pipeline {
+                if let Some(s) = stage.as_document().and_then(|d| d.keys().next()) {
+                    if txn_blocked_agg_stage(s) {
+                        return Some(format!(
+                            "Operation not permitted in transaction :: caused by :: Aggregation \
+                             stage {s} cannot run within a multi-document transaction."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The 16-byte UUID payload from a `lsid` argument (`{id: BinData(4, <uuid>)}`),
+/// or `None` for an unrecognised shape.
+fn lsid_bytes_from_arg(entry: Option<&Bson>) -> Option<Vec<u8>> {
+    let d = entry?.as_document()?;
+    match d.get("id") {
+        Some(Bson::Binary(b)) => Some(b.bytes.clone()),
+        _ => None,
+    }
+}
+
+/// `(lsid_bytes, txnNumber)` from a command's transaction envelope; either is
+/// `None` when absent or malformed (a boolean `txnNumber` is rejected).
+fn txn_envelope(doc: &Document) -> (Option<Vec<u8>>, Option<i64>) {
+    let lsid = lsid_bytes_from_arg(doc.get("lsid"));
+    let txn_number = match doc.get("txnNumber") {
+        Some(Bson::Int32(n)) => Some(*n as i64),
+        Some(Bson::Int64(n)) => Some(*n),
+        _ => None,
+    };
+    (lsid, txn_number)
+}
+
+/// The multi-document-transaction envelope around a statement (port of the
+/// `commands.py::dispatch` transaction block). When the command carries an
+/// `autocommit: false` + `lsid` + `txnNumber` envelope it resolves / runs inside
+/// the transaction; a bare `txnNumber` (retryable write) just advances the
+/// session sequence; everything else runs the handler directly.
+fn run_with_txn_envelope(
+    name: &str,
+    handler: Handler,
+    doc: &Document,
+    ctx: &mut CommandContext,
+) -> Document {
+    let registry = match (&ctx.transactions, doc.contains_key("txnNumber")) {
+        (Some(r), true) => r.clone(),
+        _ => return run_handler(handler, doc, ctx),
+    };
+    let (Some(lsid), Some(txn_number)) = txn_envelope(doc) else {
+        return run_handler(handler, doc, ctx);
+    };
+    let autocommit_false = matches!(doc.get("autocommit"), Some(Bson::Boolean(false)));
+    if !autocommit_false {
+        // Retryable write: consumes the session's txnNumber sequence (and aborts
+        // an older in-progress transaction), then runs normally.
+        registry.on_retryable_write(&lsid, txn_number);
+        return run_handler(handler, doc, ctx);
+    }
+    // commit/abort carry the same envelope but are controls (own handlers).
+    if name == "commitTransaction" || name == "abortTransaction" {
+        return run_handler(handler, doc, ctx);
+    }
+    let start = matches!(
+        doc.get("startTransaction"),
+        Some(Bson::Boolean(true)) | Some(Bson::Int32(1)) | Some(Bson::Int64(1))
+    );
+    let txn = match registry.for_statement(&lsid, txn_number, start) {
+        Ok(t) => t,
+        Err(reply) => return reply,
+    };
+    // A disallowed statement aborts the transaction, then errors (263).
+    if let Some(reason) = txn_unsupported_reason(name, doc) {
+        registry.abort_in_progress(&txn);
+        return CommandError::new(263, "OperationNotSupportedInTransaction", reason).into_reply();
+    }
+    let Some(storage) = ctx.storage.clone() else {
+        return run_handler(handler, doc, ctx);
+    };
+    // Create the WT transaction handle lazily at the first statement (the
+    // snapshot pins here).
+    {
+        let mut t = txn.lock().unwrap();
+        if t.handle.is_none() {
+            match storage.begin_user_transaction() {
+                Ok(h) => t.handle = Some(h),
+                Err(e) => {
+                    return CommandError::new(1, "InternalError", format!("{e:?}")).into_reply()
+                }
+            }
+        }
+    }
+    let mut result = {
+        let mut t = txn.lock().unwrap();
+        let handle = t.handle.as_mut().expect("handle created above").as_mut();
+        match storage.run_in_user_transaction(handle, &mut || run_handler(handler, doc, ctx)) {
+            Ok(r) => r,
+            Err(e) => CommandError::new(1, "InternalError", format!("{e:?}")).into_reply(),
+        }
+    };
+    finish_txn_statement(&registry, &txn, &mut result);
+    result
+}
+
+/// mongod parity: any failed statement aborts the transaction server-side. Only
+/// transient-class codes earn the `TransientTransactionError` label (E11000
+/// aborts unlabeled). Mirrors `commands.py::_finish_txn_statement`.
+fn finish_txn_statement(
+    registry: &transactions::TransactionRegistry,
+    txn: &std::sync::Arc<std::sync::Mutex<transactions::Transaction>>,
+    result: &mut Document,
+) {
+    let ok = result.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let failed = !ok || result.contains_key("writeErrors");
+    if !failed {
+        return;
+    }
+    registry.abort_in_progress(txn);
+    if !ok {
+        let code = result.get_i32("code").unwrap_or(0);
+        if is_transient_txn_code(code) {
+            let labels = match result.get_array_mut("errorLabels") {
+                Ok(arr) => arr,
+                Err(_) => {
+                    result.insert("errorLabels", Bson::Array(Vec::new()));
+                    result.get_array_mut("errorLabels").unwrap()
+                }
+            };
+            if !labels
+                .iter()
+                .any(|l| l.as_str() == Some(transactions::TRANSIENT_LABEL))
+            {
+                labels.push(Bson::String(transactions::TRANSIENT_LABEL.to_string()));
+            }
+        }
     }
 }
 
@@ -575,7 +935,11 @@ fn resource_for_command(
 
 /// `readConcern.level` validation (`commands.py::dispatch`): an invalid level is
 /// `FailedToParse` (9); `snapshot` is `SnapshotUnavailable` (246) on standalone.
-fn validate_read_concern(doc: &Document) -> Result<(), CommandError> {
+fn validate_read_concern(
+    doc: &Document,
+    name: &str,
+    ctx: &CommandContext,
+) -> Result<(), CommandError> {
     let Some(Bson::Document(rc)) = doc.get("readConcern") else {
         return Ok(());
     };
@@ -585,11 +949,24 @@ fn validate_read_concern(doc: &Document) -> Result<(), CommandError> {
     match level.as_str() {
         Some(l) if VALID_READ_CONCERN_LEVELS.contains(&l) => {
             if l == "snapshot" {
-                return Err(CommandError::new(
-                    246,
-                    "SnapshotUnavailable",
-                    "Snapshot read concern is not supported on standalone",
-                ));
+                // Inside a multi-document transaction (`autocommit: false`) every
+                // read runs against the txn's pinned WT snapshot — exactly what
+                // `snapshot` asks for on a single node — so it's accepted. Outside
+                // a txn, a replica-set member accepts `snapshot` on the snapshot-
+                // session reads (find / aggregate / distinct / getMore /
+                // killCursors); everything else is rejected like a standalone.
+                let in_txn = matches!(doc.get("autocommit"), Some(Bson::Boolean(false)));
+                let snapshot_readable = matches!(
+                    name,
+                    "find" | "aggregate" | "distinct" | "getMore" | "killCursors"
+                ) && ctx.replica_set_name.is_some();
+                if !in_txn && !snapshot_readable {
+                    return Err(CommandError::new(
+                        246,
+                        "SnapshotUnavailable",
+                        "Snapshot read concern is not supported on standalone",
+                    ));
+                }
             }
             Ok(())
         }

@@ -1,6 +1,6 @@
 [package]
 name = "secantus-wt"
-version = "0.5.3-beta.9"
+version = "0.5.3-beta.21"
 edition = "2021"
 description = "Safe Rust bindings over the vendored WiredTiger C library — the storage foundation for SecantusDB's Rust engine (Phase 4)."
 license = "GPL-2.0-only"

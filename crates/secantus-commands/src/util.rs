@@ -144,6 +144,11 @@ pub(crate) fn write_error(index: usize, err: StorageError) -> Document {
         StorageError::Internal(msg) => {
             doc! { "index": index as i32, "code": 1, "errmsg": msg }
         }
+        // WriteConflict is routed command-level by the handlers; degrade
+        // gracefully to a per-op 112 if it ever reaches here.
+        StorageError::WriteConflict => {
+            doc! { "index": index as i32, "code": 112, "errmsg": "WriteConflict" }
+        }
     }
 }
 
@@ -156,6 +161,12 @@ pub(crate) fn command_error(err: StorageError) -> CommandError {
             CommandError::new(code, code_name_for(code), errmsg)
         }
         StorageError::DuplicateKey(info) => CommandError::new(11000, "DuplicateKey", info.errmsg),
+        StorageError::WriteConflict => CommandError::new(
+            112,
+            "WriteConflict",
+            "WriteConflict error: this operation conflicted with another operation. Please retry \
+             your operation or multi-document transaction.",
+        ),
     }
 }
 
@@ -163,6 +174,9 @@ fn code_name_for(code: i32) -> &'static str {
     match code {
         2 => "BadValue",
         9 => "FailedToParse",
+        112 => "WriteConflict",
+        121 => "DocumentValidationFailure",
+        10334 => "BSONObjectTooLarge",
         11000 => "DuplicateKey",
         66 => "ImmutableField",
         _ => "Location",

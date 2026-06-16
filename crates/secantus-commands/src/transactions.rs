@@ -191,7 +191,7 @@ impl TransactionRegistry {
         start: bool,
     ) -> Result<Arc<Mutex<Transaction>>, Document> {
         let now = (self.clock)();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner, now);
         let cur = inner.txns.get(lsid_bytes).cloned();
         let last = inner.last_number.get(lsid_bytes).copied().unwrap_or(0);
@@ -200,8 +200,8 @@ impl TransactionRegistry {
                 return Err(transaction_too_old(txn_number, last));
             }
             if let Some(c) = &cur {
-                if c.lock().unwrap().txn_number == txn_number {
-                    if c.lock().unwrap().state == TxnState::Committed {
+                if c.lock().unwrap_or_else(|e| e.into_inner()).txn_number == txn_number {
+                    if c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::Committed {
                         return Err(transaction_committed(txn_number));
                     }
                     return Err(cannot_restart(txn_number));
@@ -225,8 +225,8 @@ impl TransactionRegistry {
         }
         // Continuation statement (no startTransaction flag).
         match cur {
-            Some(c) if c.lock().unwrap().txn_number == txn_number => {
-                let mut t = c.lock().unwrap();
+            Some(c) if c.lock().unwrap_or_else(|e| e.into_inner()).txn_number == txn_number => {
+                let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
                 match t.state {
                     TxnState::Committed => Err(transaction_committed(txn_number)),
                     TxnState::Aborted => Err(no_such_transaction_reply(txn_number, true)),
@@ -248,14 +248,14 @@ impl TransactionRegistry {
     pub fn commit(&self, lsid_bytes: &[u8], txn_number: i64) -> Option<Document> {
         let now = (self.clock)();
         let cur = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             self.prune_locked(&mut inner, now);
             inner.txns.get(lsid_bytes).cloned()
         };
         let Some(c) = cur else {
             return Some(no_such_transaction_reply(txn_number, true));
         };
-        let mut t = c.lock().unwrap();
+        let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
         if t.txn_number != txn_number {
             return Some(no_such_transaction_reply(txn_number, true));
         }
@@ -276,14 +276,14 @@ impl TransactionRegistry {
     pub fn abort(&self, lsid_bytes: &[u8], txn_number: i64) -> Option<Document> {
         let now = (self.clock)();
         let cur = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             self.prune_locked(&mut inner, now);
             inner.txns.get(lsid_bytes).cloned()
         };
         let Some(c) = cur else {
             return Some(no_such_transaction_reply(txn_number, false));
         };
-        let mut t = c.lock().unwrap();
+        let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
         if t.txn_number != txn_number {
             return Some(no_such_transaction_reply(txn_number, false));
         }
@@ -309,9 +309,9 @@ impl TransactionRegistry {
     /// session's txnNumber sequence and implicitly aborts an older in-progress
     /// transaction, as in mongod.
     pub fn on_retryable_write(&self, lsid_bytes: &[u8], txn_number: i64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = inner.txns.get(lsid_bytes).cloned() {
-            if txn_number > c.lock().unwrap().txn_number {
+            if txn_number > c.lock().unwrap_or_else(|e| e.into_inner()).txn_number {
                 self.abort_locked(&c);
                 inner.txns.remove(lsid_bytes);
             }
@@ -324,7 +324,13 @@ impl TransactionRegistry {
 
     /// `endSessions` / `killSessions`: abort the session's in-progress txn.
     pub fn abort_for_session(&self, lsid_bytes: &[u8]) {
-        let cur = self.inner.lock().unwrap().txns.get(lsid_bytes).cloned();
+        let cur = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .txns
+            .get(lsid_bytes)
+            .cloned();
         if let Some(c) = cur {
             self.abort_locked(&c);
         }
@@ -332,7 +338,14 @@ impl TransactionRegistry {
 
     /// `killAllSessions` / shutdown: abort everything.
     pub fn abort_all(&self) {
-        let txns: Vec<_> = self.inner.lock().unwrap().txns.values().cloned().collect();
+        let txns: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .txns
+            .values()
+            .cloned()
+            .collect();
         for c in txns {
             self.abort_locked(&c);
         }
@@ -345,12 +358,12 @@ impl TransactionRegistry {
             .unwrap()
             .txns
             .values()
-            .filter(|c| c.lock().unwrap().state == TxnState::InProgress)
+            .filter(|c| c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::InProgress)
             .count()
     }
 
     fn abort_locked(&self, txn: &Arc<Mutex<Transaction>>) {
-        let mut t = txn.lock().unwrap();
+        let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
         if t.state == TxnState::InProgress {
             (self.rollback)(&mut t);
             t.state = TxnState::Aborted;
@@ -360,7 +373,7 @@ impl TransactionRegistry {
     fn prune_locked(&self, inner: &mut Inner, now: f64) {
         let cutoff = now - self.lifetime;
         for c in inner.txns.values() {
-            let mut t = c.lock().unwrap();
+            let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
             if t.state == TxnState::InProgress && t.last_use < cutoff {
                 (self.rollback)(&mut t);
                 t.state = TxnState::Aborted;

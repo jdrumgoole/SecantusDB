@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-05-15 — SecantusDB 0.5.1b11. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the five gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-06-15 — SecantusDB 0.5.3b7. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 8 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -8,33 +8,30 @@ Generated 2026-05-15 — SecantusDB 0.5.1b11. Each per-driver gauge runs the dri
 
 | Driver | Language | Driver version | Tests run | Passed | Failed | Expected | Skipped | Pass rate | Adjusted |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `pymongo` | Python | `f2103a95870a` | 1341 | 959 | 0 | 0 | 382 | 100.0% | 100.0% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 4710 | 4245 | 0 | 1 | 464 | 100.0% | 100.0% |
-| `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 399 | 0 | 2 | 52 | 99.5% | 100.0% |
+| `pymongo` | Python | `f2103a95870a` | 1504 | 1021 | 8 | 0 | 475 | 99.2% | 99.2% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 447 | 0 | 0 | 453 | 100.0% | 100.0% |
+| `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 401 | 0 | 0 | 52 | 100.0% | 100.0% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 358 | 0 | 1 | 5 | 99.7% | 100.0% |
-| `mongo-ruby-driver` | Ruby | `f68d676643c1` | 318 | 293 | 0 | 1 | 24 | 99.7% | 100.0% |
-| **All drivers** | — | — | **7186** | **6254** | **0** | **5** | **927** | **99.9%** | **100.0%** |
+| `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
+| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 101 | 101 | 0 | 0 | 0 | 100.0% | 100.0% |
+| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2126 | 58 | 0 | 37 | 97.3% | 97.3% |
+| `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 240 | 7 | 0 | 23 | 97.2% | 97.2% |
+| **All drivers** | — | — | **6096** | **4952** | **73** | **2** | **1069** | **98.5%** | **98.5%** |
 
 ## Per-driver scope
 
-- **`pymongo`** — curated pytest paths under vendor/pymongo-tests/test/.
-- **`mongo-java-driver`** — 21 of 112 driver-sync functional classes + bson unit tests.
+- **`pymongo`** — curated server-touching pytest paths under vendor/pymongo-tests/test/.
+- **`mongo-java-driver`** — 21 of 112 driver-sync functional classes (bson codec unit tests excluded — they don't touch the server).
 - **`mongo-go-driver`** — vendor/mongo-go-driver/internal/integration/....
 - **`mongo-node-driver`** — curated test/integration/ spec set.
 - **`mongo-ruby-driver`** — curated spec/mongo/*.rb spec files.
+- **`mongo-rust-driver`** — curated driver/src/test/ in-tree tests.
+- **`mongo-php-library`** — curated functional tests (Operation / Collection / Database / Command).
+- **`mongo-php-driver`** — curated .phpt wire-protocol tests (bson serialization units excluded).
 
 ## Expected failures
 
 These tests fail for documented reasons that have no SecantusDB-side fix (driver-internal behaviour we can't influence, features intentionally out of scope, single-node topology assumptions in tests that assume a 3-node replica set, etc.). Each entry has a rationale in `validation_summary/expected_failures.py`. If you fix one of these gaps, delete its entry there.
-
-### `mongo-java-driver` (1)
-
-- **CRUD Api Version 1 (strict): distinct appends declared API version** — apiStrict rejection on the `distinct` command-name triggers a `MongoConnectionPoolClearedException` cascade in the Java driver's SDAM for reasons not yet diagnosed (root cause is in the driver, not SecantusDB). Leaving the stage-level apiStrict gate active but the command-level gate inert. Documented in tasks/backlog.md §5.
-
-### `mongo-go-driver` (2)
-
-- **TestIndexView/drop_all** — Same load-induced server-selection timeout as TestIndexView/drop_one.
-- **TestIndexView** — Rollup of the `drop_one` / `drop_all` / `create_many` subtests above.
 
 ### `mongo-node-driver` (1)
 
@@ -53,10 +50,13 @@ Each gauge ships its own detailed report — per-category breakdown, named failu
 - [mongo-go-driver](./validation-report-go.md)
 - [mongo-node-driver](./validation-report-node.md)
 - [mongo-ruby-driver](./validation-report-ruby.md)
+- [mongo-rust-driver](./validation-report-rust.md)
+- [mongo-php-library](./validation-report-php-lib.md)
+- [mongo-php-driver](./validation-report-php-ext.md)
 
 ## Refreshing
 
-Run all five gauges plus this summary:
+Run all 8 gauges plus this summary:
 
 ```
 uv run python -m invoke validate-all

@@ -1192,6 +1192,16 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "network": {"numRequests": 0, "bytesIn": 0, "bytesOut": 0},
             }
         )
+    # Live open-cursor count for ``metrics.cursor.open.total`` — the field
+    # drivers poll to track cursor lifecycle. ``ctx.cursors`` is the live
+    # ``CursorRegistry``; its ``__len__`` returns the count of registered
+    # (not-yet-exhausted, not-killed) cursors, so the number rises by one when
+    # a batched cursor is open and returns to baseline after ``killCursors``
+    # (mongo-php-driver's ``cursor-destruct-001`` asserts exactly that).
+    open_total = len(ctx.cursors)
+    metrics_section = base.setdefault("metrics", {})
+    if isinstance(metrics_section, dict):
+        metrics_section["cursor"] = {"open": {"total": open_total, "pinned": 0, "noTimeout": 0}}
     return base
 
 
@@ -1605,6 +1615,11 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
+        # ``allPlansExecution`` verbosity adds per-candidate-plan stats under
+        # ``executionStats``. With a single solution (no multi-planning — our
+        # ``rejectedPlans`` is always empty) mongod emits an empty array.
+        if verbosity == "allPlansExecution":
+            execution_stats["allPlansExecution"] = []
         cursor_stage: dict[str, Any] = {
             "$cursor": {
                 "queryPlanner": query_planner,
@@ -1642,7 +1657,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "ok": 1.0,
     }
     if verbosity != "queryPlanner":
-        reply["executionStats"] = {
+        exec_stats: dict[str, Any] = {
             "executionSuccess": True,
             "nReturned": n_returned,
             "executionTimeMillis": exec_millis,
@@ -1650,6 +1665,11 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "totalDocsExamined": docs_examined,
             "executionStages": execution_stage,
         }
+        # See the aggregate path: ``allPlansExecution`` verbosity carries an
+        # (empty, single-solution) per-plan stats array under executionStats.
+        if verbosity == "allPlansExecution":
+            exec_stats["allPlansExecution"] = []
+        reply["executionStats"] = exec_stats
     return reply
 
 
@@ -2263,7 +2283,25 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         if limit > 0:
             n = min(n, limit)
         return {"n": n, "ok": 1.0}
-    n = ctx.storage.count_matching(ctx.db_name, coll, filter_, collation=doc.get("collation"))
+    hint = doc.get("hint")
+    if hint is not None:
+        # A ``hint`` forces a specific index. For an empty filter this still
+        # walks that index, so hinting a **sparse** index counts only the docs
+        # present in it (the PHP library's Count ``testHintOption`` hints a
+        # sparse index and expects the reduced count). ``find_matching`` already
+        # honours the hint + sparse semantics, so count via it.
+        from secantus.storage import BadHint
+
+        try:
+            n = len(
+                ctx.storage.find_matching(
+                    ctx.db_name, coll, filter_, hint=hint, collation=doc.get("collation")
+                )
+            )
+        except BadHint as exc:
+            return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    else:
+        n = ctx.storage.count_matching(ctx.db_name, coll, filter_, collation=doc.get("collation"))
     # Mongod's ``count`` honours ``limit`` and ``skip`` — the cursor-side
     # ``cursor.count()`` API in the Node / legacy drivers translates to a
     # ``count`` command with these fields populated from the cursor's
@@ -2781,10 +2819,40 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if isinstance(validator, Mapping):
         ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
         description["validator"] = dict(validator)
+    # ``collMod {index: {keyPattern|name, expireAfterSeconds}}`` retunes a TTL
+    # index. mongod resolves the index by key pattern or name, writes the new
+    # expiry, and echoes ``expireAfterSeconds_old`` / ``expireAfterSeconds_new``
+    # (the PHP library's ModifyCollection / Database test asserts both).
+    reply: dict[str, Any] = {"ok": 1.0}
+    index_spec = doc.get("index")
+    if isinstance(index_spec, Mapping):
+        indexes = ctx.storage.list_indexes(ctx.db_name, coll)
+        target = None
+        if index_spec.get("name") is not None:
+            target = next((ix for ix in indexes if ix.get("name") == index_spec["name"]), None)
+        elif isinstance(index_spec.get("keyPattern"), Mapping):
+            want = {k: int(v) for k, v in index_spec["keyPattern"].items()}
+            target = next(
+                (ix for ix in indexes if {k: int(v) for k, v in ix.get("key", {}).items()} == want),
+                None,
+            )
+        if target is None:
+            return {
+                "ok": 0.0,
+                "errmsg": f"cannot find index for ns {ctx.db_name}.{coll}",
+                "code": 27,
+                "codeName": "IndexNotFound",
+            }
+        new_expiry = index_spec.get("expireAfterSeconds")
+        if new_expiry is not None:
+            reply["expireAfterSeconds_old"] = target.get("expireAfterSeconds")
+            reply["expireAfterSeconds_new"] = new_expiry
+            ctx.storage.set_index_expiry(ctx.db_name, coll, target["name"], new_expiry)
+            description["index"] = {"name": target["name"], "expireAfterSeconds": new_expiry}
     # Emit the collMod command oplog entry so a change stream with
     # ``showExpandedEvents`` surfaces a ``modify`` event.
     ctx.storage.record_collmod(ctx.db_name, coll, description)
-    return {"ok": 1.0}
+    return reply
 
 
 def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -3551,6 +3619,19 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "InvalidOptions",
             }
         return _aggregate_change_stream(doc, ctx, coll, pipeline, batch_size)
+
+    # Inline ``explain: true`` on the aggregate command — the legacy flag,
+    # distinct from the top-level ``explain`` command wrapper. mongod returns
+    # the explain plan instead of running the pipeline, and crucially does NOT
+    # execute ``$out`` / ``$merge`` writes. Delegate to ``_explain`` (which
+    # lists the pipeline stages without executing them) before any write stage
+    # can run. Default verbosity for the inline flag is ``queryPlanner``.
+    if doc.get("explain") is True:
+        inner = {k: v for k, v in doc.items() if k != "explain"}
+        return _explain(
+            {"explain": inner, "verbosity": doc.get("verbosity", "queryPlanner")},
+            ctx,
+        )
 
     # Linearizable read concern is incompatible with write stages.
     # mongod rejects with InvalidOptions (72): the aggregate-out-readConcern

@@ -41,6 +41,19 @@ SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/sasl
 
 Single-node change streams are implemented and conformant for typical pymongo `watch()` flows, but the following are deferred or intentionally diverge from real `mongod`:
 
+- [ ] **Rust server: DDL change-stream events not emitted (`showExpandedEvents`).**
+  The Rust server's `create_index` / `drop_index` (and `collMod`) write no oplog
+  `c` entry, so a `showExpandedEvents: true` change stream that awaits a
+  `createIndexes` / `dropIndexes` / `modify` event never sees one and pymongo's
+  `next()` spins on empty getMores until the gauge's 120s `pytest-timeout`
+  SIGKILLs the worker (the remaining `test_change_stream.py` worker crashes —
+  `test_when_showExpandedEvents_is_true,_*_events_are_reported`). `create_collection`
+  / `drop_collection` DO emit oplog. Fix = emit oplog `c` for index/collMod DDL +
+  project the events when `showExpandedEvents` is on (a change-stream feature
+  slice). Also still open: **`test_split_large_change`** — a >16 MB change event
+  (10 MB pre-image + 10 MB post-image) the Rust server can't return (no real
+  event splitting; `of` is always 1), which OOMs/errors under parallel load.
+  Both are change-stream territory (coordinate with the change-stream owner).
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
@@ -134,8 +147,6 @@ the change-stream batch. Still open, precisely characterized:
   `None` `_id` reports `did_upsert` correctly (real bug — `None` was the
   "no upsert" sentinel). Still open:
   - timeseries `insertMany` bulk path (`test_collection_management` timeseries).
-  - `test_error_code` / `test_index_filter` rejections (planner index-filter
-    command surface).
   - the 3 `test_dbref.py` execnet failures: gauge-harness artifact (xdist
     can't serialize ObjectId in subtest reports — runner-side, not server).
   - `test_maxtime_ms_message` / `test_to_list_csot_applied`: pymongo CSOT
@@ -176,6 +187,10 @@ Subtler than the above; these may bite specific test suites.
   **Repro session 2026-06-15 — verdict: test-harness artifact, not a SecantusDB scope-filter bug; accepted.** Two things were established. (1) **The change-stream scope filter does not leak.** A direct stress — a collection-scoped `watch()` open on `db.A` while a writer hammered `db.B` on the same shared `:memory:` daemon — polled 1650 times and saw **0** cross-collection events. The projection layer (`changestreams.project`) and `_ns_filter` correctly confine a collection-scoped stream to its own namespace. So the `TryNext returned true on iteration 1` is *not* SecantusDB surfacing a foreign write through a mis-scoped filter. (2) **The Go mtest harness shares one namespace across tests and truncates collection names to a colliding suffix.** `dbName` defaults to a single shared constant `TestDB` for every test (`mongotest.go:117-118`), and `collName = t.Name()` is then truncated to its *trailing* bytes to fit the 120-byte namespace cap (`sanitizeCollectionName`, `mongotest.go:591-602`: `coll = coll[len(coll)-remaining:]`). Two different long subtest names can therefore collide on the same `TestDB.<suffix>` collection. Combined with the parallel top-level `Test*` functions that call `t.Parallel()` (encryption-prose, `TestClient_BSONOptions`) writing during the change-stream's await window, a genuinely same-namespace write from a *concurrent test* can legitimately wake the stream early — which is correct server behaviour, not a leak. This reproduces only under the one-shared-daemon gauge (each test gets its own server in normal CI), and is invisible running `TestChangeStream_ReplicaSet` alone (30/30 pass). Not patchable on the SecantusDB side without breaking conformance; the honest fix is harness-side namespace isolation, which would mean editing the vendored submodule (forbidden — defeats the gauge). Left documented and accepted.
 - [ ] **Ruby gauge: `Index::View#create_one with session` test client-side-stripped** — mongo-ruby-driver's `Mongo::Index::View#create_one when provided a session behaves like a failed operation using a session raises an error` test passes `view.create_one(spec, invalid: true)` and expects an `OperationFailure` to come back from the server. But the Ruby driver's `Options::Mapper.transform` filters the model hash against its `OPTIONS` whitelist (`lib/mongo/index/view.rb:61`) **before** the command is built, so `invalid: true` never reaches the wire. We added unknown-spec-option rejection on `createIndexes` (`commands.py:_INDEX_SPEC_KNOWN_OPTIONS` + the `Location40415` gate in `_create_indexes`) which DOES fire when the option arrives, so this is a working server-side guard — the test is just structurally broken against modern Ruby drivers. Real mongod has the same problem; the test would need the driver to keep `invalid: true` in the spec for the server-side rejection path to be reachable. Documented and accepted.
 - [ ] **Ruby gauge: `applies the write concern passed in as an option` expected-fail under single-node topology** — mongo-ruby-driver's `Mongo::Collection#create ... when write concern passed in as an option` test (`spec/mongo/collection_ddl_spec.rb:211`) explicitly passes `w: 2` to `collection.create` and expects success — it assumes the canonical multi-node replica-set test cluster the Ruby driver's CI runs against. SecantusDB advertises as a single-node `secantus` replica set, so `w: 2` produces a `writeConcernError` (code 100, `CannotSatisfyWriteConcern`) — added in `commands.py:_unsatisfiable_wc_error` + dispatch wire-up. This is the correct mongod emulation; the test is structurally incompatible with our topology. **Net trade-off was +7 Ruby gauge passes**: seven `applies the write concern` tests that pass `INVALID_WRITE_CONCERN = {w: 4000}` and expect `OperationFailure` now pass because of the wce, this one test now fails. If the test cluster ever grows past 1 advertised member, this test will start passing organically.
+- [ ] **PHP gauges landed (2026-06-15) — conformance gaps surfaced, not yet fixed.** Two new gauges: `php_ext_validation` (mongo-php-driver `.phpt`, the low-level C extension that wraps libmongoc — strictest wire-protocol gauge alongside Go) at **99.9%** (670/671 ran, 41 skipped — climbing: dup-key `errmsg` fix 0.5.3b9, cursor open-count 0.5.3b11, insertion-order `find` 0.5.3b13) and `php_lib_validation` (mongo-php-library PHPUnit, the high-level `mongodb/mongodb` package) at **98.8%** (3051/3091 ran, 39 skipped — climbing: `explain` 0.5.3b8, `collMod` TTL 0.5.3b10, `count` hint + 2dsphere 0.5.3b12, insertion-order `find` 0.5.3b13). Submodules pinned to the installed extension version (driver `2.3.1`, library `2.3.0`); the ext gauge runs against the already-installed extension via `run-tests.php` (no rebuild). Real divergences to chase (none block the gauge feature):
+  - **`updateOne` / `deleteOne` (multi=false, no sort) pick the `_id`-order-first match, not the insertion-first one** — the sibling of the now-fixed `find()` insertion-order item (0.5.3b13). **Deprioritised / likely won't-do** after a scoping attempt (2026-06-16): only differs from mongod for an unindexed, multi=false update/delete over **non-monotonic `_id`s** — an extreme corner with no test/gauge consumer. A correct fix is *not* a one-line scan swap: (1) the common no-collation path goes through `_candidates_iter`, which collscans in `_id` order (`storage.py` ~`return list(self._scan_docs(...))`), so it'd need changing too (and `_candidates_iter` is shared by other callers); (2) the `list()` materialisation in the candidate loop is **load-bearing for WiredTiger cursor safety** (the loop writes to the doc table mid-iteration, which invalidates a still-walking scan cursor on the same session — see the comment at `update_matching`), so a lazy/short-circuit version must collect-matches-then-write, not stream-and-write. Net: a write-path refactor (concurrency-sensitive) for near-zero observable benefit. Leave as documented divergence unless a real consumer appears.
+  - **capped-collection tailable cursors** — php-ext `cursor-tailable_error-001` opens a `tailable` query on a **capped** collection, iterates with awaitData polling, and expects a "collection dropped" error when the coll is dropped mid-iteration. Needs real tailable `getMore` outside change streams — **out of scope** (`§4` / CLAUDE.md: capped-collection tailables deferred). (The sibling `cursor-destruct-001` — killCursors-on-destruct via the live `serverStatus.metrics.cursor.open.total` count — shipped in 0.5.3b11.)
+  - Transaction-gated cases skip/fail under single-node topology (expected, same class as the Ruby `w:2` note above).
 
 ## 6. Admin UI review punch list
 
@@ -194,6 +209,51 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
 
 ## 7. Python → Rust rewrite (in progress)
+
+### 7.1 Rust server performance and security review (2026-06-16)
+
+Items identified during a security/performance audit of the Rust server. Fixed in
+0.5.3-beta.19: SCRAM timing oracle (`subtle::ConstantTimeEq`), mutex poisoning
+panics (graceful error returns), double BSON decode in wire layer (length-only
+check), response buffer pre-allocation, compound multikey cap (10k). The items
+below remain open.
+
+#### Security (remaining)
+
+- [ ] **No SASLprep for non-ASCII passwords** (`secantus-auth/src/lib.rs:56-60`).
+  Non-ASCII passwords bypass normalization → hash differently than a
+  SASLprep-compliant client. Needs RFC 4013 implementation. Low priority (ASCII
+  passwords are the common case; tracked in the auth module docs too).
+- [ ] **No concurrent message allocation budget** (`secantus-server/src/lib.rs:297`).
+  `MAX_MESSAGE_SIZE` (48 MB) is validated per-message, but there's no cap on
+  concurrent in-flight allocations across connections. Under load, many large
+  messages could exhaust heap. Consider a global or per-connection memory budget.
+
+#### Performance (remaining)
+
+- [ ] **Global storage lock held during full oplog scans**
+  (`secantus-storage/src/lib.rs:1185,1280`). `read_oplog` and `prune_oplog` hold
+  the global `Mutex` for their entire duration, blocking all writes. WiredTiger
+  provides MVCC — acquire the lock only for metadata mutation, not read iterations.
+- [ ] **Document cloning in aggregation stages**
+  (`secantus-core/src/aggregate.rs:151,246-280,328`). `$unwind`, `$facet`,
+  `$addFields` all `doc.clone()` per element/sub-pipeline. O(n*m) for large
+  arrays. Refactor to path-based mutation or copy-on-write.
+- [ ] **Oplog clones every written document**
+  (`secantus-storage/src/lib.rs:1531,1628,1750`). Every insert/update/delete
+  clones the full document into the oplog entry. Could pass raw BSON bytes instead.
+- [ ] **Nested lock for timestamp minting**
+  (`secantus-storage/src/lib.rs:1132-1139`). Global lock + oplog mutex for every
+  timestamp mint. Consider `AtomicI64` for the sequence counter.
+- [ ] **Query path resolution clones** (`secantus-core/src/query.rs:108-133`).
+  `resolve_path` clones every BSON value at every path component, called per field
+  per document. Use borrowed references instead.
+- [ ] **Encode/decode round-trips in the find→cursor→client path**
+  (`secantus-commands/src/util.rs:93-123`). Documents go: storage bytes → Document
+  → process → Document → bytes → cursor → bytes → client. Keep as bytes until
+  projection requires deserialization.
+
+---
 
 > ⚠️ **Direction changed — authoritative plan is now `tasks/rust-server-plan.md`.**
 > The end-state is **two completely separate servers** (a pure-Python server and a

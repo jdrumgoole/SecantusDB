@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.3b7"
+version = "0.5.3b13"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -131,6 +131,10 @@ sdist.exclude = [
     "java_validation/**",
     "vendor/mongo-ruby-driver/**",
     "ruby_validation/**",
+    "vendor/mongo-php-library/**",
+    "php_lib_validation/**",
+    "vendor/mongo-php-driver/**",
+    "php_ext_validation/**",
     ".validation/**",
     # brandkit/ is marketing content (logos, brand-guide HTML); not
     # needed at install or run time. The docs that need it pull from

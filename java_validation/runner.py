@@ -25,6 +25,7 @@ Run via `uv run python -m invoke validate-java`.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -80,6 +81,27 @@ RESULTS_DIR = REPO_ROOT / ".validation" / "java-results"
 # expects when ``-Dorg.mongodb.test.uri`` carries credentials.
 ROOT_USER = "root-user"
 ROOT_PASSWORD = "password"
+
+
+def _java_major(java_home: str | None) -> int | None:
+    """Major version of the ``javac`` under ``java_home`` (or on PATH when
+    ``java_home`` is None), or None if it can't be determined.
+
+    ``javac 17.0.19`` -> 17; ``javac 21.0.11`` -> 21; the old
+    ``javac 1.8.0_431`` form -> 8.
+    """
+    javac = str(Path(java_home) / "bin" / "javac") if java_home else "javac"
+    try:
+        out = subprocess.run([javac, "-version"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"\b(\d+)(?:\.(\d+))?", out.stdout + out.stderr)
+    if not m:
+        return None
+    major = int(m.group(1))
+    if major == 1 and m.group(2):  # legacy 1.8 -> 8
+        major = int(m.group(2))
+    return major
 
 
 def _pick_ephemeral_port() -> int:
@@ -144,22 +166,40 @@ def main() -> int:
         return 2
 
     # The driver pins gradle 8.12 (caps at JDK 23) and its buildSrc
-    # toolchain requires `languageVersion=17` exactly — JDK 21 / 25 won't
-    # substitute. Prefer JDK 17 if installed; fall back to 21 with a
-    # warning (works for `:bson:test` itself, fails on toolchain query in
-    # buildSrc). CI sets JAVA_HOME via actions/setup-java to JDK 17 so
-    # this auto-detection only kicks in for local runs.
+    # toolchain requires `languageVersion=17` exactly — JDK 17 works, 21
+    # fails the toolchain query in buildSrc, and 24+ can't even parse the
+    # version string (`IllegalArgumentException: 25.0.2`, build aborts
+    # before any test runs). Pick a supported JDK *robustly*: check the
+    # EFFECTIVE jdk (JAVA_HOME if set, else PATH), and override with a
+    # 17/21 candidate whenever it's unsupported (>=24) or undetectable.
+    # The old code only auto-selected when JAVA_HOME was unset, so a
+    # machine whose shell preset JAVA_HOME to a current JDK (brew's
+    # default `openjdk` is 25) sailed straight into a doomed build. CI
+    # sets JAVA_HOME to 17 via actions/setup-java, which is kept as-is.
+    _JDK_GRADLE_MAX = 23
     java_home_override: str | None = None
-    if not os.environ.get("JAVA_HOME"):
+    effective_home = os.environ.get("JAVA_HOME") or None
+    effective_major = _java_major(effective_home)
+    if effective_major is None or effective_major > _JDK_GRADLE_MAX:
         for candidate in (
             "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
             "/usr/lib/jvm/java-17-openjdk-amd64",
             "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home",
             "/usr/lib/jvm/java-21-openjdk-amd64",
         ):
-            if Path(candidate).is_dir():
+            cand_major = _java_major(candidate) if Path(candidate).is_dir() else None
+            if cand_major is not None and cand_major <= _JDK_GRADLE_MAX:
                 java_home_override = candidate
                 break
+        if java_home_override is None:
+            print(
+                "java_validation: no Gradle-supported JDK (8-23) found "
+                f"(effective JDK major={effective_major}, JAVA_HOME={effective_home!r}). "
+                "The mongo-java-driver's bundled Gradle 8.12 cannot run on JDK 24+. "
+                "Install one, e.g. `brew install openjdk@17`, and re-run.",
+                file=sys.stderr,
+            )
+            return 2
     if not VENDOR.is_dir() or not (VENDOR / "gradlew").is_file():
         print(
             f"vendor/mongo-java-driver/ missing or not initialised "
@@ -290,6 +330,20 @@ def main() -> int:
         forks = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
         if forks is None:
             env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(os.cpu_count() or 1)
+
+        # Wipe stale JUnit XML before running so a failed build can't
+        # masquerade as a passing run. If Gradle aborts (unsupported JDK,
+        # a buildSrc compile error) it writes NO fresh XML — and without
+        # this, the harvest below would copy a *previous* run's results
+        # and emit a stale report showing a false pass rate (this is how
+        # a JDK-25 build failure silently kept reporting "100%"). Clearing
+        # both the harvest dir and the in-tree results dirs guarantees the
+        # `copied == 0` guard fires loudly when nothing actually ran.
+        shutil.rmtree(RESULTS_DIR, ignore_errors=True)
+        for module_dir in VENDOR.iterdir():
+            stale_results = module_dir / "build" / "test-results"
+            if stale_results.is_dir():
+                shutil.rmtree(stale_results, ignore_errors=True)
 
         gradle_rcs: list[int] = []
         for spec in INCLUDE:

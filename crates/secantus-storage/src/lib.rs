@@ -76,9 +76,31 @@ impl std::ops::Deref for OpSession<'_> {
 /// guarantees the session is never touched by two threads at once. The WT
 /// `begin_transaction` is deferred to the first [`Storage::with_user_transaction`]
 /// so the snapshot pins at the transaction's first statement (mongod semantics).
+///
+/// `session` is `Some` while the transaction is open and `None` once committed /
+/// rolled back — committing or aborting **closes** the dedicated WT session so it
+/// doesn't accumulate (the registry keeps the `Transaction` metadata around for
+/// idempotent re-commit, but the WT resource is released). Mirrors
+/// `storage._close_user_txn_session`.
 pub struct UserTransactionHandle {
-    session: Session,
+    session: Option<Session>,
     began: bool,
+}
+
+/// mongod's per-document BSON size limit (16 MiB). A document whose encoded size
+/// exceeds this is rejected with `BSONObjectTooLarge` (10334). Mirrors
+/// `storage.py`'s `MAX_BSON_OBJECT_SIZE`.
+const MAX_BSON_OBJECT_SIZE: usize = 16 * 1024 * 1024;
+
+/// The mongod-shaped per-op write error for an over-limit document (10334).
+fn too_large_write_error(index: usize, size: usize) -> Document {
+    bson::doc! {
+        "index": index as i32,
+        "code": 10334,
+        "errmsg": format!(
+            "object to insert too large. size in bytes: {size}, max size: {MAX_BSON_OBJECT_SIZE}"
+        ),
+    }
 }
 
 const COLL_TABLE: &str = "table:secantus_collections";
@@ -402,6 +424,19 @@ pub enum StorageError {
     /// A `fullDocument` / `fullDocumentBeforeChange: "required"` change-stream
     /// lookup missed (mongod code 280, `ChangeStreamFatalError`).
     ChangeStreamFatal(String),
+    /// An internal invariant failure (e.g. a transaction operation on an
+    /// already-closed handle). Surfaces as a command-level `InternalError`.
+    Internal(String),
+    /// A write lost a `WT_ROLLBACK` race (write conflict). Surfaces as mongod's
+    /// `WriteConflict` (112); inside a transaction it also earns the
+    /// `TransientTransactionError` label so drivers retry the whole transaction.
+    WriteConflict,
+    /// A document's encoded size exceeds `MAX_BSON_OBJECT_SIZE`. Carries the
+    /// offending size; surfaces as mongod's `BSONObjectTooLarge` (10334).
+    DocumentTooLarge(usize),
+    /// The post-apply document failed the collection `validator`. Surfaces as
+    /// mongod's `DocumentValidationFailure` (121).
+    DocumentValidationFailure,
 }
 
 impl std::fmt::Display for StorageError {
@@ -424,13 +459,31 @@ impl std::fmt::Display for StorageError {
             }
             StorageError::BadHint(m) => write!(f, "{m}"),
             StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
+            StorageError::Internal(m) => write!(f, "{m}"),
+            StorageError::WriteConflict => write!(
+                f,
+                "WriteConflict error: this operation conflicted with another operation"
+            ),
+            StorageError::DocumentTooLarge(size) => write!(
+                f,
+                "object to insert too large. size in bytes: {size}, max size: {MAX_BSON_OBJECT_SIZE}"
+            ),
+            StorageError::DocumentValidationFailure => write!(f, "Document failed validation"),
         }
     }
 }
 impl std::error::Error for StorageError {}
 impl From<WtError> for StorageError {
     fn from(e: WtError) -> Self {
-        StorageError::Wt(e)
+        // A `WT_ROLLBACK` means the write lost a concurrency race — surface it as
+        // a dedicated `WriteConflict` so the command layer can map it to mongod's
+        // 112 (+ the transient label inside a transaction) rather than a generic
+        // internal error.
+        if e.is_rollback() {
+            StorageError::WriteConflict
+        } else {
+            StorageError::Wt(e)
+        }
     }
 }
 
@@ -579,14 +632,25 @@ fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Resu
     }
 
     // Compound: cartesian product across the per-field candidate lists.
+    // Cap the product size to avoid exponential blowup when multiple fields are
+    // array-valued (real mongod rejects compound multikey on >1 array field;
+    // we accept it but bound the work).
+    const MAX_COMPOUND_KEYS: usize = 10_000;
     let mut combos: Vec<Vec<&Bson>> = vec![Vec::new()];
     for cand in &per_field {
-        let mut next: Vec<Vec<&Bson>> = Vec::with_capacity(combos.len() * cand.len());
+        let new_size = combos.len().saturating_mul(cand.len());
+        let mut next: Vec<Vec<&Bson>> = Vec::with_capacity(new_size.min(MAX_COMPOUND_KEYS + 1));
         for combo in &combos {
             for v in cand {
+                if next.len() >= MAX_COMPOUND_KEYS {
+                    break;
+                }
                 let mut c = combo.clone();
                 c.push(v);
                 next.push(c);
+            }
+            if next.len() >= MAX_COMPOUND_KEYS {
+                break;
             }
         }
         combos = next;
@@ -1366,7 +1430,7 @@ impl Storage {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         Ok(UserTransactionHandle {
-            session,
+            session: Some(session),
             began: false,
         })
     }
@@ -1381,8 +1445,12 @@ impl Storage {
         handle: &mut UserTransactionHandle,
         f: impl FnOnce() -> T,
     ) -> Result<T> {
+        let session = handle
+            .session
+            .as_ref()
+            .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
         if !handle.began {
-            handle.session.begin_transaction(None)?;
+            session.begin_transaction(None)?;
             handle.began = true;
         }
         struct Restore(*const Session);
@@ -1392,26 +1460,36 @@ impl Storage {
             }
         }
         let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
-        ACTIVE_TXN_SESSION.with(|c| c.set(&handle.session as *const Session));
+        ACTIVE_TXN_SESSION.with(|c| c.set(session as *const Session));
         Ok(f())
     }
 
-    /// Commit the transaction's WT session. Idempotent once committed/rolled
-    /// back (no active WT transaction → no-op).
+    /// Commit the transaction's WT session, then **close** it (releasing the WT
+    /// resource). Idempotent: a handle whose session is already closed is a
+    /// no-op. A commit failure still closes the session (its `Drop` rolls back
+    /// the uncommitted transaction).
     pub fn commit_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
-        if handle.began {
-            handle.session.commit_transaction(None)?;
+        if let Some(session) = handle.session.take() {
+            let began = handle.began;
             handle.began = false;
+            if began {
+                session.commit_transaction(None)?;
+            }
+            // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
     }
 
-    /// Roll back the transaction's WT session. Idempotent. (Dropping the handle
-    /// also rolls back any still-open WT transaction via `Session`'s `Drop`.)
+    /// Roll back the transaction's WT session, then **close** it. Idempotent;
+    /// best-effort rollback (closing the session also rolls back).
     pub fn rollback_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
-        if handle.began {
-            handle.session.rollback_transaction(None)?;
+        if let Some(session) = handle.session.take() {
+            let began = handle.began;
             handle.began = false;
+            if began {
+                let _ = session.rollback_transaction(None);
+            }
+            // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
     }
@@ -1428,6 +1506,9 @@ impl Storage {
         let id = doc.get("_id").expect("_id present").clone();
         let key = id_key(&id)?;
         let blob = encode_doc(&doc)?;
+        if blob.len() > MAX_BSON_OBJECT_SIZE {
+            return Err(StorageError::DocumentTooLarge(blob.len()));
+        }
 
         let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
@@ -1520,6 +1601,13 @@ impl Storage {
                 continue;
             }
             let blob = encode_doc(&doc)?;
+            if blob.len() > MAX_BSON_OBJECT_SIZE {
+                errors.push(too_large_write_error(index, blob.len()));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &key);
             doc_cur.set_value_u(&blob);
@@ -2449,7 +2537,11 @@ impl Storage {
             }
         }
 
-        let session = self.conn.open_session()?;
+        // `op_session` (not a fresh session) so `createIndexes` inside a
+        // multi-document transaction runs on the transaction's WT session — a
+        // fresh session would deadlock against the same transaction's
+        // uncommitted writes (e.g. a collection created earlier in the txn).
+        let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
 
         let c = session.open_cursor(IDX_TABLE, None)?;
@@ -3402,6 +3494,7 @@ impl Storage {
         array_filters: &[Document],
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome> {
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
@@ -3420,6 +3513,7 @@ impl Storage {
             multi,
             upsert,
             is_replacement,
+            validator,
             &|doc, up| {
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
@@ -3446,6 +3540,7 @@ impl Storage {
         upsert: bool,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
     ) -> Result<UpdateOutcome> {
         self.update_matching_core(
             db,
@@ -3456,6 +3551,7 @@ impl Storage {
             multi,
             upsert,
             false,
+            validator,
             &|doc, _up| {
                 let out = secantus_core::aggregate::apply_pipeline(
                     vec![doc.clone()],
@@ -3483,6 +3579,7 @@ impl Storage {
         multi: bool,
         upsert: bool,
         is_replacement: bool,
+        validator: Option<&Document>,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
         let _g = self.lock.lock().unwrap();
@@ -3514,13 +3611,25 @@ impl Storage {
             matched += 1;
             let new = transform(&doc, false)?;
             if new != doc {
+                // Collection validator on the post-apply doc (mongod rejects an
+                // update that would leave a document failing validation). A
+                // validator the query engine can't evaluate is treated as
+                // passing (lenient), matching the insert path.
+                if let Some(v) = validator {
+                    if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                        return Err(StorageError::DocumentValidationFailure);
+                    }
+                }
                 if let Some(c) =
                     self.unique_conflict(&session, db, coll, &new, &descs, Some(&id_k))?
                 {
                     return Err(StorageError::DuplicateKey(Box::new(c)));
                 }
-                modified += 1;
                 let new_blob = encode_doc(&new)?;
+                if new_blob.len() > MAX_BSON_OBJECT_SIZE {
+                    return Err(StorageError::DocumentTooLarge(new_blob.len()));
+                }
+                modified += 1;
                 self.delete_index_entries(&session, db, coll, &doc, &descs)?;
                 let cur = session.open_cursor(DOC_TABLE, None)?;
                 cur.set_key_ssu(db, coll, &id_k);
@@ -3577,12 +3686,21 @@ impl Storage {
             if !new.contains_key("_id") {
                 new.insert("_id", Bson::ObjectId(ObjectId::new()));
             }
+            // Validator on an upsert-inserted document, too.
+            if let Some(v) = validator {
+                if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                    return Err(StorageError::DocumentValidationFailure);
+                }
+            }
             let id = new.get("_id").cloned().unwrap();
             if let Some(c) = self.unique_conflict(&session, db, coll, &new, &descs, None)? {
                 return Err(StorageError::DuplicateKey(Box::new(c)));
             }
             let new_id_key = id_key(&id)?;
             let new_blob = encode_doc(&new)?;
+            if new_blob.len() > MAX_BSON_OBJECT_SIZE {
+                return Err(StorageError::DocumentTooLarge(new_blob.len()));
+            }
             let cur = session.open_cursor(DOC_TABLE, None)?;
             cur.set_key_ssu(db, coll, &new_id_key);
             cur.set_value_u(&new_blob);

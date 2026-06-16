@@ -19,6 +19,148 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b13] — 2026-06-16
+
+### `find()` with no sort now returns documents in insertion order
+
+An unsorted `find()` now returns documents in **insertion order**, matching
+`mongod`'s natural (storage) order. Previously SecantusDB returned them in `_id`
+order — which coincides with insertion order for the default monotonic
+`ObjectId` `_id`s, but diverged whenever a collection mixed `_id` types or used
+non-monotonic `_id`s (an int `1`, a string `"foo"`, a sub-document — BSON sorts
+those very differently from the order you inserted them). Code and drivers that
+read back rows in the order they were written — a common, reasonable assumption
+that `mongod` honours — now see the same order here.
+
+Internally this adds a small natural-order index (a monotonic insertion sequence
+→ document map) that an unsorted scan and the `$natural` hint walk; the document
+store itself is unchanged, so every `_id` lookup, secondary index, and
+uniqueness check is untouched. Capped-collection eviction and equal-key sort
+tie-breaks also follow insertion order now. (Multi=false `updateOne`/`deleteOne`
+without a sort still pick the `_id`-order-first match rather than the
+insertion-first one — a smaller remaining divergence, tracked in the backlog.)
+
+#### Fixed
+- Unsorted `find()` (and the `$natural` hint) return documents in insertion
+  order, matching `mongod` — including for collections with mixed-type or
+  non-monotonic `_id`s. Clears the PHP `BulkWrite::testInserts` /
+  `bulkwrite-insert-004` conformance tests.
+
+## [0.5.3b12] — 2026-06-16
+
+### `count` honours a `hint`, and 2dsphere indexes report their version
+
+Two driver-conformance fixes. `count` now respects a `hint`: pass an index name
+or key pattern and the count walks that index — so hinting a **sparse** index
+counts only the documents present in it. `count({}, hint: "sparse_idx")` returns
+the number of docs that have the indexed field, not the whole collection, exactly
+as `mongod` does. Previously `count` ignored the hint and always counted every
+document.
+
+Separately, `2dsphere` indexes now carry a `2dsphereIndexVersion` in their
+`listIndexes` output (version 3, mongod's format since 3.2), so drivers that
+introspect geo indexes — like the PHP library's `IndexInfo::is2dSphere()` — read
+the field they expect.
+
+#### Added
+- `2dsphereIndexVersion` (3) on `2dsphere` indexes, surfaced via `listIndexes`.
+
+#### Fixed
+- `count` now honours `hint` (index name or key pattern), counting via the
+  hinted index — including sparse-index semantics (missing-field docs excluded).
+
+## [0.5.3b11] — 2026-06-16
+
+### `serverStatus` reports a live open-cursor count
+
+`serverStatus` now includes `metrics.cursor.open.total` — the number of cursors
+currently registered on the server. It rises by one when a batched query leaves
+a cursor open for `getMore` and returns to its baseline once the cursor is
+exhausted or killed (via `killCursors`, which drivers send when a cursor object
+is destroyed). Tools and drivers that watch cursor lifecycle — including the PHP
+extension's cursor-destruct test — can now see cursors open and close.
+
+The value is read live from the server's `CursorRegistry`, so it reflects the
+true set of not-yet-exhausted, not-killed cursors at the moment of the call.
+
+#### Added
+- `serverStatus.metrics.cursor.open.total` (live open-cursor count from the
+  `CursorRegistry`).
+
+## [0.5.3b10] — 2026-06-16
+
+### `collMod` can retune a TTL index's expiry
+
+`collMod` now handles its `index` modification form: pass
+`{collMod: "<coll>", index: {keyPattern: {...}, expireAfterSeconds: N}}` (or
+`{index: {name: "<idx>", expireAfterSeconds: N}}`) and SecantusDB rewrites the
+TTL index's expiry in place, returning the `expireAfterSeconds_old` and
+`expireAfterSeconds_new` pair that `mongod` echoes. The new value takes effect
+immediately — `prune_ttl` reads the expiry from the same index options — so a
+retuned TTL window applies on the next prune.
+
+Previously `collMod` accepted the command but ignored the `index` form,
+returning a bare `{ok: 1}` with neither the old nor new expiry. The PHP
+library's `ModifyCollection` and `Database::modifyCollection` tests assert both
+values; both now pass.
+
+#### Added
+- `collMod` `index` form for TTL retuning: resolves the target index by
+  `keyPattern` or `name`, updates `expireAfterSeconds`, and returns
+  `expireAfterSeconds_old` / `expireAfterSeconds_new`. Backed by a new
+  `Storage.set_index_expiry`.
+
+## [0.5.3b9] — 2026-06-16
+
+### Duplicate-key errors now read exactly like `mongod`
+
+When a write hits a unique-index collision, the `E11000` error message now
+matches `mongod` verbatim: `E11000 duplicate key error collection: <db>.<coll>
+index: <indexName> dup key: { <field>: <value> }`. Previously SecantusDB emitted
+a terser, non-standard form (`… in index <name>: _id=<value>`) that worked for
+permissive drivers but failed the type-strict ones that pin the message text —
+the PHP extension's `WriteError::getMessage()` and `WriteResult::getWriteErrors()`
+assert the full string, down to the shell-formatted `dup key` fragment.
+
+The structured fields drivers parse — `code`, `index`, `keyPattern`, `keyValue`
+— were already correct; this is purely the human-readable message catching up,
+across every path that can raise a duplicate key (batch insert, update/upsert,
+and unique-index builds). The fix clears the PHP extension's `writeError` and
+`writeResult` suites.
+
+#### Fixed
+- Duplicate-key (`E11000`) error messages now use `mongod`'s exact wording,
+  including the `collection: <ns> index: <name> dup key: { … }` shape with
+  shell-formatted key values, consistently across all duplicate-key raise sites.
+
+## [0.5.3b8] — 2026-06-16
+
+### `explain` now speaks `allPlansExecution`, and aggregate's inline explain flag works
+
+`explain` gained the last two pieces the official MongoDB drivers probe for. At
+the most verbose level, `verbosity: "allPlansExecution"`, the reply now carries
+an `allPlansExecution` array inside `executionStats` — empty, because a
+single-node query is always served by a single candidate plan with no rejected
+alternatives, which is exactly what real `mongod` reports when there's no
+multi-planning to summarise. Drivers that assert the key is present (and absent
+at lower verbosities) now see the shape they expect.
+
+The `aggregate` command also learned to honour its legacy inline `explain: true`
+flag — the form drivers send when you call `explain()` on an aggregation rather
+than wrapping it in the top-level `explain` command. SecantusDB previously ran
+the pipeline and returned data; it now returns the explain plan instead, and
+critically does **not** execute a trailing `$out` or `$merge` write stage under
+explain, matching `mongod`'s dry-run behaviour. Together these clear the PHP
+library's entire `ExplainFunctionalTest` and aggregate-explain suite.
+
+#### Fixed
+- `explain` with `verbosity: "allPlansExecution"` now includes an
+  `executionStats.allPlansExecution` array (empty for single-solution plans),
+  on both `find`-style and `aggregate` explains.
+- The `aggregate` command's inline `explain: true` flag now returns the explain
+  document (`stages` / `queryPlanner`) instead of running the pipeline, and
+  suppresses `$out` / `$merge` writes under explain.
+
 ## [0.5.3b7] — 2026-06-15
 
 ### `$exists: true` rides a sparse index instead of scanning the collection

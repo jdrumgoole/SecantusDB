@@ -59,6 +59,10 @@ pub enum StorageError {
     /// An unexpected internal failure — surfaces as a command-level
     /// `InternalError` (`code: 1`), not a per-op write error.
     Internal(String),
+    /// A write lost a `WT_ROLLBACK` race — mongod's `WriteConflict` (112). The
+    /// command layer surfaces it as a command-level error (so the dispatch
+    /// transaction envelope attaches the `TransientTransactionError` label).
+    WriteConflict,
 }
 
 /// A change-stream watch scope (mirrors `secantus_storage::changestreams::Scope`;
@@ -234,6 +238,7 @@ pub trait Storage: Send + Sync {
         _array_filters: &[Document],
         _let_vars: &Document,
         _collation: Option<&Collation>,
+        _validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         self.update_matching(db, coll, filter, update, multi, upsert)
     }
@@ -255,6 +260,7 @@ pub trait Storage: Send + Sync {
         _upsert: bool,
         _let_vars: &Document,
         _collation: Option<&Collation>,
+        _validator: Option<&Document>,
     ) -> Result<UpdateOutcome, StorageError> {
         Err(StorageError::WriteError {
             code: 2,
@@ -406,6 +412,29 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether `(db, coll)` exists. Default `false` (test fakes track no
+    /// collections); the WiredTiger adapter forwards to the registry.
+    fn collection_exists(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Per-database profiling state `{level, slowms, sampleRate}` (mongod's
+    /// `profile` shape). Default: profiling off.
+    fn get_profile(&self, _db: &str) -> Result<Document, StorageError> {
+        Ok(bson::doc! { "level": 0i32, "slowms": 100i32, "sampleRate": 1.0 })
+    }
+
+    /// Set per-database profiling state. Default no-op (fakes don't persist it).
+    fn set_profile(
+        &self,
+        _db: &str,
+        _level: i32,
+        _slowms: i32,
+        _sample_rate: f64,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Create an index. `true` if newly created (`false` e.g. for `_id_`).
     fn create_index(
         &self,
@@ -528,5 +557,47 @@ pub trait Storage: Send + Sync {
         _limit: usize,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         Ok(Vec::new())
+    }
+
+    // --- multi-document transactions (T2) ----------------------------------
+    //
+    // The opaque handle is the storage `UserTransactionHandle`, boxed as
+    // `dyn Any + Send` so the command crate (and its test fakes) stay WT-free.
+    // The WiredTiger adapter downcasts it. Defaults make the registry's state
+    // machine run WITHOUT real isolation (writes apply immediately; abort can't
+    // roll back) — enough for the lifecycle / error-label tests; the adapter
+    // override adds real WT isolation.
+
+    /// Open a new multi-document transaction, returning an opaque handle. Default
+    /// returns a unit handle (no real WT transaction).
+    fn begin_user_transaction(&self) -> Result<Box<dyn std::any::Any + Send>, StorageError> {
+        Ok(Box::new(()))
+    }
+
+    /// Run one in-transaction statement `f` with `handle`'s WT session installed,
+    /// so the statement's reads/writes execute inside the transaction. Default
+    /// just runs `f` (no installation). Returns the statement's reply document.
+    fn run_in_user_transaction(
+        &self,
+        _handle: &mut (dyn std::any::Any + Send),
+        f: &mut dyn FnMut() -> Document,
+    ) -> Result<Document, StorageError> {
+        Ok(f())
+    }
+
+    /// Commit the transaction's WT session. Default no-op.
+    fn commit_user_transaction(
+        &self,
+        _handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Roll back the transaction's WT session. Default no-op.
+    fn rollback_user_transaction(
+        &self,
+        _handle: &mut (dyn std::any::Any + Send),
+    ) -> Result<(), StorageError> {
+        Ok(())
     }
 }
