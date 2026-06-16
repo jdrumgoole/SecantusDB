@@ -197,9 +197,7 @@ def test_duplicate_key_errmsg_on_unique_index_uses_field_value(coll) -> None:
     we = ei.value.details["writeErrors"][0]
     # Non-_id unique index: the dup-key fragment carries the indexed field's
     # value, string-quoted the way the mongo shell prints it.
-    assert re.search(
-        r'index: email_1 dup key: \{ email: "a@b\.com" \}', we["errmsg"]
-    ), we["errmsg"]
+    assert re.search(r'index: email_1 dup key: \{ email: "a@b\.com" \}', we["errmsg"]), we["errmsg"]
 
 
 def test_drop_collection_via_pymongo(client: MongoClient) -> None:

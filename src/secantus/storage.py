@@ -496,9 +496,7 @@ def _shell_value(v: Any) -> str:
     return str(v)
 
 
-def format_dup_key_errmsg(
-    namespace: str, index_name: str, key_value: dict[str, Any] | None
-) -> str:
+def format_dup_key_errmsg(namespace: str, index_name: str, key_value: dict[str, Any] | None) -> str:
     """Build mongod's E11000 duplicate-key ``errmsg`` string.
 
     ``E11000 duplicate key error collection: <ns> index: <name> dup key: { <k>: <v>, … }``
@@ -510,10 +508,7 @@ def format_dup_key_errmsg(
         dup = "{ " + inner + " }"
     else:
         dup = "{ }"
-    return (
-        f"E11000 duplicate key error collection: {namespace} "
-        f"index: {index_name} dup key: {dup}"
-    )
+    return f"E11000 duplicate key error collection: {namespace} index: {index_name} dup key: {dup}"
 
 
 class IndexConflict(Exception):
