@@ -4137,6 +4137,12 @@ class Storage:
                 if unique:
                     raise IndexConflict(name, None)
                 geo_field, geo_type = geo
+                # mongod stamps every 2dsphere index with its index format
+                # version (3 since 3.2); drivers surface it via listIndexes
+                # (the PHP library's IndexInfo::is2dSphere / ['2dsphereIndexVersion']
+                # assertion reads it). 2d indexes don't carry this field.
+                if geo_type == _GEO_2DSPHERE:
+                    options.setdefault("2dsphereIndexVersion", 3)
                 # Geo indexes are always multikey from the picker's perspective
                 # — each doc may produce many cell entries. Mark it so the
                 # regular pickers skip the index for non-geo queries.

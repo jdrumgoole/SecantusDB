@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b12] — 2026-06-16
+
+### `count` honours a `hint`, and 2dsphere indexes report their version
+
+Two driver-conformance fixes. `count` now respects a `hint`: pass an index name
+or key pattern and the count walks that index — so hinting a **sparse** index
+counts only the documents present in it. `count({}, hint: "sparse_idx")` returns
+the number of docs that have the indexed field, not the whole collection, exactly
+as `mongod` does. Previously `count` ignored the hint and always counted every
+document.
+
+Separately, `2dsphere` indexes now carry a `2dsphereIndexVersion` in their
+`listIndexes` output (version 3, mongod's format since 3.2), so drivers that
+introspect geo indexes — like the PHP library's `IndexInfo::is2dSphere()` — read
+the field they expect.
+
+#### Added
+- `2dsphereIndexVersion` (3) on `2dsphere` indexes, surfaced via `listIndexes`.
+
+#### Fixed
+- `count` now honours `hint` (index name or key pattern), counting via the
+  hinted index — including sparse-index semantics (missing-field docs excluded).
+
 ## [0.5.3b11] — 2026-06-16
 
 ### `serverStatus` reports a live open-cursor count
