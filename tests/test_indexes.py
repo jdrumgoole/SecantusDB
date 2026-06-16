@@ -230,12 +230,19 @@ def test_unique_index_uses_entry_probe(storage: Storage) -> None:
 def _spy_scans(storage: Storage, monkeypatch) -> list[tuple[str, str]]:
     calls: list[tuple[str, str]] = []
     real_scan = storage._scan_docs
+    real_nat = storage._scan_docs_natural
 
     def spy(db: str, coll: str):
         calls.append((db, coll))
         return real_scan(db, coll)
 
+    def spy_nat(db: str, coll: str):
+        # $natural / COLLSCAN now walk insertion order via _scan_docs_natural.
+        calls.append((db, coll))
+        return real_nat(db, coll)
+
     monkeypatch.setattr(storage, "_scan_docs", spy)
+    monkeypatch.setattr(storage, "_scan_docs_natural", spy_nat)
     return calls
 
 
@@ -1815,8 +1822,9 @@ def test_ttl_prune_removes_index_entries_too(storage: Storage) -> None:
 # order, matching real MongoDB's "natural" cursor for non-capped colls.
 
 
-def test_find_no_sort_int_ids_in_numeric_order(storage: Storage) -> None:
-    """Inserting ints 0..19 in arbitrary order; find() returns numeric order."""
+def test_find_no_sort_int_ids_in_insertion_order(storage: Storage) -> None:
+    """find() with no sort returns docs in insertion order (mongod's natural
+    order), NOT _id order — even when _id values are non-monotonic ints."""
     import random
 
     rng = random.Random(42)
@@ -1824,27 +1832,31 @@ def test_find_no_sort_int_ids_in_numeric_order(storage: Storage) -> None:
     rng.shuffle(ids)
     storage.insert("db", "c", [{"_id": i, "x": i} for i in ids])
     docs = storage.find_matching("db", "c", {})
-    assert [d["_id"] for d in docs] == sorted(ids)
+    assert [d["_id"] for d in docs] == ids  # insertion order, not sorted(ids)
 
 
-def test_find_no_sort_string_ids_lexical(storage: Storage) -> None:
-    storage.insert("db", "c", [{"_id": s} for s in ["banana", "apple", "cherry", "date"]])
+def test_find_no_sort_string_ids_insertion_order(storage: Storage) -> None:
+    inserted = ["banana", "apple", "cherry", "date"]
+    storage.insert("db", "c", [{"_id": s} for s in inserted])
     docs = storage.find_matching("db", "c", {})
-    assert [d["_id"] for d in docs] == ["apple", "banana", "cherry", "date"]
+    assert [d["_id"] for d in docs] == inserted  # insertion order, not lexical
 
 
-def test_find_no_sort_objectid_chronological(storage: Storage) -> None:
-    """ObjectIds inserted in time order come back in time order."""
+def test_find_no_sort_objectid_insertion_order(storage: Storage) -> None:
+    """find() returns ObjectIds in insertion order, even when inserted out of
+    chronological order."""
     import datetime as _dt
 
     import bson
 
     base = _dt.datetime(2026, 5, 2, tzinfo=_dt.UTC)
     oids = [bson.ObjectId.from_datetime(base + _dt.timedelta(seconds=i)) for i in range(5)]
-    # Insert reversed; expect chronological retrieval.
-    storage.insert("db", "c", [{"_id": oid} for oid in reversed(oids)])
+    # Insert reversed; find() returns them in insertion (reversed) order, not
+    # _id-chronological order.
+    inserted = list(reversed(oids))
+    storage.insert("db", "c", [{"_id": oid} for oid in inserted])
     docs = storage.find_matching("db", "c", {})
-    assert [d["_id"] for d in docs] == oids
+    assert [d["_id"] for d in docs] == inserted
 
 
 def test_update_multi_false_updates_natural_first_match(storage: Storage) -> None:

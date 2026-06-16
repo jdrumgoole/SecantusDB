@@ -19,6 +19,33 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.3b13] — 2026-06-16
+
+### `find()` with no sort now returns documents in insertion order
+
+An unsorted `find()` now returns documents in **insertion order**, matching
+`mongod`'s natural (storage) order. Previously SecantusDB returned them in `_id`
+order — which coincides with insertion order for the default monotonic
+`ObjectId` `_id`s, but diverged whenever a collection mixed `_id` types or used
+non-monotonic `_id`s (an int `1`, a string `"foo"`, a sub-document — BSON sorts
+those very differently from the order you inserted them). Code and drivers that
+read back rows in the order they were written — a common, reasonable assumption
+that `mongod` honours — now see the same order here.
+
+Internally this adds a small natural-order index (a monotonic insertion sequence
+→ document map) that an unsorted scan and the `$natural` hint walk; the document
+store itself is unchanged, so every `_id` lookup, secondary index, and
+uniqueness check is untouched. Capped-collection eviction and equal-key sort
+tie-breaks also follow insertion order now. (Multi=false `updateOne`/`deleteOne`
+without a sort still pick the `_id`-order-first match rather than the
+insertion-first one — a smaller remaining divergence, tracked in the backlog.)
+
+#### Fixed
+- Unsorted `find()` (and the `$natural` hint) return documents in insertion
+  order, matching `mongod` — including for collections with mixed-type or
+  non-monotonic `_id`s. Clears the PHP `BulkWrite::testInserts` /
+  `bulkwrite-insert-004` conformance tests.
+
 ## [0.5.3b12] — 2026-06-16
 
 ### `count` honours a `hint`, and 2dsphere indexes report their version
