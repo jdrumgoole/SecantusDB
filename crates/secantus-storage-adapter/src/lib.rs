@@ -73,7 +73,7 @@ impl CmdStorage for StorageAdapter {
         let h = handle
             .downcast_mut::<UserTransactionHandle>()
             .ok_or_else(|| StorageError::Internal("bad transaction handle".into()))?;
-        self.inner.with_user_transaction(h, || f()).map_err(map_err)
+        self.inner.with_user_transaction(h, f).map_err(map_err)
     }
 
     fn commit_user_transaction(
