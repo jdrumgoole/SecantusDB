@@ -2283,7 +2283,25 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         if limit > 0:
             n = min(n, limit)
         return {"n": n, "ok": 1.0}
-    n = ctx.storage.count_matching(ctx.db_name, coll, filter_, collation=doc.get("collation"))
+    hint = doc.get("hint")
+    if hint is not None:
+        # A ``hint`` forces a specific index. For an empty filter this still
+        # walks that index, so hinting a **sparse** index counts only the docs
+        # present in it (the PHP library's Count ``testHintOption`` hints a
+        # sparse index and expects the reduced count). ``find_matching`` already
+        # honours the hint + sparse semantics, so count via it.
+        from secantus.storage import BadHint
+
+        try:
+            n = len(
+                ctx.storage.find_matching(
+                    ctx.db_name, coll, filter_, hint=hint, collation=doc.get("collation")
+                )
+            )
+        except BadHint as exc:
+            return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    else:
+        n = ctx.storage.count_matching(ctx.db_name, coll, filter_, collation=doc.get("collation"))
     # Mongod's ``count`` honours ``limit`` and ``skip`` — the cursor-side
     # ``cursor.count()`` API in the Node / legacy drivers translates to a
     # ``count`` command with these fields populated from the cursor's

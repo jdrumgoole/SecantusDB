@@ -253,6 +253,25 @@ def test_server_status_open_cursor_count(coll) -> None:
     assert open_cursors() == baseline
 
 
+def test_count_hint_sparse_index(coll) -> None:
+    coll.insert_many([{"x": 1}, {"x": 2}, {"y": 3}])
+    coll.create_index("x", sparse=True, name="sparse_x")
+    coll.create_index("y", name="y_1")
+    # Hinting the sparse x-index counts only the docs that HAVE x (2 of 3).
+    assert coll.count_documents({}, hint="sparse_x") == 2
+    assert coll.count_documents({}, hint=[("x", 1)]) == 2
+    # A non-sparse index has an entry for every doc (missing field -> null),
+    # so it counts them all.
+    assert coll.count_documents({}, hint="y_1") == 3
+
+
+def test_index_info_reports_2dsphere_version(coll) -> None:
+    coll.create_index([("pos", "2dsphere")])
+    info = next(i for i in coll.list_indexes() if i["name"] == "pos_2dsphere")
+    # mongod stamps every 2dsphere index with its format version (>= 3).
+    assert info.get("2dsphereIndexVersion", 0) >= 3
+
+
 def test_drop_collection_via_pymongo(client: MongoClient) -> None:
     db = client["dropdb"]
     db["things"].insert_one({"x": 1})
