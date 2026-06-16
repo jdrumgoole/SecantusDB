@@ -237,6 +237,45 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
     "$replaceWith",
 ];
 
+/// Update modifiers mongod accepts (`secantus.update._KNOWN_UPDATE_OPS`). A
+/// top-level `$`-key outside this set is an "Unknown modifier" parse error.
+const KNOWN_UPDATE_OPS: [&str; 14] = [
+    "$set",
+    "$setOnInsert",
+    "$unset",
+    "$currentDate",
+    "$inc",
+    "$mul",
+    "$min",
+    "$max",
+    "$push",
+    "$addToSet",
+    "$pull",
+    "$pop",
+    "$rename",
+    "$bit",
+];
+
+/// Parse-time check of an operator-form update document, mirroring
+/// `secantus.update.validate_update_doc`: `Some(errmsg)` for an unknown modifier
+/// or a mix of operators and replacement fields, else `None` (a pure replacement
+/// or a valid operator update). Surfaces as a `FailedToParse` (9) write error.
+fn unsupported_update_modifier(u: &Document) -> Option<String> {
+    if !u.keys().any(|k| k.starts_with('$')) {
+        return None; // replacement-style update
+    }
+    if !u.keys().all(|k| k.starts_with('$')) {
+        return Some("update document cannot mix operators with replacement fields".to_string());
+    }
+    u.keys()
+        .find(|k| !KNOWN_UPDATE_OPS.contains(&k.as_str()))
+        .map(|k| {
+            format!(
+                "Unknown modifier: {k}. Expected a valid update modifier (e.g. $set, $unset, $inc, ...)"
+            )
+        })
+}
+
 /// `update` — batch update, one entry per `{q, u, multi?, upsert?}` spec. Ports
 /// `commands.py::_update`. Document-, replacement-, and pipeline-form `u` all
 /// apply (pipeline via `Storage::update_matching_pipeline`, diff-style oplog so
@@ -305,6 +344,22 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let q = doc_field(spec, "q");
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
+
+        // Parse-time validation of an operator-form `u`: an unknown modifier (or
+        // mixing operators with replacement fields) is rejected at parse time —
+        // mongod errors even against an empty / no-match collection, where the
+        // apply-time engine would never run. Pipeline-form `u` is validated below.
+        if !matches!(spec.get("u"), Some(Bson::Array(_))) {
+            if let Some(errmsg) = unsupported_update_modifier(&doc_field(spec, "u")) {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32, "code": 9, "errmsg": errmsg,
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
