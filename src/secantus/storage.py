@@ -122,6 +122,16 @@ def _doc_geo_cells(
 
 _COLL_TABLE = "table:secantus_collections"
 _DOC_TABLE = "table:secantus_documents"
+# Natural-order (insertion-order) index. mongod returns documents from an
+# unsorted ``find`` in insertion order (its RecordId store order); our doc
+# table is keyed by ``id_key`` (``_id`` sort order), which only coincides with
+# insertion order for monotonic ``_id``s. ``_NAT_TABLE`` maps a monotonic
+# insertion ``seq`` -> ``id_key`` so an unsorted scan yields insertion order;
+# ``_NAT_SEQ_TABLE`` is the reverse (``id_key`` -> ``seq``) so a delete can find
+# and drop the doc's ordering entry. The doc table itself is unchanged.
+_NAT_TABLE = "table:secantus_natural"
+_NAT_SEQ_TABLE = "table:secantus_natural_seq"
+_INT64_MIN = -(2**63)  # lowest WT ``q`` key — scan a (db, coll) prefix from the start
 _IDX_TABLE = "table:secantus_indexes"
 _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
 _OPLOG_TABLE = "table:secantus_oplog"
@@ -868,6 +878,8 @@ class Storage:
         try:
             boot.create(_COLL_TABLE, "key_format=SS,value_format=u")
             boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
+            boot.create(_NAT_TABLE, "key_format=SSq,value_format=u")
+            boot.create(_NAT_SEQ_TABLE, "key_format=SSu,value_format=q")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
             boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
@@ -896,6 +908,11 @@ class Storage:
         # of the WT concurrency plan) so concurrent writers can mint
         # without contending on the global storage lock.
         self._oplog_seq_lock = threading.Lock()
+        # Tiny lock for the monotonic insertion-order counter (_NAT_TABLE seq).
+        # Global (not per-collection): seqs are unique across the whole store
+        # so an unsorted scan within any one collection still sees a strictly
+        # increasing insertion order.
+        self._nat_seq_lock = threading.Lock()
         # Per-collection RLocks for the CRUD path (Phase 2.4 of the WT
         # concurrency plan). Writes to *different* collections can now
         # run in parallel; writes to the *same* collection still
@@ -907,7 +924,12 @@ class Storage:
         self._coll_locks: dict[tuple[str, str], threading.RLock] = {}
         self._coll_locks_mutex = threading.Lock()
         with self._lock:
-            self._next_seq, self._last_ts_secs, self._last_ts_ord = self._load_oplog_meta()
+            (
+                self._next_seq,
+                self._last_ts_secs,
+                self._last_ts_ord,
+                self._next_nat_seq,
+            ) = self._load_oplog_meta()
 
         # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
         # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
@@ -944,17 +966,21 @@ class Storage:
             )
             self._noop_thread.start()
 
-    def _load_oplog_meta(self) -> tuple[int, int, int]:
+    def _load_oplog_meta(self) -> tuple[int, int, int, int]:
         c = self._cursor(_OPLOG_META_TABLE)
         c.set_key("state")
         if c.search() == 0:
             blob = bytes(c.get_value())
             if blob:
                 state = bson.decode(blob)
+                nat = state.get("next_nat_seq")
+                if nat is None:
+                    nat = self._scan_max_nat_seq() + 1
                 return (
                     int(state.get("next_seq", 1)),
                     int(state.get("last_ts_secs", 0)),
                     int(state.get("last_ts_ord", 0)),
+                    int(nat),
                 )
         # Fallback: scan oplog table for max key + reconstruct from entry.
         c2 = self._cursor(_OPLOG_TABLE)
@@ -974,7 +1000,89 @@ class Storage:
                     if isinstance(ts, Timestamp):
                         last_secs, last_ord = ts.time, ts.inc
             rc = c2.next()
-        return last_seq + 1, last_secs, last_ord
+        return last_seq + 1, last_secs, last_ord, self._scan_max_nat_seq() + 1
+
+    def _scan_max_nat_seq(self) -> int:
+        """Largest insertion ``seq`` present in ``_NAT_TABLE`` (0 if empty).
+
+        Used to recover the insertion counter on reopen when the persisted
+        ``next_nat_seq`` is absent (legacy DBs / runs with the oplog disabled),
+        so minted seqs stay strictly greater than any existing one.
+        """
+        c = self._cursor(_NAT_TABLE)
+        rc = c.prev()  # last row = highest (db, coll, seq)
+        max_seq = 0
+        while rc == 0:
+            seq = int(c.get_key()[2])
+            if seq > max_seq:
+                max_seq = seq
+            rc = c.prev()
+        return max_seq
+
+    def _mint_nat_seq(self) -> int:
+        with self._nat_seq_lock:
+            seq = self._next_nat_seq
+            self._next_nat_seq += 1
+            return seq
+
+    def _write_nat_entry(self, db: str, coll: str, id_key: bytes) -> None:
+        """Record a doc's insertion position: seq -> id_key (+ reverse)."""
+        seq = self._mint_nat_seq()
+        nat = self._cursor(_NAT_TABLE)
+        nat.reset()
+        nat[db, coll, seq] = id_key
+        rev = self._cursor(_NAT_SEQ_TABLE)
+        rev.reset()
+        rev[db, coll, id_key] = seq
+
+    def _delete_nat_entry(self, db: str, coll: str, id_key: bytes) -> None:
+        """Drop a doc's insertion-order entry (both directions). No-op if absent
+        (legacy docs inserted before this index existed)."""
+        rev = self._cursor(_NAT_SEQ_TABLE)
+        rev.reset()
+        rev.set_key(db, coll, id_key)
+        if rev.search() != 0:
+            return
+        seq = int(rev.get_value())
+        rev.remove()
+        nat = self._cursor(_NAT_TABLE)
+        nat.reset()
+        nat.set_key(db, coll, seq)
+        if nat.search() == 0:
+            nat.remove()
+
+    def _scan_docs_natural(self, db: str, coll: str) -> Iterable[tuple[bytes, bytes]]:
+        """Yield ``(id_key, blob)`` in **insertion order** via ``_NAT_TABLE``.
+
+        Walks the natural-order index (seq ascending) and fetches each doc by
+        ``id_key`` from the doc table. Falls back to the plain ``id_key``-order
+        ``_scan_docs`` when the collection has no natural-order entries (legacy
+        data written before this index existed), so order is best-effort there
+        rather than empty.
+        """
+        nat = self._cursor(_NAT_TABLE)
+        nat.set_key(db, coll, _INT64_MIN)
+        rc = nat.search_near()
+        if rc == wt.WT_NOTFOUND or (rc < 0 and nat.next() != 0):
+            yield from self._scan_docs(db, coll)
+            return
+        doc = self._cursor(_DOC_TABLE)
+        saw_any = False
+        while True:
+            k = nat.get_key()
+            if k[0] != db or k[1] != coll:
+                break
+            id_key = bytes(nat.get_value())
+            doc.reset()
+            doc.set_key(db, coll, id_key)
+            if doc.search() == 0:
+                saw_any = True
+                yield id_key, bytes(doc.get_value())
+            if nat.next() != 0:
+                break
+        if not saw_any:
+            # Collection has docs but no nat entries (legacy) — fall back.
+            yield from self._scan_docs(db, coll)
 
     def _persist_oplog_meta(self) -> None:
         c = self._cursor(_OPLOG_META_TABLE)
@@ -983,6 +1091,7 @@ class Storage:
                 "next_seq": self._next_seq,
                 "last_ts_secs": self._last_ts_secs,
                 "last_ts_ord": self._last_ts_ord,
+                "next_nat_seq": self._next_nat_seq,
             }
         )
 
@@ -2687,6 +2796,7 @@ class Storage:
                         break
                     continue
                 self._write_index_entries(db, coll, doc, indexes, partials, id_key_override=key)
+                self._write_nat_entry(db, coll, key)
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
                 if oplog_on:
@@ -2755,6 +2865,7 @@ class Storage:
             doc_cur = self._cursor(_DOC_TABLE)
             doc_cur.set_key(db, coll, id_k)
             doc_cur.remove()
+            self._delete_nat_entry(db, coll, id_k)
             total -= len(blob)
             count -= 1
             if oplog_on:
@@ -2892,7 +3003,12 @@ class Storage:
                             )
                             in_sort_order = True
                 if candidates is None:
-                    raw_blobs = [b for _, b in self._scan_docs(db, coll)]
+                    # COLLSCAN: no usable index. mongod returns these in
+                    # insertion (natural) order, not _id order — walk the
+                    # natural-order index. (When a sort is applied the post-sort
+                    # below reorders anyway, and feeding it insertion order makes
+                    # equal-key ties break like mongod's RecordId order.)
+                    raw_blobs = [b for _, b in self._scan_docs_natural(db, coll)]
         if candidates is None:
             assert raw_blobs is not None
             candidates = [bson.decode(b) for b in raw_blobs]
@@ -3023,7 +3139,8 @@ class Storage:
         which case ``find_matching`` skips the post-sort step.
         """
         if resolved == "$natural":
-            return [bson.decode(b) for _, b in self._scan_docs(db, coll)], False
+            # $natural == insertion order (mongod's RecordId store order).
+            return [bson.decode(b) for _, b in self._scan_docs_natural(db, coll)], False
         if resolved == _ID_INDEX_NAME:
             # The doc table is keyed by id_key; iterating it gives entries
             # sorted by encoded _id, which matches the _id_ index walk.
@@ -3642,6 +3759,7 @@ class Storage:
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur[db, coll, _id_key(upserted_id)] = upsert_blob
                 self._write_index_entries(db, coll, new, indexes, partials)
+                self._write_nat_entry(db, coll, _id_key(upserted_id))
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
                 if oplog_on:
                     oplog_entries.append(
@@ -3725,6 +3843,7 @@ class Storage:
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
+                self._delete_nat_entry(db, coll, id_k)
                 deleted += 1
                 if oplog_on:
                     entry: dict[str, Any] = {
@@ -3806,6 +3925,7 @@ class Storage:
                 doc_cur = self._cursor(_DOC_TABLE)
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
+                self._delete_nat_entry(db, coll, id_k)
                 pruned += 1
                 entry: dict[str, Any] = {
                     "op": "d",
@@ -3826,13 +3946,17 @@ class Storage:
         return {
             _COLL_TABLE: "SS",
             _DOC_TABLE: "SSu",
+            _NAT_TABLE: "SSq",
+            _NAT_SEQ_TABLE: "SSu",
             _IDX_TABLE: "SSS",
             _IDX_ENTRIES_TABLE: "SSSu",
         }[table]
 
     @staticmethod
     def _smallest_for_kf(kf: str) -> tuple[Any, ...]:
-        return tuple(b"" if c == "u" else "" for c in kf)
+        # Smallest value per WT column type: ``u`` -> empty bytes, ``q`` ->
+        # INT64_MIN (the lowest int64 key), ``S`` -> empty string.
+        return tuple(b"" if c == "u" else _INT64_MIN if c == "q" else "" for c in kf)
 
     def _collect_prefix(
         self, table: str, prefix: tuple[Any, ...]
@@ -3876,7 +4000,7 @@ class Storage:
             self._refresh_read_snapshot()
             existed = self._coll_options(db, coll) is not None
             ui = self._collection_uuid(db, coll) if existed else None
-            for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+            for tbl in (_DOC_TABLE, _NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
                 rows = self._collect_prefix(tbl, (db, coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
             c = self._cursor(_COLL_TABLE)
@@ -3908,7 +4032,14 @@ class Storage:
             for c_name in self.list_collections(db):
                 ui = self._collection_uuid(db, c_name)
                 colls_with_ui.append((c_name, ui))
-            for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE, _COLL_TABLE):
+            for tbl in (
+                _DOC_TABLE,
+                _NAT_TABLE,
+                _NAT_SEQ_TABLE,
+                _IDX_TABLE,
+                _IDX_ENTRIES_TABLE,
+                _COLL_TABLE,
+            ):
                 rows = self._collect_prefix(tbl, (db,))
                 self._delete_keys(tbl, [k for k, _ in rows])
             entries: list[dict[str, Any]] = []
@@ -3950,14 +4081,14 @@ class Storage:
             if dst_existed:
                 if not drop_target:
                     return False, f"target namespace exists: {dst_db}.{dst_coll}"
-                for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+                for tbl in (_DOC_TABLE, _NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
                     rows = self._collect_prefix(tbl, (dst_db, dst_coll))
                     self._delete_keys(tbl, [k for k, _ in rows])
                 c = self._cursor(_COLL_TABLE)
                 c.set_key(dst_db, dst_coll)
                 if c.search() == 0:
                     c.remove()
-            for tbl in (_DOC_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+            for tbl in (_DOC_TABLE, _NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
                 rows = self._collect_prefix(tbl, (src_db, src_coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
                 c = self._cursor(tbl)

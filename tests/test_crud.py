@@ -272,6 +272,23 @@ def test_index_info_reports_2dsphere_version(coll) -> None:
     assert info.get("2dsphereIndexVersion", 0) >= 3
 
 
+def test_find_no_sort_returns_insertion_order(coll) -> None:
+    from bson import ObjectId
+
+    # Mixed / non-monotonic _id types where BSON sort order != insertion order.
+    docs = [
+        {"_id": 1, "x": 11},
+        {"_id": ObjectId(), "x": 22},
+        {"_id": "foo", "x": 33},
+        {"_id": "bar", "x": 44},
+    ]
+    coll.insert_many(docs)
+    # find() with no sort returns insertion order, like mongod — NOT _id order.
+    assert [d["x"] for d in coll.find({})] == [11, 22, 33, 44]
+    # $natural hint is the same insertion order.
+    assert [d["x"] for d in coll.find({}).hint([("$natural", 1)])] == [11, 22, 33, 44]
+
+
 def test_drop_collection_via_pymongo(client: MongoClient) -> None:
     db = client["dropdb"]
     db["things"].insert_one({"x": 1})

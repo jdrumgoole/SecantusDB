@@ -73,7 +73,8 @@ def test_snapshot_pins_at_first_statement(storage):
         # …stays invisible to the pinned snapshot.
         assert find_ids(storage) == ["before"]
     storage.abort_user_transaction(h)
-    assert find_ids(storage) == ["after", "before"]
+    # find() with no sort is insertion order now: "before" was inserted first.
+    assert find_ids(storage) == ["before", "after"]
 
 
 def test_two_transactions_conflict_is_write_conflict(storage):
