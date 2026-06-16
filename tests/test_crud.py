@@ -234,6 +234,25 @@ def test_collmod_unknown_index_errors(coll) -> None:
         )
 
 
+def test_server_status_open_cursor_count(coll) -> None:
+    def open_cursors() -> int:
+        return coll.database.command("serverStatus")["metrics"]["cursor"]["open"]["total"]
+
+    coll.insert_many([{"_id": i} for i in range(3)])
+    baseline = open_cursors()
+
+    # A batched find over 3 docs leaves the server cursor alive (1 pending)
+    # after the first batch of 2 — the open count rises by exactly one.
+    cur = coll.find({}, batch_size=2)
+    next(cur)
+    assert cur.alive  # 1 doc still pending server-side
+    assert open_cursors() == baseline + 1
+
+    # Closing the cursor sends killCursors; the count returns to baseline.
+    cur.close()
+    assert open_cursors() == baseline
+
+
 def test_drop_collection_via_pymongo(client: MongoClient) -> None:
     db = client["dropdb"]
     db["things"].insert_one({"x": 1})
