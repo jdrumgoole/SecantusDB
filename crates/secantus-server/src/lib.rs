@@ -26,7 +26,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
 use secantus_commands::{dispatch, CommandContext, ConnectionAuth, CursorRegistry, Storage};
@@ -40,6 +40,12 @@ use secantus_wire::{
 const READ_POLL: Duration = Duration::from_millis(250);
 /// Accept-loop poll interval (the listener is non-blocking) — same purpose.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
+/// Default for [`ServerConfig::message_read_timeout`]: an in-progress message
+/// must fully arrive within 10 minutes of its first byte. Generous enough that
+/// no legitimate message ever hits it (a real message's bytes are already
+/// buffered by the kernel and delivered in milliseconds), tight enough to reap
+/// a slow-loris connection that dribbles a partial frame forever.
+const DEFAULT_MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// TLS / mTLS options (R5c). Mirrors `server.py`'s `tls_*` constructor knobs:
 /// `cert_file` + `key_file` enable server-side TLS; adding `ca_file` (and
@@ -58,7 +64,7 @@ pub struct TlsOptions {
 }
 
 /// Server configuration that shapes the handshake and (later) auth.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Advertised replica-set name (`Some` ⇒ the single-node `secantus`
     /// replica-set `hello`; `None` ⇒ a plain standalone reply).
@@ -67,6 +73,26 @@ pub struct ServerConfig {
     pub require_auth: bool,
     /// TLS / mTLS options. `None` ⇒ plaintext connections.
     pub tls: Option<TlsOptions>,
+    /// Once a wire message *starts* arriving, how long the whole message
+    /// (header + body) may take to fully arrive before the connection is
+    /// dropped. `None` disables the bound. This is a slow-loris defense: a
+    /// client that dribbles a single message a byte at a time would otherwise
+    /// pin a connection thread indefinitely. It does **not** bound how long a
+    /// connection may sit idle *between* messages — an idle pooled connection
+    /// (which mongod never closes on its own) is untouched, preserving the
+    /// conformance contract. Defaults to 10 minutes via [`Default`].
+    pub message_read_timeout: Option<Duration>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            replica_set_name: None,
+            require_auth: false,
+            tls: None,
+            message_read_timeout: Some(DEFAULT_MESSAGE_READ_TIMEOUT),
+        }
+    }
 }
 
 /// Shared state every connection thread reads.
@@ -277,9 +303,17 @@ fn serve<S: Read + Write>(
     shared: &Arc<Shared>,
 ) -> io::Result<()> {
     loop {
+        // A fresh per-message deadline: `None` until the first byte of this
+        // message arrives, so an idle connection waiting between requests is
+        // never bounded — only an in-progress message is. It's threaded through
+        // both the header and body reads (the body inherits the armed deadline)
+        // so the *whole* message must complete within the timeout of its first
+        // byte, then reset on the next loop iteration.
+        let mut deadline: Option<Instant> = None;
+
         // Header.
         let mut header_buf = [0u8; HEADER_SIZE];
-        match read_full(stream, &mut header_buf, shared)? {
+        match read_full(stream, &mut header_buf, shared, &mut deadline)? {
             ReadOutcome::Filled => {}
             ReadOutcome::Closed => return Ok(()),
         }
@@ -295,7 +329,7 @@ fn serve<S: Read + Write>(
 
         // Body.
         let mut body = vec![0u8; body_len];
-        match read_full(stream, &mut body, shared)? {
+        match read_full(stream, &mut body, shared, &mut deadline)? {
             ReadOutcome::Filled => {}
             ReadOutcome::Closed => return Ok(()),
         }
@@ -528,24 +562,51 @@ enum ReadOutcome {
 
 /// Fill `buf` from `stream`, tolerating the read-timeout (re-checking the stop
 /// flag between waits) and treating EOF as `Closed`.
+///
+/// `deadline` arms the message-read timeout (`ServerConfig::message_read_timeout`):
+/// it stays `None` while no byte has arrived (an idle wait is never bounded), is
+/// set to `now + timeout` on the first byte read, and is honoured on every
+/// subsequent poll. Passing the same `deadline` to the header read and then the
+/// body read makes the whole message subject to one timeout measured from its
+/// first byte. A lapsed deadline returns `Closed` (the connection is dropped),
+/// matching how EOF and the stop flag are handled.
 fn read_full<S: Read>(
     stream: &mut S,
     buf: &mut [u8],
     shared: &Arc<Shared>,
+    deadline: &mut Option<Instant>,
 ) -> io::Result<ReadOutcome> {
+    let timeout = shared.config.message_read_timeout;
     let mut filled = 0;
     while filled < buf.len() {
         if shared.stop.load(Ordering::SeqCst) {
             return Ok(ReadOutcome::Closed);
         }
+        // An armed deadline bounds an in-progress message even while the read is
+        // blocked with no further progress (a client that sends a partial frame
+        // then stalls). Checked before each poll so a stalled body — whose
+        // deadline was armed during the header read — is reaped too.
+        if let Some(dl) = *deadline {
+            if Instant::now() >= dl {
+                return Ok(ReadOutcome::Closed);
+            }
+        }
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Ok(ReadOutcome::Closed), // EOF
-            Ok(n) => filled += n,
+            Ok(n) => {
+                filled += n;
+                // First byte of this message: arm the completion deadline.
+                if deadline.is_none() {
+                    if let Some(t) = timeout {
+                        *deadline = Some(Instant::now() + t);
+                    }
+                }
+            }
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                // Read timeout: loop to re-check the stop flag. (If we got a
-                // partial read before timing out, `filled` is preserved.)
+                // Read timeout: loop to re-check the stop flag and deadline. (If
+                // we got a partial read before timing out, `filled` is preserved.)
                 continue;
             }
             Err(e) => return Err(e),

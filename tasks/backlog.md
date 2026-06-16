@@ -226,10 +226,6 @@ below remain open.
   Non-ASCII passwords bypass normalization → hash differently than a
   SASLprep-compliant client. Needs RFC 4013 implementation. Low priority (ASCII
   passwords are the common case; tracked in the auth module docs too).
-- [ ] **No per-connection idle timeout** (`secantus-server/src/lib.rs:40`). The
-  250ms `READ_POLL` is for shutdown detection, not security. A slow-read client
-  sending 1 byte per 250ms ties up a thread indefinitely. Add an aggregate idle
-  timeout (e.g. 10 minutes no complete message → drop connection).
 - [ ] **No concurrent message allocation budget** (`secantus-server/src/lib.rs:297`).
   `MAX_MESSAGE_SIZE` (48 MB) is validated per-message, but there's no cap on
   concurrent in-flight allocations across connections. Under load, many large

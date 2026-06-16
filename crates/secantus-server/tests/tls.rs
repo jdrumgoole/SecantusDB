@@ -132,6 +132,7 @@ fn tls_hello_roundtrip() {
             ca_file: None,
             require_client_cert: false,
         }),
+        ..ServerConfig::default()
     };
     let storage: Arc<dyn Storage> = Arc::new(NoStorage);
     let cursors = Arc::new(CursorRegistry::new());

@@ -180,6 +180,7 @@ fn full_wire_roundtrip() {
             replica_set_name: Some("secantus".into()),
             require_auth: false,
             tls: None,
+            ..ServerConfig::default()
         },
         storage,
         cursors,
@@ -295,5 +296,61 @@ fn find_getmore_killcursors_over_the_wire() {
     assert_eq!(
         reply.get_array("cursorsKilled").unwrap(),
         &vec![Bson::Int64(cid)]
+    );
+}
+
+/// Slow-loris defense (`ServerConfig::message_read_timeout`): a client that
+/// starts a wire message and then dribbles/stalls without completing it is
+/// dropped once the timeout elapses from the first byte — instead of pinning a
+/// connection thread forever. An idle connection that has sent *nothing* is
+/// untouched (only an in-progress message is bounded), preserving the
+/// mongod-conformant "never close an idle pooled connection" behaviour.
+#[test]
+fn slow_loris_partial_message_is_dropped_but_idle_is_not() {
+    use std::time::Instant;
+
+    let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+    let cursors = Arc::new(CursorRegistry::new());
+    let server = bind(
+        "127.0.0.1:0",
+        ServerConfig {
+            message_read_timeout: Some(Duration::from_millis(400)),
+            ..ServerConfig::default()
+        },
+        storage,
+        cursors,
+    )
+    .unwrap();
+    let addr = server.address();
+
+    // 1. An idle connection that sends no bytes at all sits past 2× the timeout
+    //    and is still fully usable (the timeout does not bound idle waits).
+    let mut idle = connect(addr);
+    std::thread::sleep(Duration::from_millis(900));
+    let reply = op_msg(&mut idle, 1, &doc! {"hello": 1, "$db": "admin"});
+    assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+
+    // 2. A started-but-never-finished message is reaped. Send 4 bytes of a
+    //    16-byte header (the message has "started") then stall.
+    let mut stream = connect(addr);
+    stream.write_all(&[16, 0, 0, 0]).unwrap();
+    stream.flush().unwrap();
+
+    // The server closes the socket shortly after the timeout ⇒ the client read
+    // returns EOF (0 bytes). The client's own 5s read timeout would otherwise
+    // fire at ~5s, so a bounded elapsed proves the *server* closed it.
+    let start = Instant::now();
+    let mut buf = [0u8; 16];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let elapsed = start.elapsed();
+
+    assert_eq!(n, 0, "server should close the stalled connection (EOF)");
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "should not close before the timeout elapses: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "server (not the client's 5s read timeout) should close it: {elapsed:?}"
     );
 }
