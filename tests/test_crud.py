@@ -162,6 +162,46 @@ def test_duplicate_id_raises(coll) -> None:
         coll.insert_one({"_id": 1, "x": 2})
 
 
+def test_duplicate_key_errmsg_matches_mongod_shape(coll) -> None:
+    import re
+
+    from pymongo import InsertOne
+    from pymongo.errors import BulkWriteError
+
+    coll.insert_one({"_id": 1})
+    with pytest.raises(BulkWriteError) as ei:
+        coll.bulk_write([InsertOne({"_id": 1})])
+    we = ei.value.details["writeErrors"][0]
+    # mongod's exact wording: "E11000 duplicate key error collection: <ns>
+    # index: <name> dup key: { _id: 1 }". The PHP extension (and other
+    # type-strict drivers) pin this message verbatim.
+    assert re.fullmatch(
+        r"E11000 duplicate key error collection: \w+\.things index: _id_ dup key: \{ _id: 1 \}",
+        we["errmsg"],
+    ), we["errmsg"]
+    assert we["code"] == 11000
+    assert we["keyPattern"] == {"_id": 1}
+    assert we["keyValue"] == {"_id": 1}
+
+
+def test_duplicate_key_errmsg_on_unique_index_uses_field_value(coll) -> None:
+    import re
+
+    from pymongo import InsertOne
+    from pymongo.errors import BulkWriteError
+
+    coll.create_index("email", unique=True)
+    coll.insert_one({"_id": 1, "email": "a@b.com"})
+    with pytest.raises(BulkWriteError) as ei:
+        coll.bulk_write([InsertOne({"_id": 2, "email": "a@b.com"})])
+    we = ei.value.details["writeErrors"][0]
+    # Non-_id unique index: the dup-key fragment carries the indexed field's
+    # value, string-quoted the way the mongo shell prints it.
+    assert re.search(
+        r'index: email_1 dup key: \{ email: "a@b\.com" \}', we["errmsg"]
+    ), we["errmsg"]
+
+
 def test_drop_collection_via_pymongo(client: MongoClient) -> None:
     db = client["dropdb"]
     db["things"].insert_one({"x": 1})
