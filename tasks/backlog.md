@@ -261,8 +261,6 @@ below remain open.
 
 ---
 
-- [ ] **CI red: `rust-storage` job — `secantus-storage` `write` test won't compile** (2026-06-16, [issue #57](https://github.com/jdrumgoole/SecantusDB/issues/57)). Pre-existing since the `rust-next2` merge (`b079c53`); methods gained a trailing `Option<&Collation>` arg but `crates/secantus-storage/tests/write.rs` callsites weren't updated → 20× `E0061`. Fix: append the new arg (e.g. `, None`) to the flagged callsites (`count_matching` etc., `src/lib.rs:3437`). Only CI's `rust-storage` job catches it because `secantus-storage` is excluded from the clean workspace. Not fixed by `848bd7b` (different issue).
-
 > ⚠️ **Direction changed — authoritative plan is now `tasks/rust-server-plan.md`.**
 > The end-state is **two completely separate servers** (a pure-Python server and a
 > self-contained Rust server with a thin embedded Python lifecycle handle), **not**
