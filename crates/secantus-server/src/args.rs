@@ -52,6 +52,7 @@ impl CliArgs {
                 ca_file: t.ca_file.clone(),
                 require_client_cert: t.require_client_cert,
             }),
+            ..ServerConfig::default()
         }
     }
 
