@@ -244,26 +244,32 @@ def main(argv: list[str] | None = None) -> int:
     rust = _median_run(_rust_client, args.n, args.reps)
     py = _median_run(_python_client, args.n, args.reps)
 
+    # Column labels: SecantusDB = the Python server, SecantusDB-rs = the Rust
+    # server. The implementation is spelled out in a sub-label row beneath.
     if mongod is not None:
         # mongod is the reference: show each server's ms + how many x slower.
         header = (
-            f"{'workload':<22}{'mongod(ms)':>12}{'rust(ms)':>11}{'×mongod':>10}"
-            f"{'python(ms)':>13}{'×mongod':>10}"
+            f"{'workload':<22}{'mongod(ms)':>12}{'SecantusDB-rs(ms)':>19}"
+            f"{'×mongod':>9}{'SecantusDB(ms)':>16}{'×mongod':>9}"
         )
+        sub = f"{'':<22}{'':>12}{'(Rust)':>19}{'':>9}{'(Python)':>16}{'':>9}"
         print(header)
+        print(sub)
         print("-" * len(header))
         for k in WORKLOADS:
             m, r, p = mongod[k] * 1000, rust[k] * 1000, py[k] * 1000
             rx = r / m if m else float("nan")
             px = p / m if m else float("nan")
-            print(f"{k:<22}{m:>12.2f}{r:>11.2f}{rx:>9.1f}x{p:>13.2f}{px:>9.1f}x")
+            print(f"{k:<22}{m:>12.2f}{r:>19.2f}{rx:>8.1f}x{p:>16.2f}{px:>8.1f}x")
     else:
-        header = f"{'workload':<22}{'rust(ms)':>12}{'python(ms)':>14}{'speedup':>12}"
+        header = f"{'workload':<22}{'SecantusDB-rs(ms)':>19}{'SecantusDB(ms)':>16}{'speedup':>10}"
+        sub = f"{'':<22}{'(Rust)':>19}{'(Python)':>16}{'':>10}"
         print(header)
+        print(sub)
         print("-" * len(header))
         for k in WORKLOADS:
             r, p = rust[k] * 1000, py[k] * 1000
-            print(f"{k:<22}{r:>12.2f}{p:>14.2f}{(p / r if r else float('nan')):>11.1f}x")
+            print(f"{k:<22}{r:>19.2f}{p:>16.2f}{(p / r if r else float('nan')):>9.1f}x")
     return 0
 
 
