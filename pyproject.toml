@@ -200,13 +200,17 @@ before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew i
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-# SWIG ships preinstalled on windows-2022 runners; choco re-installs it idempotently.
-before-build = "choco install -y swig"
-# NOTE: the storage-engine bundle (the _secantus_storage / _secantus_server Rust
-# extensions) is NOT yet built into the Windows wheel — Windows ships pure-Python
-# for now, so no flag/libclang env here. The standalone secantusdb-rs binary is
-# non-Windows regardless (CMake gates it off). Bundling the extensions on Windows
-# (libclang + the LLVM-path CIBW env quoting) is a tracked follow-on.
+# SWIG (preinstalled, re-installed idempotently) + LLVM for bindgen's libclang.
+# Rust ships preinstalled on the windows-2022 runner, so we don't choco-install
+# it (that would risk shadowing the runner's rustup cargo).
+before-build = "choco install -y swig llvm"
+# Flag + libclang for the storage-engine bundle (_secantus_storage /
+# _secantus_server extensions + secantusdb-rs.exe). Set here, not in a workflow
+# CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't overridden). Each value is
+# wrapped in literal double quotes so cibuildwheel's bashlex evaluator treats it
+# as a string rather than choking on the inner `=` (SKBUILD_CMAKE_DEFINE) or the
+# space in the LLVM path (LIBCLANG_PATH).
+environment = { SKBUILD_CMAKE_DEFINE = '"SECANTUS_BUILD_STORAGE_ENGINE=ON"', LIBCLANG_PATH = '"C:\Program Files\LLVM\bin"' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

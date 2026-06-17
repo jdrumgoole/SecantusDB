@@ -243,34 +243,36 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     # the pure-Python `secantusdb` console script (`secantus.cli:main`,
     # `[project.scripts]`), which remains the default and is unaffected.
     #
-    # Non-Windows only: the bin links `static=wiredtiger`; the standalone
-    # binary's MSVC link path is unverified (the extensions link WT on Windows
-    # via the cdylib path, but the bin is skipped — Windows users get the
-    # embedded `_secantus_server` handle). Follow-on; see tasks/backlog.md §7.
+    # Built on every platform: the bin links `static=wiredtiger` the same way the
+    # extensions above do, which link WT successfully under MSVC too. On Windows
+    # cargo emits `secantusdb.exe`, staged as `secantusdb-rs.exe`.
     # -------------------------------------------------------------------------
-    if(NOT WIN32)
-        set(SECANTUSDB_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantusdb)
-        set(SECANTUSDB_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-target)
+    set(SECANTUSDB_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantusdb)
+    set(SECANTUSDB_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-target)
+    if(WIN32)
+        set(SECANTUSDB_BIN_BUILT  ${SECANTUSDB_TARGET_DIR}/release/secantusdb.exe)
+        set(SECANTUSDB_BIN_STAGED ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-rs.exe)
+    else()
         set(SECANTUSDB_BIN_BUILT  ${SECANTUSDB_TARGET_DIR}/release/secantusdb)
         set(SECANTUSDB_BIN_STAGED ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-rs)
-
-        # Same always-run custom-target shape as the extensions above (cargo owns
-        # freshness; copy_if_different keeps the no-change case cheap).
-        add_custom_target(secantusdb_bin ALL
-            COMMAND ${CMAKE_COMMAND} -E env
-                SECANTUS_WT_INCLUDE=${WT_BINARY_DIR}/include
-                SECANTUS_WT_LIB=${WT_BINARY_DIR}
-                CARGO_TARGET_DIR=${SECANTUSDB_TARGET_DIR}
-                ${CARGO_EXECUTABLE} build --release
-                    --manifest-path ${SECANTUSDB_CRATE_DIR}/Cargo.toml
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SECANTUSDB_BIN_BUILT} ${SECANTUSDB_BIN_STAGED}
-            DEPENDS wiredtiger_ext
-            COMMENT "Building standalone secantusdb binary (-> secantusdb-rs) against bundled WiredTiger"
-            VERBATIM
-        )
-
-        # Into the wheel's scripts dir so pip drops it in the env's bin/ on PATH.
-        # PROGRAMS (not FILES) so the executable bit is preserved.
-        install(PROGRAMS ${SECANTUSDB_BIN_STAGED} DESTINATION ${SKBUILD_SCRIPTS_DIR} OPTIONAL)
     endif()
+
+    # Same always-run custom-target shape as the extensions above (cargo owns
+    # freshness; copy_if_different keeps the no-change case cheap).
+    add_custom_target(secantusdb_bin ALL
+        COMMAND ${CMAKE_COMMAND} -E env
+            SECANTUS_WT_INCLUDE=${WT_BINARY_DIR}/include
+            SECANTUS_WT_LIB=${WT_BINARY_DIR}
+            CARGO_TARGET_DIR=${SECANTUSDB_TARGET_DIR}
+            ${CARGO_EXECUTABLE} build --release
+                --manifest-path ${SECANTUSDB_CRATE_DIR}/Cargo.toml
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SECANTUSDB_BIN_BUILT} ${SECANTUSDB_BIN_STAGED}
+        DEPENDS wiredtiger_ext
+        COMMENT "Building standalone secantusdb binary (-> secantusdb-rs) against bundled WiredTiger"
+        VERBATIM
+    )
+
+    # Into the wheel's scripts dir so pip drops it in the env's bin/ (Scripts/ on
+    # Windows) on PATH. PROGRAMS (not FILES) so the executable bit is preserved.
+    install(PROGRAMS ${SECANTUSDB_BIN_STAGED} DESTINATION ${SKBUILD_SCRIPTS_DIR} OPTIONAL)
 endif()
