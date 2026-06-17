@@ -332,6 +332,31 @@ def chaos(
 
 
 @task(
+    name="compare-servers",
+    help={
+        "count": "Documents per workload (default: 10000).",
+        "reps": "Reps to take the median over (default: 5).",
+    },
+)
+def compare_servers(c: Context, count: int = 10000, reps: int = 5) -> None:
+    """Compare Rust-server vs Python-server throughput on the perf workloads.
+
+    Runs insert / indexed-range find / full scan / update-many / $group
+    aggregate / delete-many against both servers over on-disk WiredTiger (via
+    pymongo) and prints per-workload medians + the Rust-vs-Python speedup.
+
+    Requires the Rust server extension, which is NOT in the default wheel —
+    build it first:
+
+        SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev
+    """
+    c.run(
+        f"uv run --no-sync python -m bench.compare_servers --n {int(count)} --reps {int(reps)}",
+        pty=True,
+    )
+
+
+@task(
     help={
         "duration": "Wall-clock seconds per writer count (default: 30).",
         "batch-size": "Documents per insert call (default: 100).",
