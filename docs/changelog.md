@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### The in-process Rust engine selection is fully removed
+
+The transitional in-process engine selection — `SECANTUS_ENGINE=python|rust|auto`,
+the `--engine` CLI flag, and the `SecantusDBServer(engine=...)` constructor
+parameter — has been removed entirely. It was already inert since 0.5.3b3 (no
+operator module delegated to the `_secantus_core` extension any more), so this is
+a no-op for behaviour: the Python server has been pure-Python end to end for
+several releases. This change deletes the dead surface so there is one obvious
+way things work.
+
+SecantusDB's Rust implementation lives in the **separate Rust server** (and the
+standalone `secantusdb` binary), not in this package's request path. The
+`secantus-core` wheel remains as the engine library and the parity-test oracle
+that pins each Rust engine byte-for-byte against its pure-Python counterpart.
+
+#### Removed
+- The `--engine` CLI flag and the `engine=` parameter on `SecantusDBServer`.
+  Passing `engine=` now raises `TypeError` (the flag had no effect since 0.5.3b3).
+- The `secantus.engine` module (the inert compatibility stub) and its
+  `tests/test_engine.py`.
+- The `SECANTUS_ENGINE=rust` full-suite CI step, which re-ran the test suite
+  under a now-dead env var and was a source of flaky worker-crash failures.
+
 ## [0.5.3b13] — 2026-06-16
 
 ### `find()` with no sort now returns documents in insertion order

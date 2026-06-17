@@ -272,15 +272,14 @@ side is a Cargo workspace under `crates/`: the pure-Rust engine lib crate
 which builds the abi3 extension `_secantus_core` via maturin (`invoke rust-build`
 / `rust-test` / `rust-parity`).
 
-**Both implementations are permanent (not a replacement).** ~~Selection is
-process-wide via `secantus.engine`.~~ → The pure-Python engines power the **Python
-server**; the Rust engines power the separate **Rust server**. The
-`secantus.engine` in-process selection ~~is transitional and being retired~~ has
-been **retired from the Python package** (0.5.3b3): no `src/secantus/**` module
-imports `_secantus_core` any more, and `engine.available()` / `enabled()` always
-report Python. `secantus.engine` survives only as an inert compatibility stub.
-The `tests/test_rust_*_parity.py` oracle still imports `_secantus_core` directly
-to pin the Rust engines against the pure-Python ones.
+**Both implementations are permanent (not a replacement).** The pure-Python
+engines power the **Python server**; the Rust engines power the separate **Rust
+server**. The in-process `secantus.engine` selection was first made inert
+(0.5.3b3) and is now **fully removed** (0.5.3b14): the `secantus.engine` module,
+the `--engine` CLI flag, the `SecantusDBServer(engine=...)` parameter, and the
+`SECANTUS_ENGINE=rust` CI full-suite step are all gone. The
+`tests/test_rust_*_parity.py` oracle still imports `_secantus_core` directly to
+pin the Rust engines against the pure-Python ones.
 
 - [ ] **Rust port owes numeric type preservation.** The Python `$inc` / `$mul` /
   `$sum` now follow mongod's numeric promotion (int32 < int64 < double <

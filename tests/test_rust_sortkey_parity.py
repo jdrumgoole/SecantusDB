@@ -30,8 +30,8 @@ from bson.timestamp import Timestamp
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 # Load the pure-Python encoder by path (avoid secantus/__init__ -> server ->
-# WiredTiger import chain). A stub `secantus` package with __path__ lets the
-# module's `from secantus import engine` auto-resolve engine.py without the
+# WiredTiger import chain). A stub `secantus` package with __path__ lets
+# sortkey.py's intra-package imports auto-resolve from src/secantus without the
 # heavy server imports.
 _ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "secantus"
 if "secantus" not in sys.modules:

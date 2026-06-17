@@ -141,35 +141,26 @@ needs three native build tools on `PATH`:
 
 See [Installation](https://secantusdb.readthedocs.io/en/latest/installation.html) for dev-install instructions.
 
-### Optional Rust acceleration
+### The Rust server (separate)
 
-The operator engines (query matching, updates, the aggregation-expression
-evaluator, projection, and the storage-independent aggregation pipeline) have an
-optional Rust implementation that runs off the GIL. It's an **accelerator, not a
-replacement** — the pure-Python engines are always present and remain the
-**default**, and the Rust core is pinned byte-for-byte against them.
+SecantusDB ships **two separate servers** on independent version lines: the
+pure-Python server (this package's `SecantusDBServer`) and a self-contained
+**Rust server** that speaks the same wire protocol off the GIL. You run one or
+the other — there is no in-process engine switching. The Python server is always
+pure-Python; the Rust engines live only in the Rust server.
+
+> The old in-process accelerator (`SECANTUS_ENGINE=rust` / `SecantusDBServer(engine=...)`)
+> has been **retired** in favour of this two-server split.
+
+The Rust side is a Cargo workspace under `crates/`: a pure-Rust engine crate
+(`secantus-core`, no PyO3) reused by the Rust server and the standalone
+`secantusdb` binary, plus a thin PyO3 bindings crate (`secantus-core-py`) that
+builds the `secantus-core` wheel — the vehicle that pins each Rust engine
+byte-for-byte against its pure-Python counterpart.
 
 ```bash
 pip install "secantus[rust]"      # pulls the matching secantus-core wheel
 ```
-
-Enable it process-wide (default stays Python):
-
-```bash
-export SECANTUS_ENGINE=rust       # or "auto" — rust if the extension is present
-```
-
-```python
-from secantus import SecantusDBServer
-server = SecantusDBServer(engine="rust")   # same effect, programmatic
-```
-
-`rust` transparently falls back to Python for anything it doesn't reproduce, so
-it's always correct. The Rust side is a Cargo workspace under `crates/`: a
-pure-Rust engine crate (`secantus-core`, no PyO3) plus a thin PyO3 bindings crate
-(`secantus-core-py`) that builds the `secantus-core` wheel. Splitting them keeps
-the engines reusable so they can evolve toward a first-class, standalone Rust
-build.
 
 ## Standalone daemon (drop-in `mongod` replacement)
 

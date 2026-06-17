@@ -5,10 +5,11 @@ The optional **Rust acceleration core** for [SecantusDB](https://github.com/jdru
 This package provides the `_secantus_core` compiled extension — a Rust
 reimplementation of SecantusDB's pure operator engines (sort keys, the query
 matcher, update operators, the aggregation-expression evaluator, projection,
-the change-stream diff, and the storage-independent aggregation pipeline). It is
-an **accelerator, not a replacement**: SecantusDB always ships and works with
-its pure-Python engines, and the Rust core is reproduced byte-for-byte against
-them (pinned by the `tests/test_rust_*_parity.py` suites in the main repo).
+the change-stream diff, and the storage-independent aggregation pipeline). These
+engines power the **separate Rust server**; the pure-Python `secantus` server
+never imports this extension. The Rust core is reproduced byte-for-byte against
+the pure-Python engines (pinned by the `tests/test_rust_*_parity.py` suites in
+the main repo).
 
 ## Install
 
@@ -22,24 +23,17 @@ That pulls in `secantus` plus this matching `secantus-core` wheel. Versions are
 kept in lockstep: `secantus[rust]` pins `secantus-core` to the exact SecantusDB
 version it accelerates.
 
-## Enable
+## How it's used
 
-Selection is process-wide and the **default is still Python**. Opt in with:
+There is **no in-process engine switching**. The old `SECANTUS_ENGINE` /
+`SecantusDBServer(engine=...)` selection was retired in favour of two separate
+servers — the pure-Python `secantus` server and a self-contained Rust server.
+The `secantus` Python package never imports this extension.
 
-```bash
-export SECANTUS_ENGINE=rust    # or "auto" (rust if the extension is importable)
-```
-
-or in code:
-
-```python
-import secantus.engine as engine
-engine.set_engine("rust")      # or pass SecantusDBServer(engine="rust")
-```
-
-`rust` transparently falls back to the pure-Python path for anything the Rust
-core doesn't (yet) reproduce, so it is always correct. Per-component overrides
-(`SECANTUS_RUST_QUERY=1`, etc.) exist for debugging/bisection.
+`secantus-core` exists as (1) the reusable Rust engine library behind the Rust
+server and the standalone `secantusdb` binary, and (2) the **parity-test oracle**:
+the `tests/test_rust_*_parity.py` suites import `_secantus_core` directly and
+assert each Rust engine matches its pure-Python counterpart byte-for-byte.
 
 ## Build from source
 

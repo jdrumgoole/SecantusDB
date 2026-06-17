@@ -142,13 +142,15 @@ jobs:
         # ``--timeout`` above regardless, so the restart budget is safe.
         run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
-  # The matrix above runs the default pure-Python engines. This job builds the
-  # optional Rust accelerator core (``_secantus_core``) and validates it two
-  # ways: the engine-parity suites (pure-Python vs Rust, byte-for-byte) and the
-  # FULL pytest suite under ``SECANTUS_ENGINE=rust`` — so the Rust engine is
-  # differentially validated against real WiredTiger-backed behaviour through
-  # pymongo. (The Rust engines reproduce the pure path exactly or fall back to
-  # it, so the full suite is expected green under either engine.)
+  # The matrix above runs the pure-Python server. This job builds the Rust core
+  # (``_secantus_core``) and pins each Rust engine byte-for-byte against its
+  # pure-Python counterpart via the engine-parity suites (the operator oracle).
+  # NOTE: the old ``SECANTUS_ENGINE=rust`` full-suite step was removed when the
+  # in-process engine selection was retired (two-server model) — with no Python
+  # module delegating to ``_secantus_core`` any more, running the full suite
+  # under that env var was a no-op re-run of the ``test`` job and a flake source.
+  # The Rust engines are now exercised only as the separate Rust server and via
+  # these parity suites.
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -194,18 +196,10 @@ jobs:
       - name: Engine-parity suites (pure-Python vs Rust)
         run: >-
           uv run python -m pytest
-          tests/test_engine.py
           tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py
           tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py
           tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py
           tests/test_rust_aggregate_parity.py
-
-      - name: Full suite under the Rust engine
-        env:
-          SECANTUS_ENGINE: rust
-        # ``--max-worker-restart=3`` for the same transient-worker-crash flake
-        # as the pure-Python ``test`` job above (the timeout still guards hangs).
-        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
   # The WiredTiger-linking Rust storage crate (`secantus-storage`, Phase 4) — the
   # secondary-index + CRUD storage layer. It's excluded from the `crates/`
