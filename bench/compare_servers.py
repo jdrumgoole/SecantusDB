@@ -1,23 +1,30 @@
-"""Compare throughput of the Rust server vs the Python server.
+"""Compare throughput of the Rust server, the Python server, and real mongod.
 
 SecantusDB ships two servers (see CLAUDE.md "Engines: ... TWO SEPARATE
 SERVERS"): the pure-Python ``SecantusDBServer`` and the pure-Rust server
 (``_secantus_server.RustServer``). This harness runs the same workloads the
 perf-regression suite uses — insert, indexed-range find, full scan,
-update-many, ``$group`` aggregate, delete-many — against both, over real
-on-disk WiredTiger, driven through ``pymongo`` so each number includes the
-wire + driver overhead a real client pays. It reports the median time per
-workload and the Rust-vs-Python speedup, so a regression in either server's
-relative performance is visible at a glance.
+update-many, ``$group`` aggregate, delete-many — against both, plus a real
+single-node ``mongod`` when one is on ``PATH`` (all three on real on-disk
+WiredTiger, driven through ``pymongo`` so each number includes the wire +
+driver overhead a real client pays). ``mongod`` is the reference: the table
+reports each server's median time and how many times slower than ``mongod`` it
+is, so you can see both the Rust-vs-Python gap and how close each gets to the
+real thing.
 
 The Rust server is **not** in the default wheel — it must be compiled first:
 
     SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev
 
+``mongod`` is optional: if it isn't on ``PATH`` (and no ``--mongo-uri`` is
+given), the comparison runs Rust-vs-Python only and notes mongod was skipped.
+
 Run via ``uv run python -m invoke compare-servers`` (or this module directly):
 
     uv run --no-sync python -m bench.compare_servers --n 10000 --reps 5
     uv run --no-sync python -m bench.compare_servers --n 100000   # bigger, see how the gap scales
+    uv run --no-sync python -m bench.compare_servers --mongo-uri mongodb://127.0.0.1:27017
+    uv run --no-sync python -m bench.compare_servers --no-mongod
 
 Ctrl-C aborts cleanly between reps.
 """
@@ -25,13 +32,17 @@ Ctrl-C aborts cleanly between reps.
 from __future__ import annotations
 
 import argparse
+import shutil
 import signal
+import socket
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pymongo
@@ -51,6 +62,23 @@ WORKLOADS = (
 def _make_docs(n: int) -> list[dict[str, Any]]:
     # Same shape as tests/test_perf_regression.py::make_docs.
     return [{"_id": i, "i": i, "g": i % 50, "v": i * 2, "active": i % 2 == 0} for i in range(n)]
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_listener(host: str, port: int, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError(f"{host}:{port} did not accept a connection within {timeout}s")
 
 
 @contextmanager
@@ -75,6 +103,46 @@ def _python_client() -> Iterator[pymongo.MongoClient]:
         yield pymongo.MongoClient(srv.uri, directConnection=True, serverSelectionTimeoutMS=5000)
     finally:
         srv.stop()
+
+
+@contextmanager
+def _mongod_client(mongo_uri: str | None) -> Iterator[pymongo.MongoClient]:
+    """Connect to ``--mongo-uri`` if given, else spawn a throwaway single-node
+    ``mongod`` on a free port + temp dbpath (cleaned up on exit)."""
+    if mongo_uri:
+        yield pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        return
+    data_dir = Path(tempfile.mkdtemp(prefix="cmp-mongod-"))
+    port = _free_port()
+    proc = subprocess.Popen(
+        [
+            "mongod",
+            "--bind_ip",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dbpath",
+            str(data_dir),
+            "--logpath",
+            str(data_dir / "mongod.log"),
+            "--noauth",
+            "--quiet",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_listener("127.0.0.1", port)
+        time.sleep(0.5)  # mongod accepts TCP before the handshake is fully ready
+        yield pymongo.MongoClient(f"mongodb://127.0.0.1:{port}", serverSelectionTimeoutMS=5000)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
@@ -147,6 +215,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reps", type=int, default=5, help="reps to take the median over (default: 5)"
     )
+    parser.add_argument(
+        "--mongo-uri", default="", help="existing mongod URI (default: spawn a throwaway mongod)"
+    )
+    parser.add_argument("--no-mongod", action="store_true", help="skip the mongod comparison")
     args = parser.parse_args(argv)
 
     try:
@@ -159,16 +231,39 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    use_mongod = not args.no_mongod and (bool(args.mongo_uri) or shutil.which("mongod") is not None)
+    if not args.no_mongod and not use_mongod:
+        print("note: mongod not on PATH and no --mongo-uri — skipping the mongod column.\n")
+
     print(f"workload n={args.n}, median of {args.reps} reps, on-disk WiredTiger, via pymongo\n")
+    mongod = (
+        _median_run(lambda: _mongod_client(args.mongo_uri or None), args.n, args.reps)
+        if use_mongod
+        else None
+    )
     rust = _median_run(_rust_client, args.n, args.reps)
     py = _median_run(_python_client, args.n, args.reps)
 
-    print(f"{'workload':<22}{'rust (ms)':>12}{'python (ms)':>14}{'speedup':>12}")
-    print("-" * 60)
-    for k in WORKLOADS:
-        r, p = rust[k] * 1000, py[k] * 1000
-        speedup = p / r if r else float("nan")
-        print(f"{k:<22}{r:>12.2f}{p:>14.2f}{speedup:>11.1f}x")
+    if mongod is not None:
+        # mongod is the reference: show each server's ms + how many x slower.
+        header = (
+            f"{'workload':<22}{'mongod(ms)':>12}{'rust(ms)':>11}{'×mongod':>10}"
+            f"{'python(ms)':>13}{'×mongod':>10}"
+        )
+        print(header)
+        print("-" * len(header))
+        for k in WORKLOADS:
+            m, r, p = mongod[k] * 1000, rust[k] * 1000, py[k] * 1000
+            rx = r / m if m else float("nan")
+            px = p / m if m else float("nan")
+            print(f"{k:<22}{m:>12.2f}{r:>11.2f}{rx:>9.1f}x{p:>13.2f}{px:>9.1f}x")
+    else:
+        header = f"{'workload':<22}{'rust(ms)':>12}{'python(ms)':>14}{'speedup':>12}"
+        print(header)
+        print("-" * len(header))
+        for k in WORKLOADS:
+            r, p = rust[k] * 1000, py[k] * 1000
+            print(f"{k:<22}{r:>12.2f}{p:>14.2f}{(p / r if r else float('nan')):>11.1f}x")
     return 0
 
 

@@ -336,24 +336,36 @@ def chaos(
     help={
         "count": "Documents per workload (default: 10000).",
         "reps": "Reps to take the median over (default: 5).",
+        "mongo-uri": "Existing mongod URI to compare against (default: spawn a throwaway mongod).",
+        "no-mongod": "Skip the mongod comparison (Rust-vs-Python only).",
     },
 )
-def compare_servers(c: Context, count: int = 10000, reps: int = 5) -> None:
-    """Compare Rust-server vs Python-server throughput on the perf workloads.
+def compare_servers(
+    c: Context,
+    count: int = 10000,
+    reps: int = 5,
+    mongo_uri: str = "",
+    no_mongod: bool = False,
+) -> None:
+    """Compare Rust-server, Python-server, and real mongod throughput.
 
     Runs insert / indexed-range find / full scan / update-many / $group
-    aggregate / delete-many against both servers over on-disk WiredTiger (via
-    pymongo) and prints per-workload medians + the Rust-vs-Python speedup.
+    aggregate / delete-many against all three over on-disk WiredTiger (via
+    pymongo) and prints per-workload medians + how many times slower than
+    mongod each server is. mongod is spawned automatically when on PATH (or
+    pass --mongo-uri); it's skipped with a note otherwise.
 
     Requires the Rust server extension, which is NOT in the default wheel —
     build it first:
 
         SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev
     """
-    c.run(
-        f"uv run --no-sync python -m bench.compare_servers --n {int(count)} --reps {int(reps)}",
-        pty=True,
-    )
+    cmd = f"uv run --no-sync python -m bench.compare_servers --n {int(count)} --reps {int(reps)}"
+    if mongo_uri:
+        cmd += f" --mongo-uri {shlex.quote(mongo_uri)}"
+    if no_mongod:
+        cmd += " --no-mongod"
+    c.run(cmd, pty=True)
 
 
 @task(
