@@ -121,7 +121,7 @@ jobs:
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
             SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
-            LIBCLANG_PATH=/usr/lib64
+            LIBCLANG_PATH=/opt/libclang
           # macOS: ccache via Homebrew. The macos-14 runner image
           # already has it — `brew install` is idempotent and a few
           # seconds when already present.
@@ -131,7 +131,6 @@ jobs:
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
             SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
-            LIBCLANG_PATH=$(brew --prefix llvm)/lib
           # Windows: ccache + MSVC is historically fragile, so the
           # Windows wheel build runs without ccache. If Windows becomes
           # the publish-workflow bottleneck, switch to sccache.
