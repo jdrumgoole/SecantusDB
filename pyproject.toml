@@ -194,16 +194,13 @@ before-build = "brew install swig llvm && (command -v cargo >/dev/null 2>&1 || b
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-# SWIG + LLVM (libclang for bindgen) + Rust via choco, all idempotent. The
-# standalone secantusdb binary is NOT built on Windows (CMake gates it to
-# non-Windows), but the `_secantus_storage` / `_secantus_server` extensions are.
-# Rust ships preinstalled on the windows-2022 runner, so we don't choco-install
-# it (that would risk shadowing the runner's rustup cargo).
-before-build = "choco install -y swig llvm"
-# Windows flag + libclang go here (not the workflow env): no workflow sets
-# CIBW_ENVIRONMENT_WINDOWS, so this isn't overridden, and a TOML table sidesteps
-# the space in the LLVM path that space-split CIBW_ENVIRONMENT strings choke on.
-environment = { SECANTUS_BUILD_STORAGE_ENGINE = "ON", SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' }
+# SWIG ships preinstalled on windows-2022 runners; choco re-installs it idempotently.
+before-build = "choco install -y swig"
+# NOTE: the storage-engine bundle (the _secantus_storage / _secantus_server Rust
+# extensions) is NOT yet built into the Windows wheel — Windows ships pure-Python
+# for now, so no flag/libclang env here. The standalone secantusdb-rs binary is
+# non-Windows regardless (CMake gates it off). Bundling the extensions on Windows
+# (libclang + the LLVM-path CIBW env quoting) is a tracked follow-on.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

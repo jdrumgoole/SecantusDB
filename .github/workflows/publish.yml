@@ -119,8 +119,7 @@ jobs:
             CCACHE_DIR=/host_ccache
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
-            SECANTUS_BUILD_STORAGE_ENGINE=ON
-            SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON
+            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             LIBCLANG_PATH=/usr/lib64
           # macOS: ccache via Homebrew. The macos-14 runner image
@@ -130,8 +129,7 @@ jobs:
           CIBW_ENVIRONMENT_MACOS: >-
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
-            SECANTUS_BUILD_STORAGE_ENGINE=ON
-            SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON
+            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             LIBCLANG_PATH=$(brew --prefix llvm)/lib
           # Windows: ccache + MSVC is historically fragile, so the

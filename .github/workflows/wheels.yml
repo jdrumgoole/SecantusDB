@@ -84,16 +84,14 @@ jobs:
             CCACHE_DIR=/host_ccache
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
-            SECANTUS_BUILD_STORAGE_ENGINE=ON
-            SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON
+            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             LIBCLANG_PATH=/usr/lib64
           CIBW_BEFORE_ALL_MACOS: brew install ccache
           CIBW_ENVIRONMENT_MACOS: >-
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
-            SECANTUS_BUILD_STORAGE_ENGINE=ON
-            SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON
+            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             LIBCLANG_PATH=$(brew --prefix llvm)/lib
 
