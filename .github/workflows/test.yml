@@ -351,6 +351,26 @@ jobs:
           python -c "import _secantus_storage, _secantus_server;
           print('bundled OK:', _secantus_storage.__file__, _secantus_server.__file__)"
 
+      - name: Assert the wheel bundles secantusdb-rs on PATH + it runs (non-Windows)
+        # CMake installs the standalone binary into the wheel's scripts dir
+        # (SKBUILD_SCRIPTS_DIR), so installing the wheel puts `secantusdb-rs` on
+        # PATH — distinct from the pure-Python `secantus.cli:main` `secantusdb`
+        # console script. Drive the bundled binary through the same smoke test
+        # via SECANTUSDB_BIN. Windows is skipped (the bin isn't built there; see
+        # CMakeLists.txt / tasks/backlog.md §7).
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          whl=$(ls dist-storage/*.whl)
+          uv run --no-project --with pymongo --with pytest --with "$whl" bash -c '
+            set -e
+            bin=$(command -v secantusdb-rs) || { echo "secantusdb-rs not on PATH after install" >&2; exit 1; }
+            echo "secantusdb-rs -> $bin"
+            "$bin" --version
+            SECANTUSDB_BIN="$bin" python -m pytest tests/test_rust_binary_smoke.py \
+              -o addopts= -p no:cacheprovider -q
+          '
+
       - name: Storage + Rust-server smoke tests
         # test_rust_storage_smoke.py drives the storage engine; test_rust_server
         # _smoke.py drives the embedded Rust server (R6) end-to-end via pymongo —

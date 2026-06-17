@@ -308,6 +308,20 @@ and the `_secantus_server` embedded handle — pymongo → Rust → WiredTiger w
 adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
 `tests/test_rust_binary_smoke.py` / `invoke rust-binary-test` and the
 `storage-engine` CI job (Linux/macOS).
+**Distribution:** the binary ships two ways. (1) Prebuilt static-WiredTiger
+archives on a GitHub Release via `.github/workflows/release-binaries.yml`
+(tag `secantusdb-v<crate-version>`; x86_64-linux-gnu + aarch64-apple-darwin;
+the file inside each tarball is named `secantusdb-rs`). (2) Bundled INTO the
+`secantus` wheel as the `secantusdb-rs` command (non-Windows): `CMakeLists.txt`
+installs it into `SKBUILD_SCRIPTS_DIR` under the `SECANTUS_BUILD_STORAGE_ENGINE`
+flag, so a flag-on wheel puts `secantusdb-rs` on PATH (distinct from the
+pure-Python `secantus.cli:main` `secantusdb` console script). The
+`storage-engine` CI job asserts the bundled `secantusdb-rs` runs.
+**Remaining gate for pip users:** the *shipping* `wheels.yml` cibuildwheel
+matrix still builds with the flag OFF, so `pip install secantus` does NOT yet
+include `secantusdb-rs` — flip the flag on in `wheels.yml` (same gate as
+shipping `_secantus_storage` / `_secantus_server`; see the wheel-matrix-gate
+item below).
 **Deferred / not yet ported:**
 - [ ] **R7 tail** — a Windows standalone binary (`secantus-wt`'s `build.rs`
   probes `libwiredtiger.a/.so`; the MSVC wheel build produces neither name, so

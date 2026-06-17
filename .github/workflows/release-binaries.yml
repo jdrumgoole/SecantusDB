@@ -153,7 +153,9 @@ jobs:
         run: |
           stem="secantusdb-${VERSION}-${{ matrix.target }}"
           mkdir -p "$stem"
-          cp "$BIN" "$stem/"
+          # Ship the binary as `secantusdb-rs`, matching the command name the
+          # wheel installs (the pure-Python `secantusdb` is a different program).
+          cp "$BIN" "$stem/secantusdb-rs"
           cp LICENSE README.md "$stem/"
           tar -czf "$stem.tar.gz" "$stem"
           shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256"
