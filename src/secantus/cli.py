@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import signal
 import sys
@@ -234,7 +235,102 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
     return overrides
 
 
+def _build_restore_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="secantusdb restore",
+        description=(
+            "Point-in-time recovery: rebuild a fresh data directory as the "
+            "database was at a target time, by replaying a backup's oplog "
+            "forward. The source must be a stopped server's data directory "
+            "or a backup .tar.gz (a live data directory can't be opened — "
+            "WiredTiger holds a single-writer lock). Start a new server on "
+            "--target-dir afterwards."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        required=True,
+        metavar="PATH",
+        help="Backup .tar.gz archive, or a stopped server's data directory.",
+    )
+    parser.add_argument(
+        "--target-dir",
+        required=True,
+        metavar="PATH",
+        help="Fresh directory to rebuild into (must not be a live server's path).",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--to-time",
+        metavar="ISO8601",
+        help=(
+            "Recover to the last write at or before this wall-clock time, e.g. "
+            "'2026-06-17T14:30:00Z'. Naive times are treated as UTC."
+        ),
+    )
+    group.add_argument(
+        "--to-timestamp",
+        metavar="SECS[,ORD]",
+        help="Recover to this cluster timestamp (seconds, optional ordinal).",
+    )
+    return parser
+
+
+def _parse_iso_utc(value: str) -> datetime.datetime:
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _restore_main(argv: list[str]) -> int:
+    from bson import Timestamp
+
+    from secantus import oplog_replay
+
+    args = _build_restore_parser().parse_args(argv)
+    to_ts = None
+    to_wall = None
+    if args.to_timestamp is not None:
+        secs, _, ordinal = args.to_timestamp.partition(",")
+        try:
+            to_ts = Timestamp(int(secs), int(ordinal) if ordinal else 0)
+        except ValueError:
+            print("secantusdb restore: --to-timestamp must be SECS[,ORD]", file=sys.stderr)
+            return 2
+    if args.to_time is not None:
+        try:
+            to_wall = _parse_iso_utc(args.to_time)
+        except ValueError:
+            print(f"secantusdb restore: cannot parse --to-time {args.to_time!r}", file=sys.stderr)
+            return 2
+
+    is_archive = args.source.endswith((".tar.gz", ".tgz"))
+    fn = (
+        oplog_replay.restore_archive_to_timestamp
+        if is_archive
+        else oplog_replay.restore_to_timestamp
+    )
+    try:
+        stats = fn(args.source, args.target_dir, to_ts=to_ts, to_wall=to_wall)
+    except (ValueError, RuntimeError) as exc:
+        print(f"secantusdb restore: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"Restored {stats['opsApplied']} operations "
+        f"(through oplog seq {stats['lastSeq']}) into {stats['targetDir']}.\n"
+        f"Start a server on it: secantusdb --storage-path {stats['targetDir']}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] == "restore":
+        # ``secantusdb restore ...`` is the only subcommand; everything else
+        # is the daemon (bare ``secantusdb --flags`` keeps working unchanged).
+        return _restore_main(raw[1:])
     args = build_parser().parse_args(argv)
 
     try:

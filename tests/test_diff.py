@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from secantus.diff import compute_update_description
+import copy
+import random
+
+import pytest
+
+from secantus.diff import apply_update_description, compute_update_description
 
 
 def test_diff_set_unset_inc() -> None:
@@ -149,3 +154,63 @@ def test_disambiguated_paths_for_removed_and_truncated() -> None:
     out = compute_update_description({"a": {"2": [1, 2, 3]}}, {"a": {"2": [1]}})
     assert out["truncatedArrays"] == [{"field": "a.2", "newSize": 1}]
     assert out["disambiguatedPaths"] == {"a.2": ["a", "2"]}
+
+
+# --- apply_update_description: inverse round-trip (PITR oplog replay) -------
+
+
+def test_apply_set_unset_truncate() -> None:
+    pre = {"_id": 1, "a": 1, "b": 2, "d": [1, 2, 3]}
+    diff = {
+        "updatedFields": {"a": 9, "c": 3},
+        "removedFields": ["b"],
+        "truncatedArrays": [{"field": "d", "newSize": 2}],
+    }
+    assert apply_update_description(pre, diff) == {"_id": 1, "a": 9, "c": 3, "d": [1, 2]}
+
+
+def test_apply_empty_diff_is_noop() -> None:
+    doc = {"_id": 1, "x": [1, 2], "y": {"z": 1}}
+    assert apply_update_description(copy.deepcopy(doc), {}) == doc
+
+
+def _rand_value(rng: random.Random, depth: int) -> object:
+    kinds = ["int", "str", "bool", "none"]
+    if depth < 3:
+        kinds += ["dict", "list"]
+    kind = rng.choice(kinds)
+    if kind == "int":
+        return rng.randint(-50, 50)
+    if kind == "str":
+        return rng.choice(["a", "bb", "ccc", ""])
+    if kind == "bool":
+        return rng.choice([True, False])
+    if kind == "none":
+        return None
+    if kind == "dict":
+        # Include numeric-string keys to exercise the disambiguation path.
+        return {
+            rng.choice(["x", "y", "0", "1", "n"]): _rand_value(rng, depth + 1)
+            for _ in range(rng.randint(0, 3))
+        }
+    return [_rand_value(rng, depth + 1) for _ in range(rng.randint(0, 4))]
+
+
+def _rand_doc(rng: random.Random) -> dict[str, object]:
+    doc: dict[str, object] = {"_id": 1}
+    for _ in range(rng.randint(0, 5)):
+        doc[rng.choice(["a", "b", "c", "0", "1", "nested"])] = _rand_value(rng, 0)
+    return doc
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_apply_is_inverse_of_compute(seed: int) -> None:
+    """For any pre/post, applying the computed diff to the pre-image must
+    reconstruct the post-image exactly. This is the oracle the Rust port's
+    parity suite checks against."""
+    rng = random.Random(seed)
+    pre = _rand_doc(rng)
+    post = _rand_doc(rng)
+    diff = compute_update_description(pre, post)
+    rebuilt = apply_update_description(copy.deepcopy(pre), diff)
+    assert rebuilt == post, f"seed={seed}\npre={pre}\npost={post}\ndiff={diff}\ngot={rebuilt}"

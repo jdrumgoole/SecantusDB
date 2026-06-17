@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time as _time
 import uuid as _uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 import bson
@@ -142,6 +142,10 @@ _ROLES_TABLE = "table:secantus_roles"
 _PROFILE_TABLE = "table:secantus_profile_settings"
 
 _OPLOG_PRUNE_INTERVAL = 1000  # call prune_oplog every N emits
+
+# Name of the advisory point-in-time-recovery manifest embedded in a backup
+# archive (see Storage._pitr_manifest). Not a WiredTiger file; WT ignores it.
+_PITR_MANIFEST_NAME = "pitr-manifest.json"
 
 _ENTRY_SEP = b"\x00\x00"
 
@@ -1501,6 +1505,25 @@ class Storage:
             if matches(r, filter, vars=let, collation=collation_obj)
         )
 
+    @contextlib.contextmanager
+    def replay_mode(self) -> Iterator[None]:
+        """Suppress oplog emission on the calling thread for the duration.
+
+        Point-in-time recovery replays an existing oplog into a fresh store by
+        driving the ordinary write paths (insert / update / delete / DDL) so
+        the documents, indexes, and natural order are rebuilt exactly as they
+        were produced live. Those paths normally append to the oplog and mint
+        fresh timestamps — wrong here, because the oplog is the *input*, not
+        something to regenerate. Inside this context ``_emit_oplog`` is a
+        no-op. See :mod:`secantus.oplog_replay`.
+        """
+        prev = getattr(self._tls, "replay_silent", False)
+        self._tls.replay_silent = True
+        try:
+            yield
+        finally:
+            self._tls.replay_silent = prev
+
     def _emit_oplog(
         self,
         entries: list[dict[str, Any]],
@@ -1527,6 +1550,11 @@ class Storage:
         buffer through this same method (with the buffering hook
         disarmed) inside the transaction's WT session.
         """
+        if getattr(self._tls, "replay_silent", False):
+            # Oplog replay (PITR) drives the real write paths for their
+            # storage / index / natural-order effects but must not
+            # regenerate the oplog it is replaying. See ``replay_mode``.
+            return 0
         handle = getattr(self._tls, "user_txn", None)
         if handle is not None:
             if self.enable_oplog and entries:
@@ -2250,6 +2278,8 @@ class Storage:
         round-trips cleanly through git/mail/scp; the typical workload
         compresses well because WT pages aren't snappy/zstd at rest.
         """
+        import io
+        import json
         import tarfile
 
         if self._in_memory:
@@ -2265,6 +2295,10 @@ class Storage:
             if self._closed:
                 raise RuntimeError("create_archive: storage is closed")
             self._session().checkpoint()
+            # Advisory PITR metadata describing the oplog range this archive
+            # can recover to. Computed under the lock, before the backup
+            # cursor opens; embedded in the tar (WiredTiger ignores it).
+            manifest = self._pitr_manifest()
             # A private session for the backup cursor so its lifecycle
             # doesn't interfere with the per-thread cached session
             # that handles regular work.
@@ -2283,11 +2317,44 @@ class Storage:
                             rel = cursor.get_key()
                             full = os.path.join(self.home_path, rel)
                             tar.add(full, arcname=rel)
+                        data = json.dumps(manifest, default=str).encode()
+                        info = tarfile.TarInfo(name=_PITR_MANIFEST_NAME)
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
                 finally:
                     cursor.close()
             finally:
                 backup_session.close()
         return {"path": abs_out, "sizeBytes": os.path.getsize(abs_out)}
+
+    def _pitr_manifest(self) -> dict[str, Any]:
+        """Build the point-in-time-recovery manifest embedded in a backup
+        archive: the oplog seq range and timestamps it can recover to, plus
+        whether the oplog still reaches genesis (an un-pruned front, which v1
+        empty-base replay requires). Advisory only — restore reads the oplog
+        directly; the manifest lets tooling report a backup's recoverable
+        range without opening WiredTiger. Must be called under ``self._lock``."""
+        floor = self.oplog_floor_seq()
+        head = self.oplog_tail_seq_nolock()
+
+        def _ts_of(seq: int) -> list[int] | None:
+            if seq <= 0:
+                return None
+            rows = self.read_oplog(start_seq=seq, limit=1)
+            if not rows:
+                return None
+            ts = rows[0][1].get("ts")
+            return [ts.time, ts.inc] if isinstance(ts, Timestamp) else None
+
+        return {
+            "secantusPitrManifest": 1,
+            "oplogEnabled": bool(self.enable_oplog),
+            "oplogFloorSeq": floor,
+            "oplogHeadSeq": head,
+            "genesisIntact": floor == 1,
+            "oplogFloorTs": _ts_of(floor),
+            "oplogHeadTs": _ts_of(head),
+        }
 
     @contextlib.contextmanager
     def _batch_transaction(self, *, sync: bool = False) -> Any:

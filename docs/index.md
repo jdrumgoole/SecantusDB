@@ -159,6 +159,8 @@ clustering and infrastructure that `mongod` brings.
   `createUser` / `dropUser` / `usersInfo`.
 - [Admin web UI](admin.md) — `secantusdb-admin` console, page tour,
   security model, programmatic use.
+- [Backup & point-in-time recovery](recovery.md) — backup archives,
+  restoring to a target timestamp by replaying the oplog.
 - [Running in production](production.md) — honest comparison vs
   single-node Postgres, what's missing for production use, and a
   concrete `systemd` / TLS / backup / monitoring deployment shape.
@@ -196,6 +198,7 @@ aggregation
 change-streams
 authentication
 admin
+recovery
 production
 concurrency
 compatibility

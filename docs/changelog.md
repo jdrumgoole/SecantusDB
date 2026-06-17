@@ -42,6 +42,41 @@ that pins each Rust engine byte-for-byte against its pure-Python counterpart.
 - The `SECANTUS_ENGINE=rust` full-suite CI step, which re-ran the test suite
   under a now-dead env var and was a source of flaky worker-crash failures.
 
+### Point-in-time recovery: restore the database as it was at any moment in its oplog
+
+SecantusDB already kept a mongod-shaped oplog and could take consistent
+WiredTiger backup archives; this release joins the two into real point-in-time
+recovery. Given a backup (or a stopped server's data directory), you can now
+rebuild a fresh database as it was at any target timestamp by replaying the
+oplog forward — documents, in-place updates, deletes, and index / `collMod` /
+rename DDL are all reconstructed through the ordinary write paths, so the result
+is indistinguishable from the live database at that instant.
+
+Recovery is offline, matching real `mongod`: it writes a fresh data directory
+you then start a new server on. Drive it from the CLI (`secantusdb restore
+--source <archive|dir> --target-dir <dir> [--to-time <ISO> | --to-timestamp
+<secs,ord>]`) or the `secantusAdmin.restoreToTimestamp` admin command. A
+multi-document transaction is always replayed all-or-nothing — its statements
+share one commit timestamp, so a recovery point never lands mid-transaction.
+The recovery window is the oplog retention window (tune `--oplog-retention-seconds`
+/ `--oplog-max-entries` for the horizon you need); a front-pruned oplog fails
+loudly rather than silently rebuilding a partial database. See
+[Backup & point-in-time recovery](recovery.md).
+
+#### Added
+- `secantus.diff.apply_update_description` — applies a `$v: 2`
+  `updateDescription` back to a document (the inverse of
+  `compute_update_description`); the keystone of oplog replay.
+- `secantus.oplog_replay` — `replay()` / `restore_to_timestamp()` /
+  `restore_archive_to_timestamp()`: replays an oplog source into a fresh store,
+  stopping at a target `ts` / wall-clock time.
+- `Storage.replay_mode()` — a context manager that suppresses oplog emission so
+  replay drives the real write paths without regenerating the oplog.
+- `secantusdb restore` CLI subcommand and the `secantusAdmin.restoreToTimestamp`
+  wire command.
+- Backup archives now embed a `pitr-manifest.json` describing their recoverable
+  oplog range (`Storage._pitr_manifest`).
+
 ## [0.5.3b13] — 2026-06-16
 
 ### `find()` with no sort now returns documents in insertion order

@@ -155,6 +155,43 @@ the change-stream batch. Still open, precisely characterized:
   Expected-red (single-node topology): the 3 `test_transactions_unified`
   secondary-readPreference tests.
 
+### 3.5 Point-in-time recovery (PITR) — v2 and limitations
+
+PITR v1 shipped (Python server): `secantus.oplog_replay` replays an oplog source
+(a backup archive or a stopped data dir) into a fresh store, stopping at a target
+`ts` / wall time; surfaced as `secantusdb restore` (CLI) and
+`secantusAdmin.restoreToTimestamp` (wire). v1 replays onto an **empty** base, so
+the recovery window equals the oplog retention window (genesis-intact required).
+Deferred / known limitations:
+
+- [ ] **PITR v2 — arbitrary window via oplog archiving + base snapshots.** v1
+  errors when the oplog floor is past genesis (front-pruned). v2 = continuously
+  archive oplog segments to durable files before `prune_oplog` drops them, plus
+  scheduled base snapshots, and a restore path that auto-selects the newest base
+  `≤ T` and stitches archived oplog forward (reuses the same applier with a
+  non-empty base; the `pitr-manifest.json` embedded by `create_archive` is the
+  index). Lets restore reach any `T` without keeping the entire oplog live.
+- [ ] **Restored dir starts a fresh oplog timeline.** Replay suppresses oplog
+  emission, so the target's oplog is empty after restore — a change stream on the
+  restored server resumes from the restore point, not before it (matches
+  `mongorestore`). v2 could copy the replayed oplog rows verbatim for resume
+  continuity.
+- [ ] **Collection options not replayed.** `capped` / `size` / `validator` aren't
+  carried in Storage's `create` oplog entry (only `{create, idIndex}`), so they
+  aren't reconstructed on replay. Documents + indexes are. Fix = include the
+  options in the `create` oplog `o` (also improves change-stream `create` event
+  fidelity) — a small create_collection-signature change.
+- [ ] **Rust server PITR (Phase R).** Prereqs before replay can be correct on the
+  Rust server: (R0a) `create_index`/`drop_index`/`collMod` must emit oplog `c`
+  entries — currently they don't (see §3.2; shared with `showExpandedEvents`);
+  (R0b) port `apply_update_description` into `secantus-core` (pure Rust),
+  parity-tested against the Python oracle in `tests/test_diff.py`; (R0c) expose a
+  WT `backup:` cursor in `secantus-wt` (only `checkpoint()` is exposed today).
+  Then port the applier + `replay_mode` into `secantus-storage`, add a
+  `secantusdb-rs restore` subcommand, and a cross-server restore parity smoke
+  (on-disk + oplog formats are identical, so a Python tool can restore a Rust
+  backup and vice versa once the DDL-oplog gaps close).
+
 ## 4. Out of scope (intentional, with reasoning)
 
 These are explicit non-goals. Don't add them without a reason.

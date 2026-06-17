@@ -987,6 +987,62 @@ def _secantus_admin_restore_archive(doc: dict[str, Any], _ctx: CommandContext) -
     }
 
 
+def _secantus_admin_restore_to_timestamp(
+    doc: dict[str, Any], _ctx: CommandContext
+) -> dict[str, Any]:
+    """SecantusDB extension: point-in-time recovery (PITR).
+
+    Rebuild ``targetDir`` as the database was at a target time by replaying an
+    oplog source forward (see :mod:`secantus.oplog_replay`). ``source`` is a
+    **stopped** server's data directory or a backup ``.tar.gz`` produced by
+    ``backupArchive``. Optional ``toTimestamp`` (a BSON ``Timestamp``) or
+    ``toTime`` (a date) picks the recovery point; with neither, the whole oplog
+    is replayed. Offline-shaped like ``restoreArchive`` — the running server's
+    own storage is untouched; the operator points a *new* SecantusDB at
+    ``targetDir``. Returns the replay stats.
+    """
+    from secantus import oplog_replay
+
+    source = doc.get("source")
+    target_dir = doc.get("targetDir")
+    if not isinstance(source, str) or not source:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.restoreToTimestamp requires source: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if not isinstance(target_dir, str) or not target_dir:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.restoreToTimestamp requires targetDir: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    to_ts = doc.get("toTimestamp")
+    to_wall = doc.get("toTime")
+    try:
+        if source.endswith((".tar.gz", ".tgz")):
+            stats = oplog_replay.restore_archive_to_timestamp(
+                source, target_dir, to_ts=to_ts, to_wall=to_wall
+            )
+        else:
+            stats = oplog_replay.restore_to_timestamp(
+                source, target_dir, to_ts=to_ts, to_wall=to_wall
+            )
+    except (ValueError, RuntimeError) as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {
+        "targetDir": stats["targetDir"],
+        "opsApplied": stats["opsApplied"],
+        "entriesSeen": stats["entriesSeen"],
+        "lastSeq": stats["lastSeq"],
+        "lastTs": stats.get("lastTs"),
+        "lastWall": stats.get("lastWall"),
+        "ok": 1.0,
+    }
+
+
 def _profile(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Get / set per-database profiling level (mongod ``profile`` shape).
 
@@ -5211,6 +5267,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
     "secantusAdmin.backupArchive": _secantus_admin_backup_archive,
     "secantusAdmin.restoreArchive": _secantus_admin_restore_archive,
+    "secantusAdmin.restoreToTimestamp": _secantus_admin_restore_to_timestamp,
     "explain": _explain,
     "serverStatus": _server_status,
     "top": _top,
@@ -5378,6 +5435,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.backupArchive": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.restoreArchive": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.restoreToTimestamp": (A_FSYNC, SCOPE_CLUSTER),
 }
 
 
