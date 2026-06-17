@@ -188,10 +188,10 @@ secantusdb --host 127.0.0.1 --port 27017
 # for an ephemeral temp dir cleaned up on shutdown.
 ```
 
-On **Linux and macOS** the same `pip install secantus` also puts the standalone
-**Rust** server on your `PATH` as `secantusdb-rs` (same flags, same wire
-protocol; see [The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html)).
-Windows ships the Python server only.
+The same `pip install secantus` also puts the standalone **Rust** server on your
+`PATH` as `secantusdb-rs` (same flags, same wire protocol; see
+[The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html)) —
+on Linux, macOS (Apple Silicon), and Windows. Intel-Mac wheels are pure-Python.
 
 Then point any MongoDB driver or tool at it — **no application code
 changes**, just the URI:
