@@ -214,7 +214,10 @@ before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:
 # quotes once produced a doubled-quote "Malformed environment option".
 # SECANTUS_CARGO_TARGET (no ccache on Windows) just shares one target dir across
 # the 4 CPython builds in the job so the Rust deps compile once, not 4×.
-environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:\libclang', SECANTUS_CARGO_TARGET = 'C:\cargo-target' }
+# Forward slashes: a backslash in C:\... gets eaten when the path flows through
+# CMake (`\c` escape), turning it into the invalid drive-relative `C:cargo-target`.
+# CMake, cargo and clang-sys all accept forward slashes on Windows.
+environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:/libclang', SECANTUS_CARGO_TARGET = 'C:/cargo-target' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
