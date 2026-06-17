@@ -148,8 +148,22 @@ toolchain when ON)."
 if(SECANTUS_BUILD_STORAGE_ENGINE)
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
 
+    # Cargo target-dir root. By default it lives under this build dir, which is
+    # per-wheel-tag (build/{wheel_tag}) — so a cibuildwheel job rebuilds the Rust
+    # crates from scratch for all 4 CPython × 2 libc wheels (~8×). When
+    # SECANTUS_CARGO_TARGET is set (the wheels.yml / publish.yml CI builds point
+    # it at a job-persistent, ccache-cached dir), all wheels in a job share one
+    # target dir, so the expensive dependency compiles (bindgen et al.) happen
+    # once. Each crate still gets its own subdir to avoid cargo target-lock
+    # contention when ninja runs the three builds in parallel.
+    if(DEFINED ENV{SECANTUS_CARGO_TARGET})
+        set(CARGO_TARGET_ROOT $ENV{SECANTUS_CARGO_TARGET})
+    else()
+        set(CARGO_TARGET_ROOT ${CMAKE_CURRENT_BINARY_DIR})
+    endif()
+
     set(STORAGE_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantus-storage-py)
-    set(STORAGE_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/storage-target)
+    set(STORAGE_TARGET_DIR ${CARGO_TARGET_ROOT}/storage-target)
 
     # cdylib output name (cargo) vs the Python-importable extension filename we
     # install. abi3 means one filename per platform covers every CPython >=3.10.
@@ -202,7 +216,7 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     # `_secantus_storage` above. `import _secantus_server` → `RustServer`.
     # -------------------------------------------------------------------------
     set(SERVER_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantus-server-py)
-    set(SERVER_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/server-target)
+    set(SERVER_TARGET_DIR ${CARGO_TARGET_ROOT}/server-target)
 
     if(WIN32)
         set(SERVER_CARGO_OUT "_secantus_server.dll")
@@ -248,7 +262,7 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     # cargo emits `secantusdb.exe`, staged as `secantusdb-rs.exe`.
     # -------------------------------------------------------------------------
     set(SECANTUSDB_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantusdb)
-    set(SECANTUSDB_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-target)
+    set(SECANTUSDB_TARGET_DIR ${CARGO_TARGET_ROOT}/secantusdb-target)
     if(WIN32)
         set(SECANTUSDB_BIN_BUILT  ${SECANTUSDB_TARGET_DIR}/release/secantusdb.exe)
         set(SECANTUSDB_BIN_STAGED ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-rs.exe)

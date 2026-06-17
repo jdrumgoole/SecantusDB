@@ -202,14 +202,19 @@ before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew i
 archs = ["AMD64"]
 # SWIG (preinstalled, re-installed idempotently) + LLVM for bindgen's libclang.
 # Rust ships preinstalled on the windows-2022 runner, so we don't choco-install
-# it (that would risk shadowing the runner's rustup cargo).
-before-build = "choco install -y swig llvm"
-# Flag + libclang for the storage-engine bundle (_secantus_storage /
-# _secantus_server extensions + secantusdb-rs.exe). Set here, not in a workflow
-# CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't overridden). Raw values —
-# cibuildwheel quotes table values itself when serializing them, so adding our
-# own quotes produced a doubled-quote "Malformed environment option".
-environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' }
+# it (that would risk shadowing the runner's rustup cargo). Then copy libclang.dll
+# to a SPACE-FREE path: bindgen could not find it at "C:\Program Files\LLVM\bin"
+# (`invalid: []`) because the space in the path doesn't survive cibuildwheel's
+# env serialization on Windows; a no-space LIBCLANG_PATH sidesteps that.
+before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:\libclang) && copy /Y "C:\Program Files\LLVM\bin\libclang.dll" C:\libclang'
+# Flag + libclang + shared cargo target for the storage-engine bundle
+# (_secantus_storage / _secantus_server extensions + secantusdb-rs.exe). Set here,
+# not in a workflow CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't
+# overridden). Raw values — cibuildwheel quotes table values itself, so our own
+# quotes once produced a doubled-quote "Malformed environment option".
+# SECANTUS_CARGO_TARGET (no ccache on Windows) just shares one target dir across
+# the 4 CPython builds in the job so the Rust deps compile once, not 4×.
+environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:\libclang', SECANTUS_CARGO_TARGET = 'C:\cargo-target' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
