@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.3b15"
+version = "0.5.4b2"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -65,12 +65,12 @@ admin = [
     "setproctitle>=1.3",
 ]
 rust = [
-    # Optional Rust acceleration core (the `_secantus_core` extension). Kept as
-    # a separate companion wheel rather than bundled, pinned in lockstep so the
-    # accelerator always matches this release's behaviour. The pure-Python
-    # engines remain the default; enable with SECANTUS_ENGINE=rust|auto. Built
-    # from the PyO3 bindings crate crates/secantus-core-py/ (which wraps the pure
-    # Rust engines in crates/secantus-core/); see tasks/rust-rewrite-plan.md.
+    # The Rust engine core (`_secantus_core`) as a separate companion wheel: the
+    # reusable engines behind the Rust server + the byte-for-byte parity-test
+    # oracle. The Python server does NOT import it (the in-process engine
+    # selection was retired); installing this extra is only useful for the
+    # parity tests / using the engines as a library. Built from the PyO3 bindings
+    # crate crates/secantus-core-py/ (wrapping crates/secantus-core/).
     "secantus-core==0.5.2b15",
 ]
 
@@ -200,13 +200,24 @@ before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew i
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-# SWIG ships preinstalled on windows-2022 runners; choco re-installs it idempotently.
-before-build = "choco install -y swig"
-# NOTE: the storage-engine bundle (the _secantus_storage / _secantus_server Rust
-# extensions) is NOT yet built into the Windows wheel — Windows ships pure-Python
-# for now, so no flag/libclang env here. The standalone secantusdb-rs binary is
-# non-Windows regardless (CMake gates it off). Bundling the extensions on Windows
-# (libclang + the LLVM-path CIBW env quoting) is a tracked follow-on.
+# SWIG (preinstalled, re-installed idempotently) + LLVM for bindgen's libclang.
+# Rust ships preinstalled on the windows-2022 runner, so we don't choco-install
+# it (that would risk shadowing the runner's rustup cargo). Then copy libclang.dll
+# to a SPACE-FREE path: bindgen could not find it at "C:\Program Files\LLVM\bin"
+# (`invalid: []`) because the space in the path doesn't survive cibuildwheel's
+# env serialization on Windows; a no-space LIBCLANG_PATH sidesteps that.
+before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:\libclang) && copy /Y "C:\Program Files\LLVM\bin\libclang.dll" C:\libclang'
+# Flag + libclang + shared cargo target for the storage-engine bundle
+# (_secantus_storage / _secantus_server extensions + secantusdb-rs.exe). Set here,
+# not in a workflow CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't
+# overridden). Raw values — cibuildwheel quotes table values itself, so our own
+# quotes once produced a doubled-quote "Malformed environment option".
+# SECANTUS_CARGO_TARGET (no ccache on Windows) just shares one target dir across
+# the 4 CPython builds in the job so the Rust deps compile once, not 4×.
+# Forward slashes: a backslash in C:\... gets eaten when the path flows through
+# CMake (`\c` escape), turning it into the invalid drive-relative `C:cargo-target`.
+# CMake, cargo and clang-sys all accept forward slashes on Windows.
+environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:/libclang', SECANTUS_CARGO_TARGET = 'C:/cargo-target' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

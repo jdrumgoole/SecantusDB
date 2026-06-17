@@ -353,11 +353,28 @@ installs it into `SKBUILD_SCRIPTS_DIR` under the `SECANTUS_BUILD_STORAGE_ENGINE`
 flag, so a flag-on wheel puts `secantusdb-rs` on PATH (distinct from the
 pure-Python `secantus.cli:main` `secantusdb` console script). The
 `storage-engine` CI job asserts the bundled `secantusdb-rs` runs.
-**Remaining gate for pip users:** the *shipping* `wheels.yml` cibuildwheel
-matrix still builds with the flag OFF, so `pip install secantus` does NOT yet
-include `secantusdb-rs` — flip the flag on in `wheels.yml` (same gate as
-shipping `_secantus_storage` / `_secantus_server`; see the wheel-matrix-gate
-item below).
+**Shipping wheels now flag-ON (0.5.4b1):** `wheels.yml` + `publish.yml` build
+with `SECANTUS_BUILD_STORAGE_ENGINE=ON`, so `pip install secantus` bundles the
+`_secantus_storage` / `_secantus_server` extensions **and** `secantusdb-rs` on
+**Linux (manylinux_2_28 + musllinux_1_2, x86_64 + aarch64), macOS arm64, and
+Windows AMD64** — every shipped wheel except Intel macOS (no wheel target).
+Toolchain in `[tool.cibuildwheel].before-build`: Linux swig+clang-libs+rustup
+with libclang symlinked to `/opt/libclang`; macOS swig (Xcode's libclang —
+Homebrew's breaks the WT bindings); Windows choco swig+llvm with `libclang.dll`
+copied to a space-free `C:/libclang`. `RUSTFLAGS=-Ctarget-feature=-crt-static`
+for musl cdylibs. Build perf: `SECANTUS_CARGO_TARGET` shares one cargo target dir
+across all wheels in a job (and rides the ccache mount/cache on Linux/macOS) so
+the Rust deps compile once, not per-wheel — cut wall-clock ~72min → ~35min.
+Windows paths are forward-slashed so CMake doesn't eat the `\c`. Verified: built
+manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
+`*.data/scripts/` plus the two extensions. **Remaining:**
+- [ ] **macOS x86_64 / Intel** stays pure-Python (no wheel target — runner-pool
+  scarcity), so Intel-Mac pip users don't get the Rust bits.
+- [ ] **Release fragility:** every wheel build now does cargo crates.io
+  downloads in-container; a transient network failure (seen once on macOS) can
+  fail a `publish.yml` release. The shared `SECANTUS_CARGO_TARGET` registry cache
+  reduces re-downloads within a job; cargo vendoring / a registry mirror would
+  remove the risk entirely.
 **Deferred / not yet ported:**
 - [ ] **R7 tail** — a Windows standalone binary (`secantus-wt`'s `build.rs`
   probes `libwiredtiger.a/.so`; the MSVC wheel build produces neither name, so

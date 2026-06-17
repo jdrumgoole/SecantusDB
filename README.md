@@ -90,19 +90,24 @@ compound, mixed-direction, partial, TTL, sort — proper `explain` output
 (`IXSCAN` vs `COLLSCAN`), and a hash-join `$lookup`.
 
 **Authentication**: SCRAM-SHA-256 — MongoDB's default since 4.0 — is
-implemented end-to-end on the wire. Off by default; flip on with
-`secantusdb --auth` (or `SecantusDBServer(..., require_auth=True)`),
-provision users with `createUser`, then connect with the standard
-`MongoClient(uri, username=, password=)` shape. See
-[Authentication](https://secantusdb.readthedocs.io/en/latest/authentication.html). Authorization (RBAC), x509,
-LDAP, Kerberos, and TLS are *not* implemented — an authenticated
-principal is currently treated as fully privileged.
+implemented end-to-end on the wire, alongside **native TLS / mTLS** and
+the **MONGODB-X509** cert-as-username mechanism. Off by default; flip
+SCRAM on with `secantusdb --auth` (or `SecantusDBServer(...,
+require_auth=True)`), provision users with `createUser`, then connect
+with the standard `MongoClient(uri, username=, password=)` shape. See
+[Authentication](https://secantusdb.readthedocs.io/en/latest/authentication.html). Authorization
+(RBAC) is *not* enforced — an authenticated principal is currently
+treated as fully privileged — and LDAP / Kerberos / GSSAPI / AWS / OIDC
+auth mechanisms are out of scope.
 
-What's **out of scope:** real replica sets, sharding, RBAC, x509 /
-LDAP / Kerberos auth, TLS, text / wildcard indexes, `$where`, real
-transaction rollback. If you need those, run a real `mongod`. Geo
+What's **out of scope:** real replica sets, sharding, RBAC, auth
+mechanisms beyond SCRAM-SHA-256 / MONGODB-X509 (no LDAP / Kerberos /
+GSSAPI / AWS / OIDC), `OP_COMPRESSED`, text / hashed / wildcard indexes,
+and `$where` / `$function` / `$accumulator` / `mapReduce` (no embedded
+JS runtime). If you need those, run a real `mongod`. Native TLS + mTLS,
+multi-document transactions (with WiredTiger-native rollback), and geo
 support (`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`,
-`$geoNear`, `2dsphere` and `2d` indexes) is in scope and shipped.
+`$geoNear`, `2dsphere` and `2d` indexes) are all in scope and shipped.
 
 ## Installation
 
@@ -154,13 +159,23 @@ pure-Python; the Rust engines live only in the Rust server.
 
 The Rust side is a Cargo workspace under `crates/`: a pure-Rust engine crate
 (`secantus-core`, no PyO3) reused by the Rust server and the standalone
-`secantusdb` binary, plus a thin PyO3 bindings crate (`secantus-core-py`) that
-builds the `secantus-core` wheel — the vehicle that pins each Rust engine
+`secantusdb-rs` binary, plus a thin PyO3 bindings crate (`secantus-core-py`)
+that builds the `secantus-core` wheel — the vehicle that pins each Rust engine
 byte-for-byte against its pure-Python counterpart.
 
 ```bash
 pip install "secantus[rust]"      # pulls the matching secantus-core wheel
 ```
+
+The Python server is the **conformance leader** and the default choice: it
+passes **99.2%** of pymongo's own test suite. The Rust server runs the same
+unmodified suite and currently passes **92.0%** — it's faster per operation
+(see [`docs/benchmark.md`](https://secantusdb.readthedocs.io/en/latest/benchmark.html)) but is
+still closing the gap. The features the Rust server doesn't support yet —
+`showExpandedEvents` DDL change events, large change-event splitting, read /
+write-concern semantics, timeseries `_id` non-uniqueness — and a side-by-side
+of when to pick each server are spelled out in
+[The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html).
 
 ## Standalone daemon (drop-in `mongod` replacement)
 
@@ -172,6 +187,11 @@ secantusdb --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default; pass --storage-path :memory:
 # for an ephemeral temp dir cleaned up on shutdown.
 ```
+
+The same `pip install secantus` also puts the standalone **Rust** server on your
+`PATH` as `secantusdb-rs` (same flags, same wire protocol; see
+[The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html)) —
+on Linux, macOS (Apple Silicon), and Windows. Intel-Mac wheels are pure-Python.
 
 Then point any MongoDB driver or tool at it — **no application code
 changes**, just the URI:
@@ -253,6 +273,7 @@ Full docs are on [Read the Docs](https://secantusdb.readthedocs.io/en/latest/).
 Highlights:
 
 - [Quickstart](https://secantusdb.readthedocs.io/en/latest/quickstart.html) — embedding in tests, running standalone.
+- [The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html) — Python vs Rust server, which to use, and what each doesn't support yet.
 - [Architecture](https://secantusdb.readthedocs.io/en/latest/architecture.html) — the layered design.
 - [Indexes](https://secantusdb.readthedocs.io/en/latest/indexes.html) — what `find()` and `aggregate` accelerate,
   `explain` semantics, hints, partial indexes, TTL.
