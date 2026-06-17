@@ -122,6 +122,7 @@ jobs:
             SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             LIBCLANG_PATH=/opt/libclang
+            RUSTFLAGS="-Ctarget-feature=-crt-static"
           # macOS: ccache via Homebrew. The macos-14 runner image
           # already has it — `brew install` is idempotent and a few
           # seconds when already present.

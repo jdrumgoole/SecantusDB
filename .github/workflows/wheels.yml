@@ -87,6 +87,7 @@ jobs:
             SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             LIBCLANG_PATH=/opt/libclang
+            RUSTFLAGS="-Ctarget-feature=-crt-static"
           CIBW_BEFORE_ALL_MACOS: brew install ccache
           CIBW_ENVIRONMENT_MACOS: >-
             CMAKE_C_COMPILER_LAUNCHER=ccache
