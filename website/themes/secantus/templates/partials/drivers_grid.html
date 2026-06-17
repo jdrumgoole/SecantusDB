@@ -89,10 +89,10 @@
       <span class="lang">PHP</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">97.3%</span>
+      <span class="rate">98.3%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>2126</strong> tests passed &middot; <strong>58</strong> failed</p>
+    <p class="counts"><strong>2147</strong> tests passed &middot; <strong>37</strong> failed</p>
     <p class="note">The official high-level PHP library &mdash; the <code>mongodb/mongodb</code> package Laravel and Symfony applications build on. We run its PHPUnit functional suite (<code>Operation</code> / <code>Collection</code> / <code>Database</code> / <code>Command</code>) end-to-end against an embedded SecantusDB daemon; the pure-code query-builder and BSON-comparator units are run but not counted here, since they never touch the server.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-php-lib.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -103,10 +103,10 @@
       <span class="lang">PHP</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">97.2%</span>
+      <span class="rate">99.6%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>240</strong> tests passed &middot; <strong>7</strong> failed</p>
+    <p class="counts"><strong>246</strong> tests passed &middot; <strong>1</strong> failed</p>
     <p class="note">The low-level PHP extension &mdash; the C-based PECL <code>ext-mongodb</code> that wraps libmongoc and underpins the library above. We run its <code>.phpt</code> wire-protocol suite via PHP's <code>run-tests.php</code> against an embedded SecantusDB daemon (the pure BSON-serialization tests are run but not counted). Alongside Go, the strictest wire-shape check we run &mdash; type divergences pymongo accepts silently fail here.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-php-ext.html" rel="noopener">Read the report &rarr;</a>
   </article>
