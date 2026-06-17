@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.3b14"
+version = "0.5.4b1"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -65,12 +65,12 @@ admin = [
     "setproctitle>=1.3",
 ]
 rust = [
-    # Optional Rust acceleration core (the `_secantus_core` extension). Kept as
-    # a separate companion wheel rather than bundled, pinned in lockstep so the
-    # accelerator always matches this release's behaviour. The pure-Python
-    # engines remain the default; enable with SECANTUS_ENGINE=rust|auto. Built
-    # from the PyO3 bindings crate crates/secantus-core-py/ (which wraps the pure
-    # Rust engines in crates/secantus-core/); see tasks/rust-rewrite-plan.md.
+    # The Rust engine core (`_secantus_core`) as a separate companion wheel: the
+    # reusable engines behind the Rust server + the byte-for-byte parity-test
+    # oracle. The Python server does NOT import it (the in-process engine
+    # selection was retired); installing this extra is only useful for the
+    # parity tests / using the engines as a library. Built from the PyO3 bindings
+    # crate crates/secantus-core-py/ (wrapping crates/secantus-core/).
     "secantus-core==0.5.2b15",
 ]
 
