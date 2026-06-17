@@ -206,11 +206,10 @@ archs = ["AMD64"]
 before-build = "choco install -y swig llvm"
 # Flag + libclang for the storage-engine bundle (_secantus_storage /
 # _secantus_server extensions + secantusdb-rs.exe). Set here, not in a workflow
-# CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't overridden). Each value is
-# wrapped in literal double quotes so cibuildwheel's bashlex evaluator treats it
-# as a string rather than choking on the inner `=` (SKBUILD_CMAKE_DEFINE) or the
-# space in the LLVM path (LIBCLANG_PATH).
-environment = { SKBUILD_CMAKE_DEFINE = '"SECANTUS_BUILD_STORAGE_ENGINE=ON"', LIBCLANG_PATH = '"C:\Program Files\LLVM\bin"' }
+# CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't overridden). Raw values —
+# cibuildwheel quotes table values itself when serializing them, so adding our
+# own quotes produced a doubled-quote "Malformed environment option".
+environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
