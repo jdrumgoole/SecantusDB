@@ -112,10 +112,17 @@ jobs:
               chmod +x /usr/bin/ccache
             fi
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
+          # SECANTUS_BUILD_STORAGE_ENGINE=ON bundles the Rust extensions +
+          # secantusdb-rs into the published wheel (kept in sync with
+          # wheels.yml + pyproject's [tool.cibuildwheel] toolchain installs).
           CIBW_ENVIRONMENT_LINUX: >-
             CCACHE_DIR=/host_ccache
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            SECANTUS_BUILD_STORAGE_ENGINE=ON
+            SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON
+            PATH=$HOME/.cargo/bin:$PATH
+            LIBCLANG_PATH=/usr/lib64
           # macOS: ccache via Homebrew. The macos-14 runner image
           # already has it — `brew install` is idempotent and a few
           # seconds when already present.
@@ -123,6 +130,10 @@ jobs:
           CIBW_ENVIRONMENT_MACOS: >-
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            SECANTUS_BUILD_STORAGE_ENGINE=ON
+            SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON
+            PATH=$HOME/.cargo/bin:$PATH
+            LIBCLANG_PATH=$(brew --prefix llvm)/lib
           # Windows: ccache + MSVC is historically fragile, so the
           # Windows wheel build runs without ccache. If Windows becomes
           # the publish-workflow bottleneck, switch to sccache.

@@ -168,26 +168,42 @@ test-requires = ["pytest", "pytest-xdist"]
 test-command = "pytest -v {project}/tests/test_smoke.py {project}/tests/test_pymongo_smoke.py"
 
 [tool.cibuildwheel.linux]
-# manylinux x86_64 + aarch64 + musllinux x86_64 + aarch64; install swig in
-# whichever container cibuildwheel is using:
-#   - manylinux2014: CentOS 7 (yum)
-#   - manylinux_2_28: AlmaLinux 8 (dnf)
-#   - musllinux_1_2: Alpine (apk)
-# Each image ships exactly one of these, so the chained `||` picks the right
-# one and the others fail fast with command-not-found.
+# manylinux_2_28 (AlmaLinux 8, dnf) + musllinux_1_2 (Alpine, apk). The
+# storage-engine build (SECANTUS_BUILD_STORAGE_ENGINE=ON) compiles the Rust
+# extensions, which need (a) swig for WiredTiger's Python module, (b) a Rust
+# toolchain, and (c) libclang for `secantus-wt`'s bindgen. We pin manylinux to
+# 2_28 (glibc 2.28+) precisely because its `dnf install clang-devel llvm-devel`
+# gives a modern libclang in /usr/lib64 — the CentOS-7 manylinux2014 SCL clang
+# is far more painful. `$HOME/.cargo/bin` is put on PATH via CIBW_ENVIRONMENT in
+# the workflows so the build step sees cargo.
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
 archs = ["x86_64", "aarch64"]
-before-build = "apk add --no-cache swig || dnf install -y swig || yum install -y swig"
+before-build = """
+(dnf install -y swig clang-devel llvm-devel || apk add --no-cache swig clang-dev llvm-dev clang)
+command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable)
+"""
 
 [tool.cibuildwheel.macos]
-# arm64 only; x86_64 isn't a supported wheel target.
+# arm64 only; x86_64 isn't a supported wheel target. The storage-engine build
+# also needs swig + Rust + libclang: the macos-14 runner ships Rust and Xcode's
+# clang, and Homebrew's `llvm` provides a libclang for bindgen (LIBCLANG_PATH is
+# set in the workflows). `brew install` is idempotent.
 archs = ["arm64"]
-before-build = "brew install swig"
+before-build = "brew install swig llvm && (command -v cargo >/dev/null 2>&1 || brew install rust)"
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-# SWIG ships preinstalled on windows-2022 runners; choco re-installs it idempotently
-# so a refreshed runner image without it still works.
-before-build = "choco install -y swig"
+# SWIG + LLVM (libclang for bindgen) + Rust via choco, all idempotent. The
+# standalone secantusdb binary is NOT built on Windows (CMake gates it to
+# non-Windows), but the `_secantus_storage` / `_secantus_server` extensions are.
+# Rust ships preinstalled on the windows-2022 runner, so we don't choco-install
+# it (that would risk shadowing the runner's rustup cargo).
+before-build = "choco install -y swig llvm"
+# Windows flag + libclang go here (not the workflow env): no workflow sets
+# CIBW_ENVIRONMENT_WINDOWS, so this isn't overridden, and a TOML table sidesteps
+# the space in the LLVM path that space-split CIBW_ENVIRONMENT strings choke on.
+environment = { SECANTUS_BUILD_STORAGE_ENGINE = "ON", SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
