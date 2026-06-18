@@ -439,10 +439,15 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   `run_segmented` via `is_source_stage` / `apply_source_stage`. This is what
   makes a database-level `aggregate: 1` pipeline (no source collection) work —
   the `test_database.py` `$listLocalSessions` shape and the unified db-aggregate
-  / versioned-API db-aggregate tests. **Still deferred:** `$graphLookup`; `$geoNear` `key`-inference from a geo index
-  (explicit `key` required); `$lookup` nested inside `$facet` (facet sub-pipelines
-  run in the storage-free core → Fallback); `$merge` pipeline-form `whenMatched`
-  + `on`-field unique-index validation.
+  / versioned-API db-aggregate tests. **`$graphLookup` DONE** (0.5.3-beta.22+):
+  command-layer BFS over the foreign collection (`startWith` / `connectFromField`
+  / `connectToField`, `maxDepth` default 100, `depthField` as `NumberLong`,
+  `restrictSearchWithMatch`), `_id`-dedup, value-match array-aware. **`$lookup` /
+  `$graphLookup` nested inside `$facet` DONE**: `$facet` now runs each sub-pipeline
+  through `run_segmented` (the command layer) instead of the storage-free core, so
+  storage-backed stages work inside a facet. **Still deferred:** `$geoNear`
+  `key`-inference from a geo index (explicit `key` required); `$merge`
+  pipeline-form `whenMatched` + `on`-field unique-index validation.
 - [x] **`distinct` + DDL/introspection** — `distinct`, `create`, `drop`,
   `listCollections`, `listIndexes`, `createIndexes`, `dropIndexes` (the `Storage`
   trait gained the list/DDL methods; the R4b adapter forwards them).
@@ -832,15 +837,14 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   **any regex**, `$all`, structural/compound equality (array/doc operands),
   bool-as-int comparison, exotic BSON types. Parity pinned by
   `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).
-- [ ] **Widen the Rust query matcher** — `$all` is now handled (element
-  equality via `expressions::py_eq`; regex elements still defer). Remaining
-  fallbacks to widen where faithful: bool-as-int `$gt`/`$lt` comparison and
-  structural array/doc equality (both need Python's exact quirky semantics).
-- [ ] **Flip `query.matches` default to Rust** — same gating as sortkey
-  (Phase 6 packaging + the per-call `bson.encode` overhead question). Note the
-  matcher re-encodes doc+query per call at the seam; the real win needs the doc
-  to already be bytes at the call site (it is, in storage — wire that through
-  when the boundary moves outward).
+- [ ] **Widen the Rust query matcher (Rust server)** — the matcher backs the
+  Rust server directly; there is no Python fallback in that path, so an unported
+  construct surfaces as `BadValue`. `$all` is handled (element equality via
+  `expressions::py_eq`; regex elements still defer). Remaining gaps to widen
+  where faithful: bool-as-int `$gt`/`$lt` comparison and structural array/doc
+  equality. (The retired in-process "flip `query.matches` default to Rust" item
+  is gone — the two-server model has no per-call engine selection; `_secantus_core`
+  is only the parity-test vehicle now.)
 - [x] **Phase 1, leaf engine #3: `update.apply_update`** — the common
   deterministic operators ported to Rust (`crates/secantus-core/src/update.rs`,
   with the `secantus.paths` dotted-path helpers): replacement-style, `$set`,
@@ -852,17 +856,15 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   and every error condition (so the exact `UpdateError`/`PathError` is raised by
   Python). Parity pinned by `tests/test_rust_update_parity.py` (curated +
   6000-case fuzz).
-- [ ] **Widen the Rust update matcher** to cover current fallbacks where
-  faithful: `$min`/`$max` (Python `<` cross-type / raise semantics),
+- [ ] **Widen the Rust update operators (Rust server)** to cover current defers
+  where faithful: `$min`/`$max` (Python `<` cross-type / raise semantics),
   `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and structural),
-  `$bit`. Each needs care to match Python's exact semantics.
-- [ ] **BEFORE flipping `update` default to Rust: verify field-order on $set of
-  an existing key.** Python `set_path` assigns in place (preserves dict position
-  of an existing field); confirm `bson::Document::insert` on an existing key
-  also preserves position rather than moving it to the end — otherwise a
-  flipped default would reorder fields vs mongod. (Parity test uses dict `==`,
-  which is order-insensitive, so it wouldn't catch this; the full WiredTiger
-  conformance suite would.)
+  `$bit`. In the Rust server a defer surfaces as `BadValue`, so these are real
+  capability gaps (not silent fallbacks). Field-order on `$set` of an existing
+  key is **verified correct** (0.5.3-beta.22+): `bson::Document::insert` preserves
+  an existing field's position and appends new keys — matching mongod. (The
+  retired "flip `update` default to Rust" framing is dropped — no in-process
+  default exists in the two-server model.)
 - [x] **Phase 1, leaf engine #4: `expressions.evaluate`** — a high-value core of
   the aggregation expression language ported to Rust
   (`crates/secantus-core/src/expressions.rs`): field paths / `$$var` / `$$ROOT` /

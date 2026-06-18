@@ -30,7 +30,8 @@
 //! (geo-index inference deferred).
 //!
 //! **Deferred (documented so parity is honest):**
-//! * **`$graphLookup`** — not ported; surfaces as `BadValue`.
+//! * **`$graphLookup`** — recursive BFS traversal of a foreign collection
+//!   (`maxDepth` / `depthField` / `restrictSearchWithMatch`).
 //! * **`$lookup` inside `$facet`** — `$facet` sub-pipelines run inside the
 //!   storage-free core, so a storage-backed stage nested in a facet still
 //!   Fallbacks. **`$merge` pipeline-form `whenMatched`** and **`on`-field
@@ -152,12 +153,19 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// Stages handled at the command layer (they read/write storage or need a
 /// brute-force scan), rather than by the storage-free `secantus_core` pipeline
-/// engine. Everything else flows through `apply_pipeline`. `$graphLookup` is
-/// absent — not ported, so it Fallbacks to `BadValue`.
+/// engine. Everything else flows through `apply_pipeline`.
 fn is_storage_backed(name: &str) -> bool {
     matches!(
         name,
-        "$lookup" | "$sample" | "$collStats" | "$indexStats" | "$out" | "$merge" | "$geoNear"
+        "$lookup"
+            | "$graphLookup"
+            | "$facet"
+            | "$sample"
+            | "$collStats"
+            | "$indexStats"
+            | "$out"
+            | "$merge"
+            | "$geoNear"
     )
 }
 
@@ -308,6 +316,8 @@ fn apply_storage_stage(
 ) -> Result<Vec<Document>, CommandError> {
     match name {
         "$lookup" => apply_lookup(spec, docs, db, vars, storage, collation),
+        "$graphLookup" => apply_graph_lookup(spec, docs, db, vars, storage),
+        "$facet" => apply_facet(spec, docs, db, coll, vars, storage, collation),
         "$sample" => apply_sample(spec, docs),
         "$collStats" => apply_coll_stats(spec, db, coll, storage),
         "$indexStats" => apply_index_stats(db, coll, storage),
@@ -410,6 +420,189 @@ fn apply_lookup(
         out.push(new);
     }
     Ok(out)
+}
+
+/// `$graphLookup` — recursive graph traversal of a foreign collection. Mirrors
+/// `aggregate._stage_graph_lookup`: for each input doc, evaluate `startWith`,
+/// then breadth-first walk the foreign collection matching `connectFromField`
+/// (the value to chase) against `connectToField`, collecting matched docs into
+/// `as`. `maxDepth` (default 100, matching mongod) bounds recursion; `depthField`
+/// (when set) records the BFS depth as a `NumberLong`; `restrictSearchWithMatch`
+/// (a query filter) limits which docs are traversed. We materialise the foreign
+/// collection and walk it in Rust — correctness-identical to the Python path.
+fn apply_graph_lookup(
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    db: &str,
+    vars: &Document,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Vec<Document>, CommandError> {
+    let spec = spec
+        .and_then(Bson::as_document)
+        .ok_or_else(|| bad_value("$graphLookup requires a document spec"))?;
+    let strs_err =
+        || bad_value("$graphLookup requires from/connectFromField/connectToField/as as strings");
+    let from = spec.get_str("from").map_err(|_| strs_err())?;
+    let connect_from = spec.get_str("connectFromField").map_err(|_| strs_err())?;
+    let connect_to = spec.get_str("connectToField").map_err(|_| strs_err())?;
+    let as_field = spec.get_str("as").map_err(|_| strs_err())?;
+    let start_with = spec
+        .get("startWith")
+        .ok_or_else(|| bad_value("$graphLookup requires 'startWith'"))?;
+    // Default maxDepth=100 (mongod's behaviour) so a self-referencing collection
+    // can't blow the frontier up to O(N^2).
+    let max_depth: i64 = match spec.get("maxDepth") {
+        None => 100,
+        Some(b) => as_i64(b).ok_or_else(|| bad_value("$graphLookup maxDepth must be numeric"))?,
+    };
+    let depth_field = spec.get_str("depthField").ok();
+    let restrict = spec
+        .get("restrictSearchWithMatch")
+        .and_then(Bson::as_document);
+
+    let foreign: Vec<Document> = decode_docs(
+        storage
+            .find(db, from, &Document::new(), None, None)
+            .map_err(command_error)?,
+    )?;
+
+    let mut out = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let seed = secantus_core::expressions::evaluate(&doc, start_with, vars)
+            .map_err(|_| bad_value("$graphLookup startWith expression not supported"))?;
+        let walked = graph_walk(
+            &foreign,
+            &seed,
+            connect_from,
+            connect_to,
+            max_depth,
+            depth_field,
+            restrict,
+        )?;
+        let mut new = doc;
+        set_field_path(
+            &mut new,
+            as_field,
+            Bson::Array(walked.into_iter().map(Bson::Document).collect()),
+        );
+        out.push(new);
+    }
+    Ok(out)
+}
+
+/// `$facet` at the command layer: run each named sub-pipeline through
+/// `run_segmented` (not the storage-free core engine) so storage-backed stages
+/// like `$lookup` / `$graphLookup` work inside a facet. Each sub-pipeline sees a
+/// copy of the same input docs; results collect into one output doc. Mirrors the
+/// Python pipeline, where every facet sub-pipeline dispatches through the same
+/// `apply_pipeline` as the top level.
+#[allow(clippy::too_many_arguments)]
+fn apply_facet(
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    db: &str,
+    coll: Option<&str>,
+    vars: &Document,
+    storage: &dyn crate::storage::Storage,
+    collation: Option<&Collation>,
+) -> Result<Vec<Document>, CommandError> {
+    let s = spec
+        .and_then(Bson::as_document)
+        .ok_or_else(|| bad_value("$facet requires a document spec"))?;
+    let mut out = Document::new();
+    for (name, sub) in s.iter() {
+        let sub_pipeline = sub
+            .as_array()
+            .ok_or_else(|| bad_value("$facet sub-pipeline must be an array"))?;
+        // Each sub-pipeline runs over its own copy of the input docs.
+        let res = run_segmented(
+            docs.clone(),
+            sub_pipeline,
+            db,
+            coll,
+            vars,
+            storage,
+            collation,
+            &Document::new(),
+        )?;
+        out.insert(
+            name.clone(),
+            Bson::Array(res.into_iter().map(Bson::Document).collect()),
+        );
+    }
+    Ok(vec![out])
+}
+
+/// BFS over `foreign` from `seed`, chasing `connect_from` → `connect_to`.
+/// Dedups by `_id` (a doc is collected at most once, at its shallowest depth).
+#[allow(clippy::too_many_arguments)]
+fn graph_walk(
+    foreign: &[Document],
+    seed: &Bson,
+    connect_from: &str,
+    connect_to: &str,
+    max_depth: i64,
+    depth_field: Option<&str>,
+    restrict: Option<&Document>,
+) -> Result<Vec<Document>, CommandError> {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut out: Vec<Document> = Vec::new();
+    let mut frontier: std::collections::VecDeque<(Bson, i64)> = std::collections::VecDeque::new();
+    frontier.push_back((seed.clone(), 0));
+    while let Some((value, depth)) = frontier.pop_front() {
+        if depth > max_depth {
+            continue;
+        }
+        for fdoc in foreign {
+            // restrictSearchWithMatch (mongod): only traverse matching docs.
+            if let Some(r) = restrict {
+                if !secantus_core::query::matches(fdoc, r, &Document::new(), None).unwrap_or(false)
+                {
+                    continue;
+                }
+            }
+            let id_key = graph_id_key(fdoc.get("_id"));
+            if seen.contains(&id_key) {
+                continue;
+            }
+            let target = secantus_core::get_path(fdoc, connect_to);
+            if graph_values_match(&value, target) {
+                seen.insert(id_key);
+                let mut nd = fdoc.clone();
+                if let Some(df) = depth_field {
+                    nd.insert(df, Bson::Int64(depth));
+                }
+                out.push(nd);
+                if let Some(next_value) = secantus_core::get_path(fdoc, connect_from) {
+                    frontier.push_back((next_value.clone(), depth + 1));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A hashable dedup key for a `_id` value (BSON-encoded; `None` for a missing
+/// `_id`, mirroring Python's `set` of `_id`s where a missing `_id` is `None`).
+fn graph_id_key(id: Option<&Bson>) -> Vec<u8> {
+    match id {
+        None => Vec::new(),
+        Some(v) => bson::to_vec(&doc! { "k": v.clone() }).unwrap_or_default(),
+    }
+}
+
+/// `$graphLookup` connect-value equality, mirroring `aggregate._values_match`:
+/// array↔array (any common element), array↔scalar membership, else Python `==`
+/// (numeric-aware via `expressions::py_eq`). A missing target never matches.
+fn graph_values_match(a: &Bson, target: Option<&Bson>) -> bool {
+    let Some(b) = target else { return false };
+    let eq = |x: &Bson, y: &Bson| secantus_core::expressions::py_eq(x, y).unwrap_or(false);
+    match (a, b) {
+        (Bson::Array(xs), Bson::Array(ys)) => xs.iter().any(|x| ys.iter().any(|y| eq(x, y))),
+        (Bson::Array(xs), _) => xs.iter().any(|x| eq(x, b)),
+        (_, Bson::Array(ys)) => ys.iter().any(|y| eq(a, y)),
+        _ => eq(a, b),
+    }
 }
 
 /// Set `path` (dotted) in `doc` to `value`, creating intermediate documents —
@@ -1161,10 +1354,10 @@ mod tests {
     fn aggregate_unsupported_stage_is_bad_value() {
         let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1}]);
         let mut c = ctx(s);
-        // $graphLookup isn't ported → the Rust engine Fallbacks to BadValue.
+        // A genuinely-unknown stage Fallbacks to BadValue.
         let reply = dispatch(
             &doc! {"aggregate": "c", "pipeline": [
-                {"$graphLookup": {"from": "o", "startWith": "$x", "connectFromField": "x", "connectToField": "y", "as": "g"}}
+                {"$notARealStage": {}}
             ], "cursor": {}},
             &mut c,
         );
