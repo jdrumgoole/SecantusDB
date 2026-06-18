@@ -470,7 +470,8 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ))
             }
         };
-        let creds = derive_credentials(&pwd, None, None);
+        let creds = derive_credentials(&pwd, None, None)
+            .map_err(|e| bad_value(format!("createUser: {e}")))?;
         credentials.insert(
             SCRAM_SHA_256,
             doc! {
@@ -602,7 +603,8 @@ pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if pwd.is_empty() {
             return Err(bad_value("updateUser: pwd must be a non-empty string"));
         }
-        let creds = derive_credentials(pwd, None, None);
+        let creds = derive_credentials(pwd, None, None)
+            .map_err(|e| bad_value(format!("updateUser: {e}")))?;
         record.insert(
             "credentials",
             doc! {

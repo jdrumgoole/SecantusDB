@@ -96,27 +96,6 @@ CURATED = [
 ]
 
 
-def _norm_int_width(v):
-    """Coerce ``Int64`` → ``int`` recursively so parity comparisons ignore the
-    int32-vs-int64 BSON *subtype* while still catching every other divergence.
-
-    The pure-Python engine now follows mongod's numeric type promotion
-    (int32 < int64 < double < decimal128), so ``$inc`` / ``$mul`` over an
-    ``Int64`` field yields ``Int64``. The Rust update engine doesn't preserve
-    that yet — it narrows the *same value* back to int32 — so compare values,
-    not subtypes, until the Rust port catches up (or defers these cases). See
-    ``tasks/backlog.md``. Floats / Decimal128 / strings / etc. are untouched,
-    so a genuine type mismatch still fails the assertion.
-    """
-    if isinstance(v, Int64):
-        return int(v)
-    if isinstance(v, list):
-        return [_norm_int_width(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _norm_int_width(x) for k, x in v.items()}
-    return v
-
-
 @pytest.mark.parametrize("doc,update,upsert", CURATED)
 def test_curated_parity(doc, update, upsert):
     doc = bson.decode(bson.encode(doc))
@@ -125,7 +104,10 @@ def test_curated_parity(doc, update, upsert):
     if rust is None:
         return  # fallback case — shim would run pure Python
     py = _pure.apply_update(doc, update, is_upsert=upsert)
-    assert _norm_int_width(bson.decode(rust)) == _norm_int_width(py), (
+    # The Rust update engine now follows mongod's numeric type promotion
+    # (int32 < int64 < double < decimal128) exactly like the pure-Python engine,
+    # so the BSON int32-vs-int64 subtype must match — compare values directly.
+    assert bson.decode(rust) == py, (
         f"rust={bson.decode(rust)} pure={py} update={update}"
     )
 
@@ -180,7 +162,7 @@ def test_array_filter_parity(doc, update, af, pos):
     if rust is None:
         return  # fallback — Python handles it
     py = _pure.apply_update(doc, update, array_filters=list(af), positional_matches=dict(pos))
-    assert _norm_int_width(bson.decode(rust)) == _norm_int_width(py), (
+    assert bson.decode(rust) == py, (
         f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
     )
 
@@ -247,7 +229,7 @@ def test_randomised_fuzz_parity():
             continue
         handled += 1
         py = _pure.apply_update(doc, update, is_upsert=upsert)
-        assert _norm_int_width(bson.decode(rust)) == _norm_int_width(py), (
+        assert bson.decode(rust) == py, (
             f"divergence: rust={bson.decode(rust)} pure={py} update={update} doc={doc}"
         )
     assert handled > 1000, f"expected many handled cases, only {handled}"
@@ -276,7 +258,7 @@ def test_batch_apply_parity():
             continue
         handled += 1
         py = [_pure.apply_update(d, update, is_upsert=upsert) for d in docs]
-        assert _norm_int_width(rust) == _norm_int_width(py), (
+        assert rust == py, (
             f"batch divergence: rust={rust} pure={py} update={update}"
         )
     assert handled > 500, f"expected many handled batches, only {handled}"

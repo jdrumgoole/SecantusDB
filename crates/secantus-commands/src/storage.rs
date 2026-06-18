@@ -392,7 +392,7 @@ pub trait Storage: Send + Sync {
     }
 
     /// Merge `opts` into the collection's stored options (creating it if needed) —
-    /// for `create` with options and `collMod`. Default no-op; WT adapter forwards.
+    /// for `create` with options. Default no-op; WT adapter forwards.
     fn set_collection_options(
         &self,
         _db: &str,
@@ -400,6 +400,13 @@ pub trait Storage: Send + Sync {
         _opts: &Document,
     ) -> Result<(), StorageError> {
         Ok(())
+    }
+
+    /// `collMod`: like [`Storage::set_collection_options`], but also emits a DDL
+    /// `op: "c"` `collMod` oplog entry so a `showExpandedEvents` change stream
+    /// surfaces a `modify` event. Default falls back to the silent option write.
+    fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<(), StorageError> {
+        self.set_collection_options(db, coll, opts)
     }
 
     /// Drop a collection. `true` if it existed.

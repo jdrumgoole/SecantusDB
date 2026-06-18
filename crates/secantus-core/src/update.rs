@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use bson::{Bson, Document};
 
-use crate::numeric::{as_float_like, as_int_like, int_to_bson};
+use crate::numeric::{as_float_like, as_int_like, int_promoted_to_bson, is_int64};
 use crate::paths::{self, get_path, has_path};
 use crate::query;
 
@@ -204,7 +204,10 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
         } else {
             a.checked_add(b)
         };
-        return int_to_bson(r.ok_or(Fallback)?).ok_or(Fallback);
+        // MongoDB promotes the result to int64 if either operand is already
+        // int64 (or a 32-bit result would overflow) — matching `numerics.bson_*`.
+        let wide = is_int64(current) || is_int64(operand);
+        return int_promoted_to_bson(r.ok_or(Fallback)?, wide).ok_or(Fallback);
     }
     // Float path: any non-numeric operand (current/operand) makes Python raise.
     let a = as_float_like(current).ok_or(Fallback)?;

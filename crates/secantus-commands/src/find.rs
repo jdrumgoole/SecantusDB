@@ -26,7 +26,7 @@ use bson::{doc, Bson, Document};
 use crate::cursors::CursorRegistry;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
-    resolve_let_vars,
+    encode_docs, resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
@@ -107,19 +107,34 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         docs.truncate(limit);
     }
 
-    if let Some(spec) = projection {
-        docs = project_docs(docs, spec)?;
-    }
-
-    let (first_batch, cursor_id) = if single_batch {
-        (docs, 0)
-    } else {
-        split_into_cursor(docs, batch_size, &ns, cursors)?
+    // The `firstBatch` goes straight onto the wire reply, so produce it as
+    // `Bson` directly and only encode the cursor *remainder* (which the registry
+    // stores as bytes). This avoids the round-trip the projection path otherwise
+    // pays — encoding the projected docs to bytes only to decode them right back
+    // for the reply. The no-projection path stays in storage bytes end-to-end
+    // and decodes just the firstBatch.
+    let (first_batch, cursor_id): (Vec<Bson>, i64) = match projection {
+        Some(spec) => {
+            let projected = project_to_docs(docs, spec)?;
+            if single_batch {
+                (projected.into_iter().map(Bson::Document).collect(), 0)
+            } else {
+                split_docs_into_cursor(projected, batch_size, &ns, cursors)?
+            }
+        }
+        None => {
+            let (first, cursor_id) = if single_batch {
+                (docs, 0)
+            } else {
+                split_into_cursor(docs, batch_size, &ns, cursors)?
+            };
+            (docs_to_bson(first)?, cursor_id)
+        }
     };
 
     Ok(doc! {
         "cursor": {
-            "firstBatch": docs_to_bson(first_batch)?,
+            "firstBatch": first_batch,
             // Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
             "id": Bson::Int64(cursor_id),
             "ns": ns,
@@ -153,6 +168,34 @@ pub(crate) fn split_into_cursor(
         .register(ns, remaining)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((docs, cursor_id))
+}
+
+/// Like [`split_into_cursor`], but for already-decoded result `Document`s (the
+/// `aggregate` pipeline output, or a projected `find`). The `firstBatch` is
+/// returned as `Bson` for direct embedding in the reply — never re-encoded —
+/// while only the cursor remainder is encoded to bytes for the registry. Shared
+/// with the `aggregate` handler.
+pub(crate) fn split_docs_into_cursor(
+    mut docs: Vec<Document>,
+    batch_size: i64,
+    ns: &str,
+    cursors: &CursorRegistry,
+) -> Result<(Vec<Bson>, i64), CommandError> {
+    let take = if batch_size < 0 {
+        DEFAULT_BATCH_SIZE as usize
+    } else {
+        batch_size as usize
+    }
+    .min(docs.len());
+    let remaining = docs.split_off(take);
+    let first: Vec<Bson> = docs.into_iter().map(Bson::Document).collect();
+    if remaining.is_empty() {
+        return Ok((first, 0));
+    }
+    let cursor_id = cursors
+        .register(ns, encode_docs(remaining)?)
+        .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
+    Ok((first, cursor_id))
 }
 
 /// Resolve a `hint` (index-name string or key-spec document) to the index's key
@@ -286,7 +329,7 @@ fn apply_min_max(
 /// Apply a projection spec to each result doc via `secantus_core::projection`.
 /// A `Fallback` (a projection the Rust engine can't reproduce exactly) surfaces
 /// as `BadValue` — the Rust server only ships what the Rust engine supports.
-fn project_docs(docs: Vec<Vec<u8>>, spec: &Document) -> Result<Vec<Vec<u8>>, CommandError> {
+fn project_to_docs(docs: Vec<Vec<u8>>, spec: &Document) -> Result<Vec<Document>, CommandError> {
     docs.iter()
         .map(|bytes| {
             let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
@@ -296,23 +339,13 @@ fn project_docs(docs: Vec<Vec<u8>>, spec: &Document) -> Result<Vec<Vec<u8>>, Com
                     format!("failed to decode document: {e}"),
                 )
             })?;
-            let projected =
-                secantus_core::projection::apply_projection(&d, spec).map_err(|_| {
-                    CommandError::new(
-                        2,
-                        "BadValue",
-                        "projection is not supported by the Rust server",
-                    )
-                })?;
-            let mut out = Vec::new();
-            projected.to_writer(&mut out).map_err(|e| {
+            secantus_core::projection::apply_projection(&d, spec).map_err(|_| {
                 CommandError::new(
-                    1,
-                    "InternalError",
-                    format!("failed to encode document: {e}"),
+                    2,
+                    "BadValue",
+                    "projection is not supported by the Rust server",
                 )
-            })?;
-            Ok(out)
+            })
         })
         .collect()
 }

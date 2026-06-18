@@ -39,7 +39,7 @@ use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SER
 /// `changeStreamPreAndPostImages` drives pre-image capture; `capped`/`size`/`max`
 /// are reported in stats. (TTL-index `expireAfterSeconds` modification via
 /// `collMod`'s `index` option is deferred.)
-const STORED_COLL_OPTIONS: [&str; 7] = [
+const STORED_COLL_OPTIONS: [&str; 8] = [
     "validator",
     "validationLevel",
     "validationAction",
@@ -47,6 +47,9 @@ const STORED_COLL_OPTIONS: [&str; 7] = [
     "capped",
     "size",
     "max",
+    // Persisted so the storage layer can recognise a timeseries collection and
+    // relax `_id` uniqueness (mongod buckets by time; `_id` is not a key).
+    "timeseries",
 ];
 
 /// The subset of a command doc that maps to persisted collection options.
@@ -114,8 +117,10 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .into_reply());
     }
     let opts = collection_option_subset(doc);
+    // `coll_mod` (not `set_collection_options`) so a `showExpandedEvents` change
+    // stream sees the resulting `modify` event.
     storage
-        .set_collection_options(&ctx.db_name, &coll, &opts)
+        .coll_mod(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
     Ok(doc! { "ok": 1.0 })
 }

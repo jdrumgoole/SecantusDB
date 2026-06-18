@@ -44,9 +44,9 @@
 
 use bson::{doc, Bson, Document};
 
-use crate::find::split_into_cursor;
+use crate::find::split_docs_into_cursor;
 use crate::util::{
-    as_i64, collation_of, command_error, decode_docs, docs_to_bson, encode_docs, resolve_let_vars,
+    as_i64, collation_of, command_error, decode_docs, encode_docs, resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
@@ -135,11 +135,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         doc,
     )?;
 
-    let (first_batch, cursor_id) =
-        split_into_cursor(encode_docs(result)?, batch_size, &ns, cursors)?;
+    // The pipeline result is already decoded `Document`s. Send the `firstBatch`
+    // straight to the wire as `Bson` and encode only the cursor remainder for the
+    // registry — no encode→decode round-trip on the docs the client gets now.
+    let (first_batch, cursor_id) = split_docs_into_cursor(result, batch_size, &ns, cursors)?;
     Ok(doc! {
         "cursor": {
-            "firstBatch": docs_to_bson(first_batch)?,
+            "firstBatch": first_batch,
             // Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
             "id": Bson::Int64(cursor_id),
             "ns": ns,

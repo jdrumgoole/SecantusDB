@@ -68,6 +68,29 @@ pub fn int_to_bson(r: i128) -> Option<Bson> {
     }
 }
 
+/// Whether a BSON value is specifically a 64-bit int — the flag that drives
+/// arithmetic type promotion (see [`int_promoted_to_bson`]).
+pub fn is_int64(b: &Bson) -> bool {
+    matches!(b, Bson::Int64(_))
+}
+
+/// Encode an integral arithmetic result honouring MongoDB's numeric promotion:
+/// the result is **int64** if any operand was already int64 (`operand_wide`) or
+/// a 32-bit result would overflow, otherwise **int32**. `None` for a result that
+/// overflows int64 (Python keeps a big int pymongo can't encode — defer).
+/// Mirrors the integral branch of `secantus.numerics._combine`.
+pub fn int_promoted_to_bson(r: i128, operand_wide: bool) -> Option<Bson> {
+    if !(i64::MIN as i128..=i64::MAX as i128).contains(&r) {
+        return None;
+    }
+    let fits_i32 = (i32::MIN as i128..=i32::MAX as i128).contains(&r);
+    if operand_wide || !fits_i32 {
+        Some(Bson::Int64(r as i64))
+    } else {
+        Some(Bson::Int32(r as i32))
+    }
+}
+
 fn normalize(digits: &mut Vec<u8>, exp: &mut i64) {
     while digits.first() == Some(&0) {
         digits.remove(0);

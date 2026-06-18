@@ -19,6 +19,7 @@
 //! `tasks/rust-rewrite-phase4-scoping.md`).
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -506,6 +507,20 @@ fn id_key(id: &Bson) -> Result<Vec<u8>> {
     sortkey::encode_value(id, None).map_err(|_| StorageError::UnsupportedId)
 }
 
+/// The doc-table key for `doc`: the caller-supplied override (timeseries rows
+/// carry a suffixed key) when present, else `id_key(doc["_id"])`.
+fn doc_table_key(doc: &Document, override_key: Option<&[u8]>) -> Result<Vec<u8>> {
+    match override_key {
+        Some(k) => Ok(k.to_vec()),
+        None => {
+            let id = doc
+                .get("_id")
+                .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
+            id_key(id)
+        }
+    }
+}
+
 // --- index-key construction (mirrors `storage.py`, byte-for-byte) ---
 
 /// The per-field sort direction of a `key_spec` value: `Some(1)`/`Some(-1)` for
@@ -901,6 +916,10 @@ pub struct Storage {
     /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
     oplog_retention_seconds: i64,
     oplog_max_entries: usize,
+    /// Per-insert discriminator for timeseries doc-table keys (see
+    /// `timeseries_doc_suffix`). Wraps at 16 bits; combined with a nanosecond
+    /// timestamp it keeps duplicate-`_id` rows distinct across reopens.
+    ts_suffix_counter: AtomicU64,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -1006,6 +1025,7 @@ impl Storage {
             oplog_cv: Condvar::new(),
             oplog_retention_seconds: 3600,
             oplog_max_entries: 100_000,
+            ts_suffix_counter: AtomicU64::new(0),
         })
     }
 
@@ -1141,12 +1161,19 @@ impl Storage {
     /// `storage.current_cluster_time`.
     pub fn current_cluster_time(&self) -> Result<bson::Timestamp> {
         let _g = self.lock.lock().unwrap();
-        let ts = {
+        // Mint the next timestamp and snapshot the recovery meta in a SINGLE
+        // oplog-mutex hold, instead of locking to mint and locking again inside
+        // `persist_oplog_meta` to read the same fields back. (The seq counter
+        // can't be demoted to a bare `AtomicI64`: `wait_for_oplog` pairs
+        // `next_seq` with `oplog_cv`, and the condvar's lost-wakeup guarantee
+        // requires the counter to be read under the same mutex as the wait.)
+        let (ts, meta) = {
             let mut st = self.oplog.lock().unwrap();
-            Self::mint_ts(&mut st)
+            let ts = Self::mint_ts(&mut st);
+            (ts, (st.next_seq, st.last_ts_secs, st.last_ts_ord))
         };
         let session = self.conn.open_session()?;
-        self.persist_oplog_meta(&session)?;
+        self.persist_oplog_meta(&session, meta)?;
         Ok(ts)
     }
 
@@ -1171,14 +1198,12 @@ impl Storage {
     /// Persist the recovery meta row (`next_seq` / `last_ts_*`). Best-effort
     /// optimisation — `load_oplog_meta` reconstructs from the oplog table if the
     /// row is stale or missing. Mirrors `storage._persist_oplog_meta`.
-    fn persist_oplog_meta(&self, session: &Session) -> Result<()> {
+    fn persist_oplog_meta(&self, session: &Session, meta: (i64, i64, i64)) -> Result<()> {
+        let (next_seq, last_ts_secs, last_ts_ord) = meta;
         let mut d = Document::new();
-        {
-            let st = self.oplog.lock().unwrap();
-            d.insert("next_seq", st.next_seq);
-            d.insert("last_ts_secs", st.last_ts_secs);
-            d.insert("last_ts_ord", st.last_ts_ord);
-        }
+        d.insert("next_seq", next_seq);
+        d.insert("last_ts_secs", last_ts_secs);
+        d.insert("last_ts_ord", last_ts_ord);
         let blob = encode_doc(&d)?;
         let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
         cur.set_key_s("state");
@@ -1193,7 +1218,10 @@ impl Storage {
     /// Mirrors `storage.read_oplog` (ns filtering / projection are a higher
     /// layer's job).
     pub fn read_oplog(&self, start_seq: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
-        let _g = self.lock.lock().unwrap();
+        // No global lock: a fresh session's WiredTiger MVCC snapshot gives a
+        // consistent read without blocking writers. This is the hot tailable
+        // change-stream getMore path, so serialising it against every write
+        // would needlessly throttle throughput.
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
         cur.set_key_q(start_seq);
@@ -1226,7 +1254,7 @@ impl Storage {
     /// The smallest seq currently present (0 if empty) — the retention floor a
     /// resume token must stay at or above. Mirrors `storage.oplog_floor_seq`.
     pub fn oplog_floor_seq(&self) -> Result<i64> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
         match cur.next() {
@@ -1239,7 +1267,8 @@ impl Storage {
     /// The highest seq emitted (`next_seq - 1`), 0 if none. Mirrors
     /// `storage.oplog_tail_seq`.
     pub fn oplog_tail_seq(&self) -> i64 {
-        let _g = self.lock.lock().unwrap();
+        // The tail counter lives under the dedicated oplog mutex; the global lock
+        // adds nothing here.
         self.oplog.lock().unwrap().next_seq - 1
     }
 
@@ -1257,6 +1286,38 @@ impl Storage {
         write_coll_options(&session, db, coll, &current)
     }
 
+    /// `collMod`: merge `opts` into the collection's stored options (like
+    /// `set_collection_options`) AND emit a DDL `op: "c"` `collMod` oplog entry,
+    /// so a `showExpandedEvents` change stream surfaces a `modify` event. Used by
+    /// the `collMod` command (plain `set_collection_options` stays oplog-silent
+    /// for internal option writes such as `create`'s). Mirrors mongod's collMod
+    /// oplog (`o = {collMod: <coll>, <changed fields>}`).
+    pub fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+        for (k, v) in opts {
+            current.insert(k.clone(), v.clone());
+        }
+        write_coll_options(&session, db, coll, &current)?;
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut o = Document::new();
+            o.insert("collMod", coll);
+            for (k, v) in opts {
+                o.insert(k.clone(), v.clone());
+            }
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
+        Ok(())
+    }
+
     /// The collection's 16-byte UUID (minting + persisting one on first use).
     /// Mirrors `storage.collection_uuid`.
     pub fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>> {
@@ -1269,7 +1330,7 @@ impl Storage {
     /// The pre-image document bytes stored for oplog `seq`, or `None`. Fresh
     /// session for cross-thread visibility. Mirrors `storage.read_preimage`.
     pub fn read_preimage(&self, seq: i64) -> Result<Option<Vec<u8>>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(PREIMAGE_TABLE, None)?;
         cur.set_key_q(seq);
@@ -1289,12 +1350,15 @@ impl Storage {
     /// the wall clock). Returns the number of rows pruned. No background sweeper —
     /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
     pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
-        let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         let when = now.unwrap_or_else(now_secs);
         let cutoff = when - self.oplog_retention_seconds;
 
-        // Phase 1: collect every seq + the ones past the retention window.
+        // Phase 1 (lock-free): collect every seq + the ones past the retention
+        // window. A fresh MVCC session reads consistently without blocking
+        // writers; prune is best-effort, so a slightly stale view is fine — and
+        // writers only ever append *higher* seqs, never touch the old rows we
+        // doom here.
         let oc = session.open_cursor(OPLOG_TABLE, None)?;
         let mut all_seqs: Vec<i64> = Vec::new();
         let mut doomed: Vec<i64> = Vec::new();
@@ -1334,6 +1398,9 @@ impl Storage {
             return Ok(0);
         }
 
+        // Phase 2: take the global lock only for the mutation (the deletes),
+        // not the scan above.
+        let _g = self.lock.lock().unwrap();
         let op_del = session.open_cursor(OPLOG_TABLE, None)?;
         let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
         for &seq in &doomed {
@@ -1373,7 +1440,7 @@ impl Storage {
     /// The smallest seq whose entry `ts >= target` (tail + 1 if none qualify) —
     /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
     pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
         let c = session.open_cursor(OPLOG_TABLE, None)?;
         let mut more = c.next()?;
@@ -1497,6 +1564,36 @@ impl Storage {
     /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.
     /// Returns the document's `id_key`. A duplicate `_id` yields
     /// `StorageError::DuplicateId`.
+    /// Whether `(db, coll)` is a timeseries collection (its stored options carry
+    /// a `timeseries` sub-document). Mirrors `storage._is_timeseries`.
+    fn is_timeseries(&self, session: &Session, db: &str, coll: &str) -> Result<bool> {
+        Ok(coll_options(session, db, coll)?
+            .map(|o| o.contains_key("timeseries"))
+            .unwrap_or(false))
+    }
+
+    /// A doc-table key discriminator for a timeseries collection. Timeseries
+    /// collections don't enforce `_id` uniqueness, but the doc table is keyed by
+    /// `id_key(_id)`, so equal `_id`s would collide. Appending this suffix keeps
+    /// duplicates distinct while preserving `_id` grouping (the sortkey encoding
+    /// is prefix-free). A nanosecond timestamp survives reopens; a 16-bit counter
+    /// disambiguates same-nanosecond inserts. Reads decode + filter by content,
+    /// so the suffix is invisible above storage — but the `_id` point-lookup fast
+    /// path must be skipped (it reconstructs the UNsuffixed key). Mirrors
+    /// `storage._timeseries_doc_suffix`.
+    fn timeseries_doc_suffix(&self) -> Vec<u8> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let counter = (self.ts_suffix_counter.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16;
+        let mut out = Vec::with_capacity(10);
+        out.extend_from_slice(&nanos.to_be_bytes());
+        out.extend_from_slice(&counter.to_be_bytes());
+        out
+    }
+
     pub fn insert_one(&self, db: &str, coll: &str, doc_bytes: &[u8]) -> Result<Vec<u8>> {
         let _g = self.lock.lock().unwrap();
         let mut doc = decode_doc(doc_bytes)?;
@@ -1504,7 +1601,7 @@ impl Storage {
             doc.insert("_id", Bson::ObjectId(ObjectId::new()));
         }
         let id = doc.get("_id").expect("_id present").clone();
-        let key = id_key(&id)?;
+        let mut key = id_key(&id)?;
         let blob = encode_doc(&doc)?;
         if blob.len() > MAX_BSON_OBJECT_SIZE {
             return Err(StorageError::DocumentTooLarge(blob.len()));
@@ -1512,6 +1609,10 @@ impl Storage {
 
         let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
+        // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
+        if self.is_timeseries(&session, db, coll)? {
+            key.extend_from_slice(&self.timeseries_doc_suffix());
+        }
         // Reject unique-index violations before writing anything.
         let descs = self.index_descs(&session, db, coll)?;
         if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
@@ -1528,7 +1629,7 @@ impl Storage {
         }
         // Maintain secondary indexes: write this doc's entries, and lazily flag
         // any index this doc makes multikey (array value on an indexed field).
-        self.write_index_entries(&session, db, coll, &doc, &descs)?;
+        self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
         self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         // Oplog: an insert is op "i". No pre-image (there's no prior document).
         if self.enable_oplog {
@@ -1539,7 +1640,8 @@ impl Storage {
             entry.insert("op", "i");
             entry.insert("ns", format!("{db}.{coll}"));
             entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(doc.clone()));
+            // `doc` is no longer needed after this — move it in rather than clone.
+            entry.insert("o", Bson::Document(doc));
             entry.insert("o2", Bson::Document(o2));
             self.emit_oplog(&session, vec![entry], vec![None])?;
         }
@@ -1567,6 +1669,7 @@ impl Storage {
         let descs = self.index_descs(&session, db, coll)?;
         let ns = format!("{db}.{coll}");
         let oplog_on = self.enable_oplog;
+        let timeseries = self.is_timeseries(&session, db, coll)?;
         let ui = if oplog_on {
             Some(collection_uuid(&session, db, coll)?)
         } else {
@@ -1582,7 +1685,11 @@ impl Storage {
                 doc.insert("_id", Bson::ObjectId(ObjectId::new()));
             }
             let id = doc.get("_id").expect("_id present").clone();
-            let key = id_key(&id)?;
+            let mut key = id_key(&id)?;
+            // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
+            if timeseries {
+                key.extend_from_slice(&self.timeseries_doc_suffix());
+            }
             // Unique-index pre-check (collect a write-error rather than abort).
             if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
                 let mut e = Document::new();
@@ -1626,7 +1733,7 @@ impl Storage {
                 }
                 Err(e) => return Err(e.into()),
             }
-            self.write_index_entries(&session, db, coll, &doc, &descs)?;
+            self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
             inserted += 1;
             if oplog_on {
@@ -1636,7 +1743,8 @@ impl Storage {
                 entry.insert("op", "i");
                 entry.insert("ns", ns.clone());
                 entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
-                entry.insert("o", Bson::Document(doc.clone()));
+                // `doc` isn't used after this iteration — move it in.
+                entry.insert("o", Bson::Document(doc));
                 entry.insert("o2", Bson::Document(o2));
                 oplog_entries.push(entry);
             }
@@ -1737,8 +1845,10 @@ impl Storage {
         // new, and lazily flag any index the new doc makes multikey (sticky —
         // the old doc's array-ness is never cleared).
         if !descs.is_empty() {
-            self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
-            self.write_index_entries(&session, db, coll, &doc, &descs)?;
+            // `update_by_id` is a bare-`_id` path (not used for timeseries), so the
+            // key is the canonical `id_key(_id)` — let the helper recompute it.
+            self.delete_index_entries(&session, db, coll, &old_doc, &descs, None)?;
+            self.write_index_entries(&session, db, coll, &doc, &descs, None)?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         }
         // Oplog: a full-document replacement is op "u" with `o` = the new doc
@@ -1758,7 +1868,8 @@ impl Storage {
             entry.insert("op", "u");
             entry.insert("ns", format!("{db}.{coll}"));
             entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(doc.clone()));
+            // The replacement doc isn't needed after this — move it in.
+            entry.insert("o", Bson::Document(doc));
             entry.insert("o2", Bson::Document(o2));
             self.emit_oplog(&session, vec![entry], vec![pre])?;
         }
@@ -1781,7 +1892,8 @@ impl Storage {
         cur.remove()?;
         let old_doc = decode_doc(&old_blob)?;
         let descs = self.index_descs(&session, db, coll)?;
-        self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
+        // `delete_by_id` is a bare-`_id` path (not used for timeseries).
+        self.delete_index_entries(&session, db, coll, &old_doc, &descs, None)?;
         // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
         // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
         if self.enable_oplog {
@@ -1851,7 +1963,7 @@ impl Storage {
             if !expired {
                 continue;
             }
-            self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &id_k);
             match doc_cur.remove() {
@@ -2668,6 +2780,25 @@ impl Storage {
             ec.set_value_u(b"");
             ec.insert()?;
         }
+        // Oplog: a DDL `op: "c"` `createIndexes` entry so a `showExpandedEvents`
+        // change stream surfaces a `createIndexes` event (the projector reads
+        // `o.createIndexes` + `o.indexes[].{v,key,name}`).
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut idx = Document::new();
+            idx.insert("v", 2i32);
+            idx.insert("key", Bson::Document(key_spec.clone()));
+            idx.insert("name", name);
+            let mut o = Document::new();
+            o.insert("createIndexes", coll);
+            o.insert("indexes", Bson::Array(vec![Bson::Document(idx)]));
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
         Ok(true)
     }
 
@@ -2722,6 +2853,21 @@ impl Storage {
         }
         c.remove()?;
         self.delete_entries_prefix(&session, db, coll, name)?;
+        // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
+        // change stream surfaces a `dropIndexes` event (the projector reads
+        // `o.dropIndexes` + `o.index`).
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut o = Document::new();
+            o.insert("dropIndexes", coll);
+            o.insert("index", name);
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
         Ok(true)
     }
 
@@ -2861,14 +3007,14 @@ impl Storage {
         coll: &str,
         doc: &Document,
         descs: &[IndexDesc],
+        id_key_override: Option<&[u8]>,
     ) -> Result<()> {
         if descs.is_empty() {
             return Ok(());
         }
-        let id = doc
-            .get("_id")
-            .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
-        let id_k = id_key(id)?;
+        // For timeseries collections the doc-table key is suffixed, so callers
+        // pass it explicitly; otherwise it's `id_key(_id)`.
+        let id_k = doc_table_key(doc, id_key_override)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             // 2d geo index: one cell entry per point-valued field (point-only).
@@ -2919,14 +3065,12 @@ impl Storage {
         coll: &str,
         doc: &Document,
         descs: &[IndexDesc],
+        id_key_override: Option<&[u8]>,
     ) -> Result<()> {
         if descs.is_empty() {
             return Ok(());
         }
-        let id = doc
-            .get("_id")
-            .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
-        let id_k = id_key(id)?;
+        let id_k = doc_table_key(doc, id_key_override)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             if let Some(geo) = &desc.geo_2d {
@@ -3630,16 +3774,20 @@ impl Storage {
                     return Err(StorageError::DocumentTooLarge(new_blob.len()));
                 }
                 modified += 1;
-                self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+                // The doc stays at its existing key (`id_k`, suffixed for
+                // timeseries), so retract/write entries against that exact key.
+                self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
                 let cur = session.open_cursor(DOC_TABLE, None)?;
                 cur.set_key_ssu(db, coll, &id_k);
                 cur.set_value_u(&new_blob);
                 cur.update()?;
-                self.write_index_entries(&session, db, coll, &new, &descs)?;
+                self.write_index_entries(&session, db, coll, &new, &descs, Some(&id_k))?;
                 self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                 if oplog_on {
                     let o_field = if is_replacement {
-                        Bson::Document(new.clone())
+                        // Replacement oplog `o` is the whole new doc; the diff
+                        // branch borrows it instead, so this move is safe.
+                        Bson::Document(new)
                     } else {
                         let mut o = Document::new();
                         o.insert("$v", 2i32);
@@ -3696,7 +3844,11 @@ impl Storage {
             if let Some(c) = self.unique_conflict(&session, db, coll, &new, &descs, None)? {
                 return Err(StorageError::DuplicateKey(Box::new(c)));
             }
-            let new_id_key = id_key(&id)?;
+            let mut new_id_key = id_key(&id)?;
+            // Timeseries: suffix the upserted doc's key so duplicate `_id`s coexist.
+            if self.is_timeseries(&session, db, coll)? {
+                new_id_key.extend_from_slice(&self.timeseries_doc_suffix());
+            }
             let new_blob = encode_doc(&new)?;
             if new_blob.len() > MAX_BSON_OBJECT_SIZE {
                 return Err(StorageError::DocumentTooLarge(new_blob.len()));
@@ -3705,7 +3857,7 @@ impl Storage {
             cur.set_key_ssu(db, coll, &new_id_key);
             cur.set_value_u(&new_blob);
             cur.insert()?;
-            self.write_index_entries(&session, db, coll, &new, &descs)?;
+            self.write_index_entries(&session, db, coll, &new, &descs, Some(&new_id_key))?;
             self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
             if oplog_on {
                 let mut o2 = Document::new();
@@ -3714,7 +3866,8 @@ impl Storage {
                 entry.insert("op", "i");
                 entry.insert("ns", ns.clone());
                 entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
-                entry.insert("o", Bson::Document(new.clone()));
+                // `new` isn't used after the upsert block — move it in.
+                entry.insert("o", Bson::Document(new));
                 entry.insert("o2", Bson::Document(o2));
                 oplog_entries.push(entry);
                 pre_images.push(None);
@@ -3773,7 +3926,7 @@ impl Storage {
             {
                 continue;
             }
-            self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
             let cur = session.open_cursor(DOC_TABLE, None)?;
             cur.set_key_ssu(db, coll, &id_k);
             cur.remove()?;
@@ -4079,8 +4232,11 @@ impl Storage {
         if filter.keys().any(|f| f.starts_with('$')) {
             return Ok(None);
         }
-        // `_id` equality is a primary-key point lookup on the documents table.
-        if filter.len() == 1 {
+        // `_id` equality is a primary-key point lookup on the documents table —
+        // EXCEPT in a timeseries collection, where the doc-table key is suffixed
+        // (duplicate `_id`s coexist), so a reconstructed bare key would miss
+        // rows. There, fall through to a collection scan.
+        if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
             if let Some(spec) = filter.get("_id") {
                 if let Some(id_keys) = id_point_lookup_keys(spec)? {
                     return Ok(Some(id_keys));
@@ -4684,7 +4840,9 @@ impl Storage {
         if filter.is_empty() || filter.keys().any(|f| f.starts_with('$')) {
             return Ok(None);
         }
-        if filter.len() == 1 {
+        // Timeseries skips the `_id` point lookup (suffixed keys) — see
+        // `try_index_id_keys`; mirror that here so `explain` reports COLLSCAN.
+        if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
             if let Some(spec) = filter.get("_id") {
                 if id_point_lookup_keys(spec)?.is_some() {
                     let mut kp = Document::new();

@@ -465,6 +465,31 @@ fn project_command(
         )?;
         return Ok((Some(event), false));
     }
+    if let Ok(coll) = cmd.get_str("collMod") {
+        if !show_expanded_events {
+            return Ok((None, false));
+        }
+        let affected_ns = format!("{cmd_db}.{coll}");
+        if !scope_matches(&affected_ns, scope) {
+            return Ok((None, false));
+        }
+        // `operationDescription` is the collMod doc minus the command name.
+        let mut op_desc = Document::new();
+        for (k, v) in &cmd {
+            if k != "collMod" {
+                op_desc.insert(k.clone(), v.clone());
+            }
+        }
+        let event = base(
+            "modify",
+            &affected_ns,
+            &[
+                ("ns", Bson::Document(ns_doc(&affected_ns))),
+                ("operationDescription", Bson::Document(op_desc)),
+            ],
+        )?;
+        return Ok((Some(event), false));
+    }
     Ok((None, false))
 }
 

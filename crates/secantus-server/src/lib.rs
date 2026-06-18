@@ -24,7 +24,7 @@ pub mod args;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,60 @@ const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// buffered by the kernel and delivered in milliseconds), tight enough to reap
 /// a slow-loris connection that dribbles a partial frame forever.
 const DEFAULT_MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Hard ceiling on the total bytes held across all connections' in-flight
+/// message-body buffers. [`MAX_MESSAGE_SIZE`] bounds a *single* message (48 MB),
+/// but without a global cap many concurrent large messages could exhaust the
+/// heap. A connection reserves `body_len` here before allocating its body
+/// buffer and releases the reservation once the message is dispatched and
+/// answered. The cap is comfortably larger than `MAX_MESSAGE_SIZE`, so any one
+/// message always eventually fits and a waiting connection never wedges.
+const MAX_INFLIGHT_BYTES: usize = 512 * 1024 * 1024;
+
+/// A global byte budget for concurrent message-body allocations. `acquire`
+/// blocks while granting `n` more would exceed the cap, unless nothing is
+/// outstanding (so a lone oversized request proceeds rather than deadlock). The
+/// returned [`AllocReservation`] releases the bytes on drop and wakes a waiter.
+struct AllocBudget {
+    used: Mutex<usize>,
+    available: Condvar,
+    cap: usize,
+}
+
+impl AllocBudget {
+    fn new(cap: usize) -> Self {
+        AllocBudget {
+            used: Mutex::new(0),
+            available: Condvar::new(),
+            cap,
+        }
+    }
+
+    /// Reserve `n` bytes, blocking until they fit under the cap. Poison-tolerant
+    /// (`into_inner`): a panicked peer must not wedge the whole server.
+    fn acquire(&self, n: usize) -> AllocReservation<'_> {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used != 0 && *used + n > self.cap {
+            used = self.available.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += n;
+        AllocReservation { budget: self, n }
+    }
+}
+
+/// RAII reservation against an [`AllocBudget`]; releases on drop.
+struct AllocReservation<'a> {
+    budget: &'a AllocBudget,
+    n: usize,
+}
+
+impl Drop for AllocReservation<'_> {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(self.n);
+        self.budget.available.notify_all();
+    }
+}
 
 /// TLS / mTLS options (R5c). Mirrors `server.py`'s `tls_*` constructor knobs:
 /// `cert_file` + `key_file` enable server-side TLS; adding `ca_file` (and
@@ -107,6 +161,8 @@ struct Shared {
     stop: AtomicBool,
     /// The built rustls server config when TLS is on (shared across connections).
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// Global cap on concurrent in-flight message-body allocations.
+    alloc_budget: AllocBudget,
 }
 
 /// The Rust server's own version, embedded at compile time from the crate
@@ -214,6 +270,7 @@ pub fn bind(
         next_reply_id: AtomicI64::new(1),
         stop: AtomicBool::new(false),
         tls,
+        alloc_budget: AllocBudget::new(MAX_INFLIGHT_BYTES),
     });
 
     let accept_shared = shared.clone();
@@ -327,7 +384,10 @@ fn serve<S: Read + Write>(
             Err(_) => return Ok(()),
         };
 
-        // Body.
+        // Body. Reserve against the global allocation budget first so a flood of
+        // concurrent large messages can't exhaust the heap; the reservation is
+        // released at the end of this loop iteration when `_body_budget` drops.
+        let _body_budget = shared.alloc_budget.acquire(body_len);
         let mut body = vec![0u8; body_len];
         match read_full(stream, &mut body, shared, &mut deadline)? {
             ReadOutcome::Filled => {}
@@ -613,4 +673,61 @@ fn read_full<S: Read>(
         }
     }
     Ok(ReadOutcome::Filled)
+}
+
+#[cfg(test)]
+mod alloc_budget_tests {
+    use super::AllocBudget;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn reservation_releases_on_drop() {
+        let b = AllocBudget::new(100);
+        {
+            let _r = b.acquire(60);
+            assert_eq!(*b.used.lock().unwrap(), 60);
+        }
+        assert_eq!(*b.used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn over_cap_blocks_until_released() {
+        let b = Arc::new(AllocBudget::new(100));
+        let first = b.acquire(80); // 80/100 used
+
+        let started = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let b2 = b.clone();
+        let started2 = started.clone();
+        let done2 = done.clone();
+        let h = thread::spawn(move || {
+            started2.store(true, Ordering::SeqCst);
+            // 80 + 40 > 100 → must block until `first` is released.
+            let _r = b2.acquire(40);
+            done2.store(true, Ordering::SeqCst);
+        });
+
+        // Give the waiter time to reach the blocking wait.
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(!done.load(Ordering::SeqCst), "should still be blocked");
+
+        drop(first); // frees 80 → the 40 now fits
+        h.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(*b.used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn lone_oversized_request_proceeds() {
+        // Nothing outstanding: a request larger than the cap must not deadlock.
+        let b = AllocBudget::new(100);
+        let _r = b.acquire(500);
+        assert_eq!(*b.used.lock().unwrap(), 500);
+    }
 }

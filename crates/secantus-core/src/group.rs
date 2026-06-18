@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use bson::{Bson, Document};
 
 use crate::expressions;
-use crate::numeric::{self, as_int_like, int_to_bson, NumVal};
+use crate::numeric::{self, as_int_like, int_promoted_to_bson, int_to_bson, is_int64, NumVal};
 
 type R<T> = Result<T, ()>;
 
@@ -85,10 +85,12 @@ pub fn gkey(v: &Bson) -> R<GKey> {
     }
 }
 
-/// Running numeric value preserving Python's int-vs-float distinction.
+/// Running numeric value preserving Python's int-vs-float distinction. The
+/// integral variant also tracks whether any operand was int64, so the result
+/// promotes to int64 (MongoDB's numeric widening — `numerics.bson_add`).
 #[derive(Clone, Copy)]
 enum Num {
-    Int(i128),
+    Int { v: i128, wide: bool },
     Float(f64),
 }
 
@@ -100,12 +102,15 @@ impl Num {
             Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_) => {
                 let n = as_int_like(v).unwrap();
                 Ok(match self {
-                    Num::Int(a) => Num::Int(a + n),
+                    Num::Int { v: a, wide } => Num::Int {
+                        v: a + n,
+                        wide: wide || is_int64(v),
+                    },
                     Num::Float(f) => Num::Float(f + n as f64),
                 })
             }
             Bson::Double(d) => Ok(match self {
-                Num::Int(a) => Num::Float(a as f64 + d),
+                Num::Int { v: a, .. } => Num::Float(a as f64 + d),
                 Num::Float(f) => Num::Float(f + d),
             }),
             _ => Err(()), // string / array / doc / Decimal128 / null -> TypeError
@@ -114,7 +119,7 @@ impl Num {
 
     fn to_bson(self) -> R<Bson> {
         match self {
-            Num::Int(a) => int_to_bson(a).ok_or(()),
+            Num::Int { v, wide } => int_promoted_to_bson(v, wide).ok_or(()),
             Num::Float(f) => Ok(Bson::Double(f)),
         }
     }
@@ -141,7 +146,7 @@ struct Compiled<'a> {
 
 fn new_acc(op: &str) -> R<Acc> {
     Ok(match op {
-        "$sum" => Acc::Sum(Num::Int(0)),
+        "$sum" => Acc::Sum(Num::Int { v: 0, wide: false }),
         "$count" => Acc::Count(0),
         "$avg" => Acc::Avg(None),
         "$min" => Acc::Min(None),
@@ -183,7 +188,7 @@ fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()
             if !is_null(&v) {
                 let (total, count) = match state.take() {
                     Some(s) => s,
-                    None => (Num::Int(0), 0),
+                    None => (Num::Int { v: 0, wide: false }, 0),
                 };
                 *state = Some((total.add(&v)?, count + 1));
             }
@@ -250,7 +255,7 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 // where the bucket key is never created).
                 if let Some((total, count)) = state {
                     let tf = match total {
-                        Num::Int(a) => {
+                        Num::Int { v: a, .. } => {
                             if a.unsigned_abs() > (1u128 << 53) {
                                 return Err(()); // precision: defer to Python int/int divide
                             }

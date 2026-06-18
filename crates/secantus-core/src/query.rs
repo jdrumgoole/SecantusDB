@@ -105,21 +105,26 @@ fn match_clause(
 /// Resolve a dotted path into the list of values it reaches, mirroring
 /// `secantus.query._resolve_path`: walks into maps and arrays, fans out over
 /// array elements for non-index path parts, and yields `None` for MISSING.
-fn resolve_path(doc: &Document, path: &str) -> Vec<Option<Bson>> {
-    let mut current: Vec<Option<Bson>> = vec![Some(Bson::Document(doc.clone()))];
-    for part in path.split('.') {
-        let mut nxt: Vec<Option<Bson>> = Vec::new();
+fn resolve_path<'a>(doc: &'a Document, path: &str) -> Vec<Option<&'a Bson>> {
+    // Borrow throughout — never clone the document or the values it reaches. The
+    // root is always a document, so seed by resolving the first path component
+    // against it directly; later components fan out over the borrowed values.
+    let mut parts = path.split('.');
+    let first = parts.next().unwrap_or("");
+    let mut current: Vec<Option<&Bson>> = vec![doc.get(first)];
+    for part in parts {
+        let mut nxt: Vec<Option<&Bson>> = Vec::new();
         for cur in &current {
             match cur {
-                Some(Bson::Document(d)) => nxt.push(d.get(part).cloned()),
+                Some(Bson::Document(d)) => nxt.push(d.get(part)),
                 Some(Bson::Array(arr)) => {
                     if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
                         let idx: Result<usize, _> = part.parse();
-                        nxt.push(idx.ok().and_then(|i| arr.get(i)).cloned());
+                        nxt.push(idx.ok().and_then(|i| arr.get(i)));
                     } else {
                         for elem in arr {
                             if let Bson::Document(ed) = elem {
-                                nxt.push(ed.get(part).cloned());
+                                nxt.push(ed.get(part));
                             }
                         }
                     }
@@ -136,7 +141,7 @@ fn is_operator_dict(d: &Document) -> bool {
     !d.is_empty() && d.keys().all(|k| k.starts_with('$'))
 }
 
-fn field_matches(values: &[Option<Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
+fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
     match cond {
         // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.
         Bson::RegularExpression(_) => op_regex(values, cond, None),
@@ -173,7 +178,7 @@ const MAX_REGEX_PATTERN_LEN: usize = 1000;
 /// values). `pattern` is a `String` or a BSON `RegularExpression`; `options`
 /// is the optional sibling `$options` string. Anything the `regex` crate can't
 /// compile, or a non-string pattern/options, signals `Fallback`.
-fn op_regex(values: &[Option<Bson>], pattern: &Bson, options: Option<&Bson>) -> R {
+fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) -> R {
     let re = build_regex(pattern, options)?;
     for v in values {
         match v {
@@ -228,7 +233,7 @@ fn build_regex(pattern: &Bson, options: Option<&Bson>) -> Result<regex::Regex, F
         .map_err(|_| Fallback)
 }
 
-fn op_matches(values: &[Option<Bson>], op: &str, arg: &Bson, coll: Option<&Collation>) -> R {
+fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Collation>) -> R {
     match op {
         "$eq" => eq_with_array(values, arg, coll),
         "$ne" => Ok(!eq_with_array(values, arg, coll)?),
@@ -292,7 +297,7 @@ fn is_exotic(b: &Bson) -> bool {
     )
 }
 
-fn eq_with_array(values: &[Option<Bson>], expected: &Bson, coll: Option<&Collation>) -> R {
+fn eq_with_array(values: &[Option<&Bson>], expected: &Bson, coll: Option<&Collation>) -> R {
     for v in values {
         match v {
             None => {
@@ -361,7 +366,7 @@ fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
 // --- comparison ---------------------------------------------------------
 
 fn cmp_op(
-    values: &[Option<Bson>],
+    values: &[Option<&Bson>],
     target: &Bson,
     coll: Option<&Collation>,
     pred: fn(Ordering) -> bool,
@@ -487,7 +492,7 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
         )
 }
 
-fn op_type(values: &[Option<Bson>], spec: &Bson) -> R {
+fn op_type(values: &[Option<&Bson>], spec: &Bson) -> R {
     // spec is a single alias/code or an array of them. A non-alias/code spec
     // element (e.g. a float code) is pathological -> Python.
     let specs: Vec<&Bson> = match spec {
@@ -521,7 +526,7 @@ fn op_type(values: &[Option<Bson>], spec: &Bson) -> R {
 /// element. Element equality uses Python `==` (`expressions::py_eq` — numeric
 /// bridge + bool-as-int), matching `secantus.query._op_all`. Regex elements
 /// (which Python matches as patterns) defer to Python.
-fn op_all(values: &[Option<Bson>], required: &Bson) -> R {
+fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
     let Bson::Array(required) = required else {
         return Err(Fallback); // Python raises QueryError on a non-array $all
     };
@@ -554,7 +559,7 @@ fn op_all(values: &[Option<Bson>], required: &Bson) -> R {
     Ok(false)
 }
 
-fn op_size(values: &[Option<Bson>], size: &Bson) -> R {
+fn op_size(values: &[Option<&Bson>], size: &Bson) -> R {
     let n = match size {
         Bson::Int32(n) => *n as i64,
         Bson::Int64(n) => *n,
@@ -576,7 +581,7 @@ fn op_size(values: &[Option<Bson>], size: &Bson) -> R {
 
 // --- $elemMatch ---------------------------------------------------------
 
-fn op_elem_match(values: &[Option<Bson>], cond: &Bson) -> R {
+fn op_elem_match(values: &[Option<&Bson>], cond: &Bson) -> R {
     let Bson::Document(condd) = cond else {
         return Ok(false); // Python: non-mapping condition -> False
     };
@@ -586,7 +591,7 @@ fn op_elem_match(values: &[Option<Bson>], cond: &Bson) -> R {
         for elem in arr {
             if scalar_form {
                 // Python's $elemMatch passes no collation to the inner match.
-                if field_matches(&[Some(elem.clone())], cond, None)? {
+                if field_matches(&[Some(elem)], cond, None)? {
                     return Ok(true);
                 }
             } else if let Bson::Document(ed) = elem {
@@ -610,7 +615,7 @@ fn as_int(b: &Bson) -> Option<i64> {
     }
 }
 
-fn op_mod(values: &[Option<Bson>], spec: &Bson) -> R {
+fn op_mod(values: &[Option<&Bson>], spec: &Bson) -> R {
     let arr = spec.as_array().ok_or(Fallback)?;
     if arr.len() != 2 {
         return Err(Fallback);
@@ -674,7 +679,7 @@ fn resolve_bitmask(arg: &Bson) -> Result<u64, Fallback> {
     }
 }
 
-fn op_bits(values: &[Option<Bson>], arg: &Bson, pred: fn(u64, u64) -> bool) -> R {
+fn op_bits(values: &[Option<&Bson>], arg: &Bson, pred: fn(u64, u64) -> bool) -> R {
     let mask = resolve_bitmask(arg)?;
     for v in values {
         let val = match v {

@@ -98,16 +98,15 @@ fn apply_stage(
             );
             Ok(vec![out])
         }
-        "$project" => map_docs(docs, |d| project_one(d, spec_doc(spec)?, vars)),
+        "$project" => map_docs(docs, |d| project_one(&d, spec_doc(spec)?, vars)),
         "$addFields" | "$set" => map_docs(docs, |d| add_fields_one(d, spec_doc(spec)?, vars)),
         "$unset" => {
             let paths_list = unset_paths(spec)?;
-            map_docs(docs, |d| {
-                let mut new = d.clone();
+            map_docs(docs, |mut d| {
                 for p in &paths_list {
-                    paths::unset_path(&mut new, p);
+                    paths::unset_path(&mut d, p);
                 }
-                Ok(new)
+                Ok(d)
             })
         }
         "$replaceRoot" => {
@@ -117,9 +116,9 @@ fn apply_stage(
             let Some(new_root) = s.get("newRoot") else {
                 return Err(Fallback);
             };
-            map_docs(docs, |d| replace_root_one(d, new_root, vars))
+            map_docs(docs, |d| replace_root_one(&d, new_root, vars))
         }
-        "$replaceWith" => map_docs(docs, |d| replace_root_one(d, spec, vars)),
+        "$replaceWith" => map_docs(docs, |d| replace_root_one(&d, spec, vars)),
         "$sort" => sort_stage(docs, spec),
         "$unwind" => unwind_stage(docs, spec),
         "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback),
@@ -136,19 +135,27 @@ fn apply_stage(
 /// collect the results into one output doc. Defers if any sub-pipeline defers.
 fn facet_stage(
     spec: &Bson,
-    docs: Vec<Document>,
+    mut docs: Vec<Document>,
     vars: &Document,
     coll: Option<&Collation>,
 ) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(Fallback);
     };
+    let n = s.len();
     let mut out = Document::new();
-    for (name, sub) in s {
+    for (i, (name, sub)) in s.iter().enumerate() {
         let Bson::Array(sub_pipeline) = sub else {
             return Err(Fallback); // Python raises (entry must be a pipeline array)
         };
-        let result = apply_pipeline(docs.clone(), sub_pipeline, vars, coll)?;
+        // The last sub-pipeline can consume the input docs directly; earlier
+        // ones each need their own copy.
+        let input = if i + 1 == n {
+            std::mem::take(&mut docs)
+        } else {
+            docs.clone()
+        };
+        let result = apply_pipeline(input, sub_pipeline, vars, coll)?;
         out.insert(
             name.clone(),
             Bson::Array(result.into_iter().map(Bson::Document).collect()),
@@ -252,10 +259,12 @@ fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
                     }
                     continue;
                 }
-                let arr = arr.clone();
-                for (i, elem) in arr.into_iter().enumerate() {
+                // Iterate the array in place and clone elements one at a time —
+                // cloning the whole array up front (then discarding it as each
+                // doc's copy overwrites the field) doubled the per-element work.
+                for (i, elem) in arr.iter().enumerate() {
                     let mut new = doc.clone();
-                    paths::set_path(&mut new, &path, elem).map_err(|_| Fallback)?;
+                    paths::set_path(&mut new, &path, elem.clone()).map_err(|_| Fallback)?;
                     if let Some(idx) = &include_index {
                         new.insert(idx.clone(), int_to_bson(i as i128).ok_or(Fallback)?);
                     }
@@ -283,9 +292,11 @@ fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     Ok(out)
 }
 
-fn map_docs(docs: Vec<Document>, mut f: impl FnMut(&Document) -> R<Document>) -> R<Vec<Document>> {
+/// Map each input doc through `f`, passing it **by value** so stages that only
+/// add/remove fields can mutate the doc in place instead of cloning it.
+fn map_docs(docs: Vec<Document>, mut f: impl FnMut(Document) -> R<Document>) -> R<Vec<Document>> {
     let mut out = Vec::with_capacity(docs.len());
-    for d in &docs {
+    for d in docs {
         out.push(f(d)?);
     }
     Ok(out)
@@ -324,14 +335,18 @@ fn unset_paths(spec: &Bson) -> R<Vec<String>> {
     }
 }
 
-fn add_fields_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> {
-    let mut result = doc.clone();
+fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Document> {
+    // Every field is evaluated against the ORIGINAL doc (matching Python — a
+    // computed field doesn't see another set in the same stage), so evaluate all
+    // expressions first, then mutate `doc` in place rather than cloning it.
+    let mut computed = Vec::with_capacity(spec.len());
     for (path, expr) in spec {
-        // Each field is evaluated against the ORIGINAL doc (matching Python).
-        let v = evaluate(expr, doc, vars)?;
-        paths::set_path(&mut result, path, v).map_err(|_| Fallback)?;
+        computed.push((path, evaluate(expr, &doc, vars)?));
     }
-    Ok(result)
+    for (path, v) in computed {
+        paths::set_path(&mut doc, path, v).map_err(|_| Fallback)?;
+    }
+    Ok(doc)
 }
 
 fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document) -> R<Document> {

@@ -41,19 +41,20 @@ SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/sasl
 
 Single-node change streams are implemented and conformant for typical pymongo `watch()` flows, but the following are deferred or intentionally diverge from real `mongod`:
 
-- [ ] **Rust server: DDL change-stream events not emitted (`showExpandedEvents`).**
-  The Rust server's `create_index` / `drop_index` (and `collMod`) write no oplog
-  `c` entry, so a `showExpandedEvents: true` change stream that awaits a
-  `createIndexes` / `dropIndexes` / `modify` event never sees one and pymongo's
-  `next()` spins on empty getMores until the gauge's 120s `pytest-timeout`
-  SIGKILLs the worker (the remaining `test_change_stream.py` worker crashes —
-  `test_when_showExpandedEvents_is_true,_*_events_are_reported`). `create_collection`
-  / `drop_collection` DO emit oplog. Fix = emit oplog `c` for index/collMod DDL +
-  project the events when `showExpandedEvents` is on (a change-stream feature
-  slice). Also still open: **`test_split_large_change`** — a >16 MB change event
-  (10 MB pre-image + 10 MB post-image) the Rust server can't return (no real
-  event splitting; `of` is always 1), which OOMs/errors under parallel load.
-  Both are change-stream territory (coordinate with the change-stream owner).
+- [x] **Rust server: DDL change-stream events (`showExpandedEvents`)** — DONE
+  (0.5.3-beta.22). `create_index` / `drop_index` now emit an oplog `op: "c"`
+  entry (`{createIndexes, indexes:[{v,key,name}]}` / `{dropIndexes, index}`), and
+  `collMod` routes through a new `Storage::coll_mod` that writes the options AND
+  emits `{collMod, …}` (plain `set_collection_options` stays oplog-silent so
+  `create`'s internal option writes don't fire a spurious `modify`). The
+  storage-side projector already gated `createIndexes` / `dropIndexes` behind
+  `showExpandedEvents`; added the `modify` branch. A `showExpandedEvents` watch
+  now sees `createIndexes` / `dropIndexes` / `modify`, and a default watch
+  suppresses them.
+- [ ] **Rust server: `test_split_large_change`** — a >16 MB change event (10 MB
+  pre-image + 10 MB post-image) the Rust server can't return (no real event
+  splitting; `of` is always 1), which OOMs/errors under parallel load. Still
+  open — change-stream territory (coordinate with the change-stream owner).
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
@@ -247,48 +248,47 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
-### 7.1 Rust server performance and security review (2026-06-16)
+### 7.1 Rust server performance and security review (2026-06-16) — CLOSED
 
 Items identified during a security/performance audit of the Rust server. Fixed in
 0.5.3-beta.19: SCRAM timing oracle (`subtle::ConstantTimeEq`), mutex poisoning
 panics (graceful error returns), double BSON decode in wire layer (length-only
-check), response buffer pre-allocation, compound multikey cap (10k). The items
-below remain open.
+check), response buffer pre-allocation, compound multikey cap (10k).
 
-#### Security (remaining)
+The remaining eight items (two security, six performance) were resolved in
+0.5.3-beta.22:
 
-- [ ] **No SASLprep for non-ASCII passwords** (`secantus-auth/src/lib.rs:56-60`).
-  Non-ASCII passwords bypass normalization → hash differently than a
-  SASLprep-compliant client. Needs RFC 4013 implementation. Low priority (ASCII
-  passwords are the common case; tracked in the auth module docs too).
-- [ ] **No concurrent message allocation budget** (`secantus-server/src/lib.rs:297`).
-  `MAX_MESSAGE_SIZE` (48 MB) is validated per-message, but there's no cap on
-  concurrent in-flight allocations across connections. Under load, many large
-  messages could exhaust heap. Consider a global or per-connection memory budget.
-
-#### Performance (remaining)
-
-- [ ] **Global storage lock held during full oplog scans**
-  (`secantus-storage/src/lib.rs:1185,1280`). `read_oplog` and `prune_oplog` hold
-  the global `Mutex` for their entire duration, blocking all writes. WiredTiger
-  provides MVCC — acquire the lock only for metadata mutation, not read iterations.
-- [ ] **Document cloning in aggregation stages**
-  (`secantus-core/src/aggregate.rs:151,246-280,328`). `$unwind`, `$facet`,
-  `$addFields` all `doc.clone()` per element/sub-pipeline. O(n*m) for large
-  arrays. Refactor to path-based mutation or copy-on-write.
-- [ ] **Oplog clones every written document**
-  (`secantus-storage/src/lib.rs:1531,1628,1750`). Every insert/update/delete
-  clones the full document into the oplog entry. Could pass raw BSON bytes instead.
-- [ ] **Nested lock for timestamp minting**
-  (`secantus-storage/src/lib.rs:1132-1139`). Global lock + oplog mutex for every
-  timestamp mint. Consider `AtomicI64` for the sequence counter.
-- [ ] **Query path resolution clones** (`secantus-core/src/query.rs:108-133`).
-  `resolve_path` clones every BSON value at every path component, called per field
-  per document. Use borrowed references instead.
-- [ ] **Encode/decode round-trips in the find→cursor→client path**
-  (`secantus-commands/src/util.rs:93-123`). Documents go: storage bytes → Document
-  → process → Document → bytes → cursor → bytes → client. Keep as bytes until
-  projection requires deserialization.
+- **SASLprep for non-ASCII passwords** — `secantus-auth` now applies RFC 4013
+  SASLprep (via the `stringprep` crate) in `derive_credentials`, matching the
+  Python server's `auth.saslprep` and what a compliant driver sends. `createUser`
+  / `updateUser` surface a prohibited-character / bidi failure as `BadValue`.
+- **Concurrent message allocation budget** — `secantus-server` carries a global
+  `AllocBudget` (512 MB cap); each connection reserves `body_len` before
+  allocating its body buffer and releases it once the message is answered, so a
+  flood of concurrent large messages can't exhaust the heap.
+- **Global storage lock during oplog scans** — the cross-thread readers
+  (`read_oplog` / `read_preimage` / `oplog_floor_seq` / `oplog_tail_seq` /
+  `find_seq_for_ts`) no longer take the global `Mutex` (their fresh WT session's
+  MVCC snapshot is consistent on its own); `prune_oplog` scans lock-free and takes
+  the lock only for the delete phase.
+- **Document cloning in aggregation stages** — `$addFields`/`$set`/`$unset` mutate
+  the owned doc in place (no clone), `$unwind` clones array elements one at a time
+  instead of the whole array, and `$facet` reuses the input for its last
+  sub-pipeline.
+- **Oplog clones every written document** — insert / batch-insert / replacement
+  update / upsert move the document into the oplog `o` field instead of cloning it.
+- **Nested lock for timestamp minting** — `current_cluster_time` mints and
+  snapshots the recovery meta under a single oplog-mutex hold. (The seq counter is
+  deliberately NOT a bare `AtomicI64`: `wait_for_oplog` pairs `next_seq` with
+  `oplog_cv`, whose lost-wakeup guarantee requires reading the counter under the
+  same mutex as the wait.)
+- **Query path resolution clones** — `query::resolve_path` (and the `query` /
+  `geo` field-operator helpers it feeds) now return/accept borrowed `&Bson` rather
+  than cloning every value at every path component.
+- **Encode/decode round-trips in find→cursor→client** — `find` (with projection)
+  and `aggregate` send the `firstBatch` straight to the wire as `Bson` and encode
+  only the cursor *remainder* (`split_docs_into_cursor`), dropping the
+  encode-then-decode of the docs the client receives immediately.
 
 ---
 
@@ -318,14 +318,16 @@ the `--engine` CLI flag, the `SecantusDBServer(engine=...)` parameter, and the
 `tests/test_rust_*_parity.py` oracle still imports `_secantus_core` directly to
 pin the Rust engines against the pure-Python ones.
 
-- [ ] **Rust port owes numeric type preservation.** The Python `$inc` / `$mul` /
-  `$sum` now follow mongod's numeric promotion (int32 < int64 < double <
-  decimal128) via `secantus.numerics` — `Int64` results stay `Int64`. The Rust
-  `secantus-core` update/aggregate engines still narrow to int32, so
-  `tests/test_rust_update_parity.py` normalises int32↔int64 (`_norm_int_width`)
-  to keep the oracle green. Port the same promotion into the Rust engines (and
-  the expression-language `$add`/`$subtract`/`$multiply` for full consistency),
-  then drop the normaliser.
+- [x] **Rust numeric type preservation** — DONE (0.5.3-beta.22). `secantus-core`
+  `numeric::int_promoted_to_bson` + `is_int64` encode `$inc` / `$mul` (update
+  engine) and `$sum` (group accumulator — `Num::Int` now carries a `wide` flag)
+  with mongod's promotion (int64 if any operand is int64 or a 32-bit result
+  overflows), matching `secantus.numerics`. The `_norm_int_width` normaliser is
+  dropped from `tests/test_rust_update_parity.py` (it now compares BSON subtypes
+  directly). The expression-language `$add`/`$subtract`/`$multiply` deliberately
+  still narrow to match the pure-Python `expressions` fold (which doesn't promote
+  either) — making *both* engines promote there is a Python-server behaviour
+  change, out of scope for this parity fix.
 
 **Rust server build-out (`tasks/rust-server-plan.md` §4).** Done: R1
 (`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /
@@ -389,13 +391,17 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   and pointing them at the Rust server needs a `secantusdb`-binary launch path
   in each gauge job — deferred until the Rust server's command surface is wide
   enough for those suites to be informative.
-- [ ] **Timeseries `_id` non-uniqueness not in the Rust storage layer** —
-  the Python `Storage` suffixes timeseries doc-table keys so duplicate
-  `_id`s coexist (`_timeseries_doc_suffix`, `id_key_override` on the
-  index-entry helpers, `_id` point-lookup fast paths gated off for
-  timeseries). `crates/secantus-storage` keys every doc by bare
-  `id_key(_id)` and would reject the duplicate. Port alongside the other
-  Rust-server storage gaps.
+- [x] **Timeseries `_id` non-uniqueness in the Rust storage layer** — DONE
+  (0.5.3-beta.22). `crates/secantus-storage` now mirrors the Python `Storage`:
+  the command layer persists the `timeseries` option, `Storage::is_timeseries`
+  detects it, and `timeseries_doc_suffix` (nanosecond timestamp + 16-bit counter)
+  is appended to the doc-table key on insert / upsert so duplicate `_id`s coexist.
+  `write_index_entries` / `delete_index_entries` gained an `id_key_override` so
+  secondary-index entries point at the suffixed row (insert/update/delete/prune
+  pass the actual key), and the `_id` point-lookup fast path (in both
+  `try_index_id_keys` and the `explain` planner) is gated off for timeseries so a
+  `{_id: x}` query scans and content-filters rather than reconstructing the bare
+  key. Non-timeseries `_id` uniqueness is unchanged.
 - [ ] **Gauge E11000 cluster — remaining tails (2026-06-12).** The
   order-dependent drop-then-reinsert E11000s are FIXED (stale WT read
   snapshot in the mutating scanners; see changelog Unreleased / the
