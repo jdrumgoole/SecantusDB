@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from bson import Timestamp
@@ -169,17 +169,29 @@ def replay(
     *,
     up_to_ts: Timestamp | None = None,
     up_to_wall: _dt.datetime | None = None,
+    carry_oplog: bool = False,
+    pre_image_for: Callable[[int], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Replay ``oplog_entries`` (``(seq, entry)`` in ascending seq order) into
     ``target``, stopping before the first entry past the target time.
 
-    Returns ``{"opsApplied", "entriesSeen", "lastSeq", "lastTs", "lastWall"}``.
+    With ``carry_oplog`` the in-bound rows are also written **verbatim** into the
+    target's oplog (via :meth:`Storage.import_oplog_segment`), so a change stream
+    on the restored server can resume from a token minted before the restore
+    point. ``pre_image_for(seq)`` supplies the pre-image doc for the seqs that
+    had one (so ``fullDocumentBeforeChange`` keeps working on resume); pass
+    ``source.read_preimage``. Without ``carry_oplog`` the restored store starts a
+    fresh, empty oplog timeline (matching ``mongorestore``).
+
+    Returns ``{"opsApplied", "entriesSeen", "lastSeq", "lastTs", "lastWall",
+    "oplogCarried"}``.
     """
     ops = 0
     seen = 0
     last_seq = 0
     last_ts: Timestamp | None = None
     last_wall: _dt.datetime | None = None
+    carried: list[tuple[int, Mapping[str, Any]]] = []
     with target.replay_mode():
         for seq, entry in oplog_entries:
             if not _within_bound(entry, up_to_ts=up_to_ts, up_to_wall=up_to_wall):
@@ -190,8 +202,18 @@ def replay(
             last_wall = (
                 entry.get("wall") if isinstance(entry.get("wall"), _dt.datetime) else last_wall
             )
+            if carry_oplog:
+                carried.append((seq, dict(entry)))
             if _apply_entry(target, entry):
                 ops += 1
+    if carry_oplog and carried:
+        pre_images: dict[int, Mapping[str, Any]] = {}
+        if pre_image_for is not None:
+            for seq, _entry in carried:
+                pre = pre_image_for(seq)
+                if pre is not None:
+                    pre_images[seq] = pre
+        target.import_oplog_segment(carried, pre_images)
     target.checkpoint()
     return {
         "opsApplied": ops,
@@ -199,6 +221,7 @@ def replay(
         "lastSeq": last_seq,
         "lastTs": last_ts,
         "lastWall": last_wall,
+        "oplogCarried": len(carried) if carry_oplog else 0,
     }
 
 
@@ -219,6 +242,7 @@ def restore_to_timestamp(
     *,
     to_ts: Timestamp | None = None,
     to_wall: _dt.datetime | None = None,
+    carry_oplog: bool = False,
 ) -> dict[str, Any]:
     """Rebuild ``target_dir`` as the database was at the target time by replaying
     ``source_dir``'s oplog forward.
@@ -227,6 +251,11 @@ def restore_to_timestamp(
     backup archive (WiredTiger's single-writer lock forbids opening a live
     one). ``target_dir`` must be a fresh, empty path. With neither ``to_ts``
     nor ``to_wall`` the whole oplog is replayed ("latest").
+
+    With ``carry_oplog`` the replayed oplog rows are preserved verbatim on the
+    restored store, so a change stream there can resume from a token minted
+    before the restore point. The default (``False``) starts a fresh oplog
+    timeline, matching ``mongorestore``.
 
     Raises ``ValueError`` if the source oplog has been pruned past genesis
     (v1 replays onto an empty base; a non-genesis floor needs the deferred v2
@@ -259,6 +288,8 @@ def restore_to_timestamp(
                 _iter_source_oplog(source),
                 up_to_ts=to_ts,
                 up_to_wall=to_wall,
+                carry_oplog=carry_oplog,
+                pre_image_for=source.read_preimage if carry_oplog else None,
             )
         finally:
             target.close()
@@ -275,6 +306,7 @@ def restore_archive_to_timestamp(
     *,
     to_ts: Timestamp | None = None,
     to_wall: _dt.datetime | None = None,
+    carry_oplog: bool = False,
 ) -> dict[str, Any]:
     """Like :func:`restore_to_timestamp` but the source is a ``.tar.gz`` backup
     archive (from ``Storage.create_archive`` / ``secantusAdmin.backupArchive``).
@@ -286,4 +318,6 @@ def restore_archive_to_timestamp(
 
     with tempfile.TemporaryDirectory(prefix="secantus-pitr-src-") as tmp:
         extract_backup_archive(archive_path, tmp, allow_existing=True)
-        return restore_to_timestamp(tmp, target_dir, to_ts=to_ts, to_wall=to_wall)
+        return restore_to_timestamp(
+            tmp, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
+        )

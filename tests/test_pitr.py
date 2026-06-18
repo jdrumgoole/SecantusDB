@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -268,6 +269,83 @@ def test_restored_dir_runs_a_server(tmp_path: Path) -> None:
         client = MongoClient(srv.uri, directConnection=True)
         got = sorted(client["shop"]["orders"].find({}), key=lambda d: d["_id"])
     assert got == [{"_id": 1, "total": 10}, {"_id": 2, "total": 20}]
+
+
+def _next_event(cs: Any, tries: int = 60) -> dict[str, Any]:
+    """Poll a change stream for the next event (the restored oplog already
+    holds it, so this returns within a few polls)."""
+    for _ in range(tries):
+        ev = cs.try_next()
+        if ev is not None:
+            return ev
+        time.sleep(0.05)
+    raise AssertionError("no change event arrived")
+
+
+def test_carry_oplog_preserves_timeline(tmp_path: Path) -> None:
+    """``carry_oplog`` writes the replayed oplog verbatim onto the restored
+    store — same seqs — and advances the seq counter so a fresh write mints a
+    strictly-greater seq. The default (no carry) leaves an empty timeline."""
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True)
+    s.insert("app", "c", [{"_id": 1}])
+    s.insert("app", "c", [{"_id": 2}])
+    s.insert("app", "c", [{"_id": 3}])
+    src_seqs = [seq for seq, _ in s.read_oplog(start_seq=1, limit=100)]
+    s.close()
+
+    carried = tmp_path / "carried"
+    stats = oplog_replay.restore_to_timestamp(str(src), str(carried), carry_oplog=True)
+    assert stats["oplogCarried"] == len(src_seqs)
+    r = Storage(str(carried), enable_oplog=True)
+    try:
+        assert [seq for seq, _ in r.read_oplog(start_seq=1, limit=100)] == src_seqs
+        tail = r.oplog_tail_seq()
+        r.insert("app", "c", [{"_id": 4}])
+        assert r.oplog_tail_seq() == tail + 1  # new write continues the timeline
+    finally:
+        r.close()
+
+    # Default restore leaves the restored oplog empty (fresh timeline).
+    fresh = tmp_path / "fresh"
+    stats = oplog_replay.restore_to_timestamp(str(src), str(fresh))
+    assert stats["oplogCarried"] == 0
+    r = Storage(str(fresh), enable_oplog=True)
+    try:
+        assert r.read_oplog(start_seq=1, limit=100) == []
+    finally:
+        r.close()
+
+
+def test_preserve_oplog_change_stream_resumes_across_restore(tmp_path: Path) -> None:
+    """End-to-end: with ``preserveOplog`` a change stream on the restored server
+    resumes from a token minted *before* the restore point — the carried oplog
+    still holds the rows that token references."""
+    src = tmp_path / "src"
+    with SecantusDBServer(port=0, storage_path=str(src)) as srv:
+        coll = MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll.insert_one({"_id": 1})
+        cs = coll.watch()
+        coll.insert_one({"_id": 2})
+        token = _next_event(cs)["_id"]  # resume token after the {_id: 2} insert
+        cs.close()
+        coll.insert_one({"_id": 3})  # happens after the token, before backup
+        archive = str(tmp_path / "backup.tar.gz")
+        MongoClient(srv.uri, directConnection=True)["admin"].command(
+            {"secantusAdmin.backupArchive": 1, "outputPath": archive}
+        )
+
+    out = tmp_path / "restored"
+    stats = oplog_replay.restore_archive_to_timestamp(archive, str(out), carry_oplog=True)
+    assert stats["oplogCarried"] > 0
+
+    with SecantusDBServer(port=0, storage_path=str(out)) as srv:
+        coll = MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        cs = coll.watch(resume_after=token)
+        ev = _next_event(cs)
+        cs.close()
+        assert ev["operationType"] == "insert"
+        assert ev["fullDocument"] == {"_id": 3}
 
 
 def test_collection_options_replayed(tmp_path: Path) -> None:

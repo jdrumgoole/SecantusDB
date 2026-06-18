@@ -1021,14 +1021,18 @@ def _secantus_admin_restore_to_timestamp(
         }
     to_ts = doc.get("toTimestamp")
     to_wall = doc.get("toTime")
+    # ``preserveOplog`` carries the replayed oplog onto the restored directory
+    # so a change stream there can resume from before the restore point. Default
+    # is a fresh timeline (like mongorestore).
+    carry_oplog = bool(doc.get("preserveOplog", False))
     try:
         if source.endswith((".tar.gz", ".tgz")):
             stats = oplog_replay.restore_archive_to_timestamp(
-                source, target_dir, to_ts=to_ts, to_wall=to_wall
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
             )
         else:
             stats = oplog_replay.restore_to_timestamp(
-                source, target_dir, to_ts=to_ts, to_wall=to_wall
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
             )
     except (ValueError, RuntimeError) as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
@@ -1039,6 +1043,7 @@ def _secantus_admin_restore_to_timestamp(
         "lastSeq": stats["lastSeq"],
         "lastTs": stats.get("lastTs"),
         "lastWall": stats.get("lastWall"),
+        "oplogCarried": stats.get("oplogCarried", 0),
         "ok": 1.0,
     }
 

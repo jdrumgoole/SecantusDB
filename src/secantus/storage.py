@@ -1680,6 +1680,63 @@ class Storage:
                 with contextlib.suppress(Exception):
                     session.close()
 
+    def import_oplog_segment(
+        self,
+        rows: Iterable[tuple[int, Mapping[str, Any]]],
+        pre_images: Mapping[int, Mapping[str, Any]] | None = None,
+    ) -> int:
+        """Write **verbatim** oplog rows ``(seq, entry)`` into the oplog table,
+        carrying their original seq / ts / wall, and advance the seq + cluster
+        clock past them so subsequent live writes mint strictly-greater values.
+
+        This is the seam point-in-time recovery uses to preserve the source's
+        oplog timeline on the restored store (``carry_oplog`` /
+        ``--preserve-oplog``): a change stream on the restored server can then
+        resume from a token minted *before* the restore point, because the rows
+        that token references are present. ``pre_images`` maps seq -> pre-image
+        document for the seqs that had one stored.
+
+        Unlike ``_emit_oplog`` this does NOT mint new seqs — the rows keep their
+        identity, so resume tokens stay valid. Returns the highest seq written
+        (0 if ``rows`` is empty). No-op when ``enable_oplog`` is False.
+        """
+        if not self.enable_oplog:
+            return 0
+        pre_images = pre_images or {}
+        max_seq = 0
+        best_secs = 0
+        best_ord = 0
+        with self._lock:
+            op_cur = self._cursor(_OPLOG_TABLE)
+            pre_cur = None
+            wrote = False
+            for seq, entry in rows:
+                wrote = True
+                iseq = int(seq)
+                op_cur[iseq] = bson.encode(dict(entry))
+                pre = pre_images.get(iseq)
+                if pre is not None:
+                    if pre_cur is None:
+                        pre_cur = self._cursor(_PREIMAGE_TABLE)
+                    pre_cur[iseq] = bson.encode(dict(pre))
+                if iseq > max_seq:
+                    max_seq = iseq
+                ts = entry.get("ts")
+                if isinstance(ts, Timestamp) and (ts.time, ts.inc) > (best_secs, best_ord):
+                    best_secs, best_ord = ts.time, ts.inc
+            if not wrote:
+                return 0
+            with self._oplog_seq_lock:
+                if max_seq + 1 > self._next_seq:
+                    self._next_seq = max_seq + 1
+                if (best_secs, best_ord) > (self._last_ts_secs, self._last_ts_ord):
+                    self._last_ts_secs = best_secs
+                    self._last_ts_ord = best_ord
+            self._persist_oplog_meta()
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+        return max_seq
+
     def oplog_tail_seq(self) -> int:
         """Highest seq currently present (or last emitted). 0 if empty."""
         with self._lock:

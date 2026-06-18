@@ -273,6 +273,15 @@ def _build_restore_parser() -> argparse.ArgumentParser:
         metavar="SECS[,ORD]",
         help="Recover to this cluster timestamp (seconds, optional ordinal).",
     )
+    parser.add_argument(
+        "--preserve-oplog",
+        action="store_true",
+        help=(
+            "Carry the replayed oplog onto the restored directory so a change "
+            "stream there can resume from a token minted before the restore "
+            "point. Default: start a fresh oplog timeline (like mongorestore)."
+        ),
+    )
     return parser
 
 
@@ -313,7 +322,13 @@ def _restore_main(argv: list[str]) -> int:
         else oplog_replay.restore_to_timestamp
     )
     try:
-        stats = fn(args.source, args.target_dir, to_ts=to_ts, to_wall=to_wall)
+        stats = fn(
+            args.source,
+            args.target_dir,
+            to_ts=to_ts,
+            to_wall=to_wall,
+            carry_oplog=args.preserve_oplog,
+        )
     except (ValueError, RuntimeError) as exc:
         print(f"secantusdb restore: {exc}", file=sys.stderr)
         return 2

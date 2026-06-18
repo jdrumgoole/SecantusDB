@@ -82,6 +82,12 @@ loudly rather than silently rebuilding a partial database. See
   collection (previously only documents and indexes were). `Storage.create_collection`
   gained an `options=` argument; the same options now also surface in the
   `show_expanded_events` change-stream `create` event's `operationDescription`.
+- `--preserve-oplog` (`secantusdb restore`) / `preserveOplog: true`
+  (`secantusAdmin.restoreToTimestamp`) carries the replayed oplog onto the
+  restored directory verbatim, so a change stream on the restored server can
+  resume from a token minted *before* the restore point. The default still starts
+  a fresh oplog timeline, matching `mongorestore`. Backed by
+  `Storage.import_oplog_segment`.
 
 ## [0.5.3b13] — 2026-06-16
 

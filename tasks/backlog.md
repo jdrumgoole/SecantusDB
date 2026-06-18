@@ -172,11 +172,6 @@ Deferred / known limitations:
   `≤ T` and stitches archived oplog forward (reuses the same applier with a
   non-empty base; the `pitr-manifest.json` embedded by `create_archive` is the
   index). Lets restore reach any `T` without keeping the entire oplog live.
-- [ ] **Restored dir starts a fresh oplog timeline.** Replay suppresses oplog
-  emission, so the target's oplog is empty after restore — a change stream on the
-  restored server resumes from the restore point, not before it (matches
-  `mongorestore`). v2 could copy the replayed oplog rows verbatim for resume
-  continuity.
 - [ ] **Rust server PITR (Phase R).** Prereqs before replay can be correct on the
   Rust server: (R0a) `create_index`/`drop_index`/`collMod` must emit oplog `c`
   entries — currently they don't (see §3.2; shared with `showExpandedEvents`);

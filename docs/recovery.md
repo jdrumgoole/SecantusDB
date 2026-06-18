@@ -106,9 +106,12 @@ floor would need a base snapshot to start from, which is the deferred v2
 
 ### Limitations
 
-- The restored data directory starts a **fresh oplog timeline** — the replayed
-  history isn't carried into the target, so a change stream on the restored
-  server resumes from the restore point, not from before it (like
-  `mongorestore`).
+- By default the restored data directory starts a **fresh oplog timeline** — the
+  replayed history isn't carried into the target, so a change stream on the
+  restored server resumes only from the restore point (like `mongorestore`).
+  Pass `--preserve-oplog` (`secantusdb restore`) or `preserveOplog: true`
+  (`secantusAdmin.restoreToTimestamp`) to carry the replayed oplog verbatim, so a
+  change stream on the restored server can resume from a token minted *before*
+  the restore point.
 - See [Change streams](change-streams.md) for the oplog model and
   [Compatibility](compatibility.md) for the broader divergence list.
