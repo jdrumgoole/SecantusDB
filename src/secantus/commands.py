@@ -2762,7 +2762,6 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 72,
                 "codeName": "InvalidOptions",
             }
-    ctx.storage.create_collection(ctx.db_name, coll)
     stored: dict[str, Any] = {}
     if capped:
         stored["capped"] = True
@@ -2838,8 +2837,14 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             view_pipeline = []
         stored["viewOn"] = view_on
         stored["viewPipeline"] = list(view_pipeline)
-    if stored:
-        ctx.storage.set_collection_options(ctx.db_name, coll, **stored)
+    # Create with the options inline so they ride the ``create`` oplog ``c``
+    # entry (carried as siblings of ``create`` in ``o``). This is what lets
+    # PITR replay and ``show_expanded_events`` create events reconstruct
+    # ``capped`` / ``size`` / ``max`` / ``validator`` / … rather than seeing a
+    # bare ``{create, idIndex}``. Building ``stored`` before the create call
+    # also means an invalid ``clusteredIndex`` rejects without leaving a
+    # half-created collection behind.
+    ctx.storage.create_collection(ctx.db_name, coll, options=stored or None)
     return {"ok": 1.0}
 
 

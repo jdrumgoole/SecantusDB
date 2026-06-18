@@ -177,11 +177,6 @@ Deferred / known limitations:
   restored server resumes from the restore point, not before it (matches
   `mongorestore`). v2 could copy the replayed oplog rows verbatim for resume
   continuity.
-- [ ] **Collection options not replayed.** `capped` / `size` / `validator` aren't
-  carried in Storage's `create` oplog entry (only `{create, idIndex}`), so they
-  aren't reconstructed on replay. Documents + indexes are. Fix = include the
-  options in the `create` oplog `o` (also improves change-stream `create` event
-  fidelity) — a small create_collection-signature change.
 - [ ] **Rust server PITR (Phase R).** Prereqs before replay can be correct on the
   Rust server: (R0a) `create_index`/`drop_index`/`collMod` must emit oplog `c`
   entries — currently they don't (see §3.2; shared with `showExpandedEvents`);

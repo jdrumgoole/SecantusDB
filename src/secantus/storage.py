@@ -2647,7 +2647,18 @@ class Storage:
         with self._lock:
             return self._coll_options(db, coll) is not None
 
-    def create_collection(self, db: str, coll: str) -> bool:
+    def create_collection(
+        self, db: str, coll: str, options: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Create ``db.coll`` (no-op-False if it already exists).
+
+        ``options`` is the collection-options blob (``capped`` / ``size`` /
+        ``max`` / ``validator`` / ``viewOn`` / … — everything the ``create``
+        command persists). It is written to the options blob *and* carried as
+        siblings of ``create`` in the ``c`` oplog entry's ``o``, so PITR replay
+        and ``show_expanded_events`` create events reconstruct the options
+        rather than seeing a bare ``{create, idIndex}``.
+        """
         with self._lock:
             c = self._cursor(_COLL_TABLE)
             c.set_key(db, coll)
@@ -2655,18 +2666,22 @@ class Storage:
                 return False
             c.reset()
             c[db, coll] = b""
-            self._collection_uuid(db, coll)  # mint and persist
-            ui = self._collection_uuid(db, coll)
+            if options:
+                # Persist before minting the UUID — ``_collection_uuid``'s
+                # mint path re-reads and merges, so the options survive.
+                self._write_coll_options(db, coll, dict(options))
+            ui = self._collection_uuid(db, coll)  # mint and persist
+            o: dict[str, Any] = {"create": coll}
+            if options:
+                o.update(options)
+            o["idIndex"] = {"v": 2, "key": {"_id": 1}, "name": "_id_"}
             self._emit_oplog(
                 [
                     {
                         "op": "c",
                         "ns": f"{db}.$cmd",
                         "ui": bson.Binary(ui.bytes, subtype=4),
-                        "o": {
-                            "create": coll,
-                            "idIndex": {"v": 2, "key": {"_id": 1}, "name": "_id_"},
-                        },
+                        "o": o,
                     }
                 ]
             )

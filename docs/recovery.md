@@ -40,7 +40,8 @@ fresh directory) or the `secantusAdmin.restoreArchive` command.
 PITR is *snapshot + oplog replay*: SecantusDB records a mongod-shaped oplog
 (`local.oplog.rs`), and recovery replays it into a fresh store, stopping at a
 target timestamp. The result is the database exactly as it was at that instant —
-documents, in-place updates, deletes, and index/`collMod`/rename DDL all
+documents, in-place updates, deletes, collection options (`capped` / `size` /
+`max` / `validator` / `viewOn` / …), and index/`collMod`/rename DDL all
 reconstructed by replaying through the ordinary write paths.
 
 ### CLI
@@ -109,8 +110,5 @@ floor would need a base snapshot to start from, which is the deferred v2
   history isn't carried into the target, so a change stream on the restored
   server resumes from the restore point, not from before it (like
   `mongorestore`).
-- Collection *options* — `capped` / `size` / `validator` — aren't carried in the
-  `create` oplog entry, so they aren't reconstructed on replay. Documents and
-  indexes are.
 - See [Change streams](change-streams.md) for the oplog model and
   [Compatibility](compatibility.md) for the broader divergence list.

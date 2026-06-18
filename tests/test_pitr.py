@@ -268,3 +268,64 @@ def test_restored_dir_runs_a_server(tmp_path: Path) -> None:
         client = MongoClient(srv.uri, directConnection=True)
         got = sorted(client["shop"]["orders"].find({}), key=lambda d: d["_id"])
     assert got == [{"_id": 1, "total": 10}, {"_id": 2, "total": 20}]
+
+
+def test_collection_options_replayed(tmp_path: Path) -> None:
+    """capped / size / max + a validator set at *create* time survive PITR
+    replay. These ride the ``create`` oplog entry — the options blob itself
+    is oplog-silent, so before this they were lost on restore."""
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True)
+    s.create_collection(
+        "app",
+        "events",
+        options={
+            "capped": True,
+            "size": 8192,
+            "max": 100,
+            "validator": {"v": {"$gt": 0}},
+        },
+    )
+    s.insert("app", "events", [{"_id": 1, "v": 5}])
+    s.close()
+
+    out = tmp_path / "restored"
+    oplog_replay.restore_to_timestamp(str(src), str(out))
+    r = Storage(str(out), enable_oplog=True)
+    try:
+        opts = r.get_collection_options("app", "events")
+        assert opts.get("capped") is True
+        assert opts.get("size") == 8192
+        assert opts.get("max") == 100
+        assert opts.get("validator") == {"v": {"$gt": 0}}
+        assert r.find_matching("app", "events", {}) == [{"_id": 1, "v": 5}]
+    finally:
+        r.close()
+
+
+def test_wire_create_options_survive_restore(tmp_path: Path) -> None:
+    """End-to-end: a capped collection with a validator created through the
+    driver is reconstructed (options and all) on the restored server, proving
+    the wire ``create`` -> oplog -> replay path carries collection options."""
+    src = tmp_path / "src"
+    with SecantusDBServer(port=0, storage_path=str(src)) as srv:
+        db = MongoClient(srv.uri, directConnection=True)["app"]
+        db.create_collection(
+            "events",
+            capped=True,
+            size=8192,
+            max=100,
+            validator={"v": {"$gt": 0}},
+        )
+        db["events"].insert_one({"_id": 1, "v": 5})
+
+    out = tmp_path / "restored"
+    oplog_replay.restore_to_timestamp(str(src), str(out))
+    with SecantusDBServer(port=0, storage_path=str(out)) as srv:
+        db = MongoClient(srv.uri, directConnection=True)["app"]
+        info = next(c for c in db.list_collections() if c["name"] == "events")
+        opts = info["options"]
+        assert opts.get("capped") is True
+        assert opts.get("size") == 8192
+        assert opts.get("max") == 100
+        assert opts.get("validator") == {"v": {"$gt": 0}}

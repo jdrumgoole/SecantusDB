@@ -67,12 +67,13 @@ def _apply_command(storage: Storage, db: str, o: Mapping[str, Any]) -> None:
 
     Mirrors the oplog ``c`` shapes Storage emits (create / drop / dropDatabase /
     createIndexes / dropIndexes / collMod / renameCollection). Collection
-    *options* (capped / validator) are not carried in Storage's ``create`` oplog
-    entry, so they are not reconstructed here — see the v1 limitations in
-    ``docs/recovery.md``.
+    *options* (``capped`` / ``size`` / ``max`` / ``validator`` / ``viewOn`` / …)
+    ride the ``create`` entry as siblings of ``create`` in ``o``, so they are
+    reconstructed on the new collection.
     """
     if "create" in o:
-        storage.create_collection(db, o["create"])
+        options = {k: v for k, v in o.items() if k not in ("create", "idIndex")}
+        storage.create_collection(db, o["create"], options=options or None)
     elif "drop" in o:
         storage.drop_collection(db, o["drop"])
     elif "dropDatabase" in o:

@@ -48,7 +48,8 @@ SecantusDB already kept a mongod-shaped oplog and could take consistent
 WiredTiger backup archives; this release joins the two into real point-in-time
 recovery. Given a backup (or a stopped server's data directory), you can now
 rebuild a fresh database as it was at any target timestamp by replaying the
-oplog forward — documents, in-place updates, deletes, and index / `collMod` /
+oplog forward — documents, in-place updates, deletes, collection options
+(`capped` / `size` / `max` / `validator` / `viewOn` / …), and index / `collMod` /
 rename DDL are all reconstructed through the ordinary write paths, so the result
 is indistinguishable from the live database at that instant.
 
@@ -76,6 +77,11 @@ loudly rather than silently rebuilding a partial database. See
   wire command.
 - Backup archives now embed a `pitr-manifest.json` describing their recoverable
   oplog range (`Storage._pitr_manifest`).
+- Collection options (`capped` / `size` / `max` / `validator` / `viewOn` / …) now
+  ride the `create` oplog entry, so PITR replay reconstructs them on the restored
+  collection (previously only documents and indexes were). `Storage.create_collection`
+  gained an `options=` argument; the same options now also surface in the
+  `show_expanded_events` change-stream `create` event's `operationDescription`.
 
 ## [0.5.3b13] — 2026-06-16
 
