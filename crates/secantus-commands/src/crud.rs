@@ -290,6 +290,34 @@ fn unsupported_update_modifier(u: &Document) -> Option<String> {
 ///
 /// **Deferred (tracked in backlog §7):** `validator`, `writeConcern`,
 /// `_reject_oplog_rs_write` (none are in the Rust `update_matching` seam yet).
+///
+/// Whether a timeseries update's `u` touches only the metaField (mongod 7.0's
+/// rule): an operator-form update whose every modifier targets a path rooted at
+/// `meta`. Replacement / pipeline updates and an empty `meta` (no metaField
+/// declared) never qualify.
+fn ts_update_is_meta_only(u: Option<&Bson>, meta: &str) -> bool {
+    if meta.is_empty() {
+        return false;
+    }
+    let Some(Bson::Document(ud)) = u else {
+        return false;
+    };
+    if ud.is_empty() || !ud.keys().all(|k| k.starts_with('$')) {
+        return false;
+    }
+    for (_op, arg) in ud {
+        let Some(fields) = arg.as_document() else {
+            return false;
+        };
+        for fpath in fields.keys() {
+            if fpath.split('.').next().unwrap_or("") != meta {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
@@ -309,12 +337,12 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `bypassDocumentValidation` or `validationAction: warn|off`. The validator
     // is read once here (no storage lock held) and threaded into the storage
     // update so it can check the rewritten doc before writing.
+    let opts = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .map_err(command_error)?;
     let validator = if bool_field(doc, "bypassDocumentValidation", false) {
         None
     } else {
-        let opts = storage
-            .get_collection_options(&ctx.db_name, &coll)
-            .map_err(command_error)?;
         let action = opts.get_str("validationAction").unwrap_or("error");
         if action == "warn" || action == "off" {
             None
@@ -322,6 +350,13 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             opts.get("validator").and_then(Bson::as_document).cloned()
         }
     };
+    // mongod 7.0 restricts updates on a timeseries collection to the metaField
+    // only. `ts_meta` is `Some(metaField)` for a timeseries collection (an empty
+    // string when no metaField is declared — then nothing is updatable).
+    let ts_meta: Option<String> = opts
+        .get_document("timeseries")
+        .ok()
+        .map(|t| t.get_str("metaField").unwrap_or("").to_string());
 
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
@@ -344,6 +379,23 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let q = doc_field(spec, "q");
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
+
+        // Timeseries (mongod 7.0): an update may only modify the metaField, via
+        // operator-form modifiers — no replacement / pipeline / non-meta paths.
+        if let Some(meta) = &ts_meta {
+            if !ts_update_is_meta_only(spec.get("u"), meta) {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": 2,
+                    "errmsg": "Cannot perform an update on a time-series collection \
+                               that modifies a field other than the metaField",
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // Parse-time validation of an operator-form `u`: an unknown modifier (or
         // mixing operators with replacement fields) is rejected at parse time —

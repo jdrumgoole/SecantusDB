@@ -415,8 +415,9 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   E11000 is gone) — the 2026-06-12 E11000 triage is fully closed. The
   remaining ShowExpandedEvents / disambiguatedPaths / clusteredIndex
   introspection failures are separate unimplemented features. Timeseries
-  limitation: mongod's restrictions on timeseries updates (meta-field
-  only) are not enforced — we accept general updates.
+  update restriction (mongod 7.0: an update may modify only the metaField)
+  is now ENFORCED in the Rust server's `update` handler — non-meta /
+  replacement / pipeline updates on a timeseries collection are rejected.
 - [ ] **Go gauge: CI runs ~1/5 of the local set** — CI weekly artifacts have
   always reported ~450 tests (e.g. 401/453 on 2026-06-08, 447/900 on
   2026-06-12) while local `invoke validate-go` runs ~4700 (the numbers the
@@ -445,9 +446,13 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   `restrictSearchWithMatch`), `_id`-dedup, value-match array-aware. **`$lookup` /
   `$graphLookup` nested inside `$facet` DONE**: `$facet` now runs each sub-pipeline
   through `run_segmented` (the command layer) instead of the storage-free core, so
-  storage-backed stages work inside a facet. **Still deferred:** `$geoNear`
-  `key`-inference from a geo index (explicit `key` required); `$merge`
-  pipeline-form `whenMatched` + `on`-field unique-index validation.
+  storage-backed stages work inside a facet. **`$geoNear` `key`-inference DONE**:
+  when `key` is omitted it's inferred from the collection's lone `2d`/`2dsphere`
+  index (ambiguous when there's more than one → error). **`$merge` pipeline-form
+  `whenMatched` DONE** (inline pipeline applied to each matched doc with `$$new`
+  bound to the incoming doc) plus **`on`-field unique-index validation** (a
+  non-`_id` `on` requires a matching unique index on the target, else code
+  51183). The command-layer storage-backed aggregate surface is now complete.
 - [x] **`distinct` + DDL/introspection** — `distinct`, `create`, `drop`,
   `listCollections`, `listIndexes`, `createIndexes`, `dropIndexes` (the `Storage`
   trait gained the list/DDL methods; the R4b adapter forwards them).
@@ -551,9 +556,11 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   fixed `aggregate`, which had passed the *raw* (un-evaluated) `let` doc as vars.
   findAndModify threads `let`+`collation` into its match (upsert-no-match `let`
   still deferred). **+7 gauge (`test_crud_unified` 275→282).**
-- [ ] **`find` edges** — up-front empty-collection filter validation (needs the
-  query engine's parse-error-vs-`Fallback` distinction); `tailable: true`
-  capped-collection poll. (Tracked in `find.rs` module docs.)
+- [ ] **`find` edges** — empty-collection/empty-result filter validation DONE:
+  when nothing matched, the filter is re-run once against an empty document so an
+  invalid / unsupported filter surfaces `BadValue` (consistent with the
+  non-empty storage-scan path) instead of an empty cursor. Still deferred:
+  `tailable: true` capped-collection poll. (Tracked in `find.rs` module docs.)
 - [x] **R2c — `update` command.** Document-, replacement-, and pipeline-form `u`
   all apply; positional operators + `arrayFilters` + `let` + `collation` done;
   sort-rejection (9) + pipeline-stage validation (9 / 168) pre-checks done.

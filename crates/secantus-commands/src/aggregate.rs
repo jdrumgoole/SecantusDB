@@ -323,7 +323,7 @@ fn apply_storage_stage(
         "$indexStats" => apply_index_stats(db, coll, storage),
         "$out" => apply_out(spec, docs, db, storage),
         "$merge" => apply_merge(spec, docs, db, storage),
-        "$geoNear" => apply_geo_near(spec, docs, vars),
+        "$geoNear" => apply_geo_near(spec, docs, db, coll, vars, storage),
         _ => Err(bad_value(format!(
             "unsupported storage-backed stage {name}"
         ))),
@@ -700,7 +700,10 @@ fn bson_f64(b: &Bson) -> Option<f64> {
 fn apply_geo_near(
     spec: Option<&Bson>,
     docs: Vec<Document>,
+    db: &str,
+    coll: Option<&str>,
     vars: &Document,
+    storage: &dyn crate::storage::Storage,
 ) -> Result<Vec<Document>, CommandError> {
     let spec = spec
         .and_then(Bson::as_document)
@@ -708,9 +711,13 @@ fn apply_geo_near(
     let distance_field = spec
         .get_str("distanceField")
         .map_err(|_| bad_value("$geoNear requires a string `distanceField`"))?;
-    let key = spec.get_str("key").map_err(|_| {
-        bad_value("$geoNear requires a string `key` (geo-index inference deferred)")
-    })?;
+    // `key` is optional: when absent, infer it from the collection's lone geo
+    // index (mongod does the same; ambiguous when there's more than one).
+    let key: String = match spec.get_str("key") {
+        Ok(k) => k.to_string(),
+        Err(_) => infer_geo_near_key(db, coll, storage)?,
+    };
+    let key = key.as_str();
     let (spherical, center) = match spec.get("near") {
         Some(Bson::Document(d)) if d.get_str("type").ok() == Some("Point") => {
             let coords = d
@@ -779,6 +786,37 @@ fn apply_geo_near(
     }
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     Ok(scored.into_iter().map(|(_, d)| d).collect())
+}
+
+/// Infer `$geoNear`'s `key` from the collection's geo index when the stage
+/// doesn't name one: the field of the lone `2d` / `2dsphere` index. Errors if
+/// there's no geo index or more than one (mongod's behaviour — ambiguous).
+fn infer_geo_near_key(
+    db: &str,
+    coll: Option<&str>,
+    storage: &dyn crate::storage::Storage,
+) -> Result<String, CommandError> {
+    let coll = coll.ok_or_else(|| bad_value("$geoNear requires a collection"))?;
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let mut geo_fields: Vec<String> = Vec::new();
+    for idx in &indexes {
+        if let Ok(key) = idx.get_document("key") {
+            for (field, v) in key {
+                if matches!(v, Bson::String(s) if s == "2dsphere" || s == "2d") {
+                    geo_fields.push(field.clone());
+                }
+            }
+        }
+    }
+    match geo_fields.len() {
+        1 => Ok(geo_fields.remove(0)),
+        0 => Err(bad_value(
+            "$geoNear requires a geo index; no `key` given and the collection has no 2d/2dsphere index",
+        )),
+        _ => Err(bad_value(
+            "$geoNear: more than one geo index — specify `key` to disambiguate",
+        )),
+    }
 }
 
 /// `$collStats` — first-stage collection statistics. Minimal but driver-faithful
@@ -903,9 +941,9 @@ fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), Command
 /// `$merge` — merge the pipeline result into the target collection. Mirrors
 /// `aggregate._stage_merge`: per result doc, find the target doc(s) matching the
 /// `on` key, then apply `whenMatched` (`merge` deep-merge default / `replace` /
-/// `keepExisting` / `delete` / `fail`) or `whenNotMatched` (`insert` default /
-/// `discard` / `fail`). The pipeline-array `whenMatched` form is deferred
-/// (surfaced as `BadValue`); `on`-field unique-index validation is skipped.
+/// `keepExisting` / `delete` / `fail`, or an inline pipeline with `$$new` bound
+/// to the incoming doc) or `whenNotMatched` (`insert` default / `discard` /
+/// `fail`). A non-`_id` `on` requires a matching unique index on the target.
 fn apply_merge(
     spec: Option<&Bson>,
     docs: Vec<Document>,
@@ -916,6 +954,9 @@ fn apply_merge(
     storage
         .create_collection(&out_db, &out_coll)
         .map_err(command_error)?;
+    // mongod requires a unique index covering a non-`_id` `on` so the match is
+    // guaranteed to hit at most one target doc.
+    merge_validate_on(storage, &out_db, &out_coll, &on)?;
     for d in docs {
         let mut filter = Document::new();
         for field in &on {
@@ -936,7 +977,23 @@ fn apply_merge(
             Some(existing) => {
                 let existing_id = existing.get("_id").cloned().unwrap_or(Bson::Null);
                 let id_filter = doc! {"_id": existing_id.clone()};
-                match when_matched.as_str() {
+                let mode = match &when_matched {
+                    WhenMatched::Mode(m) => m.as_str(),
+                    WhenMatched::Pipeline(pipeline) => {
+                        // Run the inline pipeline over the existing doc with the
+                        // incoming doc bound to `$$new`; the result replaces it
+                        // (existing `_id` preserved).
+                        let pvars = doc! { "new": Bson::Document(d.clone()) };
+                        let result = core_run(vec![existing.clone()], pipeline, &pvars, None)?;
+                        let mut newdoc = result.into_iter().next().unwrap_or(existing);
+                        newdoc.insert("_id", existing_id);
+                        storage
+                            .update_matching(&out_db, &out_coll, &id_filter, &newdoc, false, false)
+                            .map_err(command_error)?;
+                        continue;
+                    }
+                };
+                match mode {
                     "keepExisting" => {}
                     "fail" => {
                         return Err(CommandError::new(
@@ -991,10 +1048,17 @@ fn apply_merge(
 
 /// Parse `$merge`'s spec into `(db, coll, on, whenMatched, whenNotMatched)`.
 /// Accepts the string short-form (`$merge: "coll"`) or the document form.
+/// `$merge` `whenMatched`: either a named mode or an inline aggregation pipeline
+/// applied to each matched document (with the incoming doc bound to `$$new`).
+enum WhenMatched {
+    Mode(String),
+    Pipeline(Vec<Bson>),
+}
+
 fn merge_spec(
     spec: Option<&Bson>,
     db: &str,
-) -> Result<(String, String, Vec<String>, String, String), CommandError> {
+) -> Result<(String, String, Vec<String>, WhenMatched, String), CommandError> {
     const VALID_MATCHED: &[&str] = &["merge", "replace", "keepExisting", "fail", "delete"];
     const VALID_NOT_MATCHED: &[&str] = &["insert", "discard", "fail"];
     let (out_db, out_coll, on, when_matched, when_not_matched) = match spec {
@@ -1002,7 +1066,7 @@ fn merge_spec(
             db.to_string(),
             c.clone(),
             vec!["_id".to_string()],
-            "merge".to_string(),
+            WhenMatched::Mode("merge".to_string()),
             "insert".to_string(),
         ),
         Some(Bson::Document(d)) => {
@@ -1032,21 +1096,27 @@ fn merge_spec(
                     ))
                 }
             };
-            if matches!(d.get("whenMatched"), Some(Bson::Array(_))) {
-                return Err(bad_value(
-                    "$merge whenMatched pipeline form is not supported by the Rust server",
-                ));
-            }
-            let wm = d.get_str("whenMatched").unwrap_or("merge").to_string();
+            let wm = match d.get("whenMatched") {
+                Some(Bson::Array(p)) => WhenMatched::Pipeline(p.clone()),
+                Some(Bson::String(s)) => WhenMatched::Mode(s.clone()),
+                None => WhenMatched::Mode("merge".to_string()),
+                _ => {
+                    return Err(bad_value(
+                        "$merge whenMatched must be a mode string or a pipeline array",
+                    ))
+                }
+            };
             let wnm = d.get_str("whenNotMatched").unwrap_or("insert").to_string();
             (odb, ocoll, on, wm, wnm)
         }
         _ => return Err(bad_value("$merge requires a string or document spec")),
     };
-    if !VALID_MATCHED.contains(&when_matched.as_str()) {
-        return Err(bad_value(format!(
-            "$merge whenMatched must be one of {VALID_MATCHED:?} or a pipeline array"
-        )));
+    if let WhenMatched::Mode(m) = &when_matched {
+        if !VALID_MATCHED.contains(&m.as_str()) {
+            return Err(bad_value(format!(
+                "$merge whenMatched must be one of {VALID_MATCHED:?} or a pipeline array"
+            )));
+        }
     }
     if !VALID_NOT_MATCHED.contains(&when_not_matched.as_str()) {
         return Err(bad_value(format!(
@@ -1054,6 +1124,40 @@ fn merge_spec(
         )));
     }
     Ok((out_db, out_coll, on, when_matched, when_not_matched))
+}
+
+/// Validate that a non-`_id` `$merge` `on` is backed by a unique index on the
+/// target whose key fields are exactly the `on` fields (mongod code 51183). The
+/// default `on: ["_id"]` is always satisfied (the `_id` index is unique).
+fn merge_validate_on(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    on: &[String],
+) -> Result<(), CommandError> {
+    if on.len() == 1 && on[0] == "_id" {
+        return Ok(());
+    }
+    let mut want: Vec<&str> = on.iter().map(String::as_str).collect();
+    want.sort_unstable();
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    for idx in &indexes {
+        if !idx.get_bool("unique").unwrap_or(false) {
+            continue;
+        }
+        if let Ok(key) = idx.get_document("key") {
+            let mut have: Vec<&str> = key.keys().map(String::as_str).collect();
+            have.sort_unstable();
+            if have == want {
+                return Ok(());
+            }
+        }
+    }
+    Err(CommandError::new(
+        51183,
+        "Location51183",
+        format!("$merge: no unique index on the target collection matches the 'on' fields {on:?}"),
+    ))
 }
 
 /// Recursive document merge for `$merge whenMatched: "merge"` (mirrors

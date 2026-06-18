@@ -7,12 +7,12 @@
 //! `skip` → `limit` → `projection` (via `secantus_core::projection`) →
 //! `_split_into_cursor` (firstBatch + register the remainder).
 //!
+//! Empty-result filter validation: when nothing matched, the filter is re-run
+//! once against an empty document so an invalid / unsupported filter surfaces
+//! `BadValue` (as it would against a non-empty collection through the storage
+//! scan) instead of silently returning an empty cursor.
+//!
 //! **Deferred (documented so parity is honest):**
-//! * The up-front empty-collection filter validation (`matches({}, filter)`):
-//!   needs the query engine to distinguish a *parse* error from its `Fallback`
-//!   "defer" signal. Without it, an invalid filter on an *empty* collection
-//!   returns an empty cursor instead of a `BadValue` (non-empty collections
-//!   still surface the error through the storage scan).
 //! * `tailable: true` (capped-collection poll) — needs the tailable cursor
 //!   machinery + `collection_is_capped`; rejected here as unsupported (capped
 //!   collections aren't creatable through the ported handlers yet anyway).
@@ -77,6 +77,17 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             &let_vars,
         )
         .map_err(command_error)?;
+
+    // Validate the filter even when nothing matched: against a non-empty
+    // collection the storage scan evaluates the filter per doc and an
+    // invalid/unsupported one surfaces `BadValue`; on an empty result the scan
+    // never runs, so an invalid filter would otherwise return an empty cursor
+    // instead of the error. Re-run the matcher once against an empty document
+    // (operator recognition is doc-independent) to surface the same `BadValue`.
+    if docs.is_empty() && !filter.is_empty() {
+        secantus_core::query::matches(&Document::new(), &filter, &let_vars, collation.as_ref())
+            .map_err(|_| CommandError::new(2, "BadValue", "unsupported or invalid query filter"))?;
+    }
 
     // Cursor `min` / `max` index bounds (inclusive lower / exclusive upper),
     // evaluated on the hinted index's key — applied to the index-ordered fetch
