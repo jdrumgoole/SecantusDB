@@ -39,11 +39,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import INCLUDE, SKIP_TAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-ruby-driver"
-RAW_OUT = REPO_ROOT / ".validation" / "ruby-raw.json"
+RAW_OUT = REPO_ROOT / ".validation" / f"ruby-raw{gauge_common.report_suffix()}.json"
 
 # Hard wall-clock limit on the rspec invocation. The Ruby driver's
 # integration suite has tests that wait indefinitely on tailable
@@ -260,12 +262,14 @@ def main() -> int:
         if with_auth:
             cmd.append("--auth")
         return subprocess.Popen(
-            cmd,
+            gauge_common.for_server(cmd),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
 
-    print(f"ruby_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
+    print(
+        f"ruby_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr
+    )
     daemon = _spawn_daemon(with_auth=False)
     try:
         _wait_for_listener(host, port)
@@ -302,8 +306,7 @@ def main() -> int:
             cmd.extend(["--tag", f"~{tag}"])
         cmd.extend(INCLUDE)
         print(
-            f"ruby_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(MONGODB_URI={env['MONGODB_URI']})",
+            f"ruby_validation: `{' '.join(cmd)}` in {VENDOR} (MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
         try:

@@ -34,11 +34,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import INCLUDE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-php-driver"
-JUNIT_OUT = REPO_ROOT / ".validation" / "php-ext-junit.xml"
+JUNIT_OUT = REPO_ROOT / ".validation" / f"php-ext-junit{gauge_common.report_suffix()}.xml"
 
 # Hard wall-clock limit on the run-tests.php invocation. A single .phpt that
 # waits on a cursor / getMore the server doesn't satisfy as expected can pin
@@ -66,9 +68,7 @@ def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
 
 
 def _resolve_php_bin() -> str | None:
-    return shutil.which("php") or _first_existing(
-        ["/opt/homebrew/bin/php", "/usr/local/bin/php"]
-    )
+    return shutil.which("php") or _first_existing(["/opt/homebrew/bin/php", "/usr/local/bin/php"])
 
 
 def _first_existing(paths: list[str]) -> str | None:
@@ -187,12 +187,21 @@ def main() -> int:
     )
 
     daemon = subprocess.Popen(
-        [
-            sys.executable, "-m", "secantus",
-            "--host", host, "--port", str(port),
-            "--storage-path", storage_dir,
-            "--log-level", "WARNING",
-        ],
+        gauge_common.for_server(
+            [
+                sys.executable,
+                "-m",
+                "secantus",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--storage-path",
+                storage_dir,
+                "--log-level",
+                "WARNING",
+            ]
+        ),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
@@ -210,10 +219,13 @@ def main() -> int:
         env["PATH"] = f"{Path(php_bin).parent}:{env.get('PATH', '')}"
 
         cmd = [
-            php_bin, str(run_tests),
-            "-p", php_bin,
+            php_bin,
+            str(run_tests),
+            "-p",
+            php_bin,
             "-q",
-            "-g", "FAIL,XFAIL,BORK,WARN,LEAK",
+            "-g",
+            "FAIL,XFAIL,BORK,WARN,LEAK",
             *INCLUDE,
         ]
         print(

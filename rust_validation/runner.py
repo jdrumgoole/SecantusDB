@@ -42,11 +42,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import CARGO_FEATURES, INCLUDE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-rust-driver"
-RAW_OUT = REPO_ROOT / ".validation" / "rust-raw.json"
+RAW_OUT = REPO_ROOT / ".validation" / f"rust-raw{gauge_common.report_suffix()}.json"
 
 # Hard wall-clock limit on the cargo test invocation. The Rust
 # driver's tests are async and rely on tokio timeouts internally;
@@ -133,7 +135,11 @@ def main() -> int:
         "--log-level",
         "WARNING",
     ]
-    print(f"rust_validation: launching SecantusDB → {uri}", file=sys.stderr)
+    daemon_cmd = gauge_common.for_server(daemon_cmd)
+    print(
+        f"rust_validation: launching {gauge_common.gauge_server()} SecantusDB → {uri}",
+        file=sys.stderr,
+    )
     daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         _wait_for_listener(port)

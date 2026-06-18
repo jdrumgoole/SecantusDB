@@ -35,6 +35,8 @@ import threading
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_modules import INCLUDE
 
 
@@ -75,7 +77,7 @@ def _jstack_all_javas(jstack_dir: Path, java_home: str | None) -> None:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-java-driver"
-RESULTS_DIR = REPO_ROOT / ".validation" / "java-results"
+RESULTS_DIR = REPO_ROOT / ".validation" / f"java-results{gauge_common.report_suffix()}"
 
 # Test users mongo-java-driver's ClusterFixture connection string
 # expects when ``-Dorg.mongodb.test.uri`` carries credentials.
@@ -258,7 +260,9 @@ def main() -> int:
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return subprocess.Popen(
+            gauge_common.for_server(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
 
     print(
         f"java_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr

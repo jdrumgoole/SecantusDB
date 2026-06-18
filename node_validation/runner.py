@@ -35,11 +35,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import INCLUDE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "node-mongodb-native"
-RAW_OUT = REPO_ROOT / ".validation" / "node-raw.json"
+RAW_OUT = REPO_ROOT / ".validation" / f"node-raw{gauge_common.report_suffix()}.json"
 
 
 def _pick_ephemeral_port() -> int:
@@ -47,6 +49,7 @@ def _pick_ephemeral_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
 
 ROOT_USER = "root-user"
 ROOT_PASSWORD = "password"
@@ -176,30 +179,39 @@ def main() -> int:
 
     def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
         cmd = [
-            sys.executable, "-m", "secantus",
-            "--host", host,
-            "--port", str(port),
-            "--storage-path", storage_dir,
-            "--log-level", "WARNING",
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--storage-path",
+            storage_dir,
+            "--log-level",
+            "WARNING",
             "--standalone",
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return subprocess.Popen(
+            gauge_common.for_server(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
 
-    print(f"node_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
+    print(
+        f"node_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr
+    )
     daemon = _spawn_daemon(with_auth=False)
     try:
         _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "node_validation")
         print("node_validation: seeding root-user", file=sys.stderr)
         import pymongo
+
         client = pymongo.MongoClient(
             f"mongodb://{host}:{port}/", directConnection=True, serverSelectionTimeoutMS=5_000
         )
-        client.admin.command(
-            "createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"]
-        )
+        client.admin.command("createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"])
         client.close()
     finally:
         daemon.terminate()
@@ -219,8 +231,7 @@ def main() -> int:
 
         env = os.environ.copy()
         env["MONGODB_URI"] = (
-            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/"
-            f"?authSource=admin"
+            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"
         )
         # Required by ``test/tools/runner/hooks/configuration.ts`` —
         # if AUTH != 'noauth' the bootstrap insists on the
@@ -237,21 +248,28 @@ def main() -> int:
         # ts-node's own mocha config disables it, so pass it through too.
 
         cmd = [
-            "npx", "mocha",
-            "--config", "test/mocha_mongodb.js",
-            "--reporter", "json",
-            "--timeout", str(MOCHA_PER_TEST_TIMEOUT_MS),
+            "npx",
+            "mocha",
+            "--config",
+            "test/mocha_mongodb.js",
+            "--reporter",
+            "json",
+            "--timeout",
+            str(MOCHA_PER_TEST_TIMEOUT_MS),
             *INCLUDE,
         ]
         print(
-            f"node_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(MONGODB_URI={env['MONGODB_URI']})",
+            f"node_validation: `{' '.join(cmd)}` in {VENDOR} (MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
         try:
             with RAW_OUT.open("w") as out:
                 proc = subprocess.run(
-                    cmd, cwd=VENDOR, env=env, stdout=out, stderr=subprocess.PIPE,
+                    cmd,
+                    cwd=VENDOR,
+                    env=env,
+                    stdout=out,
+                    stderr=subprocess.PIPE,
                     timeout=MOCHA_TIMEOUT_SECONDS,
                 )
             stderr = proc.stderr
@@ -271,6 +289,7 @@ def main() -> int:
             return 1
 
         import json as _json
+
         try:
             raw = _json.loads(RAW_OUT.read_text())
         except _json.JSONDecodeError:

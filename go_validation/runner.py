@@ -31,11 +31,14 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_packages import INCLUDE, SKIP_PATTERNS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-go-driver"
-RAW_OUT = REPO_ROOT / ".validation" / "go-raw.ndjson"
+# Per-server raw-output path so a Rust-server run doesn't clobber the Python one.
+RAW_OUT = REPO_ROOT / ".validation" / f"go-raw{gauge_common.report_suffix()}.ndjson"
 
 
 def _pick_ephemeral_port() -> int:
@@ -139,7 +142,12 @@ def main() -> int:
         "--noop-heartbeat-seconds",
         "10",
     ]
-    print(f"go_validation: starting daemon on {host}:{port}", file=sys.stderr)
+    # Target the Python or the Rust server per SECANTUS_GAUGE_SERVER.
+    daemon_cmd = gauge_common.for_server(daemon_cmd)
+    print(
+        f"go_validation: starting {gauge_common.gauge_server()} daemon on {host}:{port}",
+        file=sys.stderr,
+    )
     daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         _wait_for_listener(host, port)
