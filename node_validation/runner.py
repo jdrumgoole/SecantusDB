@@ -80,9 +80,13 @@ def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
 def _ensure_npm_install() -> int:
     if (VENDOR / "node_modules" / "mocha").is_dir():
         return 0
-    print("node_validation: running `npm install` (first time only, ~1-2 min)", file=sys.stderr)
+    print("node_validation: running `npm ci` (first time only, ~1-2 min)", file=sys.stderr)
+    # ``npm ci`` (not ``install``) installs strictly from the committed
+    # lockfile and never mutates ``package-lock.json`` — ``npm install``
+    # prunes a redundant lockfile entry, dirtying the submodule and
+    # breaking the zero-local-edits gauge invariant.
     proc = subprocess.run(
-        ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
+        ["npm", "ci", "--no-audit", "--no-fund", "--ignore-scripts"],
         cwd=VENDOR,
     )
     return proc.returncode
@@ -223,13 +227,14 @@ def main() -> int:
         # ``bob:pwd123`` default URI, overriding ours. Setting AUTH=auth
         # tells the bootstrap to honour ``MONGODB_URI`` verbatim.
         env["AUTH"] = "auth"
-        # The driver's tests use ESM-style imports without extensions
-        # (`from '../../mongodb'`). Node 22+'s
-        # ``--experimental-strip-types`` resolves them at runtime.
-        existing = env.get("NODE_OPTIONS", "")
-        env["NODE_OPTIONS"] = (
-            existing + " --experimental-strip-types"
-        ).strip()
+        # TypeScript is transpiled by ``ts-node/register`` (already in
+        # ``test/mocha_mongodb.js``'s ``require`` list) — CommonJS +
+        # ``transpileOnly``, which resolves the driver's extensionless
+        # imports (`from '../../mongodb'`) and ``import x = require(...)``
+        # forms. Do **not** inject ``--experimental-strip-types``: Node's
+        # strip-only loader can't transform ``import = require`` and fights
+        # ts-node. On Node >= 23 the strip-types loader is on by default and
+        # ts-node's own mocha config disables it, so pass it through too.
 
         cmd = [
             "npx", "mocha",
