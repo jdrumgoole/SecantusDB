@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .paths import get_path, set_path, unset_path
+from secantus.paths import get_path, set_path, unset_path
 
 
 def _record_ambiguous(path: str, segments: list[Any], disambiguated: dict[str, list[Any]]) -> None:
