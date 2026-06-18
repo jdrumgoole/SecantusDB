@@ -144,6 +144,8 @@ clustering and infrastructure that `mongod` brings.
   prerequisites.
 - [Quickstart](quickstart.md) — embedded in your app, run as a daemon, or wired into tests.
 - [Examples](examples.md) — connect, insert, index, query, drop.
+- [The two servers](servers.md) — the pure-Python server vs the Rust server,
+  which to use, and what each one doesn't support yet.
 - [Architecture](architecture.md) — wire / commands / query / aggregate /
   storage layers.
 - [Indexes](indexes.md) — single-field, compound, mixed-direction, partial,
@@ -190,6 +192,7 @@ SecantusDB is dual-licensed:
 installation
 quickstart
 examples
+servers
 configuration
 architecture
 indexes

@@ -4,6 +4,13 @@ SecantusDB's conformance target is **`pymongo`**: a `pymongo` client should
 not be able to tell SecantusDB apart from a real `mongod` for the operations
 it supports. This page lists the divergences that exist anyway.
 
+:::{note}
+This page describes the **Python server** — the conformance leader. SecantusDB
+also ships a separate **Rust server** that speaks the same wire protocol but is
+still closing the conformance gap; the features it doesn't yet support are
+delineated in [The two servers](servers.md).
+:::
+
 ## Stubs
 
 These commands accept the request and return a wire-valid response, but the
@@ -93,20 +100,20 @@ These are explicit non-goals:
   SecantusDB is single-process. (Change streams *are* supported —
   oplog-backed and single-node — see [Change streams](change-streams.md).
   The oplog is queryable at `local.oplog.rs` like real mongod.)
-- **Authentication mechanisms beyond SCRAM-SHA-256** — x509, LDAP,
-  Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC. SCRAM-SHA-256 itself
-  *is* implemented; SCRAM-SHA-1 is not advertised (modern drivers
-  default to SHA-256). See [Authentication](authentication.md).
+- **Authentication mechanisms beyond SCRAM-SHA-256 and MONGODB-X509** —
+  LDAP, Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC. `SCRAM-SHA-256`
+  and `MONGODB-X509` (cert-as-username, over mTLS) *are* implemented;
+  SCRAM-SHA-1 is not advertised (modern drivers default to SHA-256).
+  See [Authentication](authentication.md).
 - **Authorization (RBAC)** — `createUser` accepts a `roles` array but
   no command consults it. An authenticated principal is treated as
   fully privileged.
 - **Native TLS + mTLS** are supported as of v0.5.1b21/b22.
   Configure via `[tls] cert_file` / `key_file` (server-side TLS)
   and optionally `[tls] ca_file` / `require_client_cert` (mTLS);
-  see [Configuration](configuration.md). The
-  `MONGODB-X509` cert-as-username auth mechanism is the one
-  remaining follow-on — until it lands, SCRAM-SHA-256 over TLS is
-  the auth + confidentiality story.
+  see [Configuration](configuration.md). The `MONGODB-X509`
+  cert-as-username auth mechanism shipped on top of the mTLS
+  slice — see [Authentication](authentication.md).
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told
   the server doesn't support compression.
 - **Text search** (`$text`, `$meta: "textScore"`, text indexes) —
