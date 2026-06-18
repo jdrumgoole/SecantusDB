@@ -107,9 +107,7 @@ def test_curated_parity(doc, update, upsert):
     # The Rust update engine now follows mongod's numeric type promotion
     # (int32 < int64 < double < decimal128) exactly like the pure-Python engine,
     # so the BSON int32-vs-int64 subtype must match — compare values directly.
-    assert bson.decode(rust) == py, (
-        f"rust={bson.decode(rust)} pure={py} update={update}"
-    )
+    assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update}"
 
 
 def _rust_apply_with(doc, update, array_filters=None, positional_matches=None, is_upsert=False):
@@ -162,9 +160,7 @@ def test_array_filter_parity(doc, update, af, pos):
     if rust is None:
         return  # fallback — Python handles it
     py = _pure.apply_update(doc, update, array_filters=list(af), positional_matches=dict(pos))
-    assert bson.decode(rust) == py, (
-        f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
-    )
+    assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
 
 
 def _rand_scalar(rng):
@@ -258,7 +254,5 @@ def test_batch_apply_parity():
             continue
         handled += 1
         py = [_pure.apply_update(d, update, is_upsert=upsert) for d in docs]
-        assert rust == py, (
-            f"batch divergence: rust={rust} pure={py} update={update}"
-        )
+        assert rust == py, f"batch divergence: rust={rust} pure={py} update={update}"
     assert handled > 500, f"expected many handled batches, only {handled}"
