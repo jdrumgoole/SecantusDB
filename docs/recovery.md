@@ -40,7 +40,8 @@ fresh directory) or the `secantusAdmin.restoreArchive` command.
 PITR is *snapshot + oplog replay*: SecantusDB records a mongod-shaped oplog
 (`local.oplog.rs`), and recovery replays it into a fresh store, stopping at a
 target timestamp. The result is the database exactly as it was at that instant —
-documents, in-place updates, deletes, and index/`collMod`/rename DDL all
+documents, in-place updates, deletes, collection options (`capped` / `size` /
+`max` / `validator` / `viewOn` / …), and index/`collMod`/rename DDL all
 reconstructed by replaying through the ordinary write paths.
 
 ### CLI
@@ -61,9 +62,10 @@ secantusdb restore --source /path/to/stopped-data-dir \
 secantusdb --storage-path /restore/at-1430
 ```
 
-`--source` is a backup `.tar.gz` **or** a stopped server's data directory (a
-live one can't be opened — WiredTiger holds a single-writer lock). `--target-dir`
-must be a fresh path.
+`--source` is a backup `.tar.gz`, a stopped server's data directory (a live one
+can't be opened — WiredTiger holds a single-writer lock), **or** a PITR archive
+directory (see [Arbitrary window](#arbitrary-window-oplog-archiving-base-snapshots)
+below). `--target-dir` must be a fresh path.
 
 ### Wire command
 
@@ -84,33 +86,65 @@ Every statement in a multi-document transaction shares one commit timestamp, so
 the timestamp cut is always **all-or-nothing** for a transaction — a recovery
 point never lands in the middle of one.
 
-## The recovery window (v1)
+## The recovery window
 
-The current implementation replays onto an **empty** base, which is exact
-whenever the source oplog still reaches genesis — i.e. it hasn't been pruned
-from the front. The recovery window is therefore the **oplog retention window**.
-Tune it for the horizon you need:
+### Live oplog (the simple case)
+
+The simplest restore replays onto an **empty** base, which is exact whenever the
+source oplog still reaches genesis — i.e. it hasn't been pruned from the front.
+The recovery window is then the **oplog retention window**. Tune it for the
+horizon you need:
 
 ```bash
 secantusdb --oplog-retention-seconds 604800 --oplog-max-entries 5000000   # ~1 week
 ```
 
 (or the `[oplog]` section of `secantusdb.toml`). The rule of thumb: *keep enough
-oplog and you can rewind to any point in it.*
+oplog and you can rewind to any point in it.* If the oplog has been pruned past
+genesis and no archive is configured, this restore **fails loudly** rather than
+silently rebuilding a partial database.
 
-If the oplog has been pruned past genesis, restore **fails loudly** rather than
-silently rebuilding a partial database — recovering to a time before the oplog
-floor would need a base snapshot to start from, which is the deferred v2
-(continuous oplog archiving + scheduled base snapshots; see `tasks/backlog.md`).
+### Arbitrary window: oplog archiving + base snapshots
+
+To recover to a time *before* the live oplog floor — without keeping the entire
+oplog live — turn on **oplog archiving** and take periodic **base snapshots** into
+the same directory:
+
+```bash
+secantusdb --storage-path /data --oplog-archive-dir /pitr-archive
+```
+
+With `--oplog-archive-dir` set, the rows `prune_oplog` is about to drop are first
+written to durable segment files (`oplog-<start>-<end>.seg`) in that directory.
+Take base snapshots on demand (there is no background scheduler — same as
+`prune_ttl` / `prune_oplog`):
+
+```python
+admin.command({"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": "/pitr-archive"})
+```
+
+Each writes a `base-<headSeq>.tar.gz` into the directory. To recover, point
+`restore` at the **archive directory** (the CLI and wire command auto-detect it):
+
+```bash
+secantusdb restore --source /pitr-archive --target-dir /restore/at-T \
+                   --to-time 2026-06-10T09:00:00Z
+```
+
+Restore picks the newest base snapshot at or before the target time, extracts it,
+and stitches the archived oplog forward onto it up to the target — so any moment
+in the archived history is reachable. If the base snapshots plus segments don't
+cover the requested time (a gap), it fails loudly rather than returning a
+truncated database.
 
 ### Limitations
 
-- The restored data directory starts a **fresh oplog timeline** — the replayed
-  history isn't carried into the target, so a change stream on the restored
-  server resumes from the restore point, not from before it (like
-  `mongorestore`).
-- Collection *options* — `capped` / `size` / `validator` — aren't carried in the
-  `create` oplog entry, so they aren't reconstructed on replay. Documents and
-  indexes are.
+- By default the restored data directory starts a **fresh oplog timeline** — the
+  replayed history isn't carried into the target, so a change stream on the
+  restored server resumes only from the restore point (like `mongorestore`).
+  Pass `--preserve-oplog` (`secantusdb restore`) or `preserveOplog: true`
+  (`secantusAdmin.restoreToTimestamp`) to carry the replayed oplog verbatim, so a
+  change stream on the restored server can resume from a token minted *before*
+  the restore point.
 - See [Change streams](change-streams.md) for the oplog model and
   [Compatibility](compatibility.md) for the broader divergence list.

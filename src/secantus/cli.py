@@ -161,6 +161,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--oplog-archive-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Enable PITR v2: archive oplog rows to durable segments in DIR before "
+            "pruning drops them. Pair with periodic base snapshots "
+            "(secantusAdmin.archiveBaseSnapshot) so recovery can reach a time "
+            "before the live oplog floor. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--tls-cert-file",
         default=None,
         metavar="PATH",
@@ -222,6 +233,7 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
         "sync_on_commit": "sync_on_commit",
         "oplog_retention_seconds": "oplog_retention_seconds",
         "oplog_max_entries": "oplog_max_entries",
+        "oplog_archive_dir": "oplog_archive_dir",
         "tls_cert_file": "tls_cert_file",
         "tls_key_file": "tls_key_file",
         "tls_ca_file": "tls_ca_file",
@@ -251,7 +263,11 @@ def _build_restore_parser() -> argparse.ArgumentParser:
         "--source",
         required=True,
         metavar="PATH",
-        help="Backup .tar.gz archive, or a stopped server's data directory.",
+        help=(
+            "Backup .tar.gz archive, a stopped server's data directory, or a "
+            "PITR v2 archive directory (base snapshots + oplog segments — lets "
+            "recovery reach a time before the live oplog floor)."
+        ),
     )
     parser.add_argument(
         "--target-dir",
@@ -272,6 +288,15 @@ def _build_restore_parser() -> argparse.ArgumentParser:
         "--to-timestamp",
         metavar="SECS[,ORD]",
         help="Recover to this cluster timestamp (seconds, optional ordinal).",
+    )
+    parser.add_argument(
+        "--preserve-oplog",
+        action="store_true",
+        help=(
+            "Carry the replayed oplog onto the restored directory so a change "
+            "stream there can resume from a token minted before the restore "
+            "point. Default: start a fresh oplog timeline (like mongorestore)."
+        ),
     )
     return parser
 
@@ -306,14 +331,31 @@ def _restore_main(argv: list[str]) -> int:
             print(f"secantusdb restore: cannot parse --to-time {args.to_time!r}", file=sys.stderr)
             return 2
 
-    is_archive = args.source.endswith((".tar.gz", ".tgz"))
-    fn = (
-        oplog_replay.restore_archive_to_timestamp
-        if is_archive
-        else oplog_replay.restore_to_timestamp
-    )
+    from secantus import pitr_archive
+
     try:
-        stats = fn(args.source, args.target_dir, to_ts=to_ts, to_wall=to_wall)
+        if pitr_archive.is_archive_dir(args.source):
+            # PITR v2: a directory of base snapshots + oplog segments.
+            stats = pitr_archive.restore_from_archive_dir(
+                args.source,
+                args.target_dir,
+                to_ts=to_ts,
+                to_wall=to_wall,
+                carry_oplog=args.preserve_oplog,
+            )
+        else:
+            fn = (
+                oplog_replay.restore_archive_to_timestamp
+                if args.source.endswith((".tar.gz", ".tgz"))
+                else oplog_replay.restore_to_timestamp
+            )
+            stats = fn(
+                args.source,
+                args.target_dir,
+                to_ts=to_ts,
+                to_wall=to_wall,
+                carry_oplog=args.preserve_oplog,
+            )
     except (ValueError, RuntimeError) as exc:
         print(f"secantusdb restore: {exc}", file=sys.stderr)
         return 2
@@ -356,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         replica_set_name=None if cfg.standalone else "secantus",
         oplog_retention_seconds=cfg.oplog_retention_seconds,
         oplog_max_entries=cfg.oplog_max_entries,
+        oplog_archive_dir=cfg.oplog_archive_dir,
         cache_size=cfg.cache_size,
         session_max=cfg.session_max,
         sync_on_commit=cfg.sync_on_commit,

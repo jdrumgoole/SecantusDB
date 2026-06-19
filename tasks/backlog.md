@@ -158,30 +158,18 @@ the change-stream batch. Still open, precisely characterized:
 
 ### 3.5 Point-in-time recovery (PITR) — v2 and limitations
 
-PITR v1 shipped (Python server): `secantus.oplog_replay` replays an oplog source
-(a backup archive or a stopped data dir) into a fresh store, stopping at a target
-`ts` / wall time; surfaced as `secantusdb restore` (CLI) and
-`secantusAdmin.restoreToTimestamp` (wire). v1 replays onto an **empty** base, so
-the recovery window equals the oplog retention window (genesis-intact required).
-Deferred / known limitations:
+PITR shipped for the Python server: `secantus.oplog_replay` replays an oplog
+source (a backup archive or a stopped data dir) into a fresh store, stopping at a
+target `ts` / wall time; surfaced as `secantusdb restore` (CLI) and
+`secantusAdmin.restoreToTimestamp` (wire). **v2 also shipped** (`secantus.pitr_archive`):
+with `oplog_archive_dir` set, `prune_oplog` archives soon-to-be-dropped oplog rows
+to durable segment files; `Storage.archive_base_snapshot` / `secantusAdmin.archiveBaseSnapshot`
+take base snapshots; and `restore_from_archive_dir` (a directory `source` on the
+CLI/wire) picks the newest base ≤ T and stitches archived oplog forward onto it,
+lifting the genesis-intact restriction. `--preserve-oplog` carries the replayed
+oplog for change-stream resume continuity, and collection options replay too.
+Deferred:
 
-- [ ] **PITR v2 — arbitrary window via oplog archiving + base snapshots.** v1
-  errors when the oplog floor is past genesis (front-pruned). v2 = continuously
-  archive oplog segments to durable files before `prune_oplog` drops them, plus
-  scheduled base snapshots, and a restore path that auto-selects the newest base
-  `≤ T` and stitches archived oplog forward (reuses the same applier with a
-  non-empty base; the `pitr-manifest.json` embedded by `create_archive` is the
-  index). Lets restore reach any `T` without keeping the entire oplog live.
-- [ ] **Restored dir starts a fresh oplog timeline.** Replay suppresses oplog
-  emission, so the target's oplog is empty after restore — a change stream on the
-  restored server resumes from the restore point, not before it (matches
-  `mongorestore`). v2 could copy the replayed oplog rows verbatim for resume
-  continuity.
-- [ ] **Collection options not replayed.** `capped` / `size` / `validator` aren't
-  carried in Storage's `create` oplog entry (only `{create, idIndex}`), so they
-  aren't reconstructed on replay. Documents + indexes are. Fix = include the
-  options in the `create` oplog `o` (also improves change-stream `create` event
-  fidelity) — a small create_collection-signature change.
 - [ ] **Rust server PITR (Phase R).** Prereqs before replay can be correct on the
   Rust server: (R0a) `create_index`/`drop_index`/`collMod` must emit oplog `c`
   entries — currently they don't (see §3.2; shared with `showExpandedEvents`);

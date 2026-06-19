@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ import pytest
 from bson import Timestamp
 from pymongo import MongoClient
 
-from secantus import SecantusDBServer, cli, oplog_replay
+from secantus import SecantusDBServer, cli, oplog_replay, pitr_archive
 from secantus.storage import Storage
 
 
@@ -268,3 +269,238 @@ def test_restored_dir_runs_a_server(tmp_path: Path) -> None:
         client = MongoClient(srv.uri, directConnection=True)
         got = sorted(client["shop"]["orders"].find({}), key=lambda d: d["_id"])
     assert got == [{"_id": 1, "total": 10}, {"_id": 2, "total": 20}]
+
+
+def test_v2_restore_past_pruned_floor(tmp_path: Path) -> None:
+    """PITR v2: with a base snapshot + archived oplog segments, a restore can
+    reach a time *before* the live oplog floor — the window v1 refuses."""
+    archive = tmp_path / "archive"
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True, oplog_archive_dir=str(archive), oplog_max_entries=2)
+    s.insert("app", "c", [{"_id": 1}])
+    s.insert("app", "c", [{"_id": 2}])
+    s.archive_base_snapshot(str(archive))  # base head = 2
+    s.insert("app", "c", [{"_id": 3}])
+    t3 = _last_ts(s)  # recovery target: just after doc 3
+    s.insert("app", "c", [{"_id": 4}])
+    s.insert("app", "c", [{"_id": 5}])
+    pruned = s.prune_oplog()  # cap=2 keeps seq 4,5; seq 1,2,3 archived + dropped
+    assert pruned >= 3
+    assert s.oplog_floor_seq() == 4  # live oplog no longer reaches seq 3
+    s.close()
+
+    # v1 can't do this — the source oplog floor is past genesis.
+    with pytest.raises(ValueError, match="past genesis"):
+        oplog_replay.restore_to_timestamp(str(src), str(tmp_path / "v1"), to_ts=t3)
+
+    # v2 stitches base (docs 1,2) + archived seq 3 → docs 1,2,3 at t3.
+    out = tmp_path / "restored"
+    stats = pitr_archive.restore_from_archive_dir(str(archive), str(out), to_ts=t3)
+    assert stats["baseHeadSeq"] == 2
+    assert _docs(out, "app", "c") == [{"_id": 1}, {"_id": 2}, {"_id": 3}]
+
+
+def test_cli_restore_from_archive_dir(tmp_path: Path) -> None:
+    """`secantusdb restore --source <archive-dir>` routes to the v2 path."""
+    archive = tmp_path / "archive"
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True, oplog_archive_dir=str(archive), oplog_max_entries=2)
+    s.insert("app", "c", [{"_id": 1}])
+    s.insert("app", "c", [{"_id": 2}])
+    s.insert("app", "c", [{"_id": 3}])
+    s.archive_base_snapshot(str(archive))  # newest base has all three
+    s.prune_oplog()
+    s.close()
+
+    out = tmp_path / "restored"
+    rc = cli.main(["restore", "--source", str(archive), "--target-dir", str(out)])
+    assert rc == 0
+    assert _docs(out, "app", "c") == [{"_id": 1}, {"_id": 2}, {"_id": 3}]
+
+
+def test_wire_v2_archive_base_snapshot_and_restore(tmp_path: Path) -> None:
+    """End-to-end v2 over the wire: a server with --oplog-archive-dir archives
+    pruned oplog, `secantusAdmin.archiveBaseSnapshot` takes base snapshots, and
+    `secantusAdmin.restoreToTimestamp` rebuilds from the archive directory."""
+    archive = tmp_path / "archive"
+    src = tmp_path / "src"
+    with SecantusDBServer(
+        port=0,
+        storage_path=str(src),
+        oplog_archive_dir=str(archive),
+        oplog_max_entries=2,
+    ) as srv:
+        admin = MongoClient(srv.uri, directConnection=True)["admin"]
+        coll = MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll.insert_one({"_id": 1})
+        coll.insert_one({"_id": 2})
+        snap = admin.command({"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": str(archive)})
+        assert snap["ok"] == 1.0 and "path" in snap
+        coll.insert_one({"_id": 3})
+        coll.insert_one({"_id": 4})
+        admin.command({"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": str(archive)})
+        admin.command({"secantusAdmin.pruneOplog": 1})  # archives the pruned front
+        out = tmp_path / "restored"
+        reply = admin.command(
+            {"secantusAdmin.restoreToTimestamp": 1, "source": str(archive), "targetDir": str(out)}
+        )
+    assert reply["ok"] == 1.0
+    with SecantusDBServer(port=0, storage_path=str(out)) as srv:
+        got = sorted(
+            MongoClient(srv.uri, directConnection=True)["app"]["c"].find({}),
+            key=lambda d: d["_id"],
+        )
+    assert got == [{"_id": 1}, {"_id": 2}, {"_id": 3}, {"_id": 4}]
+
+
+def test_v2_segment_roundtrip(tmp_path: Path) -> None:
+    """Archived oplog segments round-trip their rows verbatim in seq order."""
+    archive = str(tmp_path / "arch")
+    rows = [
+        (1, {"op": "i", "ns": "a.b", "o": {"_id": 1}}, None),
+        (2, {"op": "i", "ns": "a.b", "o": {"_id": 2}}, {"_id": 2, "old": True}),
+    ]
+    pitr_archive.write_segment(archive, rows)
+    got = list(pitr_archive.iter_archived_oplog(archive))
+    assert [(seq, e["o"]["_id"], p) for seq, e, p in got] == [
+        (1, 1, None),
+        (2, 2, {"_id": 2, "old": True}),
+    ]
+
+
+def _next_event(cs: Any, tries: int = 60) -> dict[str, Any]:
+    """Poll a change stream for the next event (the restored oplog already
+    holds it, so this returns within a few polls)."""
+    for _ in range(tries):
+        ev = cs.try_next()
+        if ev is not None:
+            return ev
+        time.sleep(0.05)
+    raise AssertionError("no change event arrived")
+
+
+def test_carry_oplog_preserves_timeline(tmp_path: Path) -> None:
+    """``carry_oplog`` writes the replayed oplog verbatim onto the restored
+    store — same seqs — and advances the seq counter so a fresh write mints a
+    strictly-greater seq. The default (no carry) leaves an empty timeline."""
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True)
+    s.insert("app", "c", [{"_id": 1}])
+    s.insert("app", "c", [{"_id": 2}])
+    s.insert("app", "c", [{"_id": 3}])
+    src_seqs = [seq for seq, _ in s.read_oplog(start_seq=1, limit=100)]
+    s.close()
+
+    carried = tmp_path / "carried"
+    stats = oplog_replay.restore_to_timestamp(str(src), str(carried), carry_oplog=True)
+    assert stats["oplogCarried"] == len(src_seqs)
+    r = Storage(str(carried), enable_oplog=True)
+    try:
+        assert [seq for seq, _ in r.read_oplog(start_seq=1, limit=100)] == src_seqs
+        tail = r.oplog_tail_seq()
+        r.insert("app", "c", [{"_id": 4}])
+        assert r.oplog_tail_seq() == tail + 1  # new write continues the timeline
+    finally:
+        r.close()
+
+    # Default restore leaves the restored oplog empty (fresh timeline).
+    fresh = tmp_path / "fresh"
+    stats = oplog_replay.restore_to_timestamp(str(src), str(fresh))
+    assert stats["oplogCarried"] == 0
+    r = Storage(str(fresh), enable_oplog=True)
+    try:
+        assert r.read_oplog(start_seq=1, limit=100) == []
+    finally:
+        r.close()
+
+
+def test_preserve_oplog_change_stream_resumes_across_restore(tmp_path: Path) -> None:
+    """End-to-end: with ``preserveOplog`` a change stream on the restored server
+    resumes from a token minted *before* the restore point — the carried oplog
+    still holds the rows that token references."""
+    src = tmp_path / "src"
+    with SecantusDBServer(port=0, storage_path=str(src)) as srv:
+        coll = MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll.insert_one({"_id": 1})
+        cs = coll.watch()
+        coll.insert_one({"_id": 2})
+        token = _next_event(cs)["_id"]  # resume token after the {_id: 2} insert
+        cs.close()
+        coll.insert_one({"_id": 3})  # happens after the token, before backup
+        archive = str(tmp_path / "backup.tar.gz")
+        MongoClient(srv.uri, directConnection=True)["admin"].command(
+            {"secantusAdmin.backupArchive": 1, "outputPath": archive}
+        )
+
+    out = tmp_path / "restored"
+    stats = oplog_replay.restore_archive_to_timestamp(archive, str(out), carry_oplog=True)
+    assert stats["oplogCarried"] > 0
+
+    with SecantusDBServer(port=0, storage_path=str(out)) as srv:
+        coll = MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        cs = coll.watch(resume_after=token)
+        ev = _next_event(cs)
+        cs.close()
+        assert ev["operationType"] == "insert"
+        assert ev["fullDocument"] == {"_id": 3}
+
+
+def test_collection_options_replayed(tmp_path: Path) -> None:
+    """capped / size / max + a validator set at *create* time survive PITR
+    replay. These ride the ``create`` oplog entry — the options blob itself
+    is oplog-silent, so before this they were lost on restore."""
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True)
+    s.create_collection(
+        "app",
+        "events",
+        options={
+            "capped": True,
+            "size": 8192,
+            "max": 100,
+            "validator": {"v": {"$gt": 0}},
+        },
+    )
+    s.insert("app", "events", [{"_id": 1, "v": 5}])
+    s.close()
+
+    out = tmp_path / "restored"
+    oplog_replay.restore_to_timestamp(str(src), str(out))
+    r = Storage(str(out), enable_oplog=True)
+    try:
+        opts = r.get_collection_options("app", "events")
+        assert opts.get("capped") is True
+        assert opts.get("size") == 8192
+        assert opts.get("max") == 100
+        assert opts.get("validator") == {"v": {"$gt": 0}}
+        assert r.find_matching("app", "events", {}) == [{"_id": 1, "v": 5}]
+    finally:
+        r.close()
+
+
+def test_wire_create_options_survive_restore(tmp_path: Path) -> None:
+    """End-to-end: a capped collection with a validator created through the
+    driver is reconstructed (options and all) on the restored server, proving
+    the wire ``create`` -> oplog -> replay path carries collection options."""
+    src = tmp_path / "src"
+    with SecantusDBServer(port=0, storage_path=str(src)) as srv:
+        db = MongoClient(srv.uri, directConnection=True)["app"]
+        db.create_collection(
+            "events",
+            capped=True,
+            size=8192,
+            max=100,
+            validator={"v": {"$gt": 0}},
+        )
+        db["events"].insert_one({"_id": 1, "v": 5})
+
+    out = tmp_path / "restored"
+    oplog_replay.restore_to_timestamp(str(src), str(out))
+    with SecantusDBServer(port=0, storage_path=str(out)) as srv:
+        db = MongoClient(srv.uri, directConnection=True)["app"]
+        info = next(c for c in db.list_collections() if c["name"] == "events")
+        opts = info["options"]
+        assert opts.get("capped") is True
+        assert opts.get("size") == 8192
+        assert opts.get("max") == 100
+        assert opts.get("validator") == {"v": {"$gt": 0}}

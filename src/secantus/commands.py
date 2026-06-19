@@ -937,6 +937,38 @@ def _secantus_admin_backup_archive(doc: dict[str, Any], ctx: CommandContext) -> 
     return {"path": result["path"], "sizeBytes": result["sizeBytes"], "ok": 1.0}
 
 
+def _secantus_admin_archive_base_snapshot(
+    doc: dict[str, Any], ctx: CommandContext
+) -> dict[str, Any]:
+    """SecantusDB extension: take a PITR v2 base snapshot into ``archiveDir``.
+
+    Writes ``base-<headSeq>.tar.gz`` into ``archiveDir`` (a server-side path).
+    Pair with a server started with ``--oplog-archive-dir <archiveDir>`` so the
+    oplog rows ``prune_oplog`` drops are archived as segments into the same
+    directory; recovery then stitches the newest base ≤ T plus the segments to
+    reach any time in the archived window. Call this periodically — there is no
+    background scheduler. Returns ``{path, sizeBytes, headSeq, ok: 1}``.
+    """
+    archive_dir = doc.get("archiveDir")
+    if not isinstance(archive_dir, str) or not archive_dir:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.archiveBaseSnapshot requires archiveDir: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    try:
+        result = ctx.storage.archive_base_snapshot(archive_dir)
+    except RuntimeError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {
+        "path": result["path"],
+        "sizeBytes": result["sizeBytes"],
+        "headSeq": result["headSeq"],
+        "ok": 1.0,
+    }
+
+
 def _secantus_admin_restore_archive(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     """SecantusDB extension: extract a backup archive into ``targetDir``.
 
@@ -1021,14 +1053,25 @@ def _secantus_admin_restore_to_timestamp(
         }
     to_ts = doc.get("toTimestamp")
     to_wall = doc.get("toTime")
+    # ``preserveOplog`` carries the replayed oplog onto the restored directory
+    # so a change stream there can resume from before the restore point. Default
+    # is a fresh timeline (like mongorestore).
+    carry_oplog = bool(doc.get("preserveOplog", False))
     try:
-        if source.endswith((".tar.gz", ".tgz")):
+        from secantus import pitr_archive
+
+        if pitr_archive.is_archive_dir(source):
+            # PITR v2: a directory of base snapshots + oplog segments.
+            stats = pitr_archive.restore_from_archive_dir(
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
+            )
+        elif source.endswith((".tar.gz", ".tgz")):
             stats = oplog_replay.restore_archive_to_timestamp(
-                source, target_dir, to_ts=to_ts, to_wall=to_wall
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
             )
         else:
             stats = oplog_replay.restore_to_timestamp(
-                source, target_dir, to_ts=to_ts, to_wall=to_wall
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
             )
     except (ValueError, RuntimeError) as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
@@ -1039,6 +1082,7 @@ def _secantus_admin_restore_to_timestamp(
         "lastSeq": stats["lastSeq"],
         "lastTs": stats.get("lastTs"),
         "lastWall": stats.get("lastWall"),
+        "oplogCarried": stats.get("oplogCarried", 0),
         "ok": 1.0,
     }
 
@@ -2762,7 +2806,6 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 72,
                 "codeName": "InvalidOptions",
             }
-    ctx.storage.create_collection(ctx.db_name, coll)
     stored: dict[str, Any] = {}
     if capped:
         stored["capped"] = True
@@ -2838,8 +2881,14 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             view_pipeline = []
         stored["viewOn"] = view_on
         stored["viewPipeline"] = list(view_pipeline)
-    if stored:
-        ctx.storage.set_collection_options(ctx.db_name, coll, **stored)
+    # Create with the options inline so they ride the ``create`` oplog ``c``
+    # entry (carried as siblings of ``create`` in ``o``). This is what lets
+    # PITR replay and ``show_expanded_events`` create events reconstruct
+    # ``capped`` / ``size`` / ``max`` / ``validator`` / … rather than seeing a
+    # bare ``{create, idIndex}``. Building ``stored`` before the create call
+    # also means an invalid ``clusteredIndex`` rejects without leaving a
+    # half-created collection behind.
+    ctx.storage.create_collection(ctx.db_name, coll, options=stored or None)
     return {"ok": 1.0}
 
 
@@ -5266,6 +5315,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "secantusAdmin.pruneOplog": _secantus_admin_prune_oplog,
     "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
     "secantusAdmin.backupArchive": _secantus_admin_backup_archive,
+    "secantusAdmin.archiveBaseSnapshot": _secantus_admin_archive_base_snapshot,
     "secantusAdmin.restoreArchive": _secantus_admin_restore_archive,
     "secantusAdmin.restoreToTimestamp": _secantus_admin_restore_to_timestamp,
     "explain": _explain,
@@ -5434,6 +5484,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "secantusAdmin.pruneOplog": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.backupArchive": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.archiveBaseSnapshot": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.restoreArchive": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.restoreToTimestamp": (A_FSYNC, SCOPE_CLUSTER),
 }

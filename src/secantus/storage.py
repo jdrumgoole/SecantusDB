@@ -786,6 +786,7 @@ class Storage:
         cache_size: str = "1G",
         session_max: int = 1000,
         sync_on_commit: bool = False,
+        oplog_archive_dir: str | None = None,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -898,6 +899,11 @@ class Storage:
         # Oplog state — durable across restart via _OPLOG_META_TABLE.
         self.oplog_retention_seconds = float(oplog_retention_seconds)
         self.oplog_max_entries = int(oplog_max_entries)
+        # When set, ``prune_oplog`` writes the rows it is about to drop into a
+        # durable oplog segment in this directory first (PITR v2), so recovery
+        # can reach a time before the live oplog floor. See
+        # :mod:`secantus.pitr_archive`.
+        self.oplog_archive_dir = oplog_archive_dir
         self._time = time_func or _time.time
         self._oplog_cv = threading.Condition(threading.Lock())
         # Set by ``signal_shutdown()`` at server stop so tailable getMore
@@ -1680,6 +1686,63 @@ class Storage:
                 with contextlib.suppress(Exception):
                     session.close()
 
+    def import_oplog_segment(
+        self,
+        rows: Iterable[tuple[int, Mapping[str, Any]]],
+        pre_images: Mapping[int, Mapping[str, Any]] | None = None,
+    ) -> int:
+        """Write **verbatim** oplog rows ``(seq, entry)`` into the oplog table,
+        carrying their original seq / ts / wall, and advance the seq + cluster
+        clock past them so subsequent live writes mint strictly-greater values.
+
+        This is the seam point-in-time recovery uses to preserve the source's
+        oplog timeline on the restored store (``carry_oplog`` /
+        ``--preserve-oplog``): a change stream on the restored server can then
+        resume from a token minted *before* the restore point, because the rows
+        that token references are present. ``pre_images`` maps seq -> pre-image
+        document for the seqs that had one stored.
+
+        Unlike ``_emit_oplog`` this does NOT mint new seqs — the rows keep their
+        identity, so resume tokens stay valid. Returns the highest seq written
+        (0 if ``rows`` is empty). No-op when ``enable_oplog`` is False.
+        """
+        if not self.enable_oplog:
+            return 0
+        pre_images = pre_images or {}
+        max_seq = 0
+        best_secs = 0
+        best_ord = 0
+        with self._lock:
+            op_cur = self._cursor(_OPLOG_TABLE)
+            pre_cur = None
+            wrote = False
+            for seq, entry in rows:
+                wrote = True
+                iseq = int(seq)
+                op_cur[iseq] = bson.encode(dict(entry))
+                pre = pre_images.get(iseq)
+                if pre is not None:
+                    if pre_cur is None:
+                        pre_cur = self._cursor(_PREIMAGE_TABLE)
+                    pre_cur[iseq] = bson.encode(dict(pre))
+                if iseq > max_seq:
+                    max_seq = iseq
+                ts = entry.get("ts")
+                if isinstance(ts, Timestamp) and (ts.time, ts.inc) > (best_secs, best_ord):
+                    best_secs, best_ord = ts.time, ts.inc
+            if not wrote:
+                return 0
+            with self._oplog_seq_lock:
+                if max_seq + 1 > self._next_seq:
+                    self._next_seq = max_seq + 1
+                if (best_secs, best_ord) > (self._last_ts_secs, self._last_ts_ord):
+                    self._last_ts_secs = best_secs
+                    self._last_ts_ord = best_ord
+            self._persist_oplog_meta()
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+        return max_seq
+
     def oplog_tail_seq(self) -> int:
         """Highest seq currently present (or last emitted). 0 if empty."""
         with self._lock:
@@ -1798,6 +1861,10 @@ class Storage:
                     extra -= 1
         if not doomed:
             return 0
+        # PITR v2: archive the doomed rows to a durable segment *before* deleting
+        # them, so recovery can still reach a time before the new oplog floor.
+        if self.oplog_archive_dir is not None:
+            self._archive_doomed_oplog(sorted(doomed))
         op_del = self._cursor(_OPLOG_TABLE)
         pre_del = self._cursor(_PREIMAGE_TABLE)
         for seq in doomed:
@@ -1810,6 +1877,32 @@ class Storage:
                 pre_del.remove()
             pre_del.reset()
         return len(doomed)
+
+    def _archive_doomed_oplog(self, doomed_sorted: list[int]) -> None:
+        """Write the soon-to-be-pruned oplog rows (and their pre-images) into a
+        durable segment in ``oplog_archive_dir``. Called under ``self._lock``
+        from ``_prune_oplog_locked`` before the rows are deleted."""
+        from . import pitr_archive
+
+        op_cur = self._cursor(_OPLOG_TABLE)
+        pre_cur = self._cursor(_PREIMAGE_TABLE)
+        rows: list[tuple[int, dict[str, Any], dict[str, Any] | None]] = []
+        for seq in doomed_sorted:
+            op_cur.set_key(seq)
+            if op_cur.search() != 0:
+                op_cur.reset()
+                continue
+            entry = bson.decode(bytes(op_cur.get_value()))
+            op_cur.reset()
+            pre = None
+            pre_cur.set_key(seq)
+            if pre_cur.search() == 0:
+                pre_blob = bytes(pre_cur.get_value())
+                if pre_blob:
+                    pre = bson.decode(pre_blob)
+            pre_cur.reset()
+            rows.append((seq, entry, pre))
+        pitr_archive.write_segment(self.oplog_archive_dir, rows)
 
     # --- Users (auth) ---
 
@@ -2327,6 +2420,24 @@ class Storage:
                 backup_session.close()
         return {"path": abs_out, "sizeBytes": os.path.getsize(abs_out)}
 
+    def archive_base_snapshot(self, archive_dir: str) -> dict[str, int | str]:
+        """Take a base snapshot into ``archive_dir`` for PITR v2, named by its
+        oplog head seq (``base-<head>.tar.gz``) so the restore path can order and
+        select snapshots. Thin wrapper over :meth:`create_archive`.
+
+        Pair with ``oplog_archive_dir=<archive_dir>`` (so pruned oplog rows are
+        archived as segments into the same directory) and call this periodically
+        — there is no background scheduler, matching ``prune_ttl`` / ``prune_oplog``.
+        """
+        from . import pitr_archive
+
+        with self._lock:
+            head = self.oplog_tail_seq_nolock()
+        out = os.path.join(archive_dir, pitr_archive.base_name(head))
+        result = self.create_archive(out)
+        result["headSeq"] = head
+        return result
+
     def _pitr_manifest(self) -> dict[str, Any]:
         """Build the point-in-time-recovery manifest embedded in a backup
         archive: the oplog seq range and timestamps it can recover to, plus
@@ -2337,23 +2448,32 @@ class Storage:
         floor = self.oplog_floor_seq()
         head = self.oplog_tail_seq_nolock()
 
-        def _ts_of(seq: int) -> list[int] | None:
+        def _row(seq: int) -> dict[str, Any] | None:
             if seq <= 0:
                 return None
             rows = self.read_oplog(start_seq=seq, limit=1)
-            if not rows:
-                return None
-            ts = rows[0][1].get("ts")
+            return rows[0][1] if rows else None
+
+        def _ts_of(row: dict[str, Any] | None) -> list[int] | None:
+            ts = row.get("ts") if row else None
             return [ts.time, ts.inc] if isinstance(ts, Timestamp) else None
 
+        def _wall_of(row: dict[str, Any] | None) -> str | None:
+            wall = row.get("wall") if row else None
+            return wall.isoformat() if isinstance(wall, _dt.datetime) else None
+
+        floor_row = _row(floor)
+        head_row = _row(head)
         return {
             "secantusPitrManifest": 1,
             "oplogEnabled": bool(self.enable_oplog),
             "oplogFloorSeq": floor,
             "oplogHeadSeq": head,
             "genesisIntact": floor == 1,
-            "oplogFloorTs": _ts_of(floor),
-            "oplogHeadTs": _ts_of(head),
+            "oplogFloorTs": _ts_of(floor_row),
+            "oplogHeadTs": _ts_of(head_row),
+            "oplogFloorWall": _wall_of(floor_row),
+            "oplogHeadWall": _wall_of(head_row),
         }
 
     @contextlib.contextmanager
@@ -2647,7 +2767,18 @@ class Storage:
         with self._lock:
             return self._coll_options(db, coll) is not None
 
-    def create_collection(self, db: str, coll: str) -> bool:
+    def create_collection(
+        self, db: str, coll: str, options: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Create ``db.coll`` (no-op-False if it already exists).
+
+        ``options`` is the collection-options blob (``capped`` / ``size`` /
+        ``max`` / ``validator`` / ``viewOn`` / … — everything the ``create``
+        command persists). It is written to the options blob *and* carried as
+        siblings of ``create`` in the ``c`` oplog entry's ``o``, so PITR replay
+        and ``show_expanded_events`` create events reconstruct the options
+        rather than seeing a bare ``{create, idIndex}``.
+        """
         with self._lock:
             c = self._cursor(_COLL_TABLE)
             c.set_key(db, coll)
@@ -2655,18 +2786,22 @@ class Storage:
                 return False
             c.reset()
             c[db, coll] = b""
-            self._collection_uuid(db, coll)  # mint and persist
-            ui = self._collection_uuid(db, coll)
+            if options:
+                # Persist before minting the UUID — ``_collection_uuid``'s
+                # mint path re-reads and merges, so the options survive.
+                self._write_coll_options(db, coll, dict(options))
+            ui = self._collection_uuid(db, coll)  # mint and persist
+            o: dict[str, Any] = {"create": coll}
+            if options:
+                o.update(options)
+            o["idIndex"] = {"v": 2, "key": {"_id": 1}, "name": "_id_"}
             self._emit_oplog(
                 [
                     {
                         "op": "c",
                         "ns": f"{db}.$cmd",
                         "ui": bson.Binary(ui.bytes, subtype=4),
-                        "o": {
-                            "create": coll,
-                            "idIndex": {"v": 2, "key": {"_id": 1}, "name": "_id_"},
-                        },
+                        "o": o,
                     }
                 ]
             )
