@@ -409,6 +409,10 @@ impl CmdStorage for StorageAdapter {
         self.inner.list_collections(db).map_err(map_err)
     }
 
+    fn list_databases(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_databases().map_err(map_err)
+    }
+
     fn create_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
         self.inner.create_collection(db, coll).map_err(map_err)
     }

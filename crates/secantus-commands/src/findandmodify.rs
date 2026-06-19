@@ -69,6 +69,14 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // match. The subsequent update/delete is keyed by the matched doc's `_id`.
     let let_vars = resolve_let_vars(doc.get("let"));
     let collation = collation_of(doc);
+    // `arrayFilters` ($[ident] identifiers) for an operator-form update.
+    let array_filters: Vec<Document> = doc
+        .get("arrayFilters")
+        .and_then(Bson::as_array)
+        .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
+        .unwrap_or_default();
+    // Pipeline-form update (`update: [ {$set: …}, … ]`) vs operator/replacement.
+    let pipeline = update.and_then(Bson::as_array);
 
     // Collection validator on the post-apply doc (code 121) unless
     // `bypassDocumentValidation` / `validationAction: warn|off`, mirroring the
@@ -110,22 +118,36 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // No match.
     let Some(matched_bytes) = matched else {
         if upsert && !is_remove {
-            let upd = update
-                .and_then(Bson::as_document)
-                .cloned()
-                .unwrap_or_default();
-            let outcome = match storage.update_matching_array_filters(
-                &ctx.db_name,
-                &coll,
-                &query,
-                &upd,
-                false,
-                true,
-                &[],
-                &let_vars,
-                collation.as_ref(),
-                validator.as_ref(),
-            ) {
+            let outcome = match if let Some(stages) = pipeline {
+                storage.update_matching_pipeline(
+                    &ctx.db_name,
+                    &coll,
+                    &query,
+                    stages,
+                    false,
+                    true,
+                    &let_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                )
+            } else {
+                let upd = update
+                    .and_then(Bson::as_document)
+                    .cloned()
+                    .unwrap_or_default();
+                storage.update_matching_array_filters(
+                    &ctx.db_name,
+                    &coll,
+                    &query,
+                    &upd,
+                    false,
+                    true,
+                    &array_filters,
+                    &let_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                )
+            } {
                 Ok(o) => o,
                 Err(e) => return Ok(storage_err_reply(e)),
             };
@@ -165,23 +187,38 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         });
     }
 
-    // update: apply it to the matched doc.
-    let upd = update
-        .and_then(Bson::as_document)
-        .cloned()
-        .unwrap_or_default();
-    if let Err(e) = storage.update_matching_array_filters(
-        &ctx.db_name,
-        &coll,
-        &id_filter,
-        &upd,
-        false,
-        false,
-        &[],
-        &let_vars,
-        collation.as_ref(),
-        validator.as_ref(),
-    ) {
+    // update: apply it to the matched doc (pipeline-form or operator/replacement).
+    let update_result = if let Some(stages) = pipeline {
+        storage.update_matching_pipeline(
+            &ctx.db_name,
+            &coll,
+            &id_filter,
+            stages,
+            false,
+            false,
+            &let_vars,
+            collation.as_ref(),
+            validator.as_ref(),
+        )
+    } else {
+        let upd = update
+            .and_then(Bson::as_document)
+            .cloned()
+            .unwrap_or_default();
+        storage.update_matching_array_filters(
+            &ctx.db_name,
+            &coll,
+            &id_filter,
+            &upd,
+            false,
+            false,
+            &array_filters,
+            &let_vars,
+            collation.as_ref(),
+            validator.as_ref(),
+        )
+    };
+    if let Err(e) = update_result {
         return Ok(storage_err_reply(e));
     }
 

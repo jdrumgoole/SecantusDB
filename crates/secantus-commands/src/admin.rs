@@ -17,8 +17,6 @@
 //!   enforced — the command layer reads the validator and the storage update
 //!   checks the post-apply doc; code 121, bypassable via
 //!   `bypassDocumentValidation`).
-//! * `listCollections` name/filter + the richer per-collection `options` /
-//!   `idIndex` detail (a minimal, faithful-enough entry is returned).
 //! * `listIndexes` `NamespaceNotFound` on a missing collection (returns an empty
 //!   cursor instead).
 //! * `dropIndexes` by key-spec document (only by name / `"*"`).
@@ -39,7 +37,7 @@ use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SER
 /// `changeStreamPreAndPostImages` drives pre-image capture; `capped`/`size`/`max`
 /// are reported in stats. (TTL-index `expireAfterSeconds` modification via
 /// `collMod`'s `index` option is deferred.)
-const STORED_COLL_OPTIONS: [&str; 8] = [
+const STORED_COLL_OPTIONS: [&str; 9] = [
     "validator",
     "validationLevel",
     "validationAction",
@@ -50,6 +48,8 @@ const STORED_COLL_OPTIONS: [&str; 8] = [
     // Persisted so the storage layer can recognise a timeseries collection and
     // relax `_id` uniqueness (mongod buckets by time; `_id` is not a key).
     "timeseries",
+    // The collection's default collation — surfaced back in `listCollections`.
+    "collation",
 ];
 
 /// The subset of a command doc that maps to persisted collection options.
@@ -307,25 +307,55 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ns": format!("{}.{}", ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0 })
 }
 
-/// `listCollections` — a cursor over the collections in the database.
-pub fn list_collections(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `listCollections` — a cursor over the collections in the database, honouring
+/// `filter` (a query predicate over each entry) and `nameOnly`. Each entry's
+/// `options` reflects the collection's stored options (capped / validator /
+/// collation / timeseries / …) so drivers introspecting them see the real
+/// values. Mirrors `commands._list_collections`.
+pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
+    let filter = doc
+        .get("filter")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+    let name_only = bool_field(doc, "nameOnly", false);
     let names = storage
         .list_collections(&ctx.db_name)
         .map_err(command_error)?;
-    let entries: Vec<Document> = names
-        .iter()
-        .map(|n| {
-            doc! {
-                "name": n,
-                "type": "collection",
-                "options": {},
-                "info": { "readOnly": false },
-                "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
-            }
-        })
-        .collect();
+    let mut entries: Vec<Document> = Vec::with_capacity(names.len());
+    for n in &names {
+        let options = storage
+            .get_collection_options(&ctx.db_name, n)
+            .map_err(command_error)?;
+        let coll_type = if options.contains_key("timeseries") {
+            "timeseries"
+        } else {
+            "collection"
+        };
+        entries.push(doc! {
+            "name": n,
+            "type": coll_type,
+            "options": Bson::Document(options),
+            "info": { "readOnly": false },
+            "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+        });
+    }
+    // `filter` is evaluated against the full entry (so `{name: …}`,
+    // `{type: …}`, `{"options.capped": true}` all work); apply it before the
+    // `nameOnly` projection so a filter on `options` still matches.
+    if let Some(f) = filter {
+        entries.retain(|e| {
+            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
+        });
+    }
+    if name_only {
+        for e in &mut entries {
+            let name = e.get_str("name").unwrap_or("").to_string();
+            let ty = e.get_str("type").unwrap_or("collection").to_string();
+            *e = doc! { "name": name, "type": ty };
+        }
+    }
     let ns = format!("{}.$cmd.listCollections", ctx.db_name);
     let (first, cid) = split_into_cursor(
         encode_docs(entries)?,
@@ -335,6 +365,49 @@ pub fn list_collections(_doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     )?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
+        "ok": 1.0,
+    })
+}
+
+/// `listDatabases` — descriptors for every database, honouring `filter` and
+/// `nameOnly`. Mirrors `commands._list_databases`: each descriptor is
+/// `{name, sizeOnDisk, empty}` (`sizeOnDisk` = summed BSON doc bytes across the
+/// db's collections; `empty` = size 0), reduced to `{name}` under `nameOnly`.
+/// The `filter` is a query predicate evaluated against each descriptor; it's
+/// applied after `totalSize` is accumulated, matching mongod.
+pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    let name_only = bool_field(doc, "nameOnly", false);
+    let filter = doc
+        .get("filter")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+
+    let names = storage.list_databases().map_err(command_error)?;
+    let mut descriptors: Vec<Document> = Vec::new();
+    let mut total_size: i64 = 0;
+    for n in &names {
+        if name_only {
+            descriptors.push(doc! { "name": n });
+            continue;
+        }
+        let mut size: i64 = 0;
+        for coll in storage.list_collections(n).map_err(command_error)? {
+            size += storage
+                .collection_data_size(n, &coll)
+                .map_err(command_error)?;
+        }
+        total_size += size;
+        descriptors.push(doc! { "name": n, "sizeOnDisk": size, "empty": size == 0 });
+    }
+    if let Some(f) = filter {
+        descriptors.retain(|d| {
+            secantus_core::query::matches(d, f, &Document::new(), None).unwrap_or(false)
+        });
+    }
+    Ok(doc! {
+        "databases": Bson::Array(descriptors.into_iter().map(Bson::Document).collect()),
+        "totalSize": total_size,
         "ok": 1.0,
     })
 }

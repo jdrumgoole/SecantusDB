@@ -379,6 +379,12 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Names of all databases that hold at least one collection (for
+    /// `listDatabases`). Default empty; the WT adapter forwards.
+    fn list_databases(&self) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Create a collection. `true` if newly created, `false` if it already existed.
     fn create_collection(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
         Ok(true)
