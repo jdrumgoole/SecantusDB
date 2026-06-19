@@ -90,8 +90,9 @@ SecantusDB **unmodified** — see the
 [Rust-driver](validation-report-rust.md),
 [PHP-library](validation-report-php-lib.md),
 [PHP-extension](validation-report-php-ext.md),
-[C-driver](validation-report-c.md), and
-[C++-driver](validation-report-cxx.md) validation reports for
+[C-driver](validation-report-c.md),
+[C++-driver](validation-report-cxx.md), and
+[.NET-driver](validation-report-dotnet.md) validation reports for
 current pass-rates per feature category.
 
 ## What's in scope
@@ -219,6 +220,7 @@ validation-report-php-lib
 validation-report-php-ext
 validation-report-c
 validation-report-cxx
+validation-report-dotnet
 validation-report-rust-server
 api
 changelog

@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### An eleventh conformance gauge: the MongoDB C# / .NET driver
+
+SecantusDB now also measures itself against the official MongoDB **C# / .NET**
+driver — the one the .NET, Unity, and Xamarin ecosystems build on — bringing the
+gauge count to eleven. The gauge runs the driver's own xUnit suite via `dotnet
+test` against an embedded SecantusDB daemon, with `MONGODB_URI` pointed at it,
+scoped to the CRUD specification conformance tests
+(`MongoDB.Driver.Tests.Specifications.crud`). `MongoDB.Driver.Tests` as a whole
+is enormous and dominated by non-server unit tests and external-service suites
+(client-side encryption, Atlas Search, multi-node transactions), so the CRUD
+spec runner is the focused, bounded conformance slice — expandable to more spec
+families over time. The driver's `[RequireServer]` attribute self-skips tests
+whose server-version or topology requirements a single node doesn't meet.
+
+Run it with `invoke validate-dotnet` (needs the .NET SDK and `gpg` — the driver's
+encryption project verifies a downloaded libmongocrypt during build). It joins
+the weekly `validate.yml` matrix and the cross-driver summary.
+
+#### Added
+- `dotnet_validation/` gauge package (`runner` / `generate_report` /
+  `include_paths`) and the `invoke validate-dotnet` task; wired into `invoke
+  validate-all`, the cross-driver summary (`validation_summary`), and CI.
+
 ### Two new conformance gauges: the MongoDB C and C++ drivers
 
 SecantusDB now measures itself against the official MongoDB **C** (`libmongoc`)

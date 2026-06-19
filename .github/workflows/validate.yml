@@ -1,7 +1,7 @@
 name: Validate (driver conformance)
 
 # Runs the vendored driver test suites (pymongo, go, node, java,
-# ruby, rust, php-lib, php-ext, c, cxx) against SecantusDB and regenerates the per-driver
+# ruby, rust, php-lib, php-ext, c, cxx, dotnet) against SecantusDB and regenerates the per-driver
 # `docs/validation-report*.md` files. Slow (~10–15 min per driver on
 # a fresh WT build) so this is NOT on every push — it runs weekly on
 # Monday and can be triggered manually.
@@ -37,6 +37,7 @@ jobs:
           - { name: php-ext, task: validate-php-ext, report: docs/validation-report-php-ext.md }
           - { name: c,       task: validate-c,    report: docs/validation-report-c.md }
           - { name: cxx,     task: validate-cxx,  report: docs/validation-report-cxx.md }
+          - { name: dotnet,  task: validate-dotnet, report: docs/validation-report-dotnet.md }
           # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
           # suite as the headline gauge, pointed at the Rust server via
           # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so
@@ -122,6 +123,25 @@ jobs:
           key: ${{ runner.os }}-mongocxx-${{ hashFiles('vendor/mongo-c-driver/VERSION_CURRENT', 'vendor/mongo-cxx-driver/etc/purls.txt', 'vendor/mongo-cxx-driver/CMakeLists.txt') }}
           restore-keys: |
             ${{ runner.os }}-mongocxx-
+
+      # The .NET gauge runs mongo-csharp-driver's xUnit suite via `dotnet test`.
+      # The driver's Encryption project verifies a downloaded libmongocrypt with
+      # gpg (preinstalled on ubuntu-latest) during build. The test project
+      # targets net10.0.
+      - name: Set up .NET SDK
+        if: matrix.driver.name == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Cache NuGet packages
+        if: matrix.driver.name == 'dotnet'
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('vendor/mongo-csharp-driver/**/*.csproj', 'vendor/mongo-csharp-driver/**/Directory.Packages.props') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
 
       - name: Set up Go
         if: matrix.driver.name == 'go'

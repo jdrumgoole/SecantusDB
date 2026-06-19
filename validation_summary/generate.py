@@ -531,6 +531,43 @@ def _collect_cxx(raw_dir: Path) -> GaugeStats | None:
     )
 
 
+# TRX outcomes that are skips (vs Passed / failures).
+_TRX_NS = "{http://microsoft.com/schemas/VisualStudio/TeamTest/2010}"
+_TRX_SKIP = {"NotExecuted", "Inconclusive", "NotRunnable", "Pending", "Warning"}
+
+
+def _collect_dotnet(raw_dir: Path) -> GaugeStats | None:
+    """Read ``dotnet test`` TRX output (``.validation/dotnet-raw.trx``)."""
+    f = raw_dir / "dotnet-raw.trx"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for res in root.iter(f"{_TRX_NS}UnitTestResult"):
+        outcome = res.attrib.get("outcome", "")
+        if outcome == "Passed":
+            passed += 1
+        elif outcome in _TRX_SKIP:
+            skipped += 1
+        else:
+            failed += 1
+            failure_descs.append(res.attrib.get("testName", ""))
+    return GaugeStats(
+        name="mongo-csharp-driver",
+        language="C#",
+        driver_version=_read_submodule_head("mongo-csharp-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated MongoDB.Driver.Tests CRUD specification suite (xUnit)",
+    )
+
+
 _COLLECTORS = (
     _collect_pymongo,
     _collect_java,
@@ -542,6 +579,7 @@ _COLLECTORS = (
     _collect_php_ext,
     _collect_c,
     _collect_cxx,
+    _collect_dotnet,
 )
 
 # Gauge name -> its per-driver report page (relative to docs/). Used by the
@@ -557,6 +595,7 @@ _REPORT_LINKS = {
     "mongo-php-driver": "./validation-report-php-ext.md",
     "mongo-c-driver": "./validation-report-c.md",
     "mongo-cxx-driver": "./validation-report-cxx.md",
+    "mongo-csharp-driver": "./validation-report-dotnet.md",
 }
 
 

@@ -40,6 +40,7 @@ from validation_summary.generate import (
     _apply_expected_failures,
     _collect_c,
     _collect_cxx,
+    _collect_dotnet,
     _collect_go,
     _collect_java,
     _collect_node,
@@ -197,6 +198,22 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
         ),
         "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-cxx.html"),
     },
+    "mongo-csharp-driver": {
+        "title": "mongo-csharp-driver",
+        "lang": "C#",
+        "note": (
+            "The official MongoDB <strong>C# / .NET</strong> driver — the one the "
+            ".NET / Unity / Xamarin ecosystem builds on. We run its xUnit CRUD "
+            "specification suite (<code>MongoDB.Driver.Tests.Specifications.crud</code>) "
+            "via <code>dotnet test</code> against an embedded SecantusDB daemon, with "
+            "<code>MONGODB_URI</code> pointed at it. The driver's "
+            "<code>[RequireServer]</code> attribute self-skips version- and "
+            "topology-gated cases."
+        ),
+        "report_url": (
+            "https://secantusdb.readthedocs.io/en/latest/validation-report-dotnet.html"
+        ),
+    },
 }
 
 # Trailing panels that aren't backed by ``.validation/`` raw data —
@@ -216,6 +233,7 @@ _COLLECTORS = {
     "mongo-php-driver": _collect_php_ext,
     "mongo-c-driver": _collect_c,
     "mongo-cxx-driver": _collect_cxx,
+    "mongo-csharp-driver": _collect_dotnet,
 }
 
 
