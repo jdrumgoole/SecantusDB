@@ -23,8 +23,22 @@ use bson::{doc, Bson, Document};
 
 use crate::cursors::{CursorProducer, TailableOptions};
 use crate::storage::{ChangeStreamOptions, ChangeStreamScope, Storage};
-use crate::util::as_i64;
+use crate::util::{as_i64, decode_docs, encode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+
+/// Aggregation stages a change-stream pipeline may contain after `$changeStream`
+/// (mongod's allow-list). Anything else is rejected when the stream is opened.
+const CHANGE_STREAM_PIPELINE_STAGES: &[&str] = &[
+    "$addFields",
+    "$set",
+    "$project",
+    "$replaceRoot",
+    "$replaceWith",
+    "$match",
+    "$redact",
+    "$unset",
+    "$changeStreamSplitLargeEvent",
+];
 
 /// The storage-backed producer stored in a change-stream cursor. Each `produce`
 /// polls the oplog tail from the current position and advances it.
@@ -36,6 +50,9 @@ struct ChangeStreamProducer {
     invalidated: bool,
     /// Max oplog rows scanned per poll — bounds a single getMore's work.
     limit: usize,
+    /// User aggregation stages after `$changeStream` (e.g. `$project` / `$match`
+    /// / `$addFields`), applied to each event before it reaches the client.
+    pipeline: Vec<Bson>,
 }
 
 impl CursorProducer for ChangeStreamProducer {
@@ -49,7 +66,11 @@ impl CursorProducer for ChangeStreamProducer {
                 if batch.invalidated {
                     self.invalidated = true;
                 }
-                batch.events
+                if self.pipeline.is_empty() {
+                    batch.events
+                } else {
+                    apply_event_pipeline(batch.events, &self.pipeline)
+                }
             }
             // A poll failure (decode / projection error) yields nothing this
             // round rather than tearing down the cursor; the next getMore retries.
@@ -155,6 +176,10 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         _ => format!("{}.$cmd.aggregate", ctx.db_name),
     };
 
+    // User pipeline stages after `$changeStream` (e.g. `$project` / `$match`),
+    // validated against the change-stream allow-list and applied to each event.
+    let user_pipeline = extract_change_stream_pipeline(doc)?;
+
     let producer = Box::new(ChangeStreamProducer {
         storage,
         scope,
@@ -162,6 +187,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         position,
         invalidated: false,
         limit: 1000,
+        pipeline: user_pipeline,
     });
 
     let cursors = ctx.cursors()?;
@@ -195,6 +221,88 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         },
         "ok": 1.0,
     })
+}
+
+/// Apply the user change-stream pipeline to a batch of projected event bytes:
+/// decode → run the storage-free core pipeline → re-encode. On any error (an
+/// event a stage can't handle) the raw events pass through, so a one-off
+/// unsupported construct never tears the stream down.
+fn apply_event_pipeline(events: Vec<Vec<u8>>, pipeline: &[Bson]) -> Vec<Vec<u8>> {
+    let raw = events.clone();
+    let Ok(decoded) = decode_docs(events) else {
+        return raw;
+    };
+    match secantus_core::aggregate::apply_pipeline(decoded, pipeline, &Document::new(), None) {
+        Ok(out) => encode_docs(out).unwrap_or(raw),
+        Err(_) => raw,
+    }
+}
+
+/// Extract + validate the user pipeline stages after `$changeStream`. Each must
+/// be in the change-stream allow-list ([`CHANGE_STREAM_PIPELINE_STAGES`]); a
+/// disallowed stage or a second `$changeStream` errors, and a stage that strips
+/// the event `_id` (the resume token) is a `ChangeStreamFatalError` (280). The
+/// `$changeStreamSplitLargeEvent` marker is dropped (handled at projection).
+fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandError> {
+    let Some(Bson::Array(stages)) = doc.get("pipeline") else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<Bson> = Vec::new();
+    for stage in stages.iter().skip(1) {
+        let Some(s) = stage.as_document() else {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "each aggregation stage must be a document",
+            ));
+        };
+        let name = s.keys().next().map(String::as_str).unwrap_or("");
+        if name == "$changeStream" {
+            return Err(CommandError::new(
+                40602,
+                "Location40602",
+                "$changeStream is only allowed as the first stage in a pipeline",
+            ));
+        }
+        if !CHANGE_STREAM_PIPELINE_STAGES.contains(&name) {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                format!("{name} is not permitted in a $changeStream pipeline"),
+            ));
+        }
+        if name == "$changeStreamSplitLargeEvent" {
+            continue;
+        }
+        if stage_removes_id(name, s.get(name)) {
+            return Err(CommandError::new(
+                280,
+                "ChangeStreamFatalError",
+                "the change stream pipeline may not remove the _id (resume token) field",
+            ));
+        }
+        out.push(stage.clone());
+    }
+    Ok(out)
+}
+
+/// Whether a `$project`/`$unset` stage strips the event's `_id` (resume token).
+fn stage_removes_id(stage_name: &str, spec: Option<&Bson>) -> bool {
+    match stage_name {
+        "$project" => spec
+            .and_then(Bson::as_document)
+            .and_then(|d| d.get("_id"))
+            .is_some_and(|v| {
+                matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false))
+                    || matches!(v, Bson::Double(d) if *d == 0.0)
+            }),
+        "$unset" => match spec {
+            Some(Bson::String(s)) => s == "_id",
+            Some(Bson::Array(a)) => a.iter().any(|x| x.as_str() == Some("_id")),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The `$changeStream: {...}` spec document from the first pipeline stage.

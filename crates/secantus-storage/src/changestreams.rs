@@ -405,6 +405,32 @@ fn project_command(
         let invalidates = matches!(scope, Scope::Coll { .. });
         return Ok((Some(event), invalidates));
     }
+    if let Ok(coll) = cmd.get_str("create") {
+        if !show_expanded_events {
+            return Ok((None, false));
+        }
+        let affected_ns = format!("{cmd_db}.{coll}");
+        if !scope_matches(&affected_ns, scope) {
+            return Ok((None, false));
+        }
+        // `operationDescription` carries the create options other than the name
+        // (e.g. `idIndex`), matching mongod's expanded `create` event.
+        let mut op_desc = Document::new();
+        for (k, v) in &cmd {
+            if k != "create" {
+                op_desc.insert(k.clone(), v.clone());
+            }
+        }
+        let event = base(
+            "create",
+            &affected_ns,
+            &[
+                ("ns", Bson::Document(ns_doc(&affected_ns))),
+                ("operationDescription", Bson::Document(op_desc)),
+            ],
+        )?;
+        return Ok((Some(event), false));
+    }
     if let Ok(coll) = cmd.get_str("createIndexes") {
         if !show_expanded_events {
             return Ok((None, false));
