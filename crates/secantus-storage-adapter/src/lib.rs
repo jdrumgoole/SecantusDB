@@ -521,6 +521,13 @@ impl CmdStorage for StorageAdapter {
         self.inner.drop_database(db).map_err(map_err)
     }
 
+    fn create_archive(&self, output_path: &str) -> Result<(String, u64), StorageError> {
+        self.inner
+            .create_archive(output_path)
+            .map(|info| (info.path, info.size_bytes))
+            .map_err(map_err)
+    }
+
     fn rename_collection(
         &self,
         src_db: &str,

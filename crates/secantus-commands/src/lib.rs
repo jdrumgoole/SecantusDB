@@ -257,6 +257,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "collmod" => admin::coll_mod,
         "explain" => admin::explain,
         "drop" => admin::drop,
+        "secantusAdmin.backupArchive" => admin::backup_archive,
         "listCollections" => admin::list_collections,
         "listDatabases" => admin::list_databases,
         "listIndexes" => admin::list_indexes,

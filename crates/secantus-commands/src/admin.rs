@@ -307,6 +307,24 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ns": format!("{}.{}", ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0 })
 }
 
+/// `secantusAdmin.backupArchive` — force a checkpoint and tar the WiredTiger home
+/// into `outputPath` (a server-side path) for point-in-time recovery. The on-disk
+/// and oplog formats match the Python server, so either server's restore tooling
+/// reads the result. Mirrors the Python `secantusAdmin.backupArchive` command.
+pub fn backup_archive(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let output_path = doc.get_str("outputPath").unwrap_or("");
+    if output_path.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.backupArchive requires outputPath: <string>",
+        ));
+    }
+    let storage = ctx.storage()?;
+    let (path, size_bytes) = storage.create_archive(output_path).map_err(command_error)?;
+    Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
+}
+
 /// `listCollections` — a cursor over the collections in the database, honouring
 /// `filter` (a query predicate over each entry) and `nameOnly`. Each entry's
 /// `options` reflects the collection's stored options (capped / validator /

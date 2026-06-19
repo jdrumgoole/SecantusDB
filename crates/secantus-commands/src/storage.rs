@@ -475,6 +475,16 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// Force a checkpoint and write a backup `.tar.gz` of the WiredTiger home to
+    /// `output_path`, returning `(path, size_bytes)`. Backs `secantusAdmin.backupArchive`
+    /// (PITR). Default: unsupported (test fakes have no on-disk state); the WT
+    /// adapter forwards to `Storage::create_archive`.
+    fn create_archive(&self, _output_path: &str) -> Result<(String, u64), StorageError> {
+        Err(StorageError::Internal(
+            "backupArchive: this storage backend has no on-disk state to archive".into(),
+        ))
+    }
+
     /// Rename a collection. Returns `(succeeded, error_message)`; `succeeded ==
     /// false` carries a reason (source missing / target exists).
     fn rename_collection(
