@@ -973,14 +973,56 @@ def validate_cxx(c: Context, server: str = "python") -> None:
     print(f"\nWrote docs/validation-report-cxx{suffix}.md")
 
 
+@task(name="validate-dotnet")
+def validate_dotnet(c: Context, server: str = "python") -> None:
+    """Run mongo-csharp-driver's xUnit suite against an embedded SecantusDB.
+
+    Generates docs/validation-report-dotnet.md with a per-namespace pass /
+    fail / skipped / pass-rate breakdown — the **C# / .NET**-driver analogue of
+    the other gauges. Requires the .NET SDK (`brew install dotnet`); the test
+    project targets net10.0. The first run restores NuGet packages and builds
+    (~several min), later runs reuse the build. The gauge runs the curated CRUD
+    specification suite (`MongoDB.Driver.Tests.Specifications.crud`) — see
+    dotnet_validation/include_paths.py.
+
+    ``--server rust`` targets the standalone ``secantusdb`` binary and writes
+    docs/validation-report-dotnet-rust-server.md.
+    """
+    import pathlib
+
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
+    suffix = "" if server == "python" else "-rust-server"
+
+    if not pathlib.Path(
+        "vendor/mongo-csharp-driver/tests/MongoDB.Driver.Tests/MongoDB.Driver.Tests.csproj"
+    ).exists():
+        c.run("git submodule update --init vendor/mongo-csharp-driver", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        f"SECANTUS_GAUGE_SERVER={server} "
+        "PYTHONPATH=. uv run --no-sync python -m dotnet_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m dotnet_validation.generate_report "
+        f".validation/dotnet-raw{suffix}.trx docs/validation-report-dotnet{suffix}.md",
+        pty=True,
+    )
+    print(f"\nWrote docs/validation-report-dotnet{suffix}.md")
+
+
 @task(name="validate-all")
 def validate_all(c: Context, server: str = "python", jobs: int = 1) -> None:
-    """Run all ten driver gauges against the Python (default) or Rust server.
+    """Run all eleven driver gauges against the Python (default) or Rust server.
 
     Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
     fans out ``validate / validate-go / validate-node / validate-java /
     validate-ruby / validate-rust / validate-php-lib / validate-php-ext /
-    validate-c / validate-cxx`` over a thread pool. Each gauge spawns its own
+    validate-c / validate-cxx / validate-dotnet`` over a thread pool. Each gauge
+    spawns its own
     SecantusDB daemon on a kernel-assigned ephemeral port + tempdir, so they
     don't collide — except ``validate-cxx``, which must bind 27017 (mongocxx's
     hard-wired default), so keep it serial (the default ``--jobs 1``) or ensure
@@ -1011,6 +1053,7 @@ def validate_all(c: Context, server: str = "python", jobs: int = 1) -> None:
         ("php-ext", "validate-php-ext"),
         ("c", "validate-c"),
         ("cxx", "validate-cxx"),
+        ("dotnet", "validate-dotnet"),
     ]
 
     def _run(name_task: tuple[str, str]) -> tuple[str, int]:
