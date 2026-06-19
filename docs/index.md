@@ -88,8 +88,10 @@ SecantusDB **unmodified** — see the
 [Java-driver](validation-report-java.md),
 [Ruby-driver](validation-report-ruby.md),
 [Rust-driver](validation-report-rust.md),
-[PHP-library](validation-report-php-lib.md), and
-[PHP-extension](validation-report-php-ext.md) validation reports for
+[PHP-library](validation-report-php-lib.md),
+[PHP-extension](validation-report-php-ext.md),
+[C-driver](validation-report-c.md), and
+[C++-driver](validation-report-cxx.md) validation reports for
 current pass-rates per feature category.
 
 ## What's in scope
@@ -215,6 +217,8 @@ validation-report-ruby
 validation-report-rust
 validation-report-php-lib
 validation-report-php-ext
+validation-report-c
+validation-report-cxx
 validation-report-rust-server
 api
 changelog

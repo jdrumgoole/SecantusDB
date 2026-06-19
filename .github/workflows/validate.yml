@@ -1,7 +1,7 @@
 name: Validate (driver conformance)
 
 # Runs the vendored driver test suites (pymongo, go, node, java,
-# ruby, rust, php-lib, php-ext) against SecantusDB and regenerates the per-driver
+# ruby, rust, php-lib, php-ext, c, cxx) against SecantusDB and regenerates the per-driver
 # `docs/validation-report*.md` files. Slow (~10–15 min per driver on
 # a fresh WT build) so this is NOT on every push — it runs weekly on
 # Monday and can be triggered manually.
@@ -35,6 +35,8 @@ jobs:
           - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
           - { name: php-lib, task: validate-php-lib, report: docs/validation-report-php-lib.md }
           - { name: php-ext, task: validate-php-ext, report: docs/validation-report-php-ext.md }
+          - { name: c,       task: validate-c,    report: docs/validation-report-c.md }
+          - { name: cxx,     task: validate-cxx,  report: docs/validation-report-cxx.md }
           # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
           # suite as the headline gauge, pointed at the Rust server via
           # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so
@@ -80,6 +82,46 @@ jobs:
         env:
           SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
         run: uv sync --extra dev
+
+      # The C gauge builds the vendored mongo-c-driver's test-libmongoc
+      # binary from source (CMake): needs cmake + OpenSSL headers. A C
+      # compiler is preinstalled on ubuntu-latest.
+      - name: Install C-driver build toolchain
+        if: matrix.driver.name == 'c'
+        run: sudo apt-get install -y cmake libssl-dev
+
+      - name: Cache test-libmongoc build
+        if: matrix.driver.name == 'c'
+        uses: actions/cache@v5
+        with:
+          # The from-source build (~several min cold) is the dominant cost.
+          # Pin the cache to the vendored driver SHA so a submodule bump
+          # rebuilds cleanly.
+          path: vendor/mongo-c-driver/_build
+          key: ${{ runner.os }}-libmongoc-${{ hashFiles('vendor/mongo-c-driver/VERSION_CURRENT', 'vendor/mongo-c-driver/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-libmongoc-
+
+      # The C++ gauge builds the vendored libmongoc (installed to a prefix) AND
+      # the mongocxx test_driver Catch2 binary from source — needs cmake, a
+      # C++17 compiler (preinstalled), and OpenSSL headers.
+      - name: Install C++-driver build toolchain
+        if: matrix.driver.name == 'cxx'
+        run: sudo apt-get install -y cmake libssl-dev
+
+      - name: Cache libmongoc install + mongocxx build
+        if: matrix.driver.name == 'cxx'
+        uses: actions/cache@v5
+        with:
+          # The libmongoc install + mongocxx build (~10-15 min cold) dominate.
+          # Pin to both vendored driver versions so either bump rebuilds.
+          path: |
+            vendor/mongo-c-driver/_install
+            vendor/mongo-c-driver/_install_build
+            vendor/mongo-cxx-driver/_build
+          key: ${{ runner.os }}-mongocxx-${{ hashFiles('vendor/mongo-c-driver/VERSION_CURRENT', 'vendor/mongo-cxx-driver/etc/purls.txt', 'vendor/mongo-cxx-driver/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-mongocxx-
 
       - name: Set up Go
         if: matrix.driver.name == 'go'

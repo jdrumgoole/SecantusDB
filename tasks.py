@@ -888,15 +888,103 @@ def validate_php_ext(c: Context, server: str = "python") -> None:
     print(f"\nWrote docs/validation-report-php-ext{suffix}.md")
 
 
+@task(name="validate-c")
+def validate_c(c: Context, server: str = "python") -> None:
+    """Run mongo-c-driver's test-libmongoc suite against an embedded SecantusDB.
+
+    Generates docs/validation-report-c.md with a per-suite pass / fail /
+    skipped / pass-rate breakdown — the low-level **C**-driver (libmongoc)
+    analogue of the other gauges, and one of the strictest wire-protocol
+    checks. Requires `cmake` and a C toolchain; the first run builds the
+    vendored driver's `test-libmongoc` binary (~several min, cached under
+    vendor/mongo-c-driver/_build), later runs reuse it. On macOS:
+    `brew install cmake openssl@3`; on Debian/Ubuntu: `apt-get install -y
+    cmake libssl-dev`.
+
+    ``--server rust`` targets the standalone ``secantusdb`` binary and writes
+    docs/validation-report-c-rust-server.md.
+    """
+    import pathlib
+
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
+    suffix = "" if server == "python" else "-rust-server"
+
+    if not pathlib.Path("vendor/mongo-c-driver/CMakeLists.txt").exists():
+        c.run("git submodule update --init vendor/mongo-c-driver", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        f"SECANTUS_GAUGE_SERVER={server} "
+        "PYTHONPATH=. uv run --no-sync python -m c_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m c_validation.generate_report "
+        f".validation/c-raw{suffix}.json docs/validation-report-c{suffix}.md",
+        pty=True,
+    )
+    print(f"\nWrote docs/validation-report-c{suffix}.md")
+
+
+@task(name="validate-cxx")
+def validate_cxx(c: Context, server: str = "python") -> None:
+    """Run mongo-cxx-driver's Catch2 suite against an embedded SecantusDB.
+
+    Generates docs/validation-report-cxx.md with a per-group pass / fail /
+    skipped / pass-rate breakdown — the **C++**-driver (mongocxx) analogue of
+    the other gauges. Requires `cmake`, a C++17 toolchain, and OpenSSL; the
+    first run builds the vendored libmongoc (installed to a prefix, since
+    mongocxx links it) and the mongocxx `test_driver` binary (~10-15 min,
+    cached), later runs reuse them. On macOS: `brew install cmake openssl@3`;
+    on Debian/Ubuntu: `apt-get install -y cmake libssl-dev`.
+
+    NOTE: mongocxx's core tests hard-wire `mongodb://localhost:27017`, so this
+    gauge binds its SecantusDB daemon on port 27017 and refuses to run if
+    something already holds that port (it won't gauge a foreign server).
+
+    ``--server rust`` targets the standalone ``secantusdb`` binary and writes
+    docs/validation-report-cxx-rust-server.md.
+    """
+    import pathlib
+
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
+    suffix = "" if server == "python" else "-rust-server"
+
+    if not pathlib.Path("vendor/mongo-cxx-driver/CMakeLists.txt").exists():
+        c.run("git submodule update --init vendor/mongo-cxx-driver", pty=True)
+    if not pathlib.Path("vendor/mongo-c-driver/CMakeLists.txt").exists():
+        c.run("git submodule update --init vendor/mongo-c-driver", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        f"SECANTUS_GAUGE_SERVER={server} "
+        "PYTHONPATH=. uv run --no-sync python -m cxx_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m cxx_validation.generate_report "
+        f".validation/cxx-raw{suffix}.xml docs/validation-report-cxx{suffix}.md",
+        pty=True,
+    )
+    print(f"\nWrote docs/validation-report-cxx{suffix}.md")
+
+
 @task(name="validate-all")
 def validate_all(c: Context, server: str = "python", jobs: int = 1) -> None:
-    """Run all eight driver gauges against the Python (default) or Rust server.
+    """Run all ten driver gauges against the Python (default) or Rust server.
 
     Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
     fans out ``validate / validate-go / validate-node / validate-java /
-    validate-ruby / validate-rust / validate-php-lib / validate-php-ext``
-    over a thread pool. Each gauge spawns its own SecantusDB daemon on a
-    kernel-assigned ephemeral port + tempdir, so they don't collide.
+    validate-ruby / validate-rust / validate-php-lib / validate-php-ext /
+    validate-c / validate-cxx`` over a thread pool. Each gauge spawns its own
+    SecantusDB daemon on a kernel-assigned ephemeral port + tempdir, so they
+    don't collide — except ``validate-cxx``, which must bind 27017 (mongocxx's
+    hard-wired default), so keep it serial (the default ``--jobs 1``) or ensure
+    nothing else uses 27017.
 
     ``--server rust`` runs every gauge against the standalone ``secantusdb``
     binary (reports get the ``-rust-server`` suffix). ``--jobs N`` sets the
@@ -921,6 +1009,8 @@ def validate_all(c: Context, server: str = "python", jobs: int = 1) -> None:
         ("rust", "validate-rust"),
         ("php-lib", "validate-php-lib"),
         ("php-ext", "validate-php-ext"),
+        ("c", "validate-c"),
+        ("cxx", "validate-cxx"),
     ]
 
     def _run(name_task: tuple[str, str]) -> tuple[str, int]:

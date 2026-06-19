@@ -38,6 +38,8 @@ from pathlib import Path
 from validation_summary.generate import (
     GaugeStats,
     _apply_expected_failures,
+    _collect_c,
+    _collect_cxx,
     _collect_go,
     _collect_java,
     _collect_node,
@@ -168,6 +170,33 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "https://secantusdb.readthedocs.io/en/latest/validation-report-php-ext.html"
         ),
     },
+    "mongo-c-driver": {
+        "title": "mongo-c-driver",
+        "lang": "C",
+        "note": (
+            "The official MongoDB <strong>C</strong> driver (<code>libmongoc</code>) "
+            "&mdash; the lowest-level official client, the one the PHP, Ruby (bson), "
+            "and PyMongo C-extensions ultimately wrap. We build its "
+            "<code>test-libmongoc</code> suite from source and run a curated set of "
+            "wire-protocol prefixes (CRUD / cursor / aggregate / command / GridFS / "
+            "index management) against an embedded SecantusDB daemon via "
+            "<code>MONGOC_TEST_URI</code>. A strict C client &mdash; type and "
+            "wire-shape divergences surface here that permissive clients accept."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-c.html"),
+    },
+    "mongo-cxx-driver": {
+        "title": "mongo-cxx-driver",
+        "lang": "C++",
+        "note": (
+            "The official MongoDB <strong>C++</strong> driver (<code>mongocxx</code>), "
+            "built on libmongoc. We build its Catch2 <code>test_driver</code> suite "
+            "from source and run it (CRUD / cursor / aggregate / GridFS / commands) "
+            "against an embedded SecantusDB daemon. mongocxx's tests hard-wire the "
+            "driver default port, so the gauge serves them on <code>127.0.0.1:27017</code>."
+        ),
+        "report_url": ("https://secantusdb.readthedocs.io/en/latest/validation-report-cxx.html"),
+    },
 }
 
 # Trailing panels that aren't backed by ``.validation/`` raw data —
@@ -185,6 +214,8 @@ _COLLECTORS = {
     "mongo-rust-driver": _collect_rust,
     "mongo-php-library": _collect_php_lib,
     "mongo-php-driver": _collect_php_ext,
+    "mongo-c-driver": _collect_c,
+    "mongo-cxx-driver": _collect_cxx,
 }
 
 

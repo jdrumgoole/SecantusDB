@@ -461,6 +461,76 @@ def _collect_php_lib(raw_dir: Path) -> GaugeStats | None:
     )
 
 
+def _collect_c(raw_dir: Path) -> GaugeStats | None:
+    """Read ``test-libmongoc`` JSON (``.validation/c-raw.json``).
+
+    Shape: ``{"results": [{"status": "pass"|"fail"|"skip", "test_file":
+    "/Suite/test", ...}, ...]}`` (see ``src/libmongoc/tests/TestSuite.c``).
+    """
+    f = raw_dir / "c-raw.json"
+    if not f.exists():
+        return None
+    # test-libmongoc's -F output isn't strictly valid JSON (trailing commas,
+    # possibly truncated); the gauge package's tolerant loader extracts the
+    # status/test_file pairs.
+    from c_validation import load_results
+
+    raw = load_results(f)
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for t in raw.get("results", []):
+        status = (t.get("status") or "").lower()
+        if status == "pass":
+            passed += 1
+        elif status == "fail":
+            failed += 1
+            failure_descs.append(t.get("test_file", ""))
+        elif status == "skip":
+            skipped += 1
+    return GaugeStats(
+        name="mongo-c-driver",
+        language="C",
+        driver_version=_read_submodule_head("mongo-c-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated test-libmongoc wire-protocol suites (CRUD / cursor / aggregate / command)",
+    )
+
+
+def _collect_cxx(raw_dir: Path) -> GaugeStats | None:
+    """Walk mongocxx's Catch2 JUnit XML (``.validation/cxx-raw.xml``)."""
+    f = raw_dir / "cxx-raw.xml"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for case in root.iter("testcase"):
+        name = case.attrib.get("name", "")
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed += 1
+            failure_descs.append(name)
+        elif case.find("skipped") is not None:
+            skipped += 1
+        else:
+            passed += 1
+    return GaugeStats(
+        name="mongo-cxx-driver",
+        language="C++",
+        driver_version=_read_submodule_head("mongo-cxx-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated mongocxx test_driver Catch2 suite (CRUD / cursor / aggregate / gridfs)",
+    )
+
+
 _COLLECTORS = (
     _collect_pymongo,
     _collect_java,
@@ -470,6 +540,8 @@ _COLLECTORS = (
     _collect_rust,
     _collect_php_lib,
     _collect_php_ext,
+    _collect_c,
+    _collect_cxx,
 )
 
 # Gauge name -> its per-driver report page (relative to docs/). Used by the
@@ -483,6 +555,8 @@ _REPORT_LINKS = {
     "mongo-rust-driver": "./validation-report-rust.md",
     "mongo-php-library": "./validation-report-php-lib.md",
     "mongo-php-driver": "./validation-report-php-ext.md",
+    "mongo-c-driver": "./validation-report-c.md",
+    "mongo-cxx-driver": "./validation-report-cxx.md",
 }
 
 
@@ -493,6 +567,7 @@ _EXPECTED_FAILURES_BY_GAUGE: dict[str, list[ef_module.ExpectedFailure]] = {
     "mongo-go-driver": ef_module.GO,
     "mongo-node-driver": ef_module.NODE,
     "mongo-ruby-driver": ef_module.RUBY,
+    "mongo-c-driver": ef_module.C,
 }
 
 
