@@ -15,6 +15,7 @@
 //! * `data.blockConnection` + `blockTimeMS` → sleep before processing (drivers'
 //!   CSOT tests rely on this to trip a client-side timeout).
 //! * `data.closeConnection` → recorded; the server layer drops the socket.
+//!
 //! An optional `failCommands: [...]` filters by command name (empty == any).
 
 use std::sync::Mutex;
