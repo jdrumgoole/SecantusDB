@@ -183,7 +183,13 @@ Deferred:
   `secantusAdmin.backupArchive`), R2 (reverse `apply_update_description` in
   `secantus-core`), R3 (applier + replay in `secantus-storage`), R4
   (`secantusdb restore` subcommand), R5 (parity for the 3 new Python PITR
-  features: options-carry, `--preserve-oplog`, v2 archiving).
+  features: options-carry, `--preserve-oplog`, v2 archiving). **Done so far:**
+  R1 (native backup), R2 (reverse diff), R3 (`secantus_storage::replay`). **R3
+  gap:** the Rust `Storage` has no `set_index_expiry`, so a `collMod`
+  `{index: {name, expireAfterSeconds}}` TTL-retune oplog entry is skipped on
+  replay (all other `collMod` options replay); add `set_index_expiry` to close
+  it. The Rust applier also doesn't yet carry collection options on `create`
+  (R5 / R3-create-options).
 
 ## 4. Out of scope (intentional, with reasoning)
 

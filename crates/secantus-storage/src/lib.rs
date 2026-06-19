@@ -38,6 +38,7 @@ use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
 pub mod changestreams;
+pub mod replay;
 
 use std::cell::Cell;
 
@@ -1301,6 +1302,16 @@ impl Storage {
         // The tail counter lives under the dedicated oplog mutex; the global lock
         // adds nothing here.
         self.oplog.lock().unwrap().next_seq - 1
+    }
+
+    /// Force a WiredTiger checkpoint (durable flush of the latest snapshot). Used
+    /// by oplog replay to make the restored database durable before the target
+    /// `Storage` is dropped.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        session.checkpoint(None)?;
+        Ok(())
     }
 
     /// Force a checkpoint, then tar the consistent WiredTiger file set (enumerated
@@ -5461,6 +5472,69 @@ mod tests {
         let got = restored.find_matching("app", "c", &doc! {}).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 7);
+    }
+
+    #[test]
+    fn replay_rebuilds_database_from_oplog() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let empty = doc! {};
+        {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32, "v": 1i32}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32, "v": 2i32}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            // operator update -> oplog $v:2 diff; reverse-applied on replay
+            s.update_matching(
+                "app",
+                "c",
+                &doc! {"_id": 1i32},
+                &doc! {"$set": {"v": 100i32}},
+                false,
+                false,
+                &[],
+                &empty,
+                None,
+                None,
+            )
+            .unwrap();
+            s.delete_matching("app", "c", &doc! {"_id": 2i32}, 1, &empty, None)
+                .unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 3i32, "v": 3i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        } // drop releases the WiredTiger single-writer lock
+
+        let out = dir.path().join("restored");
+        let stats =
+            replay::restore_to_timestamp(src.to_str().unwrap(), out.to_str().unwrap(), None, None)
+                .unwrap();
+        assert!(stats.ops_applied >= 4);
+
+        let restored = Storage::open(out.to_str().unwrap()).unwrap();
+        let mut got: Vec<(i32, i32)> = restored
+            .find_matching("app", "c", &empty)
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let d = decode_doc(b).unwrap();
+                (d.get_i32("_id").unwrap(), d.get_i32("v").unwrap())
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(1, 100), (3, 3)]);
     }
 
     #[test]
