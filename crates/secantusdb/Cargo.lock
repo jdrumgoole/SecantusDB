@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "base64",
  "hmac",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "bson",
  "rand",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "bson",
  "geo",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "bson",
  "rustls",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "bson",
  "s2",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage-adapter"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "bson",
  "secantus-commands",
@@ -1101,21 +1101,21 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
 name = "secantusdb"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.24"
 dependencies = [
  "ctrlc",
  "secantus-commands",
