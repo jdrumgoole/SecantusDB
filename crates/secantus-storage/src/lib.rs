@@ -898,6 +898,9 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
 /// concurrency story is unchanged; see `tasks/wt-bindings-plan.md`).
 pub struct Storage {
     conn: Connection,
+    /// The WiredTiger home (on-disk data) directory. Kept so `create_archive`
+    /// can tar the consistent file set the `backup:` cursor enumerates.
+    home: String,
     lock: Mutex<()>,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
     /// `storage.enable_oplog`. Default `true`.
@@ -997,6 +1000,33 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
     })
 }
 
+/// What `create_archive` produced: the absolute-ish output path and its size.
+/// Mirrors the `{path, sizeBytes}` Python `Storage.create_archive` returns.
+pub struct ArchiveInfo {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+fn archive_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
+    StorageError::Internal(format!("{ctx}: {e}"))
+}
+
+/// Extract a backup `.tar.gz` (from `create_archive`) into `target_dir`, which is
+/// then a startable WiredTiger home. Free function (no live `Storage` needed) so
+/// the restore path can rebuild a fresh directory. Mirrors Python
+/// `extract_backup_archive`.
+pub fn extract_backup_archive(archive_path: &str, target_dir: &str) -> Result<()> {
+    std::fs::create_dir_all(target_dir).map_err(|e| archive_err("extract_backup_archive", e))?;
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| archive_err("extract_backup_archive", e))?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+    archive
+        .unpack(target_dir)
+        .map_err(|e| archive_err("extract_backup_archive", e))?;
+    Ok(())
+}
+
 impl Storage {
     /// Open (creating if needed) an on-disk database at `home` with the default
     /// SecantusDB WiredTiger config, bootstrapping the table schema.
@@ -1019,6 +1049,7 @@ impl Storage {
         };
         Ok(Storage {
             conn,
+            home: home.to_string(),
             lock: Mutex::new(()),
             enable_oplog: true,
             oplog: Mutex::new(state),
@@ -1270,6 +1301,84 @@ impl Storage {
         // The tail counter lives under the dedicated oplog mutex; the global lock
         // adds nothing here.
         self.oplog.lock().unwrap().next_seq - 1
+    }
+
+    /// Force a checkpoint, then tar the consistent WiredTiger file set (enumerated
+    /// by WiredTiger's `backup:` cursor) into `output_path` as a gzip stream, with
+    /// an advisory `pitr-manifest.json` describing the oplog range it can recover
+    /// to. Mirrors Python `Storage.create_archive`. The on-disk + oplog formats
+    /// are identical across the two servers, so the Python restore tooling reads
+    /// this archive (and vice versa).
+    pub fn create_archive(&self, output_path: &str) -> Result<ArchiveInfo> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        // Durable, consistent snapshot first; the backup cursor enumerates the
+        // files that make it up and WiredTiger holds them stable for the cursor's
+        // lifetime, so we tar them all before it drops.
+        session.checkpoint(None)?;
+        let manifest = self.pitr_manifest()?;
+        let cursor = session.open_cursor("backup:", None)?;
+        let file =
+            std::fs::File::create(output_path).map_err(|e| archive_err("create_archive", e))?;
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        while cursor.next()? {
+            let rel = cursor.get_key_s()?;
+            let full = std::path::Path::new(&self.home).join(&rel);
+            builder
+                .append_path_with_name(&full, &rel)
+                .map_err(|e| archive_err("create_archive", e))?;
+        }
+        let data =
+            serde_json::to_vec(&manifest).map_err(|e| archive_err("create_archive manifest", e))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "pitr-manifest.json", &data[..])
+            .map_err(|e| archive_err("create_archive", e))?;
+        builder
+            .into_inner()
+            .map_err(|e| archive_err("create_archive", e))?
+            .finish()
+            .map_err(|e| archive_err("create_archive", e))?;
+        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        Ok(ArchiveInfo {
+            path: output_path.to_string(),
+            size_bytes: size,
+        })
+    }
+
+    /// Build the advisory PITR manifest embedded in a backup archive: the oplog
+    /// seq range and timestamps it can recover to, plus whether the oplog still
+    /// reaches genesis. Mirrors Python `Storage._pitr_manifest` (a subset; wall
+    /// times land with the v2 base-selection work). Called under `self.lock`; the
+    /// oplog reads it uses are lock-free.
+    fn pitr_manifest(&self) -> Result<serde_json::Value> {
+        let floor = self.oplog_floor_seq()?;
+        let head = self.oplog_tail_seq();
+        let ts_of = |seq: i64| -> Option<[i64; 2]> {
+            if seq <= 0 {
+                return None;
+            }
+            let rows = self.read_oplog(seq, 1).ok()?;
+            let (_s, blob) = rows.into_iter().next()?;
+            let entry = decode_doc(&blob).ok()?;
+            match entry.get("ts") {
+                Some(Bson::Timestamp(ts)) => Some([i64::from(ts.time), i64::from(ts.increment)]),
+                _ => None,
+            }
+        };
+        Ok(serde_json::json!({
+            "secantusPitrManifest": 1,
+            "oplogEnabled": self.enable_oplog,
+            "oplogFloorSeq": floor,
+            "oplogHeadSeq": head,
+            "genesisIntact": floor == 1,
+            "oplogFloorTs": ts_of(floor),
+            "oplogHeadTs": ts_of(head),
+        }))
     }
 
     /// Merge `opts` into the collection's options blob (creating the collection
@@ -5322,6 +5431,36 @@ mod tests {
     /// `kb` is).
     fn ev(b: &Bson) -> Vec<u8> {
         sortkey::encode_value(b, None).unwrap()
+    }
+
+    #[test]
+    fn create_archive_roundtrips_data_through_extract() {
+        // WiredTiger-backed: needs the rust-storage test env (WT + libclang).
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32, "v": 7i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+
+        let archive = dir.path().join("backup.tar.gz");
+        let info = s.create_archive(archive.to_str().unwrap()).unwrap();
+        assert!(info.size_bytes > 0);
+        drop(s); // release WiredTiger's single-writer lock before reopening
+
+        let target = dir.path().join("restored");
+        extract_backup_archive(archive.to_str().unwrap(), target.to_str().unwrap()).unwrap();
+        assert!(target.join("pitr-manifest.json").exists());
+
+        let restored = Storage::open(target.to_str().unwrap()).unwrap();
+        let got = restored.find_matching("app", "c", &doc! {}).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 7);
     }
 
     #[test]
