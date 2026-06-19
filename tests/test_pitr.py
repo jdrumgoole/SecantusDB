@@ -28,7 +28,7 @@ import pytest
 from bson import Timestamp
 from pymongo import MongoClient
 
-from secantus import SecantusDBServer, cli, oplog_replay
+from secantus import SecantusDBServer, cli, oplog_replay, pitr_archive
 from secantus.storage import Storage
 
 
@@ -269,6 +269,103 @@ def test_restored_dir_runs_a_server(tmp_path: Path) -> None:
         client = MongoClient(srv.uri, directConnection=True)
         got = sorted(client["shop"]["orders"].find({}), key=lambda d: d["_id"])
     assert got == [{"_id": 1, "total": 10}, {"_id": 2, "total": 20}]
+
+
+def test_v2_restore_past_pruned_floor(tmp_path: Path) -> None:
+    """PITR v2: with a base snapshot + archived oplog segments, a restore can
+    reach a time *before* the live oplog floor — the window v1 refuses."""
+    archive = tmp_path / "archive"
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True, oplog_archive_dir=str(archive), oplog_max_entries=2)
+    s.insert("app", "c", [{"_id": 1}])
+    s.insert("app", "c", [{"_id": 2}])
+    s.archive_base_snapshot(str(archive))  # base head = 2
+    s.insert("app", "c", [{"_id": 3}])
+    t3 = _last_ts(s)  # recovery target: just after doc 3
+    s.insert("app", "c", [{"_id": 4}])
+    s.insert("app", "c", [{"_id": 5}])
+    pruned = s.prune_oplog()  # cap=2 keeps seq 4,5; seq 1,2,3 archived + dropped
+    assert pruned >= 3
+    assert s.oplog_floor_seq() == 4  # live oplog no longer reaches seq 3
+    s.close()
+
+    # v1 can't do this — the source oplog floor is past genesis.
+    with pytest.raises(ValueError, match="past genesis"):
+        oplog_replay.restore_to_timestamp(str(src), str(tmp_path / "v1"), to_ts=t3)
+
+    # v2 stitches base (docs 1,2) + archived seq 3 → docs 1,2,3 at t3.
+    out = tmp_path / "restored"
+    stats = pitr_archive.restore_from_archive_dir(str(archive), str(out), to_ts=t3)
+    assert stats["baseHeadSeq"] == 2
+    assert _docs(out, "app", "c") == [{"_id": 1}, {"_id": 2}, {"_id": 3}]
+
+
+def test_cli_restore_from_archive_dir(tmp_path: Path) -> None:
+    """`secantusdb restore --source <archive-dir>` routes to the v2 path."""
+    archive = tmp_path / "archive"
+    src = tmp_path / "src"
+    s = Storage(str(src), enable_oplog=True, oplog_archive_dir=str(archive), oplog_max_entries=2)
+    s.insert("app", "c", [{"_id": 1}])
+    s.insert("app", "c", [{"_id": 2}])
+    s.insert("app", "c", [{"_id": 3}])
+    s.archive_base_snapshot(str(archive))  # newest base has all three
+    s.prune_oplog()
+    s.close()
+
+    out = tmp_path / "restored"
+    rc = cli.main(["restore", "--source", str(archive), "--target-dir", str(out)])
+    assert rc == 0
+    assert _docs(out, "app", "c") == [{"_id": 1}, {"_id": 2}, {"_id": 3}]
+
+
+def test_wire_v2_archive_base_snapshot_and_restore(tmp_path: Path) -> None:
+    """End-to-end v2 over the wire: a server with --oplog-archive-dir archives
+    pruned oplog, `secantusAdmin.archiveBaseSnapshot` takes base snapshots, and
+    `secantusAdmin.restoreToTimestamp` rebuilds from the archive directory."""
+    archive = tmp_path / "archive"
+    src = tmp_path / "src"
+    with SecantusDBServer(
+        port=0,
+        storage_path=str(src),
+        oplog_archive_dir=str(archive),
+        oplog_max_entries=2,
+    ) as srv:
+        admin = MongoClient(srv.uri, directConnection=True)["admin"]
+        coll = MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll.insert_one({"_id": 1})
+        coll.insert_one({"_id": 2})
+        snap = admin.command({"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": str(archive)})
+        assert snap["ok"] == 1.0 and "path" in snap
+        coll.insert_one({"_id": 3})
+        coll.insert_one({"_id": 4})
+        admin.command({"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": str(archive)})
+        admin.command({"secantusAdmin.pruneOplog": 1})  # archives the pruned front
+        out = tmp_path / "restored"
+        reply = admin.command(
+            {"secantusAdmin.restoreToTimestamp": 1, "source": str(archive), "targetDir": str(out)}
+        )
+    assert reply["ok"] == 1.0
+    with SecantusDBServer(port=0, storage_path=str(out)) as srv:
+        got = sorted(
+            MongoClient(srv.uri, directConnection=True)["app"]["c"].find({}),
+            key=lambda d: d["_id"],
+        )
+    assert got == [{"_id": 1}, {"_id": 2}, {"_id": 3}, {"_id": 4}]
+
+
+def test_v2_segment_roundtrip(tmp_path: Path) -> None:
+    """Archived oplog segments round-trip their rows verbatim in seq order."""
+    archive = str(tmp_path / "arch")
+    rows = [
+        (1, {"op": "i", "ns": "a.b", "o": {"_id": 1}}, None),
+        (2, {"op": "i", "ns": "a.b", "o": {"_id": 2}}, {"_id": 2, "old": True}),
+    ]
+    pitr_archive.write_segment(archive, rows)
+    got = list(pitr_archive.iter_archived_oplog(archive))
+    assert [(seq, e["o"]["_id"], p) for seq, e, p in got] == [
+        (1, 1, None),
+        (2, 2, {"_id": 2, "old": True}),
+    ]
 
 
 def _next_event(cs: Any, tries: int = 60) -> dict[str, Any]:

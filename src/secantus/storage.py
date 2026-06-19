@@ -786,6 +786,7 @@ class Storage:
         cache_size: str = "1G",
         session_max: int = 1000,
         sync_on_commit: bool = False,
+        oplog_archive_dir: str | None = None,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -898,6 +899,11 @@ class Storage:
         # Oplog state — durable across restart via _OPLOG_META_TABLE.
         self.oplog_retention_seconds = float(oplog_retention_seconds)
         self.oplog_max_entries = int(oplog_max_entries)
+        # When set, ``prune_oplog`` writes the rows it is about to drop into a
+        # durable oplog segment in this directory first (PITR v2), so recovery
+        # can reach a time before the live oplog floor. See
+        # :mod:`secantus.pitr_archive`.
+        self.oplog_archive_dir = oplog_archive_dir
         self._time = time_func or _time.time
         self._oplog_cv = threading.Condition(threading.Lock())
         # Set by ``signal_shutdown()`` at server stop so tailable getMore
@@ -1855,6 +1861,10 @@ class Storage:
                     extra -= 1
         if not doomed:
             return 0
+        # PITR v2: archive the doomed rows to a durable segment *before* deleting
+        # them, so recovery can still reach a time before the new oplog floor.
+        if self.oplog_archive_dir is not None:
+            self._archive_doomed_oplog(sorted(doomed))
         op_del = self._cursor(_OPLOG_TABLE)
         pre_del = self._cursor(_PREIMAGE_TABLE)
         for seq in doomed:
@@ -1867,6 +1877,32 @@ class Storage:
                 pre_del.remove()
             pre_del.reset()
         return len(doomed)
+
+    def _archive_doomed_oplog(self, doomed_sorted: list[int]) -> None:
+        """Write the soon-to-be-pruned oplog rows (and their pre-images) into a
+        durable segment in ``oplog_archive_dir``. Called under ``self._lock``
+        from ``_prune_oplog_locked`` before the rows are deleted."""
+        from . import pitr_archive
+
+        op_cur = self._cursor(_OPLOG_TABLE)
+        pre_cur = self._cursor(_PREIMAGE_TABLE)
+        rows: list[tuple[int, dict[str, Any], dict[str, Any] | None]] = []
+        for seq in doomed_sorted:
+            op_cur.set_key(seq)
+            if op_cur.search() != 0:
+                op_cur.reset()
+                continue
+            entry = bson.decode(bytes(op_cur.get_value()))
+            op_cur.reset()
+            pre = None
+            pre_cur.set_key(seq)
+            if pre_cur.search() == 0:
+                pre_blob = bytes(pre_cur.get_value())
+                if pre_blob:
+                    pre = bson.decode(pre_blob)
+            pre_cur.reset()
+            rows.append((seq, entry, pre))
+        pitr_archive.write_segment(self.oplog_archive_dir, rows)
 
     # --- Users (auth) ---
 
@@ -2384,6 +2420,24 @@ class Storage:
                 backup_session.close()
         return {"path": abs_out, "sizeBytes": os.path.getsize(abs_out)}
 
+    def archive_base_snapshot(self, archive_dir: str) -> dict[str, int | str]:
+        """Take a base snapshot into ``archive_dir`` for PITR v2, named by its
+        oplog head seq (``base-<head>.tar.gz``) so the restore path can order and
+        select snapshots. Thin wrapper over :meth:`create_archive`.
+
+        Pair with ``oplog_archive_dir=<archive_dir>`` (so pruned oplog rows are
+        archived as segments into the same directory) and call this periodically
+        — there is no background scheduler, matching ``prune_ttl`` / ``prune_oplog``.
+        """
+        from . import pitr_archive
+
+        with self._lock:
+            head = self.oplog_tail_seq_nolock()
+        out = os.path.join(archive_dir, pitr_archive.base_name(head))
+        result = self.create_archive(out)
+        result["headSeq"] = head
+        return result
+
     def _pitr_manifest(self) -> dict[str, Any]:
         """Build the point-in-time-recovery manifest embedded in a backup
         archive: the oplog seq range and timestamps it can recover to, plus
@@ -2394,23 +2448,32 @@ class Storage:
         floor = self.oplog_floor_seq()
         head = self.oplog_tail_seq_nolock()
 
-        def _ts_of(seq: int) -> list[int] | None:
+        def _row(seq: int) -> dict[str, Any] | None:
             if seq <= 0:
                 return None
             rows = self.read_oplog(start_seq=seq, limit=1)
-            if not rows:
-                return None
-            ts = rows[0][1].get("ts")
+            return rows[0][1] if rows else None
+
+        def _ts_of(row: dict[str, Any] | None) -> list[int] | None:
+            ts = row.get("ts") if row else None
             return [ts.time, ts.inc] if isinstance(ts, Timestamp) else None
 
+        def _wall_of(row: dict[str, Any] | None) -> str | None:
+            wall = row.get("wall") if row else None
+            return wall.isoformat() if isinstance(wall, _dt.datetime) else None
+
+        floor_row = _row(floor)
+        head_row = _row(head)
         return {
             "secantusPitrManifest": 1,
             "oplogEnabled": bool(self.enable_oplog),
             "oplogFloorSeq": floor,
             "oplogHeadSeq": head,
             "genesisIntact": floor == 1,
-            "oplogFloorTs": _ts_of(floor),
-            "oplogHeadTs": _ts_of(head),
+            "oplogFloorTs": _ts_of(floor_row),
+            "oplogHeadTs": _ts_of(head_row),
+            "oplogFloorWall": _wall_of(floor_row),
+            "oplogHeadWall": _wall_of(head_row),
         }
 
     @contextlib.contextmanager

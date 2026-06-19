@@ -24,6 +24,7 @@ standalone = false            # default: false (advertise as single-node "secant
 retention_seconds = 3600.0    # default: 3600 (1 hr); resume tokens minted before this fall outside the window
 max_entries = 100000          # default: 100000; whichever cap (this or retention) hits first prunes oldest
 noop_heartbeat_seconds = 0.0  # default: 0 (disabled); mongod's default is 10s — set to advance cluster time during idle stretches
+# archive_dir = "/var/lib/secantus/pitr-archive"  # default: off; PITR v2 — archive pruned oplog rows here so recovery can reach before the live floor (pair with secantusAdmin.archiveBaseSnapshot)
 
 [storage]
 cache_size = "1G"             # default: "1G"; WT cache, unit-suffixed string ("256M", "1G", "8G")

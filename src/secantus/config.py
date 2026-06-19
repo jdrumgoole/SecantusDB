@@ -63,6 +63,7 @@ class SecantusConfig:
     # ---- [oplog] ----------------------------------------------------
     oplog_retention_seconds: float = 3600.0
     oplog_max_entries: int = 100_000
+    oplog_archive_dir: str | None = None
     noop_heartbeat_seconds: float = 0.0
 
     # ---- [storage] --------------------------------------------------
@@ -137,6 +138,7 @@ _TABLE_FIELDS: dict[str, frozenset[str]] = {
 _RENAMES: dict[tuple[str, str], str] = {
     ("oplog", "retention_seconds"): "oplog_retention_seconds",
     ("oplog", "max_entries"): "oplog_max_entries",
+    ("oplog", "archive_dir"): "oplog_archive_dir",
     ("tls", "cert_file"): "tls_cert_file",
     ("tls", "key_file"): "tls_key_file",
     ("tls", "ca_file"): "tls_ca_file",

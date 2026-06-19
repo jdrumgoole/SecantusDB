@@ -937,6 +937,38 @@ def _secantus_admin_backup_archive(doc: dict[str, Any], ctx: CommandContext) -> 
     return {"path": result["path"], "sizeBytes": result["sizeBytes"], "ok": 1.0}
 
 
+def _secantus_admin_archive_base_snapshot(
+    doc: dict[str, Any], ctx: CommandContext
+) -> dict[str, Any]:
+    """SecantusDB extension: take a PITR v2 base snapshot into ``archiveDir``.
+
+    Writes ``base-<headSeq>.tar.gz`` into ``archiveDir`` (a server-side path).
+    Pair with a server started with ``--oplog-archive-dir <archiveDir>`` so the
+    oplog rows ``prune_oplog`` drops are archived as segments into the same
+    directory; recovery then stitches the newest base ≤ T plus the segments to
+    reach any time in the archived window. Call this periodically — there is no
+    background scheduler. Returns ``{path, sizeBytes, headSeq, ok: 1}``.
+    """
+    archive_dir = doc.get("archiveDir")
+    if not isinstance(archive_dir, str) or not archive_dir:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.archiveBaseSnapshot requires archiveDir: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    try:
+        result = ctx.storage.archive_base_snapshot(archive_dir)
+    except RuntimeError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {
+        "path": result["path"],
+        "sizeBytes": result["sizeBytes"],
+        "headSeq": result["headSeq"],
+        "ok": 1.0,
+    }
+
+
 def _secantus_admin_restore_archive(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     """SecantusDB extension: extract a backup archive into ``targetDir``.
 
@@ -1026,7 +1058,14 @@ def _secantus_admin_restore_to_timestamp(
     # is a fresh timeline (like mongorestore).
     carry_oplog = bool(doc.get("preserveOplog", False))
     try:
-        if source.endswith((".tar.gz", ".tgz")):
+        from secantus import pitr_archive
+
+        if pitr_archive.is_archive_dir(source):
+            # PITR v2: a directory of base snapshots + oplog segments.
+            stats = pitr_archive.restore_from_archive_dir(
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
+            )
+        elif source.endswith((".tar.gz", ".tgz")):
             stats = oplog_replay.restore_archive_to_timestamp(
                 source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
             )
@@ -5276,6 +5315,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "secantusAdmin.pruneOplog": _secantus_admin_prune_oplog,
     "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
     "secantusAdmin.backupArchive": _secantus_admin_backup_archive,
+    "secantusAdmin.archiveBaseSnapshot": _secantus_admin_archive_base_snapshot,
     "secantusAdmin.restoreArchive": _secantus_admin_restore_archive,
     "secantusAdmin.restoreToTimestamp": _secantus_admin_restore_to_timestamp,
     "explain": _explain,
@@ -5444,6 +5484,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "secantusAdmin.pruneOplog": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.backupArchive": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.archiveBaseSnapshot": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.restoreArchive": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.restoreToTimestamp": (A_FSYNC, SCOPE_CLUSTER),
 }
