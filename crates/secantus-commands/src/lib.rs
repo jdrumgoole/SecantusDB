@@ -39,6 +39,7 @@ pub mod crud;
 pub mod cursors;
 pub mod diagnostics;
 pub mod distinct;
+pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
 pub mod handshake;
@@ -109,6 +110,9 @@ pub struct CommandContext {
     /// on plaintext connections or when no client cert was presented; the
     /// `MONGODB-X509` mechanism (R5c) reads it.
     pub peer_cert_dn: Option<String>,
+    /// Server-wide `configureFailPoint` registry. `None` in unit-test contexts;
+    /// the server wires one in so `failCommand` short-circuits in dispatch.
+    pub failpoints: Option<Arc<failpoints::FailPointRegistry>>,
 }
 
 impl CommandContext {
@@ -130,6 +134,7 @@ impl CommandContext {
             transactions: None,
             conn_auth: None,
             peer_cert_dn: None,
+            failpoints: None,
         }
     }
 
@@ -159,6 +164,13 @@ impl CommandContext {
     /// tests). The auth family (`saslStart` / `saslContinue` / …) reads it.
     pub fn with_conn_auth(mut self, conn_auth: Arc<Mutex<ConnectionAuth>>) -> Self {
         self.conn_auth = Some(conn_auth);
+        self
+    }
+
+    /// Attach the server-wide failpoint registry (builder-style). `dispatch`
+    /// applies matching `failCommand` failpoints; `configureFailPoint` configures.
+    pub fn with_failpoints(mut self, failpoints: Arc<failpoints::FailPointRegistry>) -> Self {
+        self.failpoints = Some(failpoints);
         self
     }
 
@@ -300,8 +312,37 @@ fn lookup(name: &str) -> Option<Handler> {
         "whatsmyuri" => diagnostics::whatsmyuri,
         "hostInfo" => diagnostics::host_info,
         "getLog" => diagnostics::get_log,
+        "configureFailPoint" => configure_fail_point,
         _ => return None,
     })
+}
+
+/// `configureFailPoint` — install / replace / disable a `failCommand` failpoint
+/// (other names are accept-but-ignore). Mirrors `commands._configure_fail_point`.
+fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name = match doc.get("configureFailPoint") {
+        Some(Bson::String(s)) => s.clone(),
+        _ => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "configureFailPoint requires a string name",
+            ))
+        }
+    };
+    let mode = doc
+        .get("mode")
+        .cloned()
+        .unwrap_or_else(|| Bson::String("off".to_string()));
+    let data = doc
+        .get("data")
+        .and_then(Bson::as_document)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(reg) = &ctx.failpoints {
+        reg.configure(&name, &mode, &data);
+    }
+    Ok(doc! { "ok": 1.0 })
 }
 
 /// Dispatch one command to its handler, applying the cross-cutting validation
@@ -360,10 +401,52 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if let Err(e) = authorize(name, doc, ctx) {
                 return e.into_reply();
             }
+            // Failpoint (`failCommand`): a matching failpoint can block, then
+            // either short-circuit the command with an injected error or (when
+            // it only carries a writeConcernError) let it run and attach the
+            // block afterwards. `configureFailPoint` itself is exempt.
+            let fp = if name != "configureFailPoint" {
+                ctx.failpoints.as_ref().and_then(|r| r.match_command(name))
+            } else {
+                None
+            };
+            if let Some(m) = &fp {
+                if m.block_time_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(m.block_time_ms as u64));
+                }
+                if let Some(code) = m.error_code {
+                    let mut reply = CommandError::new(
+                        code,
+                        failpoints::fail_code_name(code),
+                        "Failing command due to 'failCommand' failpoint",
+                    )
+                    .into_reply();
+                    if !m.error_labels.is_empty() {
+                        reply.insert(
+                            "errorLabels",
+                            m.error_labels
+                                .iter()
+                                .map(|s| Bson::String(s.clone()))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    return reply;
+                }
+            }
             // Time profile-eligible commands so dispatch can record a
             // `system.profile` entry when the per-database level requires it.
             let start = profile_eligible(name, doc).then(std::time::Instant::now);
-            let reply = run_with_txn_envelope(name, handler, doc, ctx);
+            let mut reply = run_with_txn_envelope(name, handler, doc, ctx);
+            // A failpoint-configured writeConcernError attaches to a successful reply.
+            if let Some(m) = &fp {
+                if let Some(wce) = &m.write_concern_error {
+                    if reply.get_f64("ok").unwrap_or(0.0) == 1.0
+                        && !reply.contains_key("writeConcernError")
+                    {
+                        reply.insert("writeConcernError", Bson::Document(wce.clone()));
+                    }
+                }
+            }
             if let Some(start) = start {
                 maybe_record_profile(name, doc, &reply, start, ctx);
             }

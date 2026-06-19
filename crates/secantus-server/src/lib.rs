@@ -155,6 +155,8 @@ struct Shared {
     storage: Arc<dyn Storage>,
     cursors: Arc<CursorRegistry>,
     transactions: Arc<secantus_commands::transactions::TransactionRegistry>,
+    /// Server-wide `configureFailPoint` registry, shared across connections.
+    failpoints: Arc<secantus_commands::failpoints::FailPointRegistry>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
@@ -265,6 +267,7 @@ pub fn bind(
         storage,
         cursors,
         transactions,
+        failpoints: Arc::new(secantus_commands::failpoints::FailPointRegistry::new()),
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
@@ -541,6 +544,7 @@ fn make_context(
         .with_storage(shared.storage.clone())
         .with_cursors(shared.cursors.clone())
         .with_transactions(shared.transactions.clone())
+        .with_failpoints(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone());
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
