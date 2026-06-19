@@ -170,16 +170,20 @@ lifting the genesis-intact restriction. `--preserve-oplog` carries the replayed
 oplog for change-stream resume continuity, and collection options replay too.
 Deferred:
 
-- [ ] **Rust server PITR (Phase R).** Prereqs before replay can be correct on the
-  Rust server: (R0a) `create_index`/`drop_index`/`collMod` must emit oplog `c`
-  entries — currently they don't (see §3.2; shared with `showExpandedEvents`);
-  (R0b) port `apply_update_description` into `secantus-core` (pure Rust),
-  parity-tested against the Python oracle in `tests/test_diff.py`; (R0c) expose a
-  WT `backup:` cursor in `secantus-wt` (only `checkpoint()` is exposed today).
-  Then port the applier + `replay_mode` into `secantus-storage`, add a
-  `secantusdb-rs restore` subcommand, and a cross-server restore parity smoke
-  (on-disk + oplog formats are identical, so a Python tool can restore a Rust
-  backup and vice versa once the DDL-oplog gaps close).
+- [ ] **Native Rust server PITR (Phase R).** Plan + verified state in
+  `tasks/rust-pitr-phase-r-plan.md`. **Cross-server restore already works**
+  (R6a, `tests/test_rust_pitr_cross_server.py`): the on-disk WT schema + oplog
+  shape are identical, so the Python `oplog_replay` tool restores a stopped Rust
+  server's data dir today — PITR works for Rust-server data via the Python tool.
+  Stale prereqs now corrected: R0a (DDL oplog `c` entries for create_index /
+  drop_index / collMod) is **already done** in `secantus-storage`, and
+  `compute_update_description` is **already ported + parity-tested**
+  (`tests/test_rust_diff_parity.py`). Remaining for a *self-contained* Rust
+  binary: R1 (WT `backup:` cursor + `create_archive` + wire
+  `secantusAdmin.backupArchive`), R2 (reverse `apply_update_description` in
+  `secantus-core`), R3 (applier + replay in `secantus-storage`), R4
+  (`secantusdb restore` subcommand), R5 (parity for the 3 new Python PITR
+  features: options-carry, `--preserve-oplog`, v2 archiving).
 
 ## 4. Out of scope (intentional, with reasoning)
 
