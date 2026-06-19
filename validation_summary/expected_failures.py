@@ -117,6 +117,36 @@ RUBY: list[ExpectedFailure] = [
 
 PYMONGO: list[ExpectedFailure] = []
 
+C: list[ExpectedFailure] = [
+    ExpectedFailure(
+        pattern="/Client/select_server",
+        rationale=(
+            "libmongoc asserts the selected server is standalone / mongos / "
+            "RS-secondary, but SecantusDB advertises itself as an RS *primary* "
+            "in `hello` (deliberate — pymongo's change-stream topology machinery "
+            "needs a replica-set primary). RSPrimary fails the test's "
+            "`is_standalone_or_(rs_secondary_or_)mongos` check. A consequence of "
+            "the single-node-replica-set advertisement, not a CRUD/wire gap."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="/Client/last_write_date_absent",
+        rationale=(
+            "Asserts `lastWriteDate` is absent (a standalone trait); SecantusDB "
+            "advertises as an RS primary and so returns `lastWrite.lastWriteDate` "
+            "in `hello`. Same root cause as the `/Client/select_server` entries — "
+            "the single-node-replica-set advertisement."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="/Client/ipv6",
+        rationale=(
+            "Requires an IPv6 listener (`MONGOC_TEST_IPV6`); the gauge daemon "
+            "binds IPv4 `127.0.0.1` only. Environment-specific, not a protocol gap."
+        ),
+    ),
+]
+
 
 def find_match(failures: list[ExpectedFailure], description: str) -> ExpectedFailure | None:
     """Return the first expected-failure entry whose pattern is a substring

@@ -19,6 +19,41 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Two new conformance gauges: the MongoDB C and C++ drivers
+
+SecantusDB now measures itself against the official MongoDB **C** (`libmongoc`)
+and **C++** (`mongocxx`) drivers — bringing the gauge count to ten. libmongoc is
+the lowest-level official client, the one the PHP, Ruby, and PyMongo
+C-extensions ultimately wrap; mongocxx is the modern C++ driver built on top of
+it. Both gauges build the driver's own test suite from source and run it,
+unmodified, against an embedded SecantusDB daemon — `test-libmongoc` (curated
+CRUD / cursor / aggregation / command / GridFS / index suites over
+`MONGOC_TEST_URI`) for C, and the mongocxx `test_driver` Catch2 suite for C++.
+Strict native clients surface type- and wire-shape divergences that more
+permissive drivers accept silently.
+
+Two wrinkles were worth solving. First, libmongoc's test fixture probes the
+server with `replSetGetStatus` and aborts the whole run on an unexpected error,
+so SecantusDB now answers it like a standalone `mongod` —
+`NoReplicationEnabled` (code 76), "not running with --replSet" — which driver
+harnesses special-case as "standalone, skip the replica-set-only paths". Second,
+mongocxx's tests hard-wire `mongodb://localhost:27017` with no environment
+override, so the C++ gauge binds its daemon on port 27017 and refuses to run if
+something else already holds it (it won't gauge a foreign server).
+
+Run them with `invoke validate-c` / `invoke validate-cxx` (both need `cmake` and
+a C/C++ toolchain; the first run builds the drivers, later runs reuse the cached
+builds). Both join the weekly `validate.yml` matrix and the cross-driver summary.
+
+#### Added
+- `c_validation/` and `cxx_validation/` gauge packages (`runner` /
+  `generate_report` / `include_paths` each) and the `invoke validate-c` /
+  `invoke validate-cxx` tasks; wired into `invoke validate-all`, the cross-driver
+  summary (`validation_summary`), and CI.
+- `replSetGetStatus` command: returns the standalone-mongod
+  `NoReplicationEnabled` error so single-node-aware driver test fixtures skip
+  replica-set-only behaviour instead of aborting.
+
 ### The in-process Rust engine selection is fully removed
 
 The transitional in-process engine selection — `SECANTUS_ENGINE=python|rust|auto`,

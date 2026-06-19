@@ -542,6 +542,28 @@ def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     return {"ok": 1.0}
 
 
+_NO_REPLICATION_ENABLED = 76  # mongod's NoReplicationEnabled error code
+
+
+def _repl_set_get_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    # SecantusDB is a single-node surrogate: it advertises itself as a
+    # replica-set primary in `hello` (so pymongo's change-stream topology
+    # accepts it), but it is not a real replica set and has no member roster
+    # to report. Return exactly what a standalone mongod returns for
+    # `replSetGetStatus` — `NoReplicationEnabled` with the canonical
+    # "not running with --replSet" message. Drivers and their test harnesses
+    # special-case this message to mean "standalone, skip replica-set-only
+    # behaviour" (e.g. libmongoc's `test_framework_replset_member_count`),
+    # whereas a bare CommandNotFound (code 59) is treated as an unexpected
+    # error and aborts the harness.
+    return {
+        "ok": 0.0,
+        "errmsg": "not running with --replSet",
+        "code": _NO_REPLICATION_ENABLED,
+        "codeName": "NoReplicationEnabled",
+    }
+
+
 def _build_info(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     # `version` stays at the MongoDB-compatibility value so drivers enable
     # the right feature flags (change streams, $changeStream pre-images,
@@ -5295,6 +5317,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "isMaster": _hello,
     "ismaster": _hello,
     "ping": _ping,
+    "replSetGetStatus": _repl_set_get_status,
     "buildInfo": _build_info,
     "buildinfo": _build_info,
     "endSessions": _end_sessions,
