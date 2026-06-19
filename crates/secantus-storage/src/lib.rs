@@ -438,6 +438,9 @@ pub enum StorageError {
     /// The post-apply document failed the collection `validator`. Surfaces as
     /// mongod's `DocumentValidationFailure` (121).
     DocumentValidationFailure,
+    /// An update would modify the immutable `_id` field. Surfaces as mongod's
+    /// `ImmutableField` (66).
+    ImmutableField,
 }
 
 impl std::fmt::Display for StorageError {
@@ -458,6 +461,10 @@ impl std::fmt::Display for StorageError {
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
+            StorageError::ImmutableField => write!(
+                f,
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            ),
             StorageError::BadHint(m) => write!(f, "{m}"),
             StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
             StorageError::Internal(m) => write!(f, "{m}"),
@@ -505,6 +512,56 @@ fn decode_doc(bytes: &[u8]) -> Result<Document> {
 /// `id_key = sortkey.encode_value(_id)` — the byte-sortable key for the `_id`.
 fn id_key(id: &Bson) -> Result<Vec<u8>> {
     sortkey::encode_value(id, None).map_err(|_| StorageError::UnsupportedId)
+}
+
+/// Whether applying `update` to a doc with `_id == old_id` would modify the
+/// immutable `_id` field (mongod rejects this with `ImmutableField`, code 66).
+/// Operator-form: any modifier touching `_id` (or an `_id.` sub-path), except a
+/// `$set`/`$setOnInsert` that sets `_id` to its current value. Replacement-form:
+/// a specified `_id` different from the current one.
+fn update_would_change_id(update: &Document, old_id: &Bson) -> bool {
+    let touches_id = |fields: &Document| fields.keys().any(|k| k == "_id" || k.starts_with("_id."));
+    if !update.keys().any(|k| k.starts_with('$')) {
+        // Replacement-style: only a *different* explicit `_id` is a violation.
+        return matches!(update.get("_id"), Some(v) if v != old_id);
+    }
+    for (op, arg) in update {
+        let Some(fields) = arg.as_document() else {
+            continue;
+        };
+        match op.as_str() {
+            "$set" | "$setOnInsert" => {
+                if let Some(v) = fields.get("_id") {
+                    if v != old_id {
+                        return true;
+                    }
+                }
+                if fields.keys().any(|k| k.starts_with("_id.")) {
+                    return true;
+                }
+            }
+            "$unset" | "$inc" | "$mul" | "$min" | "$max" | "$pop" | "$push" | "$pull"
+            | "$pullAll" | "$addToSet" | "$bit" | "$currentDate" => {
+                if touches_id(fields) {
+                    return true;
+                }
+            }
+            "$rename" => {
+                for (from, to) in fields {
+                    if from == "_id" || from.starts_with("_id.") {
+                        return true;
+                    }
+                    if let Bson::String(t) = to {
+                        if t == "_id" || t.starts_with("_id.") {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The doc-table key for `doc`: the caller-supplied override (timeseries rows
@@ -3659,6 +3716,14 @@ impl Storage {
             is_replacement,
             validator,
             &|doc, up| {
+                // mongod rejects any update that would change the immutable `_id`
+                // with ImmutableField (66) — surface that specific code rather than
+                // a generic "unsupported".
+                if let Some(old_id) = doc.get("_id") {
+                    if update_would_change_id(update, old_id) {
+                        return Err(StorageError::ImmutableField);
+                    }
+                }
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
                     .map_err(|_| StorageError::QueryUnsupported)

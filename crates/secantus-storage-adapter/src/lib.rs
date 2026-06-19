@@ -661,6 +661,12 @@ fn map_err(e: WtError) -> StorageError {
             code: 121,
             errmsg: "Document failed validation".to_string(),
         },
+        // An update that would change `_id` → mongod's ImmutableField (66).
+        WtError::ImmutableField => StorageError::WriteError {
+            code: 66,
+            errmsg: "Performing an update on the path '_id' would modify the immutable field '_id'"
+                .to_string(),
+        },
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.
         WtError::BadHint(m) => StorageError::WriteError { code: 2, errmsg: m },
