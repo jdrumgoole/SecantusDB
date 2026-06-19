@@ -31,6 +31,9 @@ can't be opened — WiredTiger holds a single-writer lock). Start a new server o
   --target-dir PATH     Fresh directory to rebuild into.
   --to-timestamp S[,O]  Recover to this cluster timestamp (seconds, optional
                         ordinal). Omit to replay the whole oplog ('latest').
+  --preserve-oplog      Carry the replayed oplog onto the restored directory so a
+                        change stream there can resume from before the restore
+                        point. Default: a fresh oplog timeline (like mongorestore).
   --help                Show this help.
 ";
 
@@ -135,6 +138,7 @@ fn run_restore(args: &[String]) -> Result<(), String> {
     let mut source: Option<String> = None;
     let mut target_dir: Option<String> = None;
     let mut to_ts: Option<Timestamp> = None;
+    let mut preserve_oplog = false;
     let mut i = 0;
     while i < args.len() {
         let (key, inline) = match args[i].split_once('=') {
@@ -145,6 +149,7 @@ fn run_restore(args: &[String]) -> Result<(), String> {
             "--source" => source = Some(flag_value(args, &mut i, inline, &key)?),
             "--target-dir" => target_dir = Some(flag_value(args, &mut i, inline, &key)?),
             "--to-timestamp" => to_ts = Some(parse_ts(&flag_value(args, &mut i, inline, &key)?)?),
+            "--preserve-oplog" => preserve_oplog = true,
             "--help" | "-h" => {
                 print!("{RESTORE_HELP}");
                 return Ok(());
@@ -155,8 +160,14 @@ fn run_restore(args: &[String]) -> Result<(), String> {
     }
     let source = source.ok_or("--source is required")?;
     let target_dir = target_dir.ok_or("--target-dir is required")?;
-    let stats = secantus_storage::replay::restore_to_timestamp(&source, &target_dir, to_ts, None)
-        .map_err(|e| format!("{e:?}"))?;
+    let stats = secantus_storage::replay::restore_to_timestamp(
+        &source,
+        &target_dir,
+        to_ts,
+        None,
+        preserve_oplog,
+    )
+    .map_err(|e| format!("{e:?}"))?;
     println!(
         "Restored {} operations (through oplog seq {}) into {}.\n\
          Start a server on it: secantusdb --storage-path {}",

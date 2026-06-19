@@ -215,17 +215,21 @@ fn within_bound(entry: &Document, up_to_ts: Option<Timestamp>, up_to_wall_ms: Op
 }
 
 /// Replay `source`'s oplog into `target` (which must have oplog emission
-/// disabled), stopping before the first entry past the target time.
+/// disabled), stopping before the first entry past the target time. When `carry`
+/// is set, the in-bound rows are also collected (verbatim) for the caller to
+/// re-import onto the target so the restored oplog timeline is preserved.
 fn replay(
     source: &Storage,
     target: &Storage,
     up_to_ts: Option<Timestamp>,
     up_to_wall_ms: Option<i64>,
-) -> Result<ReplayStats> {
+    carry: bool,
+) -> Result<(ReplayStats, Vec<(i64, Document)>)> {
     let mut stats = ReplayStats::default();
+    let mut carried: Vec<(i64, Document)> = Vec::new();
     let mut start = source.oplog_floor_seq()?;
     if start == 0 {
-        return Ok(stats);
+        return Ok((stats, carried));
     }
     'outer: loop {
         let batch = source.read_oplog(start, READ_CHUNK)?;
@@ -240,14 +244,16 @@ fn replay(
             }
             stats.entries_seen += 1;
             stats.last_seq = *seq;
+            if carry {
+                carried.push((*seq, entry.clone()));
+            }
             if apply_entry(target, &entry)? {
                 stats.ops_applied += 1;
             }
         }
         start = batch[batch.len() - 1].0 + 1;
     }
-    target.checkpoint()?;
-    Ok(stats)
+    Ok((stats, carried))
 }
 
 /// Rebuild `target_dir` as the database was at the target time by replaying
@@ -260,6 +266,7 @@ pub fn restore_to_timestamp(
     target_dir: &str,
     up_to_ts: Option<Timestamp>,
     up_to_wall_ms: Option<i64>,
+    carry_oplog: bool,
 ) -> Result<ReplayStats> {
     let source = Storage::open(source_dir)?;
     let floor = source.oplog_floor_seq()?;
@@ -278,6 +285,21 @@ pub fn restore_to_timestamp(
         .map_err(|e| StorageError::Internal(format!("restore: create target dir: {e}")))?;
     let mut target = Storage::open(target_dir)?;
     target.set_enable_oplog(false); // replay drives the write paths without re-emitting
-    let stats = replay(&source, &target, up_to_ts, up_to_wall_ms)?;
+    let (stats, carried) = replay(&source, &target, up_to_ts, up_to_wall_ms, carry_oplog)?;
+    if carry_oplog && !carried.is_empty() {
+        // Preserve the replayed oplog timeline: write the in-bound rows verbatim
+        // (with pre-images) so a change stream on the restored server resumes
+        // from a token minted before the restore point. Default (no carry) leaves
+        // a fresh empty timeline, like mongorestore.
+        let mut pre_images: std::collections::HashMap<i64, Vec<u8>> =
+            std::collections::HashMap::new();
+        for (seq, _) in &carried {
+            if let Some(pre) = source.read_preimage(*seq)? {
+                pre_images.insert(*seq, pre);
+            }
+        }
+        target.import_oplog_segment(&carried, &pre_images)?;
+    }
+    target.checkpoint()?;
     Ok(stats)
 }

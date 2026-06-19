@@ -103,3 +103,28 @@ def test_rust_binary_restore_to_timestamp(tmp_path: pathlib.Path) -> None:
 def test_rust_binary_restore_missing_source_errors(tmp_path: pathlib.Path) -> None:
     res = _restore(tmp_path / "does-not-exist", tmp_path / "out")
     assert res.returncode != 0
+
+
+def _restored_oplog_len(path: pathlib.Path) -> int:
+    s = Storage(str(path), enable_oplog=True)
+    try:
+        return len(s.read_oplog(start_seq=1, limit=1000))
+    finally:
+        s.close()
+
+
+def test_rust_binary_preserve_oplog(tmp_path: pathlib.Path) -> None:
+    """`--preserve-oplog` carries the replayed oplog onto the restored dir; the
+    default leaves it empty (Phase R, R5b)."""
+    data = tmp_path / "pydata"
+    with SecantusDBServer(port=0, storage_path=str(data)) as srv:
+        coll = pymongo.MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
+
+    carried = tmp_path / "carried"
+    assert _restore(data, carried, "--preserve-oplog").returncode == 0
+    assert _restored_oplog_len(carried) >= 3  # timeline preserved
+
+    fresh = tmp_path / "fresh"
+    assert _restore(data, fresh).returncode == 0
+    assert _restored_oplog_len(fresh) == 0  # fresh timeline by default

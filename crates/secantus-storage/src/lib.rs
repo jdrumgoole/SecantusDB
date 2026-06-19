@@ -1464,6 +1464,68 @@ impl Storage {
         }
     }
 
+    /// Write **verbatim** oplog rows `(seq, entry)` (carrying their original seq /
+    /// ts / wall) plus any pre-images into the oplog tables, and advance the seq +
+    /// cluster clock past them — so a restored store continues a pre-existing
+    /// timeline and a change stream there can resume from a token minted before
+    /// the restore point. Unlike `emit_oplog` this does NOT mint new seqs (the
+    /// rows keep their identity, so resume tokens stay valid) and is not gated on
+    /// `enable_oplog` (it's an explicit import). Returns the highest seq written.
+    /// Mirrors Python `Storage.import_oplog_segment`.
+    pub fn import_oplog_segment(
+        &self,
+        rows: &[(i64, Document)],
+        pre_images: &std::collections::HashMap<i64, Vec<u8>>,
+    ) -> Result<i64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut pre_cur: Option<Cursor> = None;
+        let mut max_seq = 0i64;
+        let mut best = (0i64, 0i64);
+        for (seq, entry) in rows {
+            let blob = encode_doc(entry)?;
+            cur.reset()?;
+            cur.set_key_q(*seq);
+            cur.set_value_u(&blob);
+            cur.insert()?;
+            if let Some(pre) = pre_images.get(seq) {
+                if pre_cur.is_none() {
+                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
+                }
+                let pc = pre_cur.as_ref().unwrap();
+                pc.reset()?;
+                pc.set_key_q(*seq);
+                pc.set_value_u(pre);
+                pc.insert()?;
+            }
+            if *seq > max_seq {
+                max_seq = *seq;
+            }
+            if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
+                let cand = (i64::from(ts.time), i64::from(ts.increment));
+                if cand > best {
+                    best = cand;
+                }
+            }
+        }
+        {
+            let mut st = self.oplog.lock().unwrap();
+            if max_seq + 1 > st.next_seq {
+                st.next_seq = max_seq + 1;
+            }
+            if best > (st.last_ts_secs, st.last_ts_ord) {
+                st.last_ts_secs = best.0;
+                st.last_ts_ord = best.1;
+            }
+            self.oplog_cv.notify_all();
+        }
+        Ok(max_seq)
+    }
+
     /// Drop oplog rows older than the retention window (`ts.time < now -
     /// retention`) and, if more than `oplog_max_entries` remain, the oldest
     /// surplus; paired pre-images go too. `now` is injected seconds (defaults to
@@ -5544,9 +5606,14 @@ mod tests {
         } // drop releases the WiredTiger single-writer lock
 
         let out = dir.path().join("restored");
-        let stats =
-            replay::restore_to_timestamp(src.to_str().unwrap(), out.to_str().unwrap(), None, None)
-                .unwrap();
+        let stats = replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(stats.ops_applied >= 4);
 
         let restored = Storage::open(out.to_str().unwrap()).unwrap();
@@ -5583,8 +5650,14 @@ mod tests {
         }
 
         let out = dir.path().join("restored");
-        replay::restore_to_timestamp(src.to_str().unwrap(), out.to_str().unwrap(), None, None)
-            .unwrap();
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         let restored = Storage::open(out.to_str().unwrap()).unwrap();
         let got = restored.get_collection_options("app", "c").unwrap();
@@ -5592,6 +5665,73 @@ mod tests {
         assert_eq!(got.get_i64("size").ok(), Some(8192));
         assert_eq!(got.get_i64("max").ok(), Some(100));
         assert_eq!(got.get_document("validator").ok(), Some(&validator));
+    }
+
+    #[test]
+    fn restore_with_carry_oplog_preserves_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let src_seqs: Vec<i64> = {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            s.read_oplog(1, 100)
+                .unwrap()
+                .iter()
+                .map(|(q, _)| *q)
+                .collect()
+        };
+
+        // carry_oplog = true: the restored store keeps the same oplog seqs ...
+        let carried = dir.path().join("carried");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            carried.to_str().unwrap(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let r = Storage::open(carried.to_str().unwrap()).unwrap();
+        let restored_seqs: Vec<i64> = r
+            .read_oplog(1, 100)
+            .unwrap()
+            .iter()
+            .map(|(q, _)| *q)
+            .collect();
+        assert_eq!(restored_seqs, src_seqs);
+        let tail = r.oplog_tail_seq();
+        r.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 3i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.oplog_tail_seq(), tail + 1); // a fresh write continues the timeline
+        drop(r);
+
+        // ... while the default (no carry) leaves the restored oplog empty.
+        let fresh = dir.path().join("fresh");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let f = Storage::open(fresh.to_str().unwrap()).unwrap();
+        assert!(f.read_oplog(1, 100).unwrap().is_empty());
     }
 
     #[test]
