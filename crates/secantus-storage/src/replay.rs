@@ -47,7 +47,14 @@ fn empty_doc() -> Document {
 /// dropIndexes / collMod / renameCollection).
 fn apply_command(storage: &Storage, db: &str, o: &Document) -> Result<()> {
     if let Ok(coll) = o.get_str("create") {
-        storage.create_collection(db, coll)?;
+        // Collection options (capped / size / max / validator / viewOn / …) ride
+        // the create entry as siblings of `create`; reconstruct them.
+        let options: Document = o
+            .iter()
+            .filter(|(k, _)| k.as_str() != "create" && k.as_str() != "idIndex")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        storage.create_collection_with_options(db, coll, &options)?;
     } else if let Ok(coll) = o.get_str("drop") {
         storage.drop_collection(db, coll)?;
     } else if o.contains_key("dropDatabase") {

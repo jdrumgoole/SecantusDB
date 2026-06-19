@@ -66,9 +66,13 @@ fn collection_option_subset(doc: &Document) -> Document {
 /// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "create")?;
+    // Build the options up front so they ride the `create` oplog entry (carried
+    // by create_collection_with_options) — that's what lets PITR replay
+    // reconstruct capped / validator / … rather than seeing a bare create.
+    let opts = collection_option_subset(doc);
     let storage = ctx.storage()?;
     let created = storage
-        .create_collection(&ctx.db_name, &coll)
+        .create_collection_with_options(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
     if !created {
         return Ok(CommandError::new(
@@ -77,12 +81,6 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("a collection '{}.{}' already exists", ctx.db_name, coll),
         )
         .into_reply());
-    }
-    let opts = collection_option_subset(doc);
-    if !opts.is_empty() {
-        storage
-            .set_collection_options(&ctx.db_name, &coll, &opts)
-            .map_err(command_error)?;
     }
     Ok(doc! { "ok": 1.0 })
 }

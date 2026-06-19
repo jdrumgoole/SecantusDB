@@ -390,6 +390,23 @@ pub trait Storage: Send + Sync {
         Ok(true)
     }
 
+    /// Create a collection, persisting `options` (`capped` / `validator` / …) AND
+    /// carrying them in the `create` oplog entry so PITR replay reconstructs them.
+    /// Default: create then a plain (oplog-silent) option write; the WT adapter
+    /// forwards to `Storage::create_collection_with_options`.
+    fn create_collection_with_options(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool, StorageError> {
+        let created = self.create_collection(db, coll)?;
+        if created && !options.is_empty() {
+            self.set_collection_options(db, coll, options)?;
+        }
+        Ok(created)
+    }
+
     /// The collection's stored options blob (`validator` / `validationAction` /
     /// `changeStreamPreAndPostImages` / `capped` / …), empty when none/unknown.
     /// Default empty (fakes don't track options); the WT adapter forwards.

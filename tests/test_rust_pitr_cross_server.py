@@ -124,3 +124,36 @@ def test_rust_backup_archive_requires_output_path(tmp_path: Path) -> None:
         assert reply["code"] == 14
     finally:
         srv.stop()
+
+
+def test_rust_create_options_survive_restore(tmp_path: Path) -> None:
+    """A capped collection with a validator, created through the Rust server,
+    is reconstructed (options and all) after a backup+restore — proving the Rust
+    server carries collection options in the `create` oplog entry (Phase R, R5a)."""
+    data = tmp_path / "rustdata"
+    archive = tmp_path / "backup.tar.gz"
+    srv = _server.RustServer(str(data), 0)
+    try:
+        db = _rust_client(srv)["app"]
+        db.create_collection(
+            "events", capped=True, size=8192, max=100, validator={"v": {"$gt": 0}}
+        )
+        db["events"].insert_one({"_id": 1, "v": 5})
+        reply = _rust_client(srv)["admin"].command(
+            {"secantusAdmin.backupArchive": 1, "outputPath": str(archive)}
+        )
+        assert reply["ok"] == 1.0
+    finally:
+        srv.stop()
+
+    out = tmp_path / "restored"
+    oplog_replay.restore_archive_to_timestamp(str(archive), str(out))
+    s = Storage(str(out), enable_oplog=True)
+    try:
+        opts = s.get_collection_options("app", "events")
+    finally:
+        s.close()
+    assert opts.get("capped") is True
+    assert opts.get("size") == 8192
+    assert opts.get("max") == 100
+    assert opts.get("validator") == {"v": {"$gt": 0}}

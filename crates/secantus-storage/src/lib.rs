@@ -2189,12 +2189,35 @@ impl Storage {
     /// already exists, `true` if created — minting its UUID and emitting an
     /// `op: "c"` `create` oplog entry. Mirrors `storage.create_collection`.
     pub fn create_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        self.create_collection_with_options(db, coll, &Document::new())
+    }
+
+    /// Like [`create_collection`], but persists `options` (`capped` / `size` /
+    /// `max` / `validator` / `viewOn` / …) to the collection blob **and** carries
+    /// them as siblings of `create` in the `c` oplog entry's `o`, so PITR replay
+    /// (Rust or Python) and `show_expanded_events` create events reconstruct them.
+    /// Mirrors Python `Storage.create_collection(..., options=...)`.
+    pub fn create_collection_with_options(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
         let session = self.op_session()?;
         if collection_registered(&session, db, coll)? {
             return Ok(false);
         }
         ensure_collection(&session, db, coll)?;
+        if !options.is_empty() {
+            // Persist before minting the UUID below — collection_uuid re-reads and
+            // merges, so the options survive.
+            let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+            for (k, v) in options {
+                current.insert(k.clone(), v.clone());
+            }
+            write_coll_options(&session, db, coll, &current)?;
+        }
         if self.enable_oplog {
             let ui = collection_uuid(&session, db, coll)?;
             let mut id_key_spec = Document::new();
@@ -2205,6 +2228,9 @@ impl Storage {
             id_index.insert("name", ID_INDEX_NAME);
             let mut o = Document::new();
             o.insert("create", coll);
+            for (k, v) in options {
+                o.insert(k.clone(), v.clone());
+            }
             o.insert("idIndex", Bson::Document(id_index));
             let mut entry = Document::new();
             entry.insert("op", "c");
@@ -5535,6 +5561,37 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, vec![(1, 100), (3, 3)]);
+    }
+
+    #[test]
+    fn replay_reconstructs_collection_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let validator = doc! {"v": {"$gt": 0}};
+        {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            let opts = doc! {"capped": true, "size": 8192i64, "max": 100i64, "validator": validator.clone()};
+            assert!(s.create_collection_with_options("app", "c", &opts).unwrap());
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 1i32, "v": 5i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        }
+
+        let out = dir.path().join("restored");
+        replay::restore_to_timestamp(src.to_str().unwrap(), out.to_str().unwrap(), None, None)
+            .unwrap();
+
+        let restored = Storage::open(out.to_str().unwrap()).unwrap();
+        let got = restored.get_collection_options("app", "c").unwrap();
+        assert_eq!(got.get_bool("capped").ok(), Some(true));
+        assert_eq!(got.get_i64("size").ok(), Some(8192));
+        assert_eq!(got.get_i64("max").ok(), Some(100));
+        assert_eq!(got.get_document("validator").ok(), Some(&validator));
     }
 
     #[test]
