@@ -19,6 +19,51 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Closing the gaps the C, C++, and C# gauges opened
+
+Adding the mongo-c-driver, mongo-cxx-driver, and mongo-csharp-driver gauges
+turned up a cluster of small conformance divergences in the Python server, and
+this release fixes the actionable ones. None were show-stoppers on their own —
+they're the kind of edge that a permissive driver like pymongo glosses over but
+a strict C extension or a spec-faithful CRUD suite pins exactly — and together
+they tighten how faithfully SecantusDB answers the corners of the wire protocol.
+
+The headline is document-validation error detail: a write that fails a
+collection validator now returns mongod's full per-operator `errInfo.details`
+(`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`)
+instead of a bare placeholder, so a driver can tell you *why* a document was
+rejected. Alongside it: `$out` / `$merge` are now rejected unless they're the
+final pipeline stage, they enforce the destination collection's validator
+(honouring `bypassDocumentValidation`), a change stream opened with an invalid
+`$match` errors immediately rather than on the first batch, `batchSize` accepts
+any BSON number type, over-long database names are rejected, dropping or renaming
+a collection invalidates its open cursors, and `collMod` can stage an index
+`prepareUnique` and convert it to `unique` — reporting the duplicate `_id`
+groups as `violations` when the conversion can't proceed.
+
+#### Added
+- `collMod {index: {prepareUnique: true}}` arms an existing index so new
+  uniqueness-violating writes are rejected (11000) while pre-existing duplicates
+  remain, and `collMod {index: {unique: true}}` converts it — refusing with
+  `CannotConvertIndexToUnique` (359) plus a `violations: [{ids: [...]}]` array
+  when duplicates exist (`storage.set_index_options` / `find_index_duplicates`).
+
+#### Fixed
+- Document validation now synthesises mongod's per-operator `errInfo.details`
+  for query-expression validators (`commands._validation_failure_details`),
+  used by both the insert path and `findAndModify` upsert simulation.
+- `$out` / `$merge` are rejected with `Location40601` (40601) unless they are the
+  final pipeline stage, and they enforce the destination collection's `validator`
+  unless `bypassDocumentValidation` is set (`DocumentValidationFailure`, 121).
+- Change streams validate `$match` filter syntax at open time, so an unknown
+  query operator errors at `.begin()` (aggregate) rather than the first `getMore`.
+- `find` / `aggregate` accept a `batchSize` encoded as any BSON number, including
+  `Decimal128`.
+- Commands targeting a database whose name exceeds 63 bytes are rejected with
+  `InvalidNamespace` (73).
+- Dropping or renaming a collection now kills its open cursors, so a later
+  `getMore` fails with `CursorNotFound` (43) instead of serving stale rows.
+
 ### createIndexes now rejects conflicting index definitions
 
 `createIndexes` previously accepted a re-creation that collided with an existing

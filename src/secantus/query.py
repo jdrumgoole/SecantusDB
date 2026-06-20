@@ -730,6 +730,43 @@ _TYPE_PREDS: dict[Any, Callable[[Any], bool]] = {
 }
 
 
+def bson_type_name(v: Any) -> str:
+    """mongod's BSON type-alias string for a decoded value.
+
+    Used to fill ``consideredType`` in document-validation failure
+    details (the C# CRUD-spec prose test pins ``"int"`` for a Python
+    ``int``). Order matters: ``bool`` and ``Int64`` are ``int``
+    subclasses and must be checked first.
+    """
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, ObjectId):
+        return "objectId"
+    if isinstance(v, _dt.datetime):
+        return "date"
+    if v is None:
+        return "null"
+    if isinstance(v, Regex):
+        return "regex"
+    if isinstance(v, (bytes, Binary)):
+        return "binData"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return "object"
+
+
 def _matches_type(value: Any, type_spec: Any) -> bool:
     pred = _TYPE_PREDS.get(type_spec)
     return bool(pred(value)) if pred else False
