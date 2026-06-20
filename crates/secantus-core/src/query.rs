@@ -141,6 +141,51 @@ fn is_operator_dict(d: &Document) -> bool {
     !d.is_empty() && d.keys().all(|k| k.starts_with('$'))
 }
 
+/// Field-level query operators this engine recognises (incl. the geo/regex
+/// sub-operators handled specially). Used only for error messages — see
+/// [`first_unknown_operator`].
+const KNOWN_FIELD_OPS: &[&str] = &[
+    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$not", "$type",
+    "$size", "$all", "$elemMatch", "$mod", "$bitsAllSet", "$bitsAnySet", "$bitsAllClear",
+    "$bitsAnyClear", "$geoWithin", "$geoIntersects", "$near", "$nearSphere", "$regex", "$options",
+    "$geometry", "$center", "$centerSphere", "$box", "$polygon", "$minDistance", "$maxDistance",
+];
+
+/// The first unrecognised field-level operator in a filter (recursing through
+/// `$and`/`$or`/`$nor`), e.g. `$badOperator` for `{x: {$badOperator: 1}}`. Lets
+/// the command layer build mongod's "unknown operator"-style message (which the
+/// drivers' error-document tests assert names the offending operator) instead of
+/// a generic one. `None` when no field operator is unrecognised.
+pub fn first_unknown_operator(filter: &Document) -> Option<String> {
+    for (k, v) in filter.iter() {
+        if k == "$and" || k == "$or" || k == "$nor" {
+            if let Bson::Array(arr) = v {
+                for sub in arr {
+                    if let Bson::Document(d) = sub {
+                        if let Some(op) = first_unknown_operator(d) {
+                            return Some(op);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if k.starts_with('$') {
+            continue; // other document-level operators ($expr/$text/$comment/...)
+        }
+        if let Bson::Document(d) = v {
+            if is_operator_dict(d) {
+                for op in d.keys() {
+                    if !KNOWN_FIELD_OPS.contains(&op.as_str()) {
+                        return Some(op.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
     match cond {
         // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.

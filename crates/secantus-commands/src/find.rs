@@ -30,6 +30,17 @@ use crate::util::{
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
+/// Shape a `BadValue` for a filter the matcher couldn't evaluate, naming the
+/// offending operator when there's an unrecognised one (e.g. `$badOperator`) so
+/// drivers' error-document tests see the operator in the message, matching
+/// mongod / the Python server.
+pub(crate) fn query_filter_error(filter: &Document) -> CommandError {
+    match secantus_core::query::first_unknown_operator(filter) {
+        Some(op) => CommandError::new(2, "BadValue", format!("unsupported query operator: {op}")),
+        None => CommandError::new(2, "BadValue", "unsupported or invalid query filter"),
+    }
+}
+
 /// `find` — run a query and open a cursor over the results.
 pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "find")?;
@@ -86,7 +97,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // (operator recognition is doc-independent) to surface the same `BadValue`.
     if docs.is_empty() && !filter.is_empty() {
         secantus_core::query::matches(&Document::new(), &filter, &let_vars, collation.as_ref())
-            .map_err(|_| CommandError::new(2, "BadValue", "unsupported or invalid query filter"))?;
+            .map_err(|_| query_filter_error(&filter))?;
     }
 
     // Cursor `min` / `max` index bounds (inclusive lower / exclusive upper),
