@@ -4086,8 +4086,9 @@ impl Storage {
 
     /// Pipeline-form update (`u: [ {$set: …}, … ]`). Each matched doc is rewritten
     /// by running the aggregation pipeline over it (`apply_pipeline` on the single
-    /// doc); the `_id` is preserved by the pipeline stages (the allowed
-    /// `$set`/`$project`/`$replaceWith`/… never drop it). Always diff-style in the
+    /// doc); the original `_id` is re-applied when a stage (`$replaceRoot` /
+    /// `$replaceWith` / `$project`) drops it — mongod keeps `_id` immutable across
+    /// an update pipeline. Always diff-style in the
     /// oplog (`is_replacement = false`) so change streams report
     /// `operationType: "update"` — mirrors `storage.update_matching`'s list branch.
     /// On upsert with no match, the pipeline runs over the filter-seeded doc.
@@ -4122,7 +4123,20 @@ impl Storage {
                     None,
                 )
                 .map_err(|_| StorageError::QueryUnsupported)?;
-                out.into_iter().next().ok_or(StorageError::QueryUnsupported)
+                let mut new = out
+                    .into_iter()
+                    .next()
+                    .ok_or(StorageError::QueryUnsupported)?;
+                // mongod preserves the original `_id` through an update pipeline —
+                // a `$replaceRoot`/`$replaceWith`/`$project` stage can drop it, but
+                // the stored doc keeps its `_id` (which is immutable). Re-add it if
+                // a stage removed it. (`encode_doc` then restores `_id`-first order.)
+                if !new.contains_key("_id") {
+                    if let Some(id) = doc.get("_id") {
+                        new.insert("_id", id.clone());
+                    }
+                }
+                Ok(new)
             },
         )
     }

@@ -208,11 +208,16 @@ impl CommandContext {
 
 /// A command failure carrying mongod's error triple. Shaped into an `ok: 0`
 /// reply by [`CommandError::into_reply`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandError {
     pub code: i32,
     pub code_name: String,
     pub errmsg: String,
+    /// Extra top-level fields merged into the error reply (e.g. a DuplicateKey's
+    /// `keyPattern` / `keyValue`). `None` for the common case — boxed so the
+    /// error type stays small in `Result`. (`bson::Document` is `PartialEq` but
+    /// not `Eq`, so this type is `PartialEq`-only.)
+    pub extra: Option<Box<Document>>,
 }
 
 impl CommandError {
@@ -221,7 +226,14 @@ impl CommandError {
             code,
             code_name: code_name.into(),
             errmsg: errmsg.into(),
+            extra: None,
         }
+    }
+
+    /// Attach extra top-level fields to the error reply (merged by `into_reply`).
+    pub fn with_extra(mut self, extra: Document) -> Self {
+        self.extra = Some(Box::new(extra));
+        self
     }
 
     /// `59 CommandNotFound` for an unregistered command name.
@@ -229,14 +241,21 @@ impl CommandError {
         CommandError::new(59, "CommandNotFound", format!("no such command: '{name}'"))
     }
 
-    /// The standard `{ok: 0, errmsg, code, codeName}` reply document.
+    /// The standard `{ok: 0, errmsg, code, codeName}` reply document, plus any
+    /// `extra` fields (e.g. `keyPattern` / `keyValue`).
     pub fn into_reply(self) -> Document {
-        doc! {
+        let mut reply = doc! {
             "ok": 0.0,
             "errmsg": self.errmsg,
             "code": self.code,
             "codeName": self.code_name,
+        };
+        if let Some(extra) = self.extra {
+            for (k, v) in *extra {
+                reply.insert(k, v);
+            }
         }
+        reply
     }
 }
 

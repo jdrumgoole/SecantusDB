@@ -1051,11 +1051,18 @@ fn apply_merge(
                 match mode {
                     "keepExisting" => {}
                     "fail" => {
+                        // mongod's DuplicateKey carries keyPattern/keyValue so the
+                        // driver can inspect which key collided (the crud-spec
+                        // "$merge DuplicateKey error is accessible" test asserts it).
                         return Err(CommandError::new(
                             11000,
                             "DuplicateKey",
                             "$merge whenMatched=fail matched an existing document",
-                        ));
+                        )
+                        .with_extra(doc! {
+                            "keyPattern": { "_id": 1 },
+                            "keyValue": { "_id": existing_id.clone() },
+                        }));
                     }
                     "delete" => {
                         storage
