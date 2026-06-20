@@ -212,9 +212,43 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let filter = doc_field(doc, "query");
     let collation = collation_of(doc);
 
-    let mut n = storage
-        .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
-        .map_err(command_error)? as i64;
+    // View support: a collection created with `viewOn` is a read-only view; its
+    // count runs the view's pipeline (plus the count's query as a trailing
+    // `$match`) through the aggregation engine. estimatedDocumentCount (the
+    // drivers' "estimatedDocumentCount works correctly on views" tests) leans on
+    // this. Mirrors `commands.py::_count`.
+    let view_on = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .ok()
+        .and_then(|o| o.get_str("viewOn").ok().map(String::from));
+    let mut n = if let Some(view_on) = view_on {
+        let opts = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map_err(command_error)?;
+        let mut pipeline: Vec<Bson> = opts
+            .get_array("viewPipeline")
+            .ok()
+            .cloned()
+            .unwrap_or_default();
+        if !filter.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$match": filter.clone() }));
+        }
+        pipeline.push(Bson::Document(doc! { "$count": "n" }));
+        let agg = doc! { "aggregate": view_on, "pipeline": pipeline, "cursor": {} };
+        let reply = crate::aggregate::aggregate(&agg, ctx)?;
+        reply
+            .get_document("cursor")
+            .ok()
+            .and_then(|c| c.get_array("firstBatch").ok())
+            .and_then(|b| b.first())
+            .and_then(Bson::as_document)
+            .and_then(|d| d.get("n").and_then(as_i64))
+            .unwrap_or(0)
+    } else {
+        storage
+            .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
+            .map_err(command_error)? as i64
+    };
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0);
     if skip > 0 {
         n = (n - skip).max(0);

@@ -10,8 +10,12 @@
 //! `max`); `collMod` merges the same set into an existing collection (else
 //! `NamespaceNotFound`). The `insert` handler enforces `validator` (code 121).
 //!
+//! `create` with `viewOn` + `pipeline` registers a read-only view; `count`
+//! resolves through the view's pipeline and `listCollections` reports it as
+//! `type: "view"` (readOnly, no `_id` index).
+//!
 //! **Deferred (documented so parity is honest):**
-//! * `create` unknown-field validation (`Location40415`); views; capped-size
+//! * `create` unknown-field validation (`Location40415`); capped-size
 //!   enforcement; `collMod`'s TTL-index `index: {expireAfterSeconds}` modify.
 //! * `validator` enforcement on `findAndModify` (insert / `update` / replace are
 //!   enforced — the command layer reads the validator and the storage update
@@ -37,7 +41,7 @@ use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SER
 /// `changeStreamPreAndPostImages` drives pre-image capture; `capped`/`size`/`max`
 /// are reported in stats. (TTL-index `expireAfterSeconds` modification via
 /// `collMod`'s `index` option is deferred.)
-const STORED_COLL_OPTIONS: [&str; 9] = [
+const STORED_COLL_OPTIONS: [&str; 11] = [
     "validator",
     "validationLevel",
     "validationAction",
@@ -50,6 +54,10 @@ const STORED_COLL_OPTIONS: [&str; 9] = [
     "timeseries",
     // The collection's default collation — surfaced back in `listCollections`.
     "collation",
+    // Round-tripped in `listCollections` so drivers see the options they set on
+    // `create` (the rust driver's collection_management asserts both).
+    "storageEngine",
+    "indexOptionDefaults",
 ];
 
 /// The subset of a command doc that maps to persisted collection options.
@@ -69,7 +77,20 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Build the options up front so they ride the `create` oplog entry (carried
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
-    let opts = collection_option_subset(doc);
+    let mut opts = collection_option_subset(doc);
+    // `viewOn` + `pipeline` makes this a read-only view of another collection
+    // (mongod 3.4+). Store the source and the pipeline (under `viewPipeline` so
+    // it doesn't collide with an aggregate's `pipeline`); `listCollections`
+    // surfaces it as `type: "view"` and `count` resolves through it.
+    if let Some(Bson::String(view_on)) = doc.get("viewOn") {
+        opts.insert("viewOn", view_on.clone());
+        let pipeline = doc
+            .get("pipeline")
+            .and_then(Bson::as_array)
+            .cloned()
+            .unwrap_or_default();
+        opts.insert("viewPipeline", Bson::Array(pipeline));
+    }
     let storage = ctx.storage()?;
     let created = storage
         .create_collection_with_options(&ctx.db_name, &coll, &opts)
@@ -362,21 +383,35 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         .map_err(command_error)?;
     let mut entries: Vec<Document> = Vec::with_capacity(names.len());
     for n in &names {
-        let options = storage
+        let mut options = storage
             .get_collection_options(&ctx.db_name, n)
             .map_err(command_error)?;
-        let coll_type = if options.contains_key("timeseries") {
+        // A `viewOn` collection is a read-only view: type "view", readOnly true,
+        // no `_id` index, and the stored `viewPipeline` surfaces as `pipeline`.
+        let is_view = options.contains_key("viewOn");
+        if let Some(p) = options.remove("viewPipeline") {
+            options.insert("pipeline", p);
+        }
+        let coll_type = if is_view {
+            "view"
+        } else if options.contains_key("timeseries") {
             "timeseries"
         } else {
             "collection"
         };
-        entries.push(doc! {
+        let mut entry = doc! {
             "name": n,
             "type": coll_type,
             "options": Bson::Document(options),
-            "info": { "readOnly": false },
-            "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
-        });
+            "info": { "readOnly": is_view },
+        };
+        if !is_view {
+            entry.insert(
+                "idIndex",
+                doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+            );
+        }
+        entries.push(entry);
     }
     // `filter` is evaluated against the full entry (so `{name: …}`,
     // `{type: …}`, `{"options.capped": true}` all work); apply it before the
