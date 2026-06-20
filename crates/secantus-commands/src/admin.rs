@@ -429,12 +429,16 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         }
     }
     let ns = format!("{}.$cmd.listCollections", ctx.db_name);
-    let (first, cid) = split_into_cursor(
-        encode_docs(entries)?,
-        DEFAULT_BATCH_SIZE as i64,
-        &ns,
-        cursors,
-    )?;
+    // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
+    // gets a real getMore (drivers' "listCollections getMore is monitored"
+    // tests force this); absent ⇒ the wire default.
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
