@@ -2761,6 +2761,17 @@ impl Storage {
         })
     }
 
+    /// The smallest `id_key` currently in a collection, or `None` if empty. A
+    /// tailable cursor uses this to detect capped rollover: if the doc it last
+    /// returned has been evicted (min `id_key` now exceeds the cursor's anchor),
+    /// mongod kills the cursor with `CappedPositionLost`.
+    pub fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let rows = self.scan_docs(&session, db, coll)?;
+        Ok(rows.into_iter().map(|(k, _)| k).min())
+    }
+
     // --- users / roles / profiling (auth + profiling surface) ---
 
     /// Persist a user record (opaque BSON blob). Returns `true` if added,

@@ -12,23 +12,93 @@
 //! `BadValue` (as it would against a non-empty collection through the storage
 //! scan) instead of silently returning an empty cursor.
 //!
-//! **Deferred (documented so parity is honest):**
-//! * `tailable: true` (capped-collection poll) — needs the tailable cursor
-//!   machinery + `collection_is_capped`; rejected here as unsupported (capped
-//!   collections aren't creatable through the ported handlers yet anyway).
+//! `tailable: true` on a capped collection opens a tailable cursor: the matched
+//! docs seed firstBatch (+ a queued remainder), then [`TailableFindProducer`]
+//! polls for docs inserted afterwards (capped rollover → `CappedPositionLost`).
+//!
+//! **Notes:**
 //! * `let` IS applied — command `let` vars (`$$NOW` + evaluated values) are
 //!   visible to `$expr` in the filter, threaded through `find_collated`.
 //!   `collation` IS applied — filter matching + sort order are collation-aware
 //!   (COLLSCAN-forced); a non-ASCII / numericOrdering collation → `BadValue`.
 
+use std::sync::Arc;
+
 use bson::{doc, Bson, Document};
 
-use crate::cursors::CursorRegistry;
+use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
+use crate::storage::Storage;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
     encode_docs, resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+
+/// Producer for a tailable cursor on a capped collection (`find` with
+/// `tailable: true`). Each `produce` scans the collection for documents whose
+/// `id_key` sorts after the last one returned. If the cursor's anchor has been
+/// evicted by capped rollover (the collection's min `id_key` now exceeds it),
+/// it surfaces `CappedPositionLost` (136). Mirrors `commands.py::_find_tailable`.
+struct TailableFindProducer {
+    storage: Arc<dyn Storage>,
+    db: String,
+    coll: String,
+    after: Option<Vec<u8>>,
+    fatal: Option<CommandError>,
+}
+
+impl CursorProducer for TailableFindProducer {
+    fn produce(&mut self) -> Vec<Vec<u8>> {
+        if self.fatal.is_some() {
+            return Vec::new();
+        }
+        // Capped rollover: if the doc we last returned has been evicted, the
+        // cursor is lapped — mongod kills it with CappedPositionLost.
+        if let Some(after) = &self.after {
+            match self.storage.collection_min_id_key(&self.db, &self.coll) {
+                Ok(Some(min)) if min.as_slice() > after.as_slice() => {
+                    self.fatal = Some(capped_position_lost());
+                    return Vec::new();
+                }
+                Ok(None) => {
+                    self.fatal = Some(capped_position_lost());
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+        match self
+            .storage
+            .scan_docs_after_id_key(&self.db, &self.coll, self.after.as_deref())
+        {
+            Ok(rows) if !rows.is_empty() => {
+                self.after = Some(rows[rows.len() - 1].0.clone());
+                rows.into_iter().map(|(_id_k, doc)| doc).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn position(&self) -> i64 {
+        0
+    }
+
+    fn invalidated(&self) -> bool {
+        false
+    }
+
+    fn fatal_error(&self) -> Option<CommandError> {
+        self.fatal.clone()
+    }
+}
+
+fn capped_position_lost() -> CommandError {
+    CommandError::new(
+        136,
+        "CappedPositionLost",
+        "CollectionScan died due to position in capped collection being deleted.",
+    )
+}
 
 /// Shape a `BadValue` for a filter the matcher couldn't evaluate, naming the
 /// offending operator when there's an unrecognised one (e.g. `$badOperator`) so
@@ -67,14 +137,23 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None => DEFAULT_BATCH_SIZE as i64,
     };
     let single_batch = bool_field(doc, "singleBatch", false);
+    let tailable = bool_field(doc, "tailable", false);
+    let await_data = bool_field(doc, "awaitData", false);
     let ns = format!("{}.{}", ctx.db_name, coll);
 
-    if bool_field(doc, "tailable", false) {
-        return Err(CommandError::new(
-            1,
-            "InternalError",
-            "tailable find is not yet supported by the Rust server",
-        ));
+    // A tailable cursor is only valid on a capped collection (mongod rejects it
+    // on a non-capped one with BadValue). Check before the fetch.
+    if tailable
+        && !storage
+            .collection_is_capped(&ctx.db_name, &coll)
+            .map_err(command_error)?
+    {
+        return Ok(CommandError::new(
+            2,
+            "BadValue",
+            format!("error processing query: ns={ns} tailable cursor requested on non capped collection"),
+        )
+        .into_reply());
     }
 
     let mut docs = storage
@@ -127,6 +206,64 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     if limit > 0 && docs.len() > limit {
         docs.truncate(limit);
+    }
+
+    // Tailable cursor: the matched docs seed firstBatch (+ a queued remainder);
+    // a producer then polls the collection for docs inserted after this find.
+    if tailable {
+        let storage_arc = ctx
+            .storage
+            .as_ref()
+            .ok_or_else(|| CommandError::new(1, "InternalError", "storage backend not configured"))?
+            .clone();
+        // Watermark = id_key of the last matched doc, so the producer continues
+        // strictly after what we've already handed out. None for an empty match.
+        let after = match docs.last() {
+            Some(bytes) => {
+                let d = Document::from_reader(&mut bytes.as_slice())
+                    .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+                d.get("_id").map(|id| {
+                    secantus_core::sortkey::encode_value(id, collation.as_ref()).unwrap_or_default()
+                })
+            }
+            None => None,
+        };
+        let bs = batch_size.max(0) as usize;
+        let split = bs.min(docs.len());
+        let first_batch = docs[..split].to_vec();
+        let initial_remaining = docs[split..].to_vec();
+        let producer = Box::new(TailableFindProducer {
+            storage: storage_arc,
+            db: ctx.db_name.clone(),
+            coll: coll.clone(),
+            after,
+            fatal: None,
+        });
+        let cursor_id = cursors
+            .register_tailable(
+                &ns,
+                producer,
+                TailableOptions {
+                    await_data,
+                    initial_remaining,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| {
+                CommandError::new(
+                    1,
+                    "InternalError",
+                    format!("cursor registration failed: {e:?}"),
+                )
+            })?;
+        return Ok(doc! {
+            "cursor": {
+                "firstBatch": docs_to_bson(first_batch)?,
+                "id": Bson::Int64(cursor_id),
+                "ns": ns,
+            },
+            "ok": 1.0,
+        });
     }
 
     // The `firstBatch` goes straight onto the wire reply, so produce it as

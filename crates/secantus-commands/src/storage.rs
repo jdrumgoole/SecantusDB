@@ -23,6 +23,10 @@ pub use secantus_core::collation::Collation;
 /// `secantus-commands` stay decoupled from the storage crate's `Hint` type.
 pub type RawHint<'a> = &'a Bson;
 
+/// `(id_key, bson)` document rows, as returned by the collection scans the
+/// tailable-find producer polls (`scan_docs_after_id_key`).
+pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// The outcome of an `update` operation (mirrors
 /// `secantus_storage::UpdateOutcome`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -528,6 +532,28 @@ pub trait Storage: Send + Sync {
     /// Whether the collection is capped.
     fn collection_is_capped(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
         Ok(false)
+    }
+
+    /// Documents whose `id_key` sorts strictly after `after` (all of them when
+    /// `after` is `None`), as `(id_key, bson)` pairs — the tailable-find producer
+    /// polls this for docs inserted since it last returned.
+    fn scan_docs_after_id_key(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _after: Option<&[u8]>,
+    ) -> Result<IdKeyRows, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// The smallest `id_key` currently in the collection (`None` if empty) — a
+    /// tailable cursor uses it to detect capped rollover (`CappedPositionLost`).
+    fn collection_min_id_key(
+        &self,
+        _db: &str,
+        _coll: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
     }
 
     /// Total size in bytes of the collection's documents.

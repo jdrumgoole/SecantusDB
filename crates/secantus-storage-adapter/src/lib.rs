@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use bson::{Bson, Document};
 use secantus_commands::storage::{
-    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, RawHint,
-    Storage as CmdStorage, StorageError, UpdateOutcome,
+    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, IdKeyRows,
+    RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
 use secantus_storage::{
@@ -561,6 +561,21 @@ impl CmdStorage for StorageAdapter {
 
     fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
         self.inner.collection_is_capped(db, coll).map_err(map_err)
+    }
+
+    fn scan_docs_after_id_key(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<&[u8]>,
+    ) -> Result<IdKeyRows, StorageError> {
+        self.inner
+            .scan_docs_after_id_key(db, coll, after)
+            .map_err(map_err)
+    }
+
+    fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.collection_min_id_key(db, coll).map_err(map_err)
     }
 
     fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64, StorageError> {
