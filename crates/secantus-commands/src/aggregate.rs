@@ -244,7 +244,18 @@ fn run_segmented(
     let mut buffer: Vec<Bson> = Vec::new();
     for stage in pipeline {
         let name = stage_name(stage);
-        if is_source_stage(name) {
+        if name == "$documents" {
+            // `$documents: [<expr>, …]` is a source stage: it ignores its input
+            // and emits the (evaluated) array as the new document stream. mongod
+            // only allows it first in a collectionless aggregate; run any buffered
+            // stages first so ordering errors still surface in order.
+            if !buffer.is_empty() {
+                let _ = core_run(docs, &buffer, vars, collation)?;
+                buffer.clear();
+            }
+            let spec = stage.as_document().and_then(|d| d.get(name));
+            docs = documents_stage(spec, vars)?;
+        } else if is_source_stage(name) {
             // Source stages (e.g. `$currentOp` / `$listLocalSessions`) ignore the
             // input and emit a synthetic row. Run (and discard) any buffered
             // stages first so a malformed earlier stage still errors in order,
@@ -278,6 +289,28 @@ fn run_segmented(
         docs = core_run(docs, &buffer, vars, collation)?;
     }
     Ok(docs)
+}
+
+/// `$documents: [<expr>, …]` — evaluate each array element (against an empty
+/// root) into a document. The array itself may be an expression (e.g. a `$$var`)
+/// that resolves to an array of documents.
+fn documents_stage(spec: Option<&Bson>, vars: &Document) -> Result<Vec<Document>, CommandError> {
+    let spec = spec.ok_or_else(|| bad_value("$documents requires an array"))?;
+    let empty = Document::new();
+    let value = secantus_core::expressions::evaluate(&empty, spec, vars)
+        .map_err(|_| bad_value("$documents expression not supported"))?;
+    let arr = match value {
+        Bson::Array(a) => a,
+        _ => return Err(bad_value("$documents argument must evaluate to an array")),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for elem in arr {
+        match elem {
+            Bson::Document(d) => out.push(d),
+            _ => return Err(bad_value("each $documents element must be an object")),
+        }
+    }
+    Ok(out)
 }
 
 /// Run a run of storage-free stages through the core engine, mapping the engine's

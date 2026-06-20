@@ -322,14 +322,35 @@ fn eq_with_array(values: &[Option<&Bson>], expected: &Bson, coll: Option<&Collat
     Ok(false)
 }
 
+/// Element-wise array equality (same length, each pair `eq_scalar`-equal).
+/// A `Document`/exotic element keeps `eq_scalar`'s `Fallback`, so arrays of such
+/// elements still defer to Python rather than diverge.
+fn array_eq(a: &[Bson], b: &[Bson], coll: Option<&Collation>) -> R {
+    if a.len() != b.len() {
+        return Ok(false);
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if !eq_scalar(x, y, coll)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
+    // Array equality: `{field: [a, b, c]}` matches when the stored value is an
+    // array equal element-by-element (same length, each pair `eq_scalar`-equal).
+    // The "field-is-an-array-containing-this-array" nested case is handled by the
+    // caller (`eq_with_array`), which also tries each element against `expected`.
+    if let Bson::Array(exp) = expected {
+        return match v {
+            Bson::Array(val) => array_eq(val, exp, coll),
+            _ => Ok(false),
+        };
+    }
     // Compound / regex / exotic expected -> structural or special semantics we
     // don't reproduce: defer to Python.
-    if matches!(
-        expected,
-        Bson::RegularExpression(_) | Bson::Document(_) | Bson::Array(_)
-    ) || is_exotic(expected)
-    {
+    if matches!(expected, Bson::RegularExpression(_) | Bson::Document(_)) || is_exotic(expected) {
         return Err(Fallback);
     }
     let v_bool = matches!(v, Bson::Boolean(_));

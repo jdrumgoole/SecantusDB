@@ -53,6 +53,10 @@ struct ChangeStreamProducer {
     /// User aggregation stages after `$changeStream` (e.g. `$project` / `$match`
     /// / `$addFields`), applied to each event before it reaches the client.
     pipeline: Vec<Bson>,
+    /// Set when the user pipeline strips the resume-token `_id` from an event —
+    /// mongod surfaces this as a getMore-time `ChangeStreamFatalError` (280),
+    /// NOT at stream open, so it's detected here during projection.
+    fatal_error: Option<CommandError>,
 }
 
 impl CursorProducer for ChangeStreamProducer {
@@ -69,7 +73,16 @@ impl CursorProducer for ChangeStreamProducer {
                 if self.pipeline.is_empty() {
                     batch.events
                 } else {
-                    apply_event_pipeline(batch.events, &self.pipeline)
+                    let (events, stripped_id) = apply_event_pipeline(batch.events, &self.pipeline);
+                    if stripped_id {
+                        self.fatal_error = Some(CommandError::new(
+                            280,
+                            "ChangeStreamFatalError",
+                            "the change stream pipeline may not remove the _id \
+                             (resume token) field",
+                        ));
+                    }
+                    events
                 }
             }
             // A poll failure (decode / projection error) yields nothing this
@@ -84,6 +97,10 @@ impl CursorProducer for ChangeStreamProducer {
 
     fn invalidated(&self) -> bool {
         self.invalidated
+    }
+
+    fn fatal_error(&self) -> Option<CommandError> {
+        self.fatal_error.clone()
     }
 }
 
@@ -180,6 +197,20 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // validated against the change-stream allow-list and applied to each event.
     let user_pipeline = extract_change_stream_pipeline(doc)?;
 
+    // The high-water-mark resume token at the start position — mongod returns it
+    // as the open reply's `postBatchResumeToken` so a client that sees an empty
+    // first batch still has a token to resume from before any event arrives.
+    let open_pbrt = {
+        let bytes = storage.high_water_mark_token(position);
+        if bytes.is_empty() {
+            None
+        } else {
+            Document::from_reader(&mut bytes.as_slice())
+                .ok()
+                .map(Bson::Document)
+        }
+    };
+
     let producer = Box::new(ChangeStreamProducer {
         storage,
         scope,
@@ -188,6 +219,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         invalidated: false,
         limit: 1000,
         pipeline: user_pipeline,
+        fatal_error: None,
     });
 
     let cursors = ctx.cursors()?;
@@ -213,12 +245,16 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
 
     // An opening change-stream aggregate always returns an empty firstBatch;
     // the client drives the stream with getMore.
+    let mut cursor_doc = doc! {
+        "firstBatch": Bson::Array(vec![]),
+        "id": Bson::Int64(cursor_id),
+        "ns": ns,
+    };
+    if let Some(tok) = open_pbrt {
+        cursor_doc.insert("postBatchResumeToken", tok);
+    }
     Ok(doc! {
-        "cursor": {
-            "firstBatch": Bson::Array(vec![]),
-            "id": Bson::Int64(cursor_id),
-            "ns": ns,
-        },
+        "cursor": cursor_doc,
         "ok": 1.0,
     })
 }
@@ -227,22 +263,32 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
 /// decode → run the storage-free core pipeline → re-encode. On any error (an
 /// event a stage can't handle) the raw events pass through, so a one-off
 /// unsupported construct never tears the stream down.
-fn apply_event_pipeline(events: Vec<Vec<u8>>, pipeline: &[Bson]) -> Vec<Vec<u8>> {
+fn apply_event_pipeline(events: Vec<Vec<u8>>, pipeline: &[Bson]) -> (Vec<Vec<u8>>, bool) {
     let raw = events.clone();
     let Ok(decoded) = decode_docs(events) else {
-        return raw;
+        return (raw, false);
     };
     match secantus_core::aggregate::apply_pipeline(decoded, pipeline, &Document::new(), None) {
-        Ok(out) => encode_docs(out).unwrap_or(raw),
-        Err(_) => raw,
+        Ok(out) => {
+            // mongod treats a pipeline that drops a delivered event's `_id`
+            // (the resume token) as a fatal change-stream error. An event
+            // filtered out entirely (e.g. by `$match`) is fine — only a
+            // surviving event missing `_id` trips it.
+            let stripped_id = out.iter().any(|d| !d.contains_key("_id"));
+            (encode_docs(out).unwrap_or(raw), stripped_id)
+        }
+        Err(_) => (raw, false),
     }
 }
 
 /// Extract + validate the user pipeline stages after `$changeStream`. Each must
 /// be in the change-stream allow-list ([`CHANGE_STREAM_PIPELINE_STAGES`]); a
-/// disallowed stage or a second `$changeStream` errors, and a stage that strips
-/// the event `_id` (the resume token) is a `ChangeStreamFatalError` (280). The
-/// `$changeStreamSplitLargeEvent` marker is dropped (handled at projection).
+/// disallowed stage or a second `$changeStream` errors. A stage that strips the
+/// event `_id` (the resume token) is NOT rejected here — mongod accepts the
+/// pipeline at open and only fails (code 280) at getMore when a delivered event
+/// loses its `_id`, so that's detected during projection (see
+/// [`apply_event_pipeline`]). The `$changeStreamSplitLargeEvent` marker is
+/// dropped (handled at projection).
 fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandError> {
     let Some(Bson::Array(stages)) = doc.get("pipeline") else {
         return Ok(Vec::new());
@@ -274,35 +320,9 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
         if name == "$changeStreamSplitLargeEvent" {
             continue;
         }
-        if stage_removes_id(name, s.get(name)) {
-            return Err(CommandError::new(
-                280,
-                "ChangeStreamFatalError",
-                "the change stream pipeline may not remove the _id (resume token) field",
-            ));
-        }
         out.push(stage.clone());
     }
     Ok(out)
-}
-
-/// Whether a `$project`/`$unset` stage strips the event's `_id` (resume token).
-fn stage_removes_id(stage_name: &str, spec: Option<&Bson>) -> bool {
-    match stage_name {
-        "$project" => spec
-            .and_then(Bson::as_document)
-            .and_then(|d| d.get("_id"))
-            .is_some_and(|v| {
-                matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false))
-                    || matches!(v, Bson::Double(d) if *d == 0.0)
-            }),
-        "$unset" => match spec {
-            Some(Bson::String(s)) => s == "_id",
-            Some(Bson::Array(a)) => a.iter().any(|x| x.as_str() == Some("_id")),
-            _ => false,
-        },
-        _ => false,
-    }
 }
 
 /// The `$changeStream: {...}` spec document from the first pipeline stage.
