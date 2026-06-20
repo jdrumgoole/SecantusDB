@@ -112,6 +112,25 @@ pub fn ping(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }
 
+/// `replSetGetStatus`. SecantusDB advertises a single-node `secantus` replica
+/// set in `hello` (so pymongo's change-stream topology accepts it) but is not a
+/// real replica set with a member roster. Return exactly what a standalone
+/// mongod returns — `NoReplicationEnabled` (76) with the canonical "not running
+/// with --replSet" message. Drivers and their harnesses special-case this
+/// message to mean "standalone, skip replica-set-only behaviour" (e.g.
+/// libmongoc's `test_framework_replset_member_count`), whereas a bare
+/// CommandNotFound (59) is an unexpected error that aborts the harness — which
+/// truncated the entire C-driver gauge after the first suite. Mirrors
+/// `commands.py::_repl_set_get_status`.
+pub fn repl_set_get_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    Ok(doc! {
+        "ok": 0.0,
+        "errmsg": "not running with --replSet",
+        "code": 76_i32,
+        "codeName": "NoReplicationEnabled",
+    })
+}
+
 /// `buildInfo` / `buildinfo`. `version` stays at the MongoDB-compatibility value
 /// so drivers enable the right feature flags; `secantusVersion` marks the actual
 /// build (the crate version here; `commands.py` reads `secantus.__version__`).

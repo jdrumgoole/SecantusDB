@@ -258,6 +258,7 @@ fn lookup(name: &str) -> Option<Handler> {
     Some(match name {
         "hello" | "isMaster" | "ismaster" => handshake::hello,
         "ping" => handshake::ping,
+        "replSetGetStatus" => handshake::repl_set_get_status,
         "buildInfo" | "buildinfo" => handshake::build_info,
         "insert" => crud::insert,
         "update" => crud::update,
@@ -960,6 +961,7 @@ fn is_no_privilege_command(name: &str) -> bool {
             | "connectionStatus"
             | "abortTransaction"
             | "commitTransaction"
+            | "replSetGetStatus"
     )
 }
 

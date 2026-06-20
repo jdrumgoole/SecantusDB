@@ -504,6 +504,28 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 fn encode_doc(doc: &Document) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
+    // mongod stores `_id` as the FIRST field of every document. Replacement /
+    // upsert updates can leave `_id` elsewhere in field order; reorder it to the
+    // front so the stored (and later returned) document matches mongod exactly —
+    // order-sensitive driver comparisons (e.g. the C# CRUD-spec runner) check
+    // this. A no-op for docs without a top-level `_id` (oplog / index / meta
+    // blobs) or where `_id` is already first.
+    let needs_reorder = doc.contains_key("_id") && doc.keys().next().map(String::as_str) != Some("_id");
+    if needs_reorder {
+        let mut ordered = Document::new();
+        if let Some(id) = doc.get("_id") {
+            ordered.insert("_id", id.clone());
+        }
+        for (k, v) in doc {
+            if k != "_id" {
+                ordered.insert(k.clone(), v.clone());
+            }
+        }
+        ordered
+            .to_writer(&mut buf)
+            .map_err(|e| StorageError::Bson(e.to_string()))?;
+        return Ok(buf);
+    }
     doc.to_writer(&mut buf)
         .map_err(|e| StorageError::Bson(e.to_string()))?;
     Ok(buf)
