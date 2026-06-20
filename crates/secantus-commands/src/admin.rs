@@ -323,6 +323,27 @@ pub fn backup_archive(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
 }
 
+/// `secantusAdmin.archiveBaseSnapshot` — take a PITR v2 base snapshot into
+/// `archiveDir` (`base-<head>.tar.gz`). Pair with a server started with
+/// `--oplog-archive-dir <archiveDir>` so pruned oplog rows are archived as
+/// segments there too; recovery then stitches the newest base ≤ T plus the
+/// segments. Mirrors the Python `secantusAdmin.archiveBaseSnapshot` command.
+pub fn archive_base_snapshot(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let archive_dir = doc.get_str("archiveDir").unwrap_or("");
+    if archive_dir.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.archiveBaseSnapshot requires archiveDir: <string>",
+        ));
+    }
+    let storage = ctx.storage()?;
+    let (path, size_bytes) = storage
+        .archive_base_snapshot(archive_dir)
+        .map_err(command_error)?;
+    Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
+}
+
 /// `listCollections` — a cursor over the collections in the database, honouring
 /// `filter` (a query predicate over each entry) and `nameOnly`. Each entry's
 /// `options` reflects the collection's stored options (capped / validator /

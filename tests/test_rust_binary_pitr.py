@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
+import signal
 import subprocess
 import sys
 from typing import Any
@@ -103,6 +105,53 @@ def test_rust_binary_restore_to_timestamp(tmp_path: pathlib.Path) -> None:
 def test_rust_binary_restore_missing_source_errors(tmp_path: pathlib.Path) -> None:
     res = _restore(tmp_path / "does-not-exist", tmp_path / "out")
     assert res.returncode != 0
+
+
+_BANNER = re.compile(r"secantusdb listening on (\S+):(\d+)")
+
+
+def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path) -> None:
+    """End-to-end PITR v2 on the Rust server: a server started with
+    --oplog-archive-dir takes a base snapshot via secantusAdmin.archiveBaseSnapshot,
+    and `secantusdb restore` auto-detects the archive directory and rebuilds the
+    database (Phase R, R5c)."""
+    assert _BIN is not None
+    archive = tmp_path / "archive"
+    proc = subprocess.Popen(
+        [
+            str(_BIN),
+            "--port",
+            "0",
+            "--storage-path",
+            str(tmp_path / "data"),
+            "--oplog-archive-dir",
+            str(archive),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        m = _BANNER.search(proc.stdout.readline())
+        assert m, "no listening banner"
+        host, port = m.group(1), int(m.group(2))
+        client = pymongo.MongoClient(host, port, directConnection=True, serverSelectionTimeoutMS=5000)
+        client["app"]["c"].insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
+        reply = client["admin"].command(
+            {"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": str(archive)}
+        )
+        assert reply["ok"] == 1.0
+        assert "path" in reply
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+
+    # The archive dir holds a base snapshot; restore auto-detects it (v2).
+    out = tmp_path / "restored"
+    res = _restore(archive, out)
+    assert res.returncode == 0, res.stderr
+    assert _docs(out, "app", "c") == [{"_id": 1}, {"_id": 2}, {"_id": 3}]
 
 
 def _restored_oplog_len(path: pathlib.Path) -> int:

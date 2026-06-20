@@ -28,6 +28,8 @@ pub struct CliArgs {
     pub replica_set_name: Option<String>,
     pub require_auth: bool,
     pub tls: Option<CliTls>,
+    /// PITR v2: archive pruned oplog rows to this directory (off by default).
+    pub oplog_archive_dir: Option<String>,
 }
 
 /// TLS options in plain-data form (the lib's [`TlsOptions`] is not `PartialEq`,
@@ -86,6 +88,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut tls_key_file: Option<String> = None;
     let mut tls_ca_file: Option<String> = None;
     let mut tls_require_client_cert = false;
+    let mut oplog_archive_dir: Option<String> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -127,6 +130,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--tls-key-file" => tls_key_file = Some(take_value("--tls-key-file")?),
             "--tls-ca-file" => tls_ca_file = Some(take_value("--tls-ca-file")?),
             "--tls-require-client-cert" => tls_require_client_cert = true,
+            "--oplog-archive-dir" => oplog_archive_dir = Some(take_value("--oplog-archive-dir")?),
             other => return Err(format!("unknown argument: {other}")),
         }
         // Reject `--auth=yes`-style inline values on boolean flags.
@@ -181,6 +185,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
         },
         require_auth: auth,
         tls,
+        oplog_archive_dir,
     }))
 }
 
@@ -212,6 +217,9 @@ OPTIONS:
     --tls-ca-file PATH           PEM CA bundle to verify client certs (mTLS)
     --tls-require-client-cert    Reject clients without a valid X.509 cert;
                                  requires --tls-ca-file
+    --oplog-archive-dir DIR      PITR v2: archive pruned oplog rows here before
+                                 they are dropped, so recovery can reach a time
+                                 before the live oplog floor (off by default)
     --version                    Print the version and exit
     -h, --help                   Print this help and exit
 ",

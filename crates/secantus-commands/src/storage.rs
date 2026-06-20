@@ -502,6 +502,16 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Take a PITR v2 base snapshot into `archive_dir` (`base-<head>.tar.gz`),
+    /// returning `(path, size_bytes)`. Backs `secantusAdmin.archiveBaseSnapshot`.
+    /// Default: unsupported; the WT adapter forwards to
+    /// `Storage::archive_base_snapshot`.
+    fn archive_base_snapshot(&self, _archive_dir: &str) -> Result<(String, u64), StorageError> {
+        Err(StorageError::Internal(
+            "archiveBaseSnapshot: this storage backend has no on-disk state to archive".into(),
+        ))
+    }
+
     /// Rename a collection. Returns `(succeeded, error_message)`; `succeeded ==
     /// false` carries a reason (source missing / target exists).
     fn rename_collection(

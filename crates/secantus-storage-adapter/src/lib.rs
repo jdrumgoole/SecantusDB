@@ -539,6 +539,13 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn archive_base_snapshot(&self, archive_dir: &str) -> Result<(String, u64), StorageError> {
+        self.inner
+            .archive_base_snapshot(archive_dir)
+            .map(|info| (info.path, info.size_bytes))
+            .map_err(map_err)
+    }
+
     fn rename_collection(
         &self,
         src_db: &str,

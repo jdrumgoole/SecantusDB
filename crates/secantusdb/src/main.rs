@@ -78,6 +78,9 @@ fn run(cli: CliArgs) -> Result<(), String> {
     let mut storage = Storage::open(&cli.storage_path)
         .map_err(|e| format!("failed to open storage at {}: {e:?}", cli.storage_path))?;
     storage.set_enable_oplog(true);
+    if let Some(dir) = &cli.oplog_archive_dir {
+        storage.set_oplog_archive_dir(Some(dir.clone()));
+    }
 
     let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(Arc::new(storage)));
     let cursors = Arc::new(CursorRegistry::new());
@@ -160,13 +163,25 @@ fn run_restore(args: &[String]) -> Result<(), String> {
     }
     let source = source.ok_or("--source is required")?;
     let target_dir = target_dir.ok_or("--target-dir is required")?;
-    let stats = secantus_storage::replay::restore_to_timestamp(
-        &source,
-        &target_dir,
-        to_ts,
-        None,
-        preserve_oplog,
-    )
+    // A directory of base snapshots + oplog segments is a PITR v2 archive;
+    // anything else (a backup dir / stopped data dir) is a v1 source.
+    let stats = if secantus_storage::pitr_archive::is_archive_dir(&source) {
+        secantus_storage::pitr_archive::restore_from_archive_dir(
+            &source,
+            &target_dir,
+            to_ts,
+            None,
+            preserve_oplog,
+        )
+    } else {
+        secantus_storage::replay::restore_to_timestamp(
+            &source,
+            &target_dir,
+            to_ts,
+            None,
+            preserve_oplog,
+        )
+    }
     .map_err(|e| format!("{e:?}"))?;
     println!(
         "Restored {} operations (through oplog seq {}) into {}.\n\

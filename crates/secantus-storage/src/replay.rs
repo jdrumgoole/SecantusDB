@@ -79,10 +79,20 @@ fn apply_command(storage: &Storage, db: &str, o: &Document) -> Result<()> {
             storage.drop_index(db, coll, name)?;
         }
     } else if let Ok(coll) = o.get_str("collMod") {
-        // The collMod operationDescription minus the command name. The
-        // `index: {name, expireAfterSeconds}` TTL-retune form is skipped — the
-        // Rust Storage has no set_index_expiry yet (see tasks/backlog.md); all
-        // other options (validator / changeStreamPreAndPostImages / …) replay.
+        // A `collMod {index: {name, expireAfterSeconds}}` retunes a TTL index;
+        // everything else (validator / changeStreamPreAndPostImages / …) is a
+        // plain option write.
+        if let Ok(index) = o.get_document("index") {
+            if let (Ok(name), Some(expiry)) = (
+                index.get_str("name"),
+                index
+                    .get_i64("expireAfterSeconds")
+                    .ok()
+                    .or_else(|| index.get_i32("expireAfterSeconds").ok().map(i64::from)),
+            ) {
+                storage.set_index_expiry(db, coll, name, expiry)?;
+            }
+        }
         let desc: Document = o
             .iter()
             .filter(|(k, _)| k.as_str() != "collMod" && k.as_str() != "index")
@@ -252,6 +262,35 @@ fn replay(
             }
         }
         start = batch[batch.len() - 1].0 + 1;
+    }
+    Ok((stats, carried))
+}
+
+/// Replay a pre-built `(seq, entry)` list (already in ascending seq order) into
+/// `target`, stopping before the first entry past the bound. Used by PITR v2
+/// restore, whose rows are stitched from mixed sources (archived segments + base
+/// snapshots) rather than streamed from one source oplog.
+pub fn replay_entries(
+    target: &Storage,
+    rows: &[(i64, Document)],
+    up_to_ts: Option<Timestamp>,
+    up_to_wall_ms: Option<i64>,
+    carry: bool,
+) -> Result<(ReplayStats, Vec<(i64, Document)>)> {
+    let mut stats = ReplayStats::default();
+    let mut carried: Vec<(i64, Document)> = Vec::new();
+    for (seq, entry) in rows {
+        if !within_bound(entry, up_to_ts, up_to_wall_ms) {
+            break;
+        }
+        stats.entries_seen += 1;
+        stats.last_seq = *seq;
+        if carry {
+            carried.push((*seq, entry.clone()));
+        }
+        if apply_entry(target, entry)? {
+            stats.ops_applied += 1;
+        }
     }
     Ok((stats, carried))
 }

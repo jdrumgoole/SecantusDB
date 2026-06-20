@@ -1,6 +1,6 @@
 [package]
 name = "secantus-storage"
-version = "0.5.3-beta.28"
+version = "0.5.3-beta.29"
 edition = "2021"
 description = "SecantusDB's storage layer in Rust (Phase 4): WiredTiger-backed collections/documents over secantus-wt, with id_key sort encoding from secantus-core."
 license = "GPL-2.0-only"
@@ -23,6 +23,6 @@ s2 = "0.0.12"
 tar = "0.4"
 flate2 = "1"
 serde_json = "1"
-
-[dev-dependencies]
+# Restore extracts a base snapshot to a temp dir while stitching its oplog (also
+# used by tests).
 tempfile = "3"
