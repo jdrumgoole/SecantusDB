@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from secantus.expressions import evaluate
 from secantus.numerics import bson_add
 from secantus.paths import get_path, set_path, unset_path
-from secantus.query import matches
+from secantus.query import QueryError, matches
 
 if TYPE_CHECKING:
     from secantus.storage import Storage
@@ -48,6 +48,12 @@ class PipelineContext:
     # ``command`` sub-doc on the self-row mongo-node-driver's
     # ``$currentOp`` test introspects.
     command_doc: dict[str, Any] | None = None
+    # ``bypassDocumentValidation`` from the aggregate command. When
+    # false (the default) a ``$out`` / ``$merge`` write into a
+    # collection that carries a ``validator`` enforces it — mongo-c-
+    # driver's ``aggregate/bypass_document_validation`` test sets a
+    # ``{number: {$gte: 5}}`` validator and expects the cursor to error.
+    bypass_validation: bool = False
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
@@ -58,6 +64,7 @@ class PipelineContext:
             change_stream=self.change_stream,
             collation=self.collation,
             command_doc=self.command_doc,
+            bypass_validation=self.bypass_validation,
         )
 
 
@@ -80,6 +87,18 @@ def apply_pipeline(
             ctx = PipelineContext(vars={"NOW": now})
         else:
             ctx.vars["NOW"] = now
+    # ``$out`` / ``$merge`` may only appear as the final stage. mongod
+    # rejects a non-terminal write stage with Location40601 before
+    # executing anything (mongo-cxx-driver's "out fails when not last").
+    for i, stage in enumerate(pipeline):
+        if isinstance(stage, Mapping) and i != len(pipeline) - 1:
+            for write_stage in ("$out", "$merge"):
+                if write_stage in stage:
+                    raise AggregateError(
+                        f"{write_stage} can only be the final stage in the pipeline",
+                        code=40601,
+                        code_name="Location40601",
+                    )
     for stage in pipeline:
         docs = _apply_stage(stage, docs, ctx)
     return docs
@@ -1191,6 +1210,35 @@ def _stage_bucket(
     return result
 
 
+def _enforce_target_validator(
+    ctx: PipelineContext, target_db: str, target_coll: str, docs: list[dict[str, Any]]
+) -> None:
+    """Enforce the destination collection's ``validator`` on a ``$out`` /
+    ``$merge`` write unless the command set ``bypassDocumentValidation``.
+
+    mongod runs writes from these stages through the same document
+    validation as an ordinary insert: a doc that fails the validator
+    aborts the pipeline with ``DocumentValidationFailure`` (121) when
+    ``validationAction`` is ``"error"`` (the default). ``"warn"`` is a
+    no-op here (we don't surface server logs).
+    """
+    if ctx.bypass_validation or ctx.storage is None:
+        return
+    opts = ctx.storage.get_collection_options(target_db, target_coll)
+    validator = opts.get("validator")
+    if not isinstance(validator, dict) or not validator:
+        return
+    if opts.get("validationAction", "error") != "error":
+        return
+    for doc in docs:
+        if not matches(doc, validator):
+            raise AggregateError(
+                "Document failed validation",
+                code=121,
+                code_name="DocumentValidationFailure",
+            )
+
+
 def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> list[dict[str, Any]]:
     if ctx.storage is None:
         raise AggregateError("$out requires storage context")
@@ -1203,6 +1251,7 @@ def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> l
             raise AggregateError("$out requires a coll string")
     else:
         raise AggregateError("$out requires a string or {db, coll}")
+    _enforce_target_validator(ctx, target_db, target_coll, docs)
     ctx.storage.drop_collection(target_db, target_coll)
     if docs:
         ctx.storage.insert(target_db, target_coll, [copy.deepcopy(d) for d in docs])
@@ -2182,3 +2231,20 @@ def validate_stage_names(pipeline: list[Any]) -> None:
                 code=40324,
                 code_name="Location40324",
             )
+        # Validate ``$match`` filter syntax up-front too. A change-stream
+        # pipeline doesn't execute until the first ``getMore``, so an
+        # unknown query operator inside ``$match`` (e.g. ``{$foo: -1}``)
+        # would otherwise only surface there — mongo-cxx-driver's
+        # "invalid pipeline / Error on .begin()" test requires the error
+        # at aggregate (``.begin()``) time. Running the matcher against an
+        # empty doc triggers the same operator validation. Only the
+        # syntactic ``QueryError`` is surfaced now; ``$expr`` evaluation
+        # errors that only make sense against a real change event stay
+        # deferred to execution time.
+        if name == "$match" and isinstance(stage[name], Mapping):
+            try:
+                matches({}, stage[name])
+            except QueryError:
+                raise
+            except Exception:
+                pass

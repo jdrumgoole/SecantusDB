@@ -128,6 +128,18 @@ SERVER_VERSION_ARRAY = [7, 0, 0, 0]
 DEFAULT_BATCH_SIZE = 101
 
 
+def _coerce_command_int(value: Any) -> int:
+    """Coerce a numeric command argument (e.g. ``batchSize``) to ``int``.
+
+    Drivers may encode a numeric option as any BSON number — mongo-c-driver's
+    ``batchsize_override_decimal128`` test sends ``batchSize`` as a Decimal128.
+    ``int(Decimal128)`` raises, so unwrap to the underlying ``Decimal`` first.
+    """
+    if isinstance(value, bson.Decimal128):
+        return int(value.to_decimal())
+    return int(value)
+
+
 # Mongod's well-known error codes that crop up in failpoint tests +
 # the ad-hoc errors we already emit. Used by `_code_name_for` to give
 # failpoint-injected errors a plausible ``codeName`` instead of a
@@ -343,6 +355,90 @@ def _resolve_let_vars(let: Any) -> dict[str, Any]:
     return {**now_vars, **resolved}
 
 
+# mongod's per-operator failure reasons in ``errInfo.details.reason``.
+# Only ``$type`` is byte-pinned by a driver test (mongo-csharp-driver's
+# ``WriteError_details`` prose test → "type did not match"); the rest are
+# best-effort approximations of mongod's wording.
+_VALIDATION_REASON: dict[str, str] = {
+    "$type": "type did not match",
+    "$exists": "field was missing",
+    "$regex": "regular expression did not match",
+    "$size": "array did not match specified size",
+    "$mod": "$mod did not evaluate to the expected remainder",
+    "$all": "array did not contain all specified values",
+    "$elemMatch": "no matching array element found",
+    "$in": "value was not in the set of allowed values",
+    "$nin": "value was in the set of disallowed values",
+}
+
+
+def _validation_failure_details(
+    validator: Mapping[str, Any], doc: Mapping[str, Any]
+) -> dict[str, Any]:
+    """mongod-shaped ``errInfo.details`` for a doc that failed a
+    query-expression collection validator.
+
+    Walks the validator's field clauses, finds the first the document
+    violates, and reports the failing operator with the value the server
+    considered — matching the structure the mongo-csharp-driver CRUD-spec
+    prose test ``WriteError_details`` asserts (``operatorName`` /
+    ``specifiedAs`` / ``reason`` / ``consideredValue`` / ``consideredType``).
+    """
+    from secantus.paths import get_path, has_path
+    from secantus.query import bson_type_name
+
+    # $jsonSchema validators report a different (schema-rules) structure
+    # we don't synthesise; name the operator and stop.
+    if "$jsonSchema" in validator:
+        return {"operatorName": "$jsonSchema"}
+
+    for field, spec in validator.items():
+        if isinstance(field, str) and field.startswith("$"):
+            # Document-level logical operator ($and/$or/$nor) — skip for
+            # per-field detail (best-effort).
+            continue
+        if matches(doc, {field: spec}):
+            continue
+        present = has_path(doc, field)
+        value = get_path(doc, field) if present else None
+        if (
+            isinstance(spec, Mapping)
+            and spec
+            and all(isinstance(k, str) and k.startswith("$") for k in spec)
+        ):
+            # Operator form — isolate the specific operator that failed.
+            op = next(iter(spec))
+            for candidate in spec:
+                if not matches(doc, {field: {candidate: spec[candidate]}}):
+                    op = candidate
+                    break
+            detail: dict[str, Any] = {
+                "operatorName": op,
+                "specifiedAs": {field: dict(spec)},
+                "reason": _VALIDATION_REASON.get(op, "comparison failed"),
+            }
+        else:
+            detail = {
+                "operatorName": "$eq",
+                "specifiedAs": {field: spec},
+                "reason": "comparison failed",
+            }
+        if present:
+            detail["consideredValue"] = value
+            detail["consideredType"] = bson_type_name(value)
+        return detail
+    return {"operatorName": "validator"}
+
+
+def _validation_error_info(validator: Mapping[str, Any], doc: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``errInfo`` body for a failed document validation:
+    ``failingDocumentId`` plus the per-operator ``details``."""
+    return {
+        "failingDocumentId": doc.get("_id"),
+        "details": _validation_failure_details(validator, doc),
+    }
+
+
 def _validate_doc_against_collection(
     storage: Storage, db: str, coll: str, doc: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -364,15 +460,7 @@ def _validate_doc_against_collection(
         "errmsg": "Document failed validation",
         "code": 121,
         "codeName": "DocumentValidationFailure",
-        "errInfo": {
-            "failingDocumentId": doc.get("_id"),
-            "details": {
-                "operatorName": "validator",
-                "schemaRulesNotSatisfied": [
-                    {"operatorName": k, "specifiedAs": {k: v}} for k, v in validator.items()
-                ],
-            },
-        },
+        "errInfo": _validation_error_info(validator, doc),
     }
 
 
@@ -1863,10 +1951,7 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                         "index": index,
                         "code": 121,
                         "errmsg": "Document failed validation",
-                        "errInfo": {
-                            "failingDocumentId": id_value,
-                            "details": {"operatorName": "validator"},
-                        },
+                        "errInfo": _validation_error_info(validator_spec, d),
                     }
                 )
                 if ordered:
@@ -1931,7 +2016,9 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # cursor with batchSize 0, then calls SetBatchSize on the
     # batch cursor and asserts the next getMore carries that size.
     raw_batch_size = doc.get("batchSize")
-    batch_size = DEFAULT_BATCH_SIZE if raw_batch_size is None else int(raw_batch_size)
+    batch_size = (
+        DEFAULT_BATCH_SIZE if raw_batch_size is None else _coerce_command_int(raw_batch_size)
+    )
     single_batch = bool(doc.get("singleBatch", False))
     # Validate filter syntax up-front. matches() raises QueryError for
     # unknown top-level operators; running it against an empty doc is
@@ -2732,6 +2819,10 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if oplog_err is not None:
         return oplog_err
     existed = ctx.storage.drop_collection(ctx.db_name, coll)
+    # mongod kills the collection's open cursors on drop; a later getMore
+    # then fails with CursorNotFound rather than serving stale snapshot
+    # rows (mongo-c-driver's ``error_document/getmore``).
+    ctx.cursors.kill_namespace(_ns(ctx.db_name, coll))
     if not existed:
         # Modern mongod treats ``drop`` of a non-existent collection as
         # an idempotent success (``{ok: 1}``), not a NamespaceNotFound
@@ -2776,6 +2867,10 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
         code = 26 if err and "does not exist" in err else 48
         code_name = "NamespaceNotFound" if code == 26 else "NamespaceExists"
         return {"ok": 0.0, "errmsg": err, "code": code, "codeName": code_name}
+    # A rename invalidates cursors open on the old namespace, same as drop.
+    ctx.cursors.kill_namespace(src_ns)
+    if drop_target:
+        ctx.cursors.kill_namespace(dst_ns)
     return {"ok": 1.0}
 
 
@@ -2976,6 +3071,34 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             reply["expireAfterSeconds_new"] = new_expiry
             ctx.storage.set_index_expiry(ctx.db_name, coll, target["name"], new_expiry)
             description["index"] = {"name": target["name"], "expireAfterSeconds": new_expiry}
+        # ``prepareUnique`` arms the index so new writes that would break
+        # uniqueness are rejected (11000) while pre-existing duplicates
+        # are tolerated — the staging step before a ``unique: true``
+        # conversion (mongo-c-driver's ``modifyCollection-errorResponse``).
+        if "prepareUnique" in index_spec:
+            prep = bool(index_spec["prepareUnique"])
+            ctx.storage.set_index_options(ctx.db_name, coll, target["name"], prepareUnique=prep)
+            description["index"] = {"name": target["name"], "prepareUnique": prep}
+        # ``unique: true`` converts the index. If any documents already
+        # share a key the conversion is refused with code 359 and the
+        # offending ``_id`` groups reported as ``violations`` (the unified
+        # ``modifyCollection prepareUnique violations`` spec test).
+        if index_spec.get("unique") is True and not target.get("unique"):
+            dups = ctx.storage.find_index_duplicates(ctx.db_name, coll, target["name"])
+            if dups:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Cannot convert index {target['name']} to unique: found duplicate values"
+                    ),
+                    "code": 359,
+                    "codeName": "CannotConvertIndexToUnique",
+                    "violations": [{"ids": ids} for ids in dups],
+                }
+            ctx.storage.set_index_options(
+                ctx.db_name, coll, target["name"], unique=True, prepareUnique=False
+            )
+            description["index"] = {"name": target["name"], "unique": True}
     # Emit the collMod command oplog entry so a change stream with
     # ``showExpandedEvents`` surfaces a ``modify`` event.
     ctx.storage.record_collmod(ctx.db_name, coll, description)
@@ -3725,7 +3848,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     collation = doc.get("collation")
     cursor_opts = doc.get("cursor") or {}
     raw_agg_batch = cursor_opts.get("batchSize")
-    batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else int(raw_agg_batch)
+    batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else _coerce_command_int(raw_agg_batch)
     coll_name = ""
 
     first_stage = pipeline[0] if pipeline else {}
@@ -3838,6 +3961,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         vars=dict(let) if let else {},
         collation=collation,
         command_doc=dict(doc),
+        bypass_validation=bool(doc.get("bypassDocumentValidation", False)),
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)
@@ -6092,6 +6216,20 @@ def _finish_txn_statement(ctx: CommandContext, txn: Transaction, result: dict[st
 
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
+    # Database-name length limit. mongod rejects any namespace whose
+    # database component exceeds 63 bytes with InvalidNamespace before
+    # the command runs (libmongoc's ``long_namespace/unsupported_long_db``
+    # inserts into a 64-character database and expects a server error).
+    db_name = ctx.db_name or ""
+    if len(db_name.encode("utf-8")) > 63:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Invalid database name: '{db_name}'. Database names must be at most 63 characters."
+            ),
+            "code": 73,
+            "codeName": "InvalidNamespace",
+        }
     # Read-concern + apiVersion validation runs before every command
     # — they're cross-cutting concerns the wire layer should reject
     # uniformly, so invalid shapes don't silently pass through to

@@ -211,6 +211,22 @@ class CursorRegistry:
                     not_found.append(cid)
         return killed, not_found
 
+    def kill_namespace(self, namespace: str) -> int:
+        """Drop every cursor open on ``namespace`` and return the count.
+
+        mongod kills a collection's cursors when the collection is dropped
+        (or renamed); a subsequent ``getMore`` then fails with
+        CursorNotFound. SecantusDB's cursors hold detached document
+        snapshots, so without this they would keep serving rows after the
+        collection is gone — mongo-c-driver's ``error_document/getmore``
+        test drops mid-iteration and expects the next ``getMore`` to error.
+        """
+        with self._lock:
+            doomed = [cid for cid, e in self._cursors.items() if e.namespace == namespace]
+            for cid in doomed:
+                self._cursors.pop(cid, None)
+            return len(doomed)
+
     def __len__(self) -> int:
         with self._lock:
             self._prune_locked()

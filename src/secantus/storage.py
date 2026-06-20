@@ -4655,6 +4655,64 @@ class Storage:
             c[db, coll, name] = bson.encode(payload)
             return True
 
+    def set_index_options(self, db: str, coll: str, name: str, **opts: Any) -> bool:
+        """Merge ``opts`` into an existing index's stored options blob.
+
+        Read-modify-write of the ``{key, options}`` payload, mirroring
+        ``set_index_expiry``. Backs ``collMod {index: {keyPattern|name,
+        prepareUnique|unique: ...}}``. Returns ``True`` when the index
+        existed and was updated.
+        """
+        with self._lock:
+            self._refresh_read_snapshot()
+            c = self._cursor(_IDX_TABLE)
+            c.set_key(db, coll, name)
+            if c.search() != 0:
+                return False
+            payload = bson.decode(bytes(c.get_value()))
+            options = payload.get("options", {})
+            options.update(opts)
+            payload["options"] = options
+            c.reset()
+            c[db, coll, name] = bson.encode(payload)
+            return True
+
+    def find_index_duplicates(self, db: str, coll: str, name: str) -> list[list[Any]]:
+        """Group ``_id`` values of documents that share the same key on
+        index ``name``, returning one ``_id`` list per duplicated key
+        (groups of size >= 2, ``_id``-sorted within each group).
+
+        Backs ``collMod {index: {unique: true}}``: a non-empty result
+        means the conversion to unique must be refused with code 359
+        (``CannotConvertIndexToUnique``) and the groups reported as
+        ``violations``.
+        """
+        with self._lock:
+            self._refresh_read_snapshot()
+            spec: tuple[dict[str, Any], dict[str, Any]] | None = None
+            for n, key_spec, opts in self._iter_indexes(db, coll):
+                if n == name:
+                    spec = (key_spec, opts)
+                    break
+            if spec is None:
+                return []
+            key_spec, opts = spec
+            sparse = bool(opts.get("sparse"))
+            coll_opt = _parse_index_collation(opts.get("collation"))
+            blobs = [blob for _id_k, blob in self._scan_docs(db, coll)]
+        groups: dict[bytes, list[Any]] = {}
+        for blob in blobs:
+            doc = bson.decode(blob)
+            kb = _index_key(doc, key_spec, sparse=sparse, collation=coll_opt)
+            if kb is None:
+                continue
+            groups.setdefault(kb, []).append(doc.get("_id"))
+        out: list[list[Any]] = []
+        for ids in groups.values():
+            if len(ids) > 1:
+                out.append(sorted(ids, key=_id_key))
+        return out
+
     def drop_all_indexes(self, db: str, coll: str) -> int:
         with self._lock:
             # Mutating scanners read the current rows before deleting/rewriting
@@ -4932,7 +4990,11 @@ class Storage:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
         for name, key_spec, sparse, unique in indexes:
-            if not unique:
+            # ``prepareUnique`` enforces uniqueness on new writes without
+            # the index being formally unique yet — mongod blocks dup
+            # inserts the moment ``collMod {index: {prepareUnique: true}}``
+            # lands, even while pre-existing duplicates remain.
+            if not unique and not index_options.get(name, {}).get("prepareUnique"):
                 continue
             pf = partials.get(name)
             if pf is not None and not matches(candidate_doc, pf):
