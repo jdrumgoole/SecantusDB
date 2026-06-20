@@ -38,6 +38,11 @@ use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
 pub mod changestreams;
+pub mod pitr_archive;
+pub mod replay;
+
+/// Filename of the advisory PITR manifest embedded in a backup archive.
+pub(crate) const PITR_MANIFEST_NAME: &str = "pitr-manifest.json";
 
 use std::cell::Cell;
 
@@ -955,6 +960,9 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
 /// concurrency story is unchanged; see `tasks/wt-bindings-plan.md`).
 pub struct Storage {
     conn: Connection,
+    /// The WiredTiger home (on-disk data) directory. Kept so `create_archive`
+    /// can tar the consistent file set the `backup:` cursor enumerates.
+    home: String,
     lock: Mutex<()>,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
     /// `storage.enable_oplog`. Default `true`.
@@ -977,6 +985,10 @@ pub struct Storage {
     /// `timeseries_doc_suffix`). Wraps at 16 bits; combined with a nanosecond
     /// timestamp it keeps duplicate-`_id` rows distinct across reopens.
     ts_suffix_counter: AtomicU64,
+    /// When set, `prune_oplog` archives the rows it is about to drop into a
+    /// durable oplog segment in this directory first (PITR v2). Mirrors
+    /// `storage.oplog_archive_dir`.
+    oplog_archive_dir: Option<String>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -1054,6 +1066,33 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
     })
 }
 
+/// What `create_archive` produced: the absolute-ish output path and its size.
+/// Mirrors the `{path, sizeBytes}` Python `Storage.create_archive` returns.
+pub struct ArchiveInfo {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+fn archive_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
+    StorageError::Internal(format!("{ctx}: {e}"))
+}
+
+/// Extract a backup `.tar.gz` (from `create_archive`) into `target_dir`, which is
+/// then a startable WiredTiger home. Free function (no live `Storage` needed) so
+/// the restore path can rebuild a fresh directory. Mirrors Python
+/// `extract_backup_archive`.
+pub fn extract_backup_archive(archive_path: &str, target_dir: &str) -> Result<()> {
+    std::fs::create_dir_all(target_dir).map_err(|e| archive_err("extract_backup_archive", e))?;
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| archive_err("extract_backup_archive", e))?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+    archive
+        .unpack(target_dir)
+        .map_err(|e| archive_err("extract_backup_archive", e))?;
+    Ok(())
+}
+
 impl Storage {
     /// Open (creating if needed) an on-disk database at `home` with the default
     /// SecantusDB WiredTiger config, bootstrapping the table schema.
@@ -1076,6 +1115,7 @@ impl Storage {
         };
         Ok(Storage {
             conn,
+            home: home.to_string(),
             lock: Mutex::new(()),
             enable_oplog: true,
             oplog: Mutex::new(state),
@@ -1083,6 +1123,7 @@ impl Storage {
             oplog_retention_seconds: 3600,
             oplog_max_entries: 100_000,
             ts_suffix_counter: AtomicU64::new(0),
+            oplog_archive_dir: None,
         })
     }
 
@@ -1090,6 +1131,13 @@ impl Storage {
     /// Off means writes skip the oplog tables entirely.
     pub fn set_enable_oplog(&mut self, on: bool) {
         self.enable_oplog = on;
+    }
+
+    /// Enable PITR v2 oplog archiving: `prune_oplog` writes the rows it is about
+    /// to drop into a durable segment in `dir` first. `None` disables it. Mirrors
+    /// `Storage(oplog_archive_dir=...)`.
+    pub fn set_oplog_archive_dir(&mut self, dir: Option<String>) {
+        self.oplog_archive_dir = dir;
     }
 
     /// Set the oplog retention window in seconds (default 3600). Mirrors
@@ -1329,6 +1377,161 @@ impl Storage {
         self.oplog.lock().unwrap().next_seq - 1
     }
 
+    /// Force a WiredTiger checkpoint (durable flush of the latest snapshot). Used
+    /// by oplog replay to make the restored database durable before the target
+    /// `Storage` is dropped.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        session.checkpoint(None)?;
+        Ok(())
+    }
+
+    /// Force a checkpoint, then tar the consistent WiredTiger file set (enumerated
+    /// by WiredTiger's `backup:` cursor) into `output_path` as a gzip stream, with
+    /// an advisory `pitr-manifest.json` describing the oplog range it can recover
+    /// to. Mirrors Python `Storage.create_archive`. The on-disk + oplog formats
+    /// are identical across the two servers, so the Python restore tooling reads
+    /// this archive (and vice versa).
+    pub fn create_archive(&self, output_path: &str) -> Result<ArchiveInfo> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        // Durable, consistent snapshot first; the backup cursor enumerates the
+        // files that make it up and WiredTiger holds them stable for the cursor's
+        // lifetime, so we tar them all before it drops.
+        session.checkpoint(None)?;
+        let manifest = self.pitr_manifest()?;
+        let cursor = session.open_cursor("backup:", None)?;
+        let file =
+            std::fs::File::create(output_path).map_err(|e| archive_err("create_archive", e))?;
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        while cursor.next()? {
+            let rel = cursor.get_key_s()?;
+            let full = std::path::Path::new(&self.home).join(&rel);
+            builder
+                .append_path_with_name(&full, &rel)
+                .map_err(|e| archive_err("create_archive", e))?;
+        }
+        let data =
+            serde_json::to_vec(&manifest).map_err(|e| archive_err("create_archive manifest", e))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, PITR_MANIFEST_NAME, &data[..])
+            .map_err(|e| archive_err("create_archive", e))?;
+        builder
+            .into_inner()
+            .map_err(|e| archive_err("create_archive", e))?
+            .finish()
+            .map_err(|e| archive_err("create_archive", e))?;
+        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        Ok(ArchiveInfo {
+            path: output_path.to_string(),
+            size_bytes: size,
+        })
+    }
+
+    /// Take a PITR v2 base snapshot into `archive_dir`, named by its oplog head
+    /// seq (`base-<head>.tar.gz`) so the restore path can order and select
+    /// snapshots. Thin wrapper over `create_archive`. Pair with
+    /// `set_oplog_archive_dir(archive_dir)` and call periodically (no background
+    /// scheduler). Mirrors `storage.archive_base_snapshot`.
+    pub fn archive_base_snapshot(&self, archive_dir: &str) -> Result<ArchiveInfo> {
+        let head = self.oplog_tail_seq();
+        std::fs::create_dir_all(archive_dir)
+            .map_err(|e| archive_err("archive_base_snapshot", e))?;
+        let out = std::path::Path::new(archive_dir).join(pitr_archive::base_name(head));
+        self.create_archive(&out.to_string_lossy())
+    }
+
+    /// Read the doomed oplog rows (and pre-images) and write them to a durable
+    /// segment in `archive_dir` before `prune_oplog` deletes them. Best-effort
+    /// reads — a row that vanished concurrently is skipped.
+    fn archive_doomed_oplog(
+        &self,
+        session: &Session,
+        archive_dir: &str,
+        doomed_sorted: &[i64],
+    ) -> Result<()> {
+        let op_cur = session.open_cursor(OPLOG_TABLE, None)?;
+        let pre_cur = session.open_cursor(PREIMAGE_TABLE, None)?;
+        let mut rows: Vec<(i64, Document, Option<Document>)> = Vec::new();
+        for &seq in doomed_sorted {
+            op_cur.reset()?;
+            op_cur.set_key_q(seq);
+            if op_cur.search().is_err() {
+                continue;
+            }
+            let blob = op_cur.get_value_u()?;
+            if blob.is_empty() {
+                continue;
+            }
+            let entry = decode_doc(&blob)?;
+            pre_cur.reset()?;
+            pre_cur.set_key_q(seq);
+            let pre = match pre_cur.search() {
+                Ok(()) => {
+                    let pb = pre_cur.get_value_u()?;
+                    if pb.is_empty() {
+                        None
+                    } else {
+                        Some(decode_doc(&pb)?)
+                    }
+                }
+                Err(_) => None,
+            };
+            rows.push((seq, entry, pre));
+        }
+        pitr_archive::write_segment(archive_dir, &rows)?;
+        Ok(())
+    }
+
+    /// Build the advisory PITR manifest embedded in a backup archive: the oplog
+    /// seq range and timestamps it can recover to, plus whether the oplog still
+    /// reaches genesis. Mirrors Python `Storage._pitr_manifest` (a subset; wall
+    /// times land with the v2 base-selection work). Called under `self.lock`; the
+    /// oplog reads it uses are lock-free.
+    fn pitr_manifest(&self) -> Result<serde_json::Value> {
+        let floor = self.oplog_floor_seq()?;
+        let head = self.oplog_tail_seq();
+        let row_of = |seq: i64| -> Option<Document> {
+            if seq <= 0 {
+                return None;
+            }
+            let rows = self.read_oplog(seq, 1).ok()?;
+            let (_s, blob) = rows.into_iter().next()?;
+            decode_doc(&blob).ok()
+        };
+        let ts_of = |row: &Option<Document>| -> Option<[i64; 2]> {
+            match row.as_ref()?.get("ts") {
+                Some(Bson::Timestamp(ts)) => Some([i64::from(ts.time), i64::from(ts.increment)]),
+                _ => None,
+            }
+        };
+        let wall_of = |row: &Option<Document>| -> Option<String> {
+            match row.as_ref()?.get("wall") {
+                Some(Bson::DateTime(dt)) => dt.try_to_rfc3339_string().ok(),
+                _ => None,
+            }
+        };
+        let floor_row = row_of(floor);
+        let head_row = row_of(head);
+        Ok(serde_json::json!({
+            "secantusPitrManifest": 1,
+            "oplogEnabled": self.enable_oplog,
+            "oplogFloorSeq": floor,
+            "oplogHeadSeq": head,
+            "genesisIntact": floor == 1,
+            "oplogFloorTs": ts_of(&floor_row),
+            "oplogHeadTs": ts_of(&head_row),
+            "oplogFloorWall": wall_of(&floor_row),
+            "oplogHeadWall": wall_of(&head_row),
+        }))
+    }
+
     /// Merge `opts` into the collection's options blob (creating the collection
     /// if needed) — e.g. `{changeStreamPreAndPostImages: {enabled: true}}`.
     /// Mirrors `storage.set_collection_options`.
@@ -1401,6 +1604,68 @@ impl Storage {
         }
     }
 
+    /// Write **verbatim** oplog rows `(seq, entry)` (carrying their original seq /
+    /// ts / wall) plus any pre-images into the oplog tables, and advance the seq +
+    /// cluster clock past them — so a restored store continues a pre-existing
+    /// timeline and a change stream there can resume from a token minted before
+    /// the restore point. Unlike `emit_oplog` this does NOT mint new seqs (the
+    /// rows keep their identity, so resume tokens stay valid) and is not gated on
+    /// `enable_oplog` (it's an explicit import). Returns the highest seq written.
+    /// Mirrors Python `Storage.import_oplog_segment`.
+    pub fn import_oplog_segment(
+        &self,
+        rows: &[(i64, Document)],
+        pre_images: &std::collections::HashMap<i64, Vec<u8>>,
+    ) -> Result<i64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut pre_cur: Option<Cursor> = None;
+        let mut max_seq = 0i64;
+        let mut best = (0i64, 0i64);
+        for (seq, entry) in rows {
+            let blob = encode_doc(entry)?;
+            cur.reset()?;
+            cur.set_key_q(*seq);
+            cur.set_value_u(&blob);
+            cur.insert()?;
+            if let Some(pre) = pre_images.get(seq) {
+                if pre_cur.is_none() {
+                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
+                }
+                let pc = pre_cur.as_ref().unwrap();
+                pc.reset()?;
+                pc.set_key_q(*seq);
+                pc.set_value_u(pre);
+                pc.insert()?;
+            }
+            if *seq > max_seq {
+                max_seq = *seq;
+            }
+            if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
+                let cand = (i64::from(ts.time), i64::from(ts.increment));
+                if cand > best {
+                    best = cand;
+                }
+            }
+        }
+        {
+            let mut st = self.oplog.lock().unwrap();
+            if max_seq + 1 > st.next_seq {
+                st.next_seq = max_seq + 1;
+            }
+            if best > (st.last_ts_secs, st.last_ts_ord) {
+                st.last_ts_secs = best.0;
+                st.last_ts_ord = best.1;
+            }
+            self.oplog_cv.notify_all();
+        }
+        Ok(max_seq)
+    }
+
     /// Drop oplog rows older than the retention window (`ts.time < now -
     /// retention`) and, if more than `oplog_max_entries` remain, the oldest
     /// surplus; paired pre-images go too. `now` is injected seconds (defaults to
@@ -1453,6 +1718,14 @@ impl Storage {
         }
         if doomed.is_empty() {
             return Ok(0);
+        }
+        doomed.sort_unstable();
+
+        // PITR v2: archive the soon-to-be-dropped rows to a durable segment
+        // *before* deleting them, so recovery can still reach a time before the
+        // new oplog floor. Done before the lock (rows still present).
+        if let Some(archive_dir) = self.oplog_archive_dir.clone() {
+            self.archive_doomed_oplog(&session, &archive_dir, &doomed)?;
         }
 
         // Phase 2: take the global lock only for the mutation (the deletes),
@@ -2126,12 +2399,35 @@ impl Storage {
     /// already exists, `true` if created — minting its UUID and emitting an
     /// `op: "c"` `create` oplog entry. Mirrors `storage.create_collection`.
     pub fn create_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        self.create_collection_with_options(db, coll, &Document::new())
+    }
+
+    /// Like [`create_collection`], but persists `options` (`capped` / `size` /
+    /// `max` / `validator` / `viewOn` / …) to the collection blob **and** carries
+    /// them as siblings of `create` in the `c` oplog entry's `o`, so PITR replay
+    /// (Rust or Python) and `show_expanded_events` create events reconstruct them.
+    /// Mirrors Python `Storage.create_collection(..., options=...)`.
+    pub fn create_collection_with_options(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
         let session = self.op_session()?;
         if collection_registered(&session, db, coll)? {
             return Ok(false);
         }
         ensure_collection(&session, db, coll)?;
+        if !options.is_empty() {
+            // Persist before minting the UUID below — collection_uuid re-reads and
+            // merges, so the options survive.
+            let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+            for (k, v) in options {
+                current.insert(k.clone(), v.clone());
+            }
+            write_coll_options(&session, db, coll, &current)?;
+        }
         if self.enable_oplog {
             let ui = collection_uuid(&session, db, coll)?;
             let mut id_key_spec = Document::new();
@@ -2142,6 +2438,9 @@ impl Storage {
             id_index.insert("name", ID_INDEX_NAME);
             let mut o = Document::new();
             o.insert("create", coll);
+            for (k, v) in options {
+                o.insert(k.clone(), v.clone());
+            }
             o.insert("idIndex", Bson::Document(id_index));
             let mut entry = Document::new();
             entry.insert("op", "c");
@@ -2891,6 +3190,37 @@ impl Storage {
                 .cmp(b.get_str("name").unwrap_or(""))
         });
         Ok(out)
+    }
+
+    /// Retune a TTL index's `expireAfterSeconds` option, resolving the index by
+    /// name. Returns `false` if there is no such index. Used by `collMod` replay
+    /// (`{index: {name, expireAfterSeconds}}`). Mirrors `storage.set_index_expiry`.
+    pub fn set_index_expiry(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        expire_after_seconds: i64,
+    ) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, coll, name);
+        match cur.search() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let mut payload = decode_doc(&cur.get_value_u()?)?;
+        let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+        opts.insert("expireAfterSeconds", expire_after_seconds);
+        payload.insert("options", Bson::Document(opts));
+        let blob = encode_doc(&payload)?;
+        let wcur = session.open_cursor(IDX_TABLE, None)?;
+        wcur.set_key_sss(db, coll, name);
+        wcur.set_value_u(&blob);
+        wcur.update()?;
+        Ok(true)
     }
 
     /// Drop the index named `name` (and all its entries). Returns `false` if no
@@ -5387,6 +5717,275 @@ mod tests {
     /// `kb` is).
     fn ev(b: &Bson) -> Vec<u8> {
         sortkey::encode_value(b, None).unwrap()
+    }
+
+    #[test]
+    fn create_archive_roundtrips_data_through_extract() {
+        // WiredTiger-backed: needs the rust-storage test env (WT + libclang).
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32, "v": 7i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+
+        let archive = dir.path().join("backup.tar.gz");
+        let info = s.create_archive(archive.to_str().unwrap()).unwrap();
+        assert!(info.size_bytes > 0);
+        drop(s); // release WiredTiger's single-writer lock before reopening
+
+        let target = dir.path().join("restored");
+        extract_backup_archive(archive.to_str().unwrap(), target.to_str().unwrap()).unwrap();
+        assert!(target.join("pitr-manifest.json").exists());
+
+        let restored = Storage::open(target.to_str().unwrap()).unwrap();
+        let got = restored.find_matching("app", "c", &doc! {}).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 7);
+    }
+
+    #[test]
+    fn replay_rebuilds_database_from_oplog() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let empty = doc! {};
+        {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32, "v": 1i32}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32, "v": 2i32}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            // operator update -> oplog $v:2 diff; reverse-applied on replay
+            s.update_matching(
+                "app",
+                "c",
+                &doc! {"_id": 1i32},
+                &doc! {"$set": {"v": 100i32}},
+                false,
+                false,
+                &[],
+                &empty,
+                None,
+                None,
+            )
+            .unwrap();
+            s.delete_matching("app", "c", &doc! {"_id": 2i32}, 1, &empty, None)
+                .unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 3i32, "v": 3i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        } // drop releases the WiredTiger single-writer lock
+
+        let out = dir.path().join("restored");
+        let stats = replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(stats.ops_applied >= 4);
+
+        let restored = Storage::open(out.to_str().unwrap()).unwrap();
+        let mut got: Vec<(i32, i32)> = restored
+            .find_matching("app", "c", &empty)
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let d = decode_doc(b).unwrap();
+                (d.get_i32("_id").unwrap(), d.get_i32("v").unwrap())
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(1, 100), (3, 3)]);
+    }
+
+    #[test]
+    fn replay_reconstructs_collection_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let validator = doc! {"v": {"$gt": 0}};
+        {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            let opts = doc! {"capped": true, "size": 8192i64, "max": 100i64, "validator": validator.clone()};
+            assert!(s.create_collection_with_options("app", "c", &opts).unwrap());
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 1i32, "v": 5i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        }
+
+        let out = dir.path().join("restored");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let restored = Storage::open(out.to_str().unwrap()).unwrap();
+        let got = restored.get_collection_options("app", "c").unwrap();
+        assert_eq!(got.get_bool("capped").ok(), Some(true));
+        assert_eq!(got.get_i64("size").ok(), Some(8192));
+        assert_eq!(got.get_i64("max").ok(), Some(100));
+        assert_eq!(got.get_document("validator").ok(), Some(&validator));
+    }
+
+    #[test]
+    fn restore_with_carry_oplog_preserves_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let src_seqs: Vec<i64> = {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            s.read_oplog(1, 100)
+                .unwrap()
+                .iter()
+                .map(|(q, _)| *q)
+                .collect()
+        };
+
+        // carry_oplog = true: the restored store keeps the same oplog seqs ...
+        let carried = dir.path().join("carried");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            carried.to_str().unwrap(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let r = Storage::open(carried.to_str().unwrap()).unwrap();
+        let restored_seqs: Vec<i64> = r
+            .read_oplog(1, 100)
+            .unwrap()
+            .iter()
+            .map(|(q, _)| *q)
+            .collect();
+        assert_eq!(restored_seqs, src_seqs);
+        let tail = r.oplog_tail_seq();
+        r.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 3i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.oplog_tail_seq(), tail + 1); // a fresh write continues the timeline
+        drop(r);
+
+        // ... while the default (no carry) leaves the restored oplog empty.
+        let fresh = dir.path().join("fresh");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let f = Storage::open(fresh.to_str().unwrap()).unwrap();
+        assert!(f.read_oplog(1, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn v2_restore_reaches_before_pruned_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive");
+        let archive_s = archive.to_str().unwrap().to_string();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
+        {
+            let mut s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.set_oplog_archive_dir(Some(archive_s.clone()));
+            s.set_oplog_max_entries(2);
+            s.insert("app", "c", vec![enc(1), enc(2)], true).unwrap();
+            s.archive_base_snapshot(&archive_s).unwrap(); // base head = seq 2
+            s.insert("app", "c", vec![enc(3)], true).unwrap();
+            s.insert("app", "c", vec![enc(4)], true).unwrap();
+            s.insert("app", "c", vec![enc(5)], true).unwrap();
+            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive seq 1,2,3
+            assert!(pruned >= 3, "pruned {pruned}");
+            assert_eq!(s.oplog_floor_seq().unwrap(), 4); // live oplog no longer reaches seq 3
+        }
+
+        // v1 can't restore the src (floor past genesis); v2 stitches base + segments.
+        let out = dir.path().join("restored");
+        pitr_archive::restore_from_archive_dir(
+            &archive_s,
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let r = Storage::open(out.to_str().unwrap()).unwrap();
+        let mut ids: Vec<i32> = r
+            .find_matching("app", "c", &doc! {})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]); // base (1,2) + archived seq 3
+    }
+
+    #[test]
+    fn v2_segment_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().to_str().unwrap();
+        let rows = vec![
+            (
+                1i64,
+                doc! {"op": "i", "ns": "a.b", "o": {"_id": 1i32}},
+                None,
+            ),
+            (
+                2i64,
+                doc! {"op": "i", "ns": "a.b", "o": {"_id": 2i32}},
+                Some(doc! {"_id": 2i32, "old": true}),
+            ),
+        ];
+        pitr_archive::write_segment(archive, &rows).unwrap();
+        let got = pitr_archive::iter_archived_oplog(archive).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, 1);
+        assert_eq!(got[1].2, Some(doc! {"_id": 2i32, "old": true}));
+        assert!(pitr_archive::is_archive_dir(archive));
     }
 
     #[test]

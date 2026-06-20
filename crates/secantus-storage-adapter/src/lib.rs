@@ -417,6 +417,17 @@ impl CmdStorage for StorageAdapter {
         self.inner.create_collection(db, coll).map_err(map_err)
     }
 
+    fn create_collection_with_options(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .create_collection_with_options(db, coll, options)
+            .map_err(map_err)
+    }
+
     fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
         self.inner.get_collection_options(db, coll).map_err(map_err)
     }
@@ -519,6 +530,20 @@ impl CmdStorage for StorageAdapter {
 
     fn drop_database(&self, db: &str) -> Result<(), StorageError> {
         self.inner.drop_database(db).map_err(map_err)
+    }
+
+    fn create_archive(&self, output_path: &str) -> Result<(String, u64), StorageError> {
+        self.inner
+            .create_archive(output_path)
+            .map(|info| (info.path, info.size_bytes))
+            .map_err(map_err)
+    }
+
+    fn archive_base_snapshot(&self, archive_dir: &str) -> Result<(String, u64), StorageError> {
+        self.inner
+            .archive_base_snapshot(archive_dir)
+            .map(|info| (info.path, info.size_bytes))
+            .map_err(map_err)
     }
 
     fn rename_collection(

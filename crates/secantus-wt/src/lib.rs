@@ -365,6 +365,13 @@ impl Cursor {
         check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut a, &mut b) })?;
         Ok((owned(a), owned(b)))
     }
+    /// `key_format=S` — a single NUL-terminated string. Used by the `backup:`
+    /// cursor, whose key is each file in the consistent snapshot.
+    pub fn get_key_s(&self) -> Result<String> {
+        let mut a: *const c_char = ptr::null();
+        check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut a) })?;
+        Ok(owned(a))
+    }
     pub fn get_key_ssu(&self) -> Result<(String, String, Vec<u8>)> {
         let (mut a, mut b): (*const c_char, *const c_char) = (ptr::null(), ptr::null());
         let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };

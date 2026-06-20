@@ -391,6 +391,29 @@ fn compute_update_description(
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
+/// `diff.apply_update_description(doc, diff)` over BSON bytes — the inverse of
+/// `compute_update_description` (rolls a pre-image forward by an oplog update's
+/// `$v: 2` diff). Returns the post-image document's bytes, or `None` to fall back
+/// to pure Python.
+#[pyfunction]
+fn apply_update_description(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    diff_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let doc: Document = bson::from_slice(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    let diff: Document = bson::from_slice(diff_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid diff BSON: {e}")))?;
+    let out = py
+        .allow_threads(|| match diff::apply_update_description(doc, &diff) {
+            Ok(out) => encode_doc(&out).map(Some),
+            Err(diff::Fallback) => Ok(None),
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(out.map(|b| to_pybytes(py, b)))
+}
+
 /// `aggregate.apply_pipeline(docs, pipeline, vars, collation)` over BSON bytes.
 /// `docs_bytes` is `bson.encode({"d": [<doc>, ...]})` and `pipeline_bytes` is
 /// `bson.encode({"p": [<stage>, ...]})`; the result is `{"d": [...]}` bytes, or
@@ -465,6 +488,7 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(apply_projection, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_update_description, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_update_description, m)?)?;
     m.add_function(wrap_pyfunction!(apply_pipeline, m)?)?;
     Ok(())
 }

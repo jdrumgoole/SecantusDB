@@ -66,9 +66,13 @@ fn collection_option_subset(doc: &Document) -> Document {
 /// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "create")?;
+    // Build the options up front so they ride the `create` oplog entry (carried
+    // by create_collection_with_options) — that's what lets PITR replay
+    // reconstruct capped / validator / … rather than seeing a bare create.
+    let opts = collection_option_subset(doc);
     let storage = ctx.storage()?;
     let created = storage
-        .create_collection(&ctx.db_name, &coll)
+        .create_collection_with_options(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
     if !created {
         return Ok(CommandError::new(
@@ -77,12 +81,6 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("a collection '{}.{}' already exists", ctx.db_name, coll),
         )
         .into_reply());
-    }
-    let opts = collection_option_subset(doc);
-    if !opts.is_empty() {
-        storage
-            .set_collection_options(&ctx.db_name, &coll, &opts)
-            .map_err(command_error)?;
     }
     Ok(doc! { "ok": 1.0 })
 }
@@ -305,6 +303,45 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(CommandError::new(26, "NamespaceNotFound", "ns not found").into_reply());
     }
     Ok(doc! { "ns": format!("{}.{}", ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0 })
+}
+
+/// `secantusAdmin.backupArchive` — force a checkpoint and tar the WiredTiger home
+/// into `outputPath` (a server-side path) for point-in-time recovery. The on-disk
+/// and oplog formats match the Python server, so either server's restore tooling
+/// reads the result. Mirrors the Python `secantusAdmin.backupArchive` command.
+pub fn backup_archive(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let output_path = doc.get_str("outputPath").unwrap_or("");
+    if output_path.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.backupArchive requires outputPath: <string>",
+        ));
+    }
+    let storage = ctx.storage()?;
+    let (path, size_bytes) = storage.create_archive(output_path).map_err(command_error)?;
+    Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
+}
+
+/// `secantusAdmin.archiveBaseSnapshot` — take a PITR v2 base snapshot into
+/// `archiveDir` (`base-<head>.tar.gz`). Pair with a server started with
+/// `--oplog-archive-dir <archiveDir>` so pruned oplog rows are archived as
+/// segments there too; recovery then stitches the newest base ≤ T plus the
+/// segments. Mirrors the Python `secantusAdmin.archiveBaseSnapshot` command.
+pub fn archive_base_snapshot(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let archive_dir = doc.get_str("archiveDir").unwrap_or("");
+    if archive_dir.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.archiveBaseSnapshot requires archiveDir: <string>",
+        ));
+    }
+    let storage = ctx.storage()?;
+    let (path, size_bytes) = storage
+        .archive_base_snapshot(archive_dir)
+        .map_err(command_error)?;
+    Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
 }
 
 /// `listCollections` — a cursor over the collections in the database, honouring

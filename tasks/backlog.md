@@ -169,22 +169,14 @@ take base snapshots; and `restore_from_archive_dir` (a directory `source` on the
 CLI/wire) picks the newest base ≤ T and stitches archived oplog forward onto it,
 lifting the genesis-intact restriction. `--preserve-oplog` carries the replayed
 oplog for change-stream resume continuity, and collection options replay too.
-Deferred:
-
-- [ ] **Native Rust server PITR (Phase R).** Plan + verified state in
-  `tasks/rust-pitr-phase-r-plan.md`. **Cross-server restore already works**
-  (R6a, `tests/test_rust_pitr_cross_server.py`): the on-disk WT schema + oplog
-  shape are identical, so the Python `oplog_replay` tool restores a stopped Rust
-  server's data dir today — PITR works for Rust-server data via the Python tool.
-  Stale prereqs now corrected: R0a (DDL oplog `c` entries for create_index /
-  drop_index / collMod) is **already done** in `secantus-storage`, and
-  `compute_update_description` is **already ported + parity-tested**
-  (`tests/test_rust_diff_parity.py`). Remaining for a *self-contained* Rust
-  binary: R1 (WT `backup:` cursor + `create_archive` + wire
-  `secantusAdmin.backupArchive`), R2 (reverse `apply_update_description` in
-  `secantus-core`), R3 (applier + replay in `secantus-storage`), R4
-  (`secantusdb restore` subcommand), R5 (parity for the 3 new Python PITR
-  features: options-carry, `--preserve-oplog`, v2 archiving).
+Native Rust server PITR (Phase R) is **complete** (branch `rust-pitr`):
+`secantusAdmin.backupArchive` + `secantusdb restore` (v1 + v2 archive-dir
+sources, `--preserve-oplog`), `secantusAdmin.archiveBaseSnapshot`,
+`--oplog-archive-dir` server flag, the `secantus_storage::{replay,pitr_archive}`
+modules, the reverse `apply_update_description` in `secantus-core`, collection-
+options carry, and `set_index_expiry`. Cross-server restore is byte-faithful both
+ways (`tests/test_rust_pitr_cross_server.py`, `tests/test_rust_binary_pitr.py`).
+Plan/history: `tasks/rust-pitr-phase-r-plan.md`.
 
 ## 4. Out of scope (intentional, with reasoning)
 

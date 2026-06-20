@@ -39,6 +39,11 @@ def _rust_diff(pre, post):
     return None if res is None else bson.decode(res)
 
 
+def _rust_apply(doc, diff):
+    res = _rust.apply_update_description(bson.encode(doc), bson.encode(diff))
+    return None if res is None else bson.decode(res)
+
+
 CURATED = [
     ({"a": 1, "b": 2}, {"a": 9, "c": 3}),
     ({"a": {"b": 1, "c": 2}}, {"a": {"b": 1, "c": 9}}),
@@ -112,4 +117,37 @@ def test_randomised_fuzz_parity():
         handled += 1
         py = _pure.compute_update_description(pre, post)
         assert rust == py, f"divergence: rust={rust} pure={py} pre={pre} post={post}"
+    assert handled > 1000, f"expected many handled cases, only {handled}"
+
+
+@pytest.mark.parametrize("pre,post", CURATED)
+def test_apply_parity_curated(pre, post):
+    """Rust `apply_update_description` matches pure Python: rolling the pre-image
+    forward by the (pure-computed) diff produces the same document on both sides.
+    This is the reverse of `compute`, the keystone of oplog replay."""
+    pre = bson.decode(bson.encode(pre))
+    post = bson.decode(bson.encode(post))
+    diff = _pure.compute_update_description(pre, post)
+    rust = _rust_apply(pre, diff)
+    if rust is None:
+        return  # fallback to pure Python
+    py = _pure.apply_update_description(bson.decode(bson.encode(pre)), diff)
+    assert rust == py, f"apply divergence: rust={rust} pure={py} diff={diff}"
+
+
+def test_apply_parity_fuzz():
+    """Same as the compute fuzz, but checks `apply` reproduces the pure-Python
+    result across thousands of random pre/diff pairs."""
+    rng = random.Random(0xA471)
+    handled = 0
+    for _ in range(6000):
+        pre = bson.decode(bson.encode(_rand_doc(rng)))
+        post = pre if rng.random() < 0.1 else bson.decode(bson.encode(_rand_doc(rng)))
+        diff = _pure.compute_update_description(pre, post)
+        rust = _rust_apply(pre, diff)
+        if rust is None:
+            continue
+        handled += 1
+        py = _pure.apply_update_description(bson.decode(bson.encode(pre)), diff)
+        assert rust == py, f"apply divergence: rust={rust} pure={py} pre={pre} diff={diff}"
     assert handled > 1000, f"expected many handled cases, only {handled}"

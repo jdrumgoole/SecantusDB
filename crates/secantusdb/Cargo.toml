@@ -1,6 +1,6 @@
 [package]
 name = "secantusdb"
-version = "0.5.3-beta.23"
+version = "0.5.3-beta.29"
 edition = "2021"
 description = "Standalone SecantusDB server binary (Rust): WiredTiger-backed, MongoDB wire protocol."
 license = "GPL-2.0-only"
@@ -22,6 +22,7 @@ name = "secantusdb"
 path = "src/main.rs"
 
 [dependencies]
+bson = "2"
 ctrlc = { version = "3", features = ["termination"] }
 secantus-storage = { path = "../secantus-storage" }
 secantus-storage-adapter = { path = "../secantus-storage-adapter" }
