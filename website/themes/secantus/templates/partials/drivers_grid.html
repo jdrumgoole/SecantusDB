@@ -47,10 +47,10 @@
       <span class="lang">Go</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">100.0%</span>
+      <span class="rate">99.3%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>401</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="counts"><strong>398</strong> tests passed &middot; <strong>3</strong> known divergences</p>
     <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -109,6 +109,48 @@
     <p class="counts"><strong>246</strong> tests passed &middot; <strong>1</strong> failed</p>
     <p class="note">The low-level PHP extension &mdash; the C-based PECL <code>ext-mongodb</code> that wraps libmongoc and underpins the library above. We run its <code>.phpt</code> wire-protocol suite via PHP's <code>run-tests.php</code> against an embedded SecantusDB daemon (the pure BSON-serialization tests are run but not counted). Alongside Go, the strictest wire-shape check we run &mdash; type divergences pymongo accepts silently fail here.</p>
     <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-php-ext.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-c-driver</h3>
+      <span class="lang">C</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">97.1%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>712</strong> tests passed &middot; <strong>13</strong> failed</p>
+    <p class="note">The official MongoDB <strong>C</strong> driver (<code>libmongoc</code>) &mdash; the lowest-level official client, the one the PHP, Ruby (bson), and PyMongo C-extensions ultimately wrap. We build its <code>test-libmongoc</code> suite from source and run a curated set of wire-protocol prefixes (CRUD / cursor / aggregate / command / GridFS / index management) against an embedded SecantusDB daemon via <code>MONGOC_TEST_URI</code>. A strict C client &mdash; type and wire-shape divergences surface here that permissive clients accept.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-c.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-cxx-driver</h3>
+      <span class="lang">C++</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">99.7%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>885</strong> tests passed &middot; <strong>3</strong> failed</p>
+    <p class="note">The official MongoDB <strong>C++</strong> driver (<code>mongocxx</code>), built on libmongoc. We build its Catch2 <code>test_driver</code> suite from source and run it (CRUD / cursor / aggregate / GridFS / commands) against an embedded SecantusDB daemon. mongocxx's tests hard-wire the driver default port, so the gauge serves them on <code>127.0.0.1:27017</code>.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-cxx.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
+      <h3>mongo-csharp-driver</h3>
+      <span class="lang">C#</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">100.0%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>202</strong> tests passed &middot; <strong>0</strong> failed</p>
+    <p class="note">The official MongoDB <strong>C# / .NET</strong> driver — the one the .NET / Unity / Xamarin ecosystem builds on. We run its xUnit CRUD specification suite (<code>MongoDB.Driver.Tests.Specifications.crud</code>) via <code>dotnet test</code> against an embedded SecantusDB daemon, with <code>MONGODB_URI</code> pointed at it. The driver's <code>[RequireServer]</code> attribute self-skips version- and topology-gated cases.</p>
+    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-dotnet.html" rel="noopener">Read the report &rarr;</a>
   </article>
 </div>
 
