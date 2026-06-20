@@ -534,6 +534,12 @@ pub trait Storage: Send + Sync {
         Ok(false)
     }
 
+    /// The collection's 16-byte UUID (mongod's collection identity, surfaced as
+    /// `info.uuid` BinData(4) in `listCollections` and `ui` in the oplog).
+    fn collection_uuid(&self, _db: &str, _coll: &str) -> Result<Vec<u8>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Documents whose `id_key` sorts strictly after `after` (all of them when
     /// `after` is `None`), as `(id_key, bson)` pairs — the tailable-find producer
     /// polls this for docs inserted since it last returned.

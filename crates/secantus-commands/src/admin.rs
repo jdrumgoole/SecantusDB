@@ -399,11 +399,26 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         } else {
             "collection"
         };
+        // `info.uuid` is BinData(4) — driver CollectionSpecification readers
+        // (e.g. the go driver) read it as a Binary, so it must be present and the
+        // right type.
+        let mut info = doc! { "readOnly": is_view };
+        if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, n) {
+            if uuid.len() == 16 {
+                info.insert(
+                    "uuid",
+                    Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Uuid,
+                        bytes: uuid,
+                    }),
+                );
+            }
+        }
         let mut entry = doc! {
             "name": n,
             "type": coll_type,
             "options": Bson::Document(options),
-            "info": { "readOnly": is_view },
+            "info": info,
         };
         if !is_view {
             entry.insert(

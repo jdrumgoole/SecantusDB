@@ -563,6 +563,10 @@ impl CmdStorage for StorageAdapter {
         self.inner.collection_is_capped(db, coll).map_err(map_err)
     }
 
+    fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.collection_uuid(db, coll).map_err(map_err)
+    }
+
     fn scan_docs_after_id_key(
         &self,
         db: &str,
