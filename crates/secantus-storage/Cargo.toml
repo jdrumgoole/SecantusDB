@@ -1,6 +1,6 @@
 [package]
 name = "secantus-storage"
-version = "0.5.3-beta.32"
+version = "0.5.3-beta.33"
 edition = "2021"
 description = "SecantusDB's storage layer in Rust (Phase 4): WiredTiger-backed collections/documents over secantus-wt, with id_key sort encoding from secantus-core."
 license = "GPL-2.0-only"

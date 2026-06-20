@@ -510,7 +510,8 @@ fn encode_doc(doc: &Document) -> Result<Vec<u8>> {
     // order-sensitive driver comparisons (e.g. the C# CRUD-spec runner) check
     // this. A no-op for docs without a top-level `_id` (oplog / index / meta
     // blobs) or where `_id` is already first.
-    let needs_reorder = doc.contains_key("_id") && doc.keys().next().map(String::as_str) != Some("_id");
+    let needs_reorder =
+        doc.contains_key("_id") && doc.keys().next().map(String::as_str) != Some("_id");
     if needs_reorder {
         let mut ordered = Document::new();
         if let Some(id) = doc.get("_id") {

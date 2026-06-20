@@ -337,6 +337,21 @@ fn array_eq(a: &[Bson], b: &[Bson], coll: Option<&Collation>) -> R {
     Ok(true)
 }
 
+/// Embedded-document equality. mongod (and the Python oracle) compare embedded
+/// documents ORDER-SENSITIVELY: `{w:21,h:14}` does not match a stored `{h:14,
+/// w:21}`. So compare key/value pairs pairwise in field order.
+fn doc_eq(a: &Document, b: &Document, coll: Option<&Collation>) -> R {
+    if a.len() != b.len() {
+        return Ok(false);
+    }
+    for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
+        if ka != kb || !eq_scalar(va, vb, coll)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
     // Array equality: `{field: [a, b, c]}` matches when the stored value is an
     // array equal element-by-element (same length, each pair `eq_scalar`-equal).
@@ -348,9 +363,17 @@ fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
             _ => Ok(false),
         };
     }
-    // Compound / regex / exotic expected -> structural or special semantics we
-    // don't reproduce: defer to Python.
-    if matches!(expected, Bson::RegularExpression(_) | Bson::Document(_)) || is_exotic(expected) {
+    // Embedded-document equality: `{field: {a: 1}}` (a non-operator subdoc)
+    // matches a stored document equal field-by-field. Python compares decoded
+    // dicts with `==` (key-based, order-insensitive), so mirror that here.
+    if let Bson::Document(exp) = expected {
+        return match v {
+            Bson::Document(val) => doc_eq(val, exp, coll),
+            _ => Ok(false),
+        };
+    }
+    // Regex / exotic expected -> special semantics we don't reproduce: defer.
+    if matches!(expected, Bson::RegularExpression(_)) || is_exotic(expected) {
         return Err(Fallback);
     }
     let v_bool = matches!(v, Bson::Boolean(_));
