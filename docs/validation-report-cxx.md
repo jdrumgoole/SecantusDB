@@ -1,6 +1,6 @@
 # mongo-cxx-driver Validation Report
 
-Generated 2026-06-19 — SecantusDB 0.5.4b7 vs mongo-cxx-driver r3.11.0 (`vendor/mongo-cxx-driver/`).
+Generated 2026-06-20 — SecantusDB 0.5.4b9 vs mongo-cxx-driver 24852b6 (`vendor/mongo-cxx-driver/`).
 
 Run `uv run python -m invoke validate-cxx` to refresh. The official MongoDB **C++** driver (`mongocxx`), built on libmongoc — its Catch2 `test_driver` suite (CRUD / cursor / aggregate / GridFS / commands) run unmodified against an embedded SecantusDB daemon.
 
@@ -8,24 +8,18 @@ Run `uv run python -m invoke validate-cxx` to refresh. The official MongoDB **C+
 
 | Passed | Failed | Skipped | Total | Pass rate |
 |---:|---:|---:|---:|---:|
-| 880 | 9 | 9 | 898 | 99.0% |
+| 885 | 3 | 9 | 897 | 99.7% |
 
 (Catch2 expands each `SECTION` into its own JUnit `<testcase>`, so the total exceeds the number of `TEST_CASE`s.)
 
-## Failures (9)
+## Failures (3)
 
 First 30 failed tests for triage:
 
 ```
 Spec Prose Tests/1. ChangeStream must continuously track the last seen resumeToken
-Give an invalid pipeline/Error on .begin() even if no events
-Give an invalid pipeline/After error, begin == end repeatedly
 integration tests for client metadata handshake feature/with client
 integration tests for client metadata handshake feature/with pool
-CRUD functionality/out fails when not last/aggregation
-create_index tests/fails
-create_one/fails for same keys and options
-create_one/fails for same name
 ```
 
 ## How this is generated
