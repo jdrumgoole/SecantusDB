@@ -24,6 +24,17 @@ use crate::{
 /// `topologyVersion.counter` and `connectionId` MUST be int64 on the wire — the
 /// Go driver rejects the handshake otherwise (see `commands.py::_hello`).
 pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // Capture the driver `client` metadata from the handshake so `currentOp` can
+    // surface it as `clientMetadata`. Only the first hello carries it; later
+    // helloes (monitoring) omit it, so don't clobber a stored value with None.
+    if let Some(client) = doc.get_document("client").ok().cloned() {
+        if let Some(conn_auth) = ctx.conn_auth.as_ref() {
+            if let Ok(mut guard) = conn_auth.lock() {
+                guard.client_metadata = Some(client);
+            }
+        }
+    }
+
     let now = DateTime::now();
     let mut response = doc! {
         "isWritablePrimary": true,

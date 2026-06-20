@@ -64,6 +64,28 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         _ => Vec::new(),
     };
 
+    // `$out` / `$merge` are incompatible with readConcern level "linearizable"
+    // (the only level mongod rejects here — local / available / majority all
+    // run an output-stage aggregate fine). InvalidOptions (72).
+    if let Some(level) = doc
+        .get("readConcern")
+        .and_then(Bson::as_document)
+        .and_then(|rc| rc.get_str("level").ok())
+    {
+        let has_output_stage = pipeline
+            .iter()
+            .any(|s| matches!(stage_name(s), "$out" | "$merge"));
+        if level == "linearizable" && has_output_stage {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                "Aggregation stage $out/$merge cannot run with a readConcern \
+                 level of 'linearizable'",
+            )
+            .into_reply());
+        }
+    }
+
     // $changeStream gate (must come before storage access). On a standalone
     // (no replica-set name) mongod rejects with IllegalOperation (40573).
     if first_stage_has(&pipeline, "$changeStream") {

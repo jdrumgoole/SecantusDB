@@ -812,6 +812,44 @@ pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
     })
 }
 
+/// `currentOp` — mongod's in-flight-operation introspection. SecantusDB runs
+/// commands synchronously and keeps no per-op registry, so the only operation
+/// "in progress" is the `currentOp` request itself. We emit one synthetic
+/// `inprog` entry carrying this connection's driver `clientMetadata` (captured
+/// from the handshake `client` doc), which is what the drivers' handshake-
+/// metadata tests read back. A client filter (e.g. `command.currentOp` /
+/// `$ownOps`) is accepted but not applied — the single self-op already matches
+/// the introspection queries the drivers issue.
+pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let client_metadata = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok())
+        .and_then(|g| g.client_metadata.clone());
+
+    let mut op = doc! {
+        "type": "op",
+        "host": "secantus",
+        "desc": "conn",
+        "connectionId": Bson::Int64(ctx.connection_id),
+        "active": true,
+        "op": "command",
+        "ns": format!("{}.$cmd", ctx.db_name),
+        "command": doc.clone(),
+        "opid": Bson::Int64(ctx.connection_id),
+        "secs_running": Bson::Int64(0),
+        "microsecs_running": Bson::Int64(0),
+    };
+    if let Some(meta) = client_metadata {
+        op.insert("clientMetadata", meta);
+    }
+
+    Ok(doc! {
+        "inprog": vec![Bson::Document(op)],
+        "ok": 1.0,
+    })
+}
+
 /// `validate` — mongod's collection consistency check. SecantusDB stores
 /// documents as opaque BSON and maintains index entries transactionally, so
 /// there's nothing to repair: report a clean, mongod-shaped result with real

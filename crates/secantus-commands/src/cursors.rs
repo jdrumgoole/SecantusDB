@@ -67,6 +67,12 @@ pub trait CursorProducer: Send {
     }
 }
 
+/// The result of draining a tailable change-stream batch:
+/// `(batch, position, closed, fatal_error)`. `position` is the producer's oplog
+/// seq (for the resume token); `closed` is set once the cursor is exhausted /
+/// invalidated; `fatal_error` carries a getMore-time projection error (code 280).
+type TailableBatch = (Vec<Vec<u8>>, i64, bool, Option<CommandError>);
+
 /// Options for a tailable (change-stream) cursor registration.
 #[derive(Default)]
 pub struct TailableOptions {
@@ -316,7 +322,7 @@ impl CursorRegistry {
         &self,
         cursor_id: i64,
         batch_size: i64,
-    ) -> Result<(Vec<Vec<u8>>, i64, bool, Option<CommandError>), CursorError> {
+    ) -> Result<TailableBatch, CursorError> {
         let mut inner = self.inner.lock().unwrap();
         self.prune_locked(&mut inner);
         let now = (self.clock)();
