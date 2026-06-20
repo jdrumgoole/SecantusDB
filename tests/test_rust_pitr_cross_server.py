@@ -117,9 +117,7 @@ def test_rust_backup_archive_requires_output_path(tmp_path: Path) -> None:
     """``backupArchive`` without ``outputPath`` is a clean TypeMismatch error."""
     srv = _server.RustServer(str(tmp_path / "data"), 0)
     try:
-        reply = _rust_client(srv)["admin"].command(
-            {"secantusAdmin.backupArchive": 1}, check=False
-        )
+        reply = _rust_client(srv)["admin"].command({"secantusAdmin.backupArchive": 1}, check=False)
         assert reply["ok"] == 0.0
         assert reply["code"] == 14
     finally:
@@ -135,9 +133,7 @@ def test_rust_create_options_survive_restore(tmp_path: Path) -> None:
     srv = _server.RustServer(str(data), 0)
     try:
         db = _rust_client(srv)["app"]
-        db.create_collection(
-            "events", capped=True, size=8192, max=100, validator={"v": {"$gt": 0}}
-        )
+        db.create_collection("events", capped=True, size=8192, max=100, validator={"v": {"$gt": 0}})
         db["events"].insert_one({"_id": 1, "v": 5})
         reply = _rust_client(srv)["admin"].command(
             {"secantusAdmin.backupArchive": 1, "outputPath": str(archive)}

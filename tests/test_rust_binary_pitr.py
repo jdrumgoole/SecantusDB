@@ -55,7 +55,9 @@ def _docs(path: pathlib.Path, db: str, coll: str) -> list[dict[str, Any]]:
         s.close()
 
 
-def _restore(source: pathlib.Path, target: pathlib.Path, *extra: str) -> subprocess.CompletedProcess:
+def _restore(
+    source: pathlib.Path, target: pathlib.Path, *extra: str
+) -> subprocess.CompletedProcess:
     assert _BIN is not None
     return subprocess.run(
         [str(_BIN), "restore", "--source", str(source), "--target-dir", str(target), *extra],
@@ -136,7 +138,9 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
         m = _BANNER.search(proc.stdout.readline())
         assert m, "no listening banner"
         host, port = m.group(1), int(m.group(2))
-        client = pymongo.MongoClient(host, port, directConnection=True, serverSelectionTimeoutMS=5000)
+        client = pymongo.MongoClient(
+            host, port, directConnection=True, serverSelectionTimeoutMS=5000
+        )
         client["app"]["c"].insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
         reply = client["admin"].command(
             {"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": str(archive)}

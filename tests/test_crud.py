@@ -840,7 +840,9 @@ def test_create_index_identical_recreate_is_noop(coll) -> None:
     options`) report it as "already exists" rather than a fresh create."""
     coll.insert_one({"a": 1})
     coll.create_index([("a", 1)], name="a_1")
-    reply = coll.database.command("createIndexes", coll.name, indexes=[{"key": {"a": 1}, "name": "a_1"}])
+    reply = coll.database.command(
+        "createIndexes", coll.name, indexes=[{"key": {"a": 1}, "name": "a_1"}]
+    )
     assert reply["note"] == "all indexes already exist"
     assert reply["numIndexesBefore"] == reply["numIndexesAfter"]
 
