@@ -3197,6 +3197,7 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         CreateIndexUnsupported,
         GeoExtractError,
         IndexConflict,
+        IndexKeySpecsConflict,
         IndexOptionsConflict,
     )
 
@@ -3359,6 +3360,13 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 85,
                 "codeName": "IndexOptionsConflict",
             }
+        except IndexKeySpecsConflict as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 86,
+                "codeName": "IndexKeySpecsConflict",
+            }
         except IndexConflict as exc:
             return {
                 "ok": 0.0,
@@ -3379,12 +3387,20 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         if new:
             created += 1
-    return {
+    reply = {
         "createdCollectionAutomatically": created_auto,
         "numIndexesBefore": num_before,
         "numIndexesAfter": num_before + created,
         "ok": 1.0,
     }
+    # When every requested index already existed (nothing new created), mongod
+    # adds ``note: "all indexes already exist"``. Drivers key off this to report
+    # the create as a no-op (e.g. mongocxx's ``index_view::create_one`` returns
+    # an empty optional, which its ``fails for same keys and options`` test
+    # asserts) rather than as a freshly-created index.
+    if created == 0 and indexes:
+        reply["note"] = "all indexes already exist"
+    return reply
 
 
 def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
