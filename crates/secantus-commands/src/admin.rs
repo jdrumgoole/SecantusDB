@@ -392,6 +392,17 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         if let Some(p) = options.remove("viewPipeline") {
             options.insert("pipeline", p);
         }
+        // `uuid` is an internal option (the collection identity) — it's surfaced
+        // under `info.uuid`, not as a collection option. Strip it from `options`.
+        options.remove("uuid");
+        // mongod stores/reports capped `size` / `max` as int32; we may hold the
+        // driver-sent int64. Normalise so the round-tripped options match.
+        for k in ["size", "max"] {
+            if let Some(Bson::Int64(v)) = options.get(k) {
+                let v = *v;
+                options.insert(k, Bson::Int32(v as i32));
+            }
+        }
         let coll_type = if is_view {
             "view"
         } else if options.contains_key("timeseries") {
@@ -423,7 +434,12 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         if !is_view {
             entry.insert(
                 "idIndex",
-                doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+                doc! {
+                    "v": 2,
+                    "key": { "_id": 1 },
+                    "name": "_id_",
+                    "ns": format!("{}.{}", ctx.db_name, n),
+                },
             );
         }
         entries.push(entry);
