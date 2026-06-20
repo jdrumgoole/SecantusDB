@@ -25,8 +25,17 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
+import subprocess
+import threading
+import time
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent
+
+# Both servers print "listening on <host>:<port>" once bound:
+#   rust:   "secantusdb listening on 127.0.0.1:59091"   (stdout)
+#   python: "... secantus.server: secantus listening on 127.0.0.1:59092"  (stderr)
+_LISTENING_RE = re.compile(r"listening on (\d{1,3}(?:\.\d{1,3}){3}):(\d+)")
 
 # Python-server-only daemon flags the `secantusdb` binary doesn't accept yet;
 # each takes a following value, dropped together when targeting the Rust server.
@@ -83,7 +92,7 @@ def for_server(daemon_cmd: list[str]) -> list[str]:
     except ValueError:
         raise SystemExit(
             f"for_server: expected a `python -m secantus ...` command, got {daemon_cmd!r}"
-        )
+        ) from None
     args = daemon_cmd[module_idx + 1 :]
     out = [rust_binary()]
     skip_value = False
@@ -96,3 +105,76 @@ def for_server(daemon_cmd: list[str]) -> list[str]:
             continue
         out.append(arg)
     return out
+
+
+def _force_port_zero(daemon_cmd: list[str]) -> list[str]:
+    """Return ``daemon_cmd`` with the ``--port`` value rewritten to ``0`` (added
+    if absent), so the kernel assigns a free port the daemon then reports."""
+    out = list(daemon_cmd)
+    try:
+        i = out.index("--port")
+        out[i + 1] = "0"
+    except (ValueError, IndexError):
+        out += ["--port", "0"]
+    return out
+
+
+def spawn_daemon(
+    daemon_cmd: list[str],
+    *,
+    label: str = "gauge",
+    timeout: float = 30.0,
+) -> tuple[subprocess.Popen, str, int]:
+    """Spawn a SecantusDB daemon on a kernel-assigned port and return
+    ``(process, host, port)`` once it has bound.
+
+    This is the race-free replacement for "pick an ephemeral port, then spawn a
+    daemon on it": picking and binding are two steps with a window in between, so
+    when several gauges start at once two can grab the same just-freed port and a
+    daemon ends up talking to the wrong server (or dies on ``EADDRINUSE``). Here
+    the daemon binds ``--port 0`` itself and prints ``listening on <host>:<port>``;
+    we read that line back, so there is no window and gauges parallelise safely.
+
+    ``daemon_cmd`` is the usual ``python -m secantus ...`` form (it is translated
+    for the Rust server via [`for_server`] and forced to ``--port 0``). stdout and
+    stderr are merged and drained on a background thread so the daemon never
+    blocks on a full pipe.
+    """
+    cmd = for_server(_force_port_zero(daemon_cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    host: str | None = None
+    port: int | None = None
+    deadline = time.monotonic() + timeout
+    assert proc.stdout is not None
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            if proc.poll() is not None:
+                raise RuntimeError(f"{label}: daemon exited before binding a port")
+            continue
+        m = _LISTENING_RE.search(line)
+        if m:
+            host, port = m.group(1), int(m.group(2))
+            break
+    if port is None:
+        proc.terminate()
+        raise RuntimeError(f"{label}: daemon did not report a listening port within {timeout}s")
+
+    # Drain the rest of the merged output so the daemon never blocks on a full
+    # pipe (we don't need it after the port line).
+    def _drain() -> None:
+        try:
+            for _ in proc.stdout:  # type: ignore[union-attr]
+                pass
+        except (ValueError, OSError):
+            pass
+
+    threading.Thread(target=_drain, daemon=True).start()
+    return proc, host, port

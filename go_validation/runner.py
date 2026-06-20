@@ -116,7 +116,6 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-go-gauge-")
     print(
         f"go_validation: storage tempdir {storage_dir} (will be cleaned up)",
@@ -129,7 +128,7 @@ def main() -> int:
         "--host",
         host,
         "--port",
-        str(port),
+        "0",
         "--storage-path",
         storage_dir,
         "--log-level",
@@ -142,15 +141,15 @@ def main() -> int:
         "--noop-heartbeat-seconds",
         "10",
     ]
-    # Target the Python or the Rust server per SECANTUS_GAUGE_SERVER.
-    daemon_cmd = gauge_common.for_server(daemon_cmd)
+    # Spawn on a kernel-assigned port and read it back (race-free; see
+    # gauge_common.spawn_daemon). Targets the Python or Rust server per
+    # SECANTUS_GAUGE_SERVER.
+    daemon, host, port = gauge_common.spawn_daemon(daemon_cmd, label="go_validation")
     print(
-        f"go_validation: starting {gauge_common.gauge_server()} daemon on {host}:{port}",
+        f"go_validation: started {gauge_common.gauge_server()} daemon on {host}:{port}",
         file=sys.stderr,
     )
-    daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "go_validation")
 
         env = os.environ.copy()

@@ -1015,23 +1015,22 @@ def validate_dotnet(c: Context, server: str = "python") -> None:
 
 
 @task(name="validate-all")
-def validate_all(c: Context, server: str = "python", jobs: int = 1) -> None:
+def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
     """Run all eleven driver gauges against the Python (default) or Rust server.
 
     Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
     fans out ``validate / validate-go / validate-node / validate-java /
     validate-ruby / validate-rust / validate-php-lib / validate-php-ext /
     validate-c / validate-cxx / validate-dotnet`` over a thread pool. Each gauge
-    spawns its own
-    SecantusDB daemon on a kernel-assigned ephemeral port + tempdir, so they
-    don't collide — except ``validate-cxx``, which must bind 27017 (mongocxx's
-    hard-wired default), so keep it serial (the default ``--jobs 1``) or ensure
-    nothing else uses 27017.
+    spawns its own SecantusDB daemon and reads back the kernel-assigned port the
+    daemon bound (``gauge_common.spawn_daemon``), so concurrent gauges never
+    collide on a port. ``validate-cxx`` is the one exception — mongocxx's tests
+    hard-wire 27017 — but since every other gauge now binds an ephemeral high
+    port, nothing contends with cxx's 27017 either.
 
     ``--server rust`` runs every gauge against the standalone ``secantusdb``
     binary (reports get the ``-rust-server`` suffix). ``--jobs N`` sets the
-    parallelism (default 1 — serial; see the note below on why). On a machine
-    with cores to spare, ``--jobs 8`` runs them concurrently.
+    parallelism (default 4); ``--jobs 1`` forces serial.
 
     Exit code is non-zero if any gauge failed.
     """
@@ -1066,23 +1065,16 @@ def validate_all(c: Context, server: str = "python", jobs: int = 1) -> None:
         )
         return name, result.returncode
 
-    # Run gauges serially. Earlier attempts at 5-way and 3-way
-    # parallelism produced flaky failures specifically driven by
-    # OS-scheduler timing: Python's GIL pins the daemon's accept loop
-    # to one bytecode runner per process, so when N daemons + N
-    # driver test processes contend for CPU, individual ``hello``
-    # handshakes occasionally exceed the driver's
-    # ``serverSelectionTimeoutMS`` (30 s default). The Go gauge is
-    # the most sensitive (the gauge's
-    # ``TestIndexView/{drop_one,drop_all,create_many/*}`` subtests
-    # observe ``Type: Unknown`` topology and fail with
-    # ``context deadline exceeded``); the Java gauge's
-    # ``ContextProviderTest#contextShouldBeAvailableInCommandEvents``
-    # also flaked. Both pass cleanly when each gauge has the daemon's
-    # CPU to itself. Wall-clock cost: ~12 min serial vs ~7 min
-    # parallel — small enough to be worth the determinism. The default is
-    # therefore serial (``--jobs 1``); bump ``--jobs`` on a box with cores
-    # to spare, where the contention that drove those flakes doesn't bite.
+    # Parallel by default. Earlier parallel attempts flaked, but the cause
+    # was an ephemeral-port TOCTOU race in the runners — each picked a free
+    # port, closed the socket, then spawned a daemon on it, and two gauges
+    # starting at once could grab the same just-freed port (one daemon then
+    # talked to the wrong server, or died on EADDRINUSE). Ruby was worst hit
+    # (its two-phase auth restart doubled the window). Fixed by binding
+    # ``--port 0`` and reading the daemon's reported port back
+    # (``gauge_common.spawn_daemon``): no window, so gauges parallelise
+    # cleanly. Verified with a 6-way cold run (ruby 282/12 in 14s, vs the old
+    # 81/213 in 117s under contention).
     max_workers = max(1, jobs)
     mode = "serially" if max_workers == 1 else f"with {max_workers}-way parallelism"
     print(
