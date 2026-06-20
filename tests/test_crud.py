@@ -807,6 +807,44 @@ def test_create_index_with_explicit_name_and_compound(coll) -> None:
     assert dict(found["key"]) == {"a": 1, "b": -1}
 
 
+def test_create_index_same_name_different_key_conflicts(coll) -> None:
+    """Re-creating an index name with a different key spec is rejected with
+    IndexKeySpecsConflict (86), matching mongod. mongo-cxx-driver's
+    `create_index tests/fails` and `index_view/fails for same name` pin this."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"a": 1})
+    coll.create_index([("a", 1)], name="myIndex")
+    with pytest.raises(OperationFailure) as exc:
+        coll.create_index([("a", -1)], name="myIndex")
+    assert exc.value.code == 86
+    assert exc.value.details.get("codeName") == "IndexKeySpecsConflict"
+
+
+def test_create_index_same_name_different_options_conflicts(coll) -> None:
+    """Same name + same key but different options → IndexOptionsConflict (85)."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"b": 1})
+    coll.create_index([("b", 1)], name="b_idx")
+    with pytest.raises(OperationFailure) as exc:
+        coll.create_index([("b", 1)], name="b_idx", unique=True)
+    assert exc.value.code == 85
+    assert exc.value.details.get("codeName") == "IndexOptionsConflict"
+
+
+def test_create_index_identical_recreate_is_noop(coll) -> None:
+    """Re-creating an identical index (same key, name, options) is a no-op:
+    the createIndexes reply carries `note: "all indexes already exist"` and the
+    index count is unchanged — drivers (mongocxx's `fails for same keys and
+    options`) report it as "already exists" rather than a fresh create."""
+    coll.insert_one({"a": 1})
+    coll.create_index([("a", 1)], name="a_1")
+    reply = coll.database.command("createIndexes", coll.name, indexes=[{"key": {"a": 1}, "name": "a_1"}])
+    assert reply["note"] == "all indexes already exist"
+    assert reply["numIndexesBefore"] == reply["numIndexesAfter"]
+
+
 def test_unique_index_blocks_duplicate_insert_via_pymongo(coll) -> None:
     from pymongo.errors import DuplicateKeyError as PyDup
 

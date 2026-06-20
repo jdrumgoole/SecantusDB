@@ -19,6 +19,25 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### createIndexes now rejects conflicting index definitions
+
+`createIndexes` previously accepted a re-creation that collided with an existing
+index, silently treating it as a no-op. It now matches `mongod`: re-using an
+index name for a **different key spec** is rejected with `IndexKeySpecsConflict`
+(code 86), re-using a name with the **same key but different options** is
+rejected with `IndexOptionsConflict` (code 85), and an **identical** re-create
+returns `note: "all indexes already exist"` so drivers report it as a no-op
+rather than a fresh build. This was surfaced by the mongo-cxx-driver gauge
+(`create_index tests/fails`, `index_view/fails for same name`, `fails for same
+keys and options`), and applies to every driver's `createIndex` / index-view
+API.
+
+#### Fixed
+- `createIndexes`: same-name-different-key now errors `IndexKeySpecsConflict`
+  (86); identical re-creates now carry `note: "all indexes already exist"`
+  (`storage.create_index` / `commands._create_indexes`). Same-name-different-
+  options continues to error `IndexOptionsConflict` (85).
+
 ### An eleventh conformance gauge: the MongoDB C# / .NET driver
 
 SecantusDB now also measures itself against the official MongoDB **C# / .NET**

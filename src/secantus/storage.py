@@ -694,6 +694,14 @@ class IndexOptionsConflict(Exception):
     ``Collection#create_indexes`` specs) assert on the rejection."""
 
 
+class IndexKeySpecsConflict(Exception):
+    """``create_index`` was called with a name that already exists in the
+    collection but for a **different key spec** (e.g. ``{a: 1}`` vs
+    ``{a: -1}``). Real mongod rejects with ``IndexKeySpecsConflict`` (code
+    86); mongo-cxx-driver's ``create_index tests/fails`` and
+    ``index_view/fails for same name`` pin the rejection."""
+
+
 class GeoExtractError(Exception):
     """Doc's geo field can't be indexed — bad shape or out-of-bounds coords.
 
@@ -4439,7 +4447,20 @@ class Storage:
                 # create_indexes when index creation fails`` test pins.
                 existing_raw = bytes(c.get_value())
                 existing = bson.decode(existing_raw) if existing_raw else {}
+                existing_key = dict(existing.get("key") or {})
                 existing_opts = dict(existing.get("options") or {})
+                # Same name, different key spec → IndexKeySpecsConflict (86).
+                # Key comparison is order-sensitive: mongod treats
+                # ``{a: 1, b: 1}`` and ``{b: 1, a: 1}`` as distinct indexes, so
+                # plain dict ``==`` (order-insensitive) would wrongly call them
+                # equal — compare the ordered item lists.
+                if list(existing_key.items()) != list(dict(key_spec).items()):
+                    raise IndexKeySpecsConflict(
+                        "An existing index has the same name as the requested "
+                        "index. Requested index: "
+                        f"{{ key: {dict(key_spec)!r}, name: {name!r} }}, "
+                        f"existing index: {{ key: {existing_key!r}, name: {name!r} }}"
+                    )
                 _CONFLICTING_OPTS = (
                     "unique",
                     "sparse",

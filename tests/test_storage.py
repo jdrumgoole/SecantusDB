@@ -130,6 +130,21 @@ def test_bool_id_not_treated_as_numeric(storage: Storage) -> None:
     assert inserted == 2
 
 
+def test_create_index_name_conflicts(storage: Storage) -> None:
+    from secantus.storage import IndexKeySpecsConflict, IndexOptionsConflict
+
+    storage.create_collection("db", "c")
+    assert storage.create_index("db", "c", "idx", {"a": 1}, {}) is True
+    # Same name, different key spec -> IndexKeySpecsConflict.
+    with pytest.raises(IndexKeySpecsConflict):
+        storage.create_index("db", "c", "idx", {"a": -1}, {})
+    # Same name, same key, different options -> IndexOptionsConflict.
+    with pytest.raises(IndexOptionsConflict):
+        storage.create_index("db", "c", "idx", {"a": 1}, {"unique": True})
+    # Identical re-create -> no-op (False), no exception.
+    assert storage.create_index("db", "c", "idx", {"a": 1}, {}) is False
+
+
 def test_rename_collection_moves_docs_and_indexes(storage: Storage) -> None:
     storage.insert("db", "src", [{"_id": 1, "x": 1}, {"_id": 2, "x": 2}])
     storage.create_index("db", "src", "x_1", {"x": 1}, {})
