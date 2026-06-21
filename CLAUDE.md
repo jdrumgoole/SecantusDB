@@ -20,6 +20,15 @@ The audience is developers who want fast, ephemeral, in-process MongoDB behaviou
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
 - **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.
 
+## Never ignore or discount an error — this is a database
+
+SecantusDB stores data. In a database, an error is a **correctness and durability signal**, never noise to step over. Every error, panic, warning, or failed assertion — especially from the storage engine (WiredTiger) — is treated as a real bug until proven otherwise by a root-cause diagnosis.
+
+- **Never dismiss, deselect, suppress, or "retry past" an error to make output green.** A `WT_PANIC`, a checkpoint failure, a `WT_ROLLBACK`, a "the system must restart", a corrupted-read, a swallowed exception in a write path — each means data may be wrong or lost. Reproduce it (a focused harness like `invoke rust-stress`), find the actual cause, and fix that cause.
+- **"Flaky", "environmental", "only under load", "only in parallel" are descriptions of a bug, not excuses to ignore one.** A storage engine that panics under stress is broken even if a single-threaded test passes — stress is exactly when databases must hold. Diagnose the race / resource / lifecycle issue and fix it.
+- **A test failing is the system telling you something true.** Before reaching for a skip/xfail/deselect, prove the failure is a test artifact unrelated to data integrity — and even then prefer fixing the test over hiding it. Deselecting a storage test to get a clean run is how silent data loss ships.
+- **Surface errors faithfully.** Don't downgrade a storage error to a generic message, don't `let _ =` away a `Result` on a write/commit/close path, and don't report "done" while an error was logged. If a write, checkpoint, or connection close errored, that is the headline, not a footnote.
+
 ## Architecture
 
 Layers, roughly outermost-in:
