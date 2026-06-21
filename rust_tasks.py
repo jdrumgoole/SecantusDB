@@ -34,12 +34,12 @@ _RUST_ADAPTER_DIR = "crates/secantus-storage-adapter"
 _RUST_STORAGE_PY_DIR = "crates/secantus-storage-py"
 _RUST_BINARY_DIR = "crates/secantusdb"
 
-# This PITR cross-server test passes in CI but fails locally because a feature
-# worktree's Rust crates link the /tmp WiredTiger build while the project wheel
-# links its own — the two stores aren't byte-compatible for this restore path.
-# It's deselected from the gate by default so ``invoke rust-gate`` runs clean
-# locally; pass ``--deselect ""`` to re-include it.
-_LOCAL_DESELECT = "tests/test_rust_pitr_cross_server.py::test_python_restores_rust_data_to_a_mark"
+# (No default deselect. The PITR cross-server tests once appeared to be a
+# local-only failure and were deselected; the real cause was a connection-drain
+# bug in the Rust server's stop() — its final WiredTiger checkpoint raced the
+# data-dir reopen under load. Fixed in 0.5.3-beta.48, so the full suite is green
+# under -n auto. Per CLAUDE.md "Never ignore or discount an error", we do not
+# carry a standing deselect — pass --deselect explicitly if you ever need one.)
 
 
 def _rust_env() -> dict[str, str]:
@@ -235,6 +235,30 @@ def rust_server_build(c: Context) -> None:
     )
 
 
+@task(
+    name="rust-stress",
+    help={
+        "workers": "Concurrent worker threads (default 16).",
+        "iters": "Write-stop-restore cycles per worker (default 5).",
+    },
+)
+def rust_stress(c: Context, workers: int = 16, iters: int = 5) -> None:
+    """Hammer many concurrent embedded WiredTiger instances and assert no panic.
+
+    Runs ``bench/wt_stress.py``: each worker spins up an embedded Rust server,
+    writes CRUD history, stops it, and rebuilds the DB with the Python restore
+    tool — two WT connections per cycle, ``workers`` in parallel. Exercises the
+    cross-server load that made WiredTiger's eviction thread panic under
+    ``pytest -n auto``. Needs the ``_secantus_server`` extension (run
+    ``rust-server-build`` first). Exits non-zero if any cycle fails.
+    """
+    c.run(
+        f"uv run --no-sync python -m bench.wt_stress --workers {int(workers)} --iters {int(iters)}",
+        pty=True,
+        env=_rust_env(),
+    )
+
+
 @task(name="rust-bump")
 def rust_bump(c: Context, to: str) -> None:
     """Bump every Rust crate (Cargo.toml + Cargo.lock) to ``--to`` in lockstep.
@@ -272,23 +296,18 @@ def rust_bump(c: Context, to: str) -> None:
     name="rust-gate",
     help={
         "pytest": "Also run the Python test suite (default True; --no-pytest to skip).",
-        "deselect": (
-            "Comma-separated pytest node ids to deselect from the Python suite. "
-            f"Defaults to the known local-only failure ({_LOCAL_DESELECT}); pass "
-            '--deselect "" to re-include everything.'
-        ),
+        "deselect": "Comma-separated pytest node ids to deselect from the Python suite (default none).",
     },
 )
-def rust_gate(c: Context, pytest: bool = True, deselect: str = _LOCAL_DESELECT) -> None:
+def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:
     """Full pre-commit gate for Rust-server changes, in one task.
 
     Runs, in order: the clean-workspace fmt/clippy/test (``rust-test``); each
     WiredTiger-linked crate's fmt/clippy/test that the clean workspace can't
     cover (``rust-wt-test`` / ``rust-storage-test`` / ``rust-adapter-test``); the
     leaf-engine parity suites (``rust-parity``); and — unless ``--no-pytest`` —
-    the Python suite (with the known local-only failure deselected by default).
-    This is the sequence that must be green before committing Rust work;
-    previously assembled by hand every time.
+    the full Python suite. This is the sequence that must be green before
+    committing Rust work; previously assembled by hand every time.
     """
     rust_test(c)
     rust_wt_test(c)
@@ -316,7 +335,7 @@ def rust_ship(
     message: str,
     push: bool = True,
     pytest: bool = True,
-    deselect: str = _LOCAL_DESELECT,
+    deselect: str = "",
 ) -> None:
     """One-shot: run the full gate, then commit tracked changes and push HEAD:main.
 

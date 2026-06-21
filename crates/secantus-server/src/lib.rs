@@ -23,7 +23,7 @@ pub mod args;
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -161,6 +161,13 @@ struct Shared {
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
     stop: AtomicBool,
+    /// Live per-connection threads. `stop` waits for this to reach zero before
+    /// returning, so every connection thread has released its `Arc<Storage>` and
+    /// the WiredTiger connection can close cleanly (its final checkpoint must not
+    /// race a data-dir removal / reopen — see `ConnGuard`). Held behind its own
+    /// `Arc` (not via `Shared`) so a connection thread can drop its `Shared`
+    /// ref — and thus the storage ref — *before* it decrements the count.
+    active: Arc<AtomicUsize>,
     /// The built rustls server config when TLS is on (shared across connections).
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Global cap on concurrent in-flight message-body allocations.
@@ -193,13 +200,51 @@ impl RunningServer {
         format!("mongodb://{}", self.shared.address)
     }
 
-    /// Signal shutdown and join the accept loop. Connection threads notice the
-    /// flag within `READ_POLL` and exit on their own.
+    /// Signal shutdown, join the accept loop, and **wait for the connection
+    /// threads to drain** before returning. Connection threads are detached, but
+    /// each holds an `Arc<Storage>`; if `stop` returned while one was still alive,
+    /// the WiredTiger connection wouldn't close until that thread later exited —
+    /// and its final close-checkpoint would then race the caller removing or
+    /// reopening the data dir (observed as `WT_PANIC: ... the system must
+    /// restart` when `WiredTigerHS.wt` vanished mid-checkpoint). Draining makes
+    /// teardown synchronous and the data dir quiescent on return. Mirrors the
+    /// Python server's "drain active connections before storage.close()".
     pub fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.accept.take() {
             let _ = handle.join();
         }
+        // Connection threads notice the flag within READ_POLL (plain reads) or
+        // wake from a tailable getMore's ~1s oplog wait, then drop their storage
+        // ref. Poll until none remain; bounded so a wedged thread can't hang stop.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.shared.active.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(READ_POLL);
+        }
+    }
+}
+
+/// Increments the live-connection count for a connection thread's lifetime and
+/// decrements on drop — so an early `?` return or a panic still releases the
+/// slot. Holds only the counter `Arc` (never `Shared`), so it must be created
+/// *after* the thread already owns its `Shared`/storage ref and dropped *after*
+/// that ref is released: the decrement then signals "this thread holds no
+/// storage", which is exactly the invariant `stop`'s drain relies on.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        ConnGuard(active)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -272,6 +317,7 @@ pub fn bind(
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
         stop: AtomicBool::new(false),
+        active: Arc::new(AtomicUsize::new(0)),
         tls,
         alloc_budget: AllocBudget::new(MAX_INFLIGHT_BYTES),
     });
@@ -290,10 +336,19 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         match listener.accept() {
             Ok((stream, _peer)) => {
                 let conn_shared = shared.clone();
+                // Counter Arc is independent of `Shared`, so the guard can outlive
+                // `conn_shared`'s drop (which releases this thread's storage ref).
+                let active = shared.active.clone();
                 // Detached: the thread exits on EOF or when the stop flag is set
-                // (its blocking reads use READ_POLL timeouts).
+                // (its blocking reads use READ_POLL timeouts). `stop` waits on the
+                // count, not a JoinHandle.
                 thread::spawn(move || {
+                    let guard = ConnGuard::new(active);
                     let _ = handle_connection(stream, conn_shared);
+                    // `conn_shared` (and every per-request storage clone) is now
+                    // dropped; only then decrement, so a zero count guarantees no
+                    // connection thread still references storage.
+                    drop(guard);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
