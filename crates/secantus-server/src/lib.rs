@@ -308,6 +308,12 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
 /// TLS handshake (extracting the client cert DN) or plaintext, before driving
 /// the request loop in [`serve`].
 fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+    // The listener is non-blocking and (on macOS/BSD) the accepted socket
+    // inherits O_NONBLOCK. Put it back to blocking so a large `write_all` (a
+    // reply bigger than the kernel send buffer, ~1 MB) blocks until drained
+    // instead of failing with WouldBlock and dropping the connection. Reads
+    // still get a timeout via `set_read_timeout` (blocking-with-timeout).
+    tcp.set_nonblocking(false)?;
     tcp.set_read_timeout(Some(READ_POLL))?;
     let conn_id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
     // Per-connection auth state, shared across every request on this socket so a
