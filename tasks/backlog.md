@@ -430,8 +430,13 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   Pipeline-update replace-vs-update misclassification FIXED, and
   timeseries `_id` uniqueness FIXED (suffixed doc keys; the one surviving
   E11000 is gone) — the 2026-06-12 E11000 triage is fully closed. The
-  remaining ShowExpandedEvents / disambiguatedPaths / clusteredIndex
-  introspection failures are separate unimplemented features. Timeseries
+  remaining ShowExpandedEvents / disambiguatedPaths introspection failures
+  are separate unimplemented features. (`clusteredIndex` introspection is
+  DONE in 0.5.3-beta.49 — `create` validates+stores it, `listCollections`
+  surfaces `options.clusteredIndex` and omits `idIndex`, `listIndexes`
+  reports the single `clustered: true` entry; mirrors commands.py. Closes the
+  two `TestCollectionManagementClusteredIndexes` pymongo gauge tests.)
+  Timeseries
   update restriction (mongod 7.0: an update may modify only the metaField)
   is now ENFORCED in the Rust server's `update` handler — non-meta /
   replacement / pipeline updates on a timeseries collection are rejected.

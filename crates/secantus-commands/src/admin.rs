@@ -91,6 +91,41 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .unwrap_or_default();
         opts.insert("viewPipeline", Bson::Array(pipeline));
     }
+    // `clusteredIndex` clusters the collection on `_id` — which is already
+    // SecantusDB's doc-table layout (keyed by `_id`), so this is metadata-only.
+    // mongod allows it only on `{_id: 1}` with `unique: true`; normalise the
+    // stored option (default name `_id_`, add `v: 2`) so listCollections /
+    // listIndexes echo mongod's shape. Built before create so an invalid spec
+    // rejects without leaving a half-created collection. Mirrors commands.py.
+    if let Some(ci) = doc.get("clusteredIndex").and_then(Bson::as_document) {
+        let key_ok = ci.get_document("key").is_ok_and(|k| {
+            k.len() == 1
+                && k.get("_id").is_some_and(|v| {
+                    matches!(v, Bson::Int32(1) | Bson::Int64(1)) || v.as_f64() == Some(1.0)
+                })
+        });
+        if !key_ok {
+            return Ok(CommandError::new(
+                197,
+                "InvalidIndexSpecificationOption",
+                "The clusteredIndex option is only supported for key: {_id: 1}",
+            )
+            .into_reply());
+        }
+        if ci.get_bool("unique") != Ok(true) {
+            return Ok(CommandError::new(
+                5979700,
+                "Location5979700",
+                "The clusteredIndex option requires unique: true to be specified",
+            )
+            .into_reply());
+        }
+        let name = ci.get_str("name").unwrap_or("_id_").to_string();
+        opts.insert(
+            "clusteredIndex",
+            doc! { "v": 2i32, "key": { "_id": 1i32 }, "name": name, "unique": true },
+        );
+    }
     let storage = ctx.storage()?;
     let created = storage
         .create_collection_with_options(&ctx.db_name, &coll, &opts)
@@ -425,13 +460,17 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
                 );
             }
         }
+        // Captured before `options` is moved into the entry below.
+        let is_clustered = options.contains_key("clusteredIndex");
         let mut entry = doc! {
             "name": n,
             "type": coll_type,
             "options": Bson::Document(options),
             "info": info,
         };
-        if !is_view {
+        // A clustered collection has no separate `_id_` index (the clustering
+        // key IS the index), so mongod omits `idIndex` for it — same as views.
+        if !is_view && !is_clustered {
             entry.insert(
                 "idIndex",
                 doc! {
@@ -524,9 +563,30 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
-    let indexes = storage
+    let mut indexes = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // A clustered collection's clustering key IS its index: mongod reports a
+    // single entry carrying `clustered: true` (with the user's name) in place of
+    // the synthesised `_id_`. Mirrors commands.py.
+    if let Some(ci) = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .ok()
+        .and_then(|o| o.get_document("clusteredIndex").ok().cloned())
+    {
+        let clustered = doc! {
+            "v": ci.get_i32("v").unwrap_or(2),
+            "key": { "_id": 1i32 },
+            "name": ci.get_str("name").unwrap_or("_id_").to_string(),
+            "unique": true,
+            "clustered": true,
+        };
+        let mut rest: Vec<Document> = indexes
+            .into_iter()
+            .filter(|ix| ix.get_str("name") != Ok("_id_"))
+            .collect();
+        indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
+    }
     let ns = format!("{}.$cmd.listIndexes.{}", ctx.db_name, coll);
     let (first, cid) = split_into_cursor(
         encode_docs(indexes)?,
@@ -1320,6 +1380,65 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(stored.contains_key("validator"));
+    }
+
+    #[test]
+    fn clustered_index_create_list_and_validation() {
+        let s = FakeStorage::arc();
+        // Valid: stored normalised, surfaced in listCollections (no idIndex),
+        // and listIndexes reports a single clustered entry under the user's name.
+        let mut c = ctx(s.clone());
+        let reply = dispatch(
+            &doc! {"create": "c",
+            "clusteredIndex": {"key": {"_id": 1}, "unique": true, "name": "ci"}},
+            &mut c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+
+        let mut c = ctx(s.clone());
+        let lc = dispatch(&doc! {"listCollections": 1}, &mut c);
+        let spec = lc
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .iter()
+            .filter_map(Bson::as_document)
+            .find(|e| e.get_str("name") == Ok("c"))
+            .unwrap();
+        assert!(spec
+            .get_document("options")
+            .unwrap()
+            .contains_key("clusteredIndex"));
+        assert!(!spec.contains_key("idIndex"));
+
+        let mut c = ctx(s.clone());
+        let li = dispatch(&doc! {"listIndexes": "c"}, &mut c);
+        let idx = li
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(idx.len(), 1);
+        let first = idx[0].as_document().unwrap();
+        assert_eq!(first.get_str("name"), Ok("ci"));
+        assert_eq!(first.get_bool("clustered"), Ok(true));
+
+        // Invalid specs are rejected (and leave no collection behind).
+        let mut c = ctx(s.clone());
+        let bad_key = dispatch(
+            &doc! {"create": "b1", "clusteredIndex": {"key": {"x": 1}, "unique": true}},
+            &mut c,
+        );
+        assert_eq!(bad_key.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(bad_key.get_i32("code").unwrap(), 197);
+        let mut c = ctx(s.clone());
+        let bad_uniq = dispatch(
+            &doc! {"create": "b2", "clusteredIndex": {"key": {"_id": 1}}},
+            &mut c,
+        );
+        assert_eq!(bad_uniq.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(bad_uniq.get_i32("code").unwrap(), 5979700);
     }
 
     #[test]
