@@ -114,6 +114,26 @@ impl CursorProducer for ChangeStreamProducer {
 /// Handle an `aggregate` whose first pipeline stage is `$changeStream`.
 /// (The caller has already checked the replica-set persona / 40573 gate.)
 pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // Change streams accept only the default / "majority" read concern; mongod
+    // rejects an explicit "local" (or any other level) with InvalidOptions (72).
+    if let Some(level) = doc
+        .get("readConcern")
+        .and_then(Bson::as_document)
+        .and_then(|rc| rc.get_str("level").ok())
+    {
+        if level != "majority" {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                format!(
+                    "readConcern level '{level}' is not supported for change streams; \
+                     only 'majority' (or the default) is allowed"
+                ),
+            )
+            .into_reply());
+        }
+    }
+
     let storage = ctx
         .storage
         .as_ref()
@@ -157,6 +177,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             .unwrap_or("off")
             .to_string(),
         show_expanded_events: cs_spec.get_bool("showExpandedEvents").unwrap_or(false),
+        split_large_events: pipeline_has_split_stage(doc),
     };
 
     // Start position (events read are strictly after it):
@@ -333,6 +354,22 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
         out.push(stage.clone());
     }
     Ok(out)
+}
+
+/// Whether the pipeline contains a `$changeStreamSplitLargeEvent` stage (opts
+/// every event into a `splitEvent` envelope).
+fn pipeline_has_split_stage(doc: &Document) -> bool {
+    doc.get("pipeline")
+        .and_then(Bson::as_array)
+        .map(|stages| {
+            stages.iter().any(|s| {
+                s.as_document()
+                    .and_then(|d| d.keys().next())
+                    .map(|k| k == "$changeStreamSplitLargeEvent")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// The `$changeStream: {...}` spec document from the first pipeline stage.

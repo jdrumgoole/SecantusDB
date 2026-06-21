@@ -93,6 +93,10 @@ pub struct ChangeStreamOptions {
     pub full_document_before_change: String,
     /// `showExpandedEvents: true` surfaces DDL events (create / modify / …).
     pub show_expanded_events: bool,
+    /// A `$changeStreamSplitLargeEvent` stage was present: every event carries a
+    /// `splitEvent: {fragment, of}` envelope (we never actually split, so always
+    /// `{fragment: 1, of: 1}`).
+    pub split_large_events: bool,
 }
 
 /// One poll of the oplog tail for a change-stream cursor: the projected event

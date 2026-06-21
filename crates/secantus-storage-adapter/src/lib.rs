@@ -127,6 +127,7 @@ impl CmdStorage for StorageAdapter {
                 &opts.full_document_before_change,
                 &wt_scope,
                 opts.show_expanded_events,
+                opts.split_large_events,
             )
             .map_err(map_err)?;
             if let Some(ev) = event {
