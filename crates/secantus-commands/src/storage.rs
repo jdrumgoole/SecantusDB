@@ -108,6 +108,10 @@ pub struct ChangeStreamBatch {
     pub events: Vec<Vec<u8>>,
     pub new_position: i64,
     pub invalidated: bool,
+    /// A fatal projection error (e.g. `fullDocument: required` with
+    /// changeStreamPreAndPostImages disabled) — `(code, errmsg)`. The producer
+    /// surfaces it as a getMore-time `ok: 0` reply that ends the stream.
+    pub fatal: Option<(i32, String)>,
 }
 
 /// The storage operations the command handlers depend on. Bytes at the seam:
@@ -156,6 +160,7 @@ pub trait Storage: Send + Sync {
             events: Vec::new(),
             new_position: after_seq,
             invalidated: false,
+            fatal: None,
         })
     }
 

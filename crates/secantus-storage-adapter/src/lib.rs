@@ -112,6 +112,7 @@ impl CmdStorage for StorageAdapter {
         let mut events: Vec<Vec<u8>> = Vec::new();
         let mut new_position = after_seq;
         let mut invalidated = false;
+        let mut fatal: Option<(i32, String)> = None;
         for (seq, blob) in rows {
             // Always advance the position past a scanned entry, even when it
             // projects to nothing (noop heartbeats / other-scope writes) — that
@@ -119,7 +120,7 @@ impl CmdStorage for StorageAdapter {
             new_position = seq;
             let entry = Document::from_reader(&mut blob.as_slice())
                 .map_err(|e| StorageError::Internal(format!("oplog decode: {e}")))?;
-            let (event, invalidates) = changestreams::project(
+            let projected = changestreams::project(
                 seq,
                 &entry,
                 &self.inner,
@@ -128,8 +129,19 @@ impl CmdStorage for StorageAdapter {
                 &wt_scope,
                 opts.show_expanded_events,
                 opts.split_large_events,
-            )
-            .map_err(map_err)?;
+            );
+            // A fatal projection error (e.g. fullDocument: required with
+            // changeStreamPreAndPostImages disabled) ends the stream with an
+            // ok: 0 reply rather than tearing down the poll — surface it via the
+            // batch so the producer/getMore can report it (code 280).
+            let (event, invalidates) = match projected {
+                Ok(v) => v,
+                Err(WtError::ChangeStreamFatal(m)) => {
+                    fatal = Some((280, m));
+                    break;
+                }
+                Err(e) => return Err(map_err(e)),
+            };
             if let Some(ev) = event {
                 let mut buf = Vec::new();
                 ev.to_writer(&mut buf)
@@ -154,6 +166,7 @@ impl CmdStorage for StorageAdapter {
             events,
             new_position,
             invalidated,
+            fatal,
         })
     }
 

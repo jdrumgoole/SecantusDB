@@ -1610,6 +1610,15 @@ impl Storage {
         collection_uuid(&session, db, coll)
     }
 
+    /// Whether `changeStreamPreAndPostImages: {enabled: true}` is set on the
+    /// collection — change streams need it for `fullDocument: required` /
+    /// `whenAvailable` (post-image) and `fullDocumentBeforeChange`.
+    pub fn pre_post_images_enabled(&self, db: &str, coll: &str) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        pre_post_images_enabled(&session, db, coll)
+    }
+
     /// The pre-image document bytes stored for oplog `seq`, or `None`. Fresh
     /// session for cross-thread visibility. Mirrors `storage.read_preimage`.
     pub fn read_preimage(&self, seq: i64) -> Result<Option<Vec<u8>>> {

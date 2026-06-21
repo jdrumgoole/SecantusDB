@@ -70,6 +70,12 @@ impl CursorProducer for ChangeStreamProducer {
                 if batch.invalidated {
                     self.invalidated = true;
                 }
+                // A fatal projection error (e.g. fullDocument: required without
+                // changeStreamPreAndPostImages) ends the stream with an ok: 0
+                // reply at the next getMore.
+                if let Some((code, msg)) = batch.fatal {
+                    self.fatal_error = Some(CommandError::new(code, "ChangeStreamFatalError", msg));
+                }
                 if self.pipeline.is_empty() {
                     batch.events
                 } else {

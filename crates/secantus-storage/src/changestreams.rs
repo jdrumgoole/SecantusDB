@@ -171,6 +171,22 @@ fn attach_full_document(
     {
         let ns = oplog_entry.get_str("ns").unwrap_or("");
         let (db, coll) = split_ns(ns);
+        // `required` / `whenAvailable` read the stored POST-image (mongod 6.0
+        // semantics): the collection must have changeStreamPreAndPostImages
+        // enabled. With it disabled, `required` errors and `whenAvailable` yields
+        // null. Only the legacy `updateLookup` does a live re-read regardless.
+        if (mode == FULL_DOC_REQUIRED || mode == FULL_DOC_WHEN_AVAILABLE)
+            && !storage.pre_post_images_enabled(&db, &coll)?
+        {
+            if mode == FULL_DOC_REQUIRED {
+                return Err(StorageError::ChangeStreamFatal(format!(
+                    "the 'fullDocument: required' option requires \
+                     changeStreamPreAndPostImages to be enabled on the collection {ns}"
+                )));
+            }
+            event.insert("fullDocument", Bson::Null);
+            return Ok(());
+        }
         let doc_id = oplog_entry
             .get_document("o2")
             .ok()
