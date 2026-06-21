@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd *)",
+      "Bash(export *)",
+      "Bash(invoke test*)",
+      "Bash(invoke rust-test*)",
+      "Bash(uv run python -m pytest *)",
+      "Bash(uv run pytest *)",
+      "Bash(pytest *)",
+      "Bash(python -m pytest *)",
+      "Bash(python3 -m pytest *)",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(.venv-test/bin/python -m pytest *)",
+      "Bash(PYTHONPATH=src .venv-test/bin/python -m pytest *)",
+      "Bash(cargo test*)"
+    ]
+  }
+}
