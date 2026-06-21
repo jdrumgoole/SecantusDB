@@ -1119,14 +1119,80 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
             ));
         }
     }
-    if doc.get("apiStrict").and_then(Bson::as_bool) == Some(true) && name == "distinct" {
-        return Err(CommandError::new(
-            323,
-            "APIStrictError",
-            format!("Provided command {name} is not in API Version 1"),
-        ));
+    if doc.get("apiStrict").and_then(Bson::as_bool) == Some(true) {
+        // `distinct` is the canary command rejected under apiStrict (mirrors
+        // commands.py's narrow `_API_V1_REJECTED_BY_NAME`).
+        if name == "distinct" {
+            return Err(CommandError::new(
+                323,
+                "APIStrictError",
+                format!("Provided command {name} is not in API Version 1"),
+            ));
+        }
+        // An aggregate whose pipeline uses a stage outside API Version 1 (e.g.
+        // `$listLocalSessions`) is rejected — drivers probe with exactly that to
+        // land an APIStrictError from inside an allowed command.
+        if name == "aggregate" {
+            if let Some(Bson::Array(pipeline)) = doc.get("pipeline") {
+                for stage in pipeline {
+                    if let Some(s) = stage.as_document().and_then(|d| d.keys().next()) {
+                        if !api_v1_agg_stage(s) {
+                            return Err(CommandError::new(
+                                323,
+                                "APIStrictError",
+                                format!(
+                                    "Provided aggregation pipeline stage {s} is not in API Version 1"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Aggregation stages inside API Version 1 (`commands.py::_API_V1_AGG_STAGES`).
+/// A pipeline stage outside this set under `apiStrict: true` is an
+/// `APIStrictError`. Deliberately excludes `$listLocalSessions` / `$listSessions`
+/// / `$currentOp` — the stages driver tests probe with.
+fn api_v1_agg_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "$addFields"
+            | "$bucket"
+            | "$bucketAuto"
+            | "$changeStream"
+            | "$collStats"
+            | "$count"
+            | "$densify"
+            | "$documents"
+            | "$facet"
+            | "$fill"
+            | "$geoNear"
+            | "$graphLookup"
+            | "$group"
+            | "$indexStats"
+            | "$limit"
+            | "$lookup"
+            | "$match"
+            | "$merge"
+            | "$out"
+            | "$project"
+            | "$redact"
+            | "$replaceRoot"
+            | "$replaceWith"
+            | "$sample"
+            | "$set"
+            | "$setWindowFields"
+            | "$skip"
+            | "$sort"
+            | "$sortByCount"
+            | "$unionWith"
+            | "$unset"
+            | "$unwind"
+    )
 }
 
 /// Render a BSON value the way Python's `{!r}` does for the messages above:
@@ -1252,6 +1318,37 @@ mod tests {
         let reply = dispatch(&doc! {"ping": 1}, &mut ctx());
         assert!(reply.get("$clusterTime").is_none());
         assert!(reply.get("operationTime").is_none());
+    }
+
+    #[test]
+    fn api_strict_rejects_non_v1_aggregation_stage() {
+        // `$listLocalSessions` is outside API Version 1 → APIStrictError (323),
+        // surfaced by validate_api before the handler ever needs storage.
+        let reply = dispatch(
+            &doc! {
+                "aggregate": 1,
+                "pipeline": [{"$listLocalSessions": {}}, {"$limit": 1}],
+                "apiVersion": "1",
+                "apiStrict": true,
+            },
+            &mut ctx(),
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 323);
+        // `distinct` is the rejected canary command.
+        let d = dispatch(
+            &doc! {"distinct": "c", "key": "x", "apiVersion": "1", "apiStrict": true},
+            &mut ctx(),
+        );
+        assert_eq!(d.get_i32("code").unwrap(), 323);
+        // A v1 stage is not rejected by the api gate (it may fail later for lack
+        // of storage, but not with 323).
+        let ok = dispatch(
+            &doc! {"aggregate": 1, "pipeline": [{"$match": {}}],
+            "apiVersion": "1", "apiStrict": true},
+            &mut ctx(),
+        );
+        assert_ne!(ok.get_i32("code").ok(), Some(323));
     }
 
     #[test]
