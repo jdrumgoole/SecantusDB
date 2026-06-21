@@ -490,18 +490,22 @@ fn cmp_op(
 ) -> R {
     for v in values {
         let Some(val) = v else { continue };
-        if let Some(o) = compare_values(val, target, coll)? {
-            if pred(o) {
-                return Ok(true);
-            }
-        }
         if let Bson::Array(arr) = val {
+            // Multikey field: match if any element satisfies the bound. mongod
+            // does NOT compare the array-as-a-whole against a scalar bound (an
+            // array always out-ranks a number in BSON type order, which would
+            // make every array field match), so the whole-array compare is
+            // deliberately skipped here.
             for e in arr {
                 if let Some(o) = compare_values(e, target, coll)? {
                     if pred(o) {
                         return Ok(true);
                     }
                 }
+            }
+        } else if let Some(o) = compare_values(val, target, coll)? {
+            if pred(o) {
+                return Ok(true);
             }
         }
     }

@@ -151,6 +151,14 @@ CURATED = [
     ({"age": 30}, {"age": {"$gte": 30}}),
     ({"age": 30}, {"age": {"$lt": 31}}),
     ({"age": 30}, {"age": {"$lt": 30}}),
+    # Range operators against an array-valued (multikey) field: match when any
+    # element satisfies the bound; the array-as-a-whole is never compared to the
+    # scalar bound (an array out-ranks a number in BSON type order).
+    ({"dim": [14, 21]}, {"dim": {"$gt": 25}}),
+    ({"dim": [22.85, 30]}, {"dim": {"$gt": 25}}),
+    ({"dim": [10, 15.25]}, {"dim": {"$gt": 15, "$lt": 20}}),
+    ({"dim": [14, 21]}, {"dim": {"$lte": 14}}),
+    ({"dim": ["a", "z"]}, {"dim": {"$gt": "m"}}),
     ({"a": 2}, {"a": {"$in": [1, 2, 3]}}),
     ({"a": 4}, {"a": {"$in": [1, 2, 3]}}),
     ({"a": 4}, {"a": {"$nin": [1, 2, 3]}}),
