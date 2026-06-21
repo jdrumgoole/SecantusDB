@@ -75,12 +75,19 @@ impl CursorProducer for ChangeStreamProducer {
                 } else {
                     let (events, stripped_id) = apply_event_pipeline(batch.events, &self.pipeline);
                     if stripped_id {
-                        self.fatal_error = Some(CommandError::new(
-                            280,
-                            "ChangeStreamFatalError",
-                            "the change stream pipeline may not remove the _id \
-                             (resume token) field",
-                        ));
+                        // mongod tags this fatal change-stream error
+                        // NonResumableChangeStreamError so drivers don't retry it.
+                        self.fatal_error = Some(
+                            CommandError::new(
+                                280,
+                                "ChangeStreamFatalError",
+                                "the change stream pipeline may not remove the _id \
+                                 (resume token) field",
+                            )
+                            .with_extra(doc! {
+                                "errorLabels": ["NonResumableChangeStreamError"],
+                            }),
+                        );
                     }
                     events
                 }
@@ -311,10 +318,13 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
             ));
         }
         if !CHANGE_STREAM_PIPELINE_STAGES.contains(&name) {
+            // mongod reports an unrecognised stage in a change-stream pipeline as
+            // Location40324 "Unrecognized pipeline stage name", not a generic
+            // BadValue (the drivers' "invalid aggregation stage" test asserts it).
             return Err(CommandError::new(
-                2,
-                "BadValue",
-                format!("{name} is not permitted in a $changeStream pipeline"),
+                40324,
+                "Location40324",
+                format!("Unrecognized pipeline stage name: '{name}'"),
             ));
         }
         if name == "$changeStreamSplitLargeEvent" {

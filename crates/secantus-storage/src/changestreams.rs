@@ -291,6 +291,13 @@ pub fn project(
         if let Some(w) = &wall {
             event.insert("wallTime", w.clone());
         }
+        // showExpandedEvents surfaces the collection UUID on CRUD events (mongod
+        // 6.0+). The oplog entry carries it as `ui` (BinData 4).
+        if show_expanded_events {
+            if let Some(ui) = oplog_entry.get("ui") {
+                event.insert("collectionUUID", ui.clone());
+            }
+        }
         if op == "u" && op_type == "update" {
             let diff = oplog_entry
                 .get_document("o")
