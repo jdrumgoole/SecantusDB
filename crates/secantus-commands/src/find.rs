@@ -121,8 +121,10 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0).max(0) as usize;
     let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize; // 0 ⇒ no limit
     let sort = doc.get("sort").and_then(Bson::as_document);
-    // An empty projection means "no projection" (return full docs).
-    let projection = doc
+    // An empty projection means "no projection" (return full docs). Mutable
+    // because `returnKey` / `showRecordId` rewrite the result set and then
+    // suppress any normal projection (mongod ignores `projection` for them).
+    let mut projection = doc
         .get("projection")
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
@@ -264,6 +266,53 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             },
             "ok": 1.0,
         });
+    }
+
+    // `returnKey` replaces each result with just the key fields of the index
+    // serving the query (the IXSCAN keyPattern, plus the sort fields), and
+    // suppresses `showRecordId`. `showRecordId` alone tags each doc with a
+    // synthetic `$recordId`. Both ignore `projection` (mongod does too), so we
+    // rewrite the docs here and clear `projection`. Mirrors commands.py.
+    let return_key = bool_field(doc, "returnKey", false);
+    let show_record_id = bool_field(doc, "showRecordId", false);
+    if return_key || show_record_id {
+        let mut key_fields: Vec<String> = Vec::new();
+        if return_key {
+            if let Ok(plan) = storage.explain_plan(&ctx.db_name, &coll, &filter, sort, hint) {
+                if plan.get_str("kind") == Ok("IXSCAN") {
+                    if let Ok(kp) = plan.get_document("keyPattern") {
+                        key_fields.extend(kp.keys().cloned());
+                    }
+                }
+            }
+            if let Some(s) = sort {
+                for k in s.keys() {
+                    if !key_fields.iter().any(|f| f == k) {
+                        key_fields.push(k.clone());
+                    }
+                }
+            }
+        }
+        let mut rewritten: Vec<Document> = Vec::with_capacity(docs.len());
+        for (i, bytes) in docs.iter().enumerate() {
+            let d = Document::from_reader(&mut bytes.as_slice())
+                .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+            if return_key {
+                let mut o = Document::new();
+                for f in &key_fields {
+                    if let Some(v) = d.get(f) {
+                        o.insert(f.clone(), v.clone());
+                    }
+                }
+                rewritten.push(o);
+            } else {
+                let mut o = d;
+                o.insert("$recordId", Bson::Int64((i + 1) as i64));
+                rewritten.push(o);
+            }
+        }
+        docs = crate::util::encode_docs(rewritten)?;
+        projection = None;
     }
 
     // The `firstBatch` goes straight onto the wire reply, so produce it as
@@ -656,6 +705,49 @@ mod tests {
         let reply = dispatch(&doc! {"find": "c", "sort": {"_id": -1}}, &mut c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(batch_ids(cur, "firstBatch"), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn find_return_key_and_show_record_id() {
+        let docs = (1..4)
+            .map(|i| doc! {"_id": i, "x": i * 10, "y": "z"})
+            .collect();
+        let mut c = ctx(FakeStorage::seed("t", "c", docs));
+        c.db_name = "t".into();
+        // returnKey (+ showRecordId, which it suppresses): only the sort key field.
+        let reply = dispatch(
+            &doc! {"find": "c", "sort": {"_id": 1}, "returnKey": true, "showRecordId": true},
+            &mut c,
+        );
+        let batch = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        for b in batch {
+            let d = b.as_document().unwrap();
+            assert_eq!(
+                d.keys().collect::<Vec<_>>(),
+                vec!["_id"],
+                "returnKey ⇒ key only"
+            );
+        }
+        assert_eq!(batch.len(), 3);
+        // showRecordId alone: full doc plus a $recordId.
+        let reply = dispatch(
+            &doc! {"find": "c", "sort": {"_id": 1}, "showRecordId": true},
+            &mut c,
+        );
+        let first = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert!(first.contains_key("$recordId"));
+        assert!(first.contains_key("x"));
     }
 
     #[test]
