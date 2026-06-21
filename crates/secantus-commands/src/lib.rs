@@ -338,6 +338,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
         "connectionStatus" => diagnostics::connection_status,
         "whatsmyuri" => diagnostics::whatsmyuri,
+        "fsync" => diagnostics::fsync,
         "hostInfo" => diagnostics::host_info,
         "getLog" => diagnostics::get_log,
         "configureFailPoint" => configure_fail_point,

@@ -43,6 +43,23 @@ pub fn whatsmyuri(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "you": "127.0.0.1:0", "ok": 1.0 })
 }
 
+/// `fsync` — flush data to disk. WiredTiger checkpoints on its own cadence, so
+/// this reports success without forcing one. `lock: true` (which would block
+/// writes until `fsyncUnlock` — needs coordination we don't have) is rejected
+/// rather than silently skipped, so backup tools relying on the lock aren't
+/// misled. Mirrors `commands.py::_fsync`.
+pub fn fsync(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    if doc.get("lock").and_then(Bson::as_bool) == Some(true) {
+        return Ok(crate::CommandError::new(
+            9,
+            "FailedToParse",
+            "fsync with lock:true is not supported by SecantusDB",
+        )
+        .into_reply());
+    }
+    Ok(doc! { "numFiles": 1i32, "ok": 1.0 })
+}
+
 /// `connectionStatus` — auth info for the connection (empty until R5 auth).
 pub fn connection_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! {
