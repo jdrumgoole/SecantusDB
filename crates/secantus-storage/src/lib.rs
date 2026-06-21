@@ -1379,6 +1379,58 @@ impl Storage {
         Ok(out)
     }
 
+    /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
+    fn is_oplog_rs(&self, db: &str, coll: &str) -> bool {
+        self.enable_oplog && db == "local" && coll == "oplog.rs"
+    }
+
+    /// Read path for the synthetic `local.oplog.rs` view: every persisted oplog
+    /// entry, filtered by `filter` and ordered by `$natural` (the oplog's only
+    /// meaningful order — entries are scanned in seq == insertion == ts order,
+    /// so `$natural: 1` is the identity and `$natural: -1` reverses). A
+    /// non-`$natural` sort falls through to the generic compound-key post-sort.
+    /// skip / limit / projection are the caller's job. Mirrors
+    /// `storage._find_oplog_rs`.
+    fn find_oplog_rs(
+        &self,
+        filter: &Document,
+        sort: Option<&Document>,
+        coll_opt: Option<&Collation>,
+        vars: &Document,
+    ) -> Result<Vec<Vec<u8>>> {
+        let rows = self.read_oplog(0, usize::MAX)?;
+        let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
+        for (_seq, blob) in rows {
+            let d = decode_doc(&blob)?;
+            if filter.is_empty()
+                || query_matches(&d, filter, vars, coll_opt)
+                    .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                out.push((d, blob));
+            }
+        }
+        if let Some(s) = sort {
+            if let Some(nat) = s.get("$natural") {
+                let dir = nat
+                    .as_i32()
+                    .or_else(|| nat.as_i64().map(|v| v as i32))
+                    .or_else(|| nat.as_f64().map(|v| v as i32))
+                    .unwrap_or(1);
+                if dir < 0 {
+                    out.reverse();
+                }
+            } else if let Some(spec) = multi_sort_spec(sort) {
+                let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(out.len());
+                for (d, blob) in out {
+                    keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
+                }
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                return Ok(keyed.into_iter().map(|(_, b)| b).collect());
+            }
+        }
+        Ok(out.into_iter().map(|(_, b)| b).collect())
+    }
+
     /// The smallest seq currently present (0 if empty) — the retention floor a
     /// resume token must stay at or above. Mirrors `storage.oplog_floor_seq`.
     pub fn oplog_floor_seq(&self) -> Result<i64> {
@@ -2015,9 +2067,10 @@ impl Storage {
     /// where `errors` are mongod-shaped write-error docs (`{index, code,
     /// errmsg, keyPattern?, keyValue?}`) for duplicate-`_id` / unique-index
     /// violations. `ordered` stops at the first error (else continues). All
-    /// successful inserts share one batched oplog emit. Mirrors
-    /// `storage.insert`. (Capped-collection eviction and geo-index validation
-    /// are not yet enforced by the Rust engine — see backlog.)
+    /// successful inserts share one batched oplog emit. Capped collections
+    /// evict oldest non-fresh docs to stay within `size`/`max` bounds. Mirrors
+    /// `storage.insert`. (Geo-index validation is not yet enforced by the Rust
+    /// engine — see backlog.)
     pub fn insert(
         &self,
         db: &str,
@@ -2040,6 +2093,7 @@ impl Storage {
         let mut inserted = 0usize;
         let mut errors: Vec<Document> = Vec::new();
         let mut oplog_entries: Vec<Document> = Vec::new();
+        let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
         let doc_cur = session.open_cursor(DOC_TABLE, Some("overwrite=false"))?;
         for (index, doc_bytes) in docs.iter().enumerate() {
             let mut doc = decode_doc(doc_bytes)?;
@@ -2097,6 +2151,7 @@ impl Storage {
             }
             self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+            fresh_id_keys.insert(key.clone());
             inserted += 1;
             if oplog_on {
                 let mut o2 = Document::new();
@@ -2111,9 +2166,26 @@ impl Storage {
                 oplog_entries.push(entry);
             }
         }
+        // Capped-collection eviction: drop oldest non-fresh docs until within
+        // the collection's `size` / `max` bounds. Inserts have no pre-image, so
+        // the per-insert pre-image slots are all None; eviction appends its own.
+        let mut pre_images: Vec<Option<Vec<u8>>> = vec![None; oplog_entries.len()];
+        if inserted > 0 {
+            self.enforce_capped_bounds(
+                &session,
+                db,
+                coll,
+                &fresh_id_keys,
+                &descs,
+                oplog_on,
+                &ns,
+                ui.as_deref(),
+                &mut oplog_entries,
+                &mut pre_images,
+            )?;
+        }
         if oplog_on && !oplog_entries.is_empty() {
-            let n = oplog_entries.len();
-            self.emit_oplog(&session, oplog_entries, vec![None; n])?;
+            self.emit_oplog(&session, oplog_entries, pre_images)?;
         }
         Ok((inserted, errors))
     }
@@ -2706,6 +2778,11 @@ impl Storage {
     /// Whether the collection has `capped: true`. Mirrors
     /// `storage.collection_is_capped`.
     pub fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool> {
+        // The synthetic oplog view is a capped collection (so tailable cursors
+        // are accepted on it), even though it has no registry row.
+        if self.is_oplog_rs(db, coll) {
+            return Ok(true);
+        }
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         Ok(coll_options(&session, db, coll)?
@@ -3389,6 +3466,94 @@ impl Storage {
         Ok(out)
     }
 
+    /// Evict oldest non-fresh docs from a capped collection until within its
+    /// `size` (byte) and `max` (count) bounds. "Oldest" is natural (doc-table
+    /// `id_key`) order, which matches insertion order for monotonic `_id`s.
+    /// Appends a `"d"` oplog entry (and pre-image when enabled) per eviction to
+    /// the caller's vectors. No-op when the collection isn't capped or has no
+    /// bounds. Mirrors `storage._enforce_capped_bounds_locked`.
+    #[allow(clippy::too_many_arguments)]
+    fn enforce_capped_bounds(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        fresh_id_keys: &HashSet<Vec<u8>>,
+        descs: &[IndexDesc],
+        oplog_on: bool,
+        ns: &str,
+        ui: Option<&[u8]>,
+        oplog_entries: &mut Vec<Document>,
+        pre_images: &mut Vec<Option<Vec<u8>>>,
+    ) -> Result<()> {
+        let opts = match coll_options(session, db, coll)? {
+            Some(o) if o.get_bool("capped").unwrap_or(false) => o,
+            _ => return Ok(()),
+        };
+        let num = |k: &str| -> Option<i64> {
+            match opts.get(k) {
+                Some(Bson::Int32(v)) => Some(*v as i64),
+                Some(Bson::Int64(v)) => Some(*v),
+                Some(Bson::Double(v)) => Some(*v as i64),
+                _ => None,
+            }
+        };
+        let size_limit = num("size");
+        let max_limit = num("max");
+        if size_limit.is_none() && max_limit.is_none() {
+            return Ok(());
+        }
+        let scanned = self.scan_docs(session, db, coll)?;
+        let mut total: i64 = scanned.iter().map(|(_, b)| b.len() as i64).sum();
+        let mut count = scanned.len() as i64;
+        let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
+        let doc_cur = session.open_cursor(DOC_TABLE, None)?;
+        for (id_k, blob) in scanned {
+            let over_size = size_limit.is_some_and(|s| total > s);
+            let over_max = max_limit.is_some_and(|m| count > m);
+            if !over_size && !over_max {
+                break;
+            }
+            if fresh_id_keys.contains(&id_k) {
+                // Don't evict docs inserted in this batch — with monotonic
+                // _ids they sort to the tail, so reaching one means the rest
+                // are fresh too.
+                break;
+            }
+            let doc = decode_doc(&blob)?;
+            self.delete_index_entries(session, db, coll, &doc, descs, Some(&id_k))?;
+            doc_cur.reset()?;
+            doc_cur.set_key_ssu(db, coll, &id_k);
+            match doc_cur.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+            total -= blob.len() as i64;
+            count -= 1;
+            if oplog_on {
+                let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+                let mut o = Document::new();
+                o.insert("_id", id);
+                let mut entry = Document::new();
+                entry.insert("op", "d");
+                entry.insert("ns", ns);
+                if let Some(u) = ui {
+                    entry.insert("ui", uuid_binary(u));
+                }
+                entry.insert("o", Bson::Document(o.clone()));
+                entry.insert("o2", Bson::Document(o));
+                oplog_entries.push(entry);
+                pre_images.push(if preimages_on {
+                    Some(encode_doc(&doc)?)
+                } else {
+                    None
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Flag every index in `descs` that `doc` makes multikey (an array value
     /// on an indexed field) by rewriting its registry options with
     /// `multikey: true`. Sticky — never cleared. Indexes already flagged are
@@ -3886,6 +4051,9 @@ impl Storage {
         coll_opt: Option<&Collation>,
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
+        if self.is_oplog_rs(db, coll) {
+            return self.find_oplog_rs(filter, sort, coll_opt, vars);
+        }
         let _g = self.lock.lock().unwrap();
         let session = self.op_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
@@ -4030,6 +4198,11 @@ impl Storage {
         filter: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
+        if self.is_oplog_rs(db, coll) {
+            return Ok(self
+                .find_oplog_rs(filter, None, coll_opt, &Document::new())?
+                .len());
+        }
         let _g = self.lock.lock().unwrap();
         let session = self.op_session()?;
         if filter.is_empty() {
@@ -5804,6 +5977,84 @@ mod tests {
         let got = restored.find_matching("app", "c", &doc! {}).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 7);
+    }
+
+    #[test]
+    fn capped_collection_evicts_oldest_across_inserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_collection_with_options(
+            "app",
+            "cap",
+            &doc! {"capped": true, "size": 1_000_000i64, "max": 3i32},
+        )
+        .unwrap();
+        // One-at-a-time inserts: each is its own batch, so the prior docs are
+        // non-fresh and eviction trims to the cap.
+        for i in 0..6i32 {
+            s.insert(
+                "app",
+                "cap",
+                vec![encode_doc(&doc! {"_id": i}).unwrap()],
+                true,
+            )
+            .unwrap();
+        }
+        let mut ids: Vec<i32> = s
+            .find_matching("app", "cap", &doc! {})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![3, 4, 5]);
+
+        // A single over-cap batch keeps all its docs (they're all "fresh").
+        s.create_collection_with_options(
+            "app",
+            "cap2",
+            &doc! {"capped": true, "size": 1_000_000i64, "max": 3i32},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "cap2",
+            (0..6i32)
+                .map(|i| encode_doc(&doc! {"_id": i}).unwrap())
+                .collect(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.find_matching("app", "cap2", &doc! {}).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn oplog_rs_view_is_findable_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        // The synthetic view surfaces the persisted oplog entries.
+        let entries = s.find_matching("local", "oplog.rs", &doc! {}).unwrap();
+        assert!(!entries.is_empty());
+        assert!(decode_doc(&entries[0]).unwrap().contains_key("ts"));
+        // count routes through the same synthesis.
+        assert_eq!(
+            s.count_matching("local", "oplog.rs", &doc! {}, None)
+                .unwrap(),
+            entries.len()
+        );
+        // Tailable cursors require a capped collection — the view reports capped.
+        assert!(s.collection_is_capped("local", "oplog.rs").unwrap());
     }
 
     #[test]
