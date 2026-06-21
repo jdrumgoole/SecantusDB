@@ -901,6 +901,53 @@ def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
         sys.exit(1)
 
 
+@task(name="validate-all-servers")
+def validate_all_servers(c: Context, jobs: int = 4) -> None:
+    """Run all eleven driver gauges against BOTH the Python and the Rust server.
+
+    Runs ``validate-all --server python`` then ``validate-all --server rust``
+    **sequentially** — never concurrently. The two fleets can't overlap: the C++
+    gauge binds 27017 on both runs, and two full gauge fleets at once
+    oversubscribe the box and flake the timing-sensitive gauges. Each run writes
+    its own reports (the Rust pass adds the ``-rust-server`` suffix).
+
+    ``--jobs N`` is forwarded to each ``validate-all`` (default 4; keep it <= 4
+    per CLAUDE.md). Exit code is non-zero if any gauge failed on either server.
+    """
+    import subprocess
+    import sys
+
+    failed: list[str] = []
+    for srv in ("python", "rust"):
+        print(f"\n===== validate-all against the {srv} server =====\n", flush=True)
+        rc = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--no-sync",
+                "python",
+                "-m",
+                "invoke",
+                "validate-all",
+                "--server",
+                srv,
+                "--jobs",
+                str(jobs),
+            ],
+            check=False,
+        ).returncode
+        if rc != 0:
+            failed.append(srv)
+
+    print("\n=== validate-all-servers summary ===", flush=True)
+    for srv in ("python", "rust"):
+        print(f"  {srv:<7} {'FAILED' if srv in failed else 'ok'}", flush=True)
+    if failed:
+        print(f"\ngauges failed on: {', '.join(failed)}", flush=True)
+        sys.exit(1)
+    print("\nall gauges passed on both servers.", flush=True)
+
+
 @task(name="validate-summary")
 def validate_summary(c: Context) -> None:
     """Generate ``docs/validation-summary.md`` from the five gauges' raw output.
