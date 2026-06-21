@@ -889,7 +889,11 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   key is **verified correct** (0.5.3-beta.22+): `bson::Document::insert` preserves
   an existing field's position and appends new keys — matching mongod. (The
   retired "flip `update` default to Rust" framing is dropped — no in-process
-  default exists in the two-server model.)
+  default exists in the two-server model.) **`$currentDate` is done** (0.5.3-beta.47):
+  the core engine still defers it (non-deterministic), but the Rust *storage* layer
+  resolves it to a concrete clock value before `apply_update_with` (date / timestamp,
+  one clock read per op), via `resolve_current_date` — mirrors `update.py`. Closes
+  the pymongo gauge `test_update_and_replace`.
 - [x] **Phase 1, leaf engine #4: `expressions.evaluate`** — a high-value core of
   the aggregation expression language ported to Rust
   (`crates/secantus-core/src/expressions.rs`): field paths / `$$var` / `$$ROOT` /

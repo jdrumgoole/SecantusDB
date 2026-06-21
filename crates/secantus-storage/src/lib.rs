@@ -592,6 +592,51 @@ fn update_would_change_id(update: &Document, old_id: &Bson) -> bool {
     false
 }
 
+/// Resolve `$currentDate` to concrete clock values so the deterministic core
+/// update engine (which defers `$currentDate` as non-deterministic) never sees
+/// it. Each field is folded into `$set`: a `true` value or `{$type: "date"}`
+/// becomes the current UTC `DateTime`; `{$type: "timestamp"}` becomes
+/// `Timestamp(now_secs, 0)`. All fields in one update share a single clock read
+/// (mongod applies one operation time). The update is returned unchanged when it
+/// carries no `$currentDate`. Mirrors `update.py`'s `$currentDate` branch. An
+/// unrecognised option (anything other than `true` / `{$type: "date"|"timestamp"}`)
+/// or a non-document `$set`/`$currentDate` is rejected.
+fn resolve_current_date(update: &Document) -> Result<Document> {
+    let Some(cd_bson) = update.get("$currentDate") else {
+        return Ok(update.clone());
+    };
+    let Bson::Document(cd) = cd_bson else {
+        return Err(StorageError::QueryUnsupported);
+    };
+    let millis = now_millis();
+    let date = Bson::DateTime(bson::DateTime::from_millis(millis));
+    let ts = Bson::Timestamp(bson::Timestamp {
+        time: (millis / 1000) as u32,
+        increment: 0,
+    });
+    let mut out = update.clone();
+    out.remove("$currentDate");
+    let mut set = match out.remove("$set") {
+        Some(Bson::Document(d)) => d,
+        None => Document::new(),
+        Some(_) => return Err(StorageError::QueryUnsupported),
+    };
+    for (path, opts) in cd {
+        let value = match opts {
+            Bson::Boolean(true) => date.clone(),
+            Bson::Document(o) => match o.get_str("$type") {
+                Ok("date") => date.clone(),
+                Ok("timestamp") => ts.clone(),
+                _ => return Err(StorageError::QueryUnsupported),
+            },
+            _ => return Err(StorageError::QueryUnsupported),
+        };
+        set.insert(path.clone(), value);
+    }
+    out.insert("$set", Bson::Document(set));
+    Ok(out)
+}
+
 /// The doc-table key for `doc`: the caller-supplied override (timeseries rows
 /// carry a suffixed key) when present, else `id_key(doc["_id"])`.
 fn doc_table_key(doc: &Document, override_key: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -4251,6 +4296,11 @@ impl Storage {
         // `let_vars` are visible to `$expr` in the filter (command `let`);
         // `coll_opt` forces a collation-aware COLLSCAN match.
         let is_replacement = !update.keys().any(|k| k.starts_with('$'));
+        // Resolve `$currentDate` to a concrete clock value once per operation (so
+        // a multi-update stamps every matched doc with the same time), keeping the
+        // deterministic core engine free of the clock.
+        let update = resolve_current_date(update)?;
+        let update = &update;
         self.update_matching_core(
             db,
             coll,
@@ -5977,6 +6027,35 @@ mod tests {
         let got = restored.find_matching("app", "c", &doc! {}).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 7);
+    }
+
+    #[test]
+    fn resolve_current_date_folds_into_set() {
+        // `true` and `{$type: "date"}` → DateTime; `{$type: "timestamp"}` →
+        // Timestamp; all merged into an existing $set.
+        let upd = doc! {
+            "$set": {"status": "P"},
+            "$currentDate": {
+                "a": true,
+                "b": {"$type": "date"},
+                "c": {"$type": "timestamp"},
+            },
+        };
+        let out = resolve_current_date(&upd).unwrap();
+        assert!(!out.contains_key("$currentDate"));
+        let set = out.get_document("$set").unwrap();
+        assert_eq!(set.get_str("status").unwrap(), "P");
+        assert!(matches!(set.get("a"), Some(Bson::DateTime(_))));
+        assert!(matches!(set.get("b"), Some(Bson::DateTime(_))));
+        assert!(matches!(set.get("c"), Some(Bson::Timestamp(_))));
+        // No $currentDate → returned unchanged.
+        let plain = doc! {"$inc": {"n": 1i32}};
+        assert_eq!(resolve_current_date(&plain).unwrap(), plain);
+        // Unrecognised option → error (mirrors mongod / update.py rejecting it).
+        let bad = doc! {"$currentDate": {"x": {"$type": "nope"}}};
+        assert!(resolve_current_date(&bad).is_err());
+        let bad2 = doc! {"$currentDate": {"x": false}};
+        assert!(resolve_current_date(&bad2).is_err());
     }
 
     #[test]

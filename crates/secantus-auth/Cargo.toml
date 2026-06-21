@@ -1,6 +1,6 @@
 [package]
 name = "secantus-auth"
-version = "0.5.3-beta.46"
+version = "0.5.3-beta.47"
 edition = "2021"
 description = "Pure-Rust SCRAM-SHA-256 server-side mechanism for the SecantusDB Rust server (R5 auth)."
 license = "GPL-2.0-only"
