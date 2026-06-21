@@ -34,7 +34,14 @@ def test(c: Context, k: str = "", verbose: bool = False) -> None:
 
 @task(name="test-one")
 def test_one(c: Context, nodeid: str) -> None:
-    c.run(f"uv run python -m pytest -p no:xdist {shlex.quote(nodeid)}", pty=True)
+    # `-n0 -o addopts=` runs serially: `-p no:xdist` fails because the
+    # project's addopts still injects `-n auto --dist=loadgroup`, which xdist
+    # then can't parse once its plugin is disabled. Clearing addopts and forcing
+    # zero workers is the reliable single-test form.
+    c.run(
+        f"uv run --no-sync python -m pytest -n0 -o addopts= -p no:cacheprovider {shlex.quote(nodeid)}",
+        pty=True,
+    )
 
 
 @task
