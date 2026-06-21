@@ -23,6 +23,10 @@ pub use secantus_core::collation::Collation;
 /// `secantus-commands` stay decoupled from the storage crate's `Hint` type.
 pub type RawHint<'a> = &'a Bson;
 
+/// `(id_key, bson)` document rows, as returned by the collection scans the
+/// tailable-find producer polls (`scan_docs_after_id_key`).
+pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// The outcome of an `update` operation (mirrors
 /// `secantus_storage::UpdateOutcome`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -89,6 +93,10 @@ pub struct ChangeStreamOptions {
     pub full_document_before_change: String,
     /// `showExpandedEvents: true` surfaces DDL events (create / modify / …).
     pub show_expanded_events: bool,
+    /// A `$changeStreamSplitLargeEvent` stage was present: every event carries a
+    /// `splitEvent: {fragment, of}` envelope (we never actually split, so always
+    /// `{fragment: 1, of: 1}`).
+    pub split_large_events: bool,
 }
 
 /// One poll of the oplog tail for a change-stream cursor: the projected event
@@ -100,6 +108,10 @@ pub struct ChangeStreamBatch {
     pub events: Vec<Vec<u8>>,
     pub new_position: i64,
     pub invalidated: bool,
+    /// A fatal projection error (e.g. `fullDocument: required` with
+    /// changeStreamPreAndPostImages disabled) — `(code, errmsg)`. The producer
+    /// surfaces it as a getMore-time `ok: 0` reply that ends the stream.
+    pub fatal: Option<(i32, String)>,
 }
 
 /// The storage operations the command handlers depend on. Bytes at the seam:
@@ -148,6 +160,7 @@ pub trait Storage: Send + Sync {
             events: Vec::new(),
             new_position: after_seq,
             invalidated: false,
+            fatal: None,
         })
     }
 
@@ -528,6 +541,34 @@ pub trait Storage: Send + Sync {
     /// Whether the collection is capped.
     fn collection_is_capped(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
         Ok(false)
+    }
+
+    /// The collection's 16-byte UUID (mongod's collection identity, surfaced as
+    /// `info.uuid` BinData(4) in `listCollections` and `ui` in the oplog).
+    fn collection_uuid(&self, _db: &str, _coll: &str) -> Result<Vec<u8>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Documents whose `id_key` sorts strictly after `after` (all of them when
+    /// `after` is `None`), as `(id_key, bson)` pairs — the tailable-find producer
+    /// polls this for docs inserted since it last returned.
+    fn scan_docs_after_id_key(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _after: Option<&[u8]>,
+    ) -> Result<IdKeyRows, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// The smallest `id_key` currently in the collection (`None` if empty) — a
+    /// tailable cursor uses it to detect capped rollover (`CappedPositionLost`).
+    fn collection_min_id_key(
+        &self,
+        _db: &str,
+        _coll: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
     }
 
     /// Total size in bytes of the collection's documents.

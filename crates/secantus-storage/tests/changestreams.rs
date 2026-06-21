@@ -52,7 +52,17 @@ fn project_op(
         .into_iter()
         .find(|(_, b)| decode(b).get_str("op").unwrap() == op)
         .expect("oplog entry");
-    changestreams::project(seq, &decode(&blob), st, full_doc, before, scope, false).unwrap()
+    changestreams::project(
+        seq,
+        &decode(&blob),
+        st,
+        full_doc,
+        before,
+        scope,
+        false,
+        false,
+    )
+    .unwrap()
 }
 
 fn coll_scope() -> Scope {
@@ -156,6 +166,7 @@ fn update_diff_event_has_update_description() {
             FULL_DOC_DEFAULT,
             &Scope::Cluster,
             false,
+            false,
         )
         .unwrap();
         let ev = ev.unwrap();
@@ -187,6 +198,7 @@ fn update_lookup_fetches_current_document() {
             FULL_DOC_UPDATE_LOOKUP,
             FULL_DOC_DEFAULT,
             &Scope::Cluster,
+            false,
             false,
         )
         .unwrap();
@@ -287,6 +299,7 @@ fn noop_heartbeat_projects_nothing() {
             FULL_DOC_DEFAULT,
             &Scope::Cluster,
             false,
+            false,
         )
         .unwrap();
         assert!(ev.is_none());
@@ -310,6 +323,7 @@ fn drop_event_invalidates_collection_scope() {
             FULL_DOC_DEFAULT,
             FULL_DOC_DEFAULT,
             &coll_scope(),
+            false,
             false,
         )
         .unwrap();

@@ -749,9 +749,11 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   public `UpdateOutcome`. 14 WT-backed tests in `tests/write.rs`; `clippy -D warnings`
   + `fmt` clean. **Deferred to the future engine-selection adapter (route to Python):**
   `array_filters`, positional update operators (`$`/`$[]`), `let`/`collation`,
-  document `validator`, capped-collection eviction bounds, and geo-index validation on
-  update — the Rust signatures don't accept these, so such ops stay on pure-Python
-  `Storage`.
+  document `validator`, and geo-index validation on update — the Rust signatures
+  don't accept these, so such ops stay on pure-Python `Storage`. (Capped-collection
+  eviction now lands natively in `Storage::insert` via `enforce_capped_bounds` —
+  oldest non-fresh docs evicted to stay within `size`/`max`, with `op:"d"` oplog +
+  pre-images; mirrors Python's `_enforce_capped_bounds_locked`.)
 - [x] **Phase 4 sub-phase 5b — collection/database lifecycle in `secantus-storage`.**
   `create_collection` / `drop_collection` / `drop_database` / `rename_collection`
   (move-by-rekey, `drop_target`, source/target guards) / `list_databases`, with the

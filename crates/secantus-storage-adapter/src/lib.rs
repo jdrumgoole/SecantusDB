@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use bson::{Bson, Document};
 use secantus_commands::storage::{
-    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, RawHint,
-    Storage as CmdStorage, StorageError, UpdateOutcome,
+    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, IdKeyRows,
+    RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
 use secantus_storage::{
@@ -112,6 +112,7 @@ impl CmdStorage for StorageAdapter {
         let mut events: Vec<Vec<u8>> = Vec::new();
         let mut new_position = after_seq;
         let mut invalidated = false;
+        let mut fatal: Option<(i32, String)> = None;
         for (seq, blob) in rows {
             // Always advance the position past a scanned entry, even when it
             // projects to nothing (noop heartbeats / other-scope writes) — that
@@ -119,7 +120,7 @@ impl CmdStorage for StorageAdapter {
             new_position = seq;
             let entry = Document::from_reader(&mut blob.as_slice())
                 .map_err(|e| StorageError::Internal(format!("oplog decode: {e}")))?;
-            let (event, invalidates) = changestreams::project(
+            let projected = changestreams::project(
                 seq,
                 &entry,
                 &self.inner,
@@ -127,8 +128,20 @@ impl CmdStorage for StorageAdapter {
                 &opts.full_document_before_change,
                 &wt_scope,
                 opts.show_expanded_events,
-            )
-            .map_err(map_err)?;
+                opts.split_large_events,
+            );
+            // A fatal projection error (e.g. fullDocument: required with
+            // changeStreamPreAndPostImages disabled) ends the stream with an
+            // ok: 0 reply rather than tearing down the poll — surface it via the
+            // batch so the producer/getMore can report it (code 280).
+            let (event, invalidates) = match projected {
+                Ok(v) => v,
+                Err(WtError::ChangeStreamFatal(m)) => {
+                    fatal = Some((280, m));
+                    break;
+                }
+                Err(e) => return Err(map_err(e)),
+            };
             if let Some(ev) = event {
                 let mut buf = Vec::new();
                 ev.to_writer(&mut buf)
@@ -153,6 +166,7 @@ impl CmdStorage for StorageAdapter {
             events,
             new_position,
             invalidated,
+            fatal,
         })
     }
 
@@ -561,6 +575,25 @@ impl CmdStorage for StorageAdapter {
 
     fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
         self.inner.collection_is_capped(db, coll).map_err(map_err)
+    }
+
+    fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.collection_uuid(db, coll).map_err(map_err)
+    }
+
+    fn scan_docs_after_id_key(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<&[u8]>,
+    ) -> Result<IdKeyRows, StorageError> {
+        self.inner
+            .scan_docs_after_id_key(db, coll, after)
+            .map_err(map_err)
+    }
+
+    fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.collection_min_id_key(db, coll).map_err(map_err)
     }
 
     fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64, StorageError> {

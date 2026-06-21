@@ -10,8 +10,12 @@
 //! `max`); `collMod` merges the same set into an existing collection (else
 //! `NamespaceNotFound`). The `insert` handler enforces `validator` (code 121).
 //!
+//! `create` with `viewOn` + `pipeline` registers a read-only view; `count`
+//! resolves through the view's pipeline and `listCollections` reports it as
+//! `type: "view"` (readOnly, no `_id` index).
+//!
 //! **Deferred (documented so parity is honest):**
-//! * `create` unknown-field validation (`Location40415`); views; capped-size
+//! * `create` unknown-field validation (`Location40415`); capped-size
 //!   enforcement; `collMod`'s TTL-index `index: {expireAfterSeconds}` modify.
 //! * `validator` enforcement on `findAndModify` (insert / `update` / replace are
 //!   enforced — the command layer reads the validator and the storage update
@@ -37,7 +41,7 @@ use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SER
 /// `changeStreamPreAndPostImages` drives pre-image capture; `capped`/`size`/`max`
 /// are reported in stats. (TTL-index `expireAfterSeconds` modification via
 /// `collMod`'s `index` option is deferred.)
-const STORED_COLL_OPTIONS: [&str; 9] = [
+const STORED_COLL_OPTIONS: [&str; 11] = [
     "validator",
     "validationLevel",
     "validationAction",
@@ -50,6 +54,10 @@ const STORED_COLL_OPTIONS: [&str; 9] = [
     "timeseries",
     // The collection's default collation — surfaced back in `listCollections`.
     "collation",
+    // Round-tripped in `listCollections` so drivers see the options they set on
+    // `create` (the rust driver's collection_management asserts both).
+    "storageEngine",
+    "indexOptionDefaults",
 ];
 
 /// The subset of a command doc that maps to persisted collection options.
@@ -69,7 +77,20 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Build the options up front so they ride the `create` oplog entry (carried
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
-    let opts = collection_option_subset(doc);
+    let mut opts = collection_option_subset(doc);
+    // `viewOn` + `pipeline` makes this a read-only view of another collection
+    // (mongod 3.4+). Store the source and the pipeline (under `viewPipeline` so
+    // it doesn't collide with an aggregate's `pipeline`); `listCollections`
+    // surfaces it as `type: "view"` and `count` resolves through it.
+    if let Some(Bson::String(view_on)) = doc.get("viewOn") {
+        opts.insert("viewOn", view_on.clone());
+        let pipeline = doc
+            .get("pipeline")
+            .and_then(Bson::as_array)
+            .cloned()
+            .unwrap_or_default();
+        opts.insert("viewPipeline", Bson::Array(pipeline));
+    }
     let storage = ctx.storage()?;
     let created = storage
         .create_collection_with_options(&ctx.db_name, &coll, &opts)
@@ -362,21 +383,66 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         .map_err(command_error)?;
     let mut entries: Vec<Document> = Vec::with_capacity(names.len());
     for n in &names {
-        let options = storage
+        let mut options = storage
             .get_collection_options(&ctx.db_name, n)
             .map_err(command_error)?;
-        let coll_type = if options.contains_key("timeseries") {
+        // A `viewOn` collection is a read-only view: type "view", readOnly true,
+        // no `_id` index, and the stored `viewPipeline` surfaces as `pipeline`.
+        let is_view = options.contains_key("viewOn");
+        if let Some(p) = options.remove("viewPipeline") {
+            options.insert("pipeline", p);
+        }
+        // `uuid` is an internal option (the collection identity) — it's surfaced
+        // under `info.uuid`, not as a collection option. Strip it from `options`.
+        options.remove("uuid");
+        // mongod stores/reports capped `size` / `max` as int32; we may hold the
+        // driver-sent int64. Normalise so the round-tripped options match.
+        for k in ["size", "max"] {
+            if let Some(Bson::Int64(v)) = options.get(k) {
+                let v = *v;
+                options.insert(k, Bson::Int32(v as i32));
+            }
+        }
+        let coll_type = if is_view {
+            "view"
+        } else if options.contains_key("timeseries") {
             "timeseries"
         } else {
             "collection"
         };
-        entries.push(doc! {
+        // `info.uuid` is BinData(4) — driver CollectionSpecification readers
+        // (e.g. the go driver) read it as a Binary, so it must be present and the
+        // right type.
+        let mut info = doc! { "readOnly": is_view };
+        if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, n) {
+            if uuid.len() == 16 {
+                info.insert(
+                    "uuid",
+                    Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Uuid,
+                        bytes: uuid,
+                    }),
+                );
+            }
+        }
+        let mut entry = doc! {
             "name": n,
             "type": coll_type,
             "options": Bson::Document(options),
-            "info": { "readOnly": false },
-            "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
-        });
+            "info": info,
+        };
+        if !is_view {
+            entry.insert(
+                "idIndex",
+                doc! {
+                    "v": 2,
+                    "key": { "_id": 1 },
+                    "name": "_id_",
+                    "ns": format!("{}.{}", ctx.db_name, n),
+                },
+            );
+        }
+        entries.push(entry);
     }
     // `filter` is evaluated against the full entry (so `{name: …}`,
     // `{type: …}`, `{"options.capped": true}` all work); apply it before the
@@ -394,12 +460,16 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         }
     }
     let ns = format!("{}.$cmd.listCollections", ctx.db_name);
-    let (first, cid) = split_into_cursor(
-        encode_docs(entries)?,
-        DEFAULT_BATCH_SIZE as i64,
-        &ns,
-        cursors,
-    )?;
+    // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
+    // gets a real getMore (drivers' "listCollections getMore is monitored"
+    // tests force this); absent ⇒ the wire default.
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
@@ -808,6 +878,44 @@ pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
         // accidental real MongoDB on the same address. The Python server
         // reports `server: "python"`.
         "secantus": { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
+        "ok": 1.0,
+    })
+}
+
+/// `currentOp` — mongod's in-flight-operation introspection. SecantusDB runs
+/// commands synchronously and keeps no per-op registry, so the only operation
+/// "in progress" is the `currentOp` request itself. We emit one synthetic
+/// `inprog` entry carrying this connection's driver `clientMetadata` (captured
+/// from the handshake `client` doc), which is what the drivers' handshake-
+/// metadata tests read back. A client filter (e.g. `command.currentOp` /
+/// `$ownOps`) is accepted but not applied — the single self-op already matches
+/// the introspection queries the drivers issue.
+pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let client_metadata = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok())
+        .and_then(|g| g.client_metadata.clone());
+
+    let mut op = doc! {
+        "type": "op",
+        "host": "secantus",
+        "desc": "conn",
+        "connectionId": Bson::Int64(ctx.connection_id),
+        "active": true,
+        "op": "command",
+        "ns": format!("{}.$cmd", ctx.db_name),
+        "command": doc.clone(),
+        "opid": Bson::Int64(ctx.connection_id),
+        "secs_running": Bson::Int64(0),
+        "microsecs_running": Bson::Int64(0),
+    };
+    if let Some(meta) = client_metadata {
+        op.insert("clientMetadata", meta);
+    }
+
+    Ok(doc! {
+        "inprog": vec![Bson::Document(op)],
         "ok": 1.0,
     })
 }

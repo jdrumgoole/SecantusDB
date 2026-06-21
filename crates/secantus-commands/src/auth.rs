@@ -78,6 +78,9 @@ pub struct ConnectionAuth {
     /// The union of role bindings (`(role, db)`) the authenticated principals
     /// hold, used by the dispatcher's RBAC check.
     pub effective_roles: Vec<(String, String)>,
+    /// The driver `client` metadata document sent in the handshake (`hello`'s
+    /// `client` field), surfaced by `currentOp` as `clientMetadata`.
+    pub client_metadata: Option<Document>,
 }
 
 impl ConnectionAuth {
@@ -87,6 +90,7 @@ impl ConnectionAuth {
             next_conversation_id: 0,
             authenticated: Vec::new(),
             effective_roles: Vec::new(),
+            client_metadata: None,
         }
     }
 

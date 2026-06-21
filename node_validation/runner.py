@@ -169,7 +169,6 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
 
     storage_dir = tempfile.mkdtemp(prefix="secantus-node-gauge-")
     print(
@@ -177,7 +176,7 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+    def _spawn_daemon(*, with_auth: bool) -> tuple[subprocess.Popen, str, int]:
         cmd = [
             sys.executable,
             "-m",
@@ -185,7 +184,7 @@ def main() -> int:
             "--host",
             host,
             "--port",
-            str(port),
+            "0",
             "--storage-path",
             storage_dir,
             "--log-level",
@@ -194,16 +193,13 @@ def main() -> int:
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(
-            gauge_common.for_server(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+        # Each phase binds its own port; seeded users persist via storage_dir.
+        return gauge_common.spawn_daemon(cmd, label="node_validation")
 
-    print(
-        f"node_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr
-    )
-    daemon = _spawn_daemon(with_auth=False)
+    print("node_validation: phase 1 — seeding daemon (no --auth)", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=False)
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "node_validation")
         print("node_validation: seeding root-user", file=sys.stderr)
         import pymongo
@@ -221,14 +217,9 @@ def main() -> int:
             daemon.kill()
             daemon.wait()
 
-    print(
-        f"node_validation: phase 2 — running gauge with --auth on {host}:{port}",
-        file=sys.stderr,
-    )
-    daemon = _spawn_daemon(with_auth=True)
+    print("node_validation: phase 2 — running gauge with --auth", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=True)
     try:
-        _wait_for_listener(host, port)
-
         env = os.environ.copy()
         env["MONGODB_URI"] = (
             f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"

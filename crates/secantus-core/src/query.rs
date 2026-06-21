@@ -141,6 +141,79 @@ fn is_operator_dict(d: &Document) -> bool {
     !d.is_empty() && d.keys().all(|k| k.starts_with('$'))
 }
 
+/// Field-level query operators this engine recognises (incl. the geo/regex
+/// sub-operators handled specially). Used only for error messages — see
+/// [`first_unknown_operator`].
+const KNOWN_FIELD_OPS: &[&str] = &[
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$exists",
+    "$not",
+    "$type",
+    "$size",
+    "$all",
+    "$elemMatch",
+    "$mod",
+    "$bitsAllSet",
+    "$bitsAnySet",
+    "$bitsAllClear",
+    "$bitsAnyClear",
+    "$geoWithin",
+    "$geoIntersects",
+    "$near",
+    "$nearSphere",
+    "$regex",
+    "$options",
+    "$geometry",
+    "$center",
+    "$centerSphere",
+    "$box",
+    "$polygon",
+    "$minDistance",
+    "$maxDistance",
+];
+
+/// The first unrecognised field-level operator in a filter (recursing through
+/// `$and`/`$or`/`$nor`), e.g. `$badOperator` for `{x: {$badOperator: 1}}`. Lets
+/// the command layer build mongod's "unknown operator"-style message (which the
+/// drivers' error-document tests assert names the offending operator) instead of
+/// a generic one. `None` when no field operator is unrecognised.
+pub fn first_unknown_operator(filter: &Document) -> Option<String> {
+    for (k, v) in filter.iter() {
+        if k == "$and" || k == "$or" || k == "$nor" {
+            if let Bson::Array(arr) = v {
+                for sub in arr {
+                    if let Bson::Document(d) = sub {
+                        if let Some(op) = first_unknown_operator(d) {
+                            return Some(op);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if k.starts_with('$') {
+            continue; // other document-level operators ($expr/$text/$comment/...)
+        }
+        if let Bson::Document(d) = v {
+            if is_operator_dict(d) {
+                for op in d.keys() {
+                    if !KNOWN_FIELD_OPS.contains(&op.as_str()) {
+                        return Some(op.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
     match cond {
         // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.
@@ -322,14 +395,58 @@ fn eq_with_array(values: &[Option<&Bson>], expected: &Bson, coll: Option<&Collat
     Ok(false)
 }
 
+/// Element-wise array equality (same length, each pair `eq_scalar`-equal).
+/// A `Document`/exotic element keeps `eq_scalar`'s `Fallback`, so arrays of such
+/// elements still defer to Python rather than diverge.
+fn array_eq(a: &[Bson], b: &[Bson], coll: Option<&Collation>) -> R {
+    if a.len() != b.len() {
+        return Ok(false);
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if !eq_scalar(x, y, coll)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Embedded-document equality. mongod (and the Python oracle) compare embedded
+/// documents ORDER-SENSITIVELY: `{w:21,h:14}` does not match a stored `{h:14,
+/// w:21}`. So compare key/value pairs pairwise in field order.
+fn doc_eq(a: &Document, b: &Document, coll: Option<&Collation>) -> R {
+    if a.len() != b.len() {
+        return Ok(false);
+    }
+    for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
+        if ka != kb || !eq_scalar(va, vb, coll)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
-    // Compound / regex / exotic expected -> structural or special semantics we
-    // don't reproduce: defer to Python.
-    if matches!(
-        expected,
-        Bson::RegularExpression(_) | Bson::Document(_) | Bson::Array(_)
-    ) || is_exotic(expected)
-    {
+    // Array equality: `{field: [a, b, c]}` matches when the stored value is an
+    // array equal element-by-element (same length, each pair `eq_scalar`-equal).
+    // The "field-is-an-array-containing-this-array" nested case is handled by the
+    // caller (`eq_with_array`), which also tries each element against `expected`.
+    if let Bson::Array(exp) = expected {
+        return match v {
+            Bson::Array(val) => array_eq(val, exp, coll),
+            _ => Ok(false),
+        };
+    }
+    // Embedded-document equality: `{field: {a: 1}}` (a non-operator subdoc)
+    // matches a stored document equal field-by-field. Python compares decoded
+    // dicts with `==` (key-based, order-insensitive), so mirror that here.
+    if let Bson::Document(exp) = expected {
+        return match v {
+            Bson::Document(val) => doc_eq(val, exp, coll),
+            _ => Ok(false),
+        };
+    }
+    // Regex / exotic expected -> special semantics we don't reproduce: defer.
+    if matches!(expected, Bson::RegularExpression(_)) || is_exotic(expected) {
         return Err(Fallback);
     }
     let v_bool = matches!(v, Bson::Boolean(_));
@@ -373,18 +490,22 @@ fn cmp_op(
 ) -> R {
     for v in values {
         let Some(val) = v else { continue };
-        if let Some(o) = compare_values(val, target, coll)? {
-            if pred(o) {
-                return Ok(true);
-            }
-        }
         if let Bson::Array(arr) = val {
+            // Multikey field: match if any element satisfies the bound. mongod
+            // does NOT compare the array-as-a-whole against a scalar bound (an
+            // array always out-ranks a number in BSON type order, which would
+            // make every array field match), so the whole-array compare is
+            // deliberately skipped here.
             for e in arr {
                 if let Some(o) = compare_values(e, target, coll)? {
                     if pred(o) {
                         return Ok(true);
                     }
                 }
+            }
+        } else if let Some(o) = compare_values(val, target, coll)? {
+            if pred(o) {
+                return Ok(true);
             }
         }
     }

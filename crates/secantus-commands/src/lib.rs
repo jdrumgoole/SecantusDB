@@ -113,6 +113,10 @@ pub struct CommandContext {
     /// Server-wide `configureFailPoint` registry. `None` in unit-test contexts;
     /// the server wires one in so `failCommand` short-circuits in dispatch.
     pub failpoints: Option<Arc<failpoints::FailPointRegistry>>,
+    /// Set by a `failCommand` failpoint with `closeConnection: true` — the
+    /// server drops the socket after dispatch instead of replying, so the driver
+    /// sees a network error (the drivers' retryability / socket-error tests).
+    pub close_connection: bool,
 }
 
 impl CommandContext {
@@ -135,6 +139,7 @@ impl CommandContext {
             conn_auth: None,
             peer_cert_dn: None,
             failpoints: None,
+            close_connection: false,
         }
     }
 
@@ -203,11 +208,16 @@ impl CommandContext {
 
 /// A command failure carrying mongod's error triple. Shaped into an `ok: 0`
 /// reply by [`CommandError::into_reply`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandError {
     pub code: i32,
     pub code_name: String,
     pub errmsg: String,
+    /// Extra top-level fields merged into the error reply (e.g. a DuplicateKey's
+    /// `keyPattern` / `keyValue`). `None` for the common case — boxed so the
+    /// error type stays small in `Result`. (`bson::Document` is `PartialEq` but
+    /// not `Eq`, so this type is `PartialEq`-only.)
+    pub extra: Option<Box<Document>>,
 }
 
 impl CommandError {
@@ -216,7 +226,14 @@ impl CommandError {
             code,
             code_name: code_name.into(),
             errmsg: errmsg.into(),
+            extra: None,
         }
+    }
+
+    /// Attach extra top-level fields to the error reply (merged by `into_reply`).
+    pub fn with_extra(mut self, extra: Document) -> Self {
+        self.extra = Some(Box::new(extra));
+        self
     }
 
     /// `59 CommandNotFound` for an unregistered command name.
@@ -224,14 +241,21 @@ impl CommandError {
         CommandError::new(59, "CommandNotFound", format!("no such command: '{name}'"))
     }
 
-    /// The standard `{ok: 0, errmsg, code, codeName}` reply document.
+    /// The standard `{ok: 0, errmsg, code, codeName}` reply document, plus any
+    /// `extra` fields (e.g. `keyPattern` / `keyValue`).
     pub fn into_reply(self) -> Document {
-        doc! {
+        let mut reply = doc! {
             "ok": 0.0,
             "errmsg": self.errmsg,
             "code": self.code,
             "codeName": self.code_name,
+        };
+        if let Some(extra) = self.extra {
+            for (k, v) in *extra {
+                reply.insert(k, v);
+            }
         }
+        reply
     }
 }
 
@@ -253,6 +277,7 @@ fn lookup(name: &str) -> Option<Handler> {
     Some(match name {
         "hello" | "isMaster" | "ismaster" => handshake::hello,
         "ping" => handshake::ping,
+        "replSetGetStatus" => handshake::repl_set_get_status,
         "buildInfo" | "buildinfo" => handshake::build_info,
         "insert" => crud::insert,
         "update" => crud::update,
@@ -281,6 +306,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "collStats" => admin::coll_stats,
         "dbStats" => admin::db_stats,
         "serverStatus" => admin::server_status,
+        "currentOp" => admin::current_op,
         "validate" => admin::validate,
         "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
@@ -415,6 +441,12 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if let Some(m) = &fp {
                 if m.block_time_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(m.block_time_ms as u64));
+                }
+                // closeConnection: flag the socket for the server to drop after
+                // dispatch (the reply is discarded). mongod sends nothing back.
+                if m.close_connection {
+                    ctx.close_connection = true;
+                    return doc! { "ok": 1.0 };
                 }
                 if let Some(code) = m.error_code {
                     let mut reply = CommandError::new(
@@ -948,6 +980,7 @@ fn is_no_privilege_command(name: &str) -> bool {
             | "connectionStatus"
             | "abortTransaction"
             | "commitTransaction"
+            | "replSetGetStatus"
     )
 }
 
@@ -989,6 +1022,7 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "revokeRolesFromRole" => (A_REVOKE_ROLE, SCOPE_DATABASE),
         "rolesInfo" => (A_VIEW_ROLE, SCOPE_DATABASE),
         "serverStatus" => (A_SERVER_STATUS, SCOPE_CLUSTER),
+        "currentOp" => (A_INPROG, SCOPE_CLUSTER),
         "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
         "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),

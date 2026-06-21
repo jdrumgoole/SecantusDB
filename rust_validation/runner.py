@@ -118,9 +118,7 @@ def main() -> int:
         return 2
 
     RAW_OUT.parent.mkdir(exist_ok=True)
-    port = _free_port()
     storage = Path(tempfile.mkdtemp(prefix="secantus-rust-gauge-"))
-    uri = f"mongodb://127.0.0.1:{port}/"
 
     daemon_cmd = [
         sys.executable,
@@ -129,20 +127,20 @@ def main() -> int:
         "--host",
         "127.0.0.1",
         "--port",
-        str(port),
+        "0",
         "--storage-path",
         str(storage),
         "--log-level",
         "WARNING",
     ]
-    daemon_cmd = gauge_common.for_server(daemon_cmd)
+    # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+    daemon, host, port = gauge_common.spawn_daemon(daemon_cmd, label="rust_validation")
+    uri = f"mongodb://{host}:{port}/"
     print(
-        f"rust_validation: launching {gauge_common.gauge_server()} SecantusDB → {uri}",
+        f"rust_validation: launched {gauge_common.gauge_server()} SecantusDB → {uri}",
         file=sys.stderr,
     )
-    daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        _wait_for_listener(port)
         _verify_secantus(uri)
         rc, raw = _run_cargo_tests(uri)
     finally:

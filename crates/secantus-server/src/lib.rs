@@ -308,6 +308,12 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
 /// TLS handshake (extracting the client cert DN) or plaintext, before driving
 /// the request loop in [`serve`].
 fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+    // The listener is non-blocking and (on macOS/BSD) the accepted socket
+    // inherits O_NONBLOCK. Put it back to blocking so a large `write_all` (a
+    // reply bigger than the kernel send buffer, ~1 MB) blocks until drained
+    // instead of failing with WouldBlock and dropping the connection. Reads
+    // still get a timeout via `set_read_timeout` (blocking-with-timeout).
+    tcp.set_nonblocking(false)?;
     tcp.set_read_timeout(Some(READ_POLL))?;
     let conn_id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
     // Per-connection auth state, shared across every request on this socket so a
@@ -408,7 +414,13 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let reply = run_dispatch(&request, conn_id, shared, conn_auth, &peer_cert_dn);
+                let (reply, close_conn) =
+                    run_dispatch(&request, conn_id, shared, conn_auth, &peer_cert_dn);
+                // A `closeConnection` failpoint drops the socket without replying,
+                // so the driver observes a network error.
+                if close_conn {
+                    return Ok(());
+                }
                 if !more_to_come {
                     write_op_msg(stream, &header, shared, &reply)?;
                 }
@@ -520,18 +532,21 @@ fn merge_op_msg_body(msg: &OpMsg) -> Result<Document, WireError> {
     Ok(body)
 }
 
+/// Dispatch one request, returning the reply plus whether the connection should
+/// be dropped (a `closeConnection` failpoint fired — the reply is discarded).
 fn run_dispatch(
     request: &Document,
     conn_id: i64,
     shared: &Arc<Shared>,
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
     peer_cert_dn: &Option<String>,
-) -> Document {
+) -> (Document, bool) {
     let mut ctx = make_context(conn_id, shared, conn_auth, peer_cert_dn);
     if let Ok(db) = request.get_str("$db") {
         ctx.db_name = db.to_string();
     }
-    dispatch(request, &mut ctx)
+    let reply = dispatch(request, &mut ctx);
+    (reply, ctx.close_connection)
 }
 
 fn make_context(

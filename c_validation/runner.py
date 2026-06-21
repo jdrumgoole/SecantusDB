@@ -183,36 +183,31 @@ def main() -> int:
     RAW_OUT.unlink(missing_ok=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-c-gauge-")
+    # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+    daemon, host, port = gauge_common.spawn_daemon(
+        [
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            host,
+            "--port",
+            "0",
+            "--storage-path",
+            storage_dir,
+            "--log-level",
+            "WARNING",
+        ],
+        label="c_validation",
+    )
     print(
-        f"c_validation: starting daemon on {host}:{port} "
+        f"c_validation: started daemon on {host}:{port} "
         f"(storage {storage_dir}, will be cleaned up)",
         file=sys.stderr,
     )
-
-    daemon = subprocess.Popen(
-        gauge_common.for_server(
-            [
-                sys.executable,
-                "-m",
-                "secantus",
-                "--host",
-                host,
-                "--port",
-                str(port),
-                "--storage-path",
-                storage_dir,
-                "--log-level",
-                "WARNING",
-            ]
-        ),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
     skip_file: Path | None = None
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "c_validation")
 
         env = os.environ.copy()

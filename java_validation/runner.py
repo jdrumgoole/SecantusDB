@@ -225,7 +225,6 @@ def main() -> int:
     RESULTS_DIR.mkdir(parents=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
 
     # Tempdir storage so the user records we seed in phase 1 survive
     # the daemon restart in phase 2 with --auth.
@@ -235,7 +234,7 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+    def _spawn_daemon(*, with_auth: bool) -> tuple[subprocess.Popen, str, int]:
         cmd = [
             sys.executable,
             "-m",
@@ -243,7 +242,7 @@ def main() -> int:
             "--host",
             host,
             "--port",
-            str(port),
+            "0",
             "--storage-path",
             storage_dir,
             "--log-level",
@@ -260,16 +259,13 @@ def main() -> int:
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(
-            gauge_common.for_server(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+        # Each phase binds its own port; seeded users persist via storage_dir.
+        return gauge_common.spawn_daemon(cmd, label="java_validation")
 
-    print(
-        f"java_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr
-    )
-    daemon = _spawn_daemon(with_auth=False)
+    print("java_validation: phase 1 — seeding daemon (no --auth)", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=False)
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "java_validation")
         print("java_validation: seeding root-user", file=sys.stderr)
         import pymongo
@@ -287,14 +283,9 @@ def main() -> int:
             daemon.kill()
             daemon.wait()
 
-    print(
-        f"java_validation: phase 2 — running gauge with --auth on {host}:{port}",
-        file=sys.stderr,
-    )
-    daemon = _spawn_daemon(with_auth=True)
+    print("java_validation: phase 2 — running gauge with --auth", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=True)
     try:
-        _wait_for_listener(host, port)
-
         uri = f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"
         env = os.environ.copy()
         if java_home_override:
