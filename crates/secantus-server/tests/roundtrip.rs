@@ -299,6 +299,99 @@ fn find_getmore_killcursors_over_the_wire() {
     );
 }
 
+/// Send an OP_MSG with the `exhaustAllowed` flag (1<<16), then read replies
+/// until one arrives without the `moreToCome` bit (1<<1). Returns every reply
+/// document in stream order.
+fn op_msg_exhaust(stream: &mut TcpStream, request_id: i32, body: &Document) -> Vec<Document> {
+    let body_bytes = enc(body);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(1u32 << 16).to_le_bytes()); // exhaustAllowed
+    payload.push(0u8); // kind 0
+    payload.extend_from_slice(&body_bytes);
+    let msg_len = (16 + payload.len()) as i32;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&msg_len.to_le_bytes());
+    frame.extend_from_slice(&request_id.to_le_bytes());
+    frame.extend_from_slice(&0i32.to_le_bytes()); // responseTo
+    frame.extend_from_slice(&OP_MSG.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame).unwrap();
+
+    let mut replies = Vec::new();
+    loop {
+        let header = read_exact(stream, 16);
+        let total = i32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let rest = read_exact(stream, total - 16);
+        let flags = u32::from_le_bytes(rest[0..4].try_into().unwrap());
+        assert_eq!(rest[4], 0, "kind 0 section");
+        replies.push(Document::from_reader(&mut &rest[5..]).unwrap());
+        if flags & (1 << 1) == 0 {
+            break; // moreToCome clear ⇒ last reply
+        }
+    }
+    replies
+}
+
+/// OP_MSG exhaust: a getMore with `exhaustAllowed` streams every remaining batch
+/// back over the same socket with `moreToCome`, ending with an empty `id: 0`
+/// reply — instead of one round-trip per getMore.
+#[test]
+fn exhaust_getmore_streams_remaining_batches() {
+    let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+    let cursors = Arc::new(CursorRegistry::new());
+    let server = bind("127.0.0.1:0", ServerConfig::default(), storage, cursors).unwrap();
+    let mut stream = connect(server.address());
+
+    op_msg(
+        &mut stream,
+        1,
+        &doc! {"insert": "c", "documents": [
+            {"_id": 1}, {"_id": 2}, {"_id": 3}, {"_id": 4}, {"_id": 5}
+        ], "$db": "t"},
+    );
+
+    // find batchSize 2 ⇒ live cursor (2 docs already delivered in firstBatch).
+    let reply = op_msg(
+        &mut stream,
+        2,
+        &doc! {"find": "c", "batchSize": 2, "$db": "t"},
+    );
+    let cid = reply.get_document("cursor").unwrap().get_i64("id").unwrap();
+    assert_ne!(cid, 0);
+
+    // Exhaust getMore: the server streams the remaining 3 docs across multiple
+    // moreToCome replies, then a final empty reply with cursor id 0.
+    let replies = op_msg_exhaust(
+        &mut stream,
+        3,
+        &doc! {"getMore": cid, "collection": "c", "batchSize": 2, "$db": "t"},
+    );
+    assert!(
+        replies.len() >= 2,
+        "exhaust should produce multiple replies"
+    );
+    let last = replies.last().unwrap();
+    assert_eq!(
+        last.get_document("cursor").unwrap().get_i64("id").unwrap(),
+        0,
+        "stream terminates with cursor id 0"
+    );
+    let streamed: usize = replies
+        .iter()
+        .map(|r| {
+            r.get_document("cursor")
+                .ok()
+                .and_then(|c| c.get_array("nextBatch").ok())
+                .map(|b| b.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    assert_eq!(
+        streamed, 3,
+        "remaining 3 docs streamed (2 were in firstBatch)"
+    );
+}
+
 /// Slow-loris defense (`ServerConfig::message_read_timeout`): a client that
 /// starts a wire message and then dribbles/stalls without completing it is
 /// dropped once the timeout elapses from the first byte — instead of pinning a

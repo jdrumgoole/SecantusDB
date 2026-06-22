@@ -32,7 +32,7 @@ use bson::{doc, Bson, Document};
 use secantus_commands::{dispatch, CommandContext, ConnectionAuth, CursorRegistry, Storage};
 use secantus_wire::{
     build_op_msg_reply, build_op_reply, Header, Op, OpMsg, WireError, HEADER_SIZE,
-    OP_MSG_FLAG_MORE_TO_COME,
+    OP_MSG_FLAG_EXHAUST_ALLOWED, OP_MSG_FLAG_MORE_TO_COME,
 };
 
 /// How long a connection read blocks before re-checking the shutdown flag, so
@@ -461,6 +461,7 @@ fn serve<S: Read + Write>(
         match secantus_wire::parse_body(header.op_code, &body) {
             Ok(Op::Msg(msg)) => {
                 let more_to_come = msg.flags & OP_MSG_FLAG_MORE_TO_COME != 0;
+                let exhaust_allowed = msg.flags & OP_MSG_FLAG_EXHAUST_ALLOWED != 0;
                 let request = match merge_op_msg_body(&msg) {
                     Ok(d) => d,
                     Err(e) => {
@@ -476,7 +477,31 @@ fn serve<S: Read + Write>(
                 if close_conn {
                     return Ok(());
                 }
-                if !more_to_come {
+                if more_to_come {
+                    // Fire-and-forget request (`w: 0` write): spec forbids a reply.
+                    continue;
+                }
+                // OP_MSG exhaust: a getMore with `exhaustAllowed` set streams every
+                // remaining batch back over the same socket with `moreToCome`,
+                // instead of one reply per getMore. mongod only streams on getMore
+                // (the find/aggregate reply that opens the cursor is sent normally).
+                if exhaust_allowed
+                    && request.contains_key("getMore")
+                    && matches!(reply.get("cursor"), Some(Bson::Document(_)))
+                {
+                    if !stream_exhaust_getmore(
+                        stream,
+                        &header,
+                        shared,
+                        &request,
+                        conn_id,
+                        conn_auth,
+                        &peer_cert_dn,
+                        reply,
+                    )? {
+                        return Ok(());
+                    }
+                } else {
                     write_op_msg(stream, &header, shared, &reply)?;
                 }
             }
@@ -648,6 +673,115 @@ fn write_op_msg<S: Write>(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, 0);
     stream.write_all(&frame)
+}
+
+/// Write one OP_MSG reply with the given flag bits (e.g. `moreToCome` for an
+/// exhaust-stream batch).
+fn write_op_msg_flags<S: Write>(
+    stream: &mut S,
+    header: &Header,
+    shared: &Arc<Shared>,
+    reply: &Document,
+    flags: u32,
+) -> io::Result<()> {
+    let mut body_bytes = Vec::with_capacity(256);
+    reply
+        .to_writer(&mut body_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, flags);
+    stream.write_all(&frame)
+}
+
+/// Stream the rest of an exhaust cursor over one socket. Called when a getMore
+/// arrives with the OP_MSG `exhaustAllowed` flag set: `first_reply` (the getMore
+/// handler's reply) and every subsequent batch are sent with `moreToCome` set,
+/// pulling further batches with synthetic getMores, until the cursor drains —
+/// then a final `id: 0` reply with `moreToCome` clear closes the stream. mongod
+/// keeps the cursor alive until a getMore returns an empty batch, so a cursor
+/// that drains on a non-empty batch still gets a trailing empty reply. Mirrors
+/// `server.py::_stream_exhaust_getmore`. `Ok(true)` = stream written (connection
+/// survives); `Ok(false)` = a write failed mid-stream (drop the connection).
+#[allow(clippy::too_many_arguments)]
+fn stream_exhaust_getmore<S: Write>(
+    stream: &mut S,
+    header: &Header,
+    shared: &Arc<Shared>,
+    request: &Document,
+    conn_id: i64,
+    conn_auth: &Arc<Mutex<ConnectionAuth>>,
+    peer_cert_dn: &Option<String>,
+    first_reply: Document,
+) -> io::Result<bool> {
+    let target_id = match request.get("getMore") {
+        Some(b) => b.clone(),
+        None => return Ok(true),
+    };
+    let coll = request.get_str("collection").unwrap_or("").to_string();
+    let db = request.get_str("$db").unwrap_or("admin").to_string();
+    let ns = first_reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get_str("ns").ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{db}.{coll}"));
+
+    let send = |stream: &mut S, doc: &Document, more: bool| -> io::Result<bool> {
+        let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
+        match write_op_msg_flags(stream, header, shared, doc, flags) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    };
+
+    let mut doc = first_reply;
+    loop {
+        let cursor = match doc.get("cursor") {
+            Some(Bson::Document(c)) => c.clone(),
+            // An error reply (ok: 0) mid-stream — deliver it without moreToCome.
+            _ => return send(stream, &doc, false),
+        };
+        let batch: Vec<Bson> = cursor
+            .get_array("nextBatch")
+            .or_else(|_| cursor.get_array("firstBatch"))
+            .cloned()
+            .unwrap_or_default();
+        let drained = cursor.get_i64("id").unwrap_or(0) == 0;
+        if drained {
+            if !batch.is_empty()
+                && !send(
+                    stream,
+                    &doc! {"cursor": {"nextBatch": batch, "id": target_id.clone(), "ns": &ns}, "ok": 1.0},
+                    true,
+                )?
+            {
+                return Ok(false);
+            }
+            let empty: Vec<Bson> = Vec::new();
+            return send(
+                stream,
+                &doc! {"cursor": {"nextBatch": empty, "id": 0i64, "ns": &ns}, "ok": 1.0},
+                false,
+            );
+        }
+        if batch.is_empty() {
+            // A live cursor that yielded nothing (tailable/awaitData wait expired):
+            // deliver this empty batch without moreToCome and stop streaming so we
+            // don't spin. Normal cursors never reach here (empty drains id to 0).
+            return send(stream, &doc, false);
+        }
+        if !send(stream, &doc, true)? {
+            return Ok(false);
+        }
+        let mut getmore = doc! {"getMore": target_id.clone(), "collection": &coll, "$db": &db};
+        if let Some(bs) = request.get("batchSize") {
+            getmore.insert("batchSize", bs.clone());
+        }
+        if let Some(mt) = request.get("maxTimeMS") {
+            getmore.insert("maxTimeMS", mt.clone());
+        }
+        let (reply, _close) = run_dispatch(&getmore, conn_id, shared, conn_auth, peer_cert_dn);
+        doc = reply;
+    }
 }
 
 fn write_op_reply<S: Write>(
