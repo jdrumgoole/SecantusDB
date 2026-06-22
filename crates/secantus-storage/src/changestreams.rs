@@ -43,6 +43,9 @@ pub struct ResumeTokenData {
     pub ts: Timestamp,
     pub ns: String,
     pub document_key: Document,
+    /// True for the token of an `invalidate` event. `resumeAfter` on such a token
+    /// is rejected (the stream it came from is over); `startAfter` is required.
+    pub from_invalidate: bool,
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -70,6 +73,9 @@ pub fn make_resume_token(data: &ResumeTokenData) -> Result<Document> {
     inner.insert("t", Bson::Timestamp(data.ts));
     inner.insert("n", data.ns.clone());
     inner.insert("k", Bson::Document(data.document_key.clone()));
+    if data.from_invalidate {
+        inner.insert("i", true);
+    }
     let bytes = encode_doc(&inner)?;
     let mut out = Document::new();
     out.insert("_data", hex_encode(&bytes));
@@ -100,6 +106,7 @@ pub fn parse_resume_token(token: &Document) -> Result<ResumeTokenData> {
         ts,
         ns: inner.get_str("n").unwrap_or("").to_string(),
         document_key: inner.get_document("k").cloned().unwrap_or_default(),
+        from_invalidate: inner.get_bool("i").unwrap_or(false),
     })
 }
 
@@ -299,6 +306,7 @@ pub fn project(
             ts,
             ns: ns.clone(),
             document_key: document_key.clone(),
+            from_invalidate: false,
         })?;
         let mut event = Document::new();
         event.insert("_id", Bson::Document(token));
@@ -375,6 +383,7 @@ fn project_command(
             ts,
             ns: affected_ns.to_string(),
             document_key: Document::new(),
+            from_invalidate: false,
         })?;
         let mut event = Document::new();
         event.insert("_id", Bson::Document(token));
@@ -574,6 +583,7 @@ pub fn invalidate_event(seq: i64, oplog_entry: &Document) -> Result<Document> {
         ts,
         ns: affected_ns,
         document_key: Document::new(),
+        from_invalidate: true,
     })?;
     let mut event = Document::new();
     event.insert("_id", Bson::Document(token));

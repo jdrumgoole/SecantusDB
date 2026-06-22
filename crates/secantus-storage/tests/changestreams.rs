@@ -349,6 +349,7 @@ fn resume_token_round_trips() {
         },
         ns: "app.c".into(),
         document_key: doc! {"_id": 7},
+        from_invalidate: false,
     };
     let token = changestreams::make_resume_token(&data).unwrap();
     let parsed = changestreams::parse_resume_token(&token).unwrap();

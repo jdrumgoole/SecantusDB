@@ -194,6 +194,12 @@ impl CmdStorage for StorageAdapter {
         changestreams::parse_resume_token(token).ok().map(|d| d.seq)
     }
 
+    fn resume_token_from_invalidate(&self, token: &Document) -> bool {
+        changestreams::parse_resume_token(token)
+            .map(|d| d.from_invalidate)
+            .unwrap_or(false)
+    }
+
     fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {
         let ts = self.inner.peek_cluster_time().unwrap_or(bson::Timestamp {
             time: 0,
@@ -204,6 +210,7 @@ impl CmdStorage for StorageAdapter {
             ts,
             ns: String::new(),
             document_key: Document::new(),
+            from_invalidate: false,
         };
         match changestreams::make_resume_token(&data) {
             Ok(doc) => {

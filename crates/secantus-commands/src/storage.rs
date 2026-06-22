@@ -200,6 +200,13 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// Whether a resume token is for an `invalidate` event. `resumeAfter` on such
+    /// a token is rejected (the stream it came from is over) — mongod requires
+    /// `startAfter` instead (`InvalidResumeToken`, 260). Default: `false`.
+    fn resume_token_from_invalidate(&self, _token: &Document) -> bool {
+        false
+    }
+
     /// A high-water-mark resume token at oplog `seq` and the current cluster
     /// time, encoded as `bson::encode({_data: "<hex>"})`. Returned as the
     /// `postBatchResumeToken` of an empty change-stream batch so the client can

@@ -190,6 +190,20 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     //   resumeAfter / startAfter — the token's seq (resume just past it)
     //   startAtOperationTime     — one before the first seq at/after the ts
     //   neither                  — the current oplog tail (fresh stream)
+    // `resumeAfter` cannot point at an invalidate event's token — the stream it
+    // came from is over; mongod requires `startAfter` for that (InvalidResumeToken,
+    // 260). `startAfter` with the same token is allowed.
+    if let Some(tok) = cs_spec.get("resumeAfter").and_then(Bson::as_document) {
+        if storage.resume_token_from_invalidate(tok) {
+            return Ok(CommandError::new(
+                260,
+                "InvalidResumeToken",
+                "Attempting to resume a change stream using 'resumeAfter' is not allowed \
+                 from an invalidate notification; use 'startAfter' instead",
+            )
+            .into_reply());
+        }
+    }
     let resume_token = cs_spec
         .get("resumeAfter")
         .or_else(|| cs_spec.get("startAfter"))
@@ -231,22 +245,17 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // validated against the change-stream allow-list and applied to each event.
     let user_pipeline = extract_change_stream_pipeline(doc)?;
 
-    // The high-water-mark resume token at the start position — mongod returns it
-    // as the open reply's `postBatchResumeToken` so a client that sees an empty
-    // first batch still has a token to resume from before any event arrives.
-    let open_pbrt = {
-        let bytes = storage.high_water_mark_token(position);
-        if bytes.is_empty() {
-            None
-        } else {
-            Document::from_reader(&mut bytes.as_slice())
-                .ok()
-                .map(Bson::Document)
-        }
-    };
+    // The open reply's firstBatch size (the rest is buffered for getMore).
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64)
+        .max(0) as usize;
 
-    let producer = Box::new(ChangeStreamProducer {
-        storage,
+    let mut producer = Box::new(ChangeStreamProducer {
+        storage: storage.clone(),
         scope,
         opts,
         position,
@@ -256,6 +265,33 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         fatal_error: None,
     });
 
+    // Poll once so events already available at the start position (the common
+    // case when resuming past a token whose successors exist) ride the open
+    // reply's firstBatch. pymongo's `_has_next()` only inspects the client-side
+    // buffer, so an empty firstBatch on a resumed stream would be wrongly read as
+    // "no changes"; mongod and the Python server populate it here too. The
+    // producer advances its position past whatever it returns; the overflow
+    // beyond `batchSize` is buffered for the first getMore.
+    let mut initial = producer.produce();
+    let split = batch_size.min(initial.len());
+    let remainder = initial.split_off(split);
+    let first_batch_bytes = initial;
+    let open_position = producer.position();
+
+    // The high-water-mark resume token at the (post-poll) position — mongod
+    // returns it as the open reply's `postBatchResumeToken` so a client that sees
+    // an empty first batch still has a token to resume from.
+    let open_pbrt = {
+        let bytes = storage.high_water_mark_token(open_position);
+        if bytes.is_empty() {
+            None
+        } else {
+            Document::from_reader(&mut bytes.as_slice())
+                .ok()
+                .map(Bson::Document)
+        }
+    };
+
     let cursors = ctx.cursors()?;
     let cursor_id = cursors
         .register_tailable(
@@ -264,9 +300,9 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             TailableOptions {
                 await_data: true,
                 no_cursor_timeout: false,
-                position_seq: position,
+                position_seq: open_position,
                 collection_uuid: None,
-                initial_remaining: Vec::new(),
+                initial_remaining: remainder,
             },
         )
         .map_err(|e| {
@@ -277,10 +313,16 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             )
         })?;
 
-    // An opening change-stream aggregate always returns an empty firstBatch;
-    // the client drives the stream with getMore.
+    // firstBatch carries any events already pending at open (mongod returns an
+    // empty firstBatch only when nothing was waiting); getMore drives the rest.
+    let mut first_batch = Vec::with_capacity(first_batch_bytes.len());
+    for bytes in first_batch_bytes {
+        let d = Document::from_reader(&mut bytes.as_slice())
+            .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+        first_batch.push(Bson::Document(d));
+    }
     let mut cursor_doc = doc! {
-        "firstBatch": Bson::Array(vec![]),
+        "firstBatch": Bson::Array(first_batch),
         "id": Bson::Int64(cursor_id),
         "ns": ns,
     };
