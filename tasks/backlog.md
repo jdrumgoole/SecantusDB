@@ -934,8 +934,10 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   conversion edges; `$round`/`$pow`/`$trunc` (rounding mode) and the
   transcendentals `$exp`/`$ln`/`$log`/`$log10` (last-ULP vs Python's libm);
   `$sortArray` (Python `sorted()` ordering/stability, raises on mixed types);
-  `$rand` (non-deterministic); non-ASCII `$toLower`/`$toUpper` and
-  default-whitespace `$trim`. Each is a deliberate fallback, not a gap.
+  non-ASCII `$toLower`/`$toUpper` and default-whitespace `$trim`. Each is a
+  deliberate fallback, not a gap. (`$rand` is the lone exception that is
+  *evaluated* in Rust rather than deferred — see the "now also handled" item —
+  because deferring would error the standalone server, which has no Python.)
 - [x] **Widen the Rust expression evaluator** — now also handled:
   `$slice`/`$indexOfArray`; ASCII `$concat`/`$toLower`/`$toUpper`/`$strLenCP`/
   `$split`/`$substrCP`; `$mergeObjects`/`$objectToArray`; the scope-introducing
@@ -946,7 +948,9 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   strings); exactly-deterministic math (`$abs`/`$floor`/`$ceil`/`$sqrt`); and
   `$range`/`$strLenBytes`/`$arrayToObject`; and the date-arithmetic ops
   `$dateAdd`/`$dateSubtract`/`$dateDiff`/`$dateTrunc` (UTC, civil-date math —
-  see the "Date arithmetic" item). Remaining whole-call fallbacks to widen
+  see the "Date arithmetic" item); and `$rand` (uniform double in [0, 1) via the
+  `rand` crate — evaluated directly, not byte-pinned to Python, since the
+  standalone server has no Python to defer to). Remaining whole-call fallbacks to widen
   where faithful: `$dateToString`/`$dateFromString` (timezones, `strftime`/
   `strptime`); `$round`/`$pow`/`$trunc` (rounding mode) and transcendental math
   (`$exp`/`$ln`/`$log`/`$log10` — last-ULP divergence risk vs Python's libm);

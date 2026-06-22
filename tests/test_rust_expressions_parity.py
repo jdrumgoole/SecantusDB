@@ -320,6 +320,21 @@ def test_curated_parity(expr, doc):
     assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
 
 
+def test_rand_shape_parity():
+    # $rand is non-deterministic — the engines can't agree bit-for-bit, only on
+    # the shape: a float in [0, 1). Verify both produce that (and that the Rust
+    # engine evaluates it, not defers), and that a malformed arg defers/raises.
+    for _ in range(64):
+        rust = _rust_eval({"$rand": {}}, {})
+        assert isinstance(rust, float) and 0.0 <= rust < 1.0, f"rust $rand={rust!r}"
+        py = _pure.evaluate({"$rand": {}}, {})
+        assert isinstance(py, float) and 0.0 <= py < 1.0, f"pure $rand={py!r}"
+    # Non-empty argument: Rust defers (None), Python raises a parse error.
+    assert _rust_eval({"$rand": {"x": 1}}, {}) is None
+    with pytest.raises(_pure.ExpressionError):
+        _pure.evaluate({"$rand": {"x": 1}}, {})
+
+
 def _rand_scalar(rng):
     return rng.choice(
         [rng.randint(-20, 20), round(rng.uniform(-9, 9), 2), "a", "bb", "z", True, False, None]

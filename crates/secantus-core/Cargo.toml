@@ -1,6 +1,6 @@
 [package]
 name = "secantus-core"
-version = "0.5.3-beta.56"
+version = "0.5.3-beta.57"
 edition = "2021"
 description = "Pure-Rust operator engines for SecantusDB (sort keys, query matcher, update operators, aggregation-expression evaluator, projection, change-stream diff, aggregation pipeline)."
 license = "GPL-2.0-only"
@@ -27,3 +27,7 @@ geo = "0.28"
 # backtrack; patterns it can't compile (backreferences / lookaround) signal
 # `Fallback`, matching the "defer to Python `re`" contract for the parity vehicle.
 regex = "1"
+# `$rand` — a uniform random double in [0, 1). Inherently non-deterministic, so
+# it's NOT byte-pinned to the Python evaluator (no parity corpus case); both
+# engines independently produce a fresh value in range.
+rand = "0.9"

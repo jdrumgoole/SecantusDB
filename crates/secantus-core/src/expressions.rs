@@ -30,9 +30,11 @@
 //! `$convert`/`$toDecimal` + float-`str()` / string-parse / Decimal128
 //! conversions; `$round`/`$pow`/`$trunc` (rounding mode) and transcendentals
 //! (`$exp`/`$ln`/`$log`/`$log10` — last-ULP) risk float divergence; `$sortArray`
-//! depends on Python's `sorted()` ordering/stability; `$rand` is
-//! non-deterministic; and non-ASCII case / default-whitespace trim. All defer
-//! to the authoritative pure-Python evaluator.
+//! depends on Python's `sorted()` ordering/stability; and non-ASCII case /
+//! default-whitespace trim. All defer to the authoritative pure-Python
+//! evaluator. `$rand` is non-deterministic, so it's evaluated here directly (a
+//! fresh double in [0, 1)) rather than deferred — the two engines agree on the
+//! value's shape, not its bits.
 
 use std::cmp::Ordering;
 
@@ -235,7 +237,21 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$range" => op_range(arg, ctx),
         "$strLenBytes" => op_str_len_bytes(arg, ctx),
         "$arrayToObject" => op_array_to_object(arg, ctx),
+        // non-deterministic: a fresh uniform double in [0, 1) (mirrors
+        // `expressions._op_rand` / `random.random()`; not byte-pinned to it).
+        "$rand" => op_rand(arg),
         _ => Err(Fallback),
+    }
+}
+
+/// `$rand`: a uniform random double in [0, 1). The argument must be an empty
+/// document (anything else is a parse error in mongod). Mirrors
+/// `expressions._op_rand` — non-deterministic, so the two engines agree on the
+/// *shape* (a double in range), not the exact value.
+fn op_rand(arg: &Bson) -> R {
+    match arg {
+        Bson::Document(d) if d.is_empty() => Ok(Bson::Double(rand::random::<f64>())),
+        _ => Err(Fallback), // non-empty / wrong-typed arg -> Python raises
     }
 }
 
@@ -1818,6 +1834,24 @@ mod tests {
             Bson::String("hi".into())
         );
         assert_eq!(ev(doc! {}, Bson::String("$missing".into())), Bson::Null);
+    }
+
+    #[test]
+    fn rand_returns_double_in_unit_interval() {
+        for _ in 0..256 {
+            match evaluate(&doc! {}, &bson::bson!({"$rand": {}}), &Document::new()).unwrap() {
+                Bson::Double(v) => assert!((0.0..1.0).contains(&v), "out of range: {v}"),
+                other => panic!("$rand returned non-double: {other:?}"),
+            }
+        }
+        // Non-empty / wrong-typed argument defers (Python raises a parse error).
+        assert!(evaluate(
+            &doc! {},
+            &bson::bson!({"$rand": {"x": 1}}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(&doc! {}, &bson::bson!({"$rand": 5}), &Document::new()).is_err());
     }
 
     #[test]
