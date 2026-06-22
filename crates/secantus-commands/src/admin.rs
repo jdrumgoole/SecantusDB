@@ -356,7 +356,13 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .drop_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
     if !existed {
-        return Ok(CommandError::new(26, "NamespaceNotFound", "ns not found").into_reply());
+        // Modern mongod treats `drop` of a non-existent collection as an
+        // idempotent success (`{ok: 1}`), not a NamespaceNotFound error. The
+        // ok:1 shape also lets dispatch attach a `writeConcernError` for an
+        // unsatisfiable write concern — pymongo's test_drop_collection drops an
+        // already-absent collection with w:50 and asserts a WriteConcernError.
+        // Mirrors commands.py::_drop.
+        return Ok(doc! { "ok": 1.0 });
     }
     Ok(doc! { "ns": format!("{}.{}", ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0 })
 }
@@ -1327,14 +1333,12 @@ mod tests {
         let mut c = ctx(s.clone());
         let reply = dispatch(&doc! {"drop": "c"}, &mut c);
         assert_eq!(reply.get_str("ns").unwrap(), "t.c");
-        // drop again ⇒ NamespaceNotFound
+        // drop again ⇒ idempotent success (modern mongod), not NamespaceNotFound,
+        // so an unsatisfiable writeConcern can still attach a writeConcernError.
         let mut c = ctx(s);
-        assert_eq!(
-            dispatch(&doc! {"drop": "c"}, &mut c)
-                .get_i32("code")
-                .unwrap(),
-            26
-        );
+        let reply = dispatch(&doc! {"drop": "c"}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert!(!reply.contains_key("ns"));
     }
 
     #[test]
