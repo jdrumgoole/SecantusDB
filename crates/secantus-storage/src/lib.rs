@@ -4593,9 +4593,13 @@ impl Storage {
         let mut upserted_id: Option<Bson> = None;
         if matched == 0 && upsert {
             // Seed from the filter's bare-equality fields, then apply the update.
+            // A document value is skipped only when it's an OPERATOR expression
+            // (`{$gt: 5}`); a literal subdocument equality (`{f: .., f2: ..}`,
+            // e.g. a compound `_id`) is a real predicate and must be seeded —
+            // dropping it would mint a fresh ObjectId instead of using it.
             let mut seed = Document::new();
             for (k, v) in filter {
-                if !k.starts_with('$') && !matches!(v, Bson::Document(_)) {
+                if !k.starts_with('$') && !is_op_doc(v) {
                     seed.insert(k.clone(), v.clone());
                 }
             }

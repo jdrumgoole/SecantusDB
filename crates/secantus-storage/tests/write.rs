@@ -196,6 +196,41 @@ fn update_upsert_inserts_when_no_match() {
 }
 
 #[test]
+fn update_upsert_uses_subdocument_id_from_filter() {
+    // A filter `{_id: {f, f2}}` is a bare-equality predicate (a compound _id),
+    // not an operator clause — the upsert must seed that exact _id, not mint a
+    // fresh ObjectId. Regression for the upsert_uuid_subdocuments gauge gap.
+    with_db(|st| {
+        let compound_id = doc! {"f": 1, "f2": "x"};
+        let out = st
+            .update_matching(
+                "app",
+                "c",
+                &doc! {"_id": compound_id.clone()},
+                &doc! {"$set": {"n": 1}},
+                false,
+                true,
+                &[],
+                &bson::Document::new(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(out.matched, 0);
+        assert_eq!(
+            out.upserted_id,
+            Some(Bson::Document(compound_id.clone())),
+            "upsert should use the filter's subdocument _id"
+        );
+        let found = st
+            .find_matching("app", "c", &doc! {"_id": compound_id})
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(decode(&found[0]).get_i32("n").unwrap(), 1);
+    });
+}
+
+#[test]
 fn update_maintains_index_entries() {
     with_db(|st| {
         st.create_index("app", "c", "x_1", &doc! {"x": 1}, &doc! {})
