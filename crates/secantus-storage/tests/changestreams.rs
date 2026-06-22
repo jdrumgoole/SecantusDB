@@ -286,6 +286,67 @@ fn scope_filters_events() {
 }
 
 #[test]
+fn rename_event_carries_operation_description_with_drop_target() {
+    // With showExpandedEvents, a rename that replaced an existing target carries
+    // `operationDescription: {to, dropTarget}` (the dropTarget UUID comes from
+    // the oplog `o.dropTarget`). Mirrors mongod 6.0+ expanded rename events.
+    with_db(|st| {
+        let dropped_ui = Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: vec![7u8; 16],
+        });
+        let entry = doc! {
+            "op": "c",
+            "ns": "app.$cmd",
+            "o": {
+                "renameCollection": "app.c",
+                "to": "app.foo",
+                "dropTarget": dropped_ui.clone(),
+            },
+            "ts": Bson::Timestamp(Timestamp { time: 300, increment: 1 }),
+        };
+        let (ev, inv) = changestreams::project(
+            7,
+            &entry,
+            st,
+            FULL_DOC_DEFAULT,
+            FULL_DOC_DEFAULT,
+            &coll_scope(),
+            true, // show_expanded_events
+            false,
+        )
+        .unwrap();
+        let ev = ev.unwrap();
+        assert_eq!(ev.get_str("operationType").unwrap(), "rename");
+        assert_eq!(
+            ev.get_document("to").unwrap(),
+            &doc! {"db": "app", "coll": "foo"}
+        );
+        let op_desc = ev.get_document("operationDescription").unwrap();
+        assert_eq!(
+            op_desc.get_document("to").unwrap(),
+            &doc! {"db": "app", "coll": "foo"}
+        );
+        assert_eq!(op_desc.get("dropTarget"), Some(&dropped_ui));
+        assert!(inv); // a rename of the watched collection ends the stream
+
+        // Without showExpandedEvents, there's no operationDescription at all.
+        let (ev2, _) = changestreams::project(
+            7,
+            &entry,
+            st,
+            FULL_DOC_DEFAULT,
+            FULL_DOC_DEFAULT,
+            &coll_scope(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(ev2.unwrap().get("operationDescription").is_none());
+    });
+}
+
+#[test]
 fn noop_heartbeat_projects_nothing() {
     with_db(|st| {
         let seq = st.emit_noop_heartbeat().unwrap();

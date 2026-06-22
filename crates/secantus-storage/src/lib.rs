@@ -2883,6 +2883,12 @@ impl Storage {
             let mut o = Document::new();
             o.insert("renameCollection", format!("{src_db}.{src_coll}"));
             o.insert("to", format!("{dst_db}.{dst_coll}"));
+            // mongod records the dropped target's UUID under `dropTarget` in the
+            // rename oplog entry; the change-stream `rename` event surfaces it as
+            // `operationDescription.dropTarget` when `showExpandedEvents` is on.
+            if let Some(du) = &dst_ui {
+                o.insert("dropTarget", uuid_binary(du));
+            }
             let mut e = Document::new();
             e.insert("op", "c");
             e.insert("ns", format!("{src_db}.$cmd"));

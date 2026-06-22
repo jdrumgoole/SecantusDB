@@ -434,14 +434,22 @@ fn project_command(
         if !to_coll.is_empty() {
             to.insert("coll", to_coll);
         }
-        let event = base(
-            "rename",
-            from_ns,
-            &[
-                ("ns", Bson::Document(ns_doc(from_ns))),
-                ("to", Bson::Document(to)),
-            ],
-        )?;
+        let mut fields: Vec<(&str, Bson)> = vec![
+            ("ns", Bson::Document(ns_doc(from_ns))),
+            ("to", Bson::Document(to.clone())),
+        ];
+        if show_expanded_events {
+            // mongod 6.0+ attaches `operationDescription` to expanded rename
+            // events: the `to` namespace plus `dropTarget` (the dropped target
+            // collection's UUID) when the rename replaced an existing collection.
+            let mut op_desc = Document::new();
+            op_desc.insert("to", Bson::Document(to));
+            if let Some(dt) = cmd.get("dropTarget") {
+                op_desc.insert("dropTarget", dt.clone());
+            }
+            fields.push(("operationDescription", Bson::Document(op_desc)));
+        }
+        let event = base("rename", from_ns, &fields)?;
         let invalidates = matches!(scope, Scope::Coll { .. });
         return Ok((Some(event), invalidates));
     }
