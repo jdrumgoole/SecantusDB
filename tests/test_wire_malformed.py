@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import threading
 
 from secantus import SecantusDBServer
 
@@ -101,6 +102,71 @@ def test_malformed_body_returns_bad_value_keeps_connection_open(tmp_path) -> Non
             reply2 = _read_op_msg_reply(sock)
             ping_doc = bson.decode(reply2[5:])
             assert ping_doc["ok"] == 1.0
+
+
+_OP_MSG_FLAG_MORE_TO_COME = 1 << 1
+_OP_MSG_FLAG_EXHAUST_ALLOWED = 1 << 16
+
+
+def _build_op_msg_flags(request_id: int, body_bytes: bytes, flags: int) -> bytes:
+    """An OP_MSG with a kind-0 body and arbitrary flag bits (e.g. exhaustAllowed)."""
+    body = struct.pack("<I", flags) + b"\x00" + body_bytes
+    msg_len = 16 + len(body)
+    return _HEADER_FMT.pack(msg_len, request_id, 0, _OP_MSG) + body
+
+
+def _read_reply_flags_and_doc(sock: socket.socket) -> tuple[int, bytes]:
+    """Read one OP_MSG reply; return its flag bits and the kind-0 BSON bytes."""
+    body = _read_op_msg_reply(sock)
+    flags = struct.unpack_from("<I", body)[0]
+    assert body[4:5] == b"\x00", "reply section should be kind 0"
+    return flags, body[5:]
+
+
+def test_awaitable_exhaust_hello_streams_more_to_come(tmp_path) -> None:
+    """Streaming-SDAM monitor: an awaitable ``hello`` (carries ``maxAwaitTimeMS``)
+    sent with the OP_MSG ``exhaustAllowed`` flag must get a *stream* of
+    ``moreToCome`` replies, and on server shutdown a final ``moreToCome``-clear
+    reply that ends the stream cleanly. Without this the driver's monitor raises
+    ``Server ended moreToCome unexpectedly`` on teardown and clears the pool —
+    the intermittent ``mongosh`` smoke failure this guards against."""
+    import bson
+
+    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "wt"))
+    srv.start()
+    try:
+        host, port = srv.address
+        with socket.create_connection((host, port), timeout=10) as sock:
+            hello = bson.encode(
+                {
+                    "hello": 1,
+                    "maxAwaitTimeMS": 150,
+                    "topologyVersion": {"processId": bson.ObjectId(), "counter": 0},
+                    "$db": "admin",
+                }
+            )
+            sock.sendall(_build_op_msg_flags(1, hello, _OP_MSG_FLAG_EXHAUST_ALLOWED))
+
+            # First streamed reply: moreToCome set, a valid hello body.
+            flags, doc_bytes = _read_reply_flags_and_doc(sock)
+            assert flags & _OP_MSG_FLAG_MORE_TO_COME, "first streaming reply must set moreToCome"
+            assert bson.decode(doc_bytes)["isWritablePrimary"] is True
+
+            # A second reply arrives ~maxAwaitTimeMS later — the stream continues
+            # (this is the behaviour the driver's streaming monitor requires; its
+            # absence was the flake). The stream is held on its own daemon thread.
+            flags2, _ = _read_reply_flags_and_doc(sock)
+            assert flags2 & _OP_MSG_FLAG_MORE_TO_COME, "heartbeat reply must set moreToCome"
+
+        # Client gone (socket closed) — like mongosh exiting. The streaming
+        # thread must notice and let shutdown drain promptly rather than pinning
+        # a connection thread forever.
+        stopper = threading.Thread(target=srv.stop)
+        stopper.start()
+        stopper.join(timeout=15)
+        assert not stopper.is_alive(), "stop() hung — streaming monitor thread not reaped"
+    finally:
+        srv.stop()
 
 
 def test_malformed_body_logs_warning_does_not_unhandled_traceback(tmp_path, caplog) -> None:
