@@ -380,7 +380,7 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let mut reply = dispatch_inner(doc, ctx);
     attach_write_concern_error(doc, &mut reply);
-    attach_cluster_time_gossip(&mut reply, ctx);
+    attach_cluster_time_gossip(doc, &mut reply, ctx);
     reply
 }
 
@@ -837,7 +837,7 @@ fn finish_txn_statement(
 /// preserve a handler that already attached a more specific value (e.g. the
 /// change-stream `aggregate` reply). The keyless signature (20 zero bytes,
 /// keyId 0) is what auth-less replica sets send. Mirrors `commands.py::dispatch`.
-fn attach_cluster_time_gossip(reply: &mut Document, ctx: &CommandContext) {
+fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &CommandContext) {
     if ctx.replica_set_name.is_none() {
         return;
     }
@@ -866,6 +866,34 @@ fn attach_cluster_time_gossip(reply: &mut Document, ctx: &CommandContext) {
     }
     if !reply.contains_key("operationTime") {
         reply.insert("operationTime", Bson::Timestamp(ts));
+    }
+    // Snapshot sessions: pymongo pins the session's read timestamp from the
+    // FIRST snapshot read's reply — `cursor.atClusterTime` for cursor commands,
+    // top-level `atClusterTime` otherwise — and echoes it as
+    // `readConcern.atClusterTime` on subsequent reads. Reads aren't actually
+    // pinned (single node, accept-and-record), but the wire contract is met.
+    // Mirrors `commands.py::dispatch`.
+    let is_snapshot = req
+        .get_document("readConcern")
+        .ok()
+        .and_then(|rc| rc.get_str("level").ok())
+        == Some("snapshot");
+    let ok = matches!(reply.get("ok"), Some(Bson::Double(d)) if *d != 0.0)
+        || matches!(reply.get("ok"), Some(Bson::Int32(n)) if *n != 0)
+        || matches!(reply.get("ok"), Some(Bson::Int64(n)) if *n != 0);
+    if is_snapshot && ok {
+        match reply.get_mut("cursor") {
+            Some(Bson::Document(cur)) => {
+                if !cur.contains_key("atClusterTime") {
+                    cur.insert("atClusterTime", Bson::Timestamp(ts));
+                }
+            }
+            _ => {
+                if !reply.contains_key("atClusterTime") {
+                    reply.insert("atClusterTime", Bson::Timestamp(ts));
+                }
+            }
+        }
     }
 }
 
@@ -1311,6 +1339,43 @@ mod tests {
                 Some(Bson::Timestamp(_))
             ));
         }
+    }
+
+    #[test]
+    fn snapshot_read_concern_pins_at_cluster_time() {
+        // A successful snapshot-level read echoes `atClusterTime` so pymongo can
+        // pin the session timestamp: nested under `cursor` for cursor replies,
+        // top-level otherwise. Tests the gossip helper directly (the read-concern
+        // validation that gates which commands may use snapshot is separate, and
+        // the end-to-end find/aggregate/distinct paths are covered by the gauge).
+        let mut c = ctx();
+        c.replica_set_name = Some("secantus".into());
+        // Non-cursor reply (e.g. distinct) -> top-level atClusterTime.
+        let req = doc! {"distinct": "t", "readConcern": {"level": "snapshot"}};
+        let mut reply = doc! {"ok": 1.0, "values": []};
+        attach_cluster_time_gossip(&req, &mut reply, &c);
+        assert!(matches!(
+            reply.get("atClusterTime"),
+            Some(Bson::Timestamp(_))
+        ));
+        // Cursor reply (e.g. find) -> nested under cursor.atClusterTime.
+        let req2 = doc! {"find": "t", "readConcern": {"level": "snapshot"}};
+        let mut reply2 = doc! {"ok": 1.0, "cursor": {"id": 0i64, "ns": "d.t", "firstBatch": []}};
+        attach_cluster_time_gossip(&req2, &mut reply2, &c);
+        let cur = reply2.get_document("cursor").unwrap();
+        assert!(matches!(cur.get("atClusterTime"), Some(Bson::Timestamp(_))));
+        // No snapshot readConcern -> no atClusterTime.
+        let mut reply3 = doc! {"ok": 1.0};
+        attach_cluster_time_gossip(&doc! {"find": "t"}, &mut reply3, &c);
+        assert!(reply3.get("atClusterTime").is_none());
+        // A failed reply (ok:0) doesn't pin, even with snapshot readConcern.
+        let mut reply4 = doc! {"ok": 0.0};
+        attach_cluster_time_gossip(&req, &mut reply4, &c);
+        assert!(reply4.get("atClusterTime").is_none());
+        // Standalone (no persona) never gossips.
+        let mut reply5 = doc! {"ok": 1.0};
+        attach_cluster_time_gossip(&req, &mut reply5, &ctx());
+        assert!(reply5.get("atClusterTime").is_none());
     }
 
     #[test]
