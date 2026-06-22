@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import itertools
 import logging
-import select
 import socket
 import ssl
 import threading
@@ -461,103 +460,6 @@ class SecantusDBServer:
                     more=False,
                 )
 
-    def _stream_awaitable_hello(
-        self,
-        conn: socket.socket,
-        response_to: int,
-        reply_ids: itertools.count[int],
-        body: dict[str, Any],
-        ctx: CommandContext,
-        first_doc: dict[str, Any],
-    ) -> bool:
-        """Stream awaitable (streaming-SDAM) ``hello`` replies over an exhaust
-        monitor connection.
-
-        Once a driver sees ``topologyVersion`` in a hello reply it switches its
-        monitor to the streaming protocol: it sends ``hello`` with
-        ``maxAwaitTimeMS`` and the OP_MSG ``exhaustAllowed`` flag, then keeps the
-        connection open expecting a *continuous* stream of ``moreToCome`` replies
-        (mongod holds each one until the topology changes or ``maxAwaitTimeMS``
-        elapses). If the server instead answers with a single ``moreToCome``-clear
-        reply, the driver's streaming monitor still treats the connection as a
-        live stream — and when the socket later closes (e.g. server teardown) it
-        raises ``Server ended moreToCome unexpectedly`` and clears the pool,
-        failing whatever operation was in flight. That was an intermittent
-        ``mongosh`` smoke failure on slower CI.
-
-        Our topology is fixed, so we simply re-emit the same hello state every
-        ``maxAwaitTimeMS`` with ``moreToCome`` set. The wait is interruptible by
-        ``_stop_event`` so shutdown is prompt, and on shutdown we send one final
-        ``moreToCome``-clear reply: a *clean* end of stream the driver accepts
-        silently instead of surfacing as an unexpected close.
-
-        Returns True if the stream ended cleanly (the caller drops the
-        connection), False if a socket write failed (caller drops it too).
-        """
-        raw = body.get("maxAwaitTimeMS", 10000)
-        try:
-            max_await_s = max(0.0, float(raw) / 1000.0)
-        except (TypeError, ValueError):
-            max_await_s = 10.0
-
-        def send(doc: dict[str, Any], *, more: bool) -> bool:
-            flags = OP_MSG_FLAG_MORE_TO_COME if more else 0
-            try:
-                conn.sendall(
-                    build_op_msg_reply(
-                        response_to=response_to,
-                        request_id=next(reply_ids),
-                        body=doc,
-                        flags=flags,
-                    )
-                )
-            except OSError:
-                return False
-            return True
-
-        # Establish the stream with the reply the handler already produced.
-        if not send(first_doc, more=True):
-            return False
-        while True:
-            # Hold up to maxAwaitTimeMS (topology never changes), but wake early
-            # if the socket becomes readable — the client closed it or ``killOp``
-            # shut it down, both of which surface as readability/EOF — or if the
-            # server is stopping. Poll in short slices so kill and shutdown are
-            # both promptly noticed (a plain ``_stop_event.wait`` would leave a
-            # killed monitor connection pinned until maxAwaitTimeMS elapsed).
-            remaining = max_await_s
-            socket_closed = False
-            while remaining > 0 and not self._stop_event.is_set():
-                slice_t = min(remaining, 0.25)
-                try:
-                    readable, _, _ = select.select([conn], [], [], slice_t)
-                except (OSError, ValueError):
-                    socket_closed = True  # socket already closed under us
-                    break
-                if readable:
-                    socket_closed = True
-                    break
-                remaining -= slice_t
-            if socket_closed:
-                # killOp / client close: the connection is gone — drop it so the
-                # handler thread is reaped and the registry entry cleared.
-                return False
-            if self._stop_event.is_set():
-                # Clean shutdown: end the stream so the driver doesn't see an
-                # unexpected mid-stream close.
-                send(first_doc, more=False)
-                return True
-            try:
-                doc = dispatch(body, ctx)
-            except Exception:
-                # Refresh failed — terminate the stream cleanly rather than
-                # dropping the socket mid-``moreToCome``.
-                logger.exception("error refreshing awaitable hello on conn %d", ctx.connection_id)
-                send(first_doc, more=False)
-                return True
-            if not send(doc, more=True):
-                return False
-
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         # Register the socket alongside the conn_id so killOp can
         # shut it down from another thread.
@@ -700,28 +602,6 @@ class SecantusDBServer:
                             and isinstance(response_doc.get("cursor"), dict)
                         ):
                             if self._stream_exhaust_getmore(
-                                conn,
-                                message.header.request_id,
-                                reply_ids,
-                                body,
-                                ctx,
-                                response_doc,
-                            ):
-                                continue
-                            return
-                        # Streaming-SDAM monitor: an awaitable `hello`/`isMaster`
-                        # (carries `maxAwaitTimeMS`) sent with `exhaustAllowed`
-                        # wants a continuous `moreToCome` hello stream. Honour it
-                        # so the driver's monitor doesn't later raise "Server
-                        # ended moreToCome unexpectedly" on teardown.
-                        cmd0 = next(iter(body), "")
-                        if (
-                            op.flags & OP_MSG_FLAG_EXHAUST_ALLOWED
-                            and cmd0 in ("hello", "isMaster", "ismaster")
-                            and "maxAwaitTimeMS" in body
-                            and response_doc.get("ok")
-                        ):
-                            if self._stream_awaitable_hello(
                                 conn,
                                 message.header.request_id,
                                 reply_ids,

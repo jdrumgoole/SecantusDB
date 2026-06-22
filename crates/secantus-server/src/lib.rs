@@ -501,28 +501,6 @@ fn serve<S: Read + Write>(
                     )? {
                         return Ok(());
                     }
-                } else if exhaust_allowed
-                    && is_hello_command(&request)
-                    && request.contains_key("maxAwaitTimeMS")
-                    && reply_ok(&reply)
-                {
-                    // Streaming-SDAM monitor: an awaitable `hello`/`isMaster`
-                    // (carries `maxAwaitTimeMS`) sent with `exhaustAllowed` wants
-                    // a continuous `moreToCome` hello stream. Honour it so the
-                    // driver's monitor doesn't raise "Server ended moreToCome
-                    // unexpectedly" on teardown.
-                    if !stream_awaitable_hello(
-                        stream,
-                        &header,
-                        shared,
-                        &request,
-                        conn_id,
-                        conn_auth,
-                        &peer_cert_dn,
-                        reply,
-                    )? {
-                        return Ok(());
-                    }
                 } else {
                     write_op_msg(stream, &header, shared, &reply)?;
                 }
@@ -803,97 +781,6 @@ fn stream_exhaust_getmore<S: Write>(
         }
         let (reply, _close) = run_dispatch(&getmore, conn_id, shared, conn_auth, peer_cert_dn);
         doc = reply;
-    }
-}
-
-/// True if `request` is a `hello` / `isMaster` / `ismaster` handshake command.
-fn is_hello_command(request: &Document) -> bool {
-    matches!(
-        request.keys().next().map(String::as_str),
-        Some("hello") | Some("isMaster") | Some("ismaster")
-    )
-}
-
-/// True if `reply.ok` is truthy (1.0 / nonzero int).
-fn reply_ok(reply: &Document) -> bool {
-    matches!(reply.get("ok"), Some(Bson::Double(d)) if *d != 0.0)
-        || matches!(reply.get("ok"), Some(Bson::Int32(n)) if *n != 0)
-        || matches!(reply.get("ok"), Some(Bson::Int64(n)) if *n != 0)
-}
-
-/// Stream awaitable (streaming-SDAM) `hello` replies over an exhaust monitor
-/// connection. Once a driver sees `topologyVersion` it switches its monitor to
-/// the streaming protocol: it sends `hello` with `maxAwaitTimeMS` and the
-/// `exhaustAllowed` flag and keeps the connection open expecting a *continuous*
-/// stream of `moreToCome` replies (mongod holds each until the topology changes
-/// or `maxAwaitTimeMS` elapses). If the server answers with a single
-/// `moreToCome`-clear reply, the driver's monitor still treats the connection as
-/// a live stream and, when the socket later closes, raises "Server ended
-/// moreToCome unexpectedly" and clears the pool. Our topology is fixed, so we
-/// re-emit the same hello state every `maxAwaitTimeMS` with `moreToCome` set;
-/// the wait polls `shared.stop` so shutdown is prompt, and on shutdown we send a
-/// final `moreToCome`-clear reply (a clean end the driver accepts silently).
-/// Mirrors `server.py::_stream_awaitable_hello`. `Ok(true)` = ended cleanly,
-/// `Ok(false)` = a write failed (drop the connection).
-#[allow(clippy::too_many_arguments)]
-fn stream_awaitable_hello<S: Read + Write>(
-    stream: &mut S,
-    header: &Header,
-    shared: &Arc<Shared>,
-    request: &Document,
-    conn_id: i64,
-    conn_auth: &Arc<Mutex<ConnectionAuth>>,
-    peer_cert_dn: &Option<String>,
-    first_reply: Document,
-) -> io::Result<bool> {
-    let max_await_ms = request
-        .get_i64("maxAwaitTimeMS")
-        .or_else(|_| request.get_i32("maxAwaitTimeMS").map(i64::from))
-        .unwrap_or(10_000)
-        .max(0) as u64;
-
-    // Establish the stream with the reply the handler already produced.
-    if write_op_msg_flags(
-        stream,
-        header,
-        shared,
-        &first_reply,
-        OP_MSG_FLAG_MORE_TO_COME,
-    )
-    .is_err()
-    {
-        return Ok(false);
-    }
-    loop {
-        // Hold up to maxAwaitTimeMS (topology never changes). Each iteration
-        // probes the socket (its read timeout is `READ_POLL`): a 0-byte read is
-        // EOF — the client closed it or a kill shut it down — and any bytes mid-
-        // stream are an unexpected client message; either way we drop the stream.
-        // `shared.stop` is checked too so the monitor thread is reaped promptly
-        // on shutdown, ending the stream with a clean `moreToCome`-clear reply.
-        let deadline = Instant::now() + Duration::from_millis(max_await_ms);
-        loop {
-            if shared.stop.load(Ordering::SeqCst) {
-                let _ = write_op_msg_flags(stream, header, shared, &first_reply, 0);
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            let mut probe = [0u8; 1];
-            match stream.read(&mut probe) {
-                Ok(0) => return Ok(false), // EOF: client closed / killed
-                Ok(_) => return Ok(false), // unexpected data mid-stream: drop
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut => {}
-                Err(_) => return Ok(false), // socket error: drop
-            }
-        }
-        let (reply, _close) = run_dispatch(request, conn_id, shared, conn_auth, peer_cert_dn);
-        if write_op_msg_flags(stream, header, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
-            return Ok(false);
-        }
     }
 }
 
