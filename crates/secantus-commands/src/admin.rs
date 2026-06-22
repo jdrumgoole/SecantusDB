@@ -287,15 +287,32 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let winning_plan = if is_ixscan {
+        let index_name = plan.get_str("indexName").unwrap_or("");
+        let mut input_stage = doc! {
+            "stage": "IXSCAN",
+            "indexName": index_name,
+            "keyPattern": plan.get_document("keyPattern").cloned().unwrap_or_default(),
+            "direction": plan.get_str("direction").unwrap_or("forward"),
+        };
+        // mongod flags an IXSCAN over a partial index with `isPartial`.
+        if !coll.is_empty() {
+            let is_partial = storage
+                .list_indexes(&ctx.db_name, &coll)
+                .map(|ixs| {
+                    ixs.iter().any(|ix| {
+                        ix.get_str("name").ok() == Some(index_name)
+                            && ix.contains_key("partialFilterExpression")
+                    })
+                })
+                .unwrap_or(false);
+            if is_partial {
+                input_stage.insert("isPartial", true);
+            }
+        }
         doc! {
             "stage": "FETCH",
             "filter": filter.clone(),
-            "inputStage": {
-                "stage": "IXSCAN",
-                "indexName": plan.get_str("indexName").unwrap_or(""),
-                "keyPattern": plan.get_document("keyPattern").cloned().unwrap_or_default(),
-                "direction": plan.get_str("direction").unwrap_or("forward"),
-            },
+            "inputStage": input_stage,
         }
     } else {
         doc! { "stage": "COLLSCAN", "filter": filter.clone() }

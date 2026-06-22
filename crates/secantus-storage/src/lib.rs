@@ -150,6 +150,10 @@ const CONFLICTING_OPTS: &[&str] = &[
 /// `storage._RANGE_OPS`.
 const RANGE_OPS: &[&str] = &["$eq", "$gt", "$gte", "$lt", "$lte", "$in"];
 
+/// `(index_name, direction, is_compound)` — the index a leading-field lookup
+/// resolves to (the tuple `find_leading_field_index` returns).
+type LeadingFieldMatch = (String, i32, bool);
+
 /// The plan `find_matching` would use for a filter — what `explain_plan`
 /// reports. Mirrors `storage.explain_plan`'s `{kind, index_name, key_pattern,
 /// direction}` shape.
@@ -901,13 +905,103 @@ fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
     }
 }
 
-/// True if `query` is at least as restrictive as `partial` — every key/value
-/// pair in `partial` appears with the same *bare* value in `query`.
-/// Conservative: operator-form clauses or document-level operators in the query
-/// don't count as implying the partial filter. Mirrors
-/// `storage._query_implies_partial`.
+/// True if `v` is a non-empty operator document (every key starts with `$`),
+/// e.g. `{$lte: 1.5}`. Mirrors Python's `all(k.startswith("$") for k in v)`.
+fn is_op_doc(v: &Bson) -> bool {
+    matches!(v, Bson::Document(d) if !d.is_empty() && d.keys().all(|k| k.starts_with('$')))
+}
+
+/// Does a single query constraint `(qop, qv)` guarantee the partial bound
+/// `(pop, pv)`? Comparison uses `encode_value` so it follows MongoDB's
+/// cross-type BSON sort order. Returns `false` for any pairing it can't prove
+/// (soundness over completeness). Mirrors `storage._op_implies_bound`.
+fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
+    let (a, b) = match (
+        sortkey::encode_value(qv, None),
+        sortkey::encode_value(pv, None),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return false,
+    };
+    let (le, lt, ge, gt, eq) = (a <= b, a < b, a >= b, a > b, a == b);
+    match pop {
+        // query upper-bounds the field; need its max <= / < pv.
+        "$lte" | "$lt" => match qop {
+            "$eq" | "$lte" => {
+                if pop == "$lte" {
+                    le
+                } else {
+                    lt
+                }
+            }
+            "$lt" => le, // a < qv <= pv => a < pv => a <= pv (and a < pv for $lt)
+            _ => false,
+        },
+        "$gte" | "$gt" => match qop {
+            "$eq" | "$gte" => {
+                if pop == "$gte" {
+                    ge
+                } else {
+                    gt
+                }
+            }
+            "$gt" => ge,
+            _ => false,
+        },
+        "$eq" => qop == "$eq" && eq,
+        _ => false,
+    }
+}
+
+/// True if the query clause `qval` (a bare value or an operator dict) guarantees
+/// every constraint in the partial operator dict `pbound` (e.g. `{$lte: 1.5}`).
+/// Mirrors `storage._clause_implies_bounds`.
+fn clause_implies_bounds(qval: &Bson, pbound: &Document) -> bool {
+    let q_constraints: Vec<(&str, &Bson)> = match qval {
+        Bson::Document(d) if is_op_doc(qval) => d.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        _ => vec![("$eq", qval)],
+    };
+    for (pop, pv) in pbound.iter() {
+        if !matches!(pop.as_str(), "$eq" | "$lt" | "$lte" | "$gt" | "$gte") {
+            return false; // partial filter uses an operator we can't reason about
+        }
+        if !q_constraints
+            .iter()
+            .any(|(qop, qv)| op_implies_bound(qop, qv, pop, pv))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// True if every document matching `query` is guaranteed to be in a partial
+/// index whose filter is `partial` — i.e. `query` is at least as restrictive as
+/// `partial` on every partial-filter field. SOUNDNESS is the rule: errs to
+/// `false` (skip the index, full scan) for anything it can't prove implied.
+/// Supports bare-equality partial values and the `$eq`/`$lt`/`$lte`/`$gt`/`$gte`
+/// range operators on both sides. Mirrors `storage._query_implies_partial`.
 fn query_implies_partial(query: &Document, partial: &Document) -> bool {
-    partial.iter().all(|(k, v)| query.get(k) == Some(v))
+    for (key, pval) in partial.iter() {
+        let qval = match query.get(key) {
+            Some(v) => v,
+            None => return false,
+        };
+        if is_op_doc(pval) {
+            if !clause_implies_bounds(qval, pval.as_document().unwrap()) {
+                return false;
+            }
+        } else if is_op_doc(qval) {
+            // bare-value partial, operator-form query: only an exact `$eq` of the
+            // same value implies it.
+            if qval.as_document().unwrap().get("$eq") != Some(pval) {
+                return false;
+            }
+        } else if qval != pval {
+            return false;
+        }
+    }
+    true
 }
 
 /// `(field, direction)` if `sort` is a single `±1` field (not operator-prefixed),
@@ -4939,15 +5033,22 @@ impl Storage {
                 return Ok(Some(r));
             }
         }
-        if filter.len() != 1 {
-            return Ok(None);
+        if filter.len() == 1 {
+            let (field, value) = filter.iter().next().unwrap();
+            let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+            return self.lookup_id_keys_via_leading_field(session, db, coll, &idx, value);
         }
-        let (field, value) = filter.iter().next().unwrap();
-        let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
-            Some(m) => m,
-            None => return Ok(None),
-        };
-        self.lookup_id_keys_via_leading_field(session, db, coll, &idx, value)
+        // Multi-field filter: a single-field index can still serve it when every
+        // other filter field is absorbed by the index's (implied) partial filter.
+        let (_field, value, idx_match) =
+            match self.single_field_partial_residual_match(session, db, coll, filter)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+        self.lookup_id_keys_via_leading_field(session, db, coll, &idx_match, &value)
     }
 
     /// Find the `2d` index covering `field`, as `(index_name, params)`.
@@ -5128,6 +5229,70 @@ impl Storage {
             }
         }
         Ok(compound_fallback)
+    }
+
+    /// The `partialFilterExpression` of index `name`, or `None` (non-partial /
+    /// absent). Used by the residual-match path to verify residual fields are
+    /// exactly partial-filter fields.
+    fn partial_filter_for(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Option<Document>> {
+        for desc in self.index_descs(session, db, coll)? {
+            if desc.name == name {
+                return Ok(desc.partial.clone());
+            }
+        }
+        Ok(None)
+    }
+
+    /// For a *multi-field* filter, find a single-field (or leading-field) index
+    /// whose leading field serves one clause while every **other** filter field
+    /// is absorbed by the index's (implied) partial filter. e.g.
+    /// `find({x: {$gt: 1}, a: 1})` against an index on `x` partial on
+    /// `{a: {$lte: 1.5}}`: `x`'s range rides the index, `a: 1` is partial-implied
+    /// (rechecked by the exact `matches()` pass in `find_matching`). Returns
+    /// `(field, value, idx_match)` or `None`. Conservative: only *partial*
+    /// indexes qualify, and only when the residual fields are exactly
+    /// partial-filter fields. Mirrors
+    /// `storage._single_field_partial_residual_match`.
+    fn single_field_partial_residual_match(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<(String, Bson, LeadingFieldMatch)>> {
+        for (field, value) in filter.iter() {
+            // An operator-form clause must be range ops the index can serve;
+            // otherwise this field can't be the leading-field clause.
+            if let Bson::Document(opd) = value {
+                if opd.is_empty() || !opd.keys().all(|k| RANGE_OPS.contains(&k.as_str())) {
+                    continue;
+                }
+            }
+            let idx_match = match self.find_leading_field_index(session, db, coll, field, filter)? {
+                Some(m) => m,
+                None => continue,
+            };
+            let pf = match self.partial_filter_for(session, db, coll, &idx_match.0)? {
+                Some(pf) => pf,
+                None => continue,
+            };
+            // Every residual field must be a partial-filter field.
+            let residual_ok = filter
+                .keys()
+                .filter(|f| f.as_str() != field)
+                .all(|f| pf.contains_key(f));
+            if !residual_ok {
+                continue;
+            }
+            return Ok(Some((field.clone(), value.clone(), idx_match)));
+        }
+        Ok(None)
     }
 
     /// `id_key`s for `field <value>` against the index `(name, direction,
@@ -5560,25 +5725,34 @@ impl Storage {
                 return Ok(Some(p));
             }
         }
-        if filter.len() != 1 {
-            return Ok(None);
+        if filter.len() == 1 {
+            let (field, value) = filter.iter().next().unwrap();
+            let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+            // Operator-form values must be range ops the index can serve.
+            if let Bson::Document(opdoc) = value {
+                if opdoc.is_empty()
+                    || !opdoc.keys().all(|k| k.starts_with('$'))
+                    || !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str()))
+                {
+                    return Ok(None);
+                }
+            }
+            return match self.key_spec_for(session, db, coll, &idx.0)? {
+                Some(key_spec) => Ok(Some((idx.0, key_spec))),
+                None => Ok(None),
+            };
         }
-        let (field, value) = filter.iter().next().unwrap();
-        let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
-            Some(m) => m,
+        // Multi-field filter: a single-field index whose leading field serves one
+        // clause while the rest are absorbed by its (implied) partial filter.
+        let idx_match = match self.single_field_partial_residual_match(session, db, coll, filter)? {
+            Some(m) => m.2,
             None => return Ok(None),
         };
-        // Operator-form values must be range ops the index can serve.
-        if let Bson::Document(opdoc) = value {
-            if opdoc.is_empty()
-                || !opdoc.keys().all(|k| k.starts_with('$'))
-                || !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str()))
-            {
-                return Ok(None);
-            }
-        }
-        match self.key_spec_for(session, db, coll, &idx.0)? {
-            Some(key_spec) => Ok(Some((idx.0, key_spec))),
+        match self.key_spec_for(session, db, coll, &idx_match.0)? {
+            Some(key_spec) => Ok(Some((idx_match.0, key_spec))),
             None => Ok(None),
         }
     }
@@ -6056,6 +6230,97 @@ mod tests {
         assert!(resolve_current_date(&bad).is_err());
         let bad2 = doc! {"$currentDate": {"x": false}};
         assert!(resolve_current_date(&bad2).is_err());
+    }
+
+    #[test]
+    fn query_implies_partial_operator_bounds() {
+        // bare equality implies an operator-form partial bound it satisfies.
+        assert!(query_implies_partial(
+            &doc! {"a": 1i32},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        // ... but not one it violates.
+        assert!(!query_implies_partial(
+            &doc! {"a": 2i32},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        // operator-form query implies a looser operator-form partial bound.
+        assert!(query_implies_partial(
+            &doc! {"a": {"$lte": 1i32}},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        assert!(!query_implies_partial(
+            &doc! {"a": {"$lte": 1.6}},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        // bare equality implies a bare-equality partial of the same value.
+        assert!(query_implies_partial(&doc! {"s": "x"}, &doc! {"s": "x"}));
+        // missing partial-filter field in the query is never implied.
+        assert!(!query_implies_partial(&doc! {"b": 1i32}, &doc! {"a": 1i32}));
+    }
+
+    #[test]
+    fn partial_index_used_via_residual_when_query_implies_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_index(
+            "app",
+            "t",
+            "x_1",
+            &doc! {"x": 1i32},
+            &doc! {"partialFilterExpression": {"a": {"$lte": 1.5}}},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "x": 5i32, "a": 2i32}).unwrap(),
+                encode_doc(&doc! {"_id": 2i32, "x": 6i32, "a": 1i32}).unwrap(),
+                encode_doc(&doc! {"_id": 3i32, "x": 6i32, "a": 5i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+
+        // Residual `a:1` is partial-implied → IXSCAN on x_1, and the exact
+        // recheck must exclude the unindexed a=5 doc.
+        let plan = s
+            .explain_plan("app", "t", &doc! {"x": 6i32, "a": 1i32})
+            .unwrap();
+        assert!(matches!(&plan, ExplainPlan::IxScan { index_name, .. } if index_name == "x_1"));
+        let ids: Vec<i32> = s
+            .find_matching("app", "t", &doc! {"x": 6i32, "a": 1i32})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        assert_eq!(ids, vec![2]);
+
+        // Operator-form leading clause + partial-implied residual → IXSCAN.
+        let plan = s
+            .explain_plan("app", "t", &doc! {"x": {"$gt": 1i32}, "a": 1i32})
+            .unwrap();
+        assert!(matches!(&plan, ExplainPlan::IxScan { index_name, .. } if index_name == "x_1"));
+
+        // Residual `a <= 1.6` does NOT imply `a <= 1.5` → COLLSCAN, but results
+        // still correct (only a=1 satisfies a<=1.6 among x=6 docs other than a=5).
+        let plan = s
+            .explain_plan("app", "t", &doc! {"x": 6i32, "a": {"$lte": 1.6}})
+            .unwrap();
+        assert!(matches!(plan, ExplainPlan::CollScan));
+
+        // No constraint on the partial field → COLLSCAN, returns both x=6 docs.
+        let plan = s.explain_plan("app", "t", &doc! {"x": 6i32}).unwrap();
+        assert!(matches!(plan, ExplainPlan::CollScan));
+        assert_eq!(
+            s.find_matching("app", "t", &doc! {"x": 6i32})
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
