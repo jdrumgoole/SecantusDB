@@ -626,9 +626,13 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   and a bare `Bson::RegularExpression`; `op_regex` does `re.search`-style
   unanchored `is_match` over string values + string elements of arrays; flags
   `i`/`m`/`s`/`x` map to `RegexBuilder` (other flag chars ignored, mirroring
-  Python's `_re_flags`). Patterns the crate can't compile (backreferences,
-  lookaround, `\Z`) or over the 1000-char cap → `Fallback` (defer). Parity suite
-  extended: 16 curated regex cases + a 4000-iteration `test_regex_fuzz_parity`
+  Python's `_re_flags`). Patterns the linear `regex` crate can't compile
+  (backreferences, lookaround) now fall back to the backtracking **`fancy-regex`**
+  engine (flags ride an inline `(?ims x)` prefix) — closing the
+  `test_list_collection_names` gauge gap (pymongo's `^(?!system\.)` negative
+  lookahead). Only patterns neither engine compiles, or over the 1000-char cap,
+  → `Fallback` (defer). Parity suite extended: curated regex cases (incl.
+  lookahead/lookbehind/backref) + a 4000-iteration `test_regex_fuzz_parity`
   (safe-subset patterns/options/subjects; Rust ≡ Python `re`). **Known divergence
   (accepted):** the `regex` crate's `$` matches only end-of-haystack, not before a
   trailing `\n` like Python/PCRE — so `{x:{$regex:"foo$"}}` against `"foo\n"`

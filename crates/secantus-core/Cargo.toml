@@ -1,6 +1,6 @@
 [package]
 name = "secantus-core"
-version = "0.5.3-beta.58"
+version = "0.5.3-beta.59"
 edition = "2021"
 description = "Pure-Rust operator engines for SecantusDB (sort keys, query matcher, update operators, aggregation-expression evaluator, projection, change-stream diff, aggregation pipeline)."
 license = "GPL-2.0-only"
@@ -24,9 +24,14 @@ bson = { workspace = true }
 geo = "0.28"
 # `$regex` / `$options` + BSON-regex field matching. A linear-time
 # (finite-automaton) engine, so unlike Python's `re` it can't catastrophically
-# backtrack; patterns it can't compile (backreferences / lookaround) signal
-# `Fallback`, matching the "defer to Python `re`" contract for the parity vehicle.
+# backtrack; it's tried first for every pattern. Patterns it can't compile
+# (backreferences / lookaround) fall back to `fancy-regex` below.
 regex = "1"
+# Backtracking regex with lookaround + backreference support (Python `re`-style),
+# used only when the linear `regex` engine above can't compile a pattern — e.g.
+# the negative-lookahead `^(?!system\.)` pymongo emits for listCollections name
+# filters. The standalone server has no Python to defer to, so it evaluates here.
+fancy-regex = "0.14"
 # `$rand` — a uniform random double in [0, 1). Inherently non-deterministic, so
 # it's NOT byte-pinned to the Python evaluator (no parity corpus case); both
 # engines independently produce a fresh value in range.

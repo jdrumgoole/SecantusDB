@@ -13,13 +13,16 @@
 //! `crate::collation`), deferring non-ASCII / `numericOrdering` to Python.
 //!
 //! **Regex** (`$regex` + `$options`, and a bare BSON `RegularExpression` value)
-//! is matched with the `regex` crate (`re.search` semantics → unanchored
-//! `is_match`; options `i`/`m`/`s`/`x` map to the builder flags; other flag
-//! chars are ignored, mirroring Python's `_re_flags`). Patterns the crate can't
-//! compile — backreferences, lookaround, `\Z`, etc. — signal `Fallback` (defer
-//! to Python `re`), as do patterns over the 1000-char cap. Known divergence
-//! from Python/PCRE: the crate's `$` matches only the end of the haystack, not
-//! before a trailing `\n` (backlog §7).
+//! is matched with `re.search` semantics (unanchored `is_match`; options
+//! `i`/`m`/`s`/`x` map to flags; other flag chars are ignored, mirroring
+//! Python's `_re_flags`). The linear `regex` crate is tried first (the fast
+//! path for almost every pattern); patterns it can't compile — backreferences,
+//! lookaround (e.g. the `^(?!system\.)` pymongo emits for listCollections), etc.
+//! — fall back to the backtracking `fancy-regex`. Only patterns neither engine
+//! compiles, or those over the 1000-char cap, signal `Fallback` (defer to
+//! Python `re`). Known divergence from Python/PCRE on the linear path: the
+//! crate's `$` matches only the end of the haystack, not before a trailing `\n`
+//! (backlog §7).
 
 use std::cmp::Ordering;
 
@@ -246,11 +249,31 @@ fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>
 /// (which raises a `QueryError`).
 const MAX_REGEX_PATTERN_LEN: usize = 1000;
 
+/// A compiled `$regex`, from whichever engine could build it: the linear
+/// `regex` crate (the fast path for almost every pattern) or, when that can't
+/// compile a pattern (lookaround / backreferences), the backtracking
+/// `fancy-regex`. Both run `re.search` semantics (unanchored).
+enum CompiledRegex {
+    Linear(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+
+impl CompiledRegex {
+    fn is_match(&self, s: &str) -> bool {
+        match self {
+            CompiledRegex::Linear(re) => re.is_match(s),
+            // fancy-regex's is_match is fallible (e.g. backtrack-limit hit); a
+            // failure is treated as no-match to stay sound (never over-match).
+            CompiledRegex::Fancy(re) => re.is_match(s).unwrap_or(false),
+        }
+    }
+}
+
 /// `$regex` / bare-regex matching, mirroring `secantus.query._op_regex`:
 /// `re.search` over each string value (and over string elements of array
 /// values). `pattern` is a `String` or a BSON `RegularExpression`; `options`
-/// is the optional sibling `$options` string. Anything the `regex` crate can't
-/// compile, or a non-string pattern/options, signals `Fallback`.
+/// is the optional sibling `$options` string. A non-string pattern/options, or
+/// a pattern neither regex engine can compile, signals `Fallback`.
 fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) -> R {
     let re = build_regex(pattern, options)?;
     for v in values {
@@ -271,7 +294,7 @@ fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) ->
     Ok(false)
 }
 
-fn build_regex(pattern: &Bson, options: Option<&Bson>) -> Result<regex::Regex, Fallback> {
+fn build_regex(pattern: &Bson, options: Option<&Bson>) -> Result<CompiledRegex, Fallback> {
     let (pat, embedded_flags): (&str, &str) = match pattern {
         Bson::String(s) => (s.as_str(), ""),
         Bson::RegularExpression(r) => (r.pattern.as_str(), r.options.as_str()),
@@ -297,12 +320,31 @@ fn build_regex(pattern: &Bson, options: Option<&Bson>) -> Result<regex::Regex, F
             _ => {}
         }
     }
-    RegexBuilder::new(pat)
+    // Fast path: the linear engine handles almost every pattern.
+    if let Ok(re) = RegexBuilder::new(pat)
         .case_insensitive(ci)
         .multi_line(ml)
         .dot_matches_new_line(dotall)
         .ignore_whitespace(ext)
         .build()
+    {
+        return Ok(CompiledRegex::Linear(re));
+    }
+    // Fallback: lookaround / backreferences via the backtracking engine. Flags
+    // ride an inline group prefix since fancy-regex has no builder-flag API.
+    let mut flagstr = String::new();
+    for (on, ch) in [(ci, 'i'), (ml, 'm'), (dotall, 's'), (ext, 'x')] {
+        if on {
+            flagstr.push(ch);
+        }
+    }
+    let full = if flagstr.is_empty() {
+        pat.to_string()
+    } else {
+        format!("(?{flagstr}){pat}")
+    };
+    fancy_regex::Regex::new(&full)
+        .map(CompiledRegex::Fancy)
         .map_err(|_| Fallback)
 }
 
@@ -921,15 +963,33 @@ mod tests {
     }
 
     #[test]
-    fn regex_uncompilable_defers() {
-        // A backreference is unsupported by the `regex` crate -> Fallback.
-        assert!(matches(
-            &doc! {"x": "aa"},
-            &doc! {"x": {"$regex": r"(a)\1"}},
-            &Document::new(),
-            None,
-        )
-        .is_err());
+    fn regex_lookaround_and_backref_via_fancy() {
+        // Backreferences / lookaround aren't compilable by the linear `regex`
+        // crate, so they fall back to fancy-regex and evaluate (no Fallback).
+        let m = |doc: Document, q: Document| {
+            matches(&doc, &q, &Document::new(), None).expect("fancy-regex should evaluate")
+        };
+        // backreference
+        assert!(m(doc! {"x": "aa"}, doc! {"x": {"$regex": r"(a)\1"}}));
+        assert!(!m(doc! {"x": "ab"}, doc! {"x": {"$regex": r"(a)\1"}}));
+        // negative lookahead — the listCollections `^(?!system\.)` shape
+        assert!(m(
+            doc! {"x": "systemcoll"},
+            doc! {"x": {"$regex": r"^(?!system\.)"}}
+        ));
+        assert!(!m(
+            doc! {"x": "system.foo"},
+            doc! {"x": {"$regex": r"^(?!system\.)"}}
+        ));
+        // lookbehind, and flags applied through the inline-prefix path
+        assert!(m(
+            doc! {"x": "xyzabc"},
+            doc! {"x": {"$regex": r"(?<=xyz)abc"}}
+        ));
+        assert!(m(
+            doc! {"x": "FOObar"},
+            doc! {"x": {"$regex": r"foo(?!baz)", "$options": "i"}}
+        ));
     }
 
     #[test]

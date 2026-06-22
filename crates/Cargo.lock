@@ -97,6 +97,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -265,6 +280,17 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "fancy-regex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -958,7 +984,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.58"
+version = "0.5.3-beta.59"
 dependencies = [
  "base64",
  "hmac",
@@ -971,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.58"
+version = "0.5.3-beta.59"
 dependencies = [
  "base64",
  "bson",
@@ -986,9 +1012,10 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.58"
+version = "0.5.3-beta.59"
 dependencies = [
  "bson",
+ "fancy-regex",
  "geo",
  "rand",
  "regex",
@@ -996,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core-py"
-version = "0.5.3-beta.58"
+version = "0.5.3-beta.59"
 dependencies = [
  "bson",
  "pyo3",
@@ -1005,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.58"
+version = "0.5.3-beta.59"
 dependencies = [
  "bson",
  "rcgen",
@@ -1018,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.58"
+version = "0.5.3-beta.59"
 dependencies = [
  "bson",
 ]

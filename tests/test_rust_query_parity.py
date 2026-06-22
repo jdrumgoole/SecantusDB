@@ -264,7 +264,16 @@ CURATED = [
     ({"x": "foobar"}, {"x": {"$regex": "o.b", "$options": "s"}}),
     ({"x": 5}, {"x": {"$regex": "5"}}),  # non-string value -> no match
     ({}, {"x": {"$regex": "anything"}}),  # missing field -> no match
-    ({"x": r"(a)\1"}, {"x": {"$regex": r"(a)\1"}}),  # backref pattern -> Rust defers
+    # backref / lookaround now compile via fancy-regex (linear engine can't),
+    # so Rust evaluates them instead of deferring — must match Python `re`.
+    ({"x": "aa"}, {"x": {"$regex": r"(a)\1"}}),  # backreference -> match
+    ({"x": r"(a)\1"}, {"x": {"$regex": r"(a)\1"}}),  # one 'a' -> no match
+    ({"x": "foobar"}, {"x": {"$regex": r"foo(?!baz)"}}),  # neg lookahead -> match
+    ({"x": "foobaz"}, {"x": {"$regex": r"foo(?!baz)"}}),  # neg lookahead -> no match
+    ({"x": "systemcoll"}, {"x": {"$regex": r"^(?!system\.)"}}),  # listColl filter -> match
+    ({"x": "system.foo"}, {"x": {"$regex": r"^(?!system\.)"}}),  # -> no match
+    ({"x": "Foobar"}, {"x": {"$regex": r"foo(?!baz)", "$options": "i"}}),  # flags + lookahead
+    ({"x": "xyzabc"}, {"x": {"$regex": r"(?<=xyz)abc"}}),  # lookbehind -> match
     # --- geo (slices geo-1 / geo-1b): point docs vs region/near queries ---
     # $geoWithin $box — point inside / outside.
     ({"loc": [5.0, 5.0]}, {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}}),
