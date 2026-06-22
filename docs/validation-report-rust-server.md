@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-06-21 — SecantusDB 0.5.4b8 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-06-22 — SecantusDB 0.5.4b9 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -10,21 +10,21 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
 | `test_bulk.py` | 33 | 1 | 0 | 4 | 38 | 97.1% |
-| `test_change_stream.py` | 100 | 6 | 0 | 49 | 155 | 94.3% |
+| `test_change_stream.py` | 104 | 2 | 0 | 49 | 155 | 98.1% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 83 | 4 | 0 | 4 | 91 | 95.4% |
-| `test_collection_management.py` | 5 | 2 | 0 | 0 | 7 | 71.4% |
+| `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
-| `test_command_monitoring.py` | 30 | 1 | 0 | 7 | 38 | 96.8% |
+| `test_command_monitoring.py` | 31 | 0 | 0 | 7 | 38 | 100.0% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_crud_unified.py` | 300 | 1 | 0 | 185 | 486 | 99.7% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 61 | 6 | 0 | 5 | 72 | 91.0% |
 | `test_custom_types.py` | 51 | 0 | 0 | 0 | 51 | 100.0% |
-| `test_database.py` | 32 | 3 | 0 | 1 | 36 | 91.4% |
+| `test_database.py` | 34 | 1 | 0 | 1 | 36 | 97.1% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_examples.py` | 16 | 2 | 0 | 2 | 20 | 88.9% |
+| `test_examples.py` | 18 | 0 | 0 | 2 | 20 | 100.0% |
 | `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
 | `test_operations.py` | 2 | 0 | 0 | 0 | 2 | 100.0% |
 | `test_raw_bson.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
@@ -34,29 +34,22 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
 | `test_transactions_unified.py` | 92 | 3 | 0 | 172 | 267 | 96.8% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_versioned_api_integration.py` | 37 | 1 | 0 | 5 | 43 | 97.4% |
+| `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **998** | **30** | **0** | **475** | **1503** | **97.1%** |
+| **Overall** | **1010** | **18** | **0** | **475** | **1503** | **98.2%** |
 
-## Failures (30)
+## Failures (18)
 
 First 30 failure node-ids for manual triage:
 
 ```
 vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_upsert_uuid_standard_subdocuments
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_resumeafter
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_resumetoken_uniterated_nonempty_batch_startafter
 vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_split_large_change
-vendor/pymongo-tests/test/test_change_stream.py::TestCollectionChangeStream::test_start_after
-vendor/pymongo-tests/test/test_change_stream.py::TestDatabaseChangeStream::test_start_after
 vendor/pymongo-tests/test/test_change_stream.py::TestUnifiedChangeStreamsShowExpandedEvents::test_when_showExpandedEvents_is_true,_new_fields_on_change_stream_events_are_handled_appropriately
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_exhaust
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_filter
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
-vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listCollections_includes_clusteredIndex
-vendor/pymongo-tests/test/test_collection_management.py::TestCollectionManagementClusteredIndexes::test_listIndexes_returns_the_index
-vendor/pymongo-tests/test/test_command_monitoring.py::TestCommandMonitoringFind::test_A_successful_find_with_showRecordId_and_returnKey
 vendor/pymongo-tests/test/test_crud_unified.py::TestUnifiedAggregateLet::test_Aggregate_with_let_option
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
@@ -64,15 +57,10 @@ vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
 vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCommandCursor::test_aggregate_raw_snapshot_reads
 vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCommandCursor::test_exhaust_cursor_db_set
 vendor/pymongo-tests/test/test_cursor.py::TestRawBatchCursor::test_find_raw_snapshot_reads
-vendor/pymongo-tests/test/test_database.py::TestDatabase::test_drop_collection
 vendor/pymongo-tests/test/test_database.py::TestDatabase::test_list_collection_names
-vendor/pymongo-tests/test/test_database.py::TestDatabase::test_validate_collection_background
-vendor/pymongo-tests/test/test_examples.py::TestSampleShellCommands::test_query_arrays
-vendor/pymongo-tests/test/test_examples.py::TestSampleShellCommands::test_update_and_replace
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedReadPref::test_secondary_readPreference
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_explicit_secondary_read_preference
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_secondary_read_preference_from_transaction_options
-vendor/pymongo-tests/test/test_versioned_api_integration.py::TestVersionedApiCrudApiVersion_1Strict::test_aggregate_on_database_appends_declared_API_version
 ```
 
 ## How this is generated
