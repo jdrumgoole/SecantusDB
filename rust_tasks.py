@@ -296,7 +296,7 @@ def rust_bump(c: Context, to: str) -> None:
     name="rust-gate",
     help={
         "pytest": "Also run the Python test suite (default True; --no-pytest to skip).",
-        "deselect": "Comma-separated pytest node ids to deselect from the Python suite (default none).",
+        "deselect": "Comma-separated pytest node ids to deselect from the suite (default none).",
     },
 )
 def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:

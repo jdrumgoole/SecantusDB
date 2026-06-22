@@ -13,87 +13,18 @@ import urllib.request
 from invoke.context import Context
 from invoke.tasks import task
 
-
-@task
-def sync(c: Context) -> None:
-    c.run("uv sync --extra dev", pty=True)
-
-
-@task
-def test(c: Context, k: str = "", verbose: bool = False) -> None:
-    cmd = "uv run python -m pytest"
-    if verbose:
-        cmd += " -v"
-    if k:
-        # shlex.quote — `f"{k!r}"` uses Python repr() which wraps in
-        # single quotes but doesn't escape embedded single quotes,
-        # leaving a shell-injection hole on a CLI-supplied filter.
-        cmd += f" -k {shlex.quote(k)}"
-    c.run(cmd, pty=True)
-
-
-@task(name="test-one")
-def test_one(c: Context, nodeid: str) -> None:
-    # `-n0 -o addopts=` runs serially: `-p no:xdist` fails because the
-    # project's addopts still injects `-n auto --dist=loadgroup`, which xdist
-    # then can't parse once its plugin is disabled. Clearing addopts and forcing
-    # zero workers is the reliable single-test form.
-    c.run(
-        f"uv run --no-sync python -m pytest -n0 -o addopts= -p no:cacheprovider {shlex.quote(nodeid)}",
-        pty=True,
-    )
-
-
-@task
-def perf(c: Context) -> None:
-    """Run the performance regression suite (serially, no xdist).
-
-    Benchmarks fight for CPU under parallel workers, amplifying noise to
-    the point that the gate becomes flappy — so this task forces serial
-    execution and explicitly opts in to the ``perf`` marker excluded
-    from the default ``invoke test``. Median time per workload is
-    asserted against a hard upper bound calibrated for ``:memory:``
-    storage on a quiet 2024-era arm64 mac. Lower the bounds in
-    ``tests/test_perf_regression.py`` when an optimisation moves the
-    floor.
-    """
-    c.run(
-        "uv run python -m pytest -p no:xdist "
-        "-o addopts= -m perf "
-        "--benchmark-columns=min,median,max -v "
-        "tests/test_perf_regression.py",
-        pty=True,
-    )
-
-
-@task
-def lint(c: Context) -> None:
-    c.run("uv run ruff check src tests", pty=True)
-    c.run("uv run ruff format --check src tests", pty=True)
-
-
-@task
-def fmt(c: Context) -> None:
-    c.run("uv run ruff format src tests", pty=True)
-    c.run("uv run ruff check --fix src tests", pty=True)
-
-
-# --- Rust tasks -----------------------------------------------------------
-# All rust-* tasks (build / test / parity / gate / ship / bump / per-crate
-# checks) live in the imported `rust_tasks` module — "a commands file that
-# invoke imports" — so they're maintained in one place and reused (e.g.
-# `validate-one` below shares `_rust_env`). `import *` brings the Task objects
-# into this root namespace for invoke discovery.
+# --- Per-server task modules ("command files that invoke imports") --------
+# Python-server dev workflow (sync / test / test-one / perf / lint / fmt / serve
+# / docs / docs-serve / clean + py-gate / py-ship) lives in `python_tasks`; the
+# rust-* tasks (build / test / parity / gate / ship / bump / stress / per-crate
+# checks) live in `rust_tasks`. Each is maintained in one place; `import *`
+# brings their Task objects into this root namespace for invoke discovery, so
+# `invoke test` / `invoke lint` / `invoke rust-gate` etc. are unchanged. The
+# cross-cutting families — driver gauges (`validate-*`), the release pipeline
+# (`release-*`), and the bench/chaos harnesses — stay below in this file.
+from python_tasks import *  # noqa: E402,F401,F403
 from rust_tasks import *  # noqa: E402,F401,F403
 from rust_tasks import _rust_env  # noqa: E402  (underscore name: explicit import)
-
-
-@task
-def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
-    c.run(
-        f"uv run python -m secantus --host {shlex.quote(host)} --port {int(port)}",
-        pty=True,
-    )
 
 
 @task(
@@ -348,31 +279,6 @@ def admin(
     if token:
         cmd.extend(["--token", token])
     c.run(" ".join(cmd), pty=True)
-
-
-@task
-def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
-    # --no-sync skips uv's project rebuild check: docs only need the Python
-    # source for autodoc, never a fresh WiredTiger C-extension build. Falling
-    # through to `uv sync` here would invoke scikit-build-core's isolated
-    # build env, which is sensitive to host cmake/swig setup and unnecessary
-    # for a docs build.
-    if clean:
-        c.run("rm -rf docs/_build", pty=True)
-    qb = shlex.quote(builder)
-    c.run(
-        f"uv run --no-sync sphinx-build -W --keep-going -b {qb} docs docs/_build/{qb}",
-        pty=True,
-    )
-
-
-@task(name="docs-serve")
-def docs_serve(c: Context, port: int = 8000) -> None:
-    docs(c)
-    c.run(
-        f"uv run --no-sync python -m http.server {port} --directory docs/_build/html",
-        pty=True,
-    )
 
 
 @task(
@@ -1033,39 +939,6 @@ def validate_readme(c: Context) -> None:
         "tests/test_pypi_readme_links.py",
         pty=True,
     )
-
-
-@task
-def clean(c: Context) -> None:
-    c.run(
-        "rm -rf build dist *.egg-info .pytest_cache .ruff_cache .coverage htmlcov docs/_build",
-        pty=True,
-    )
-    # Sweep leaked gauge tempdirs. Aborted runs of ``invoke validate-*``
-    # leave ``secantus-<driver>-gauge-XXXXXX`` directories under the
-    # system tempdir (``/var/folders/.../T`` on macOS, ``/tmp`` on
-    # Linux). Each holds a WiredTiger store — tens of MB at minimum.
-    # Reap anything older than an hour so an active gauge isn't
-    # interrupted.
-    import glob
-    import os
-    import shutil
-    import tempfile
-    import time
-
-    cutoff = time.time() - 3600.0
-    base = tempfile.gettempdir()
-    candidates = glob.glob(os.path.join(base, "secantus-*-gauge-*"))
-    swept = 0
-    for path in candidates:
-        try:
-            if os.stat(path).st_mtime < cutoff:
-                shutil.rmtree(path, ignore_errors=True)
-                swept += 1
-        except FileNotFoundError:
-            continue
-    if swept:
-        print(f"clean: swept {swept} stale gauge tempdir(s) older than 1h under {base}")
 
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([ab]\d+|rc\d+)?$")
