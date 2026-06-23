@@ -133,9 +133,20 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Command `let` → vars visible to `$expr` in the filter.
     let let_vars = resolve_let_vars(doc.get("let"));
     // `batchSize` is tri-state: absent ⇒ default, 0 ⇒ empty firstBatch + cursor,
-    // explicit positive ⇒ that size.
+    // explicit positive ⇒ that size. A present-but-non-numeric value (e.g. a
+    // string) is a TypeMismatch — mongod rejects it, and the mongo-c-driver
+    // find/batchSize test sends `{batchSize: 'foo'}` expecting a server error.
     let batch_size = match doc.get("batchSize") {
-        Some(b) => as_i64(b).unwrap_or(DEFAULT_BATCH_SIZE as i64),
+        Some(b) => match as_i64(b) {
+            Some(n) => n,
+            None => {
+                return Err(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    "BSON field 'batchSize' is the wrong type, expected a number",
+                ))
+            }
+        },
         None => DEFAULT_BATCH_SIZE as i64,
     };
     let single_batch = bool_field(doc, "singleBatch", false);
@@ -685,6 +696,24 @@ mod tests {
         assert_eq!(cur.get_i64("id").unwrap(), 0, "all fit ⇒ no cursor");
         assert_eq!(cur.get_str("ns").unwrap(), "t.c");
         assert_eq!(batch_ids(cur, "firstBatch"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn find_non_numeric_batch_size_is_type_mismatch() {
+        // A string batchSize is rejected with TypeMismatch (14) — the
+        // mongo-c-driver find/batchSize test sends {batchSize: 'foo'} expecting
+        // a server error; a numeric one (incl. Decimal128) is accepted.
+        let mut c = ctx(FakeStorage::seed("t", "c", vec![doc! {"_id": 1}]));
+        c.db_name = "t".into();
+        let reply = dispatch(&doc! {"find": "c", "batchSize": "foo"}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 14);
+        assert_eq!(reply.get_str("codeName").unwrap(), "TypeMismatch");
+        // A numeric batchSize still works.
+        let mut c = ctx(FakeStorage::seed("t", "c", vec![doc! {"_id": 1}]));
+        c.db_name = "t".into();
+        let reply = dispatch(&doc! {"find": "c", "batchSize": 5i32}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     }
 
     #[test]
