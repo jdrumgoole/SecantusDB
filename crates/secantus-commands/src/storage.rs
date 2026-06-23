@@ -507,6 +507,33 @@ pub trait Storage: Send + Sync {
         Ok(0)
     }
 
+    /// Merge `opts` into an existing index's stored options (e.g. `prepareUnique`
+    /// / `unique`). Backs `collMod {index: {keyPattern|name, ...}}`. `true` if the
+    /// index existed. Default no-op for test fakes; the WT adapter forwards to
+    /// `Storage::set_index_options`.
+    fn set_index_options(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+        _opts: &Document,
+    ) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Group the `_id`s of docs sharing a key on index `name` (groups of >= 2).
+    /// A non-empty result blocks a `collMod {index: {unique: true}}` conversion
+    /// (code 359 + `violations`). Default empty; the WT adapter forwards to
+    /// `Storage::find_index_duplicates`.
+    fn find_index_duplicates(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+    ) -> Result<Vec<Vec<Bson>>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Drop an entire database (all its collections + indexes).
     fn drop_database(&self, _db: &str) -> Result<(), StorageError> {
         Ok(())

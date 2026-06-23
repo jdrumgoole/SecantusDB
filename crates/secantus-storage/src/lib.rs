@@ -190,6 +190,10 @@ struct IndexDesc {
     key_spec: Document,
     sparse: bool,
     unique: bool,
+    /// `prepareUnique` (set via `collMod`): enforce uniqueness on *new* writes
+    /// (block dup inserts with 11000) while pre-existing duplicates are tolerated
+    /// — the staging step before a `unique: true` conversion.
+    prepare_unique: bool,
     /// `partialFilterExpression` if non-empty — entries are written (and the
     /// index considered) only for docs/queries that match / imply it.
     partial: Option<Document>,
@@ -3488,6 +3492,91 @@ impl Storage {
         Ok(true)
     }
 
+    /// Merge `new_opts` into an existing index's stored options blob
+    /// (read-modify-write, like `set_index_expiry`). Backs `collMod {index:
+    /// {keyPattern|name, prepareUnique|unique: ...}}`. Returns `true` when the
+    /// index existed and was updated. Mirrors `storage.set_index_options`.
+    pub fn set_index_options(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        new_opts: &Document,
+    ) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, coll, name);
+        match cur.search() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let mut payload = decode_doc(&cur.get_value_u()?)?;
+        let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+        for (k, v) in new_opts {
+            opts.insert(k.clone(), v.clone());
+        }
+        payload.insert("options", Bson::Document(opts));
+        let blob = encode_doc(&payload)?;
+        let wcur = session.open_cursor(IDX_TABLE, None)?;
+        wcur.set_key_sss(db, coll, name);
+        wcur.set_value_u(&blob);
+        wcur.update()?;
+        Ok(true)
+    }
+
+    /// Group the `_id`s of documents that share the same key on index `name`,
+    /// returning one `_id` list per duplicated key (groups of size >= 2,
+    /// `_id`-sorted within each group, in first-seen key order). A non-empty
+    /// result means a `collMod {index: {unique: true}}` conversion must be
+    /// refused with `CannotConvertIndexToUnique` (359) and these reported as
+    /// `violations`. Mirrors `storage.find_index_duplicates`.
+    pub fn find_index_duplicates(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<Vec<Bson>>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let descs = self.index_descs(&session, db, coll)?;
+        let desc = match descs.iter().find(|d| d.name == name) {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+        let mut index_of: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::new();
+        let mut groups: Vec<Vec<Bson>> = Vec::new();
+        for (_id_k, blob) in self.scan_docs(&session, db, coll)? {
+            let doc = decode_doc(&blob)?;
+            let kb = match index_key(&doc, &desc.key_spec, desc.sparse)? {
+                Some(k) => k,
+                None => continue, // sparse: missing key isn't a duplicate
+            };
+            let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+            match index_of.get(&kb) {
+                Some(&i) => groups[i].push(id),
+                None => {
+                    index_of.insert(kb, groups.len());
+                    groups.push(vec![id]);
+                }
+            }
+        }
+        let mut out: Vec<Vec<Bson>> = Vec::new();
+        for mut ids in groups {
+            if ids.len() > 1 {
+                ids.sort_by(|a, b| {
+                    let ka = sortkey::encode_value(a, None).unwrap_or_default();
+                    let kbk = sortkey::encode_value(b, None).unwrap_or_default();
+                    ka.cmp(&kbk)
+                });
+                out.push(ids);
+            }
+        }
+        Ok(out)
+    }
+
     /// Drop the index named `name` (and all its entries). Returns `false` if no
     /// such index, or `name == "_id_"`. Mirrors `storage.drop_index`.
     pub fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
@@ -3888,6 +3977,7 @@ impl Storage {
                     key_spec,
                     sparse: opts.get_bool("sparse").unwrap_or(false),
                     unique: opts.get_bool("unique").unwrap_or(false),
+                    prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
                     partial,
                     geo_2d,
                     geo_sphere,
@@ -3911,7 +4001,9 @@ impl Storage {
     ) -> Result<Option<UniqueConflict>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
-            if !desc.unique || !self.doc_in_partial(candidate, desc)? {
+            // `prepareUnique` arms an index to reject dup *new* writes (11000)
+            // before it's formally unique — so it enforces uniqueness here too.
+            if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
                 continue;
             }
             let kb = match index_key(candidate, &desc.key_spec, desc.sparse)? {

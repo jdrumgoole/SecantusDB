@@ -170,6 +170,84 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
+    // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique}}`.
+    if let Some(Bson::Document(index_spec)) = doc.get("index") {
+        let indexes = storage
+            .list_indexes(&ctx.db_name, &coll)
+            .map_err(command_error)?;
+        // Resolve the target index by name or key pattern.
+        let target = if let Ok(want) = index_spec.get_str("name") {
+            indexes
+                .iter()
+                .find(|ix| ix.get_str("name") == Ok(want))
+                .cloned()
+        } else if let Some(Bson::Document(want_key)) = index_spec.get("keyPattern") {
+            indexes
+                .iter()
+                .find(|ix| {
+                    ix.get_document("key")
+                        .map(|k| key_patterns_eq(k, want_key))
+                        .unwrap_or(false)
+                })
+                .cloned()
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            return Ok(CommandError::new(
+                27,
+                "IndexNotFound",
+                format!("cannot find index for ns {}.{}", ctx.db_name, coll),
+            )
+            .into_reply());
+        };
+        let target_name = target.get_str("name").unwrap_or("").to_string();
+        // `prepareUnique` arms the index: new dup writes are rejected (11000)
+        // while pre-existing duplicates are tolerated — the staging step before
+        // a `unique: true` conversion.
+        if let Some(prep) = index_spec.get("prepareUnique").and_then(Bson::as_bool) {
+            storage
+                .set_index_options(
+                    &ctx.db_name,
+                    &coll,
+                    &target_name,
+                    &doc! {"prepareUnique": prep},
+                )
+                .map_err(command_error)?;
+        }
+        // `unique: true` converts the index; if any docs already share a key the
+        // conversion is refused with 359 and the offending `_id` groups reported
+        // as `violations`. Mirrors commands.py::_coll_mod.
+        if index_spec.get("unique").and_then(Bson::as_bool) == Some(true)
+            && !target.get_bool("unique").unwrap_or(false)
+        {
+            let dups = storage
+                .find_index_duplicates(&ctx.db_name, &coll, &target_name)
+                .map_err(command_error)?;
+            if !dups.is_empty() {
+                let violations: Vec<Bson> = dups
+                    .into_iter()
+                    .map(|ids| Bson::Document(doc! {"ids": ids}))
+                    .collect();
+                let mut reply = CommandError::new(
+                    359,
+                    "CannotConvertIndexToUnique",
+                    format!("Cannot convert index {target_name} to unique: found duplicate values"),
+                )
+                .into_reply();
+                reply.insert("violations", violations);
+                return Ok(reply);
+            }
+            storage
+                .set_index_options(
+                    &ctx.db_name,
+                    &coll,
+                    &target_name,
+                    &doc! {"unique": true, "prepareUnique": false},
+                )
+                .map_err(command_error)?;
+        }
+    }
     let opts = collection_option_subset(doc);
     // `coll_mod` (not `set_collection_options`) so a `showExpandedEvents` change
     // stream sees the resulting `modify` event.
@@ -177,6 +255,15 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .coll_mod(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
     Ok(doc! { "ok": 1.0 })
+}
+
+/// Whether two index key patterns are equal (same fields, same order, same
+/// `±1` direction regardless of the numeric BSON type they're encoded as).
+fn key_patterns_eq(a: &Document, b: &Document) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|((ak, av), (bk, bv))| ak == bk && as_i64(av) == as_i64(bv))
 }
 
 /// `explain` — report the query plan (and, above `queryPlanner` verbosity,
@@ -1191,11 +1278,16 @@ mod tests {
         idx: Mutex<HashMap<(String, String), Vec<String>>>,
         // (db, coll) -> stored options blob
         opts: Mutex<HashMap<(String, String), Document>>,
+        // duplicate _id groups find_index_duplicates returns (for collMod tests)
+        dups: Mutex<Vec<Vec<Bson>>>,
     }
 
     impl FakeStorage {
         fn arc() -> Arc<FakeStorage> {
             Arc::new(FakeStorage::default())
+        }
+        fn set_dups(&self, dups: Vec<Vec<Bson>>) {
+            *self.dups.lock().unwrap() = dups;
         }
     }
 
@@ -1335,6 +1427,23 @@ mod tests {
             let before = v.len();
             v.retain(|n| n != name);
             Ok(v.len() != before)
+        }
+        fn set_index_options(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _name: &str,
+            _opts: &Document,
+        ) -> Result<bool, StorageError> {
+            Ok(true)
+        }
+        fn find_index_duplicates(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _name: &str,
+        ) -> Result<Vec<Vec<Bson>>, StorageError> {
+            Ok(self.dups.lock().unwrap().clone())
         }
         fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize, StorageError> {
             let mut idx = self.idx.lock().unwrap();
@@ -1544,6 +1653,62 @@ mod tests {
             .unwrap();
         assert!(stored.contains_key("validator"));
         assert!(stored.contains_key("changeStreamPreAndPostImages"));
+    }
+
+    #[test]
+    fn collmod_index_prepare_unique_then_unique_conversion() {
+        // prepareUnique succeeds; a unique:true conversion over existing
+        // duplicates is refused with 359 + violations; with no dups it succeeds.
+        // Mirrors mongo-c-driver modifyCollection-errorResponse.
+        let s = FakeStorage::arc();
+        let mut c = ctx(s.clone());
+        dispatch(&doc! {"create": "c"}, &mut c);
+        let mut c = ctx(s.clone());
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"x": 1}, "name": "x_1"}]},
+            &mut c,
+        );
+
+        // prepareUnique arms the index — ok.
+        let mut c = ctx(s.clone());
+        let r = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "x_1", "prepareUnique": true}},
+            &mut c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+
+        // unique:true with existing duplicates → 359 + violations.
+        s.set_dups(vec![vec![Bson::Int32(1), Bson::Int32(2)]]);
+        let mut c = ctx(s.clone());
+        let r = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "x_1", "unique": true}},
+            &mut c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(r.get_i32("code").unwrap(), 359);
+        assert_eq!(r.get_str("codeName").unwrap(), "CannotConvertIndexToUnique");
+        let v = r.get_array("violations").unwrap();
+        assert_eq!(
+            v[0].as_document().unwrap().get_array("ids").unwrap(),
+            &vec![Bson::Int32(1), Bson::Int32(2)]
+        );
+
+        // No duplicates → conversion succeeds.
+        s.set_dups(vec![]);
+        let mut c = ctx(s.clone());
+        let r = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "x_1", "unique": true}},
+            &mut c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+
+        // A missing index → IndexNotFound (27).
+        let mut c = ctx(s.clone());
+        let r = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "nope", "unique": true}},
+            &mut c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 27);
     }
 
     #[test]

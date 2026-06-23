@@ -549,6 +549,29 @@ impl CmdStorage for StorageAdapter {
         self.inner.drop_all_indexes(db, coll).map_err(map_err)
     }
 
+    fn set_index_options(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        opts: &Document,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .set_index_options(db, coll, name, opts)
+            .map_err(map_err)
+    }
+
+    fn find_index_duplicates(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<Vec<Bson>>, StorageError> {
+        self.inner
+            .find_index_duplicates(db, coll, name)
+            .map_err(map_err)
+    }
+
     fn drop_database(&self, db: &str) -> Result<(), StorageError> {
         self.inner.drop_database(db).map_err(map_err)
     }

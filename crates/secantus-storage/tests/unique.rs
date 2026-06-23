@@ -55,6 +55,43 @@ fn unique_rejects_duplicate_insert() {
 }
 
 #[test]
+fn prepare_unique_arms_index_then_find_duplicates_groups() {
+    // collMod prepareUnique: arms a non-unique index so new dup writes are
+    // rejected (11000) while pre-existing duplicates remain and are reportable
+    // as `violations` via find_index_duplicates (mongo-c-driver
+    // modifyCollection-errorResponse).
+    with_db(|st| {
+        st.create_index("app", "c", "x_1", &doc! {"x": 1}, &doc! {})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "x": 1}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "x": 1}))
+            .unwrap();
+        // Arm with prepareUnique → a new duplicate is now rejected…
+        assert!(st
+            .set_index_options("app", "c", "x_1", &doc! {"prepareUnique": true})
+            .unwrap());
+        match st.insert_one("app", "c", &enc(&doc! {"_id": 3, "x": 1})) {
+            Err(StorageError::DuplicateKey(_)) => {}
+            other => panic!("expected DuplicateKey after prepareUnique, got {other:?}"),
+        }
+        // …but the pre-existing duplicates remain, grouped by key, _id-sorted.
+        let dups = st.find_index_duplicates("app", "c", "x_1").unwrap();
+        assert_eq!(dups, vec![vec![Bson::Int32(1), Bson::Int32(2)]]);
+        // A distinct value still inserts.
+        st.insert_one("app", "c", &enc(&doc! {"_id": 4, "x": 2}))
+            .unwrap();
+        // Once the duplicates are gone, there are no more violations.
+        st.delete_matching("app", "c", &doc! {"_id": 2}, 0, &doc! {}, None)
+            .unwrap();
+        assert!(st
+            .find_index_duplicates("app", "c", "x_1")
+            .unwrap()
+            .is_empty());
+    });
+}
+
+#[test]
 fn unique_create_over_existing_dupes_errors() {
     with_db(|st| {
         st.insert_one("app", "c", &enc(&doc! {"_id": 1, "e": "x"}))
