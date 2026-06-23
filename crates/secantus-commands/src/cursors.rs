@@ -384,6 +384,26 @@ impl CursorRegistry {
         (killed, not_found)
     }
 
+    /// Drop every cursor open on `namespace` (a `db.coll` string), returning the
+    /// count. mongod kills a collection's cursors when it's dropped or renamed,
+    /// so a later `getMore` fails with `CursorNotFound`; SecantusDB's cursors
+    /// hold detached snapshots, so without this they'd keep serving rows after
+    /// the collection is gone (mongo-c-driver's `error_document/getmore` test).
+    /// Mirrors `cursors.kill_namespace`.
+    pub fn kill_namespace(&self, namespace: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let doomed: Vec<i64> = inner
+            .cursors
+            .iter()
+            .filter(|(_, e)| e.namespace == namespace)
+            .map(|(&cid, _)| cid)
+            .collect();
+        for cid in &doomed {
+            inner.cursors.remove(cid);
+        }
+        doomed.len()
+    }
+
     /// Mark a cursor invalidated (a blocked tailable getMore wakes and ends).
     /// No-op if the cursor is gone.
     pub fn invalidate(&self, cursor_id: i64) {
@@ -880,6 +900,29 @@ mod tests {
         // claim collection "other" ⇒ ns mismatch ⇒ CursorNotFound
         let reply = dispatch(&doc! {"getMore": id, "collection": "other"}, &mut c);
         assert_eq!(reply.get_i32("code").unwrap(), 43);
+    }
+
+    #[test]
+    fn kill_namespace_drops_matching_cursors() {
+        // kill_namespace removes only cursors on the exact ns; a later getMore on
+        // a killed cursor is CursorNotFound (43). Guards the drop/rename → getMore
+        // path the mongo-c-driver error_document/getmore test exercises.
+        let reg = Arc::new(CursorRegistry::new());
+        let a = reg
+            .register("t.c", vec![enc(&doc! {"_id": 1}), enc(&doc! {"_id": 2})])
+            .unwrap();
+        let b = reg
+            .register("t.other", vec![enc(&doc! {"_id": 1})])
+            .unwrap();
+        assert_eq!(reg.kill_namespace("t.c"), 1);
+        let mut c = ctx_with_cursors(reg);
+        c.db_name = "t".into();
+        // The dropped-ns cursor is gone → CursorNotFound.
+        let reply = dispatch(&doc! {"getMore": a, "collection": "c"}, &mut c);
+        assert_eq!(reply.get_i32("code").unwrap(), 43);
+        // The other-ns cursor survives.
+        let reply = dispatch(&doc! {"getMore": b, "collection": "other"}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     }
 
     #[test]

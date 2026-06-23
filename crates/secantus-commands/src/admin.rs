@@ -368,10 +368,17 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// `drop` — drop a collection.
 pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "drop")?;
+    let ns = format!("{}.{}", ctx.db_name, coll);
     let storage = ctx.storage()?;
     let existed = storage
         .drop_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // Dropping a collection kills its open cursors so a later getMore fails with
+    // CursorNotFound rather than serving stale snapshot rows (mongo-c-driver's
+    // error_document/getmore). Mirrors commands.py::_drop.
+    if let Ok(cursors) = ctx.cursors() {
+        cursors.kill_namespace(&ns);
+    }
     if !existed {
         // Modern mongod treats `drop` of a non-existent collection as an
         // idempotent success (`{ok: 1}`), not a NamespaceNotFound error. The
@@ -879,6 +886,15 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
             (26, "NamespaceNotFound")
         };
         return Ok(CommandError::new(code, name, m).into_reply());
+    }
+    // A rename invalidates cursors open on the source (and the dropped target),
+    // same as a drop — a later getMore then fails with CursorNotFound. Mirrors
+    // commands.py::_rename_collection.
+    if let Ok(cursors) = ctx.cursors() {
+        cursors.kill_namespace(&src);
+        if drop_target {
+            cursors.kill_namespace(&to);
+        }
     }
     Ok(doc! { "ok": 1.0 })
 }

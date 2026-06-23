@@ -415,6 +415,22 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
 fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     let name = command_name(doc);
 
+    // Database-name length limit: mongod rejects any namespace whose database
+    // component exceeds 63 bytes with InvalidNamespace before the command runs
+    // (libmongoc's `long_namespace/unsupported_long_db` inserts into a
+    // 64-character database and expects a server error). Mirrors commands.py.
+    if ctx.db_name.len() > 63 {
+        return CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!(
+                "Invalid database name: '{}'. Database names must be at most 63 characters.",
+                ctx.db_name
+            ),
+        )
+        .into_reply();
+    }
+
     if let Err(e) = validate_read_concern(doc, name, ctx) {
         return e.into_reply();
     }
@@ -1339,6 +1355,25 @@ mod tests {
                 Some(Bson::Timestamp(_))
             ));
         }
+    }
+
+    #[test]
+    fn long_database_name_is_invalid_namespace() {
+        // A database component over 63 bytes is rejected with InvalidNamespace
+        // (73) before the command runs (libmongoc long_namespace test).
+        let mut c = ctx();
+        c.db_name = "d".repeat(64);
+        let reply = dispatch(&doc! {"ping": 1}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 73);
+        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidNamespace");
+        // Exactly 63 is allowed.
+        let mut c = ctx();
+        c.db_name = "d".repeat(63);
+        assert_eq!(
+            dispatch(&doc! {"ping": 1}, &mut c).get_f64("ok").unwrap(),
+            1.0
+        );
     }
 
     #[test]
