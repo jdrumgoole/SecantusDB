@@ -611,12 +611,17 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
     }
     let ns = format!("{}.$cmd.listIndexes.{}", ctx.db_name, coll);
-    let (first, cid) = split_into_cursor(
-        encode_docs(indexes)?,
-        DEFAULT_BATCH_SIZE as i64,
-        &ns,
-        cursors,
-    )?;
+    // Honour `cursor: {batchSize: N}` so a client asking for a small batch gets a
+    // real getMore round-trip (the Go driver's
+    // `TestIndexView/list/getMore_commands_are_monitored` asserts a getMore fires
+    // at batchSize 2); absent ⇒ the wire default. Mirrors `list_collections`.
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let (first, cid) = split_into_cursor(encode_docs(indexes)?, batch_size, &ns, cursors)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
@@ -1330,6 +1335,46 @@ mod tests {
             .with_cursors(Arc::new(CursorRegistry::new()));
         c.db_name = "t".into();
         c
+    }
+
+    #[test]
+    fn list_indexes_honours_cursor_batch_size() {
+        // A small `cursor.batchSize` must produce a real getMore-able cursor
+        // (live id) rather than dumping every index into firstBatch — the Go
+        // driver's TestIndexView/list/getMore_commands_are_monitored asserts a
+        // getMore fires at batchSize 2.
+        let s = Arc::new(FakeStorage::default());
+        let mut c = ctx(s.clone());
+        dispatch(&doc! {"create": "c"}, &mut c);
+        let mut c = ctx(s.clone());
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [
+                {"key": {"a": 1}, "name": "a_1"},
+                {"key": {"b": 1}, "name": "b_1"},
+            ]},
+            &mut c,
+        );
+
+        // batchSize 2 over three indexes (_id_, a_1, b_1) ⇒ 2 in firstBatch + live cursor.
+        let mut c = ctx(s.clone());
+        let li = dispatch(
+            &doc! {"listIndexes": "c", "cursor": {"batchSize": 2}},
+            &mut c,
+        );
+        let cur = li.get_document("cursor").unwrap();
+        assert_eq!(cur.get_array("firstBatch").unwrap().len(), 2);
+        assert_ne!(
+            cur.get_i64("id").unwrap(),
+            0,
+            "remaining index ⇒ live cursor so a getMore is emitted"
+        );
+
+        // No batchSize ⇒ all three in one batch, cursor closed.
+        let mut c = ctx(s.clone());
+        let li = dispatch(&doc! {"listIndexes": "c"}, &mut c);
+        let cur = li.get_document("cursor").unwrap();
+        assert_eq!(cur.get_array("firstBatch").unwrap().len(), 3);
+        assert_eq!(cur.get_i64("id").unwrap(), 0);
     }
 
     #[test]
