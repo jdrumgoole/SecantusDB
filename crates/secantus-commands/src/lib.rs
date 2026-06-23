@@ -304,7 +304,9 @@ fn lookup(name: &str) -> Option<Handler> {
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
         "collStats" => admin::coll_stats,
-        "dbStats" => admin::db_stats,
+        // mongod accepts the lowercase `dbstats` spelling too (the C driver's
+        // command_fully_qualified test sends it over the legacy OP_QUERY path).
+        "dbStats" | "dbstats" => admin::db_stats,
         "serverStatus" => admin::server_status,
         "currentOp" => admin::current_op,
         "validate" => admin::validate,

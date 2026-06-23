@@ -1894,6 +1894,17 @@ mod tests {
     }
 
     #[test]
+    fn dbstats_lowercase_alias_is_recognised() {
+        // mongod accepts the lowercase `dbstats` spelling (mongo-c-driver
+        // command_fully_qualified sends it over OP_QUERY); it must reach the
+        // handler, not CommandNotFound, and report `db`.
+        let mut c = ctx(FakeStorage::arc());
+        let reply = dispatch(&doc! {"dbstats": 1}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(reply.get_str("db").unwrap(), "t");
+    }
+
+    #[test]
     fn coll_stats_shape() {
         let s = FakeStorage::arc();
         let mut c = ctx(s.clone());
