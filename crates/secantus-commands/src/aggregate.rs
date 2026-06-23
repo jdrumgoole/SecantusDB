@@ -47,7 +47,7 @@ use bson::{doc, Bson, Document};
 
 use crate::find::split_docs_into_cursor;
 use crate::util::{
-    as_i64, collation_of, command_error, decode_docs, encode_docs, resolve_let_vars,
+    as_i64, bool_field, collation_of, command_error, decode_docs, encode_docs, resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
@@ -293,6 +293,7 @@ fn run_segmented(
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name)).cloned();
+            let bypass = bool_field(cmd_doc, "bypassDocumentValidation", false);
             docs = apply_storage_stage(
                 name,
                 spec.as_ref(),
@@ -302,6 +303,7 @@ fn run_segmented(
                 vars,
                 storage,
                 collation,
+                bypass,
             )?;
         } else {
             buffer.push(stage.clone());
@@ -368,6 +370,7 @@ fn apply_storage_stage(
     vars: &Document,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
+    bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     match name {
         "$lookup" => apply_lookup(spec, docs, db, vars, storage, collation),
@@ -376,8 +379,8 @@ fn apply_storage_stage(
         "$sample" => apply_sample(spec, docs),
         "$collStats" => apply_coll_stats(spec, db, coll, storage),
         "$indexStats" => apply_index_stats(db, coll, storage),
-        "$out" => apply_out(spec, docs, db, storage),
-        "$merge" => apply_merge(spec, docs, db, storage),
+        "$out" => apply_out(spec, docs, db, storage, bypass_validation),
+        "$merge" => apply_merge(spec, docs, db, storage, bypass_validation),
         "$geoNear" => apply_geo_near(spec, docs, db, coll, vars, storage),
         _ => Err(bad_value(format!(
             "unsupported storage-backed stage {name}"
@@ -953,6 +956,43 @@ fn apply_index_stats(
         .collect())
 }
 
+/// Enforce the destination collection's `validator` on a `$out`/`$merge` write
+/// unless `bypass` (the command's `bypassDocumentValidation`) is set: a doc that
+/// fails the validator aborts with `DocumentValidationFailure` (121) when
+/// `validationAction` is `"error"` (the default; `"warn"` is a no-op here).
+/// Mirrors `aggregate._enforce_target_validator`.
+fn enforce_target_validator(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    docs: &[Document],
+    bypass: bool,
+) -> Result<(), CommandError> {
+    if bypass {
+        return Ok(());
+    }
+    let opts = storage
+        .get_collection_options(db, coll)
+        .map_err(command_error)?;
+    let validator = match opts.get_document("validator") {
+        Ok(v) if !v.is_empty() => v.clone(),
+        _ => return Ok(()),
+    };
+    if opts.get_str("validationAction").unwrap_or("error") != "error" {
+        return Ok(());
+    }
+    for d in docs {
+        if !secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(false) {
+            return Err(CommandError::new(
+                121,
+                "DocumentValidationFailure",
+                "Document failed validation",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `$out` — replace the target collection with the pipeline result. Mirrors
 /// `aggregate._stage_out`'s default (same-db) behaviour: drop the target, insert
 /// every result doc, and emit nothing downstream.
@@ -961,8 +1001,10 @@ fn apply_out(
     docs: Vec<Document>,
     db: &str,
     storage: &dyn crate::storage::Storage,
+    bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     let (out_db, out_coll) = out_target(spec, db)?;
+    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation)?;
     storage
         .drop_collection(&out_db, &out_coll)
         .map_err(command_error)?;
@@ -1004,8 +1046,10 @@ fn apply_merge(
     docs: Vec<Document>,
     db: &str,
     storage: &dyn crate::storage::Storage,
+    bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     let (out_db, out_coll, on, when_matched, when_not_matched) = merge_spec(spec, db)?;
+    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation)?;
     storage
         .create_collection(&out_db, &out_coll)
         .map_err(command_error)?;
@@ -1278,6 +1322,7 @@ mod tests {
     struct FakeStorage {
         cols: Mutex<HashMap<(String, String), Vec<Document>>>,
         indexes: Mutex<HashMap<(String, String), Vec<Document>>>,
+        options: Mutex<HashMap<(String, String), Document>>,
     }
 
     impl FakeStorage {
@@ -1304,6 +1349,13 @@ mod tests {
                 .entry((db.to_string(), coll.to_string()))
                 .or_default()
                 .push(index);
+        }
+        /// Seed a collection's options doc (e.g. `{validator: ...}`).
+        fn set_options(&self, db: &str, coll: &str, opts: Document) {
+            self.options
+                .lock()
+                .unwrap()
+                .insert((db.to_string(), coll.to_string()), opts);
         }
     }
 
@@ -1397,6 +1449,15 @@ mod tests {
         fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>, StorageError> {
             Ok(self
                 .indexes
+                .lock()
+                .unwrap()
+                .get(&(db.to_string(), coll.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
+            Ok(self
+                .options
                 .lock()
                 .unwrap()
                 .get(&(db.to_string(), coll.to_string()))
@@ -1802,6 +1863,47 @@ mod tests {
         let mut ids: Vec<i32> = dst.iter().map(|d| d.get_i32("_id").unwrap()).collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn out_enforces_target_validator_unless_bypassed() {
+        // $out into a collection with a validator runs each doc through it: a
+        // failing doc aborts with DocumentValidationFailure (121), unless the
+        // command sets bypassDocumentValidation. Mirrors the mongo-c-driver
+        // aggregate/bypass_document_validation test.
+        let s = FakeStorage::seed("t", "c", vec![doc! {"_id": 1, "n": 5}]);
+        s.set_options("t", "dst", doc! {"validator": {"n": {"$gt": 100}}});
+
+        // n=5 fails the validator → 121.
+        let mut c = ctx(s.clone());
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$out": "dst"}], "cursor": {}},
+            &mut c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 121);
+        assert_eq!(
+            reply.get_str("codeName").unwrap(),
+            "DocumentValidationFailure"
+        );
+
+        // bypassDocumentValidation: true → the write goes through.
+        let mut c = ctx(s.clone());
+        let reply = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$out": "dst"}],
+            "bypassDocumentValidation": true, "cursor": {}},
+            &mut c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(
+            s.cols
+                .lock()
+                .unwrap()
+                .get(&("t".into(), "dst".into()))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
