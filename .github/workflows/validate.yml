@@ -28,9 +28,11 @@ jobs:
       matrix:
         driver:
           - { name: pymongo, task: validate,      report: docs/validation-report.md }
+          - { name: pymongo-async, task: validate-pymongo-async, report: docs/validation-report-pymongo-async.md }
           - { name: go,      task: validate-go,   report: docs/validation-report-go.md }
           - { name: node,    task: validate-node, report: docs/validation-report-node.md }
           - { name: java,    task: validate-java, report: docs/validation-report-java.md }
+          - { name: kotlin,  task: validate-kotlin, report: docs/validation-report-kotlin.md }
           - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
           - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
           - { name: php-lib, task: validate-php-lib, report: docs/validation-report-php-lib.md }
@@ -182,14 +184,14 @@ jobs:
             ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
-        if: matrix.driver.name == 'java'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin'
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
-        if: matrix.driver.name == 'java'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin'
         uses: actions/cache@v5
         with:
           path: |

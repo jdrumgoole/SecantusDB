@@ -35,6 +35,7 @@ dev = [
     "pytest-json-report>=1.5",  # for pymongo-validation report generation
     "pytest-benchmark>=4.0",  # for tests/test_perf_regression.py
     "pytest-timeout>=2.4",  # per-test deadline; names hung tests instead of letting CI hang at 97%
+    "pytest-asyncio>=0.24",  # drives pymongo's async test suite in the validate-pymongo-async gauge
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "invoke>=2.2",
     "ruff>=0.6",
@@ -123,12 +124,19 @@ sdist.exclude = [
     "vendor/pymongo-tests/**",
     "pymongo_validation/**",
     "pymongo-validation/**",
+    # pymongo-async reuses the vendor/pymongo-tests submodule (the async
+    # suite under test/asynchronous/); only its adapter dir needs excluding.
+    "pymongo_async_validation/**",
     "vendor/mongo-go-driver/**",
     "go_validation/**",
     "vendor/node-mongodb-native/**",
     "node_validation/**",
+    # mongo-java-driver hosts both the Java and the Kotlin driver; the
+    # vendor tree is already excluded above, so the Kotlin gauge just adds
+    # its own adapter dir.
     "vendor/mongo-java-driver/**",
     "java_validation/**",
+    "kotlin_validation/**",
     "vendor/mongo-ruby-driver/**",
     "ruby_validation/**",
     "vendor/mongo-php-library/**",

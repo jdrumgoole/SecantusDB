@@ -19,6 +19,61 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Two more conformance gauges: the Kotlin driver and pymongo async
+
+SecantusDB now also measures itself against the official MongoDB **Kotlin**
+driver and against pymongo's native **async** (`AsyncMongoClient`) suite —
+bringing the gauge count to thirteen. Both reuse infrastructure already in the
+tree rather than vendoring new submodules: the Kotlin driver ships *inside* the
+mongo-java-driver monorepo (`driver-kotlin-sync`), so its gauge runs the
+`:driver-kotlin-sync:integrationTest` Gradle task against an embedded SecantusDB
+daemon over the same JDK/Gradle toolchain the Java gauge already needs; and the
+async gauge points pymongo's `test/asynchronous/` suite at the same
+embedded-server plugin the sync gauge uses, run under `pytest-asyncio` with
+`asyncio_mode=auto`. The async gauge is the more interesting of the two — it
+exercises the async/await wire path that replaced Motor, which drives cursors and
+change-stream `getMore` polling through a different event-loop code path than the
+synchronous client, catching divergences a sync-only gauge can't see.
+
+Run them with `invoke validate-pymongo-async` and `invoke validate-kotlin`. Both
+join the weekly `validate.yml` matrix and `invoke validate-all`. Neither touches
+the shipped `secantus` package — the gauge directories are dev-only, excluded
+from the wheel and sdist like every other gauge.
+
+Bringing the Kotlin gauge up also surfaced and fixed a latent break in the
+shared gauge plumbing: every daemon-subprocess gauge (go / node / java / ruby /
+rust / c / cxx / dotnet) passes `--log-level WARNING`, but `gauge_common.
+spawn_daemon` learns the daemon's kernel-assigned port by grepping its
+`listening on <host>:<port>` line — which the Python server logs at INFO, so
+WARNING suppressed it and the spawn waited the full timeout (and, with a
+blocking read, could hang for hours — one scheduled CI run was cancelled at 6h).
+The spawn now forces the Python daemon to INFO (per-request logging is at DEBUG,
+so this adds only the one readiness line, no noise) and reads the daemon's output
+under a hard deadline so a missing line times out instead of hanging. This is
+why those gauges were red in the weekly run; they go green again with this fix.
+
+#### Added
+- `pymongo_async_validation/` gauge package (`include_paths` / `generate_report`)
+  and the `invoke validate-pymongo-async` task — pymongo's native
+  `AsyncMongoClient` suite against an embedded SecantusDB, reusing
+  `pymongo_validation.plugin` and the `vendor/pymongo-tests` submodule. Adds a
+  `pytest-asyncio` dev dependency.
+- `kotlin_validation/` gauge package (`include_modules` / `runner` /
+  `generate_report` / `init.gradle.kts`) and the `invoke validate-kotlin` task —
+  the official Kotlin driver's `:driver-kotlin-sync:integrationTest` suite against
+  a standalone SecantusDB daemon, sharing the Java gauge's JVM toolchain and
+  `vendor/mongo-java-driver` submodule.
+- Both gauges wired into `invoke validate-all` / `validate-all-servers` and the
+  CI `validate.yml` matrix.
+
+#### Fixed
+- `gauge_common.spawn_daemon`: the Python daemon is now forced to `--log-level
+  INFO` so its `listening on …` readiness line (logged at INFO) is visible even
+  though gauges pass `--log-level WARNING`, and the readiness read is bounded by
+  the spawn deadline instead of a blocking `readline()`. Unbreaks the
+  daemon-subprocess gauges (go / node / java / ruby / rust / c / cxx / dotnet),
+  which were failing/hanging in CI because WARNING suppressed the line.
+
 ### Closing the gaps the C, C++, and C# gauges opened
 
 Adding the mongo-c-driver, mongo-cxx-driver, and mongo-csharp-driver gauges

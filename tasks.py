@@ -397,6 +397,71 @@ def validate_one(c: Context, nodeid: str, server: str = "python") -> None:
     )
 
 
+@task(name="validate-pymongo-async")
+def validate_pymongo_async(c: Context, server: str = "python") -> None:
+    """Run pymongo's vendored *async* test suite against an embedded SecantusDB.
+
+    The async sibling of ``validate``: it drives pymongo's native
+    ``AsyncMongoClient`` API (the async/await wire path that replaced Motor)
+    over the in-scope CRUD / cursor / change-stream / command-monitoring
+    surface. Generates docs/validation-report-pymongo-async.md.
+
+    Reuses the same embedded-server plugin (``pymongo_validation.plugin``) as
+    the sync gauge — only the test paths
+    (``pymongo_async_validation.include_paths``) and the report differ. The
+    async tests need ``pytest-asyncio``; this task enables it on the command
+    line (``-o asyncio_mode=auto``) so the unmodified vendored config isn't
+    required.
+
+    ``--server rust`` runs the same suite against the Rust server and writes
+    docs/validation-report-pymongo-async-rust-server.md.
+    """
+    import pathlib
+
+    from pymongo_async_validation.include_paths import DESELECT_TESTS, INCLUDE
+
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
+
+    if not pathlib.Path("vendor/pymongo-tests/test/asynchronous").exists():
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    paths = " ".join(INCLUDE)
+    deselect = " ".join(f"--deselect={t}" for t in DESELECT_TESTS)
+    suffix = "" if server == "python" else "-rust-server"
+    raw_json = f".validation/pymongo-async-raw{suffix}.json"
+    report = f"docs/validation-report-pymongo-async{suffix}.md"
+    # Same invocation shape as `validate` (see that task for the `-c
+    # pyproject.toml` / `-o addopts=` / `-n1` rationale), plus the
+    # pytest-asyncio knobs the async suite needs: `-o asyncio_mode=auto`
+    # (pymongo's async tests are bare `async def test_*`, no per-test
+    # marker) and the session-scoped default loop pymongo's async fixtures
+    # assume. The embedded-server plugin is the SAME one the sync gauge
+    # loads — it sets DB_IP/DB_PORT before pymongo's conftest import, which
+    # the async `AsyncClientContext` resolves from too.
+    c.run(
+        f"SECANTUS_GAUGE_SERVER={server} "
+        "PYTHONPATH=. uv run --no-sync python -m pytest "
+        "-c pyproject.toml "
+        "-o addopts= -o testpaths= -o timeout=120 "
+        "-o asyncio_mode=auto -o asyncio_default_fixture_loop_scope=session "
+        "-n1 --max-worker-restart=200 "
+        "-p no:cacheprovider -p pytest_asyncio -p pymongo_validation.plugin "
+        "--continue-on-collection-errors "
+        f"--json-report --json-report-file={raw_json} "
+        f"--no-header --tb=no -q {deselect} {paths}",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m pymongo_async_validation.generate_report "
+        f"--server {server} {raw_json} {report}",
+        pty=True,
+    )
+    print(f"\nWrote {report}")
+
+
 @task(name="validate-go")
 def validate_go(c: Context, server: str = "python") -> None:
     """Run mongo-go-driver's tests against an embedded SecantusDB.
@@ -570,6 +635,62 @@ def validate_java(c: Context, server: str = "python") -> None:
         pty=True,
     )
     print(f"\nWrote docs/validation-report-java{suffix}.md")
+
+
+@task(name="validate-kotlin")
+def validate_kotlin(c: Context, server: str = "python") -> None:
+    """Run mongo-kotlin-driver's integration tests against an embedded SecantusDB.
+
+    Generates docs/validation-report-kotlin.md — the official MongoDB Kotlin
+    driver analogue of the Java gauge. The Kotlin driver ships in the
+    mongo-java-driver monorepo, so this gauge reuses the same vendored
+    submodule and JVM toolchain (a JDK 8-23 on PATH, plus the gradle wrapper
+    the driver ships) and targets the ``:driver-kotlin-sync:integrationTest``
+    task. First run downloads the gradle distribution + dependencies and
+    compiles the Kotlin sources (slow); subsequent runs reuse the caches.
+
+    ``--server rust`` targets the standalone ``secantusdb`` binary and writes
+    docs/validation-report-kotlin-rust-server.md.
+    """
+    import pathlib
+
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
+    suffix = "" if server == "python" else "-rust-server"
+
+    # Same nested-submodule requirement as the Java gauge — the unified-spec
+    # runners load driver-spec test data from testing/resources/specifications.
+    if (
+        not pathlib.Path("vendor/mongo-java-driver/gradlew").exists()
+        or not pathlib.Path(
+            "vendor/mongo-java-driver/testing/resources/specifications/source"
+        ).is_dir()
+    ):
+        c.run("git submodule update --init --recursive", pty=True)
+
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    result = c.run(
+        f"SECANTUS_GAUGE_SERVER={server} "
+        "PYTHONPATH=. uv run --no-sync python -m kotlin_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    # Fail loudly rather than regenerate a stale/empty report (same guard as
+    # validate-java): the runner wipes prior JUnit XML up front, so a non-zero
+    # exit means no tests actually ran this invocation (usual cause: no
+    # Gradle-supported JDK — needs 8-23, JDK 24+ aborts the build).
+    if result.exited != 0:
+        raise SystemExit(
+            f"kotlin_validation.runner failed (exit {result.exited}); not regenerating "
+            f"docs/validation-report-kotlin{suffix}.md from stale/empty results. See the "
+            "runner output above (a JDK 24+ default is the usual cause — install openjdk@17)."
+        )
+    c.run(
+        "uv run --no-sync python -m kotlin_validation.generate_report "
+        f".validation/kotlin-results{suffix} docs/validation-report-kotlin{suffix}.md",
+        pty=True,
+    )
+    print(f"\nWrote docs/validation-report-kotlin{suffix}.md")
 
 
 @task(name="validate-rust")
@@ -816,12 +937,13 @@ def validate_dotnet(c: Context, server: str = "python") -> None:
 
 @task(name="validate-all")
 def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
-    """Run all eleven driver gauges against the Python (default) or Rust server.
+    """Run all thirteen driver gauges against the Python (default) or Rust server.
 
     Local equivalent of the CI ``.github/workflows/validate.yml`` matrix:
-    fans out ``validate / validate-go / validate-node / validate-java /
-    validate-ruby / validate-rust / validate-php-lib / validate-php-ext /
-    validate-c / validate-cxx / validate-dotnet`` over a thread pool. Each gauge
+    fans out ``validate / validate-pymongo-async / validate-go / validate-node /
+    validate-java / validate-kotlin / validate-ruby / validate-rust /
+    validate-php-lib / validate-php-ext / validate-c / validate-cxx /
+    validate-dotnet`` over a thread pool. Each gauge
     spawns its own SecantusDB daemon and reads back the kernel-assigned port the
     daemon bound (``gauge_common.spawn_daemon``), so concurrent gauges never
     collide on a port. ``validate-cxx`` is the one exception — mongocxx's tests
@@ -843,9 +965,11 @@ def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
 
     GAUGES = [
         ("pymongo", "validate"),
+        ("pymongo-async", "validate-pymongo-async"),
         ("go", "validate-go"),
         ("node", "validate-node"),
         ("java", "validate-java"),
+        ("kotlin", "validate-kotlin"),
         ("ruby", "validate-ruby"),
         ("rust", "validate-rust"),
         ("php-lib", "validate-php-lib"),
@@ -903,7 +1027,7 @@ def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
 
 @task(name="validate-all-servers")
 def validate_all_servers(c: Context, jobs: int = 4) -> None:
-    """Run all eleven driver gauges against BOTH the Python and the Rust server.
+    """Run all thirteen driver gauges against BOTH the Python and the Rust server.
 
     Runs ``validate-all --server python`` then ``validate-all --server rust``
     **sequentially** — never concurrently. The two fleets can't overlap: the C++

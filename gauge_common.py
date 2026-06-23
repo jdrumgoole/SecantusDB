@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import queue
 import re
 import subprocess
 import threading
@@ -119,6 +120,29 @@ def _force_port_zero(daemon_cmd: list[str]) -> list[str]:
     return out
 
 
+def _force_log_level_info(daemon_cmd: list[str]) -> list[str]:
+    """Return ``daemon_cmd`` with ``--log-level`` set to ``INFO`` (added if
+    absent).
+
+    [`spawn_daemon`] learns the kernel-assigned port by waiting for the Python
+    server's ``listening on <host>:<port>`` line — but the server logs that line
+    at **INFO**, while every gauge passes ``--log-level WARNING`` to keep its
+    output quiet. WARNING suppresses the readiness line, so ``spawn_daemon``
+    would wait the full timeout (and, before the deadline-bounded read below,
+    block indefinitely — a misconfigured gauge once hung CI for six hours). The
+    server's per-request logging is at DEBUG, so forcing INFO surfaces only the
+    single startup readiness line and adds no request noise. Python server only:
+    the ``secantusdb`` binary prints its own listening line unconditionally and
+    has ``--log-level`` stripped by [`for_server`]."""
+    out = list(daemon_cmd)
+    try:
+        i = out.index("--log-level")
+        out[i + 1] = "INFO"
+    except (ValueError, IndexError):
+        out += ["--log-level", "INFO"]
+    return out
+
+
 def spawn_daemon(
     daemon_cmd: list[str],
     *,
@@ -140,7 +164,12 @@ def spawn_daemon(
     stderr are merged and drained on a background thread so the daemon never
     blocks on a full pipe.
     """
-    cmd = for_server(_force_port_zero(daemon_cmd))
+    prepared = _force_port_zero(daemon_cmd)
+    if gauge_server() == "python":
+        # Ensure the readiness line the loop below greps for is actually emitted
+        # (the gauges' --log-level WARNING would otherwise suppress it).
+        prepared = _force_log_level_info(prepared)
+    cmd = for_server(prepared)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -148,33 +177,49 @@ def spawn_daemon(
         text=True,
         bufsize=1,
     )
+    assert proc.stdout is not None
+
+    # Read the merged output on a background thread into a queue. A blocking
+    # ``proc.stdout.readline()`` in the main loop never observes the deadline
+    # when the daemon prints nothing (e.g. its readiness line is below the
+    # configured log level), which turned a misconfigured gauge into a
+    # multi-hour CI hang. The reader keeps draining after we've found the port,
+    # so the daemon never blocks on a full pipe.
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def _read() -> None:
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                lines.put(line)
+        except (ValueError, OSError):
+            pass
+        finally:
+            lines.put(None)  # EOF sentinel
+
+    threading.Thread(target=_read, daemon=True).start()
 
     host: str | None = None
     port: int | None = None
     deadline = time.monotonic() + timeout
-    assert proc.stdout is not None
-    while time.monotonic() < deadline:
-        line = proc.stdout.readline()
-        if not line:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            line = lines.get(timeout=remaining)
+        except queue.Empty:
+            break
+        if line is None:  # daemon closed its output without binding
             if proc.poll() is not None:
                 raise RuntimeError(f"{label}: daemon exited before binding a port")
-            continue
+            break
         m = _LISTENING_RE.search(line)
         if m:
             host, port = m.group(1), int(m.group(2))
             break
+
     if port is None:
         proc.terminate()
         raise RuntimeError(f"{label}: daemon did not report a listening port within {timeout}s")
 
-    # Drain the rest of the merged output so the daemon never blocks on a full
-    # pipe (we don't need it after the port line).
-    def _drain() -> None:
-        try:
-            for _ in proc.stdout:  # type: ignore[union-attr]
-                pass
-        except (ValueError, OSError):
-            pass
-
-    threading.Thread(target=_drain, daemon=True).start()
     return proc, host, port
