@@ -65,6 +65,17 @@ pub(crate) fn as_i64(b: &Bson) -> Option<i64> {
         Bson::Int32(i) => Some(*i as i64),
         Bson::Int64(i) => Some(*i),
         Bson::Double(d) => Some(*d as i64),
+        // Drivers may encode a numeric command option as any BSON number —
+        // mongo-c-driver's `batchsize_override_decimal128` sends `batchSize` as a
+        // Decimal128. There's no direct Decimal128→int, so parse its decimal
+        // string (i64 first, then f64 for a fractional form). Mirrors
+        // `commands._coerce_command_int`.
+        Bson::Decimal128(d) => {
+            let s = d.to_string();
+            s.parse::<i64>()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+        }
         _ => None,
     }
 }
@@ -180,5 +191,24 @@ fn code_name_for(code: i32) -> &'static str {
         11000 => "DuplicateKey",
         66 => "ImmutableField",
         _ => "Location",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::as_i64;
+    use bson::Bson;
+    use std::str::FromStr;
+
+    #[test]
+    fn as_i64_coerces_numeric_types_incl_decimal128() {
+        assert_eq!(as_i64(&Bson::Int32(2)), Some(2));
+        assert_eq!(as_i64(&Bson::Int64(2)), Some(2));
+        assert_eq!(as_i64(&Bson::Double(2.0)), Some(2));
+        // Decimal128 batchSize (mongo-c-driver batchsize_override_decimal128).
+        let d = Bson::Decimal128(bson::Decimal128::from_str("2").unwrap());
+        assert_eq!(as_i64(&d), Some(2));
+        // A non-number is rejected.
+        assert_eq!(as_i64(&Bson::String("x".into())), None);
     }
 }
