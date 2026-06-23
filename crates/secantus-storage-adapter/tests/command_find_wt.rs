@@ -1,0 +1,194 @@
+//! Real-WiredTiger ports of the `find` command unit tests. Docs are seeded with
+//! real `insert` commands; unsorted reads come back in natural (insertion)
+//! order, exactly as the handler-plumbing tests expect.
+
+mod common;
+
+use bson::doc;
+use common::with_wt;
+use secantus_commands::dispatch;
+
+fn batch_ids(cursor: &bson::Document, key: &str) -> Vec<i64> {
+    cursor
+        .get_array(key)
+        .unwrap()
+        .iter()
+        .map(|b| b.as_document().unwrap().get_i32("_id").unwrap() as i64)
+        .collect()
+}
+
+fn seed(c: &mut secantus_commands::CommandContext, docs: Vec<bson::Document>) {
+    dispatch(
+        &doc! {"insert": "c", "documents": docs.into_iter().map(bson::Bson::Document).collect::<Vec<_>>()},
+        c,
+    );
+}
+
+#[test]
+fn find_all_single_batch() {
+    with_wt(|c| {
+        seed(c, (0..3).map(|i| doc! {"_id": i}).collect());
+        let reply = dispatch(&doc! {"find": "c"}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert_eq!(cur.get_i64("id").unwrap(), 0, "all fit ⇒ no cursor");
+        assert_eq!(cur.get_str("ns").unwrap(), "t.c");
+        assert_eq!(batch_ids(cur, "firstBatch"), vec![0, 1, 2]);
+    });
+}
+
+#[test]
+fn find_non_numeric_batch_size_is_type_mismatch() {
+    with_wt(|c| {
+        seed(c, vec![doc! {"_id": 1}]);
+        let reply = dispatch(&doc! {"find": "c", "batchSize": "foo"}, c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 14);
+        assert_eq!(reply.get_str("codeName").unwrap(), "TypeMismatch");
+        // A numeric batchSize still works.
+        let reply = dispatch(&doc! {"find": "c", "batchSize": 5i32}, c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+    });
+}
+
+#[test]
+fn find_skip_and_limit() {
+    with_wt(|c| {
+        seed(c, (0..5).map(|i| doc! {"_id": i}).collect());
+        let reply = dispatch(&doc! {"find": "c", "skip": 1, "limit": 2}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert_eq!(batch_ids(cur, "firstBatch"), vec![1, 2]);
+    });
+}
+
+#[test]
+fn find_sort_descending() {
+    with_wt(|c| {
+        seed(c, (0..3).map(|i| doc! {"_id": i}).collect());
+        let reply = dispatch(&doc! {"find": "c", "sort": {"_id": -1}}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert_eq!(batch_ids(cur, "firstBatch"), vec![2, 1, 0]);
+    });
+}
+
+#[test]
+fn find_return_key_and_show_record_id() {
+    with_wt(|c| {
+        seed(
+            c,
+            (1..4)
+                .map(|i| doc! {"_id": i, "x": i * 10, "y": "z"})
+                .collect(),
+        );
+        // returnKey (+ showRecordId, which it suppresses): only the sort key field.
+        let reply = dispatch(
+            &doc! {"find": "c", "sort": {"_id": 1}, "returnKey": true, "showRecordId": true},
+            c,
+        );
+        let batch = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        for b in batch {
+            let d = b.as_document().unwrap();
+            assert_eq!(
+                d.keys().collect::<Vec<_>>(),
+                vec!["_id"],
+                "returnKey ⇒ key only"
+            );
+        }
+        assert_eq!(batch.len(), 3);
+        // showRecordId alone: full doc plus a $recordId.
+        let reply = dispatch(
+            &doc! {"find": "c", "sort": {"_id": 1}, "showRecordId": true},
+            c,
+        );
+        let first = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert!(first.contains_key("$recordId"));
+        assert!(first.contains_key("x"));
+    });
+}
+
+#[test]
+fn find_batched_opens_cursor_and_getmore_drains() {
+    with_wt(|c| {
+        seed(c, (0..5).map(|i| doc! {"_id": i}).collect());
+        let reply = dispatch(&doc! {"find": "c", "batchSize": 2}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert_eq!(batch_ids(cur, "firstBatch"), vec![0, 1]);
+        let cid = cur.get_i64("id").unwrap();
+        assert_ne!(cid, 0, "remaining docs ⇒ live cursor");
+
+        let reply = dispatch(&doc! {"getMore": cid, "collection": "c", "batchSize": 2}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert_eq!(batch_ids(cur, "nextBatch"), vec![2, 3]);
+        assert_eq!(cur.get_i64("id").unwrap(), cid);
+
+        let reply = dispatch(&doc! {"getMore": cid, "collection": "c", "batchSize": 2}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert_eq!(batch_ids(cur, "nextBatch"), vec![4]);
+        assert_eq!(cur.get_i64("id").unwrap(), 0, "exhausted");
+    });
+}
+
+#[test]
+fn find_batch_size_zero_empty_first_batch() {
+    with_wt(|c| {
+        seed(c, (0..2).map(|i| doc! {"_id": i}).collect());
+        let reply = dispatch(&doc! {"find": "c", "batchSize": 0}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert!(cur.get_array("firstBatch").unwrap().is_empty());
+        assert_ne!(cur.get_i64("id").unwrap(), 0);
+    });
+}
+
+#[test]
+fn find_single_batch_never_opens_cursor() {
+    with_wt(|c| {
+        seed(c, (0..5).map(|i| doc! {"_id": i}).collect());
+        let reply = dispatch(&doc! {"find": "c", "batchSize": 2, "singleBatch": true}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        // singleBatch overrides batchSize splitting: all docs, id 0.
+        assert_eq!(batch_ids(cur, "firstBatch").len(), 5);
+        assert_eq!(cur.get_i64("id").unwrap(), 0);
+    });
+}
+
+#[test]
+fn find_projection_includes_fields() {
+    with_wt(|c| {
+        seed(c, vec![doc! {"_id": 1, "a": 10, "b": 20}]);
+        let reply = dispatch(&doc! {"find": "c", "projection": {"a": 1}}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        let first = cur.get_array("firstBatch").unwrap()[0]
+            .as_document()
+            .unwrap();
+        assert!(first.get("a").is_some());
+        assert!(first.get("b").is_none(), "b excluded by projection");
+        assert!(first.get("_id").is_some(), "_id included by default");
+    });
+}
+
+#[test]
+fn find_filter_matches_subset() {
+    with_wt(|c| {
+        seed(
+            c,
+            vec![
+                doc! {"_id": 1, "x": 1},
+                doc! {"_id": 2, "x": 2},
+                doc! {"_id": 3, "x": 1},
+            ],
+        );
+        let reply = dispatch(&doc! {"find": "c", "filter": {"x": 1}}, c);
+        let cur = reply.get_document("cursor").unwrap();
+        assert_eq!(batch_ids(cur, "firstBatch"), vec![1, 3]);
+    });
+}

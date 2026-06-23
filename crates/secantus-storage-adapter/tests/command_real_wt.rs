@@ -1,11 +1,11 @@
-//! Real-WiredTiger integration tests for the command-layer fixes that the
-//! per-module unit tests exercise only against an in-memory `FakeStorage`.
+//! Real-WiredTiger integration tests for a focused set of command-layer fixes.
 //!
-//! Here the same `dispatch` path runs over the real `WtStorage` (via
+//! The command crate has no in-memory storage double any more: every command
+//! test drives the real `dispatch` path over a real `WtStorage` (via
 //! `StorageAdapter`), so the handler logic AND the storage semantics are
-//! exercised together — without the wire/TCP layer. This closes the gap where a
-//! hand-rolled fake could pass while real WiredTiger diverged (the fakes were
-//! only backed end-to-end by the driver gauges).
+//! exercised together — without the wire/TCP layer. The full per-module command
+//! coverage lives alongside this file in `command_{find,crud,findandmodify,
+//! admin,aggregate,distinct}_wt.rs`; these are the cross-cutting fixes.
 
 use std::path::PathBuf;
 use std::str::FromStr;
