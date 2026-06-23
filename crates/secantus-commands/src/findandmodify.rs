@@ -187,6 +187,34 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         });
     }
 
+    // Command-layer validator check that produces mongod's `errInfo`
+    // (failingDocumentId + per-operator details) — storage enforces the
+    // validator too, but its error lacks the detail drivers' errorResponse tests
+    // read (mongo-c-driver findOneAndUpdate-errorResponse). Only the
+    // operator/replacement form is reconstructible in-memory here; pipeline-form
+    // falls back to storage's plain 121. Purely additive: it only short-circuits
+    // on a clear post-apply validation failure, otherwise the storage write runs.
+    if let Some(v) = &validator {
+        if pipeline.is_none() {
+            let upd = update
+                .and_then(Bson::as_document)
+                .cloned()
+                .unwrap_or_default();
+            if let Ok(post) = secantus_core::update::apply_update(&matched_doc, &upd, false) {
+                if !secantus_core::query::matches(&post, v, &Document::new(), None).unwrap_or(true)
+                {
+                    return Ok(doc! {
+                        "ok": 0.0,
+                        "errmsg": "Document failed validation",
+                        "code": 121,
+                        "codeName": "DocumentValidationFailure",
+                        "errInfo": crate::crud::validation_error_info(v, &post),
+                    });
+                }
+            }
+        }
+    }
+
     // update: apply it to the matched doc (pipeline-form or operator/replacement).
     let update_result = if let Some(stages) = pipeline {
         storage.update_matching_pipeline(
@@ -312,6 +340,7 @@ mod tests {
     struct FakeStorage {
         docs: Mutex<Vec<Document>>,
         next_id: Mutex<i32>,
+        validator: Mutex<Option<Document>>,
     }
 
     impl FakeStorage {
@@ -319,7 +348,11 @@ mod tests {
             Arc::new(FakeStorage {
                 docs: Mutex::new(docs),
                 next_id: Mutex::new(100),
+                validator: Mutex::new(None),
             })
+        }
+        fn set_validator(&self, v: Document) {
+            *self.validator.lock().unwrap() = Some(v);
         }
     }
 
@@ -447,12 +480,50 @@ mod tests {
                 })
                 .collect())
         }
+        fn get_collection_options(&self, _: &str, _: &str) -> Result<Document, StorageError> {
+            Ok(match &*self.validator.lock().unwrap() {
+                Some(v) => doc! {"validator": v.clone()},
+                None => Document::new(),
+            })
+        }
     }
 
     fn ctx(storage: Arc<FakeStorage>) -> CommandContext {
         let mut c = CommandContext::new(1).with_storage(storage);
         c.db_name = "t".into();
         c
+    }
+
+    #[test]
+    fn update_validation_failure_carries_err_info() {
+        // findAndModify whose post-apply doc fails the collection validator is
+        // rejected with 121 + errInfo (failingDocumentId + details) — the
+        // mongo-c-driver findOneAndUpdate-errorResponse test reads errInfo.
+        let s = FakeStorage::with(vec![doc! {"_id": 1, "x": "foo"}]);
+        s.set_validator(doc! {"x": {"$type": "string"}});
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"findAndModify": "c", "query": {"_id": 1}, "update": {"$set": {"x": 1}}},
+            &mut c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 121);
+        let info = reply.get_document("errInfo").unwrap();
+        assert_eq!(info.get_i32("failingDocumentId").unwrap(), 1);
+        assert!(info.get_document("details").is_ok());
+    }
+
+    #[test]
+    fn update_passes_validator_when_post_apply_doc_is_valid() {
+        // A post-apply doc that satisfies the validator updates normally.
+        let s = FakeStorage::with(vec![doc! {"_id": 1, "x": "foo"}]);
+        s.set_validator(doc! {"x": {"$type": "string"}});
+        let mut c = ctx(s);
+        let reply = dispatch(
+            &doc! {"findAndModify": "c", "query": {"_id": 1}, "update": {"$set": {"x": "bar"}}},
+            &mut c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     }
 
     #[test]

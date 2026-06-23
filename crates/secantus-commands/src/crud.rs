@@ -86,8 +86,8 @@ fn validation_failure_details(validator: &Document, doc: &Document) -> Document 
 /// The `errInfo` body for a failed document validation: `failingDocumentId`
 /// (when the doc has an `_id`) plus the per-operator `details`. Lets drivers'
 /// errorResponse tests pick out which doc was rejected. Mirrors
-/// `commands._validation_error_info`.
-fn validation_error_info(validator: &Document, doc: &Document) -> Document {
+/// `commands._validation_error_info`. Shared with `findandmodify`.
+pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Document {
     let mut info = Document::new();
     if let Some(id) = doc.get("_id") {
         info.insert("failingDocumentId", id.clone());
