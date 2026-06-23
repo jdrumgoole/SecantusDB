@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-06-20 — SecantusDB 0.5.4b9 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-06-23 — SecantusDB 0.5.4b10 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -8,19 +8,9 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 356 | 3 | 52 | 411 | 99.2% |
+| `internal/integration` | 359 | 0 | 52 | 411 | 100.0% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **398** | **3** | **52** | **453** | **99.3%** |
-
-## Failures (3)
-
-First 30 failed tests for triage:
-
-```
-internal/integration :: TestChangeStream_ReplicaSet/try_next/one_getMore_sent
-internal/integration :: TestChangeStream_ReplicaSet/try_next
-internal/integration :: TestChangeStream_ReplicaSet
-```
+| **Overall** | **401** | **0** | **52** | **453** | **100.0%** |
 
 ## How this is generated
 
