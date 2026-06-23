@@ -21,6 +21,81 @@
 
 use bson::{doc, Bson, Document};
 
+/// mongod's per-operator `errInfo.details.reason` wording (best-effort; only a
+/// few are byte-pinned by driver tests). Mirrors `commands._VALIDATION_REASON`.
+fn validation_reason(op: &str) -> &'static str {
+    match op {
+        "$type" => "type did not match",
+        "$exists" => "field was missing",
+        "$regex" => "regular expression did not match",
+        "$size" => "array did not match specified size",
+        "$mod" => "$mod did not evaluate to the expected remainder",
+        "$all" => "array did not contain all specified values",
+        "$elemMatch" => "no matching array element found",
+        "$in" => "value was not in the set of allowed values",
+        "$nin" => "value was in the set of disallowed values",
+        _ => "comparison failed",
+    }
+}
+
+/// Whether `doc` satisfies the single-field clause `{field: spec}`.
+fn clause_matches(doc: &Document, field: &str, spec: &Bson) -> bool {
+    let mut clause = Document::new();
+    clause.insert(field, spec.clone());
+    secantus_core::query::matches(doc, &clause, &Document::new(), None).unwrap_or(false)
+}
+
+/// mongod-shaped `errInfo.details` for a doc that failed a query-expression
+/// validator: walk the clauses, find the first the doc violates, and report the
+/// failing operator. Mirrors `commands._validation_failure_details`.
+fn validation_failure_details(validator: &Document, doc: &Document) -> Document {
+    if validator.contains_key("$jsonSchema") {
+        return doc! {"operatorName": "$jsonSchema"};
+    }
+    for (field, spec) in validator {
+        if field.starts_with('$') {
+            continue; // document-level logical operator — skip for per-field detail
+        }
+        if clause_matches(doc, field, spec) {
+            continue;
+        }
+        // Operator-form clause: isolate the specific failing operator.
+        if let Bson::Document(opspec) = spec {
+            if !opspec.is_empty() && opspec.keys().all(|k| k.starts_with('$')) {
+                let mut op = opspec.keys().next().cloned().unwrap_or_default();
+                for cand in opspec.keys() {
+                    let single = doc! { cand.clone(): opspec.get(cand).unwrap().clone() };
+                    if !clause_matches(doc, field, &Bson::Document(single)) {
+                        op = cand.clone();
+                        break;
+                    }
+                }
+                let mut spec_as = Document::new();
+                spec_as.insert(field, spec.clone());
+                let reason = validation_reason(&op);
+                return doc! { "operatorName": op, "specifiedAs": spec_as, "reason": reason };
+            }
+        }
+        let mut spec_as = Document::new();
+        spec_as.insert(field, spec.clone());
+        return doc! { "operatorName": "$eq", "specifiedAs": spec_as, "reason": "comparison failed" };
+    }
+    doc! {"operatorName": "validator"}
+}
+
+/// The `errInfo` body for a failed document validation: `failingDocumentId`
+/// (when the doc has an `_id`) plus the per-operator `details`. Lets drivers'
+/// errorResponse tests pick out which doc was rejected. Mirrors
+/// `commands._validation_error_info`.
+fn validation_error_info(validator: &Document, doc: &Document) -> Document {
+    let mut info = Document::new();
+    if let Some(id) = doc.get("_id") {
+        info.insert("failingDocumentId", id.clone());
+    }
+    info.insert("details", validation_failure_details(validator, doc));
+    info
+}
+
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, resolve_let_vars,
     write_error,
@@ -102,13 +177,16 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 continue;
             }
         }
-        // Collection validator (code 121, DocumentValidationFailure).
+        // Collection validator (code 121, DocumentValidationFailure). mongod
+        // attaches an `errInfo` (failingDocumentId + per-operator details) that
+        // drivers' errorResponse tests read; mirror it.
         if let Some(v) = &validator {
             if !secantus_core::query::matches(d, v, &Document::new(), None).unwrap_or(true) {
                 pre_errors.push(doc! {
                     "index": index as i32,
                     "code": 121,
                     "errmsg": "Document failed validation",
+                    "errInfo": validation_error_info(v, d),
                 });
                 if ordered {
                     break;
@@ -871,6 +949,13 @@ mod tests {
         let e = we[0].as_document().unwrap();
         assert_eq!(e.get_i32("code").unwrap(), 121);
         assert_eq!(e.get_i32("index").unwrap(), 0);
+        // mongod attaches errInfo (failingDocumentId + per-operator details) —
+        // drivers' errorResponse tests read it (mongo-c-driver crud/prose_test_2).
+        let info = e.get_document("errInfo").unwrap();
+        assert_eq!(info.get_i32("failingDocumentId").unwrap(), 1);
+        let details = info.get_document("details").unwrap();
+        assert_eq!(details.get_str("operatorName").unwrap(), "$exists");
+        assert_eq!(details.get_str("reason").unwrap(), "field was missing");
     }
 
     #[test]
