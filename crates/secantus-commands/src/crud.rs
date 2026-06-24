@@ -339,6 +339,23 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .and_then(Bson::as_document)
             .and_then(|d| d.get("n").and_then(as_i64))
             .unwrap_or(0)
+    } else if let Some(hint) = doc.get("hint") {
+        // A `hint` forces a specific index; for an empty filter this still walks
+        // that index, so hinting a sparse index counts only the docs present in
+        // it (php-lib Count `testHintOption`). Count via the hinted find, which
+        // honours the hint + sparse semantics. Mirrors `commands.py::_count`.
+        storage
+            .find_collated(
+                &ctx.db_name,
+                &coll,
+                &filter,
+                None,
+                Some(hint),
+                collation.as_ref(),
+                &Document::new(),
+            )
+            .map_err(command_error)?
+            .len() as i64
     } else {
         storage
             .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())

@@ -235,6 +235,38 @@ fn count_skip_and_limit_clamp() {
 }
 
 #[test]
+fn count_hint_honours_sparse_index() {
+    // count + a sparse-index hint counts only the docs present in that index
+    // (php-lib Count testHintOption); a non-sparse / _id hint counts all docs.
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"x": 1}, {"x": 2}, {"y": 3}]},
+            c,
+        );
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [
+                {"key": {"x": 1}, "sparse": true, "name": "sparse_x"},
+                {"key": {"y": 1}, "name": "y_1"},
+            ]},
+            c,
+        );
+        // Sparse index on x → only the 2 docs with x.
+        for hint in [
+            Bson::Document(doc! {"x": 1}),
+            Bson::String("sparse_x".into()),
+        ] {
+            let r = dispatch(&doc! {"count": "c", "hint": hint.clone()}, c);
+            assert_eq!(r.get_i32("n").unwrap(), 2, "sparse hint {hint:?}");
+        }
+        // Non-sparse y index and _id → all 3 docs (missing-field entries present).
+        for hint in [Bson::String("y_1".into()), Bson::String("_id_".into())] {
+            let r = dispatch(&doc! {"count": "c", "hint": hint.clone()}, c);
+            assert_eq!(r.get_i32("n").unwrap(), 3, "non-sparse hint {hint:?}");
+        }
+    });
+}
+
+#[test]
 fn data_command_without_storage_is_internal_error() {
     let mut c = CommandContext::new(1); // no storage attached
     let reply = dispatch(&doc! {"count": "c"}, &mut c);

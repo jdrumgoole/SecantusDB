@@ -520,3 +520,15 @@ fn rename_collection_ok() {
         assert_eq!(index_names(c, "b"), vec!["_id_"]);
     });
 }
+
+#[test]
+fn rename_nonexistent_source_is_namespace_not_found() {
+    // Renaming a missing source is NamespaceNotFound (26), not NamespaceExists
+    // (48) — php-lib RenameCollectionFunctionalTest::testRenameNonexistentCollection.
+    with_wt(|c| {
+        let r = dispatch(&doc! {"renameCollection": "t.nope", "to": "t.dst"}, c);
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(r.get_i32("code").unwrap(), 26);
+        assert_eq!(r.get_str("codeName").unwrap(), "NamespaceNotFound");
+    });
+}

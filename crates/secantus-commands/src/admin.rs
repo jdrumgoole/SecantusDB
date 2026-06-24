@@ -983,7 +983,14 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         .map_err(command_error)?;
     if !ok_ {
         let m = msg.unwrap_or_else(|| "rename failed".to_string());
-        let (code, name) = if m.to_lowercase().contains("exist") {
+        // A missing source ("source namespace does not exist") is
+        // NamespaceNotFound (26); an existing target ("target namespace exists")
+        // is NamespaceExists (48). Check the source-missing phrasing first so a
+        // bare "exist" substring doesn't misclassify "does not exist" as 48.
+        let lower = m.to_lowercase();
+        let (code, name) = if lower.contains("does not exist") || lower.contains("not found") {
+            (26, "NamespaceNotFound")
+        } else if lower.contains("exists") {
             (48, "NamespaceExists")
         } else {
             (26, "NamespaceNotFound")
