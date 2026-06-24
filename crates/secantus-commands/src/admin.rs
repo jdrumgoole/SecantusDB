@@ -822,6 +822,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .create_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
 
+    let mut any_created = false;
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
         let key = s
@@ -860,21 +861,29 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 }
             }
         }
-        storage
+        let created = storage
             .create_index(&ctx.db_name, &coll, &name, &key, s)
             .map_err(command_error)?;
+        any_created |= created;
     }
 
     let after = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?
         .len();
-    Ok(doc! {
+    let mut reply = doc! {
         "createdCollectionAutomatically": created_coll,
         "numIndexesBefore": before as i32,
         "numIndexesAfter": after as i32,
         "ok": 1.0,
-    })
+    };
+    // When every requested index already existed, mongod adds
+    // `note: "all indexes already exist"` so drivers report a no-op (mongocxx's
+    // `index_view::create_one` returns an empty optional off this).
+    if !any_created && !specs.is_empty() {
+        reply.insert("note", "all indexes already exist");
+    }
+    Ok(reply)
 }
 
 /// `dropIndexes` — drop a named index, or all of them with `"*"`.

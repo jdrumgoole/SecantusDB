@@ -396,12 +396,58 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
                 format!("Unrecognized pipeline stage name: '{name}'"),
             ));
         }
+        // Validate `$match` filter syntax up-front. A change-stream pipeline
+        // doesn't execute until the first getMore, so an unknown query operator
+        // (e.g. `{$foo: -1}`) would otherwise only surface there — mongo-cxx-driver's
+        // "invalid pipeline / Error on .begin()" requires the error at aggregate
+        // (`.begin()`) time. Only genuinely-unknown operators are rejected;
+        // valid-but-Rust-deferred field constructs are left to execution.
+        if name == "$match" {
+            if let Some(Bson::Document(filter)) = s.get("$match") {
+                if let Some(op) = invalid_match_operator(filter) {
+                    return Err(CommandError::new(
+                        2,
+                        "BadValue",
+                        format!("unknown operator: {op}"),
+                    ));
+                }
+            }
+        }
         if name == "$changeStreamSplitLargeEvent" {
             continue;
         }
         out.push(stage.clone());
     }
     Ok(out)
+}
+
+/// The first genuinely-unknown query operator in a `$match` filter — an unknown
+/// document-level operator (`{$foo: -1}`, which `first_unknown_operator` skips
+/// as a top-level `$`-key) or an unknown field-level operator (`{x: {$foo: 1}}`).
+/// `None` when every operator is recognised; valid-but-Rust-deferred field
+/// constructs are deliberately *not* flagged (left to execution, not rejected).
+fn invalid_match_operator(filter: &Document) -> Option<String> {
+    for (k, v) in filter {
+        match k.as_str() {
+            "$and" | "$or" | "$nor" => {
+                if let Bson::Array(arr) = v {
+                    for sub in arr {
+                        if let Some(d) = sub.as_document() {
+                            if let Some(op) = invalid_match_operator(d) {
+                                return Some(op);
+                            }
+                        }
+                    }
+                }
+            }
+            // Document-level operators the matcher / mongod recognise.
+            "$expr" | "$text" | "$comment" | "$where" | "$jsonSchema" | "$sampleRate"
+            | "$alwaysTrue" | "$alwaysFalse" => {}
+            other if other.starts_with('$') => return Some(other.to_string()),
+            _ => {}
+        }
+    }
+    secantus_core::query::first_unknown_operator(filter)
 }
 
 /// Whether the pipeline contains a `$changeStreamSplitLargeEvent` stage (opts

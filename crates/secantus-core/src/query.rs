@@ -655,6 +655,30 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
         )
 }
 
+/// mongod's BSON type-alias string for a value — fills `consideredType` in
+/// document-validation failure details (`crud::validation_failure_details`).
+/// Mirrors `query.bson_type_name`. The Rust `Bson` enum is disjoint, so a
+/// straight match suffices (Python orders `bool`/`Int64` ahead of `int` only
+/// because they're `int` subclasses there). Unknown variants → `"object"`,
+/// matching Python's default.
+pub fn bson_type_name(v: &Bson) -> &'static str {
+    match v {
+        Bson::Boolean(_) => "bool",
+        Bson::Int64(_) => "long",
+        Bson::Int32(_) => "int",
+        Bson::Double(_) => "double",
+        Bson::Decimal128(_) => "decimal",
+        Bson::String(_) => "string",
+        Bson::ObjectId(_) => "objectId",
+        Bson::DateTime(_) => "date",
+        Bson::Null => "null",
+        Bson::RegularExpression(_) => "regex",
+        Bson::Binary(_) => "binData",
+        Bson::Array(_) => "array",
+        _ => "object",
+    }
+}
+
 fn op_type(values: &[Option<&Bson>], spec: &Bson) -> R {
     // spec is a single alias/code or an array of them. A non-alias/code spec
     // element (e.g. a float code) is pathological -> Python.

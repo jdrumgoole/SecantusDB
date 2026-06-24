@@ -185,6 +185,9 @@ fn code_name_for(code: i32) -> &'static str {
     match code {
         2 => "BadValue",
         9 => "FailedToParse",
+        67 => "CannotCreateIndex",
+        85 => "IndexOptionsConflict",
+        86 => "IndexKeySpecsConflict",
         112 => "WriteConflict",
         121 => "DocumentValidationFailure",
         10334 => "BSONObjectTooLarge",

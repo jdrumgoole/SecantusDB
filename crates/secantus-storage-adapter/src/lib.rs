@@ -772,10 +772,23 @@ fn map_err(e: WtError) -> StorageError {
         },
         // Index-create / change-stream faults don't arise on the CRUD path, but
         // map them to a command-level internal error if they ever surface here.
-        WtError::CreateIndexUnsupported(m)
-        | WtError::IndexOptionsConflict(m)
-        | WtError::ChangeStreamFatal(m)
-        | WtError::Internal(m) => StorageError::Internal(m),
+        // Index re-create conflicts → mongod's IndexOptionsConflict (85) /
+        // IndexKeySpecsConflict (86); an unsupported index type (text/hashed) →
+        // CannotCreateIndex (67). These reach the command layer via createIndexes.
+        WtError::IndexOptionsConflict(m) => StorageError::WriteError {
+            code: 85,
+            errmsg: m,
+        },
+        WtError::IndexKeySpecsConflict(m) => StorageError::WriteError {
+            code: 86,
+            errmsg: m,
+        },
+        WtError::CreateIndexUnsupported(m) => StorageError::WriteError {
+            code: 67,
+            errmsg: m,
+        },
+        // Change-stream faults don't arise on the CRUD path; map to internal.
+        WtError::ChangeStreamFatal(m) | WtError::Internal(m) => StorageError::Internal(m),
         WtError::Wt(err) => StorageError::Internal(format!("WiredTiger error: {err:?}")),
         WtError::Bson(m) => StorageError::Internal(format!("BSON error: {m}")),
     }

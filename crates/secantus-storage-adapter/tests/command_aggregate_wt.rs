@@ -219,6 +219,33 @@ fn aggregate_changestream_standalone_rejected() {
 }
 
 #[test]
+fn change_stream_invalid_match_errors_at_open() {
+    with_wt(|c| {
+        // Change streams require a replica-set persona.
+        c.replica_set_name = Some("secantus".into());
+        // Unknown operator in $match → error at aggregate (.begin()) time, not
+        // lazily at the first getMore (mongo-cxx-driver invalid-pipeline test).
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$changeStream": {}}, {"$match": {"$foo": -1}}
+            ], "cursor": {}},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(r.get_i32("code").unwrap(), 2);
+        // A valid $match opens the stream fine (live cursor returned).
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$changeStream": {}}, {"$match": {"operationType": "insert"}}
+            ], "cursor": {}},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert!(r.get_document("cursor").is_ok());
+    });
+}
+
+#[test]
 fn lookup_simple_form_joins_foreign_docs() {
     with_wt(|c| {
         seed(
@@ -375,6 +402,29 @@ fn out_replaces_target_collection() {
             .collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
+    });
+}
+
+#[test]
+fn out_or_merge_not_last_stage_is_rejected() {
+    with_wt(|c| {
+        seed(c, "c", vec![doc! {"_id": 1}]);
+        // $out before the end → Location40601, nothing written.
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$out": "dst"}, {"$match": {}}], "cursor": {}},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(r.get_i32("code").unwrap(), 40601);
+        assert_eq!(r.get_str("codeName").unwrap(), "Location40601");
+        // $merge non-terminal too.
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$merge": {"into": "dst"}}, {"$limit": 1}], "cursor": {}},
+            c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 40601);
+        // Target was never created (rejected before executing any stage).
+        assert!(read_all(c, "dst").is_empty());
     });
 }
 

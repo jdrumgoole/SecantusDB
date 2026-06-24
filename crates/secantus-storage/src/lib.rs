@@ -428,6 +428,9 @@ pub enum StorageError {
     /// `create_index` was asked to re-create an existing index with conflicting
     /// options.
     IndexOptionsConflict(String),
+    /// `create_index` was asked to re-create an existing index *name* with a
+    /// different key spec.
+    IndexKeySpecsConflict(String),
     /// A query filter used a construct the Rust query engine can't evaluate
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
@@ -471,6 +474,7 @@ impl std::fmt::Display for StorageError {
             }
             StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
+            StorageError::IndexKeySpecsConflict(m) => write!(f, "{m}"),
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
@@ -3285,8 +3289,24 @@ impl Storage {
         c.set_key_sss(db, coll, name);
         match c.search() {
             Ok(()) => {
-                // Index exists: reject conflicting options, else no-op success.
+                // Index exists: reject a conflicting key spec or options, else
+                // no-op success.
                 let existing = decode_doc(&c.get_value_u()?)?;
+                // Same name, different key spec → IndexKeySpecsConflict (86).
+                // Order-sensitive: mongod treats {a:1,b:1} and {b:1,a:1} as
+                // distinct indexes, so compare the ordered field lists.
+                let existing_key = existing.get_document("key").ok();
+                let same_key = existing_key
+                    .map(|k| k.iter().collect::<Vec<_>>() == key_spec.iter().collect::<Vec<_>>())
+                    .unwrap_or(false);
+                if !same_key {
+                    return Err(StorageError::IndexKeySpecsConflict(format!(
+                        "An existing index has the same name as the requested index. \
+                         Requested index: {{ key: {key_spec:?}, name: {name:?} }}, \
+                         existing index: {{ key: {:?}, name: {name:?} }}",
+                        existing_key.cloned().unwrap_or_default()
+                    )));
+                }
                 let existing_opts = existing.get_document("options").ok();
                 for opt in CONFLICTING_OPTS {
                     let in_new = options.contains_key(opt);

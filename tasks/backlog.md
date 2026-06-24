@@ -237,15 +237,20 @@ Subtler than the above; these may bite specific test suites.
   - ~~**Document-validation error detail** (`CrudProseTests.WriteError_details_should_expose_writeErrors_errInfo`)~~ **FIXED (0.5.4b9)** — a failed query-expression validator now synthesises mongod's per-operator `errInfo.details` (`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`) via `commands._validation_failure_details` + `query.bson_type_name`, used by both the insert path and `_validate_doc_against_collection`. ($jsonSchema validators still report a minimal `{operatorName: "$jsonSchema"}` — their schema-rules detail is unsynthesised.)
   - The CRUD-only scope is deliberate and expandable — broaden the `--filter` in `dotnet_validation/include_paths.py` to add more spec families (e.g. `read_write_concern`, `change-streams`) as they're validated. Build note: the driver's `MongoDB.Driver.Encryption` project verifies a downloaded libmongocrypt with **gpg** at build time, so `gpg` (and network for the libmongocrypt download) are build prerequisites even though CSFLE itself is out of scope.
 
-> **Rust-server follow-up (the same gauges run against either server).** The
-> 0.5.4b9 Python-server fixes above (`$out`/`$merge`-not-last 40601, change-stream
-> `$match` validation, Decimal128 `batchSize`, over-long db-name rejection,
-> document-validation `errInfo.details`, `$out`/`$merge` target-validator
-> enforcement, `collMod prepareUnique`→`unique` 359 violations, cursor-kill on
-> drop/rename) are command/storage/cursor-layer behaviours the **Rust server**
-> does not yet mirror. When a driver gauge is pointed at the Rust server these
-> gaps will resurface there — port each into `crates/secantus-server` /
-> `crates/secantus-storage` (`tasks/rust-server-plan.md`).
+> **Rust-server follow-up — RESOLVED (Rust 0.5.3-beta.73).** The 0.5.4b8/b9
+> Python-server fixes that the Rust server didn't yet mirror have now all been
+> ported into `crates/secantus-{core,commands,storage,storage-adapter}`, each
+> with a real-WiredTiger integration test in `crates/secantus-storage-adapter/
+> tests/`: `$out`/`$merge`-not-last (`Location40601`), change-stream `$match`
+> validation at open (unknown operator → `BadValue` at `.begin()` not first
+> getMore), document-validation `errInfo.details` (`consideredValue` /
+> `consideredType` via a new `secantus_core::query::bson_type_name`),
+> index-conflict codes `IndexKeySpecsConflict` (86) / `IndexOptionsConflict`
+> (85) + the `note: "all indexes already exist"` no-op, and (earlier) Decimal128
+> `batchSize`, over-long db-name rejection, `$out`/`$merge` target-validator
+> enforcement, `collMod prepareUnique`→`unique` 359 violations, and cursor-kill
+> on drop/rename. Driver gauges pointed at the Rust server no longer regress on
+> these.
 
 ## 6. Admin UI review punch list
 

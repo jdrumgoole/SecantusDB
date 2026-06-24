@@ -340,6 +340,51 @@ fn create_indexes_and_list() {
 }
 
 #[test]
+fn create_index_conflicts_and_noop_note() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+            c,
+        );
+        // Identical re-create → no-op success with the note drivers key off.
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(r.get_str("note").unwrap(), "all indexes already exist");
+        // Same name, different key spec → IndexKeySpecsConflict (86).
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"b": 1}, "name": "a_1"}]},
+            c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 86);
+        assert_eq!(r.get_str("codeName").unwrap(), "IndexKeySpecsConflict");
+        // Same name + key, different option → IndexOptionsConflict (85).
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [
+                {"key": {"a": 1}, "name": "a_1", "unique": true}
+            ]},
+            c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 85);
+        assert_eq!(r.get_str("codeName").unwrap(), "IndexOptionsConflict");
+    });
+}
+
+#[test]
+fn create_text_index_is_cannot_create_index() {
+    with_wt(|c| {
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"t": "text"}, "name": "t_text"}]},
+            c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 67);
+        assert_eq!(r.get_str("codeName").unwrap(), "CannotCreateIndex");
+    });
+}
+
+#[test]
 fn drop_indexes_by_name_and_star() {
     with_wt(|c| {
         dispatch(

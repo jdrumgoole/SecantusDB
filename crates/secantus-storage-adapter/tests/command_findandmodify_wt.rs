@@ -28,7 +28,11 @@ fn update_validation_failure_carries_err_info() {
         assert_eq!(reply.get_i32("code").unwrap(), 121);
         let info = reply.get_document("errInfo").unwrap();
         assert_eq!(info.get_i32("failingDocumentId").unwrap(), 1);
-        assert!(info.get_document("details").is_ok());
+        // Full per-operator details on the post-apply doc ({x: 1}).
+        let details = info.get_document("details").unwrap();
+        assert_eq!(details.get_str("operatorName").unwrap(), "$type");
+        assert_eq!(details.get("consideredValue"), Some(&Bson::Int32(1)));
+        assert_eq!(details.get_str("consideredType").unwrap(), "int");
     });
 }
 

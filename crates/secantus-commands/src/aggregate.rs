@@ -64,6 +64,24 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         _ => Vec::new(),
     };
 
+    // `$out` / `$merge` may only be the final pipeline stage — mongod rejects a
+    // non-terminal write stage with Location40601 before executing anything
+    // (mongo-cxx-driver "out fails when not last").
+    if !pipeline.is_empty() {
+        let last = pipeline.len() - 1;
+        for (i, s) in pipeline.iter().enumerate() {
+            let name = stage_name(s);
+            if (name == "$out" || name == "$merge") && i != last {
+                return Ok(CommandError::new(
+                    40601,
+                    "Location40601",
+                    format!("{name} can only be the final stage in the pipeline"),
+                )
+                .into_reply());
+            }
+        }
+    }
+
     // `$out` / `$merge` are incompatible with readConcern level "linearizable"
     // (the only level mongod rejects here — local / available / majority all
     // run an output-stage aggregate fine). InvalidOptions (72).

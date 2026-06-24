@@ -49,6 +49,7 @@ fn clause_matches(doc: &Document, field: &str, spec: &Bson) -> bool {
 /// validator: walk the clauses, find the first the doc violates, and report the
 /// failing operator. Mirrors `commands._validation_failure_details`.
 fn validation_failure_details(validator: &Document, doc: &Document) -> Document {
+    use secantus_core::{get_path, has_path};
     if validator.contains_key("$jsonSchema") {
         return doc! {"operatorName": "$jsonSchema"};
     }
@@ -59,9 +60,14 @@ fn validation_failure_details(validator: &Document, doc: &Document) -> Document 
         if clause_matches(doc, field, spec) {
             continue;
         }
-        // Operator-form clause: isolate the specific failing operator.
-        if let Bson::Document(opspec) = spec {
-            if !opspec.is_empty() && opspec.keys().all(|k| k.starts_with('$')) {
+        let mut spec_as = Document::new();
+        spec_as.insert(field, spec.clone());
+        // Operator-form clause: isolate the specific failing operator; otherwise
+        // a bare-equality clause reports as `$eq`.
+        let mut detail = match spec {
+            Bson::Document(opspec)
+                if !opspec.is_empty() && opspec.keys().all(|k| k.starts_with('$')) =>
+            {
                 let mut op = opspec.keys().next().cloned().unwrap_or_default();
                 for cand in opspec.keys() {
                     let single = doc! { cand.clone(): opspec.get(cand).unwrap().clone() };
@@ -70,15 +76,26 @@ fn validation_failure_details(validator: &Document, doc: &Document) -> Document 
                         break;
                     }
                 }
-                let mut spec_as = Document::new();
-                spec_as.insert(field, spec.clone());
                 let reason = validation_reason(&op);
-                return doc! { "operatorName": op, "specifiedAs": spec_as, "reason": reason };
+                doc! { "operatorName": op, "specifiedAs": spec_as, "reason": reason }
+            }
+            _ => {
+                doc! { "operatorName": "$eq", "specifiedAs": spec_as, "reason": "comparison failed" }
+            }
+        };
+        // The value the server considered (and its BSON type), when the field is
+        // present — drivers' errorResponse tests read both (mongo-csharp-driver
+        // `WriteError_details`, mongo-java-driver `findOneAndUpdate-errorResponse`).
+        if has_path(doc, field) {
+            if let Some(value) = get_path(doc, field) {
+                detail.insert("consideredValue", value.clone());
+                detail.insert(
+                    "consideredType",
+                    secantus_core::query::bson_type_name(value),
+                );
             }
         }
-        let mut spec_as = Document::new();
-        spec_as.insert(field, spec.clone());
-        return doc! { "operatorName": "$eq", "specifiedAs": spec_as, "reason": "comparison failed" };
+        return detail;
     }
     doc! {"operatorName": "validator"}
 }

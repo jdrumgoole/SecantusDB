@@ -56,6 +56,39 @@ fn insert_rejects_validator_violation() {
 }
 
 #[test]
+fn insert_validation_errinfo_details_carries_considered_value() {
+    // A present-but-wrong field reports the full per-operator details mongod
+    // synthesises — including consideredValue/consideredType — which
+    // mongo-csharp-driver `WriteError_details` and mongo-java-driver
+    // `findOneAndUpdate-errorResponse` assert.
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "c", "validator": {"x": {"$type": "string"}}},
+            c,
+        );
+        let r = dispatch(&doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}]}, c);
+        let e = r.get_array("writeErrors").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert_eq!(e.get_i32("code").unwrap(), 121);
+        let details = e
+            .get_document("errInfo")
+            .unwrap()
+            .get_document("details")
+            .unwrap();
+        assert_eq!(details.get_str("operatorName").unwrap(), "$type");
+        assert_eq!(
+            details.get_document("specifiedAs").unwrap(),
+            &doc! {"x": {"$type": "string"}}
+        );
+        assert_eq!(details.get_str("reason").unwrap(), "type did not match");
+        assert_eq!(details.get("consideredValue"), Some(&Bson::Int32(1)));
+        assert_eq!(details.get_str("consideredType").unwrap(), "int");
+    });
+}
+
+#[test]
 fn insert_bypass_document_validation_skips_validator() {
     with_wt(|c| {
         dispatch(
