@@ -114,6 +114,15 @@ const DOC_TABLE: &str = "table:secantus_documents";
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
 
+// Natural-order (insertion) index. mongod returns an unsorted `find()` in
+// insertion (storage / RecordId) order, which equals `_id` order only for
+// monotonic `_id`s — so a separate seq index is needed. `NAT_TABLE` maps a
+// monotonic insertion `seq` to the doc's `id_key`; `NAT_SEQ_TABLE` is the reverse
+// (so a delete can find and drop the seq). Mirrors the Python storage's
+// `secantus_natural` / `secantus_natural_seq`.
+const NAT_TABLE: &str = "table:secantus_natural";
+const NAT_SEQ_TABLE: &str = "table:secantus_natural_seq";
+
 // Oplog / change-stream tables (Phase 4 sub-phase 3). `q`-keyed (int64 seq) for
 // the oplog + pre-images; a single `S` key ("state") for the recovery metadata.
 const OPLOG_TABLE: &str = "table:secantus_oplog";
@@ -394,6 +403,11 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     (
         "table:secantus_index_entries",
         "key_format=SSSu,value_format=u",
+    ),
+    ("table:secantus_natural", "key_format=SSq,value_format=u"),
+    (
+        "table:secantus_natural_seq",
+        "key_format=SSu,value_format=q",
     ),
     ("table:secantus_oplog", "key_format=q,value_format=u"),
     ("table:secantus_preimages", "key_format=q,value_format=u"),
@@ -1168,6 +1182,9 @@ struct OplogState {
     next_seq: i64,
     last_ts_secs: i64,
     last_ts_ord: i64,
+    /// Next monotonic insertion `seq` for the natural-order index (independent of
+    /// the oplog `seq`; advances on every doc insert even when the oplog is off).
+    next_nat_seq: i64,
 }
 
 /// Milliseconds since the Unix epoch (UTC), for oplog `wall` times.
@@ -1203,6 +1220,10 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                     next_seq: g("next_seq").unwrap_or(1),
                     last_ts_secs: g("last_ts_secs").unwrap_or(0),
                     last_ts_ord: g("last_ts_ord").unwrap_or(0),
+                    // Absent in legacy / oplog-disabled rows — recover by scanning
+                    // the natural index so minted seqs stay strictly greater.
+                    next_nat_seq: g("next_nat_seq")
+                        .unwrap_or_else(|| scan_max_nat_seq(session) + 1),
                 });
             }
         }
@@ -1233,7 +1254,30 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         next_seq: last_seq + 1,
         last_ts_secs: last_secs,
         last_ts_ord: last_ord,
+        next_nat_seq: scan_max_nat_seq(session) + 1,
     })
+}
+
+/// Largest insertion `seq` present in `NAT_TABLE` (0 if empty) — used to recover
+/// the natural-order counter on open when the persisted `next_nat_seq` is absent,
+/// so minted seqs stay strictly greater than any existing one. Mirrors
+/// `storage._scan_max_nat_seq`.
+fn scan_max_nat_seq(session: &Session) -> i64 {
+    let Ok(c) = session.open_cursor(NAT_TABLE, None) else {
+        return 0;
+    };
+    // The table is keyed (db, coll, seq); the last row has the highest seq within
+    // the last (db, coll), but seqs are global-monotonic so any row's seq could be
+    // the max across collections — scan and take the max.
+    let mut max_seq = 0i64;
+    while c.next().unwrap_or(false) {
+        if let Ok((_db, _coll, seq)) = c.get_key_ssq() {
+            if seq > max_seq {
+                max_seq = seq;
+            }
+        }
+    }
+    max_seq
 }
 
 /// What `create_archive` produced: the absolute-ish output path and its size.
@@ -1445,7 +1489,15 @@ impl Storage {
         let (ts, meta) = {
             let mut st = self.oplog.lock().unwrap();
             let ts = Self::mint_ts(&mut st);
-            (ts, (st.next_seq, st.last_ts_secs, st.last_ts_ord))
+            (
+                ts,
+                (
+                    st.next_seq,
+                    st.last_ts_secs,
+                    st.last_ts_ord,
+                    st.next_nat_seq,
+                ),
+            )
         };
         let session = self.conn.open_session()?;
         self.persist_oplog_meta(&session, meta)?;
@@ -1473,12 +1525,13 @@ impl Storage {
     /// Persist the recovery meta row (`next_seq` / `last_ts_*`). Best-effort
     /// optimisation — `load_oplog_meta` reconstructs from the oplog table if the
     /// row is stale or missing. Mirrors `storage._persist_oplog_meta`.
-    fn persist_oplog_meta(&self, session: &Session, meta: (i64, i64, i64)) -> Result<()> {
-        let (next_seq, last_ts_secs, last_ts_ord) = meta;
+    fn persist_oplog_meta(&self, session: &Session, meta: (i64, i64, i64, i64)) -> Result<()> {
+        let (next_seq, last_ts_secs, last_ts_ord, next_nat_seq) = meta;
         let mut d = Document::new();
         d.insert("next_seq", next_seq);
         d.insert("last_ts_secs", last_ts_secs);
         d.insert("last_ts_ord", last_ts_ord);
+        d.insert("next_nat_seq", next_nat_seq);
         let blob = encode_doc(&d)?;
         let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
         cur.set_key_s("state");
@@ -2192,6 +2245,7 @@ impl Storage {
         // any index this doc makes multikey (array value on an indexed field).
         self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
         self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+        self.write_nat_entry(&session, db, coll, &key)?;
         // Oplog: an insert is op "i". No pre-image (there's no prior document).
         if self.enable_oplog {
             let ui = collection_uuid(&session, db, coll)?;
@@ -2298,6 +2352,7 @@ impl Storage {
             }
             self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+            self.write_nat_entry(&session, db, coll, &key)?;
             fresh_id_keys.insert(key.clone());
             inserted += 1;
             if oplog_on {
@@ -2475,6 +2530,7 @@ impl Storage {
         let descs = self.index_descs(&session, db, coll)?;
         // `delete_by_id` is a bare-`_id` path (not used for timeseries).
         self.delete_index_entries(&session, db, coll, &old_doc, &descs, None)?;
+        self.delete_nat_entry(&session, db, coll, &key)?;
         // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
         // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
         if self.enable_oplog {
@@ -2545,6 +2601,7 @@ impl Storage {
                 continue;
             }
             self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
+            self.delete_nat_entry(&session, db, coll, &id_k)?;
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &id_k);
             match doc_cur.remove() {
@@ -3720,6 +3777,169 @@ impl Storage {
         Ok(out)
     }
 
+    // --- natural-order (insertion) index maintenance + scan ---
+
+    /// Reserve the next monotonic insertion `seq`. Mirrors `storage._mint_nat_seq`.
+    fn mint_nat_seq(&self) -> i64 {
+        let mut st = self.oplog.lock().unwrap();
+        let seq = st.next_nat_seq;
+        st.next_nat_seq += 1;
+        seq
+    }
+
+    /// Record a doc's insertion position: `seq -> id_key` plus the reverse
+    /// `id_key -> seq`. Mirrors `storage._write_nat_entry`.
+    fn write_nat_entry(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+    ) -> Result<()> {
+        let seq = self.mint_nat_seq();
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, seq);
+        nat.set_value_u(id_key);
+        nat.insert()?;
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, id_key);
+        rev.set_value_q(seq);
+        rev.insert()?;
+        Ok(())
+    }
+
+    /// Drop a doc's insertion-order entry (both directions). No-op if absent
+    /// (legacy docs predating the index). Mirrors `storage._delete_nat_entry`.
+    fn delete_nat_entry(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+    ) -> Result<()> {
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, id_key);
+        let seq = match rev.search() {
+            Ok(()) => rev.get_value_q()?,
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        rev.remove()?;
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, seq);
+        match nat.search() {
+            Ok(()) => nat.remove()?,
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    /// Drop every natural-order entry for `(db, coll)` (both directions) — called
+    /// on drop / rename so a later re-create can't resurrect stale positions.
+    fn drop_nat_collection(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        // Forward (db, coll, seq): collect this collection's seqs, then remove.
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut seqs: Vec<i64> = Vec::new();
+        while more {
+            let (d, c, seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            seqs.push(seq);
+            more = nat.next()?;
+        }
+        for seq in seqs {
+            nat.set_key_ssq(db, coll, seq);
+            if nat.search().is_ok() {
+                nat.remove()?;
+            }
+        }
+        // Reverse (db, coll, id_key).
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, b"");
+        let mut more = match rev.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    rev.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while more {
+            let (d, c, k) = rev.get_key_ssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push(k);
+            more = rev.next()?;
+        }
+        for k in keys {
+            rev.set_key_ssu(db, coll, &k);
+            if rev.search().is_ok() {
+                rev.remove()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// All doc blobs of a collection in **insertion order** via `NAT_TABLE` (seq
+    /// ascending, each fetched by `id_key`). Falls back to `id_key`-order
+    /// `scan_blobs` when the collection has no natural entries (legacy data).
+    /// Mirrors `storage._scan_docs_natural`.
+    fn scan_blobs_natural(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let doc = session.open_cursor(DOC_TABLE, None)?;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut saw_any = false;
+        while more {
+            let (d, c, _seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let id_key = nat.get_value_u()?;
+            doc.set_key_ssu(db, coll, &id_key);
+            if doc.search().is_ok() {
+                saw_any = true;
+                out.push(doc.get_value_u()?);
+            }
+            more = nat.next()?;
+        }
+        if !saw_any {
+            // Collection has docs but no natural entries (legacy) — fall back.
+            return self.scan_blobs(session, db, coll);
+        }
+        Ok(out)
+    }
+
     /// Evict oldest non-fresh docs from a capped collection until within its
     /// `size` (byte) and `max` (count) bounds. "Oldest" is natural (doc-table
     /// `id_key`) order, which matches insertion order for monotonic `_id`s.
@@ -3776,6 +3996,7 @@ impl Storage {
             }
             let doc = decode_doc(&blob)?;
             self.delete_index_entries(session, db, coll, &doc, descs, Some(&id_k))?;
+            self.delete_nat_entry(session, db, coll, &id_k)?;
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &id_k);
             match doc_cur.remove() {
@@ -4172,6 +4393,10 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             }
         }
+        // Drop the natural-order entries too, so a re-created collection can't
+        // resurrect stale insertion positions (which would double a re-inserted
+        // `_id` in a natural scan).
+        self.drop_nat_collection(session, db, coll)?;
         Ok(())
     }
 
@@ -4322,7 +4547,7 @@ impl Storage {
         let force_collscan = coll_opt.is_some();
 
         let blobs: Vec<Vec<u8>> = if force_collscan {
-            self.scan_blobs(&session, db, coll)?
+            self.scan_blobs_natural(&session, db, coll)?
         } else if let Some(h) = hint {
             let resolved = self.resolve_hint(&session, db, coll, h)?;
             let (cands, ord) =
@@ -4361,7 +4586,7 @@ impl Storage {
                             sort_dir != idx_dir,
                         )?
                     }
-                    None => self.scan_blobs(&session, db, coll)?,
+                    None => self.scan_blobs_natural(&session, db, coll)?,
                 }
             } else if let Some(multi) = multi_sort_spec(sort).filter(|m| m.len() > 1) {
                 // Multi-field sort: walk a strict-match compound index, else COLLSCAN.
@@ -4370,13 +4595,13 @@ impl Storage {
                         in_sort_order = true;
                         self.walk_index_in_order(&session, db, coll, &idx_name, reverse)?
                     }
-                    None => self.scan_blobs(&session, db, coll)?,
+                    None => self.scan_blobs_natural(&session, db, coll)?,
                 }
             } else {
-                self.scan_blobs(&session, db, coll)?
+                self.scan_blobs_natural(&session, db, coll)?
             }
         } else {
-            self.scan_blobs(&session, db, coll)?
+            self.scan_blobs_natural(&session, db, coll)?
         };
 
         // Decode + filter; keep the doc alongside the blob for the post-sort.
@@ -4750,6 +4975,7 @@ impl Storage {
             cur.insert()?;
             self.write_index_entries(&session, db, coll, &new, &descs, Some(&new_id_key))?;
             self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
+            self.write_nat_entry(&session, db, coll, &new_id_key)?;
             if oplog_on {
                 let mut o2 = Document::new();
                 o2.insert("_id", id.clone());
@@ -4818,6 +5044,7 @@ impl Storage {
                 continue;
             }
             self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
+            self.delete_nat_entry(&session, db, coll, &id_k)?;
             let cur = session.open_cursor(DOC_TABLE, None)?;
             cur.set_key_ssu(db, coll, &id_k);
             cur.remove()?;
@@ -4998,9 +5225,10 @@ impl Storage {
         sort_dir: i32,
     ) -> Result<(Vec<Vec<u8>>, bool)> {
         match resolved {
-            ResolvedHint::Natural => Ok((self.scan_blobs(session, db, coll)?, false)),
+            // `$natural` is insertion order — walk the natural-order index.
+            ResolvedHint::Natural => Ok((self.scan_blobs_natural(session, db, coll)?, false)),
             ResolvedHint::IdIndex => {
-                // The doc table is keyed by id_key, so a natural scan is _id order.
+                // The doc table is keyed by id_key, so this scan IS _id order.
                 let mut docs = self.scan_blobs(session, db, coll)?;
                 let in_order = sort_field == Some("_id");
                 if in_order && sort_dir == -1 {

@@ -267,6 +267,35 @@ fn count_hint_honours_sparse_index() {
 }
 
 #[test]
+fn find_returns_insertion_order_for_mixed_id_types() {
+    // Unsorted find returns insertion order, not _id-sort order — the case
+    // php-lib BulkWriteFunctionalTest::testInserts pins (mixed _id types inserted
+    // out of _id order).
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "c", "documents": [
+                {"_id": 1, "x": 11}, {"x": 22}, {"_id": "foo", "x": 33}, {"_id": "bar", "x": 44}
+            ]},
+            c,
+        );
+        let found = dispatch(&doc! {"find": "c"}, c);
+        let xs: Vec<i32> = found
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_document().unwrap().get_i32("x").unwrap())
+            .collect();
+        assert_eq!(
+            xs,
+            vec![11, 22, 33, 44],
+            "insertion order regardless of _id type"
+        );
+    });
+}
+
+#[test]
 fn data_command_without_storage_is_internal_error() {
     let mut c = CommandContext::new(1); // no storage attached
     let reply = dispatch(&doc! {"count": "c"}, &mut c);

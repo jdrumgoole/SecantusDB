@@ -315,6 +315,12 @@ impl Cursor {
         *self.key_strs_hold.borrow_mut() = vec![ca, cb];
         *self.key_bytes_hold.borrow_mut() = owned;
     }
+    /// `key_format=SSq` — `(db, coll, seq)` (the natural-order index).
+    pub fn set_key_ssq(&self, a: &str, b: &str, c: i64) {
+        let (ca, cb) = (cstr(a), cstr(b));
+        unsafe { cur_fn!(self, set_key)(self.ptr, ca.as_ptr(), cb.as_ptr(), c) };
+        *self.key_strs_hold.borrow_mut() = vec![ca, cb];
+    }
     /// `key_format=SSS` — `(db, coll, index_name)` (the indexes registry).
     pub fn set_key_sss(&self, a: &str, b: &str, c: &str) {
         let (ca, cb, cc) = (cstr(a), cstr(b), cstr(c));
@@ -339,13 +345,20 @@ impl Cursor {
         *self.key_bytes_hold.borrow_mut() = owned;
     }
 
-    // --- value (all SecantusDB tables use value_format=u) ---
+    // --- value (most SecantusDB tables use value_format=u; the natural-order
+    // reverse index uses value_format=q) ---
 
     pub fn set_value_u(&self, v: &[u8]) {
         let owned = v.to_vec();
         let it = item(&owned);
         unsafe { cur_fn!(self, set_value)(self.ptr, &it as *const sys::WT_ITEM) };
         *self.val_bytes_hold.borrow_mut() = owned;
+    }
+
+    /// `value_format=q` — a signed 64-bit integer (the natural-order reverse
+    /// index's `seq`). Scalars are packed by value, so no buffer needs holding.
+    pub fn set_value_q(&self, v: i64) {
+        unsafe { cur_fn!(self, set_value)(self.ptr, v) };
     }
 
     // --- key getters (for scans) ---
@@ -380,6 +393,13 @@ impl Cursor {
         })?;
         Ok((owned(a), owned(b), unsafe { item_bytes(&it) }))
     }
+    /// `key_format=SSq` — `(db, coll, seq)` (the natural-order index).
+    pub fn get_key_ssq(&self) -> Result<(String, String, i64)> {
+        let (mut a, mut b): (*const c_char, *const c_char) = (ptr::null(), ptr::null());
+        let mut c: i64 = 0;
+        check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut a, &mut b, &mut c as *mut i64) })?;
+        Ok((owned(a), owned(b), c))
+    }
     /// `key_format=SSS` — `(db, coll, index_name)` (the indexes registry).
     pub fn get_key_sss(&self) -> Result<(String, String, String)> {
         let (mut a, mut b, mut c): (*const c_char, *const c_char, *const c_char) =
@@ -408,6 +428,13 @@ impl Cursor {
         let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
         check(unsafe { cur_fn!(self, get_value)(self.ptr, &mut it as *mut sys::WT_ITEM) })?;
         Ok(unsafe { item_bytes(&it) })
+    }
+
+    /// `value_format=q` — the natural-order reverse index's `seq`.
+    pub fn get_value_q(&self) -> Result<i64> {
+        let mut v: i64 = 0;
+        check(unsafe { cur_fn!(self, get_value)(self.ptr, &mut v as *mut i64) })?;
+        Ok(v)
     }
 
     // --- operations ---

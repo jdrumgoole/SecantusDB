@@ -1139,6 +1139,37 @@ pass while real WT diverged. Both doubles are now scrapped (commits `a11328a`,
   hello-only TLS handshake never touches storage). Neither is a storage
   stand-in.
 
+### 7.3 Natural-order (insertion) index ported to Rust storage (2026-06-25) — CLOSED
+
+The Rust storage previously had no insertion-order index — its doc table is keyed
+by `id_key = encode_value(_id)`, so an unsorted `find()` walked `_id`-sort order,
+not insertion order. This only diverged from mongod / the Python server for
+**mixed `_id` types inserted out of `_id` order** (monotonic ids hide it), which
+php-lib `BulkWriteFunctionalTest::testInserts` exposed. Ported Python's design to
+`crates/secantus-storage`:
+
+- Two WT tables (`secantus_natural` `SSq→u` = `(db,coll,seq)→id_key` and the
+  reverse `secantus_natural_seq` `SSu→q`) + a persisted monotonic `next_nat_seq`
+  counter (in the oplog-meta blob; recovered on reopen, or by scanning the max
+  nat seq when absent — so it survives oplog-disabled / legacy DBs).
+- Maintenance on **every** doc mutation: insert / `insert_one` / upsert write a
+  nat entry; `delete_by_id` / `delete_matching` / `prune_ttl` / capped eviction /
+  `purge_collection_tables` (drop + dropDatabase + rename's dropTarget) remove it.
+  rename drops the source's entries; the destination is re-keyed directly (no nat
+  entries) so it falls back to `id_key` order (a minor, documented degradation).
+- The collscan find paths + the `$natural` hint walk `scan_blobs_natural`
+  (seq-ascending → fetch by `id_key`, with a legacy `id_key`-order fallback when a
+  collection has no nat entries); the `_id_` hint stays `id_key` order.
+- New `SSq` key / `q` value cursor accessors in `secantus-wt`.
+- Tests: `crates/secantus-storage/tests/natural_order.rs` (insertion order for
+  mixed `_id`s, reopen recovery, delete+reinsert no-doubling, drop+recreate reset,
+  `$natural` hint) + an end-to-end adapter test.
+
+Remaining sub-divergence: **capped-collection eviction** still selects victims in
+`id_key` order (see §4 capped note), not insertion order — only the `find` result
+order and `$natural` were moved onto the new index. Closing that means routing
+`enforce_capped_bounds` through a natural-order scan too.
+
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
