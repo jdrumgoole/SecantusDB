@@ -124,6 +124,7 @@ fn apply_stage(
         "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$bucket" => group::bucket_stage(spec, &docs, vars).map_err(|_| Fallback),
+        "$bucketAuto" => group::bucket_auto_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$facet" => facet_stage(spec, docs, vars, coll),
         "$densify" => densify::densify_stage(spec, &docs).map_err(|_| Fallback),
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.

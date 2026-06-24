@@ -542,6 +542,41 @@ fn aggregate_explain_option_returns_plan_without_running() {
 }
 
 #[test]
+fn bucket_auto_chunks_by_count() {
+    // php-lib Builder{Collection,Database}FunctionalTest::testAggregate. Pure
+    // count-chunking (Python parity): 3 docs / 2 buckets → chunks of 1 then 2.
+    with_wt(|c| {
+        // Collection variant: 3 identical values still split into 2 buckets.
+        seed(c, "c", vec![doc! {"x": 10}, doc! {"x": 10}, doc! {"x": 10}]);
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$bucketAuto": {"groupBy": "$x", "buckets": 2}}
+            ], "cursor": {}},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(docs_of(&r).len(), 2);
+
+        // Database variant: $documents source + $bucketAuto over distinct values.
+        let r = dispatch(
+            &doc! {"aggregate": 1, "pipeline": [
+                {"$documents": [{"x": 1}, {"x": 2}, {"x": 3}]},
+                {"$bucketAuto": {"groupBy": "$x", "buckets": 2}}
+            ], "cursor": {}},
+            c,
+        );
+        let out = docs_of(&r);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].get_i32("count").unwrap(), 1);
+        assert_eq!(out[1].get_i32("count").unwrap(), 2);
+        assert_eq!(
+            out[0].get_document("_id").unwrap().get_i32("min").unwrap(),
+            1
+        );
+    });
+}
+
+#[test]
 fn aggregate_batches_into_cursor() {
     with_wt(|c| {
         seed(c, "c", (0..5).map(|i| doc! {"_id": i}).collect());

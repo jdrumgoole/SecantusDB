@@ -495,6 +495,78 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
     Ok(out)
 }
 
+/// `$bucketAuto` — sort docs by the `groupBy` value (byte-sortable sort key, so
+/// cross-type order matches mongod / storage) and split them into at most
+/// `buckets` chunks of roughly equal count, then run the `output` accumulators
+/// (default `{count: {$sum: 1}}`) per chunk with `_id: {min, max}`. Mirrors
+/// `aggregate._stage_bucket_auto`: a pure count-chunking — documents that share a
+/// boundary value are *not* coalesced into one bucket (so N equal values still
+/// split across buckets), matching the Python server.
+pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+    let Bson::Document(s) = spec else {
+        return Err(());
+    };
+    let Some(group_by) = s.get("groupBy") else {
+        return Err(());
+    };
+    let n_buckets = match s.get("buckets") {
+        Some(Bson::Int32(n)) if *n >= 1 => *n as usize,
+        Some(Bson::Int64(n)) if *n >= 1 => *n as usize,
+        _ => return Err(()),
+    };
+    let default_output = bson::doc! {"count": {"$sum": 1i32}};
+    let output_spec: &Document = match s.get("output") {
+        Some(Bson::Document(d)) if !d.is_empty() => d,
+        None | Some(Bson::Document(_)) => &default_output,
+        Some(_) => return Err(()),
+    };
+
+    // Evaluate groupBy per doc, then sort by the byte-sortable encoding (the same
+    // order Python's `_SortKey` gives). A value the encoder can't represent
+    // defers the whole stage to Python.
+    let mut pairs: Vec<(Bson, &Document)> = Vec::with_capacity(docs.len());
+    for d in docs {
+        pairs.push((eval(group_by, d, vars)?, d));
+    }
+    let mut keyed: Vec<(Vec<u8>, Bson, &Document)> = Vec::with_capacity(pairs.len());
+    for (v, d) in pairs {
+        let k = crate::sortkey::encode_value(&v, None).map_err(|_| ())?;
+        keyed.push((k, v, d));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    if keyed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let bucket_size = std::cmp::max(1, keyed.len() / n_buckets);
+    let mut out: Vec<Document> = Vec::new();
+    let mut i = 0usize;
+    while i < keyed.len() && out.len() < n_buckets {
+        let is_last = out.len() == n_buckets - 1;
+        let end = if is_last {
+            keyed.len()
+        } else {
+            std::cmp::min(i + bucket_size, keyed.len())
+        };
+        let chunk = &keyed[i..end];
+        if chunk.is_empty() {
+            break;
+        }
+        // Upper bound: the next chunk's first value when there is one, else this
+        // chunk's last value (mirrors Python's `pairs[i + bucket_size]` lookahead).
+        let upper = if !is_last && i + bucket_size < keyed.len() {
+            keyed[i + bucket_size].1.clone()
+        } else {
+            chunk[chunk.len() - 1].1.clone()
+        };
+        let id = Bson::Document(bson::doc! { "min": chunk[0].1.clone(), "max": upper });
+        let chunk_docs: Vec<&Document> = chunk.iter().map(|(_, _, d)| *d).collect();
+        out.push(accumulate_into(id, output_spec, &chunk_docs, vars)?);
+        i += chunk.len();
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

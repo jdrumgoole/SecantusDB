@@ -134,6 +134,19 @@ CURATED = [
             }
         }
     ],
+    # $bucketAuto — count-chunking (equal values still split), custom output
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 3}}],
+    [{"$sort": {"_id": 1}}, {"$bucketAuto": {"groupBy": "$_id", "buckets": 4}}],
+    [
+        {
+            "$bucketAuto": {
+                "groupBy": "$a",
+                "buckets": 2,
+                "output": {"n": {"$sum": 1}, "av": {"$avg": "$a"}},
+            }
+        }
+    ],
     # $facet — multiple sub-pipelines over the same input
     [
         {
