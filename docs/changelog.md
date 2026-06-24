@@ -19,6 +19,44 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Change-stream resume tokens now advance per event, even at batchSize 1
+
+A change stream's `postBatchResumeToken` now tracks the resume token of the
+**last event actually returned in each batch**, not the last event the server
+happened to prefetch. The producer reads up to 200 oplog rows ahead while the
+cursor hands them back `batchSize` at a time, so with a small batch size the
+token reported on each `getMore` was stale — three single-event reads all
+carried the same token. Drivers that resume off the per-batch token (the whole
+point of `postBatchResumeToken`) would resume from the wrong place. Alongside
+it, an empty `getMore` over a quiet collection no longer re-mints the token with
+a fresh cluster time when the oplog tail hasn't actually moved, so an exhausted
+stream reports the same resume token as its last event rather than drifting.
+
+This was surfaced by the mongo-cxx-driver gauge's spec prose test "ChangeStream
+must continuously track the last seen resumeToken" (`batchSize=1`, read three
+events, assert each token differs, then assert the post-exhaustion token equals
+the last event's). The fix is server-side and driver-agnostic — every change-
+stream driver benefits.
+
+#### Fixed
+- `commands._change_stream_cursor_doc`: `postBatchResumeToken` is now the `_id`
+  (resume token) of the last event in the returned batch, not the producer's
+  prefetch-tail `last_token` — so per-batch tokens advance correctly under any
+  `batchSize`.
+- `commands` change-stream producer: an empty `getMore` only advances /
+  re-mints the resume token when the oplog tail has genuinely moved past the
+  cursor's position, preserving the go `resume_token_updated_on_empty_batch`
+  advance while fixing the mongocxx no-change-equals-last-token case. (On a
+  truly quiet collection the token now advances via the oplog's periodic noop
+  heartbeats, mirroring mongod's `periodicNoopIntervalSecs` — not a per-getMore
+  clock tick.)
+- The change-stream batch builder (`_change_stream_cursor_doc`) is shared with
+  capped-collection tailable cursors, whose documents carry plain `_id` values
+  and no resume token. The new `postBatchResumeToken` = last-event-`_id` logic
+  is gated to change-stream cursors only, so a capped tailable getMore no longer
+  emits a non-document PBRT (strict drivers — the Java driver — rejected an
+  int32 there).
+
 ### Two more conformance gauges: the Kotlin driver and pymongo async
 
 SecantusDB now also measures itself against the official MongoDB **Kotlin**

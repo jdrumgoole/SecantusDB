@@ -651,3 +651,41 @@ def test_pipeline_update_is_update_event_with_truncated_arrays(client: MongoClie
     assert desc["updatedFields"] == {}
     assert desc["removedFields"] == []
     assert desc["truncatedArrays"] == [{"field": "array", "newSize": 2}]
+
+
+def test_resume_token_tracks_per_event_with_batch_size_one(client: MongoClient) -> None:
+    """mongocxx spec prose #1 — "ChangeStream must continuously track the last
+    seen resumeToken".
+
+    With ``batchSize=1`` the resume token must advance after each single-event
+    read, and once the stream is exhausted with no further activity it must stay
+    equal to the last delivered event's token — not jump to a freshly-minted
+    high-water-mark token. Regression for two coupled PBRT bugs: (1) the
+    producer prefetches up to 200 oplog rows and reported the prefetch tail as
+    the postBatchResumeToken regardless of ``batchSize`` (so all three reads saw
+    the same token); (2) an empty getMore re-minted the token with a fresh
+    cluster time even when the oplog tail had not moved (so the post-exhaustion
+    token differed from the last event's)."""
+    db = client["csrt"]
+    coll = db["c"]
+    cs = coll.watch(batch_size=1, max_await_time_ms=500)
+    coll.insert_one({"a": 1})
+    coll.insert_one({"b": 2})
+    coll.insert_one({"c": 3})
+
+    tokens: list[Any] = []
+    deadline = time.time() + 10.0
+    while len(tokens) < 3 and time.time() < deadline:
+        if cs.try_next() is not None:
+            tokens.append(cs.resume_token)
+    assert len(tokens) == 3, f"only saw {len(tokens)} events: {tokens}"
+
+    # Each single-event read advances the resume token.
+    assert tokens[0] != tokens[1]
+    assert tokens[1] != tokens[2]
+    assert tokens[0] != tokens[2]
+
+    # Exhausted with no further activity: the token stays at the last event's.
+    assert cs.try_next() is None
+    assert cs.resume_token == tokens[2]
+    cs.close()

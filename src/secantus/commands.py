@@ -3666,6 +3666,28 @@ def _change_stream_cursor_doc(
         # The invalidate event has now been delivered.
         entry.final_event_pending = False
     cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
+    if batch and entry.last_token is not None:
+        # The postBatchResumeToken must reflect the resume token of the last
+        # event ACTUALLY RETURNED in this batch — not the producer's prefetch
+        # tail. The producer reads up to 200 oplog rows ahead while the cursor
+        # hands them back ``batch_size`` at a time, so with a small batchSize a
+        # single getMore returns one event while ``entry.last_token`` already
+        # points at the last *buffered* event. Each change event's ``_id`` IS
+        # its resume token (incl. documentKey), so pin the token to the last
+        # returned event. mongocxx's "ChangeStream must continuously track the
+        # last seen resumeToken" reads the PBRT after each batchSize=1 getMore
+        # and requires it to advance per event.
+        #
+        # Gated on ``entry.last_token is not None``: only change-stream cursors
+        # carry a resume token (set at registration). This builder is shared
+        # with capped-collection tailable cursors, whose documents have plain
+        # ``_id`` values (e.g. an int) and no postBatchResumeToken — overwriting
+        # ``last_token`` with such an ``_id`` made the reply carry a non-document
+        # PBRT and broke strict drivers (the Java driver: "Value expected to be
+        # of type DOCUMENT is of unexpected type INT32").
+        last_ev = batch[-1]
+        if isinstance(last_ev, Mapping) and "_id" in last_ev:
+            entry.last_token = last_ev["_id"]
     cursor_doc: dict[str, Any] = {
         batch_key: batch,
         # Cursor `id` MUST be int64 — Go driver hard-fails int32.
@@ -4141,22 +4163,26 @@ def _aggregate_change_stream(
             return []
         rows = storage.read_oplog(start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter)
         if not rows:
-            # No new MATCHING oplog entries since last poll, but the
-            # oplog as a whole may have moved on (writes on other
-            # collections, periodic noop heartbeats). The
-            # postBatchResumeToken should advance to reflect the
-            # latest oplog position so consumers on quiet collections
-            # can resume past unrelated activity — mongo-go-driver's
-            # ``resume_token_updated_on_empty_batch`` test asserts
-            # exactly that. Pin ``position_seq`` to the oplog tail so
-            # the next read starts from there.
+            # No new MATCHING oplog entries since last poll. If the oplog as a
+            # whole has moved on (writes on other collections, periodic noop
+            # heartbeats), advance ``position_seq`` to the tail and mint a fresh
+            # high-water-mark token so a quiet collection's postBatchResumeToken
+            # can move past unrelated activity — mongo-go-driver's
+            # ``resume_token_updated_on_empty_batch`` asserts exactly that.
+            # When the tail has NOT moved, leave ``last_token`` untouched:
+            # re-minting with a fresh cluster time would change the token even
+            # though nothing happened, breaking the spec rule that a no-change
+            # empty batch reports the SAME resume token as the last event
+            # delivered (mongocxx's "continuously track the last seen
+            # resumeToken" asserts the post-exhaustion token equals the last
+            # doc's token).
             tail_seq = storage.oplog_tail_seq()
             if tail_seq > entry.position_seq:
                 entry.position_seq = tail_seq
-            ts = storage.current_cluster_time()
-            entry.last_token = changestreams.make_resume_token(
-                changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
-            )
+                ts = storage.current_cluster_time()
+                entry.last_token = changestreams.make_resume_token(
+                    changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
+                )
             return []
         events: list[dict[str, Any]] = []
         last_seen = entry.position_seq

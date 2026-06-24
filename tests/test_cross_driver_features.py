@@ -379,6 +379,25 @@ def server(tmp_path):
         yield srv
 
 
+@pytest.fixture
+def server_with_noop(tmp_path):
+    """Server with periodic noop oplog heartbeats enabled, mirroring mongod.
+
+    Real mongod advances a change stream's ``postBatchResumeToken`` on a quiet
+    collection through the oplog's periodic noop writes
+    (``periodicNoopIntervalSecs``, 10s by default) — not through a per-getMore
+    clock tick. SecantusDB's server-side PBRT only advances on genuine oplog
+    movement (so an immediately-exhausted stream keeps its last event's token,
+    per the change-streams spec), so the PBRT smokes — which assert the token
+    advances across empty getMores on an otherwise-quiet collection — need that
+    background activity. A fast 0.2s interval so the ~600 ms smoke window sees
+    several heartbeats."""
+    with SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "wt"), noop_heartbeat_seconds=0.2
+    ) as srv:
+        yield srv
+
+
 _ADMIN_USER = "root"
 _ADMIN_PWD = "rootpw"
 
@@ -1653,9 +1672,9 @@ print(JSON.stringify({
 
 @pytest.mark.skipif(_MONGOSH is None, reason="mongosh not on PATH")
 @pytest.mark.xdist_group(name="mongosh_smokes")
-def test_pbrt_smoke_via_mongosh(server: SecantusDBServer) -> None:
+def test_pbrt_smoke_via_mongosh(server_with_noop: SecantusDBServer) -> None:
     result = _run_mongosh(
-        [_MONGOSH, "--quiet", f"{server.uri}pbrt_xd", "--eval", _PBRT_MONGOSH_SCRIPT],
+        [_MONGOSH, "--quiet", f"{server_with_noop.uri}pbrt_xd", "--eval", _PBRT_MONGOSH_SCRIPT],
         timeout=60.0,
     )
     assert result.returncode == 0, (
@@ -1677,10 +1696,10 @@ def test_pbrt_smoke_via_mongosh(server: SecantusDBServer) -> None:
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 @pytest.mark.skipif(_NPM is None, reason="npm not on PATH")
 @pytest.mark.xdist_group(name="node_smokes")
-def test_pbrt_smoke_via_node_driver(server: SecantusDBServer) -> None:
+def test_pbrt_smoke_via_node_driver(server_with_noop: SecantusDBServer) -> None:
     if not _ensure_node_modules():
         pytest.skip("could not install mongodb npm package")
-    env = {**os.environ, "MONGODB_URI": server.uri}
+    env = {**os.environ, "MONGODB_URI": server_with_noop.uri}
     result = _run(
         [_NODE, str(_NODE_SMOKE_DIR / "pbrt_smoke.js")],
         env=env,
@@ -1693,8 +1712,8 @@ def test_pbrt_smoke_via_node_driver(server: SecantusDBServer) -> None:
 
 
 @pytest.mark.skipif(_GO is None, reason="go not on PATH")
-def test_pbrt_smoke_via_go_driver(server: SecantusDBServer) -> None:
-    env = {**os.environ, "MONGODB_URI": server.uri}
+def test_pbrt_smoke_via_go_driver(server_with_noop: SecantusDBServer) -> None:
+    env = {**os.environ, "MONGODB_URI": server_with_noop.uri}
     result = _run(
         [_GO, "run", "./pbrt"],
         cwd=_GO_SMOKE_DIR,
@@ -1710,10 +1729,10 @@ def test_pbrt_smoke_via_go_driver(server: SecantusDBServer) -> None:
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
 @pytest.mark.skipif(_GRADLE is None, reason="gradle not on PATH")
 @pytest.mark.xdist_group(name="java_smokes")
-def test_pbrt_smoke_via_java_driver(server: SecantusDBServer) -> None:
+def test_pbrt_smoke_via_java_driver(server_with_noop: SecantusDBServer) -> None:
     if not _ensure_java_smokes_jar():
         pytest.skip("could not build secantus-java-smokes-all.jar")
-    env = {**os.environ, "MONGODB_URI": server.uri}
+    env = {**os.environ, "MONGODB_URI": server_with_noop.uri}
     result = _run_java_smoke("com.secantus.smokes.PbrtSmoke", env)
     assert result.returncode == 0, (
         f"java pbrt smoke: rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
