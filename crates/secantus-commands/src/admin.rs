@@ -170,7 +170,8 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
-    // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique}}`.
+    let mut reply = doc! { "ok": 1.0 };
+    // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique|expireAfterSeconds}}`.
     if let Some(Bson::Document(index_spec)) = doc.get("index") {
         let indexes = storage
             .list_indexes(&ctx.db_name, &coll)
@@ -202,6 +203,26 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply());
         };
         let target_name = target.get_str("name").unwrap_or("").to_string();
+        // `expireAfterSeconds` retunes a TTL index: echo the old/new expiry and
+        // persist the new one. Mirrors commands.py::_coll_mod.
+        if let Some(new_expiry) = index_spec.get("expireAfterSeconds") {
+            reply.insert(
+                "expireAfterSeconds_old",
+                target
+                    .get("expireAfterSeconds")
+                    .cloned()
+                    .unwrap_or(Bson::Null),
+            );
+            reply.insert("expireAfterSeconds_new", new_expiry.clone());
+            storage
+                .set_index_options(
+                    &ctx.db_name,
+                    &coll,
+                    &target_name,
+                    &doc! {"expireAfterSeconds": new_expiry.clone()},
+                )
+                .map_err(command_error)?;
+        }
         // `prepareUnique` arms the index: new dup writes are rejected (11000)
         // while pre-existing duplicates are tolerated — the staging step before
         // a `unique: true` conversion.
@@ -254,7 +275,7 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     storage
         .coll_mod(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
-    Ok(doc! { "ok": 1.0 })
+    Ok(reply)
 }
 
 /// Whether two index key patterns are equal (same fields, same order, same

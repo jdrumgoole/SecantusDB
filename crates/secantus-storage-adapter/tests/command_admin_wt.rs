@@ -256,6 +256,40 @@ fn collmod_index_prepare_unique_then_unique_conversion() {
 }
 
 #[test]
+fn collmod_index_expire_after_seconds_reflection() {
+    // collMod retuning a TTL index echoes expireAfterSeconds_old/new and persists
+    // the new expiry — php-lib ModifyCollectionFunctionalTest::testCollMod.
+    with_wt(|c| {
+        dispatch(&doc! {"create": "c"}, c);
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [
+                {"key": {"lastAccess": 1}, "expireAfterSeconds": 3, "name": "lastAccess_1"}
+            ]},
+            c,
+        );
+        let r = dispatch(
+            &doc! {"collMod": "c", "index": {"keyPattern": {"lastAccess": 1}, "expireAfterSeconds": 1000}},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(r.get_i32("expireAfterSeconds_old").unwrap(), 3);
+        assert_eq!(r.get_i32("expireAfterSeconds_new").unwrap(), 1000);
+        // Persisted: listIndexes reports the new expiry.
+        let li = dispatch(&doc! {"listIndexes": "c"}, c);
+        let idx = li
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_document().unwrap().clone())
+            .find(|d| d.get_str("name") == Ok("lastAccess_1"))
+            .unwrap();
+        assert_eq!(idx.get_i32("expireAfterSeconds").unwrap(), 1000);
+    });
+}
+
+#[test]
 fn collmod_missing_ns_is_namespace_not_found() {
     with_wt(|c| {
         let reply = dispatch(&doc! {"collMod": "nope", "validator": {}}, c);
