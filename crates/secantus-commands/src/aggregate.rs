@@ -64,6 +64,22 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         _ => Vec::new(),
     };
 
+    // Inline `explain: true` on the aggregate command (the legacy flag, distinct
+    // from the top-level `explain` wrapper): return the plan instead of running
+    // the pipeline, and crucially do NOT execute `$out` / `$merge`. Delegate to
+    // the explain handler before any write stage runs; default verbosity is
+    // `queryPlanner`. Mirrors `commands.py::_aggregate`.
+    if doc.get("explain") == Some(&Bson::Boolean(true)) {
+        let mut inner = doc.clone();
+        inner.remove("explain");
+        let verbosity = doc
+            .get_str("verbosity")
+            .unwrap_or("queryPlanner")
+            .to_string();
+        let wrapped = doc! { "explain": inner, "verbosity": verbosity };
+        return crate::admin::explain(&wrapped, ctx);
+    }
+
     // `$out` / `$merge` may only be the final pipeline stage — mongod rejects a
     // non-terminal write stage with Location40601 before executing anything
     // (mongo-cxx-driver "out fails when not last").

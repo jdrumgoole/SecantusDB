@@ -506,6 +506,42 @@ fn merge_keep_existing_skips_matched() {
 }
 
 #[test]
+fn aggregate_explain_option_returns_plan_without_running() {
+    // The inline `explain: true` aggregate flag (mongo-php-library
+    // AggregateFunctionalTest::testExplainOption*) returns the plan instead of a
+    // cursor and must NOT execute a write stage.
+    with_wt(|c| {
+        seed(
+            c,
+            "c",
+            vec![doc! {"_id": 1}, doc! {"_id": 2}, doc! {"_id": 3}],
+        );
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [{"$match": {"_id": {"$ne": 2}}}], "explain": true},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert!(r.get_array("stages").is_ok(), "explain output has stages");
+        assert!(r.get_document("queryPlanner").is_ok());
+
+        // $out as the final stage with explain:true returns stages and is a dry
+        // run — the target collection is never written.
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$match": {"_id": {"$ne": 2}}}, {"$out": "c.output"}
+            ], "explain": true},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert!(r.get_array("stages").is_ok());
+        assert!(
+            read_all(c, "c.output").is_empty(),
+            "$out not executed under explain"
+        );
+    });
+}
+
+#[test]
 fn aggregate_batches_into_cursor() {
     with_wt(|c| {
         seed(c, "c", (0..5).map(|i| doc! {"_id": i}).collect());
