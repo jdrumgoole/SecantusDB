@@ -1,107 +1,59 @@
-//! End-to-end: drive the Rust server over a real TCP socket with an in-memory
-//! `Storage`, speaking the wire protocol by hand (no pymongo needed). Proves the
-//! whole path — socket → wire parse → dispatch → reply → socket — works
-//! in-process, which is exactly what the embedded Python handle (R6) will wrap.
+//! End-to-end: drive the Rust server over a real TCP socket backed by a real
+//! `WtStorage` (via `StorageAdapter`), speaking the wire protocol by hand (no
+//! pymongo needed). Proves the whole path — socket → wire parse → dispatch →
+//! storage → reply → socket — works in-process over real WiredTiger. (Moved out
+//! of `secantus-server`, which is WiredTiger-free and so could only test this
+//! against a hand-rolled in-memory storage double.)
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bson::{doc, Bson, Document};
-use secantus_commands::storage::{RawHint, Storage, StorageError, UpdateOutcome};
-use secantus_commands::CursorRegistry;
+use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 use secantus_server::{bind, ServerConfig};
+use secantus_storage::Storage as WtStorage;
+use secantus_storage_adapter::StorageAdapter;
 
-// --- a minimal in-memory Storage ----------------------------------------
+// --- real-WT storage behind a temp dir that cleans up on drop ------------
 
-#[derive(Default)]
-struct MemStorage {
-    cols: Mutex<HashMap<(String, String), Vec<Document>>>,
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Removes its temp dir on drop (after the server — and thus the WT
+/// connection — has been released).
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
-fn matches(d: &Document, filter: &Document) -> bool {
-    filter.iter().all(|(k, v)| d.get(k) == Some(v))
-}
-
-fn enc(d: &Document) -> Vec<u8> {
-    let mut v = Vec::new();
-    d.to_writer(&mut v).unwrap();
-    v
-}
-
-impl Storage for MemStorage {
-    fn insert(
-        &self,
-        db: &str,
-        coll: &str,
-        docs: Vec<Vec<u8>>,
-        _ordered: bool,
-    ) -> Result<(usize, Vec<Document>), StorageError> {
-        let mut cols = self.cols.lock().unwrap();
-        let bucket = cols.entry((db.into(), coll.into())).or_default();
-        for b in &docs {
-            bucket.push(Document::from_reader(&mut b.as_slice()).unwrap());
-        }
-        Ok((docs.len(), vec![]))
-    }
-    fn update_matching(
-        &self,
-        _db: &str,
-        _coll: &str,
-        _filter: &Document,
-        _update: &Document,
-        _multi: bool,
-        _upsert: bool,
-    ) -> Result<UpdateOutcome, StorageError> {
-        Ok(UpdateOutcome::default())
-    }
-    fn delete_matching(
-        &self,
-        db: &str,
-        coll: &str,
-        filter: &Document,
-        _limit: usize,
-    ) -> Result<usize, StorageError> {
-        let mut cols = self.cols.lock().unwrap();
-        let bucket = cols.entry((db.into(), coll.into())).or_default();
-        let before = bucket.len();
-        bucket.retain(|d| !matches(d, filter));
-        Ok(before - bucket.len())
-    }
-    fn count_matching(
-        &self,
-        db: &str,
-        coll: &str,
-        filter: &Document,
-    ) -> Result<usize, StorageError> {
-        let cols = self.cols.lock().unwrap();
-        Ok(cols
-            .get(&(db.into(), coll.into()))
-            .map(|b| b.iter().filter(|d| matches(d, filter)).count())
-            .unwrap_or(0))
-    }
-    fn find(
-        &self,
-        db: &str,
-        coll: &str,
-        filter: &Document,
-        _sort: Option<&Document>,
-        _hint: Option<RawHint<'_>>,
-    ) -> Result<Vec<Vec<u8>>, StorageError> {
-        let cols = self.cols.lock().unwrap();
-        Ok(cols
-            .get(&(db.into(), coll.into()))
-            .map(|b| b.iter().filter(|d| matches(d, filter)).map(enc).collect())
-            .unwrap_or_default())
-    }
+/// A real `WtStorage` (adapted to the command `Storage` trait) over a fresh
+/// temp dir. Hold the returned guard for the lifetime of the server.
+fn wt_storage() -> (Arc<dyn CmdStorage>, TempDir) {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("secantus-srvwt-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let wt = Arc::new(WtStorage::open(dir.to_str().unwrap()).unwrap());
+    let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(wt));
+    (adapter, TempDir(dir))
 }
 
 // --- wire helpers (client side) -----------------------------------------
 
 const OP_MSG: i32 = 2013;
 const OP_QUERY: i32 = 2004;
+
+fn enc(d: &Document) -> Vec<u8> {
+    let mut v = Vec::new();
+    d.to_writer(&mut v).unwrap();
+    v
+}
 
 fn read_exact(stream: &mut TcpStream, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
@@ -125,11 +77,9 @@ fn op_msg(stream: &mut TcpStream, request_id: i32, body: &Document) -> Document 
     frame.extend_from_slice(&payload);
     stream.write_all(&frame).unwrap();
 
-    // Read reply: header then body.
     let header = read_exact(stream, 16);
     let total = i32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
     let rest = read_exact(stream, total - 16);
-    // OP_MSG reply: flags(4) + kind(1) + bson
     assert_eq!(&rest[0..4], &[0, 0, 0, 0], "reply flags 0");
     assert_eq!(rest[4], 0, "kind 0 section");
     Document::from_reader(&mut &rest[5..]).unwrap()
@@ -168,11 +118,11 @@ fn connect(addr: std::net::SocketAddr) -> TcpStream {
     stream
 }
 
-// --- the test ------------------------------------------------------------
+// --- the tests -----------------------------------------------------------
 
 #[test]
 fn full_wire_roundtrip() {
-    let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+    let (storage, _tmp) = wt_storage();
     let cursors = Arc::new(CursorRegistry::new());
     let server = bind(
         "127.0.0.1:0",
@@ -195,7 +145,6 @@ fn full_wire_roundtrip() {
     assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     assert!(reply.get_bool("isWritablePrimary").unwrap());
     assert_eq!(reply.get_str("setName").unwrap(), "secantus");
-    // connectionId must be int64.
     assert!(matches!(reply.get("connectionId"), Some(Bson::Int64(_))));
 
     // 2. ping.
@@ -252,12 +201,11 @@ fn full_wire_roundtrip() {
 
 #[test]
 fn find_getmore_killcursors_over_the_wire() {
-    let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+    let (storage, _tmp) = wt_storage();
     let cursors = Arc::new(CursorRegistry::new());
     let server = bind("127.0.0.1:0", ServerConfig::default(), storage, cursors).unwrap();
     let mut stream = connect(server.address());
 
-    // seed 5 docs
     op_msg(
         &mut stream,
         1,
@@ -266,7 +214,6 @@ fn find_getmore_killcursors_over_the_wire() {
         ], "$db": "t"},
     );
 
-    // find batchSize 2 ⇒ live cursor
     let reply = op_msg(
         &mut stream,
         2,
@@ -277,7 +224,6 @@ fn find_getmore_killcursors_over_the_wire() {
     let cid = cursor.get_i64("id").unwrap();
     assert_ne!(cid, 0);
 
-    // getMore drains the next batch
     let reply = op_msg(
         &mut stream,
         3,
@@ -287,7 +233,6 @@ fn find_getmore_killcursors_over_the_wire() {
     assert_eq!(cursor.get_array("nextBatch").unwrap().len(), 2);
     assert_eq!(cursor.get_i64("id").unwrap(), cid);
 
-    // killCursors closes it
     let reply = op_msg(
         &mut stream,
         4,
@@ -300,8 +245,7 @@ fn find_getmore_killcursors_over_the_wire() {
 }
 
 /// Send an OP_MSG with the `exhaustAllowed` flag (1<<16), then read replies
-/// until one arrives without the `moreToCome` bit (1<<1). Returns every reply
-/// document in stream order.
+/// until one arrives without the `moreToCome` bit (1<<1).
 fn op_msg_exhaust(stream: &mut TcpStream, request_id: i32, body: &Document) -> Vec<Document> {
     let body_bytes = enc(body);
     let mut payload = Vec::new();
@@ -333,11 +277,10 @@ fn op_msg_exhaust(stream: &mut TcpStream, request_id: i32, body: &Document) -> V
 }
 
 /// OP_MSG exhaust: a getMore with `exhaustAllowed` streams every remaining batch
-/// back over the same socket with `moreToCome`, ending with an empty `id: 0`
-/// reply — instead of one round-trip per getMore.
+/// back over the same socket with `moreToCome`, ending with an empty `id: 0`.
 #[test]
 fn exhaust_getmore_streams_remaining_batches() {
-    let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+    let (storage, _tmp) = wt_storage();
     let cursors = Arc::new(CursorRegistry::new());
     let server = bind("127.0.0.1:0", ServerConfig::default(), storage, cursors).unwrap();
     let mut stream = connect(server.address());
@@ -350,7 +293,6 @@ fn exhaust_getmore_streams_remaining_batches() {
         ], "$db": "t"},
     );
 
-    // find batchSize 2 ⇒ live cursor (2 docs already delivered in firstBatch).
     let reply = op_msg(
         &mut stream,
         2,
@@ -359,8 +301,6 @@ fn exhaust_getmore_streams_remaining_batches() {
     let cid = reply.get_document("cursor").unwrap().get_i64("id").unwrap();
     assert_ne!(cid, 0);
 
-    // Exhaust getMore: the server streams the remaining 3 docs across multiple
-    // moreToCome replies, then a final empty reply with cursor id 0.
     let replies = op_msg_exhaust(
         &mut stream,
         3,
@@ -392,18 +332,17 @@ fn exhaust_getmore_streams_remaining_batches() {
     );
 }
 
-/// Streaming-SDAM monitor: an awaitable `hello` (carries `maxAwaitTimeMS`) sent
-/// with the `exhaustAllowed` flag must get a continuous stream of `moreToCome`
-/// hello replies, and a client close must reap the monitor thread (stop() must
-/// not hang). Guards the "Server ended moreToCome unexpectedly" mongosh flake.
+/// Streaming-SDAM monitor: an awaitable `hello` sent with `exhaustAllowed` must
+/// get a continuous stream of `moreToCome` hello replies, and a client close
+/// must reap the monitor thread (stop() must not hang). Guards the "Server ended
+/// moreToCome unexpectedly" mongosh flake.
 #[test]
 fn awaitable_exhaust_hello_streams_more_to_come() {
-    let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+    let (storage, _tmp) = wt_storage();
     let cursors = Arc::new(CursorRegistry::new());
     let server = bind("127.0.0.1:0", ServerConfig::default(), storage, cursors).unwrap();
     let mut stream = connect(server.address());
 
-    // Awaitable hello with the exhaustAllowed flag (1<<16).
     let hello = doc! {
         "hello": 1,
         "maxAwaitTimeMS": 100i32,
@@ -424,7 +363,6 @@ fn awaitable_exhaust_hello_streams_more_to_come() {
     frame.extend_from_slice(&payload);
     stream.write_all(&frame).unwrap();
 
-    // Two streamed replies: each sets moreToCome and is a valid hello.
     for _ in 0..2 {
         let header = read_exact(&mut stream, 16);
         let total = i32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
@@ -446,6 +384,10 @@ fn awaitable_exhaust_hello_streams_more_to_come() {
     let mut srv = server;
     std::thread::spawn(move || {
         srv.stop();
+        // Fully drop the server (releasing its storage ref and closing the WT
+        // connection's final checkpoint) *before* signalling done, so the test
+        // doesn't remove the temp dir out from under an in-flight close.
+        drop(srv);
         let _ = tx.send(());
     });
     assert!(
@@ -455,16 +397,13 @@ fn awaitable_exhaust_hello_streams_more_to_come() {
 }
 
 /// Slow-loris defense (`ServerConfig::message_read_timeout`): a client that
-/// starts a wire message and then dribbles/stalls without completing it is
-/// dropped once the timeout elapses from the first byte — instead of pinning a
-/// connection thread forever. An idle connection that has sent *nothing* is
-/// untouched (only an in-progress message is bounded), preserving the
-/// mongod-conformant "never close an idle pooled connection" behaviour.
+/// starts a wire message and then stalls is dropped once the timeout elapses;
+/// an idle connection that has sent *nothing* is untouched.
 #[test]
 fn slow_loris_partial_message_is_dropped_but_idle_is_not() {
     use std::time::Instant;
 
-    let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+    let (storage, _tmp) = wt_storage();
     let cursors = Arc::new(CursorRegistry::new());
     let server = bind(
         "127.0.0.1:0",
@@ -478,22 +417,17 @@ fn slow_loris_partial_message_is_dropped_but_idle_is_not() {
     .unwrap();
     let addr = server.address();
 
-    // 1. An idle connection that sends no bytes at all sits past 2× the timeout
-    //    and is still fully usable (the timeout does not bound idle waits).
+    // 1. Idle connection (no bytes) sits past 2× the timeout and is still usable.
     let mut idle = connect(addr);
     std::thread::sleep(Duration::from_millis(900));
     let reply = op_msg(&mut idle, 1, &doc! {"hello": 1, "$db": "admin"});
     assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
 
-    // 2. A started-but-never-finished message is reaped. Send 4 bytes of a
-    //    16-byte header (the message has "started") then stall.
+    // 2. A started-but-never-finished message is reaped (4 of 16 header bytes).
     let mut stream = connect(addr);
     stream.write_all(&[16, 0, 0, 0]).unwrap();
     stream.flush().unwrap();
 
-    // The server closes the socket shortly after the timeout ⇒ the client read
-    // returns EOF (0 bytes). The client's own 5s read timeout would otherwise
-    // fire at ~5s, so a bounded elapsed proves the *server* closed it.
     let start = Instant::now();
     let mut buf = [0u8; 16];
     let n = stream.read(&mut buf).unwrap_or(0);
