@@ -128,6 +128,14 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .get("projection")
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
+    // A projection may not mix inclusion and exclusion (except `_id`). mongod
+    // rejects it at parse with a per-field 31254 / 31253 — the exact wording
+    // mongo-node-driver's projection-error tests assert.
+    if let Some(spec) = projection {
+        if let Some(err) = projection_mix_error(spec) {
+            return Ok(err.into_reply());
+        }
+    }
     let hint = doc.get("hint");
     let collation = collation_of(doc);
     // Command `let` → vars visible to `$expr` in the filter.
@@ -543,6 +551,54 @@ fn apply_min_max(
         }
     }
     Ok(out)
+}
+
+/// mongod's mixed-inclusion/exclusion projection error, if the spec mixes the
+/// two modes. `_id` is exempt (it may be excluded in an inclusion projection and
+/// included in an exclusion one). The first non-`_id` field sets the mode; the
+/// first field that contradicts it loses, with mongod's per-field wording
+/// (`Cannot do exclusion on field X in inclusion projection`, 31254 — or the
+/// inclusion-in-exclusion mirror, 31253). Operator specs (`$slice` / `$elemMatch`)
+/// are neutral here (handled by `apply_projection`). Mirrors mongod's parse-time
+/// validation that mongo-node-driver's projection-error tests assert.
+fn projection_mix_error(spec: &Document) -> Option<CommandError> {
+    let field_inclusion = |v: &Bson| -> Option<bool> {
+        match v {
+            Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false) => Some(false),
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(true) => Some(true),
+            Bson::Double(d) => Some(*d != 0.0),
+            _ => None, // operator spec ($slice / $elemMatch) — neutral
+        }
+    };
+    let mut mode: Option<bool> = None;
+    for (field, v) in spec {
+        if field == "_id" {
+            continue;
+        }
+        let Some(incl) = field_inclusion(v) else {
+            continue;
+        };
+        match mode {
+            None => mode = Some(incl),
+            Some(m) if m != incl => {
+                return Some(if m {
+                    CommandError::new(
+                        31254,
+                        "Location31254",
+                        format!("Cannot do exclusion on field {field} in inclusion projection"),
+                    )
+                } else {
+                    CommandError::new(
+                        31253,
+                        "Location31253",
+                        format!("Cannot do inclusion on field {field} in exclusion projection"),
+                    )
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Apply a projection spec to each result doc via `secantus_core::projection`.

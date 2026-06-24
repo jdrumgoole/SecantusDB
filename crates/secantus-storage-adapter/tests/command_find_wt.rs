@@ -177,6 +177,28 @@ fn find_projection_includes_fields() {
 }
 
 #[test]
+fn find_mixed_projection_is_rejected() {
+    // A projection mixing inclusion and exclusion (except _id) is rejected with
+    // mongod's per-field 31254 / 31253 — mongo-node-driver projection-error tests.
+    with_wt(|c| {
+        seed(c, vec![doc! {"_id": 1, "a": 1, "b": 2}]);
+        let r = dispatch(&doc! {"find": "c", "projection": {"a": 1, "b": 0}}, c);
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(r.get_i32("code").unwrap(), 31254);
+        assert!(r
+            .get_str("errmsg")
+            .unwrap()
+            .contains("Cannot do exclusion on field b in inclusion projection"));
+        // Exclusion mode + an inclusion field → 31253.
+        let r = dispatch(&doc! {"find": "c", "projection": {"a": 0, "b": 1}}, c);
+        assert_eq!(r.get_i32("code").unwrap(), 31253);
+        // `_id` is exempt: {_id: 0, a: 1} is a valid inclusion projection.
+        let r = dispatch(&doc! {"find": "c", "projection": {"_id": 0, "a": 1}}, c);
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+    });
+}
+
+#[test]
 fn find_filter_matches_subset() {
     with_wt(|c| {
         seed(
