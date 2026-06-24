@@ -1093,6 +1093,47 @@ affected values (immaterial for ephemeral test data, but note it):
   (e.g. flags=10 → ten NULs instead of `"im"`). Now reconstructs the option
   chars in pymongo's on-wire order (`ilmsux`).
 
+### 7.2 Command/server tests moved onto real WiredTiger (2026-06-24) — CLOSED
+
+The Rust command/server crates were unit-tested against hand-rolled in-memory
+storage doubles, so the command×storage and wire×storage paths were only ever
+exercised on real WiredTiger end-to-end via the driver gauges — a fake could
+pass while real WT diverged. Both doubles are now scrapped (commits `a11328a`,
+`e13d526`):
+
+- **`FakeStorage` (six `secantus-commands` modules) → gone.** All 82
+  storage-backed command tests (find / crud / findandmodify / admin / aggregate
+  / distinct) were re-homed as real-WT integration tests in the WT-linked
+  `secantus-storage-adapter` crate (`tests/command_*_wt.rs` + a shared
+  `tests/common/mod.rs` `with_wt()` helper), each driving the real `dispatch`
+  path over `WtStorage` via `StorageAdapter`. Fake-specific setup/verification
+  was redone in real-WT terms (validators via real `create`; `$out`/`$merge`
+  checked by reading the target back; the collMod unique-conversion over real
+  duplicate docs instead of injected dup-groups).
+- **`MemStorage` (`secantus-server` roundtrip tests) → gone.** The five
+  wire/TCP roundtrip tests moved to `secantus-storage-adapter/tests/
+  server_roundtrip_wt.rs`, binding the real server over real `WtStorage`
+  (`secantus-server` added as a *dev-dependency* of the adapter crate only).
+- **Why the adapter crate is the home:** `secantus-commands` and
+  `secantus-server` are deliberately WiredTiger-free (clean-workspace members,
+  so the fast `rust` CI job + manylinux wheels build with no libclang/WT). They
+  *can't* link WT, so the tests had to relocate to a WT-linked, gate-covered
+  crate (`rust-adapter-test` runs its `cargo test`). Those two crates keep only
+  their pure-unit tests (lib/cursors/util) and no storage doubles; `clippy -D
+  warnings` confirms the removal left no dead code.
+- **Teardown race found + fixed while porting:** the awaitable-hello server test
+  signalled completion after `stop()` but before the server finished dropping,
+  letting the temp dir be removed out from under WiredTiger's final
+  close-checkpoint (`WT_PANIC: WiredTigerHS.wt No such file`). Fixed by fully
+  dropping the server before signalling; other tests rely on
+  `RunningServer::Drop` → `stop()` draining connection threads first. 5/5 repeat
+  runs clean.
+- **Remaining storage doubles (intentional, not scrapped):** `ClockStorage`
+  (`secantus-commands` lib test — injects a deterministic `Timestamp(555,9)`
+  real WT can't reproduce) and `NoStorage` (`secantus-server` `tls.rs` — a
+  hello-only TLS handshake never touches storage). Neither is a storage
+  stand-in.
+
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
