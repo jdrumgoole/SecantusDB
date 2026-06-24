@@ -416,7 +416,7 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     } else {
         doc! {"stage": "COLLSCAN", "nReturned": n_returned}
     };
-    let exec_stats = doc! {
+    let mut exec_stats = doc! {
         "executionSuccess": true,
         "nReturned": n_returned,
         "executionTimeMillis": 0_i64,
@@ -424,6 +424,13 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "totalDocsExamined": docs_examined,
         "executionStages": execution_stages,
     };
+    // `allPlansExecution` verbosity adds per-candidate-plan stats under
+    // executionStats. With a single solution (no multi-planning; rejectedPlans
+    // is always empty) mongod emits an empty array — drivers' explain helpers
+    // (mongo-php-library `ExplainFunctionalTest`) assert the key's presence.
+    if verbosity == "allPlansExecution" {
+        exec_stats.insert("allPlansExecution", Bson::Array(vec![]));
+    }
     let server_info = doc! {
         "host": "secantus", "port": 0_i32, "version": SERVER_VERSION, "gitVersion": "0".repeat(40),
     };

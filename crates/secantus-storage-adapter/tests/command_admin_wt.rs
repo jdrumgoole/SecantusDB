@@ -323,6 +323,50 @@ fn explain_aggregate_has_cursor_stages() {
 }
 
 #[test]
+fn explain_wrapped_commands_across_verbosities() {
+    // mongo-php-library ExplainFunctionalTest wraps count/delete/update/distinct/
+    // findAndModify and asserts, per verbosity: queryPlanner always present;
+    // executionStats present except at queryPlanner; allPlansExecution present
+    // only at allPlansExecution. (explain is a dry run — it never mutates.)
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 11}, {"_id": 2, "x": 22}]},
+            c,
+        );
+        let wrapped = vec![
+            doc! {"count": "c", "query": {"x": 11}},
+            doc! {"delete": "c", "deletes": [{"q": {"x": 11}, "limit": 1}]},
+            doc! {"update": "c", "updates": [{"q": {"x": 11}, "u": {"$set": {"y": 1}}}]},
+            doc! {"distinct": "c", "key": "x"},
+            doc! {"findAndModify": "c", "query": {"x": 11}, "update": {"$set": {"y": 2}}},
+        ];
+        for inner in wrapped {
+            let qp = dispatch(
+                &doc! {"explain": inner.clone(), "verbosity": "queryPlanner"},
+                c,
+            );
+            assert_eq!(qp.get_f64("ok").unwrap(), 1.0, "{inner:?}");
+            assert!(qp.get_document("queryPlanner").is_ok(), "{inner:?}");
+            assert!(qp.get("executionStats").is_none(), "{inner:?}");
+
+            let es = dispatch(
+                &doc! {"explain": inner.clone(), "verbosity": "executionStats"},
+                c,
+            );
+            let stats = es.get_document("executionStats").unwrap();
+            assert!(stats.get("allPlansExecution").is_none(), "{inner:?}");
+
+            let ap = dispatch(
+                &doc! {"explain": inner.clone(), "verbosity": "allPlansExecution"},
+                c,
+            );
+            let stats = ap.get_document("executionStats").unwrap();
+            assert!(stats.get_array("allPlansExecution").is_ok(), "{inner:?}");
+        }
+    });
+}
+
+#[test]
 fn create_indexes_and_list() {
     with_wt(|c| {
         let reply = dispatch(
