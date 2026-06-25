@@ -167,6 +167,26 @@ fn sort_picks_first() {
 }
 
 #[test]
+fn non_document_query_is_type_mismatch() {
+    // A bare ObjectId (non-document) as the query is rejected with TypeMismatch
+    // (mongo-node-driver findOneAnd* "object ids as a query predicate" tests),
+    // not silently treated as an empty filter.
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1, "a": 1}]}, c);
+        let oid = bson::oid::ObjectId::new();
+        let r = dispatch(
+            &doc! {"findAndModify": "c", "query": oid, "remove": true},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(r.get_i32("code").unwrap(), 14);
+        assert_eq!(r.get_str("codeName").unwrap(), "TypeMismatch");
+        // The doc was not touched.
+        assert_eq!(dispatch(&doc! {"count": "c"}, c).get_i32("n").unwrap(), 1);
+    });
+}
+
+#[test]
 fn remove_and_update_together_is_failed_to_parse() {
     with_wt(|c| {
         let reply = dispatch(

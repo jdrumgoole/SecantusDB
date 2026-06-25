@@ -38,6 +38,24 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             ))
         }
     };
+    // `query` must be a document. mongod rejects a bare value (e.g. an ObjectId
+    // passed as a findOneAnd* filter) with TypeMismatch (14) rather than treating
+    // it as an empty filter — mongo-node-driver's "object ids as a query
+    // predicate" tests assert the error.
+    if let Some(q) = doc.get("query") {
+        if !matches!(q, Bson::Document(_)) {
+            let ty = secantus_core::query::bson_type_name(q);
+            return Ok(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'findAndModify.query' is the wrong type '{ty}', \
+                     expected type 'object'"
+                ),
+            )
+            .into_reply());
+        }
+    }
     let query = doc_field(doc, "query");
     let sort = doc.get("sort").and_then(Bson::as_document);
     let fields = doc.get("fields").and_then(Bson::as_document);
