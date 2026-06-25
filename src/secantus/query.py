@@ -65,11 +65,24 @@ def _match_clause(
     vars: dict[str, Any] | None,
     collation: Collation | None,
 ) -> bool:
-    if key == "$and":
-        return all(matches(doc, c, vars=vars, collation=collation) for c in condition)
-    if key == "$or":
-        return any(matches(doc, c, vars=vars, collation=collation) for c in condition)
-    if key == "$nor":
+    if key in ("$and", "$or", "$nor"):
+        # mongod requires a non-empty array of sub-documents. A non-list (or a
+        # non-document element) is a parse error — BadValue (2) — NOT an
+        # unhandled iteration crash. Without this guard ``for c in condition``
+        # raised ``TypeError: '<type>' object is not iterable`` for e.g.
+        # ``{$or: true}``, which leaked out of the QueryError catch and
+        # surfaced as a generic InternalError (1) instead of mongod's BadValue.
+        if not isinstance(condition, list):
+            raise QueryError(f"{key} must be an array")
+        if not condition:
+            raise QueryError(f"{key} must be a nonempty array")
+        for c in condition:
+            if not isinstance(c, Mapping):
+                raise QueryError(f"{key} entries need to be full objects")
+        if key == "$and":
+            return all(matches(doc, c, vars=vars, collation=collation) for c in condition)
+        if key == "$or":
+            return any(matches(doc, c, vars=vars, collation=collation) for c in condition)
         return not any(matches(doc, c, vars=vars, collation=collation) for c in condition)
     if key == "$expr":
         from secantus.expressions import evaluate

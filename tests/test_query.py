@@ -72,6 +72,22 @@ def test_and_or_nor() -> None:
     assert matches(doc, {"$nor": [{"a": 99}, {"b": 99}]})
 
 
+def test_and_or_nor_malformed_raises() -> None:
+    """``$and`` / ``$or`` / ``$nor`` require a non-empty array of sub-documents.
+    A non-list, an empty list, or a non-document element is a parse error
+    (``QueryError`` → BadValue 2 on the wire), not a Python ``TypeError`` that
+    leaks out as a generic InternalError."""
+    for op in ("$and", "$or", "$nor"):
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: True})
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: 5})
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: []})
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: [True]})
+
+
 def test_not_at_field_level() -> None:
     assert matches({"a": 5}, {"a": {"$not": {"$gt": 10}}})
     assert not matches({"a": 50}, {"a": {"$not": {"$gt": 10}}})
