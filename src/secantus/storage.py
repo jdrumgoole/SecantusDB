@@ -4434,6 +4434,21 @@ class Storage:
         for _field, _spec_val in key_spec.items():
             if _spec_val in ("text", "hashed"):
                 raise CreateIndexUnsupported(f"{_spec_val} indexes are not supported by SecantusDB")
+            # A string index-key value names an index *plugin* (the special
+            # index types). mongod recognises a fixed set — anything else is
+            # rejected at parse time with "Unknown index plugin '<value>'"
+            # (CannotCreateIndex, 67). We accept the geo plugins (2d /
+            # 2dsphere); text / hashed are caught above as out-of-scope; any
+            # other string (e.g. a typo'd ``{abc: "hallo thar"}``) is invalid.
+            # mongo-c-driver's /Collection/index_w_write_concern asserts the
+            # server rejects such a key.
+            if isinstance(_spec_val, str) and _spec_val not in (
+                "2d",
+                "2dsphere",
+                "2dsphere_bucket",
+                "geoHaystack",
+            ):
+                raise CreateIndexUnsupported(f"Unknown index plugin '{_spec_val}'")
         options = dict(options or {})
         with self._lock:
             self._ensure_collection(db, coll)

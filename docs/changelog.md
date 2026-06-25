@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### An unrecognised index-key string is rejected as an unknown plugin
+
+A string value in an index key names a special index type ("plugin") — `2d`,
+`2dsphere`, `text`, `hashed`. SecantusDB already accepted the geo plugins and
+rejected `text`/`hashed` as out-of-scope, but it let *any other* string through:
+`createIndex({abc: "hallo thar"})` silently created a broken index instead of
+erroring. It now matches mongod and rejects an unrecognised plugin name with
+`CannotCreateIndex` (67) "Unknown index plugin '<value>'".
+
+This closes the mongo-c-driver gauge's `/Collection/index_w_write_concern` test,
+which (after the 0.5.4b13 write-concern fix) was failing on its invalid-index
+assertion — it creates `{abc: "hallo thar"}` and expects the server to reject
+it. The test name is misleading; the failure had nothing to do with write
+concern.
+
+#### Fixed
+- `storage.create_index`: a string index-key value that isn't a recognised
+  plugin (`2d` / `2dsphere` / `2dsphere_bucket` / `geoHaystack`) is rejected
+  with `CannotCreateIndex` (67) "Unknown index plugin '<value>'", alongside the
+  existing `text` / `hashed` out-of-scope rejection.
+
 ### A numeric write-concern `w` above 50 is now a parse error
 
 A `writeConcern` with a numeric `w` greater than 50 (or negative) is now rejected
