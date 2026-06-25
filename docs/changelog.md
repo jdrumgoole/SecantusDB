@@ -19,6 +19,22 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### A malformed `$and` / `$or` / `$nor` is a clean parse error, not a crash
+
+`$and` / `$or` / `$nor` require a non-empty array of sub-documents. A query
+passing a non-array (`{$or: true}`), an empty array, or a non-document element
+used to crash the query engine — `for c in condition` raised a Python
+`TypeError` that escaped the parse-error handling and surfaced over the wire as
+a generic `InternalError` (1) with the traceback logged server-side. It now
+matches mongod: a `BadValue` (2) parse error ("$or must be an array" / "must be
+a nonempty array" / "entries need to be full objects"). Surfaced while triaging
+the mongo-c-driver gauge's malformed-input command-monitoring tests.
+
+#### Fixed
+- `query._match_clause`: `$and` / `$or` / `$nor` validate their argument is a
+  non-empty list of documents and raise `QueryError` (→ BadValue 2) for any
+  malformed shape, instead of letting a `TypeError` leak out as InternalError.
+
 ### An unrecognised index-key string is rejected as an unknown plugin
 
 A string value in an index key names a special index type ("plugin") — `2d`,
