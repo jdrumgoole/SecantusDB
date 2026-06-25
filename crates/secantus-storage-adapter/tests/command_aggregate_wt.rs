@@ -577,6 +577,39 @@ fn bucket_auto_chunks_by_count() {
 }
 
 #[test]
+fn redact_prunes_and_descends() {
+    // $redact with $$PRUNE/$$DESCEND prunes a high-level sub-doc, keeps the rest
+    // (mongo-cxx-driver redact/aggregation).
+    with_wt(|c| {
+        seed(
+            c,
+            "c",
+            vec![doc! {
+                "_id": 1, "level": 1,
+                "secret": {"level": 5, "data": "x"},
+                "public": {"level": 1, "data": "y"},
+            }],
+        );
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$redact": {"$cond": {
+                    "if": {"$gt": ["$level", 3]},
+                    "then": "$$PRUNE",
+                    "else": "$$DESCEND"
+                }}}
+            ], "cursor": {}},
+            c,
+        );
+        let out = docs_of(&r);
+        assert_eq!(out.len(), 1);
+        // secret (level 5) pruned; public (level 1) kept; scalars retained.
+        assert!(out[0].get("secret").is_none());
+        assert!(out[0].get_document("public").is_ok());
+        assert_eq!(out[0].get_i32("level").unwrap(), 1);
+    });
+}
+
+#[test]
 fn aggregate_batches_into_cursor() {
     with_wt(|c| {
         seed(c, "c", (0..5).map(|i| doc! {"_id": i}).collect());

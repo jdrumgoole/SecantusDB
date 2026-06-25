@@ -118,9 +118,13 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
         v.clone()
     } else if base == "ROOT" || base == "CURRENT" {
         Bson::Document(ctx.doc.clone())
+    } else if matches!(base, "KEEP" | "PRUNE" | "DESCEND") {
+        // $redact sentinels: the evaluator returns the `"$$NAME"` string so the
+        // `$redact` stage can dispatch on equality (mirrors `expressions`).
+        Bson::String(format!("$${base}"))
     } else {
-        // $$REMOVE / $$KEEP / $$PRUNE / $$DESCEND sentinels (tied to unported
-        // $setField/$redact), and undefined vars (Python raises) -> Python.
+        // $$REMOVE (tied to unported $setField/$project-remove) and undefined
+        // vars (Python raises) -> Python.
         return Err(Fallback);
     };
     match rest {

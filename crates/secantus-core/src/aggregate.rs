@@ -125,6 +125,7 @@ fn apply_stage(
         "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$bucket" => group::bucket_stage(spec, &docs, vars).map_err(|_| Fallback),
         "$bucketAuto" => group::bucket_auto_stage(spec, &docs, vars).map_err(|_| Fallback),
+        "$redact" => redact_stage(spec, docs, vars),
         "$facet" => facet_stage(spec, docs, vars, coll),
         "$densify" => densify::densify_stage(spec, &docs).map_err(|_| Fallback),
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
@@ -134,6 +135,65 @@ fn apply_stage(
 
 /// `$facet` — run each named sub-pipeline over a copy of the same input docs and
 /// collect the results into one output doc. Defers if any sub-pipeline defers.
+/// `$redact` — content-based, recursive document / sub-document pruning. The
+/// expression is evaluated against each (sub-)document and must return one of the
+/// sentinels `$$KEEP` (include as-is, no recursion), `$$PRUNE` (drop it), or
+/// `$$DESCEND` (recurse into nested docs / arrays-of-docs). Mirrors
+/// `aggregate._stage_redact`; a missing/empty expression or a non-sentinel result
+/// defers (Python raises).
+fn redact_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Document>> {
+    if matches!(spec, Bson::Document(d) if d.is_empty()) {
+        return Err(Fallback);
+    }
+    let mut out = Vec::with_capacity(docs.len());
+    for doc in docs {
+        if let Some(r) = redact_subdoc(&doc, spec, vars)? {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+fn redact_subdoc(doc: &Document, spec: &Bson, vars: &Document) -> R<Option<Document>> {
+    match evaluate(spec, doc, vars)?.as_str() {
+        Some("$$KEEP") => Ok(Some(doc.clone())),
+        Some("$$PRUNE") => Ok(None),
+        Some("$$DESCEND") => Ok(Some(redact_descend(doc, spec, vars)?)),
+        _ => Err(Fallback), // non-sentinel result -> Python raises
+    }
+}
+
+fn redact_descend(doc: &Document, spec: &Bson, vars: &Document) -> R<Document> {
+    let mut out = Document::new();
+    for (k, v) in doc {
+        match v {
+            Bson::Document(sub) => {
+                if let Some(r) = redact_subdoc(sub, spec, vars)? {
+                    out.insert(k, r);
+                }
+            }
+            Bson::Array(arr) => {
+                let mut new_list = Vec::with_capacity(arr.len());
+                for elem in arr {
+                    match elem {
+                        Bson::Document(sub) => {
+                            if let Some(r) = redact_subdoc(sub, spec, vars)? {
+                                new_list.push(Bson::Document(r));
+                            }
+                        }
+                        other => new_list.push(other.clone()),
+                    }
+                }
+                out.insert(k, Bson::Array(new_list));
+            }
+            other => {
+                out.insert(k, other.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn facet_stage(
     spec: &Bson,
     mut docs: Vec<Document>,

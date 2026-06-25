@@ -147,6 +147,9 @@ CURATED = [
             }
         }
     ],
+    # $redact — descend, pruning a nested sub-doc by content ($$PRUNE/$$DESCEND).
+    [{"$redact": {"$cond": {"if": {"$eq": ["$k", 9]}, "then": "$$PRUNE", "else": "$$DESCEND"}}}],
+    [{"$redact": "$$KEEP"}],
     # $facet — multiple sub-pipelines over the same input
     [
         {
