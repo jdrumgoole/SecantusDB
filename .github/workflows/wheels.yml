@@ -15,6 +15,14 @@ on:
       - 'docs/**'
   workflow_dispatch:  # Manual ad-hoc trigger.
 
+# Keyed on the ref so each branch / PR is its own lane: a newer push to the same
+# ref cancels that ref's stale build, but distinct refs never cancel each other.
+# (Several sessions pushing the same ref — e.g. main — still collide; the project
+# convention is one feature branch per session, merged via PR.)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build_wheels:
     name: Build ${{ matrix.platform }} wheels
