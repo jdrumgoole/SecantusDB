@@ -19,6 +19,30 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$currentOp` now reports each connection's driver metadata
+
+The `$currentOp` aggregation stage now surfaces the connecting driver's
+handshake metadata — the full `clientMetadata` document (driver name/version,
+OS, application name) plus a top-level `appName` — on its self-row, matching
+real `mongod`. Previously only the `currentOp` *command* echoed this back; the
+aggregation form (`db.aggregate([{$currentOp: {}}])`) returned a bare stub, so a
+client couldn't find its own operation by `appName` or read back the metadata it
+sent on connect.
+
+This was the last real divergence the mongo-cxx-driver gauge's "integration
+tests for client metadata handshake feature" exercised — it connects with
+`?appName=xyz`, scans `$currentOp` for the matching op, and verifies its
+`clientMetadata.{application,driver,os}`. With this and the 0.5.4b11
+resume-token fix, the cxx gauge's remaining real failures are closed.
+
+#### Fixed
+- `aggregate._stage_current_op`: the `$currentOp` self-row now carries
+  `clientMetadata` (the connection's `hello.client` subdoc) and a top-level
+  `appName` lifted from `application.name`, threaded in via a new
+  `PipelineContext.client_metadata` field that the `aggregate` command handler
+  populates from the connection registry. The `currentOp` command already did
+  this; the aggregation stage now matches.
+
 ### Change-stream resume tokens now advance per event, even at batchSize 1
 
 A change stream's `postBatchResumeToken` now tracks the resume token of the

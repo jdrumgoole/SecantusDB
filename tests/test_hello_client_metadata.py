@@ -62,6 +62,27 @@ def test_current_op_surfaces_client_metadata(client) -> None:
     assert meta.get("application", {}).get("name") == "meta-app"
 
 
+def test_aggregation_currentop_surfaces_appname_and_metadata(client) -> None:
+    """The ``$currentOp`` aggregation stage (not just the ``currentOp``
+    command) surfaces the connection's ``clientMetadata`` document plus a
+    top-level ``appName``.
+
+    Mirrors mongo-cxx-driver's "integration tests for client metadata
+    handshake feature", which connects with ``?appName=...`` and scans
+    ``db.aggregate([{$currentOp: {}}])`` for an op whose ``appName`` matches,
+    then asserts its ``clientMetadata.{application,driver,os}``."""
+    ops = list(client["admin"].aggregate([{"$currentOp": {}}]))
+    assert ops, "$currentOp returned no ops"
+    self_op = next((op for op in ops if op.get("appName") == "meta-app"), None)
+    assert self_op is not None, f"no op with appName=meta-app: {ops}"
+    meta = self_op.get("clientMetadata")
+    assert isinstance(meta, dict)
+    assert meta.get("application", {}).get("name") == "meta-app"
+    assert meta["driver"]["name"].startswith("PyMongo")
+    assert isinstance(meta["driver"]["version"], str)
+    assert "os" in meta and "type" in meta["os"]
+
+
 def test_currentop_without_hello_has_no_metadata(server) -> None:
     """A connection that hasn't sent ``hello`` shouldn't have
     ``clientMetadata`` in its currentOp entry. The default pymongo

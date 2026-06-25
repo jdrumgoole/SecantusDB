@@ -3976,6 +3976,10 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     else:
         docs = []
         ns = f"{ctx.db_name}.$cmd.aggregate"
+    # The current connection's hello.client handshake metadata, so a
+    # ``$currentOp`` stage can surface ``clientMetadata`` + ``appName`` on its
+    # self-row (mongocxx's "client metadata handshake feature" test).
+    conn_info = ctx.connections.get(ctx.connection_id) if ctx.connections is not None else None
     pipeline_ctx = PipelineContext(
         storage=ctx.storage,
         db_name=ctx.db_name,
@@ -3984,6 +3988,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         collation=collation,
         command_doc=dict(doc),
         bypass_validation=bool(doc.get("bypassDocumentValidation", False)),
+        client_metadata=conn_info.client_metadata if conn_info is not None else None,
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)

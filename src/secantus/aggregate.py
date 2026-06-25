@@ -54,6 +54,13 @@ class PipelineContext:
     # driver's ``aggregate/bypass_document_validation`` test sets a
     # ``{number: {$gte: 5}}`` validator and expects the cursor to error.
     bypass_validation: bool = False
+    # The current connection's ``hello.client`` handshake subdoc (driver
+    # name/version, OS, application name). Surfaced by ``$currentOp`` as the
+    # ``clientMetadata`` document + the top-level ``appName`` on the self-row,
+    # which mongocxx's "client metadata handshake feature" test reads back via
+    # ``db.aggregate([{$currentOp: {}}])``. Set by the aggregate command handler
+    # from the connection registry; ``None`` for non-connection callers.
+    client_metadata: dict[str, Any] | None = None
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
@@ -65,6 +72,7 @@ class PipelineContext:
             collation=self.collation,
             command_doc=self.command_doc,
             bypass_validation=self.bypass_validation,
+            client_metadata=self.client_metadata,
         )
 
 
@@ -1520,18 +1528,29 @@ def _stage_current_op(
         command_doc.setdefault("cursor", {})
     else:
         command_doc = {"aggregate": 1}
-    return [
-        {
-            "type": "op",
-            "host": "secantus",
-            "desc": "$currentOp",
-            "active": False,
-            "currentOpTime": "",
-            "command": command_doc,
-            "ns": _ctx.db_name + "." + (_ctx.coll_name or "$cmd.aggregate"),
-            "op": "command",
-        }
-    ]
+    entry: dict[str, Any] = {
+        "type": "op",
+        "host": "secantus",
+        "desc": "$currentOp",
+        "active": False,
+        "currentOpTime": "",
+        "command": command_doc,
+        "ns": _ctx.db_name + "." + (_ctx.coll_name or "$cmd.aggregate"),
+        "op": "command",
+    }
+    # Surface the connection's driver handshake metadata, like mongod's
+    # ``$currentOp``: the full ``clientMetadata`` document plus the top-level
+    # ``appName`` lifted from ``application.name``. mongocxx's "client metadata
+    # handshake feature" test connects with ``?appName=xyz`` and scans
+    # ``db.aggregate([{$currentOp: {}}])`` for an op whose ``appName`` matches,
+    # then verifies its ``clientMetadata.{application,driver,os}``.
+    meta = _ctx.client_metadata
+    if isinstance(meta, Mapping):
+        entry["clientMetadata"] = dict(meta)
+        application = meta.get("application")
+        if isinstance(application, Mapping) and application.get("name"):
+            entry["appName"] = application["name"]
+    return [entry]
 
 
 def _stage_bucket_auto(
