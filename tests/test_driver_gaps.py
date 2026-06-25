@@ -199,3 +199,24 @@ def test_getmore_errors_after_collection_dropped(db) -> None:
     with pytest.raises(OperationFailure) as exc:
         list(cur)
     assert exc.value.code == 43
+
+
+# --- an unrecognised string index-key value is rejected (mongo-c-driver) ----
+
+
+def test_unknown_index_plugin_rejected(db) -> None:
+    """A string index-key value names an index plugin; an unrecognised one is
+    rejected with CannotCreateIndex (67) "Unknown index plugin '<value>'", like
+    mongod. mongo-c-driver's /Collection/index_w_write_concern creates an index
+    ``{abc: "hallo thar"}`` and asserts the server rejects it."""
+    with pytest.raises(OperationFailure) as exc:
+        db.command(
+            "createIndexes",
+            "c",
+            indexes=[{"key": {"abc": "hallo thar"}, "name": "abc_bad"}],
+        )
+    assert exc.value.code == 67
+    assert "Unknown index plugin" in str(exc.value)
+    # The valid geo plugins and numeric directions are still accepted.
+    db.command("createIndexes", "c", indexes=[{"key": {"loc": "2dsphere"}, "name": "loc_2d"}])
+    db.command("createIndexes", "c", indexes=[{"key": {"n": -1}, "name": "n_-1"}])
