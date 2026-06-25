@@ -159,6 +159,53 @@ def rust_adapter_test(c: Context) -> None:
     c.run(f"cd {_RUST_ADAPTER_DIR} && cargo test", pty=True, env=env)
 
 
+@task(name="rust-test-one")
+def rust_test_one(
+    c: Context,
+    crate: str = "secantus-storage-adapter",
+    test: str = "",
+    name: str = "",
+    nocapture: bool = False,
+) -> None:
+    """Run a single Rust test in a WiredTiger-linked crate (no fmt/clippy).
+
+    The fast inner loop for iterating on one test. ``--crate`` is the dir under
+    ``crates/`` (default the adapter crate, where the command-layer integration
+    tests live); ``--test`` selects one integration-test binary (the file stem
+    under that crate's ``tests/``); ``--name`` filters by test name; ``--nocapture``
+    shows stdout / ``eprintln!``. WiredTiger / libclang prerequisites are the same
+    as ``rust-wt-test`` (auto-filled when unset).
+
+    Examples::
+
+        inv rust-test-one --test command_crud_wt --name update_bit_operator
+        inv rust-test-one --crate secantus-storage --test natural_order --nocapture
+    """
+    cmd = f"cd crates/{shlex.quote(crate)} && cargo test"
+    if test:
+        cmd += f" --test {shlex.quote(test)}"
+    if name:
+        cmd += f" {shlex.quote(name)}"
+    if nocapture:
+        cmd += " -- --nocapture"
+    c.run(cmd, pty=True, env=_rust_env())
+
+
+@task(name="rust-fmt")
+def rust_fmt(c: Context) -> None:
+    """`cargo fmt` the clean workspace + the WiredTiger-linked crates.
+
+    The WT-linked crates (``-wt`` / ``-storage`` / ``-storage-adapter``) are
+    excluded from the ``crates`` workspace, so a single workspace ``cargo fmt``
+    doesn't reach them — format each separately. WiredTiger / libclang
+    prerequisites as ``rust-wt-test`` (auto-filled).
+    """
+    env = _rust_env()
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt", pty=True, env=env)
+    for d in (_RUST_WT_DIR, _RUST_STORAGE_DIR, _RUST_ADAPTER_DIR):
+        c.run(f"cd {d} && cargo fmt", pty=True, env=env)
+
+
 @task(name="rust-storage-py")
 def rust_storage_py(c: Context) -> None:
     """Build the _secantus_storage extension and run its Python smoke test.
@@ -260,21 +307,27 @@ def rust_stress(c: Context, workers: int = 16, iters: int = 5) -> None:
 
 
 @task(name="rust-bump")
-def rust_bump(c: Context, to: str) -> None:
-    """Bump every Rust crate (Cargo.toml + Cargo.lock) to ``--to`` in lockstep.
+def rust_bump(c: Context, to: str = "") -> None:
+    """Bump every Rust crate (Cargo.toml + Cargo.lock) in lockstep.
 
-    Pass the full new version, e.g. ``invoke rust-bump --to 0.5.3-beta.46``.
-    All Rust crates carry the same version (the WT-linked crates can't inherit a
+    With no ``--to``, increments the beta pre-release
+    (``0.5.3-beta.N`` → ``0.5.3-beta.(N+1)``) — the common per-slice bump. Pass
+    ``--to`` for an explicit version, e.g. ``invoke rust-bump --to 0.5.4-beta.0``
+    after a patch bump (which resets the beta label to 0 per CLAUDE.md). All Rust
+    crates carry the same version (the WT-linked crates can't inherit a
     ``workspace.package`` version), so they're rewritten together. Reads the
-    current version from ``secantus-core/Cargo.toml``. Remember: bumping the
-    patch/minor/major component resets the beta label to 0
-    (``0.5.3-beta.46`` → ``0.5.4-beta.0``).
+    current version from ``secantus-core/Cargo.toml``.
     """
     core = pathlib.Path("crates/secantus-core/Cargo.toml")
     m = re.search(r'^version = "([^"]+)"', core.read_text(), re.M)
     if not m:
         raise SystemExit("could not read current version from secantus-core/Cargo.toml")
     old = m.group(1)
+    if not to:
+        bm = re.match(r"^(.*-beta\.)(\d+)$", old)
+        if not bm:
+            raise SystemExit(f"current version {old!r} is not '-beta.N'; pass --to=<version>")
+        to = f"{bm.group(1)}{int(bm.group(2)) + 1}"
     if old == to:
         print(f"already at {to}")
         return
