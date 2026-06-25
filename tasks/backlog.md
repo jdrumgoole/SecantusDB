@@ -1214,13 +1214,21 @@ When you close a bucket, delete it.
   `Index::View#create_one`) and php-lib `WatchFunctionalTest::testSessionFreed` (×1,
   `resumeCallable` unset on invalidate via reflection). Same class as the deferred
   change-stream session items — driver-internal session lifecycle, not a wire divergence.
-- [ ] **go `TestChangeStream_ReplicaSet/try_next/one_getMore_sent` (3 entries, 1 test) — confirm flake-vs-real.**
-  Historically logged as the load-induced flake (§5). But in this same-day run **Python
-  passed go with 0 failures under the identical `--jobs 4` load while Rust failed 3** — if
-  it were pure host saturation Python would flake too. So this may be a real Rust-side
-  change-stream `getMore`/awaitData timing issue. **Next step: run `validate-go --server
-  rust` alone** — if it reproduces isolated, it's a genuine bug (change-stream correctness
-  is load-bearing); if it's clean alone, it's the documented flake.
+- [ ] **go `TestChangeStream_ReplicaSet/try_next/one getMore sent` (3 entries, 1 test) — CONFIRMED real Rust bug (2026-06-25).**
+  Reproduces with `validate-go --server rust` run **alone** (398/3, isolated, no other
+  gauge) — so it is *not* the host-saturation flake. (Go's internal `t.Parallel()` test
+  funcs still run concurrently and write the shared `TestDB` namespace even when go is the
+  only gauge — the §5 harness behaviour — but that is identical for both servers.) The
+  decisive fact: **Python passes this test under the same harness; Rust fails it.** The
+  failing assertion is `TryNext returned true on iteration N` in the "one getMore sent"
+  subtest — i.e. a collection-scoped `Watch` on an (otherwise) empty stream surfaces a
+  change event it shouldn't. §5 verified the *Python* collection-scoped `_ns_filter` is
+  leak-free (0 cross-collection events in direct stress). **Prime suspect: the Rust
+  change-stream namespace/scope filter surfaces sibling-collection (or same-DB) events
+  that Python's excludes** — secondary suspect an off-by-one in the default start position
+  (`oplog_tail_seq()`, events read strictly after it). Next diagnostic: a focused direct
+  repro against the Rust server — collection-scoped watch on `db.A` while writing `db.A2`
+  / `db.B` (mirror the §5 Python stress) — to localise scope-leak vs start-position.
 
 ---
 
