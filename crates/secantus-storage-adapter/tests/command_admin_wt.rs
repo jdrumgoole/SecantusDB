@@ -80,6 +80,36 @@ fn create_index_numeric_direction_is_idempotent() {
 }
 
 #[test]
+fn create_compound_geo_scalar_index() {
+    // mongod accepts a compound 2dsphere+scalar index ({g:"2dsphere", z:1}); it is
+    // indexed geo-only (the trailing scalar is ignored at index time, verified
+    // post-fetch), the derived name is g_2dsphere_z_1, and inserting a geo doc
+    // maintains the index cleanly (mongo-php-library CreateIndexesFunctionalTest).
+    with_wt(|c| {
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"g": "2dsphere", "z": 1}}]},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0, "{r:?}");
+        assert!(index_names(c, "c").contains(&"g_2dsphere_z_1".to_string()));
+        // A 2d compound index is likewise accepted.
+        let r2d = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"p": "2d", "z": 1}}]},
+            c,
+        );
+        assert_eq!(r2d.get_f64("ok").unwrap(), 1.0, "{r2d:?}");
+        // Inserting a doc with a geo value maintains the compound geo index.
+        let ins = dispatch(
+            &doc! {"insert": "c", "documents": [
+                {"_id": 1, "g": {"type": "Point", "coordinates": [1.0, 2.0]}, "p": [1.0, 2.0], "z": 5}
+            ]},
+            c,
+        );
+        assert_eq!(ins.get_f64("ok").unwrap(), 1.0, "{ins:?}");
+    });
+}
+
+#[test]
 fn list_indexes_honours_cursor_batch_size() {
     with_wt(|c| {
         dispatch(&doc! {"create": "c"}, c);
