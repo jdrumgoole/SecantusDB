@@ -729,19 +729,20 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
     let Bson::Array(required) = required else {
         return Err(Fallback); // Python raises QueryError on a non-array $all
     };
-    if required
-        .iter()
-        .any(|r| matches!(r, Bson::RegularExpression(_)))
-    {
-        return Err(Fallback);
-    }
+    // A regex element matches array elements as a *pattern* (not by equality),
+    // mirroring `query._op_all`; a non-regex element matches by `py_eq`. A regex
+    // the engine can't compile still defers via `op_regex`.
     for v in values {
         let Some(Bson::Array(arr)) = v else { continue };
         let mut all_present = true;
         for r in required {
             let mut found = false;
             for e in arr {
-                if expressions::py_eq(e, r).map_err(|_| Fallback)? {
+                let matched = match r {
+                    Bson::RegularExpression(_) => op_regex(&[Some(e)], r, None)?,
+                    _ => expressions::py_eq(e, r).map_err(|_| Fallback)?,
+                };
+                if matched {
                     found = true;
                     break;
                 }

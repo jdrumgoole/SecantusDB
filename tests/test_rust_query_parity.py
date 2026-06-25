@@ -140,6 +140,9 @@ CURATED = [
     ({"f": Code("function () {}")}, {"f": Code("function () {}")}),
     ({"f": Code("function () {}")}, {"f": Code("other")}),
     ({"f": Code("c", {"a": 55})}, {"f": Code("c", {"a": 55})}),
+    # $all with regex elements matches array elements as patterns.
+    ({"k": ["serialization", "test", "x"]}, {"k": {"$all": [Regex("ser"), Regex("test")]}}),
+    ({"k": ["abc", "def"]}, {"k": {"$all": [Regex("zzz")]}}),
     # Embedded-document equality is order-sensitive + exact (Rust defers
     # on Document/Array expected values; Python is the oracle).
     ({"s": {"h": 14, "w": 21}}, {"s": {"h": 14, "w": 21}}),

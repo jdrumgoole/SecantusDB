@@ -199,6 +199,54 @@ fn find_mixed_projection_is_rejected() {
 }
 
 #[test]
+fn find_all_with_regex_elements() {
+    // $all with regex elements matches array elements as patterns
+    // (mongo-node-driver "Find should correctly find documents by regExp").
+    with_wt(|c| {
+        seed(
+            c,
+            vec![doc! {"_id": 1, "keywords": [
+                "test", "segmentation", "fault", "regex", "serialization", "native"
+            ]}],
+        );
+        let re = |p: &str| {
+            bson::Bson::RegularExpression(bson::Regex {
+                pattern: p.into(),
+                options: String::new(),
+            })
+        };
+        let r = dispatch(
+            &doc! {"find": "c", "filter": {"keywords": {"$all": [
+                re("ser"), re("test"), re("seg"), re("fault"), re("nat")
+            ]}}},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(
+            r.get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap()
+                .len(),
+            1
+        );
+        // A regex that matches nothing → no result.
+        let r = dispatch(
+            &doc! {"find": "c", "filter": {"keywords": {"$all": [re("zzz")]}}},
+            c,
+        );
+        assert_eq!(
+            r.get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap()
+                .len(),
+            0
+        );
+    });
+}
+
+#[test]
 fn find_filter_matches_subset() {
     with_wt(|c| {
         seed(
