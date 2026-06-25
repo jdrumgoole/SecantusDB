@@ -1214,21 +1214,30 @@ When you close a bucket, delete it.
   `Index::View#create_one`) and php-lib `WatchFunctionalTest::testSessionFreed` (×1,
   `resumeCallable` unset on invalidate via reflection). Same class as the deferred
   change-stream session items — driver-internal session lifecycle, not a wire divergence.
-- [ ] **go `TestChangeStream_ReplicaSet/try_next/one getMore sent` (3 entries, 1 test) — CONFIRMED real Rust bug (2026-06-25).**
-  Reproduces with `validate-go --server rust` run **alone** (398/3, isolated, no other
-  gauge) — so it is *not* the host-saturation flake. (Go's internal `t.Parallel()` test
-  funcs still run concurrently and write the shared `TestDB` namespace even when go is the
-  only gauge — the §5 harness behaviour — but that is identical for both servers.) The
-  decisive fact: **Python passes this test under the same harness; Rust fails it.** The
-  failing assertion is `TryNext returned true on iteration N` in the "one getMore sent"
-  subtest — i.e. a collection-scoped `Watch` on an (otherwise) empty stream surfaces a
-  change event it shouldn't. §5 verified the *Python* collection-scoped `_ns_filter` is
-  leak-free (0 cross-collection events in direct stress). **Prime suspect: the Rust
-  change-stream namespace/scope filter surfaces sibling-collection (or same-DB) events
-  that Python's excludes** — secondary suspect an off-by-one in the default start position
-  (`oplog_tail_seq()`, events read strictly after it). Next diagnostic: a focused direct
-  repro against the Rust server — collection-scoped watch on `db.A` while writing `db.A2`
-  / `db.B` (mirror the §5 Python stress) — to localise scope-leak vs start-position.
+- **go `TestChangeStream_ReplicaSet/try_next/one getMore sent` (3 entries, 1 test) — NOT a server bug; §5 harness race (verdict 2026-06-26).**
+  The Rust change-stream behaviour was verified **correct** by two direct probes, so the
+  earlier "confirmed real Rust bug / scope-leak" escalation was wrong and is retracted:
+  (1) a pymongo repro against the standalone `secantusdb` binary (`/tmp/cs_repro.py`) —
+  collection-scoped watch on an empty collection returns `try_next()==None` (start
+  position correct), writes to a sibling collection / other DB do **not** surface (no
+  scope leak), and an own-collection write **does** surface (control); (2) the exact go
+  test run **in isolation** (`go test -run TestChangeStream_ReplicaSet/try_next
+  -count=10` against the rust binary) passes **10/10**. The full-suite failure is the
+  documented §5 artifact: other `t.Parallel()` top-level tests write the shared `TestDB`
+  namespace (with collection-name-truncation collisions) during the `try_next` await
+  window, and that genuinely-same-namespace write *correctly* wakes the stream — the test
+  only assumes an empty stream because the shared-daemon gauge doesn't give it the
+  per-test namespace isolation real `mongod`s would. Rust appears more susceptible than
+  Python in the full suite (getMore/await response timing makes it catch the concurrent
+  write more often — Python passed the same-day run, Rust failed), but that's scheduling
+  sensitivity to a harness race, not a wire/correctness divergence. No fix on the
+  SecantusDB side without editing the vendored submodule (forbidden). Accepted, same as
+  the Python-server verdict in §5.
+  - [ ] *Minor, separate:* the `secantusdb` binary doesn't accept `--noop-heartbeat-seconds`
+    (stripped by `gauge_common._PYTHON_ONLY_FLAGS` for the Rust server), so the go gauge
+    runs Rust without periodic noop heartbeats. Not the cause here (the `resume_token_
+    updated_on_empty_batch` test that needs it is in the skip list), but worth adding the
+    flag to the binary for gauge parity.
 
 ---
 
