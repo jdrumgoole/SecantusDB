@@ -487,6 +487,18 @@ fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
             _ => Ok(false),
         };
     }
+    // Symbol / JS-Code (with or without scope) match by value — mongod compares
+    // them directly (mongo-node-driver's "handles BSON type inserts" queries on
+    // a Symbol / Code value). Cross-type (Symbol vs String) and ordering keep
+    // deferring via the `is_exotic` checks below / in the comparison path.
+    match (v, expected) {
+        (Bson::Symbol(a), Bson::Symbol(b)) => return Ok(a == b),
+        (Bson::JavaScriptCode(a), Bson::JavaScriptCode(b)) => return Ok(a == b),
+        (Bson::JavaScriptCodeWithScope(a), Bson::JavaScriptCodeWithScope(b)) => {
+            return Ok(a.code == b.code && a.scope == b.scope)
+        }
+        _ => {}
+    }
     // Regex / exotic expected -> special semantics we don't reproduce: defer.
     if matches!(expected, Bson::RegularExpression(_)) || is_exotic(expected) {
         return Err(Fallback);

@@ -27,6 +27,7 @@ import types
 import bson
 import pytest
 from bson import Decimal128, Int64, ObjectId, Regex
+from bson.code import Code
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -135,6 +136,10 @@ CURATED = [
     ({"a": {"b": {"c": 5}}}, {"a.b.c": 5}),
     ({"a": {"b": {"c": 5}}}, {"a.b.c": 6}),
     ({"tags": ["red", "blue", "green"]}, {"tags": "red"}),
+    # JS-Code equality — Rust now matches by value, like Python.
+    ({"f": Code("function () {}")}, {"f": Code("function () {}")}),
+    ({"f": Code("function () {}")}, {"f": Code("other")}),
+    ({"f": Code("c", {"a": 55})}, {"f": Code("c", {"a": 55})}),
     # Embedded-document equality is order-sensitive + exact (Rust defers
     # on Document/Array expected values; Python is the oracle).
     ({"s": {"h": 14, "w": 21}}, {"s": {"h": 14, "w": 21}}),

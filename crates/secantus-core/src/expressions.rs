@@ -1765,6 +1765,17 @@ fn op_array_to_object(arg: &Bson, ctx: &Ctx) -> R {
 /// by type, arrays/docs structurally. `Err(Fallback)` for Decimal128
 /// (uncertain) and exotic types.
 pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
+    // Symbol / JS-Code (with or without scope) compare by value — used by the
+    // oplog update-diff to detect a changed Code/Symbol field, and by `$eq`.
+    // Cross-type and other exotic values (DbPointer / Undefined) still defer.
+    match (a, b) {
+        (Bson::Symbol(x), Bson::Symbol(y)) => return Ok(x == y),
+        (Bson::JavaScriptCode(x), Bson::JavaScriptCode(y)) => return Ok(x == y),
+        (Bson::JavaScriptCodeWithScope(x), Bson::JavaScriptCodeWithScope(y)) => {
+            return Ok(x.code == y.code && x.scope == y.scope)
+        }
+        _ => {}
+    }
     if matches!(a, Bson::Decimal128(_))
         || matches!(b, Bson::Decimal128(_))
         || is_exotic(a)

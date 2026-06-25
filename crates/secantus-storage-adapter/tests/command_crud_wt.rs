@@ -296,6 +296,76 @@ fn find_returns_insertion_order_for_mixed_id_types() {
 }
 
 #[test]
+fn find_on_symbol_and_code_values() {
+    // Equality queries on Symbol / JS-Code (with scope) values — mongo-node-driver
+    // "handles BSON type inserts".
+    with_wt(|c| {
+        let code = Bson::JavaScriptCodeWithScope(bson::JavaScriptCodeWithScope {
+            code: "function () {}".into(),
+            scope: doc! {"a": 55},
+        });
+        dispatch(
+            &doc! {"insert": "c", "documents": [{
+                "_id": 1,
+                "symbol": Bson::Symbol("abcdefghijkl".into()),
+                "code": code.clone(),
+                "minkey": Bson::MinKey,
+                "maxkey": Bson::MaxKey,
+            }]},
+            c,
+        );
+        for filter in [
+            doc! {"symbol": Bson::Symbol("abcdefghijkl".into())},
+            doc! {"code": code.clone()},
+            doc! {"minkey": Bson::MinKey},
+            doc! {"maxkey": Bson::MaxKey},
+        ] {
+            let r = dispatch(&doc! {"find": "c", "filter": filter.clone()}, c);
+            assert_eq!(r.get_f64("ok").unwrap(), 1.0, "{filter:?}");
+            assert_eq!(
+                r.get_document("cursor")
+                    .unwrap()
+                    .get_array("firstBatch")
+                    .unwrap()
+                    .len(),
+                1,
+                "{filter:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn update_set_code_value() {
+    // Insert + $set a JS-Code value — mongo-node-driver "function serialization".
+    with_wt(|c| {
+        let f1 = Bson::JavaScriptCode("function (x){return x;}".into());
+        let f2 = Bson::JavaScriptCode("function (y){return y;}".into());
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1, "a": 1, "f": f1}]},
+            c,
+        );
+        let r = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"a": 1}, "u": {"$set": {"f": f2.clone()}}}]},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0, "update reply: {r:?}");
+        assert_eq!(r.get_i32("nModified").unwrap(), 1);
+        let found = dispatch(&doc! {"find": "c"}, c);
+        let f = found
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .get("f")
+            .cloned();
+        assert_eq!(f, Some(f2));
+    });
+}
+
+#[test]
 fn data_command_without_storage_is_internal_error() {
     let mut c = CommandContext::new(1); // no storage attached
     let reply = dispatch(&doc! {"count": "c"}, &mut c);
