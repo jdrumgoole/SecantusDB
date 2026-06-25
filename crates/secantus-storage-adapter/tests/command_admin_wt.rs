@@ -43,6 +43,43 @@ fn index_names(c: &mut CommandContext, coll: &str) -> Vec<String> {
 }
 
 #[test]
+fn create_index_numeric_direction_is_idempotent() {
+    // mongocxx's GridFS pre-creates its indexes with Double directions
+    // ({filename: 1.0}); re-creating the same name with Int directions ({...: 1})
+    // must be a no-op, not an IndexKeySpecsConflict (mongo-cxx-driver "gridfs does
+    // not create additional indexes").
+    with_wt(|c| {
+        let pre = dispatch(
+            &doc! {"createIndexes": "fs.files", "indexes": [
+                {"key": {"filename": 1.0, "uploadDate": 1.0}, "name": "filename_1_uploadDate_1"}
+            ]},
+            c,
+        );
+        assert_eq!(pre.get_f64("ok").unwrap(), 1.0, "{pre:?}");
+        // Same name + numerically-equal Int directions → no-op success.
+        let r = dispatch(
+            &doc! {"createIndexes": "fs.files", "indexes": [
+                {"key": {"filename": 1, "uploadDate": 1}, "name": "filename_1_uploadDate_1"}
+            ]},
+            c,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0, "{r:?}");
+        assert_eq!(r.get_str("note").unwrap(), "all indexes already exist");
+        // Exactly _id_ + the one index — no additional index created.
+        assert_eq!(index_names(c, "fs.files").len(), 2);
+        // A genuinely different direction ({filename: -1}) still conflicts (86).
+        let conflict = dispatch(
+            &doc! {"createIndexes": "fs.files", "indexes": [
+                {"key": {"filename": -1, "uploadDate": 1}, "name": "filename_1_uploadDate_1"}
+            ]},
+            c,
+        );
+        assert_eq!(conflict.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(conflict.get_i32("code").unwrap(), 86);
+    });
+}
+
+#[test]
 fn list_indexes_honours_cursor_batch_size() {
     with_wt(|c| {
         dispatch(&doc! {"create": "c"}, c);

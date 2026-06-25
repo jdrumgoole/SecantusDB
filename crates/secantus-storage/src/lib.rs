@@ -691,6 +691,22 @@ fn direction_of(v: &Bson) -> Option<i32> {
     }
 }
 
+/// Whether two index key specs name the *same* index. Field names and order must
+/// match exactly (mongod treats `{a:1,b:1}` and `{b:1,a:1}` as distinct), but
+/// numeric direction values compare numerically — `{a: 1}` and `{a: 1.0}` are the
+/// same index (drivers such as mongocxx's GridFS create indexes with `1.0`).
+/// Non-numeric directions (geo type strings like `"2dsphere"`) compare exactly.
+fn index_keys_equiv(a: &Document, b: &Document) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|((ak, av), (bk, bv))| {
+            ak == bk
+                && match (direction_of(av), direction_of(bv)) {
+                    (Some(da), Some(db)) => da == db,
+                    _ => av == bv,
+                }
+        })
+}
+
 /// Direction-aware sort-key encoding for one value (defers to Python on the
 /// constructs the Rust encoder can't reproduce).
 fn enc_dir(v: &Bson, direction: i32) -> Result<Vec<u8>> {
@@ -3353,9 +3369,7 @@ impl Storage {
                 // Order-sensitive: mongod treats {a:1,b:1} and {b:1,a:1} as
                 // distinct indexes, so compare the ordered field lists.
                 let existing_key = existing.get_document("key").ok();
-                let same_key = existing_key
-                    .map(|k| k.iter().collect::<Vec<_>>() == key_spec.iter().collect::<Vec<_>>())
-                    .unwrap_or(false);
+                let same_key = existing_key.is_some_and(|k| index_keys_equiv(k, key_spec));
                 if !same_key {
                     return Err(StorageError::IndexKeySpecsConflict(format!(
                         "An existing index has the same name as the requested index. \
