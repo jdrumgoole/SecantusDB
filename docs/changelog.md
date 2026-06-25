@@ -19,7 +19,30 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-### `$currentOp` now reports each connection's driver metadata
+### A numeric write-concern `w` above 50 is now a parse error
+
+A `writeConcern` with a numeric `w` greater than 50 (or negative) is now rejected
+at parse time with `FailedToParse` (9) and the message "w has to be a non-negative
+number and not greater than 50" — matching mongod, which caps `w` at the maximum
+number of voting replica-set members (50). Previously SecantusDB treated any
+`w` above 1 the same way (a `CannotSatisfyWriteConcern` writeConcernError, code
+100, attached to a *successful* reply). That's only correct for `1 < w <= 50` —
+satisfiable on a multi-node deployment but not on our single node. Above 50 the
+value is simply invalid, and mongod errors the whole command.
+
+This closes the mongo-c-driver gauge's last cluster of failures —
+`/Collection/{drop,rename,index}` and `/Database/drop`, which each run a DDL op
+with `w: 99` and assert the `assert_wc_oob_error` shape (code 9, the message
+above) for a server advertising version >= 4.3.3 (we advertise 7.0). The
+"state-ordering" label these carried in the backlog was a misdiagnosis: the
+failure is deterministic, not dependent on test order.
+
+#### Fixed
+- `commands._validate_write_concern`: a numeric `writeConcern.w` outside `[0, 50]`
+  is rejected with `FailedToParse` (9) before the command runs, instead of
+  falling through to the satisfiability check (code 100). `_drop_database` and
+  `_rename_collection` now run this validation too (they previously skipped it,
+  relying only on the dispatch-level `_unsatisfiable_wc_error`).
 
 The `$currentOp` aggregation stage now surfaces the connecting driver's
 handshake metadata — the full `clientMetadata` document (driver name/version,

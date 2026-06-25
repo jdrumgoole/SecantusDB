@@ -211,6 +211,22 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
                 "code": 79,
                 "codeName": "UnknownReplWriteConcern",
             }
+        if isinstance(w, int) and (w < 0 or w > 50):
+            # mongod caps a numeric ``w`` at 50 (the max number of voting
+            # replica-set members) and rejects an out-of-range ``w`` at
+            # writeConcern *parse* time with FailedToParse (9) — NOT a
+            # ``writeConcernError`` attached to a successful reply (that's
+            # the satisfiable-but-too-many-nodes case, ``1 < w <= 50``,
+            # handled by ``_unsatisfiable_wc_error``). mongo-c-driver's
+            # /Collection/{drop,rename,index} + /Database/drop assert exactly
+            # this for ``w: 99`` (``assert_wc_oob_error``, the server-version
+            # >= 4.3.3 branch).
+            return {
+                "ok": 0.0,
+                "errmsg": "w has to be a non-negative number and not greater than 50",
+                "code": 9,
+                "codeName": "FailedToParse",
+            }
     if "j" in wc and not isinstance(wc["j"], (bool, int)):
         # Real mongod is loose on the ``j`` type — bool or int both
         # work (truthiness used). Mongo-node-driver's
@@ -2835,12 +2851,18 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"ns": _ns(ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0}
 
 
-def _drop_database(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+def _drop_database(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     ctx.storage.drop_database(ctx.db_name)
     return {"dropped": ctx.db_name, "ok": 1.0}
 
 
 def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     src_ns = doc.get("renameCollection")
     dst_ns = doc.get("to")
     drop_target = bool(doc.get("dropTarget", False))

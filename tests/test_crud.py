@@ -2132,9 +2132,11 @@ def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     # `Database.command()` returns the raw doc rather than raising — check
     # the wce directly on the reply.
     db = client["wc_unsat_db"]
-    # `create` with w:4000 — collection IS created (the op runs), reply
-    # carries writeConcernError.
-    reply = db.command({"create": "things", "writeConcern": {"w": 4000}})
+    # `create` with w:2 — within mongod's 0..50 parse range but unsatisfiable
+    # on our single-node replica set: the collection IS created (the op runs)
+    # and the reply carries writeConcernError. (w above 50 is a *parse* error
+    # instead — see test_write_concern_w_above_50_is_parse_error.)
+    reply = db.command({"create": "things", "writeConcern": {"w": 2}})
     assert reply["ok"] == 1.0
     wce = reply.get("writeConcernError")
     assert wce is not None, f"expected writeConcernError, got {reply!r}"
@@ -2142,8 +2144,8 @@ def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     assert wce["codeName"] == "CannotSatisfyWriteConcern"
     assert "things" in db.list_collection_names()
 
-    # `drop` with w:4000 — same shape: op runs, wce attached.
-    reply = db.command({"drop": "things", "writeConcern": {"w": 4000}})
+    # `drop` with w:2 — same shape: op runs, wce attached.
+    reply = db.command({"drop": "things", "writeConcern": {"w": 2}})
     assert reply["ok"] == 1.0
     assert reply.get("writeConcernError", {}).get("code") == 100
     assert "things" not in db.list_collection_names()
@@ -2159,6 +2161,37 @@ def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     assert reply["ok"] == 1.0
     assert "writeConcernError" not in reply
     assert "majority_things" in db.list_collection_names()
+
+
+def test_write_concern_w_above_50_is_parse_error(client: MongoClient) -> None:
+    """A numeric ``writeConcern.w`` above 50 (mongod's max voting-member count)
+    is rejected at *parse* time with FailedToParse (9) — a top-level command
+    error, not a ``writeConcernError`` attached to a success. This is the C
+    driver's ``assert_wc_oob_error`` shape (server >= 4.3.3) that mongo-c-driver's
+    /Collection/{drop,rename,index} + /Database/drop assert for ``w: 99``."""
+    from pymongo.errors import OperationFailure
+
+    db = client["wc_oob_db"]
+    db.command({"create": "c"})
+
+    def assert_oob(cmd: dict) -> None:
+        with pytest.raises(OperationFailure) as exc:
+            db.command(cmd)
+        assert exc.value.code == 9, f"{cmd}: expected code 9, got {exc.value.code}"
+        assert "not greater than 50" in str(exc.value)
+
+    assert_oob({"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}],
+                "writeConcern": {"w": 99}})
+    assert_oob({"renameCollection": "wc_oob_db.c", "to": "wc_oob_db.c2",
+                "writeConcern": {"w": 99}})
+    assert_oob({"drop": "c2", "writeConcern": {"w": 99}})
+    assert_oob({"dropDatabase": 1, "writeConcern": {"w": 99}})
+    # Boundary: w == 50 is valid (parse-OK), so it's the unsatisfiable path, not
+    # a parse error — a success with a writeConcernError, not an OperationFailure.
+    db.command({"create": "fifty"})
+    reply = db.command({"drop": "fifty", "writeConcern": {"w": 50}})
+    assert reply["ok"] == 1.0
+    assert reply.get("writeConcernError", {}).get("code") == 100
 
 
 def test_unacknowledged_writes_do_not_desync_connection(server: SecantusDBServer) -> None:
