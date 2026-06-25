@@ -1172,6 +1172,56 @@ Remaining sub-divergence: **capped-collection eviction** still selects victims i
 order and `$natural` were moved onto the new index. Closing that means routing
 `enforce_capped_bounds` through a natural-order scan too.
 
+### 7.4 Verified rust-only gauge tail (2026-06-25)
+
+Authoritative `invoke validate-all-servers --jobs 4` run (every gauge on **both**
+Python and Rust, same day, JDK 17 for java) — so each "rust-only" item below is a
+failure the Rust server has that the **Python server does not**, not a stale-baseline
+artifact. **Clean (0 rust-only): c, cxx, dotnet, kotlin, node, mongo-rust-driver.**
+Remaining rust-only = ~21 actionable in 4 themes (+ 4 out-of-scope session tests).
+When you close a bucket, delete it.
+
+- [ ] **`splitLargeChangeStreamEvents` not implemented in the Rust server (2 tests, 1 feature).**
+  `test_change_stream.py::...::test_split_large_change` fails on both the pymongo and
+  pymongo-async gauges. In scope per CLAUDE.md (the envelope is supported on the Python
+  server: every fragment `{fragment: 1, of: 1}` when the user opts in). Cleanest, best-
+  defined fix — one feature clears both. Port the Python server's change-stream split
+  envelope handling to the Rust changestream projection / dispatch.
+- [ ] **Geo `$center` / `$near` / `$nearSphere` query operators (3 tests, java).**
+  java `GeoFiltersFunctionalSpecification#$geoWithin $center / $near / $nearSphere` fail
+  on Rust; Python passes them (its java geo specs are 10/10). The Rust geo *index* path
+  and `2dsphere`/`2d` creation work (§7.3-era), but these planar/near query operators
+  diverge — likely the `$center` planar-disk and `$near`/`$nearSphere` distance-sort
+  field paths in `secantus_core::geo` + the query/aggregate wiring. Verify against the
+  Python `secantus.geo` operators.
+- [ ] **php-ext write-reply wire shapes (6 tests, php-ext — strictest gauge).**
+  `WriteError` debug output + `WriteError::getMessage()`; `WriteResult::getWriteErrors()`
+  (ordered + unordered) + `getUpsertedIds()` with client-generated values; and
+  `Cursor` destruct-should-kill-a-live-cursor. The first five are how the Rust server
+  encodes `writeErrors` / upserted ids in the write reply (shape/field divergence the
+  libmongoc-level gauge catches that pymongo's permissive client misses); the last is
+  killing a still-open cursor when the driver tears it down (killCursors-on-destruct).
+- [ ] **ruby index-option validation + echo (7 tests, ruby).**
+  `Index::View#create_one/create_many` should *raise* on unsupported `commit_quorum`
+  values and on invalid wildcard projections (`create_one ... invalid wildcard projection`
+  ×2, `commit_quorum value is not supported` ×2); `hidden: false` should not apply the
+  hidden option (×2); capped-collection `create` should apply the options; and
+  `Index::View#each` on a nonexistent collection should raise a nonexistent-collection
+  error. All are validation/echo gaps in the Rust `createIndexes` / `create` / `listIndexes`
+  handlers, not query-engine bugs.
+- **Out of scope (session plumbing, do not chase):** ruby "behaves like a failed
+  operation using a session raises an error" (×3, `Collection#create` / `#indexes` /
+  `Index::View#create_one`) and php-lib `WatchFunctionalTest::testSessionFreed` (×1,
+  `resumeCallable` unset on invalidate via reflection). Same class as the deferred
+  change-stream session items — driver-internal session lifecycle, not a wire divergence.
+- [ ] **go `TestChangeStream_ReplicaSet/try_next/one_getMore_sent` (3 entries, 1 test) — confirm flake-vs-real.**
+  Historically logged as the load-induced flake (§5). But in this same-day run **Python
+  passed go with 0 failures under the identical `--jobs 4` load while Rust failed 3** — if
+  it were pure host saturation Python would flake too. So this may be a real Rust-side
+  change-stream `getMore`/awaitData timing issue. **Next step: run `validate-go --server
+  rust` alone** — if it reproduces isolated, it's a genuine bug (change-stream correctness
+  is load-bearing); if it's clean alone, it's the documented flake.
+
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
