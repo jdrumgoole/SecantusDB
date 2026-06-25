@@ -82,6 +82,14 @@ jobs:
 
       - name: Install MongoDB CLI tools (macOS)
         if: runner.os == 'macOS'
+        env:
+          # Homebrew refuses to load formulae from the third-party
+          # `mongodb/brew` tap via its JSON API ("Refusing to load formula
+          # ... from untrusted tap mongodb/brew"), which broke this step on
+          # every macOS run. Forcing HOMEBREW_NO_INSTALL_FROM_API installs
+          # from the tap `brew tap` just cloned locally, bypassing the
+          # API-side trust check.
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
         run: |
           brew tap mongodb/brew
           brew install mongosh mongodb-database-tools
