@@ -237,13 +237,10 @@ impl Geo2d {
 /// (`bits` / `min` / `max`, defaulting to mongod's 26 / -180 / 180). `None` if
 /// it isn't a single-field `2d` index.
 fn parse_geo_2d(key_spec: &Document, opts: &Document) -> Option<Geo2d> {
-    if key_spec.len() != 1 {
-        return None;
-    }
-    let (field, v) = key_spec.iter().next().unwrap();
-    if v.as_str() != Some("2d") {
-        return None;
-    }
+    // Like parse_geo_sphere: any field valued "2d" makes this a 2d index on that
+    // field; compound geo+scalar specs are accepted as geo-only (trailing scalar
+    // fields ignored at index time). Mirrors storage._geo_type_of.
+    let (field, _) = key_spec.iter().find(|(_, v)| v.as_str() == Some("2d"))?;
     let numf = |k: &str, default: f64| -> f64 {
         match opts.get(k) {
             Some(Bson::Double(x)) => *x,
@@ -297,13 +294,13 @@ impl GeoSphere {
 /// Parse a `2dsphere` geo index from its key spec (`{field: "2dsphere"}`).
 /// `None` if it isn't a single-field `2dsphere` index.
 fn parse_geo_sphere(key_spec: &Document) -> Option<GeoSphere> {
-    if key_spec.len() != 1 {
-        return None;
-    }
-    let (field, v) = key_spec.iter().next().unwrap();
-    if v.as_str() != Some("2dsphere") {
-        return None;
-    }
+    // A 2dsphere index is any spec containing a field whose value is the string
+    // "2dsphere". Compound geo+scalar specs ({g:"2dsphere", z:1}) are accepted as
+    // geo-only on the geo field; trailing scalar fields are ignored at index time
+    // and verified post-fetch (mirrors storage._geo_type_of).
+    let (field, _) = key_spec
+        .iter()
+        .find(|(_, v)| v.as_str() == Some("2dsphere"))?;
     Some(GeoSphere {
         field: field.clone(),
     })
