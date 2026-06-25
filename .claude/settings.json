@@ -13,7 +13,15 @@
       "Bash(.venv/bin/python -m pytest *)",
       "Bash(.venv-test/bin/python -m pytest *)",
       "Bash(PYTHONPATH=src .venv-test/bin/python -m pytest *)",
-      "Bash(cargo test*)"
+      "Bash(cargo test*)",
+      "Bash(ruff *)",
+      "Bash(python -m ruff *)",
+      "Bash(uv run ruff *)",
+      "Bash(uv run python -m ruff *)",
+      "Bash(.venv/bin/python -m ruff *)",
+      "Bash(.venv-test/bin/python -m ruff *)",
+      "Bash(invoke lint*)",
+      "Bash(invoke fmt*)"
     ]
   }
 }
