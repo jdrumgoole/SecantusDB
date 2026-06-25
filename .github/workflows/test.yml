@@ -82,17 +82,24 @@ jobs:
 
       - name: Install MongoDB CLI tools (macOS)
         if: runner.os == 'macOS'
-        env:
-          # Homebrew refuses to load formulae from the third-party
-          # `mongodb/brew` tap via its JSON API ("Refusing to load formula
-          # ... from untrusted tap mongodb/brew"), which broke this step on
-          # every macOS run. Forcing HOMEBREW_NO_INSTALL_FROM_API installs
-          # from the tap `brew tap` just cloned locally, bypassing the
-          # API-side trust check.
-          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        # Homebrew's third-party `mongodb/brew` tap is refused on ~half of runs
+        # under Homebrew's tap-trust policy ("Refusing to load formula ... from
+        # untrusted tap mongodb/brew") — a cache-dependent flake that reds the
+        # macOS cell at random. Download the official mongosh + database-tools
+        # tarballs directly instead: deterministic, no tap, no Homebrew.
         run: |
-          brew tap mongodb/brew
-          brew install mongosh mongodb-database-tools
+          set -euxo pipefail
+          arch="$(uname -m)"   # arm64 on the Apple-Silicon macos-latest runners
+          dest="$RUNNER_TEMP/mongotools"
+          mkdir -p "$dest"
+          mongosh_ver=2.5.1
+          curl -fsSL "https://downloads.mongodb.com/compass/mongosh-${mongosh_ver}-darwin-${arch}.zip" -o "$dest/mongosh.zip"
+          unzip -q "$dest/mongosh.zip" -d "$dest"
+          echo "$dest/mongosh-${mongosh_ver}-darwin-${arch}/bin" >> "$GITHUB_PATH"
+          dbtools_ver=100.12.0
+          curl -fsSL "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-macos-${arch}-${dbtools_ver}.zip" -o "$dest/dbtools.zip"
+          unzip -q "$dest/dbtools.zip" -d "$dest"
+          echo "$dest/mongodb-database-tools-macos-${arch}-${dbtools_ver}/bin" >> "$GITHUB_PATH"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
