@@ -2180,10 +2180,14 @@ def test_write_concern_w_above_50_is_parse_error(client: MongoClient) -> None:
         assert exc.value.code == 9, f"{cmd}: expected code 9, got {exc.value.code}"
         assert "not greater than 50" in str(exc.value)
 
-    assert_oob({"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}],
-                "writeConcern": {"w": 99}})
-    assert_oob({"renameCollection": "wc_oob_db.c", "to": "wc_oob_db.c2",
-                "writeConcern": {"w": 99}})
+    assert_oob(
+        {
+            "createIndexes": "c",
+            "indexes": [{"key": {"a": 1}, "name": "a_1"}],
+            "writeConcern": {"w": 99},
+        }
+    )
+    assert_oob({"renameCollection": "wc_oob_db.c", "to": "wc_oob_db.c2", "writeConcern": {"w": 99}})
     assert_oob({"drop": "c2", "writeConcern": {"w": 99}})
     assert_oob({"dropDatabase": 1, "writeConcern": {"w": 99}})
     # Boundary: w == 50 is valid (parse-OK), so it's the unsatisfiable path, not
