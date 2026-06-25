@@ -332,8 +332,44 @@ fn apply_op(
                 }
             }
         }
-        // $currentDate (non-deterministic), $min/$max/$pull/$addToSet/$bit
-        // (Python comparison/== semantics), and unknown ops -> Python.
+        "$bit" => {
+            for (path, ops) in payload {
+                // `{field: {and|or|xor: <int mask>}}` — exactly one sub-op.
+                let ops = match ops {
+                    Bson::Document(d) if d.len() == 1 => d,
+                    _ => return Err(Fallback), // not a single-op doc -> Python raises
+                };
+                let (bit_op, mask_b) = ops.iter().next().unwrap();
+                let mask = match mask_b {
+                    Bson::Int32(n) => *n as i64,
+                    Bson::Int64(n) => *n,
+                    _ => return Err(Fallback), // non-integer mask -> Python raises
+                };
+                for cpath in expand_path(result, path, filters, pos)? {
+                    let cur = match get_path(result, &cpath) {
+                        None | Some(Bson::Null) => 0i64,
+                        Some(Bson::Int32(n)) => *n as i64,
+                        Some(Bson::Int64(n)) => *n,
+                        Some(_) => return Err(Fallback), // $bit on non-integer -> Python raises
+                    };
+                    let res = match bit_op.as_str() {
+                        "and" => cur & mask,
+                        "or" => cur | mask,
+                        "xor" => cur ^ mask,
+                        _ => return Err(Fallback), // unknown sub-op -> Python raises
+                    };
+                    // Python computes a plain int -> bson encodes it as int32 when
+                    // it fits, else int64. Match that so the BSON subtype agrees.
+                    let val = match i32::try_from(res) {
+                        Ok(v) => Bson::Int32(v),
+                        Err(_) => Bson::Int64(res),
+                    };
+                    set_path(result, &cpath, val)?;
+                }
+            }
+        }
+        // $currentDate (non-deterministic), $min/$max/$pull/$addToSet (Python
+        // comparison/== semantics), and unknown ops -> Python.
         _ => return Err(Fallback),
     }
     Ok(())
@@ -443,6 +479,27 @@ mod tests {
         assert_eq!(
             upd(doc! {"a": 1}, doc! {"$rename": {"a": "b"}}),
             doc! {"b": 1}
+        );
+    }
+
+    #[test]
+    fn bit_operator() {
+        assert_eq!(
+            upd(doc! {"b": 1i32}, doc! {"$bit": {"b": {"and": 0}}}),
+            doc! {"b": 0i32}
+        );
+        assert_eq!(
+            upd(doc! {"b": 5i32}, doc! {"$bit": {"b": {"or": 2}}}),
+            doc! {"b": 7i32}
+        );
+        assert_eq!(
+            upd(doc! {"b": 6i32}, doc! {"$bit": {"b": {"xor": 3}}}),
+            doc! {"b": 5i32}
+        );
+        // Missing field defaults to 0.
+        assert_eq!(
+            upd(doc! {}, doc! {"$bit": {"b": {"or": 7}}}),
+            doc! {"b": 7i32}
         );
     }
 

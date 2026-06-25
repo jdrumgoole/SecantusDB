@@ -319,6 +319,30 @@ fn update_set_modifies_and_counts() {
 }
 
 #[test]
+fn update_bit_operator() {
+    // $bit and/or/xor on an integer field (mongo-node-driver "apply bit operator").
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1, "b": 5}]}, c);
+        let r = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$bit": {"b": {"and": 1}}}}]},
+            c,
+        );
+        assert_eq!(r.get_i32("nModified").unwrap(), 1);
+        let found = dispatch(&doc! {"find": "c"}, c);
+        let b = found
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .get_i32("b")
+            .unwrap();
+        assert_eq!(b, 1, "5 & 1 == 1");
+    });
+}
+
+#[test]
 fn update_multi_touches_all_matches() {
     with_wt(|c| {
         dispatch(
