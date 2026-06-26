@@ -1097,8 +1097,14 @@ pub fn db_stats(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     })
 }
 
-/// `serverStatus` — a minimal subset (host / version / process / uptime).
-pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+/// `serverStatus` — a minimal subset (host / version / process / uptime), plus a
+/// live `metrics.cursor.open.total` so drivers can track cursor lifecycle
+/// (mongo-php-driver `cursor-destruct-001` opens a batched cursor and asserts the
+/// count rises by one, then returns to baseline after `killCursors`).
+pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // `CursorRegistry::len` prunes idle cursors then counts the live ones — the
+    // count rises while a batched cursor is open and drops on killCursors.
+    let open_cursors = ctx.cursors().map(|c| c.len()).unwrap_or(0) as i64;
     Ok(doc! {
         "host": "secantus",
         "version": crate::SERVER_VERSION,
@@ -1107,6 +1113,11 @@ pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
         "uptime": 0.0,
         "uptimeMillis": Bson::Int64(0),
         "localTime": bson::DateTime::now(),
+        "metrics": {
+            "cursor": {
+                "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
+            },
+        },
         // Categorical self-identification: real mongod never has this key.
         // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
         // checks it to prove it's talking to SecantusDB rather than an

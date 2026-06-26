@@ -110,6 +110,36 @@ fn create_compound_geo_scalar_index() {
 }
 
 #[test]
+fn server_status_tracks_open_cursor_count() {
+    // metrics.cursor.open.total rises while a batched cursor is open and returns
+    // to baseline after killCursors (mongo-php-driver cursor-destruct-001).
+    with_wt(|c| {
+        let open_total = |c: &mut CommandContext| -> i64 {
+            dispatch(&doc! {"serverStatus": 1}, c)
+                .get_document("metrics")
+                .unwrap()
+                .get_document("cursor")
+                .unwrap()
+                .get_document("open")
+                .unwrap()
+                .get_i64("total")
+                .unwrap()
+        };
+        dispatch(
+            &doc! {"insert": "c", "documents": (0..5).map(|i| Bson::Document(doc!{"_id": i})).collect::<Vec<_>>()},
+            c,
+        );
+        let base = open_total(c);
+        let reply = dispatch(&doc! {"find": "c", "batchSize": 2}, c);
+        let cid = reply.get_document("cursor").unwrap().get_i64("id").unwrap();
+        assert_ne!(cid, 0, "batched cursor should stay open");
+        assert_eq!(open_total(c), base + 1, "count rises while cursor open");
+        dispatch(&doc! {"killCursors": "c", "cursors": [cid]}, c);
+        assert_eq!(open_total(c), base, "count returns to baseline after kill");
+    });
+}
+
+#[test]
 fn list_indexes_honours_cursor_batch_size() {
     with_wt(|c| {
         dispatch(&doc! {"create": "c"}, c);

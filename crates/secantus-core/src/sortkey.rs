@@ -238,7 +238,10 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
             out.push(RANK_NUMBER);
             out.extend(encode_number(v));
         }
-        Bson::String(s) => {
+        // `bson.Code` subclasses `str` in pymongo, so Python's sortkey ranks it as
+        // a string (RANK_STRING) — mirror that so a `Code` value can serve as an
+        // `_id` / index key (mongo-php-driver getUpsertedIds upserts a Code `_id`).
+        Bson::String(s) | Bson::JavaScriptCode(s) => {
             out.push(RANK_STRING);
             let bytes = match coll {
                 Some(c) => collation::normalize_index_bytes(s, c)
