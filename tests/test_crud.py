@@ -2553,6 +2553,64 @@ def test_tailable_capped_rollover_kills_cursor(client: MongoClient) -> None:
     assert db.cap.count_documents({}) == 3
 
 
+def test_tailable_drop_returns_collection_dropped(client: MongoClient) -> None:
+    """Dropping a capped collection out from under a tailable cursor makes the
+    next getMore fail with QueryPlanKilled (175) and a "collection dropped"
+    message — what mongod surfaces to a tailing client. mongo-php-driver's
+    cursor-tailable_error-001 asserts the message mentions "collection
+    dropped"; a bare CursorNotFound (which non-tailable cursors still get)
+    would not satisfy it. Tested at the command level because pymongo's
+    high-level cursor swallows 175 as a clean tailable close (see the
+    companion test below)."""
+    db = client["tail_drop_db"]
+    db.cap.drop()
+    db.create_collection("cap", capped=True, size=1024 * 1024)
+    db.cap.insert_many([{"_id": i} for i in (1, 2, 3)])
+
+    res = db.command("find", "cap", filter={}, tailable=True, batchSize=2)
+    cid = res["cursor"]["id"]
+    assert cid != 0
+
+    db.command("drop", "cap")
+
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        db.command("getMore", cid, collection="cap")
+    assert exc.value.code == 175, f"want QueryPlanKilled(175), got {exc.value.code}"
+    assert "collection dropped" in str(exc.value)
+
+    # A NON-tailable cursor whose collection is dropped still gets the plain
+    # CursorNotFound (43) — mongo-c-driver's error_document/getmore depends
+    # on it, so the tailable special-case must not bleed into regular cursors.
+    db.reg.drop()
+    db.reg.insert_many([{"_id": i} for i in range(5)])
+    res2 = db.command("find", "reg", filter={}, batchSize=2)
+    cid2 = res2["cursor"]["id"]
+    db.command("drop", "reg")
+    with pytest.raises(pymongo.errors.OperationFailure) as exc2:
+        db.command("getMore", cid2, collection="reg")
+    assert exc2.value.code == 43, f"want CursorNotFound(43), got {exc2.value.code}"
+
+
+def test_tailable_drop_closes_pymongo_cursor_cleanly(client: MongoClient) -> None:
+    """pymongo lists 175 (QueryPlanKilled) in ``_CURSOR_CLOSED_ERRORS``, so a
+    high-level TAILABLE cursor whose collection is dropped simply stops
+    iterating (``alive`` False) rather than raising — the server still emits
+    the 175 the wire test above asserts; this pins the driver-visible
+    behaviour."""
+    db = client["tail_drop_clean_db"]
+    db.cap.drop()
+    db.create_collection("cap", capped=True, size=1024 * 1024)
+    db.cap.insert_many([{"_id": i} for i in (1, 2, 3)])
+
+    cursor = db.cap.find(cursor_type=pymongo.CursorType.TAILABLE).max_await_time_ms(50)
+    drained = [cursor.next()["_id"] for _ in range(3)]
+    assert drained == [1, 2, 3]
+
+    db.command("drop", "cap")
+    assert cursor.to_list() == []
+    assert cursor.alive is False
+
+
 # --- local.oplog.rs wire-surface (pymongo-driven) -------------------------
 
 

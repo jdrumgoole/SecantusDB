@@ -49,6 +49,17 @@ class _Entry:
     collection_uuid: _uuid.UUID | None = None
     invalidated: bool = False
     final_event_pending: bool = False
+    # True for change-stream cursors (registered by ``aggregate`` with a
+    # ``$changeStream`` stage). They are tailable but handle drop / rename
+    # invalidation themselves via the producer's final ``invalidate`` event,
+    # so ``kill_namespace`` leaves them untouched (it must not tombstone them
+    # like a plain capped tailable).
+    change_stream: bool = False
+    # Set when the cursor's collection is dropped out from under a plain
+    # (non-change-stream) tailable cursor (see ``kill_namespace``). The next
+    # ``getMore`` surfaces a ``QueryPlanKilled`` "collection dropped" error
+    # rather than serving stale rows or a bare CursorNotFound.
+    dropped: bool = False
     # Latest change-stream resume token observed by the producer.
     # Returned to the client as ``cursor.postBatchResumeToken`` on
     # every getMore so consumers on quiet collections can advance
@@ -131,6 +142,7 @@ class CursorRegistry:
         position_seq: int = 0,
         collection_uuid: _uuid.UUID | None = None,
         initial_remaining: list[dict[str, Any]] | None = None,
+        change_stream: bool = False,
     ) -> int:
         """Register a tailable cursor backed by a producer closure.
 
@@ -166,6 +178,7 @@ class CursorRegistry:
                 producer=producer,
                 position_seq=position_seq,
                 collection_uuid=collection_uuid,
+                change_stream=change_stream,
             )
             return cursor_id
 
@@ -212,20 +225,40 @@ class CursorRegistry:
         return killed, not_found
 
     def kill_namespace(self, namespace: str) -> int:
-        """Drop every cursor open on ``namespace`` and return the count.
+        """Kill every cursor open on ``namespace`` and return the count.
 
         mongod kills a collection's cursors when the collection is dropped
-        (or renamed); a subsequent ``getMore`` then fails with
-        CursorNotFound. SecantusDB's cursors hold detached document
-        snapshots, so without this they would keep serving rows after the
-        collection is gone — mongo-c-driver's ``error_document/getmore``
-        test drops mid-iteration and expects the next ``getMore`` to error.
+        (or renamed). SecantusDB's cursors hold detached document snapshots,
+        so without this they would keep serving rows after the collection is
+        gone.
+
+        Non-tailable cursors are removed outright: the next ``getMore``
+        fails with CursorNotFound (mongo-c-driver's ``error_document/getmore``
+        depends on this). Plain tailable cursors are instead *tombstoned*
+        (``dropped = True``, entry kept) so the next ``getMore`` can return a
+        ``QueryPlanKilled`` "collection dropped" error — what mongod surfaces
+        to a tailing client (mongo-php-driver's ``cursor-tailable_error-001``
+        expects the message to mention "collection dropped", not a bare
+        CursorNotFound).
+
+        Change-stream cursors are left untouched: they are tailable but
+        drive their own drop / rename invalidation through the producer's
+        final ``invalidate`` event, and tombstoning them would surface a
+        "collection dropped" error instead of that event.
         """
         with self._lock:
-            doomed = [cid for cid, e in self._cursors.items() if e.namespace == namespace]
-            for cid in doomed:
-                self._cursors.pop(cid, None)
-            return len(doomed)
+            affected = [
+                cid
+                for cid, e in self._cursors.items()
+                if e.namespace == namespace and not e.change_stream
+            ]
+            for cid in affected:
+                entry = self._cursors[cid]
+                if entry.tailable:
+                    entry.dropped = True
+                else:
+                    self._cursors.pop(cid, None)
+            return len(affected)
 
     def __len__(self) -> int:
         with self._lock:

@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Dropping a collection under a tailable cursor reports "collection dropped"
+
+When a capped collection is dropped while a tailable cursor is open on
+it, the next `getMore` now fails with `QueryPlanKilled` (175) and a
+"collection dropped" message — exactly what mongod surfaces to a tailing
+client. Previously the cursor was simply removed, so the follow-up
+`getMore` returned a bare `CursorNotFound` (43). Regular (non-tailable)
+cursors are unchanged: dropping their collection still yields
+`CursorNotFound`, which the strict wire gauges rely on. Closes
+mongo-php-driver's `cursor-tailable_error-001`, which asserts the
+dropped-collection error mentions "collection dropped".
+
+#### Fixed
+- `CursorRegistry.kill_namespace` tombstones tailable cursors (sets a
+  `dropped` flag, keeps the entry) instead of deleting them; non-tailable
+  cursors are still deleted. `_get_more` returns the new
+  `QueryPlanKilled` "collection dropped" reply for a tombstoned tailable
+  cursor, and `_drop` tombstones before the storage drop so a parked
+  `awaitData` `getMore` (woken by the drop's oplog write) observes the
+  flag.
+
 ### A tailable cursor's filter now applies to docs inserted after the find
 
 A tailable + `awaitData` cursor on a capped collection re-polls the
