@@ -117,6 +117,27 @@ CURATED = [
     ({"$last": "$a"}, {"a": [1, 2]}),
     ({"$concatArrays": [[1, 2], [3]]}, {}),
     ({"$reverseArray": [1, 2, 3]}, {}),
+    # $sortArray. Int form: homogeneous / numeric scalars (Python's native sort
+    # raises on docs or incomparable mixes, so the corpus avoids those). Doc form
+    # uses BSON sort order on the named fields.
+    ({"$sortArray": {"input": [3, 1, 2], "sortBy": 1}}, {}),
+    ({"$sortArray": {"input": [3, 1, 2], "sortBy": -1}}, {}),
+    ({"$sortArray": {"input": [3, 1.5, 2, 1.5], "sortBy": 1}}, {}),  # numeric + stable ties
+    ({"$sortArray": {"input": ["b", "a", "c"], "sortBy": -1}}, {}),
+    ({"$sortArray": {"input": "$xs", "sortBy": 1}}, {"xs": [5, 2, 8, 1]}),
+    ({"$sortArray": {"input": "$missing", "sortBy": 1}}, {}),  # missing input -> null
+    ({"$sortArray": {"input": [{"x": 3}, {"x": 1}, {"x": 2}], "sortBy": {"x": 1}}}, {}),
+    (
+        {
+            "$sortArray": {
+                "input": [{"a": 1, "b": 2}, {"a": 1, "b": 1}, {"a": 0, "b": 9}],
+                "sortBy": {"a": 1, "b": -1},
+            }
+        },
+        {},
+    ),
+    # missing sort field sorts as null (first)
+    ({"$sortArray": {"input": [{"x": 2}, {"y": 1}], "sortBy": {"x": 1}}}, {}),
     ({"$in": [2, [1, 2, 3]]}, {}),
     ({"$in": [9, [1, 2, 3]]}, {}),
     # Nested
