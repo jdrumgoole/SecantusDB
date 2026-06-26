@@ -247,6 +247,48 @@ fn find_all_with_regex_elements() {
 }
 
 #[test]
+fn find_geo_center_near_nearsphere() {
+    // Mirrors mongo-java-driver GeoFiltersFunctionalSpecification: a 2d index over
+    // legacy [x,y] points, queried with $geoWithin $center, legacy-sibling $near,
+    // and $nearSphere; results sorted by _id.
+    with_wt(|c| {
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"geo": "2d"}, "name": "geo_2d"}]},
+            c,
+        );
+        seed(
+            c,
+            vec![
+                doc! {"_id": 1, "geo": [1.0, 1.0]},
+                doc! {"_id": 2, "geo": [45.0, 2.0]},
+                doc! {"_id": 3, "geo": [3.0, 3.0]},
+            ],
+        );
+        let ids = |r: &bson::Document| -> Vec<i64> {
+            batch_ids(r.get_document("cursor").unwrap(), "firstBatch")
+        };
+        // $geoWithin $center [[2,2], 4] -> points 1 and 3 (within dist 4 of (2,2)).
+        let r = dispatch(
+            &doc! {"find": "c", "filter": {"geo": {"$geoWithin": {"$center": [[2.0, 2.0], 4.0]}}}, "sort": {"_id": 1}},
+            c,
+        );
+        assert_eq!(ids(&r), vec![1, 3], "$center {r:?}");
+        // legacy 2d $near with sibling $maxDistance -> only point 1.
+        let r = dispatch(
+            &doc! {"find": "c", "filter": {"geo": {"$near": [1.01, 1.01], "$maxDistance": 0.1, "$minDistance": 0.0}}, "sort": {"_id": 1}},
+            c,
+        );
+        assert_eq!(ids(&r), vec![1], "$near {r:?}");
+        // $nearSphere (radians bound 0.1) -> points 1 and 3.
+        let r = dispatch(
+            &doc! {"find": "c", "filter": {"geo": {"$nearSphere": [1.01, 1.01], "$maxDistance": 0.1, "$minDistance": 0.0}}, "sort": {"_id": 1}},
+            c,
+        );
+        assert_eq!(ids(&r), vec![1, 3], "$nearSphere {r:?}");
+    });
+}
+
+#[test]
 fn find_filter_matches_subset() {
     with_wt(|c| {
         seed(

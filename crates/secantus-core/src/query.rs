@@ -231,6 +231,35 @@ fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>
                             return Ok(false);
                         }
                     }
+                    // `$maxDistance` / `$minDistance` are sibling modifiers of the
+                    // legacy 2d `$near` / `$nearSphere` form; consumed with them.
+                    "$maxDistance" | "$minDistance"
+                        if d.contains_key("$near") || d.contains_key("$nearSphere") =>
+                    {
+                        continue
+                    }
+                    "$near" => {
+                        if !crate::geo::op_geo_near(
+                            values,
+                            arg,
+                            d.get("$maxDistance"),
+                            d.get("$minDistance"),
+                            false,
+                        )? {
+                            return Ok(false);
+                        }
+                    }
+                    "$nearSphere" => {
+                        if !crate::geo::op_geo_near(
+                            values,
+                            arg,
+                            d.get("$maxDistance"),
+                            d.get("$minDistance"),
+                            true,
+                        )? {
+                            return Ok(false);
+                        }
+                    }
                     _ => {
                         if !op_matches(values, op, arg, coll)? {
                             return Ok(false);
@@ -390,11 +419,14 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         "$bitsAnyClear" => op_bits(values, arg, |v, m| v & m != m),
         "$geoWithin" => crate::geo::op_geo_within(values, arg),
         "$geoIntersects" => crate::geo::op_geo_intersects(values, arg),
-        "$near" => crate::geo::op_geo_near(values, arg, false),
-        "$nearSphere" => crate::geo::op_geo_near(values, arg, true),
-        // $center (Shapely 64-gon) and anything unknown -> Python (Python raises
-        // QueryError for genuinely-unknown operators). $regex/$options are
-        // intercepted in `field_matches` (they share a condition dict).
+        // The legacy 2d *sibling* `$maxDistance`/`$minDistance` form is handled in
+        // `field_matches` (it needs the parent condition dict); here (e.g. under
+        // `$elemMatch`/`$not`) only the self-contained list / GeoJSON form is seen.
+        "$near" => crate::geo::op_geo_near(values, arg, None, None, false),
+        "$nearSphere" => crate::geo::op_geo_near(values, arg, None, None, true),
+        // Anything unknown -> Python (Python raises QueryError for genuinely-
+        // unknown operators). $regex/$options are intercepted in `field_matches`
+        // (they share a condition dict).
         _ => Err(Fallback),
     }
 }
