@@ -412,3 +412,87 @@ def rust_ship(
     c.run(f"git commit -m {shlex.quote(message)}", pty=True)
     if push:
         c.run("git push origin HEAD:main", pty=True)
+
+
+# --- Canonical repro + PR-lifecycle tasks ---------------------------------
+#
+# These exist so the operations done on every rust-server slice — running an
+# ad-hoc pymongo repro against the standalone binary, and the commit → push → PR
+# → watch → merge lifecycle — are each a single ``./inv …`` command on the
+# ``Bash(./inv *)`` allowlist, instead of bespoke compound shell lines (which
+# re-prompt every time because each is textually unique). Build/repro env is
+# auto-filled by ``_rust_env``, so never prefix these with ``export …``.
+
+
+@task(
+    name="rust-repro",
+    help={
+        "script": "path to a pymongo repro .py (run with `--binary <secantusdb>`)",
+        "release": "build/use the release binary (default: True)",
+    },
+)
+def rust_repro(c: Context, script: str, release: bool = True) -> None:
+    """Build the standalone ``secantusdb`` binary, then run a pymongo repro script
+    against it (the script is passed ``--binary <path>``). Write the repro with the
+    editor, then ``./inv rust-repro <script>`` — no bespoke ``uv run python …``."""
+    sub = "release" if release else "debug"
+    flag = " --release" if release else ""
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=True, env=_rust_env())
+    binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusdb"
+    c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=True, env=_rust_env())
+
+
+@task(name="gh-watch", help={"pr": "PR number"})
+def gh_watch(c: Context, pr: str) -> None:
+    """Watch a PR's CI checks to completion, then print the final states."""
+    c.run(f"gh pr checks {shlex.quote(str(pr))} --watch --interval 30", pty=True, warn=True)
+    c.run(f"gh pr checks {shlex.quote(str(pr))}", pty=True, warn=True)
+
+
+@task(
+    name="gh-merge",
+    help={"pr": "PR number", "sync-branch": "local branch to reset to origin/main"},
+)
+def gh_merge(c: Context, pr: str, sync_branch: str = "rust-tasks") -> None:
+    """Squash-merge a PR (keeping the remote branch), then fast-sync the local
+    working branch to the new ``origin/main``. Replaces the bespoke
+    ``gh pr merge … ; git fetch ; git checkout ; git reset --hard`` sequence."""
+    c.run(f"gh pr merge {shlex.quote(str(pr))} --squash --delete-branch=false", pty=True)
+    c.run("git fetch origin -q", pty=True)
+    c.run(f"git checkout {shlex.quote(sync_branch)}", pty=True, warn=True)
+    c.run("git reset --hard origin/main", pty=True)
+    c.run("git log --oneline -2", pty=True)
+
+
+@task(
+    name="gh-ship",
+    help={
+        "branch": "feature branch to commit/push and open the PR from",
+        "paths": "git pathspec to stage (default: crates)",
+        "msg-file": "file holding the commit message (line 1 becomes the PR title)",
+        "body-file": "file holding the PR body markdown (PR skipped if absent)",
+        "base": "PR base branch (default: main)",
+    },
+)
+def gh_ship(
+    c: Context,
+    branch: str,
+    paths: str = "crates",
+    msg_file: str = "/tmp/secantus-commit.txt",
+    body_file: str = "/tmp/secantus-pr.md",
+    base: str = "main",
+) -> None:
+    """Stage ``paths``, commit with the message in ``msg_file``, push ``branch``,
+    and open a PR (title = first line of ``msg_file``, body from ``body_file``).
+    Write the two files with the editor first, then one ``./inv gh-ship -b
+    <branch>`` runs the whole commit → push → PR lifecycle on the allowlist."""
+    title = pathlib.Path(msg_file).read_text().splitlines()[0]
+    c.run(f"git add {paths}", pty=True)
+    c.run(f"git commit -F {shlex.quote(msg_file)}", pty=True)
+    c.run(f"git push -u origin {shlex.quote(branch)}", pty=True)
+    if pathlib.Path(body_file).exists():
+        c.run(
+            f"gh pr create --base {shlex.quote(base)} --head {shlex.quote(branch)} "
+            f"--title {shlex.quote(title)} --body-file {shlex.quote(body_file)}",
+            pty=True,
+        )
