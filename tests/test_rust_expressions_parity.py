@@ -207,6 +207,35 @@ CURATED = [
     ({"$sqrt": 2}, {}),
     ({"$sqrt": "$n"}, {"n": -1}),  # negative -> null
     ({"$sqrt": 0}, {}),
+    # $exp / $ln / $log (libm: Rust f64 and CPython math share the platform libm,
+    # so the bits agree; the test asserts rust == py, not a literal).
+    ({"$exp": 0}, {}),
+    ({"$exp": 1}, {}),
+    ({"$exp": "$x"}, {}),  # missing -> null
+    ({"$ln": 1}, {}),
+    ({"$ln": "$n"}, {"n": 2.5}),
+    ({"$ln": 0}, {}),  # <= 0 -> null
+    ({"$ln": -3}, {}),  # -> null
+    ({"$log": [8, 2]}, {}),
+    ({"$log": [100, 10]}, {}),
+    ({"$log": [8, 1]}, {}),  # base 1 -> null
+    ({"$log": [None, 2]}, {}),  # null arg -> null
+    # $pow: int**non-neg-int -> int; float operand / negative exp -> double.
+    ({"$pow": [2, 10]}, {}),
+    ({"$pow": [2, 0]}, {}),
+    ({"$pow": [2, -1]}, {}),  # -> 0.5 (double)
+    ({"$pow": [2.0, 3]}, {}),  # float base -> double
+    ({"$pow": ["$b", 3]}, {"b": 3}),
+    # $round: half-to-even; int stays int, double rounds to `place` decimals.
+    ({"$round": [3.14159, 2]}, {}),
+    ({"$round": [2.25, 1]}, {}),  # banker's: 2.25 -> 2.2
+    ({"$round": 5}, {}),  # int -> unchanged int
+    ({"$round": [15, -1]}, {}),  # -> 20 (int)
+    ({"$round": "$x"}, {}),  # missing -> null
+    # $trunc: truncate toward zero; always a double (Python `/` float division).
+    ({"$trunc": [3.789, 2]}, {}),
+    ({"$trunc": 5}, {}),  # -> 5.0 (double)
+    ({"$trunc": [-3.789, 1]}, {}),
     # $dateToParts (UTC).
     ({"$dateToParts": {"date": "$d"}}, {"d": _DT}),
     ({"$dateToParts": {"date": "$x"}}, {}),  # missing -> null
