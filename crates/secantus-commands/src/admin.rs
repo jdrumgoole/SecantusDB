@@ -711,6 +711,18 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut indexes = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // A collection that exists always has at least the synthesised `_id_` index, so
+    // an empty result means the namespace doesn't exist — mongod errors
+    // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not
+    // exist`). Mirrors commands.py's `if not indexes`.
+    if indexes.is_empty() {
+        return Ok(CommandError::new(
+            26,
+            "NamespaceNotFound",
+            format!("ns does not exist: {}.{}", ctx.db_name, coll),
+        )
+        .into_reply());
+    }
     // A clustered collection's clustering key IS its index: mongod reports a
     // single entry carrying `clustered: true` (with the user's name) in place of
     // the synthesised `_id_`. Mirrors commands.py.
@@ -833,6 +845,19 @@ fn invalid_partial_filter(filter: &Document) -> Option<String> {
     None
 }
 
+/// Whether a BSON value is "falsy" the way mongod treats default index options
+/// (`hidden` / `sparse` / `unique`): `false`, `0`, `0.0`, or null.
+fn is_falsy(v: &Bson) -> bool {
+    match v {
+        Bson::Boolean(b) => !b,
+        Bson::Int32(i) => *i == 0,
+        Bson::Int64(i) => *i == 0,
+        Bson::Double(d) => *d == 0.0,
+        Bson::Null => true,
+        _ => false,
+    }
+}
+
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "createIndexes")?;
     let storage = ctx.storage()?;
@@ -840,6 +865,26 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         Some(Bson::Array(a)) => a.clone(),
         _ => Vec::new(),
     };
+
+    // `commitQuorum` (4.4+) accepts an integer, `"majority"`, or `"votingMembers"`;
+    // any other string is an unknown write-concern mode (mongo-ruby-driver's
+    // `commit_quorum value is not supported` pins this). Mirrors commands.py.
+    if let Some(cq) = doc.get("commitQuorum") {
+        let ok = matches!(cq, Bson::Int32(_) | Bson::Int64(_))
+            || matches!(cq.as_str(), Some("majority") | Some("votingMembers"));
+        if !ok {
+            let shown = match cq {
+                Bson::String(s) => format!("'{s}'"),
+                other => format!("{other}"),
+            };
+            return Ok(CommandError::new(
+                79,
+                "UnknownReplWriteConcern",
+                format!("No write concern mode named {shown} found in replica set configuration"),
+            )
+            .into_reply());
+        }
+    }
 
     let before = storage
         .list_indexes(&ctx.db_name, &coll)
@@ -889,8 +934,46 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 }
             }
         }
+        // `wildcardProjection` is only valid on a wildcard index ({$**:1} /
+        // {f.$**:1}) and must be a non-empty document (mongo-ruby-driver's
+        // invalid-wildcard-projection tests). Mirrors commands.py.
+        if let Some(wcp) = s.get("wildcardProjection") {
+            let nonempty_doc = matches!(wcp, Bson::Document(d) if !d.is_empty());
+            if !nonempty_doc {
+                return Ok(CommandError::new(
+                    67,
+                    "CannotCreateIndex",
+                    format!(
+                        "Error in specification {{ key: {key:?}, wildcardProjection: {wcp:?} }} \
+                         :: caused by :: wildcardProjection must be a non-empty object"
+                    ),
+                )
+                .into_reply());
+            }
+            let is_wildcard = key.keys().any(|k| k == "$**" || k.ends_with(".$**"));
+            if !is_wildcard {
+                return Ok(CommandError::new(
+                    67,
+                    "CannotCreateIndex",
+                    format!(
+                        "Error in specification {{ key: {key:?}, wildcardProjection: {wcp:?} }} \
+                         :: caused by :: wildcardProjection is only allowed on wildcard indexes"
+                    ),
+                )
+                .into_reply());
+            }
+        }
+        // mongod stores only the non-default form of hidden / sparse / unique: a
+        // falsy value is dropped so it doesn't come back from listIndexes
+        // (mongo-ruby-driver `hidden is false` asserts hidden isn't echoed).
+        let mut spec = s.clone();
+        for opt in ["hidden", "sparse", "unique"] {
+            if spec.get(opt).is_some_and(is_falsy) {
+                spec.remove(opt);
+            }
+        }
         let created = storage
-            .create_index(&ctx.db_name, &coll, &name, &key, s)
+            .create_index(&ctx.db_name, &coll, &name, &key, &spec)
             .map_err(command_error)?;
         any_created |= created;
     }

@@ -110,6 +110,72 @@ fn create_compound_geo_scalar_index() {
 }
 
 #[test]
+fn create_indexes_validates_options() {
+    // mongo-ruby-driver index-option specs: commitQuorum / wildcardProjection
+    // validation, falsy-hidden stripping, and listIndexes on a missing namespace.
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1}]}, c);
+
+        // commitQuorum with an unsupported value -> UnknownReplWriteConcern (79).
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}], "commitQuorum": "unsupported-value"},
+            c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 79, "{r:?}");
+        assert!(r
+            .get_str("errmsg")
+            .unwrap()
+            .contains("No write concern mode named 'unsupported-value'"));
+
+        // wildcardProjection must be a non-empty document.
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"$**": 1}, "name": "w", "wildcardProjection": 5}]},
+            c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 67);
+        assert!(r
+            .get_str("errmsg")
+            .unwrap()
+            .contains("wildcardProjection must be a non-empty object"));
+
+        // wildcardProjection only on a wildcard ($**) index.
+        let r = dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"x": 1}, "name": "x_1", "wildcardProjection": {"rating": 1}}]},
+            c,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), 67);
+        assert!(r
+            .get_str("errmsg")
+            .unwrap()
+            .contains("wildcardProjection is only allowed on wildcard indexes"));
+
+        // hidden: false is dropped, not echoed by listIndexes.
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"h": 1}, "name": "h_1", "hidden": false}]},
+            c,
+        );
+        let h = dispatch(&doc! {"listIndexes": "c"}, c)
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_document().unwrap().clone())
+            .find(|ix| ix.get_str("name") == Ok("h_1"))
+            .unwrap();
+        assert!(
+            !h.contains_key("hidden"),
+            "hidden:false should not be echoed: {h:?}"
+        );
+
+        // listIndexes on a nonexistent collection -> NamespaceNotFound (26).
+        let r = dispatch(&doc! {"listIndexes": "nope"}, c);
+        assert_eq!(r.get_i32("code").unwrap(), 26, "{r:?}");
+        assert!(r.get_str("errmsg").unwrap().contains("ns does not exist"));
+    });
+}
+
+#[test]
 fn server_status_tracks_open_cursor_count() {
     // metrics.cursor.open.total rises while a batched cursor is open and returns
     // to baseline after killCursors (mongo-php-driver cursor-destruct-001).
