@@ -153,7 +153,16 @@ def main() -> int:
         _verify_secantus_identity(host, port, "go_validation")
 
         env = os.environ.copy()
-        env["MONGODB_URI"] = f"mongodb://{host}:{port}"
+        # serverSelectionTimeoutMS is bumped from the driver's 30s default to
+        # 60s. Under `validate-all`'s multi-gauge CPU / socket-buffer
+        # contention the daemon can briefly miss a heartbeat, and
+        # `TestIndexView/drop_one` / `drop_all` then trip the 30s
+        # server-selection deadline mid-test (`context deadline exceeded`,
+        # topology `Type: Unknown`) — a documented flake, not a server bug
+        # (tasks/backlog.md). The longer floor rides out the transient blip; a
+        # genuinely unreachable daemon still fails well inside the 30m package
+        # timeout.
+        env["MONGODB_URI"] = f"mongodb://{host}:{port}/?serverSelectionTimeoutMS=60000"
         env.setdefault("REQUIRE_API_VERSION", "false")
 
         # Default Go per-package timeout is 10 min. The mongo-go-driver
