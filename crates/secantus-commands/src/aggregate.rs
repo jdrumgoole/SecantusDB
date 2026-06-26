@@ -222,6 +222,7 @@ fn is_storage_backed(name: &str) -> bool {
             | "$out"
             | "$merge"
             | "$geoNear"
+            | "$unionWith"
     )
 }
 
@@ -416,6 +417,7 @@ fn apply_storage_stage(
         "$out" => apply_out(spec, docs, db, storage, bypass_validation),
         "$merge" => apply_merge(spec, docs, db, storage, bypass_validation),
         "$geoNear" => apply_geo_near(spec, docs, db, coll, vars, storage),
+        "$unionWith" => apply_union_with(spec, docs, db, storage, collation),
         _ => Err(bad_value(format!(
             "unsupported storage-backed stage {name}"
         ))),
@@ -623,6 +625,60 @@ fn apply_facet(
         );
     }
     Ok(vec![out])
+}
+
+/// `$unionWith` — concatenate docs from another collection, optionally after a
+/// sub-pipeline. The spec is a bare collection name (`{$unionWith: "coll"}`) or
+/// `{coll, pipeline}`. The sub-pipeline runs in a *fresh* context (outer `let` /
+/// vars are not visible — mongod's `$unionWith` has no `let`), and the union docs
+/// are appended after the input docs (no dedup). Mirrors
+/// `aggregate._stage_union_with`.
+fn apply_union_with(
+    spec: Option<&Bson>,
+    mut docs: Vec<Document>,
+    db: &str,
+    storage: &dyn crate::storage::Storage,
+    collation: Option<&Collation>,
+) -> Result<Vec<Document>, CommandError> {
+    let (from, sub_pipeline): (&str, Option<&Vec<Bson>>) = match spec {
+        Some(Bson::String(s)) => (s.as_str(), None),
+        Some(Bson::Document(d)) => {
+            let from = d
+                .get_str("coll")
+                .map_err(|_| bad_value("$unionWith requires 'coll' (string)"))?;
+            let sub = match d.get("pipeline") {
+                None => None,
+                Some(Bson::Array(a)) if !a.is_empty() => Some(a),
+                Some(Bson::Array(_)) => None, // empty pipeline is a no-op
+                Some(_) => return Err(bad_value("$unionWith 'pipeline' must be an array")),
+            };
+            (from, sub)
+        }
+        _ => {
+            return Err(bad_value(
+                "$unionWith requires a collection name or {coll, pipeline} doc",
+            ))
+        }
+    };
+    let mut foreign: Vec<Document> = decode_docs(
+        storage
+            .find(db, from, &Document::new(), None, None)
+            .map_err(command_error)?,
+    )?;
+    if let Some(sub) = sub_pipeline {
+        foreign = run_segmented(
+            foreign,
+            sub,
+            db,
+            Some(from),
+            &Document::new(),
+            storage,
+            collation,
+            &Document::new(),
+        )?;
+    }
+    docs.append(&mut foreign);
+    Ok(docs)
 }
 
 /// BFS over `foreign` from `seed`, chasing `connect_from` → `connect_to`.
