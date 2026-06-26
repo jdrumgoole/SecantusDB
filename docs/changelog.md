@@ -19,6 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### A tailable cursor's filter now applies to docs inserted after the find
+
+A tailable + `awaitData` cursor on a capped collection re-polls the
+collection for documents inserted after the `find`. That poll was
+returning *every* new row, ignoring the cursor's query filter — so a
+tailable cursor watching for `{a: 1}` would surface unrelated inserts
+(and even pre-existing non-matching docs) the moment it ran a `getMore`.
+The producer now re-applies the find filter (with the same `let` vars and
+collation) to each scanned row, exactly as the oplog-tailing variant
+already did. The watermark still advances past every scanned row, matched
+or not, so non-matching docs aren't re-examined on the next poll. Closes
+the mongo-c-driver gauge's `/Collection/tailable/timeout/single`.
+
+#### Fixed
+- `commands._find_tailable`: the capped-collection tailable producer
+  filters follow-up inserts through `query.matches` instead of returning
+  them unconditionally.
+
 ### A malformed `$and` / `$or` / `$nor` is a clean parse error, not a crash
 
 `$and` / `$or` / `$nor` require a non-empty array of sub-documents. A query
