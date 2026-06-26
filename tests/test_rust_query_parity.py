@@ -360,8 +360,19 @@ CURATED = [
             }
         },
     ),
-    # $center -> Rust returns None (Fallback to Python); curated test skips it.
+    # $geoWithin $center (planar disk) — in / out. Rust uses an exact disk and
+    # Python a Shapely 64-gon buffer; they agree away from the sub-degree boundary
+    # annulus, so these points sit well inside / outside.
     ({"loc": [1.0, 1.0]}, {"loc": {"$geoWithin": {"$center": [[0.0, 0.0], 5.0]}}}),
+    ({"loc": [40.0, 40.0]}, {"loc": {"$geoWithin": {"$center": [[0.0, 0.0], 5.0]}}}),
+    # $near legacy 2d sibling form ({$near: [x,y], $maxDistance, $minDistance}) —
+    # the shape Java's Filters.near builds. In / out of the planar bound.
+    ({"loc": [1.0, 1.0]}, {"loc": {"$near": [0.0, 0.0], "$maxDistance": 5.0}}),
+    ({"loc": [5.0, 5.0]}, {"loc": {"$near": [0.0, 0.0], "$maxDistance": 5.0}}),
+    ({"loc": [1.0, 1.0]}, {"loc": {"$near": [0.0, 0.0], "$maxDistance": 5.0, "$minDistance": 3.0}}),
+    # $nearSphere legacy sibling form ($maxDistance in radians on the unit sphere).
+    ({"loc": [0.0, 0.0]}, {"loc": {"$nearSphere": [0.0, 0.0], "$maxDistance": 0.1}}),
+    ({"loc": [10.0, 10.0]}, {"loc": {"$nearSphere": [0.0, 0.0], "$maxDistance": 0.1}}),
 ]
 
 
