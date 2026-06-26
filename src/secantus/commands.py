@@ -2853,11 +2853,15 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     oplog_err = _reject_oplog_rs_write(ctx, coll, "drop")
     if oplog_err is not None:
         return oplog_err
-    existed = ctx.storage.drop_collection(ctx.db_name, coll)
-    # mongod kills the collection's open cursors on drop; a later getMore
-    # then fails with CursorNotFound rather than serving stale snapshot
-    # rows (mongo-c-driver's ``error_document/getmore``).
+    # mongod kills the collection's open cursors on drop. Tombstone them
+    # *before* the storage drop: dropping the collection emits an oplog
+    # entry that wakes any awaitData ``getMore`` parked on a tailable
+    # cursor, and it must observe the ``dropped`` flag (set here) so it
+    # returns "collection dropped" rather than re-polling the now-gone
+    # collection. Non-tailable cursors are removed (later getMore →
+    # CursorNotFound, per mongo-c-driver's ``error_document/getmore``).
     ctx.cursors.kill_namespace(_ns(ctx.db_name, coll))
+    existed = ctx.storage.drop_collection(ctx.db_name, coll)
     if not existed:
         # Modern mongod treats ``drop`` of a non-existent collection as
         # an idempotent success (``{ok: 1}``), not a NamespaceNotFound
@@ -3677,6 +3681,20 @@ def _capped_position_lost_reply() -> dict[str, Any]:
     }
 
 
+def _collection_dropped_reply(ns: str) -> dict[str, Any]:
+    """Error a tailable ``getMore`` returns when its collection was dropped
+    out from under it. mongod kills the plan executor with ``QueryPlanKilled``
+    (175) and a message naming the dropped namespace; mongo-php-driver's
+    ``cursor-tailable_error-001`` asserts the message contains
+    "collection dropped"."""
+    return {
+        "ok": 0.0,
+        "errmsg": f"collection dropped: {ns}",
+        "code": 175,
+        "codeName": "QueryPlanKilled",
+    }
+
+
 def _drain_change_stream_producer(entry: Any) -> None:
     """Pull one producer batch into ``entry.remaining`` if it's empty.
 
@@ -3800,6 +3818,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
             "ok": 1.0,
         }
+    # Collection dropped out from under the cursor: surface the dropped
+    # error before anything else (any buffered rows are stale).
+    if entry.dropped:
+        ctx.cursors.kill([cursor_id])
+        return _collection_dropped_reply(entry.namespace or ns)
     # Drain any already-buffered events first.
     try:
         _drain_change_stream_producer(entry)
@@ -3827,10 +3850,15 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 lambda: (
                     ctx.storage.oplog_tail_seq_nolock() > captured_tail
                     or entry.invalidated
+                    or entry.dropped
                     or ctx.storage._shutting_down
                 ),
                 timeout=wait_seconds,
             )
+        # A concurrent drop may have tombstoned the cursor while we waited.
+        if entry.dropped:
+            ctx.cursors.kill([cursor_id])
+            return _collection_dropped_reply(entry.namespace or ns)
         try:
             _drain_change_stream_producer(entry)
         except changestreams.ChangeStreamFatalError as exc:
@@ -4299,6 +4327,7 @@ def _aggregate_change_stream(
         await_data=True,
         position_seq=start_seq - 1,
         collection_uuid=coll_uuid,
+        change_stream=True,
     )
     entry = ctx.cursors.get(cursor_id)
     entry_ref["entry"] = entry
