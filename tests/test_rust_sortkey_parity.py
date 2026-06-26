@@ -24,7 +24,7 @@ import types
 
 import bson
 import pytest
-from bson import Binary, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
 from bson.timestamp import Timestamp
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
@@ -117,6 +117,9 @@ def _curated_values():
         {"a": 1, "b": "x"},
         {"nested": {"deep": [1, {"k": ObjectId()}]}},
         Regex("^abc$", "im"),
+        # bson.Code subclasses str, so both engines rank it RANK_STRING.
+        Code("function(){}"),
+        Code("x"),
     ]
 
 

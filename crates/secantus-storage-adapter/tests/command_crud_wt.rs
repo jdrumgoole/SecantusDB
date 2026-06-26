@@ -89,6 +89,49 @@ fn insert_validation_errinfo_details_carries_considered_value() {
 }
 
 #[test]
+fn duplicate_key_writeerror_message_shape() {
+    // E11000 writeError carries mongod's exact errmsg + keyPattern/keyValue
+    // (mongo-php-driver writeError-getMessage / writeResult-getWriteErrors).
+    with_wt(|c| {
+        let r = dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1}, {"_id": 1}], "ordered": true},
+            c,
+        );
+        let e = r.get_array("writeErrors").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert_eq!(e.get_i32("code").unwrap(), 11000);
+        assert_eq!(e.get_i32("index").unwrap(), 1);
+        assert_eq!(
+            e.get_str("errmsg").unwrap(),
+            "E11000 duplicate key error collection: t.c index: _id_ dup key: { _id: 1 }"
+        );
+        assert_eq!(e.get_document("keyPattern").unwrap(), &doc! {"_id": 1});
+        assert_eq!(e.get_document("keyValue").unwrap(), &doc! {"_id": 1});
+    });
+}
+
+#[test]
+fn upsert_with_code_id_succeeds() {
+    // A bson Code value is a valid _id (pymongo ranks it as a string); the upsert
+    // inserts and reports it (mongo-php-driver writeResult-getUpsertedIds).
+    with_wt(|c| {
+        let code = Bson::JavaScriptCode("function(){}".into());
+        let r = dispatch(
+            &doc! {"update": "c", "updates": [
+                {"q": {"_id": code.clone()}, "u": {"$set": {"x": 1}}, "upsert": true}
+            ]},
+            c,
+        );
+        assert_eq!(r.get_i32("n").unwrap(), 1);
+        let up = r.get_array("upserted").unwrap();
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0].as_document().unwrap().get("_id"), Some(&code));
+    });
+}
+
+#[test]
 fn insert_bypass_document_validation_skips_validator() {
     with_wt(|c| {
         dispatch(

@@ -704,6 +704,47 @@ fn index_keys_equiv(a: &Document, b: &Document) -> bool {
         })
 }
 
+/// Format a scalar BSON value the way the mongo shell prints it, for the
+/// `dup key: { … }` fragment of an E11000 message (drivers like the PHP extension
+/// pin the text verbatim). Mirrors `storage._shell_value`.
+fn shell_value(v: &Bson) -> String {
+    match v {
+        Bson::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Bson::String(s) => format!("\"{s}\""),
+        Bson::ObjectId(o) => format!("ObjectId('{o}')"),
+        Bson::Null => "null".to_string(),
+        Bson::Int32(i) => i.to_string(),
+        Bson::Int64(i) => i.to_string(),
+        // Match Python `str(float)`: integral doubles keep a trailing `.0`.
+        Bson::Double(d) if d.fract() == 0.0 && d.is_finite() => format!("{d:.1}"),
+        Bson::Double(d) => d.to_string(),
+        Bson::Decimal128(d) => d.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Build mongod's E11000 duplicate-key `errmsg`:
+/// `E11000 duplicate key error collection: <ns> index: <name> dup key: { <k>: <v>, … }`
+/// — the exact shape drivers assert against. Mirrors `storage.format_dup_key_errmsg`.
+fn format_dup_key_errmsg(namespace: &str, index_name: &str, key_value: &Document) -> String {
+    let dup = if key_value.is_empty() {
+        "{ }".to_string()
+    } else {
+        let inner: Vec<String> = key_value
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", shell_value(v)))
+            .collect();
+        format!("{{ {} }}", inner.join(", "))
+    };
+    format!("E11000 duplicate key error collection: {namespace} index: {index_name} dup key: {dup}")
+}
+
 /// Direction-aware sort-key encoding for one value (defers to Python on the
 /// constructs the Rust encoder can't reproduce).
 fn enc_dir(v: &Bson, direction: i32) -> Result<Vec<u8>> {
@@ -2322,13 +2363,11 @@ impl Storage {
             }
             // Unique-index pre-check (collect a write-error rather than abort).
             if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+                let ns = format!("{db}.{coll}");
                 let mut e = Document::new();
                 e.insert("index", index as i32);
                 e.insert("code", 11000i32);
-                e.insert(
-                    "errmsg",
-                    format!("E11000 duplicate key error in index {}", c.index),
-                );
+                e.insert("errmsg", format_dup_key_errmsg(&ns, &c.index, &c.key_value));
                 e.insert("keyPattern", Bson::Document(c.key_pattern));
                 e.insert("keyValue", Bson::Document(c.key_value));
                 errors.push(e);
@@ -2351,10 +2390,20 @@ impl Storage {
             match doc_cur.insert() {
                 Ok(()) => {}
                 Err(e) if e.is_duplicate_key() => {
+                    let ns = format!("{db}.{coll}");
+                    let mut key_value = Document::new();
+                    key_value.insert("_id", id.clone());
+                    let mut key_pattern = Document::new();
+                    key_pattern.insert("_id", 1i32);
                     let mut ed = Document::new();
                     ed.insert("index", index as i32);
                     ed.insert("code", 11000i32);
-                    ed.insert("errmsg", format!("E11000 duplicate key error: _id {id:?}"));
+                    ed.insert(
+                        "errmsg",
+                        format_dup_key_errmsg(&ns, ID_INDEX_NAME, &key_value),
+                    );
+                    ed.insert("keyPattern", Bson::Document(key_pattern));
+                    ed.insert("keyValue", Bson::Document(key_value));
                     errors.push(ed);
                     if ordered {
                         break;
