@@ -51,10 +51,6 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   `showExpandedEvents`; added the `modify` branch. A `showExpandedEvents` watch
   now sees `createIndexes` / `dropIndexes` / `modify`, and a default watch
   suppresses them.
-- [ ] **Rust server: `test_split_large_change`** — a >16 MB change event (10 MB
-  pre-image + 10 MB post-image) the Rust server can't return (no real event
-  splitting; `of` is always 1), which OOMs/errors under parallel load. Still
-  open — change-stream territory (coordinate with the change-stream owner).
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **C-driver (`libmongoc`) change-stream gauge tests excluded** — the C gauge's `include_paths.py` deliberately omits the `/change_stream` and `/change_streams` suites. libmongoc's test fixture bootstraps every change-stream test through `test_framework_replset_member_count()`, which now sees `replSetGetStatus` → `NoReplicationEnabled` (member count 0) and therefore *skips* those tests as "standalone". They no longer abort the run (that was the pre-`replSetGetStatus` behaviour), but they wouldn't actually exercise the change-stream path either, so they're left out. To gauge change streams through the C driver, `replSetGetStatus` would need to report ≥1 live member (a fuller fake-replset reply) — a larger emulation change than the standalone error we ship.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
@@ -1181,12 +1177,6 @@ artifact. **Clean (0 rust-only): c, cxx, dotnet, kotlin, node, mongo-rust-driver
 Remaining rust-only = ~21 actionable in 4 themes (+ 4 out-of-scope session tests).
 When you close a bucket, delete it.
 
-- [ ] **`splitLargeChangeStreamEvents` not implemented in the Rust server (2 tests, 1 feature).**
-  `test_change_stream.py::...::test_split_large_change` fails on both the pymongo and
-  pymongo-async gauges. In scope per CLAUDE.md (the envelope is supported on the Python
-  server: every fragment `{fragment: 1, of: 1}` when the user opts in). Cleanest, best-
-  defined fix — one feature clears both. Port the Python server's change-stream split
-  envelope handling to the Rust changestream projection / dispatch.
 - [ ] **Geo `$center` / `$near` / `$nearSphere` query operators (3 tests, java).**
   java `GeoFiltersFunctionalSpecification#$geoWithin $center / $near / $nearSphere` fail
   on Rust; Python passes them (its java geo specs are 10/10). The Rust geo *index* path
