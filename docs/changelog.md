@@ -19,6 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Atlas Search index commands are rejected with an "Atlas" error
+
+Atlas Search index management — the `createSearchIndexes`, `updateSearchIndex`,
+and `dropSearchIndex` commands plus the `$listSearchIndexes` aggregation stage
+(and its `$search` / `$searchMeta` / `$vectorSearch` siblings) — is an
+Atlas-only feature. A real non-Atlas `mongod` registers these but fails them at
+execution with a message naming Atlas. SecantusDB now does the same
+(`CommandNotSupported`, message mentioning Atlas) instead of returning
+`CommandNotFound` / an "unrecognized pipeline stage" error. Closes the
+mongo-c-driver `/index-management/{list,drop,update,create}SearchIndex` tests,
+which assert the error contains "Atlas".
+
+#### Added
+- `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` command
+  handlers and `$listSearchIndexes` / `$search` / `$searchMeta` /
+  `$vectorSearch` aggregation-stage rejection, all returning the shared
+  `aggregate.SEARCH_INDEX_ATLAS_MSG` (mirrors mongod's not-on-Atlas error).
+
 ### Dropping a collection under a tailable cursor reports "collection dropped"
 
 When a capped collection is dropped while a tailable cursor is open on

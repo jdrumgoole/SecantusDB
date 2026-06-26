@@ -2611,6 +2611,35 @@ def test_tailable_drop_closes_pymongo_cursor_cleanly(client: MongoClient) -> Non
     assert cursor.alive is False
 
 
+def test_atlas_search_index_commands_rejected(client: MongoClient) -> None:
+    """Atlas Search index management is Atlas-only. A non-Atlas mongod rejects
+    the createSearchIndexes / updateSearchIndex / dropSearchIndex commands and
+    the $listSearchIndexes aggregation stage with an error naming Atlas — the
+    mongo-c-driver /index-management/{list,drop,update}SearchIndex tests assert
+    the error mentions "Atlas". Previously these surfaced as CommandNotFound /
+    unrecognized-stage, neither containing "Atlas"."""
+    db = client["atlas_search_db"]
+    db.coll.insert_one({"x": 1})
+
+    # $listSearchIndexes aggregation stage.
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        list(db.coll.aggregate([{"$listSearchIndexes": {}}]))
+    assert "Atlas" in str(exc.value)
+
+    # The three search-index management commands.
+    for cmd in (
+        {"createSearchIndexes": "coll", "indexes": [{"name": "i", "definition": {}}]},
+        {"updateSearchIndex": "coll", "name": "i", "definition": {}},
+        {"dropSearchIndex": "coll", "name": "i"},
+    ):
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            db.command(cmd)
+        assert "Atlas" in str(exc.value), f"{next(iter(cmd))} error missing 'Atlas'"
+
+    # A normal aggregation is unaffected.
+    assert list(db.coll.aggregate([{"$match": {"x": 1}}, {"$project": {"_id": 0}}])) == [{"x": 1}]
+
+
 # --- local.oplog.rs wire-surface (pymongo-driven) -------------------------
 
 

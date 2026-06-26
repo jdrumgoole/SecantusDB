@@ -175,6 +175,23 @@ def test_unsupported_stage_raises() -> None:
         apply_pipeline([{"x": 1}], [{"$bogusStage": {}}])
 
 
+def test_atlas_only_stage_rejected_with_atlas_message() -> None:
+    # Atlas-only stages ($listSearchIndexes / $search / $searchMeta /
+    # $vectorSearch) are rejected with a message naming Atlas and code 115,
+    # not the generic 40324 "unrecognized stage" — drivers' index-management
+    # spec tests assert errorContains "Atlas".
+    from secantus.aggregate import validate_stage_names
+
+    for stage in ("$listSearchIndexes", "$search", "$searchMeta", "$vectorSearch"):
+        with pytest.raises(AggregateError, match="Atlas") as exc:
+            apply_pipeline([{"x": 1}], [{stage: {}}])
+        assert exc.value.code == 115
+        assert exc.value.code_name == "CommandNotSupported"
+        # Also rejected up-front at parse time (before any document flows).
+        with pytest.raises(AggregateError, match="Atlas"):
+            validate_stage_names([{stage: {}}])
+
+
 def test_project_mixed_inclusion_exclusion_rejected() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline([{"a": 1, "b": 2}], [{"$project": {"a": 1, "b": 0}}])
