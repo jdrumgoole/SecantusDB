@@ -14,6 +14,7 @@ import bson
 
 from secantus import changestreams
 from secantus.aggregate import (
+    SEARCH_INDEX_ATLAS_MSG,
     AggregateError,
     PipelineContext,
     apply_pipeline,
@@ -3613,6 +3614,24 @@ def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"nIndexesWas": num_before, "ok": 1.0}
 
 
+# Atlas Search index management (createSearchIndexes / updateSearchIndex /
+# dropSearchIndex commands + the $listSearchIndexes aggregation stage) is an
+# Atlas-only feature. A real non-Atlas mongod registers these commands but
+# fails them at execution with a message naming Atlas; the driver
+# index-management spec tests assert only that the error mentions "Atlas"
+# (mongo-c-driver's /index-management/{list,drop,update}SearchIndex). We are
+# not Atlas and never will be, so we reject them the same way. The shared
+# message lives in ``aggregate`` so the $listSearchIndexes stage and these
+# commands stay in lockstep.
+def _search_index_not_supported(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    return {
+        "ok": 0.0,
+        "errmsg": SEARCH_INDEX_ATLAS_MSG,
+        "code": 115,
+        "codeName": "CommandNotSupported",
+    }
+
+
 def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_ids = [int(c) for c in doc.get("cursors", [])]
     # Wake any in-flight `_get_more` on these cursors BEFORE removing them
@@ -5610,6 +5629,10 @@ _HANDLERS: dict[str, CommandHandler] = {
     "listIndexes": _list_indexes,
     "createIndexes": _create_indexes,
     "dropIndexes": _drop_indexes,
+    # Atlas-only search index management — rejected with an "Atlas" error.
+    "createSearchIndexes": _search_index_not_supported,
+    "updateSearchIndex": _search_index_not_supported,
+    "dropSearchIndex": _search_index_not_supported,
     "killCursors": _kill_cursors,
     "getMore": _get_more,
     "aggregate": _aggregate,

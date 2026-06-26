@@ -29,6 +29,22 @@ class AggregateError(Exception):
         self.code_name = code_name
 
 
+# Atlas Search is an Atlas-only feature. A real non-Atlas mongod rejects the
+# ``$listSearchIndexes`` aggregation stage (and the createSearchIndexes /
+# updateSearchIndex / dropSearchIndex commands, see ``commands.py``) with a
+# message naming Atlas; the driver index-management spec tests assert only that
+# the error mentions "Atlas". Shared with ``commands.py`` so the stage and the
+# commands stay in lockstep.
+SEARCH_INDEX_ATLAS_MSG = (
+    "Using Atlas Search Database Commands and the $listSearchIndexes aggregation "
+    "stage requires additional configuration. Please connect to Atlas or an "
+    "Atlas-compatible deployment to use this feature."
+)
+# Atlas-only aggregation stages: not supported off Atlas, rejected with the
+# Atlas message above rather than the generic "unrecognized stage" error.
+_ATLAS_ONLY_STAGES = frozenset({"$listSearchIndexes", "$search", "$searchMeta", "$vectorSearch"})
+
+
 @dataclass
 class PipelineContext:
     storage: Storage | None = None
@@ -120,6 +136,12 @@ def _apply_stage(
     if len(stage) != 1:
         raise AggregateError("each pipeline stage must have exactly one key")
     name, spec = next(iter(stage.items()))
+    if name in _ATLAS_ONLY_STAGES:
+        # Atlas-only stage on a non-Atlas deployment — mongod fails it with a
+        # message naming Atlas (CommandNotSupported), not the generic
+        # "unrecognized stage" error (mongo-c-driver
+        # /index-management/listSearchIndexes asserts errorContains "Atlas").
+        raise AggregateError(SEARCH_INDEX_ATLAS_MSG, code=115, code_name="CommandNotSupported")
     handler = _STAGES.get(name)
     if handler is None:
         # mongod's exact shape: 40324 with this wording (the unified
@@ -2244,6 +2266,11 @@ def validate_stage_names(pipeline: list[Any]) -> None:
         if not isinstance(stage, Mapping) or len(stage) != 1:
             raise AggregateError("each pipeline stage must have exactly one key")
         name = next(iter(stage))
+        if name in _ATLAS_ONLY_STAGES:
+            # Atlas-only stage — reject with the Atlas message at parse time
+            # (this validation runs before any document flows), so the driver
+            # sees "Atlas" rather than the generic unrecognized-stage error.
+            raise AggregateError(SEARCH_INDEX_ATLAS_MSG, code=115, code_name="CommandNotSupported")
         if name not in _STAGES:
             raise AggregateError(
                 f"Unrecognized pipeline stage name: '{name}'",
