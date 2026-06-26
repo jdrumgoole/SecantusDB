@@ -51,10 +51,6 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   `showExpandedEvents`; added the `modify` branch. A `showExpandedEvents` watch
   now sees `createIndexes` / `dropIndexes` / `modify`, and a default watch
   suppresses them.
-- [ ] **Rust server: `test_split_large_change`** — a >16 MB change event (10 MB
-  pre-image + 10 MB post-image) the Rust server can't return (no real event
-  splitting; `of` is always 1), which OOMs/errors under parallel load. Still
-  open — change-stream territory (coordinate with the change-stream owner).
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
 - [ ] **C-driver (`libmongoc`) change-stream gauge tests excluded** — the C gauge's `include_paths.py` deliberately omits the `/change_stream` and `/change_streams` suites. libmongoc's test fixture bootstraps every change-stream test through `test_framework_replset_member_count()`, which now sees `replSetGetStatus` → `NoReplicationEnabled` (member count 0) and therefore *skips* those tests as "standalone". They no longer abort the run (that was the pre-`replSetGetStatus` behaviour), but they wouldn't actually exercise the change-stream path either, so they're left out. To gauge change streams through the C driver, `replSetGetStatus` would need to report ≥1 live member (a fuller fake-replset reply) — a larger emulation change than the standalone error we ship.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
@@ -1171,6 +1167,67 @@ Remaining sub-divergence: **capped-collection eviction** still selects victims i
 `id_key` order (see §4 capped note), not insertion order — only the `find` result
 order and `$natural` were moved onto the new index. Closing that means routing
 `enforce_capped_bounds` through a natural-order scan too.
+
+### 7.4 Verified rust-only gauge tail (2026-06-25)
+
+Authoritative `invoke validate-all-servers --jobs 4` run (every gauge on **both**
+Python and Rust, same day, JDK 17 for java) — so each "rust-only" item below is a
+failure the Rust server has that the **Python server does not**, not a stale-baseline
+artifact. **Clean (0 rust-only): c, cxx, dotnet, kotlin, node, mongo-rust-driver.**
+Remaining rust-only = ~21 actionable in 4 themes (+ 4 out-of-scope session tests).
+When you close a bucket, delete it.
+
+- [ ] **Geo `$center` / `$near` / `$nearSphere` query operators (3 tests, java).**
+  java `GeoFiltersFunctionalSpecification#$geoWithin $center / $near / $nearSphere` fail
+  on Rust; Python passes them (its java geo specs are 10/10). The Rust geo *index* path
+  and `2dsphere`/`2d` creation work (§7.3-era), but these planar/near query operators
+  diverge — likely the `$center` planar-disk and `$near`/`$nearSphere` distance-sort
+  field paths in `secantus_core::geo` + the query/aggregate wiring. Verify against the
+  Python `secantus.geo` operators.
+- [ ] **php-ext write-reply wire shapes (6 tests, php-ext — strictest gauge).**
+  `WriteError` debug output + `WriteError::getMessage()`; `WriteResult::getWriteErrors()`
+  (ordered + unordered) + `getUpsertedIds()` with client-generated values; and
+  `Cursor` destruct-should-kill-a-live-cursor. The first five are how the Rust server
+  encodes `writeErrors` / upserted ids in the write reply (shape/field divergence the
+  libmongoc-level gauge catches that pymongo's permissive client misses); the last is
+  killing a still-open cursor when the driver tears it down (killCursors-on-destruct).
+- [ ] **ruby index-option validation + echo (7 tests, ruby).**
+  `Index::View#create_one/create_many` should *raise* on unsupported `commit_quorum`
+  values and on invalid wildcard projections (`create_one ... invalid wildcard projection`
+  ×2, `commit_quorum value is not supported` ×2); `hidden: false` should not apply the
+  hidden option (×2); capped-collection `create` should apply the options; and
+  `Index::View#each` on a nonexistent collection should raise a nonexistent-collection
+  error. All are validation/echo gaps in the Rust `createIndexes` / `create` / `listIndexes`
+  handlers, not query-engine bugs.
+- **Out of scope (session plumbing, do not chase):** ruby "behaves like a failed
+  operation using a session raises an error" (×3, `Collection#create` / `#indexes` /
+  `Index::View#create_one`) and php-lib `WatchFunctionalTest::testSessionFreed` (×1,
+  `resumeCallable` unset on invalidate via reflection). Same class as the deferred
+  change-stream session items — driver-internal session lifecycle, not a wire divergence.
+- **go `TestChangeStream_ReplicaSet/try_next/one getMore sent` (3 entries, 1 test) — NOT a server bug; §5 harness race (verdict 2026-06-26).**
+  The Rust change-stream behaviour was verified **correct** by two direct probes, so the
+  earlier "confirmed real Rust bug / scope-leak" escalation was wrong and is retracted:
+  (1) a pymongo repro against the standalone `secantusdb` binary (`/tmp/cs_repro.py`) —
+  collection-scoped watch on an empty collection returns `try_next()==None` (start
+  position correct), writes to a sibling collection / other DB do **not** surface (no
+  scope leak), and an own-collection write **does** surface (control); (2) the exact go
+  test run **in isolation** (`go test -run TestChangeStream_ReplicaSet/try_next
+  -count=10` against the rust binary) passes **10/10**. The full-suite failure is the
+  documented §5 artifact: other `t.Parallel()` top-level tests write the shared `TestDB`
+  namespace (with collection-name-truncation collisions) during the `try_next` await
+  window, and that genuinely-same-namespace write *correctly* wakes the stream — the test
+  only assumes an empty stream because the shared-daemon gauge doesn't give it the
+  per-test namespace isolation real `mongod`s would. Rust appears more susceptible than
+  Python in the full suite (getMore/await response timing makes it catch the concurrent
+  write more often — Python passed the same-day run, Rust failed), but that's scheduling
+  sensitivity to a harness race, not a wire/correctness divergence. No fix on the
+  SecantusDB side without editing the vendored submodule (forbidden). Accepted, same as
+  the Python-server verdict in §5.
+  - [ ] *Minor, separate:* the `secantusdb` binary doesn't accept `--noop-heartbeat-seconds`
+    (stripped by `gauge_common._PYTHON_ONLY_FLAGS` for the Rust server), so the go gauge
+    runs Rust without periodic noop heartbeats. Not the cause here (the `resume_token_
+    updated_on_empty_batch` test that needs it is in the skip list), but worth adding the
+    flag to the binary for gauge parity.
 
 ---
 
