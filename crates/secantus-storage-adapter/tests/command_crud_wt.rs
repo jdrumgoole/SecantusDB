@@ -14,6 +14,39 @@ fn count(c: &mut CommandContext) -> i32 {
 }
 
 #[test]
+fn capped_eviction_is_fifo_with_non_monotonic_ids() {
+    // A capped collection evicts in true insertion order (FIFO), even when the
+    // _ids are non-monotonic — the first-inserted doc is evicted first, not the
+    // lowest _id. Regression for the natural-order eviction fix.
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "c", "capped": true, "max": 2i64, "size": 100000i64},
+            c,
+        );
+        // Insert in DECREASING _id order: 5, then 3, then 1.
+        for id in [5, 3, 1] {
+            dispatch(&doc! {"insert": "c", "documents": [{"_id": id}]}, c);
+        }
+        // max=2: after inserting 1 (the 3rd), the oldest (_id 5, first inserted)
+        // is evicted — FIFO. id_key order would have wrongly evicted _id 1.
+        let reply = dispatch(&doc! {"find": "c", "sort": {"_id": 1}}, c);
+        let ids: Vec<i32> = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_document().unwrap().get_i32("_id").unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "FIFO should keep the two most-recent inserts"
+        );
+    });
+}
+
+#[test]
 fn insert_then_count() {
     with_wt(|c| {
         let reply = dispatch(

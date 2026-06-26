@@ -4000,12 +4000,58 @@ impl Storage {
         Ok(out)
     }
 
+    /// Like [`scan_docs`] but in natural (insertion `seq`) order, returning
+    /// `(id_key, blob)` pairs. Capped eviction uses this so FIFO holds even for
+    /// non-monotonic custom `_id`s (doc-table `id_key` order only equals insertion
+    /// order for monotonic `_id`s). Falls back to `scan_docs` (id_key order) for a
+    /// legacy collection with no natural-order entries.
+    fn scan_docs_natural(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let doc = session.open_cursor(DOC_TABLE, None)?;
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut saw_any = false;
+        while more {
+            let (d, c, _seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let id_key = nat.get_value_u()?;
+            doc.set_key_ssu(db, coll, &id_key);
+            if doc.search().is_ok() {
+                saw_any = true;
+                out.push((id_key, doc.get_value_u()?));
+            }
+            more = nat.next()?;
+        }
+        if !saw_any {
+            return self.scan_docs(session, db, coll);
+        }
+        Ok(out)
+    }
+
     /// Evict oldest non-fresh docs from a capped collection until within its
-    /// `size` (byte) and `max` (count) bounds. "Oldest" is natural (doc-table
-    /// `id_key`) order, which matches insertion order for monotonic `_id`s.
-    /// Appends a `"d"` oplog entry (and pre-image when enabled) per eviction to
-    /// the caller's vectors. No-op when the collection isn't capped or has no
-    /// bounds. Mirrors `storage._enforce_capped_bounds_locked`.
+    /// `size` (byte) and `max` (count) bounds. "Oldest" is natural (insertion
+    /// `seq`) order via `scan_docs_natural`, so FIFO holds even for non-monotonic
+    /// custom `_id`s. Appends a `"d"` oplog entry (and pre-image when enabled) per
+    /// eviction to the caller's vectors. No-op when the collection isn't capped or
+    /// has no bounds. Mirrors `storage._enforce_capped_bounds_locked`.
     #[allow(clippy::too_many_arguments)]
     fn enforce_capped_bounds(
         &self,
@@ -4037,7 +4083,7 @@ impl Storage {
         if size_limit.is_none() && max_limit.is_none() {
             return Ok(());
         }
-        let scanned = self.scan_docs(session, db, coll)?;
+        let scanned = self.scan_docs_natural(session, db, coll)?;
         let mut total: i64 = scanned.iter().map(|(_, b)| b.len() as i64).sum();
         let mut count = scanned.len() as i64;
         let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
