@@ -2486,6 +2486,48 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
         cur.close()
 
 
+def test_tailable_await_filter_applies_to_follow_up_inserts(client: MongoClient) -> None:
+    """The tailable producer must re-apply the find filter to docs inserted
+    after the find — not just to firstBatch. Regression for the libmongoc
+    ``/Collection/tailable/timeout/single`` failure: a TAILABLE_AWAIT cursor
+    with a filter matching nothing was surfacing every later (and existing)
+    doc, because the producer returned scanned rows unfiltered."""
+    db = client["tail_filter_db"]
+    db.tailcap.drop()
+    db.create_collection("tailcap", capped=True, size=64 * 1024)
+    db.tailcap.insert_one({"x": 1})  # does NOT match {a: 1}
+
+    cur = db.tailcap.find(
+        {"a": 1},
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        batch_size=10,
+    ).max_await_time_ms(100)
+
+    # No matching doc exists yet — the cursor must yield nothing and stay alive.
+    with pytest.raises(StopIteration):
+        cur.next()
+
+    # A non-matching insert must remain invisible.
+    db.tailcap.insert_one({"x": 2})
+    with pytest.raises(StopIteration):
+        cur.next()
+
+    # A matching insert must surface.
+    db.tailcap.insert_one({"a": 1, "tag": "hit"})
+    found = None
+    deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+    while found is None and dt.datetime.now() < deadline:
+        try:
+            found = cur.next()
+        except StopIteration:
+            continue
+    assert found is not None and found.get("tag") == "hit", (
+        f"tailable filter did not surface the matching insert, got {found!r}"
+    )
+    with contextlib.suppress(Exception):
+        cur.close()
+
+
 def test_tailable_capped_rollover_kills_cursor(client: MongoClient) -> None:
     """When a capped collection rolls over and evicts the document a tailable
     cursor is anchored on, mongod kills the cursor with CappedPositionLost

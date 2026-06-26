@@ -2126,7 +2126,17 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # seq rather than the doc-table id_key path ``_find_tailable`` uses.
         if ctx.db_name == "local" and coll == "oplog.rs":
             return _find_tailable_oplog(filter_, docs, batch_size, ns, await_data, ctx)
-        return _find_tailable(coll, docs, batch_size, ns, await_data, ctx)
+        return _find_tailable(
+            coll,
+            docs,
+            batch_size,
+            ns,
+            await_data,
+            ctx,
+            filter_=filter_,
+            let=let,
+            collation=collation,
+        )
     if single_batch:
         first_batch, cursor_id = docs, 0
     else:
@@ -2145,6 +2155,10 @@ def _find_tailable(
     ns: str,
     await_data: bool,
     ctx: CommandContext,
+    *,
+    filter_: dict[str, Any] | None = None,
+    let: dict[str, Any] | None = None,
+    collation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a tailable cursor on a capped collection.
 
@@ -2196,8 +2210,13 @@ def _find_tailable(
         new_rows = storage.scan_docs_after_id_key(db_name, coll, after=after)
         if not new_rows:
             return []
+        # Advance the watermark past every row we scanned — matched or not —
+        # so non-matching docs aren't re-examined on the next poll.
         state["after_id_key"] = new_rows[-1][0]
-        return [doc for _id_k, doc in new_rows]
+        out = [doc for _id_k, doc in new_rows]
+        if filter_:
+            out = [d for d in out if matches(d, filter_, vars=let, collation=collation)]
+        return out
 
     cursor_id = ctx.cursors.register_tailable(
         ns,
