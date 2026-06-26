@@ -14,7 +14,7 @@
 //! and may call `find_matching` for `fullDocument: "updateLookup"` or
 //! `read_preimage` for `fullDocumentBeforeChange`.
 
-use bson::{doc, Bson, Document, Timestamp};
+use bson::{Bson, Document, Timestamp};
 
 use crate::{decode_doc, encode_doc, Result, Storage, StorageError};
 
@@ -263,7 +263,6 @@ pub fn project(
     full_document_before_change_mode: &str,
     scope: &Scope,
     show_expanded_events: bool,
-    split_large_events: bool,
 ) -> Result<(Option<Document>, bool)> {
     let op = oplog_entry.get_str("op").unwrap_or("");
     let ns = oplog_entry.get_str("ns").unwrap_or("").to_string();
@@ -349,12 +348,10 @@ pub fn project(
             storage,
             full_document_before_change_mode,
         )?;
-        // splitLargeChangeStreamEvents: our events never exceed the 16MB cap, so
-        // each is a single fragment {fragment: 1, of: 1} — but the envelope is
-        // present when the user opted in via $changeStreamSplitLargeEvent.
-        if split_large_events {
-            event.insert("splitEvent", doc! { "fragment": 1i32, "of": 1i32 });
-        }
+        // Splitting (splitLargeChangeStreamEvents / $changeStreamSplitLargeEvent)
+        // is applied by the caller via `stamp_split_event` so one over-16MB event
+        // can expand into several fragments — mirrors `commands.py`'s producer
+        // applying `stamp_split_event` to each projected event.
         return Ok((Some(event), false));
     }
 

@@ -128,7 +128,6 @@ impl CmdStorage for StorageAdapter {
                 &opts.full_document_before_change,
                 &wt_scope,
                 opts.show_expanded_events,
-                opts.split_large_events,
             );
             // A fatal projection error (e.g. fullDocument: required with
             // changeStreamPreAndPostImages disabled) ends the stream with an
@@ -143,20 +142,14 @@ impl CmdStorage for StorageAdapter {
                 Err(e) => return Err(map_err(e)),
             };
             if let Some(ev) = event {
-                let mut buf = Vec::new();
-                ev.to_writer(&mut buf)
-                    .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
-                events.push(buf);
+                push_event(&mut events, ev, opts.split_large_events)?;
                 if invalidates {
                     // An invalidating event (drop / rename / dropDatabase on the
                     // watched scope) is followed by a synthesized terminal
                     // `invalidate` event, then the cursor closes — mirroring
                     // `commands.py`'s producer (project → invalidate_event → break).
                     let inv = changestreams::invalidate_event(seq, &entry).map_err(map_err)?;
-                    let mut inv_buf = Vec::new();
-                    inv.to_writer(&mut inv_buf)
-                        .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
-                    events.push(inv_buf);
+                    push_event(&mut events, inv, opts.split_large_events)?;
                     invalidated = true;
                     break;
                 }
@@ -696,6 +689,30 @@ impl CmdStorage for StorageAdapter {
 /// Translate the WT-free command-layer scope into the storage projector's
 /// `Scope`. Identity-shaped; the split exists only to keep `secantus-commands`
 /// free of the WiredTiger-linked `secantus-storage` crate.
+/// Encode a projected change event into the batch, splitting it into fragments
+/// first when the user opted into `splitLargeChangeStreamEvents` /
+/// `$changeStreamSplitLargeEvent` (one over-16MB event → several fragments, each
+/// a valid event tagged `splitEvent: {fragment, of}`). Mirrors `commands.py`'s
+/// producer applying `stamp_split_event` to every projected / invalidate event.
+fn push_event(
+    events: &mut Vec<Vec<u8>>,
+    ev: Document,
+    split_large_events: bool,
+) -> Result<(), StorageError> {
+    let fragments = if split_large_events {
+        changestreams::stamp_split_event(ev).map_err(map_err)?
+    } else {
+        vec![ev]
+    };
+    for frag in fragments {
+        let mut buf = Vec::new();
+        frag.to_writer(&mut buf)
+            .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
+        events.push(buf);
+    }
+    Ok(())
+}
+
 fn to_wt_scope(scope: &ChangeStreamScope) -> WtScope {
     match scope {
         ChangeStreamScope::Cluster => WtScope::Cluster,

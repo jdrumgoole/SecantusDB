@@ -52,17 +52,7 @@ fn project_op(
         .into_iter()
         .find(|(_, b)| decode(b).get_str("op").unwrap() == op)
         .expect("oplog entry");
-    changestreams::project(
-        seq,
-        &decode(&blob),
-        st,
-        full_doc,
-        before,
-        scope,
-        false,
-        false,
-    )
-    .unwrap()
+    changestreams::project(seq, &decode(&blob), st, full_doc, before, scope, false).unwrap()
 }
 
 fn coll_scope() -> Scope {
@@ -166,7 +156,6 @@ fn update_diff_event_has_update_description() {
             FULL_DOC_DEFAULT,
             &Scope::Cluster,
             false,
-            false,
         )
         .unwrap();
         let ev = ev.unwrap();
@@ -198,7 +187,6 @@ fn update_lookup_fetches_current_document() {
             FULL_DOC_UPDATE_LOOKUP,
             FULL_DOC_DEFAULT,
             &Scope::Cluster,
-            false,
             false,
         )
         .unwrap();
@@ -313,7 +301,6 @@ fn rename_event_carries_operation_description_with_drop_target() {
             FULL_DOC_DEFAULT,
             &coll_scope(),
             true, // show_expanded_events
-            false,
         )
         .unwrap();
         let ev = ev.unwrap();
@@ -339,7 +326,6 @@ fn rename_event_carries_operation_description_with_drop_target() {
             FULL_DOC_DEFAULT,
             &coll_scope(),
             false,
-            false,
         )
         .unwrap();
         assert!(ev2.unwrap().get("operationDescription").is_none());
@@ -359,7 +345,6 @@ fn noop_heartbeat_projects_nothing() {
             FULL_DOC_DEFAULT,
             FULL_DOC_DEFAULT,
             &Scope::Cluster,
-            false,
             false,
         )
         .unwrap();
@@ -384,7 +369,6 @@ fn drop_event_invalidates_collection_scope() {
             FULL_DOC_DEFAULT,
             FULL_DOC_DEFAULT,
             &coll_scope(),
-            false,
             false,
         )
         .unwrap();
@@ -426,4 +410,40 @@ fn small_event_gets_single_fragment() {
         frags[0].get_document("splitEvent").unwrap(),
         &doc! {"fragment": 1, "of": 1}
     );
+}
+
+#[test]
+fn over_16mb_event_splits_by_heavy_field() {
+    // An update with a ~10MB pre-image and a ~10MB updated value exceeds 16MB and
+    // has two heavy (>1MB) fields, so it splits into 2 fragments — one heavy field
+    // each, light metadata copied into both (mirrors pymongo test_split_large_change).
+    let big = "q".repeat(10 * 1024 * 1024);
+    let event = doc! {
+        "_id": doc! {"_data": "tok"},
+        "operationType": "update",
+        "ns": doc! {"db": "d", "coll": "c"},
+        "fullDocumentBeforeChange": big.clone(),
+        "updateDescription": doc! {"updatedFields": doc! {"value": big}},
+    };
+    let frags = changestreams::stamp_split_event(event).unwrap();
+    assert_eq!(frags.len(), 2);
+    assert_eq!(
+        frags[0].get_document("splitEvent").unwrap(),
+        &doc! {"fragment": 1, "of": 2}
+    );
+    assert_eq!(
+        frags[1].get_document("splitEvent").unwrap(),
+        &doc! {"fragment": 2, "of": 2}
+    );
+    // Light metadata is copied verbatim into every fragment.
+    for f in &frags {
+        assert_eq!(f.get_str("operationType").unwrap(), "update");
+        assert!(f.get_document("ns").is_ok());
+    }
+    // Each heavy field lands in exactly one fragment.
+    let has_pre: Vec<bool> = frags
+        .iter()
+        .map(|f| f.contains_key("fullDocumentBeforeChange"))
+        .collect();
+    assert_eq!(has_pre.iter().filter(|b| **b).count(), 1);
 }
