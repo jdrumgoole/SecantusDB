@@ -236,6 +236,12 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$floor" => op_floor_ceil(arg, ctx, false),
         "$ceil" => op_floor_ceil(arg, ctx, true),
         "$sqrt" => op_sqrt(arg, ctx),
+        "$exp" => op_exp(arg, ctx),
+        "$ln" => op_ln(arg, ctx),
+        "$log" => op_log(arg, ctx),
+        "$pow" => op_pow(arg, ctx),
+        "$round" => op_round(arg, ctx),
+        "$trunc" => op_trunc(arg, ctx),
         // misc structural / deterministic
         "$dateToParts" => op_date_to_parts(arg, ctx),
         "$range" => op_range(arg, ctx),
@@ -1502,6 +1508,149 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
             } else {
                 Ok(Bson::Null)
             }
+        }
+    }
+}
+
+// `$exp`: e**x. Numeric (incl. bool) -> Double; null -> null; Decimal128 /
+// non-numeric -> Python (matches `expressions._op_exp`, which calls math.exp).
+fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        v => as_float_like(&v)
+            .map(|f| Bson::Double(f.exp()))
+            .ok_or(Fallback),
+    }
+}
+
+// `$ln`: natural log. Python returns null for v <= 0 (incl. NaN, since NaN > 0 is
+// false). Mirrors `expressions._op_ln`.
+fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        v => {
+            let f = as_float_like(&v).ok_or(Fallback)?;
+            Ok(if f > 0.0 {
+                Bson::Double(f.ln())
+            } else {
+                Bson::Null
+            })
+        }
+    }
+}
+
+// `$log`: [number, base] -> log_base(number). Null if any arg null or out of
+// domain (n <= 0, base <= 0, base == 1). Mirrors `expressions._op_log`.
+fn op_log(arg: &Bson, ctx: &Ctx) -> R {
+    let vals = eval_args(arg, ctx)?;
+    if vals.len() != 2 {
+        return Err(Fallback); // Python raises on a non-2 arg
+    }
+    if is_null(&vals[0]) || is_null(&vals[1]) {
+        return Ok(Bson::Null);
+    }
+    let (Some(n), Some(base)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
+        return Err(Fallback);
+    };
+    if n <= 0.0 || base <= 0.0 || base == 1.0 {
+        return Ok(Bson::Null);
+    }
+    // CPython's math.log(n, base) is log(n)/log(base); same operations -> same
+    // result under the shared platform libm.
+    Ok(Bson::Double(n.ln() / base.ln()))
+}
+
+// `$pow`: [base, exp]. Both integer types with a non-negative exponent give an
+// exact integer (Python `int**int`); anything else (a float operand, a negative
+// exponent, or integer overflow past int64) is a Double / defers. Mirrors
+// `expressions._op_pow`.
+fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
+    let vals = eval_args(arg, ctx)?;
+    if vals.len() != 2 {
+        return Err(Fallback);
+    }
+    if is_null(&vals[0]) || is_null(&vals[1]) {
+        return Ok(Bson::Null);
+    }
+    if let (b @ (Bson::Int32(_) | Bson::Int64(_)), e @ (Bson::Int32(_) | Bson::Int64(_))) =
+        (&vals[0], &vals[1])
+    {
+        let base = as_int_like(b).unwrap();
+        let exp = as_int_like(e).unwrap();
+        if exp >= 0 {
+            // checked_pow on i128, then narrow; overflow / exp > u32 -> Python
+            // (a bignum pymongo couldn't encode anyway).
+            return u32::try_from(exp)
+                .ok()
+                .and_then(|e| base.checked_pow(e))
+                .and_then(int_to_bson)
+                .ok_or(Fallback);
+        }
+        // negative exponent -> float, handled below.
+    }
+    let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
+        return Err(Fallback);
+    };
+    Ok(Bson::Double(a.powf(b)))
+}
+
+// Shared arg parse for `$round` / `$trunc`: `[n, place?]` or a bare `n`. A
+// non-integer `place` becomes 0 (mirrors the Python impls). An empty list defers
+// (Python raises / index-errors).
+fn round_trunc_args(arg: &Bson, ctx: &Ctx) -> Result<(Bson, i32), Fallback> {
+    match arg {
+        Bson::Array(a) if !a.is_empty() => {
+            let n = eval(&a[0], ctx)?;
+            let place = if a.len() > 1 {
+                match eval(&a[1], ctx)? {
+                    Bson::Int32(i) => i,
+                    Bson::Int64(i) => i as i32,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            Ok((n, place))
+        }
+        Bson::Array(_) => Err(Fallback),
+        other => Ok((eval(other, ctx)?, 0)),
+    }
+}
+
+// `$round`: round-half-to-even (Python `round`). An int stays an int (unchanged
+// for place >= 0; rounded to the 10^|place| place for place < 0); a double rounds
+// to `place` decimals as a double. Mirrors `expressions._op_round`.
+fn op_round(arg: &Bson, ctx: &Ctx) -> R {
+    let (n, place) = round_trunc_args(arg, ctx)?;
+    match n {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Int32(_) | Bson::Int64(_) => {
+            if place >= 0 {
+                return Ok(n);
+            }
+            let iv = as_int_like(&n).unwrap() as f64;
+            let scale = 10f64.powi(-place);
+            int_to_bson(((iv / scale).round_ties_even() * scale) as i128).ok_or(Fallback)
+        }
+        Bson::Double(d) => {
+            let factor = 10f64.powi(place);
+            Ok(Bson::Double((d * factor).round_ties_even() / factor))
+        }
+        _ => Err(Fallback), // Decimal128 / non-numeric -> Python
+    }
+}
+
+// `$trunc`: truncate toward zero to `place` decimals. Python computes
+// `math.trunc(n * 10**place) / 10**place`, and `/` is float division, so the
+// result is always a double (even for an int input). Mirrors `_op_trunc`.
+fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
+    let (n, place) = round_trunc_args(arg, ctx)?;
+    match n {
+        Bson::Null => Ok(Bson::Null),
+        _ => {
+            let nf = as_float_like(&n).ok_or(Fallback)?;
+            let factor = 10f64.powi(place);
+            Ok(Bson::Double((nf * factor).trunc() / factor))
         }
     }
 }
