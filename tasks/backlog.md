@@ -1254,8 +1254,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   result-format codes), channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert auth,
   user management via SQL (`CREATE ROLE` — users are constructor config, not stored in
   the catalog / shared with the Mongo user store), the `Copy` subprotocol, and cursor
-  `DECLARE`. `psycopg`/`psql` as live gauges need libpq (absent in the dev env), so the
-  wire paths are covered by pure-Python clients — revisit when libpq is available.
+  `DECLARE`. A real-driver gauge runs in CI via **pg8000** (pure-Python) + a SQLAlchemy
+  Core smoke (P7); `psycopg`/`psql`/JDBC as live gauges still need libpq/a JVM (absent in
+  the dev env). Full SQLAlchemy **reflection** (`inspect().get_table_names()` /
+  `get_columns()`) issues `pg_catalog` *joins*, which hit the catalog-join gap (0A000) —
+  needs the join surface before ORM schema reflection works end to end.
 - [ ] **Reflected tables are SELECT-only and not in the pipeline path (P6 landed the
   read path).** A collection with no `CREATE TABLE` reflects (sampled schema-on-read)
   for `SELECT` (incl. `->`/`->>`/`#>` jsonb navigation), but: INSERT/UPDATE/DELETE on an

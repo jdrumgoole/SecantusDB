@@ -913,9 +913,52 @@ def _append_sort_limit(
         pipeline.append({"$limit": limit})
 
 
+def _normalize_params(sql: str) -> str:
+    """Space-pad ``$N`` placeholders so sqlglot doesn't misread ``$1,$2``.
+
+    sqlglot's Postgres tokenizer treats ``$1,$2`` (adjacent, no spaces — what
+    psycopg / pg8000 emit) as the start of a dollar-quoted string. A ``$``
+    followed by digits is unambiguously a bind parameter (Postgres dollar-quote
+    tags can't begin with a digit), so we append a space after each one. String
+    literals are skipped so a ``'$1'`` inside data is left untouched.
+    """
+    if "$" not in sql:
+        return sql
+    out: list[str] = []
+    i, n, in_str = 0, len(sql), False
+    while i < n:
+        ch = sql[i]
+        if in_str:
+            out.append(ch)
+            if ch == "'":
+                if i + 1 < n and sql[i + 1] == "'":  # '' escape
+                    out.append("'")
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if ch == "'":
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "$" and i + 1 < n and sql[i + 1].isdigit():
+            j = i + 1
+            while j < n and sql[j].isdigit():
+                j += 1
+            out.append(sql[i:j])
+            out.append(" ")
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def parse(sql: str) -> list[exp.Expression]:
     """Parse a (possibly multi-statement) SQL string into AST statements."""
     try:
-        return [s for s in sqlglot.parse(sql, read="postgres") if s is not None]
+        return [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
     except sqlglot.errors.ParseError as exc:
         raise errors.syntax_error(str(exc).splitlines()[0]) from exc

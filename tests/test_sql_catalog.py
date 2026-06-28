@@ -38,6 +38,13 @@ def test_version(storage, session):
     assert res.rows[0][0].startswith("PostgreSQL 15.0 (SecantusDB)")
 
 
+def test_schema_qualified_function(storage, session):
+    # SQLAlchemy's init calls pg_catalog.version() — the catalog qualifier is
+    # stripped and the function evaluated.
+    res = q(storage, session, "SELECT pg_catalog.version()")
+    assert res.rows[0][0].startswith("PostgreSQL 15.0 (SecantusDB)")
+
+
 def test_current_database_user_schema(storage, session):
     assert q(storage, session, "SELECT current_database()").rows == [("testdb",)]
     assert q(storage, session, "SELECT current_user").rows == [("joe",)]

@@ -429,9 +429,22 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   **Deferred:** aggregates / joins over reflected tables (the pipeline path is
   still catalog-only), writes to reflected tables, and `jsonb` containment
   operators (`@>` / `?`). Tests: `tests/test_sql_reflect.py`.
-- **P7 — JDBC + tooling hardening.** Postgres JDBC driver, then SQLAlchemy /
-  an ORM reflection smoke. These are the strict introspection clients (the
-  SQL analogue of the Go/PHP-ext gauges being the strictest wire checks).
+- **P7 — Real-driver gauge (pg8000 + SQLAlchemy). ✅ landed.** psql/psycopg need
+  libpq (absent in the dev env), but **`pg8000`** is a *pure-Python* Postgres
+  driver — a real, strict, extended-protocol client that runs here. A gauge
+  (`tests/test_pgserver_pg8000.py`) drives it against `SecantusPGServer`:
+  connect, parameterised CRUD, type round-trips (`numeric`→`Decimal`,
+  `timestamptz`→`datetime`, `bigint`→`int`, `bool`), GROUP BY, JOIN, reflected +
+  jsonb reads, session functions, **SCRAM auth** (pg8000 uses `scramp`), **TLS**
+  (pg8000 `ssl_context`), and a **SQLAlchemy** Core round-trip
+  (`postgresql+pg8000://`). The strict driver immediately found two real bugs,
+  now fixed + pinned: sqlglot mis-tokenising adjacent `$1,$2` placeholders (the
+  driver emits no spaces — fixed by `planner._normalize_params`), and
+  schema-qualified `pg_catalog.version()` from SQLAlchemy's init (fixed by
+  unwrapping `exp.Dot` in `functions`). **Deferred:** full SQLAlchemy *reflection*
+  (`inspect().get_table_names()` issues pg_catalog *joins* — needs the catalog-join
+  surface), the JDBC driver, and a live psql/psycopg gauge (when libpq is
+  available). pg8000 + sqlalchemy added to the `dev` extra so the gauge runs in CI.
 
 ---
 

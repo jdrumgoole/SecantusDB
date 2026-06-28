@@ -64,3 +64,15 @@ def test_insert_builds_field_keyed_docs():
     stmt = sqlglot.parse_one("INSERT INTO users (id, name) VALUES (1, 'x')", read="postgres")
     plan = planner.plan_insert(stmt, USERS)
     assert plan.docs == [{"_id": bson.Int64(1), "name": "x"}]
+
+
+def test_parse_handles_adjacent_parameters():
+    # pg8000 / psycopg emit ``$1,$2`` without spaces; sqlglot mis-tokenizes that
+    # as a dollar-quoted string unless we normalize.
+    (stmt,) = planner.parse("INSERT INTO t (a,b,c) VALUES ($1,$2,$3)")
+    assert len(list(stmt.find_all(sqlglot.exp.Parameter))) == 3
+
+
+def test_parse_leaves_dollar_in_string_literal_untouched():
+    (stmt,) = planner.parse("SELECT * FROM t WHERE name = '$1,$2'")
+    assert stmt.args["where"].this.expression.this == "$1,$2"
