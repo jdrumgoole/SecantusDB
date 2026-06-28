@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlglot import exp
 
-from secantus.sql import errors, executor, planner, typemap, virtual
+from secantus.sql import errors, executor, planner, reflect, typemap, virtual
 from secantus.sql.catalog import Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import REPORTABLE_GUCS, Session
@@ -76,7 +76,10 @@ def describe_statement(
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None
     vtable = virtual.lookup(schema_name, table_node.name)
-    table = vtable.table_def() if vtable is not None else catalog.get(db, table_node.name)
+    if vtable is not None:
+        table = vtable.table_def()
+    else:
+        table = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
     if table is None:
         return None  # undefined table — let Execute raise the real error
     select_plan = planner.plan_select(stmt, table)
@@ -176,7 +179,11 @@ def _run_select(
             f"catalog relation {schema_name}.{table_node.name} is not supported yet"
         )
 
-    table = _require_table(catalog, db, table_node.name)
+    # A declared table, else a reflected (schema-on-read) view of an existing
+    # Mongo collection — the dual-protocol read path.
+    table = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
+    if table is None:
+        raise errors.undefined_table(table_node.name)
     return executor.execute_select(planner.plan_select(stmt, table), storage, db)
 
 

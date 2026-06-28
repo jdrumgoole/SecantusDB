@@ -411,8 +411,24 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   `tests/test_sql_aggregate.py`. Interactive `psql`'s `\d` is now closer but
   still needs the pg_catalog *functions* (`format_type`, `pg_table_is_visible`)
   + casts those join queries use.
-- **P6 — Reflected tables + jsonb.** Read Mongo-written collections via SQL,
-  the dual-protocol view, `jsonb` for nested docs/arrays.
+- **P6 — Reflected tables + jsonb. ✅ landed.** A collection with no
+  `CREATE TABLE` is queryable schema-on-read: `reflect.py` samples N docs, infers
+  a column + type per top-level field, and presents a `TableDef` flagged
+  `reflected` (un-sampled fields still resolve, as the permissive `any` type;
+  nested docs/arrays surface as `jsonb`). `SELECT *` expands to the inferred
+  columns; missing fields read as `NULL`; WHERE coercion uses the inferred type
+  (so `age > 18` compares numerically) or passes the literal through for `any`.
+  **jsonb navigation** — `->` / `->>` / `#>` (sqlglot `JSONExtract` /
+  `JSONExtractScalar` / `JSONBExtract`) lower to dotted field paths read via
+  `paths.get_path`; `->>`/`#>>` type as `text`, `->`/`#>` as `json`. Works in
+  both projection and WHERE, on reflected *and* declared `jsonb` columns. The
+  WHERE translator's `_field` helper resolves either a column or a jsonb path.
+  Reflected tables are **read-only** (no `CREATE TABLE` → INSERT/UPDATE/DELETE
+  still `42P01`); a declared table shadows reflection. This is the dual-protocol
+  payoff — data written via `pymongo` is readable via SQL with no DDL.
+  **Deferred:** aggregates / joins over reflected tables (the pipeline path is
+  still catalog-only), writes to reflected tables, and `jsonb` containment
+  operators (`@>` / `?`). Tests: `tests/test_sql_reflect.py`.
 - **P7 — JDBC + tooling hardening.** Postgres JDBC driver, then SQLAlchemy /
   an ORM reflection smoke. These are the strict introspection clients (the
   SQL analogue of the Go/PHP-ext gauges being the strictest wire checks).

@@ -164,12 +164,44 @@ def table_resolver(table: TableDef) -> Resolve:
     return resolve
 
 
+# jsonb navigation: ->, ->>, #>, #>> parse to these nodes. ``Scalar`` variants
+# (->> / #>>) return text; the others return jsonb.
+_JSONB_CLASSES = (exp.JSONExtract, exp.JSONExtractScalar, exp.JSONBExtract, exp.JSONBExtractScalar)
+_JSONB_SCALAR = (exp.JSONExtractScalar, exp.JSONBExtractScalar)
+
+
+def _is_field_node(node: exp.Expression) -> bool:
+    return isinstance(node, (exp.Column, *_JSONB_CLASSES))
+
+
+def _json_keys(expr: exp.Expression) -> list[str]:
+    """Extract the path keys from a ->/#> right-hand side."""
+    if isinstance(expr, exp.JSONPath):
+        return [p.this for p in expr.expressions if isinstance(p, exp.JSONPathKey)]
+    if isinstance(expr, exp.Literal):
+        # ``#> '{a,b}'`` — a Postgres text[] path literal.
+        return [k for k in str(expr.this).strip("{}").split(",") if k]
+    raise errors.feature_not_supported(f"unsupported jsonb path: {expr.sql()}")
+
+
+def _field(node: exp.Expression, resolve: Resolve) -> tuple[str, str]:
+    """Resolve a column or jsonb-path node to (dotted_field_path, type_tag)."""
+    if isinstance(node, exp.Column):
+        return resolve(node)
+    if isinstance(node, _JSONB_CLASSES):
+        base_path, _ = _field(node.this, resolve)
+        keys = _json_keys(node.expression)
+        path = base_path + ("." + ".".join(keys) if keys else "")
+        return path, ("text" if isinstance(node, _JSONB_SCALAR) else "json")
+    raise errors.feature_not_supported(f"expected a column or jsonb path: {node.sql()}")
+
+
 def _comparison(node: exp.Expression) -> tuple[exp.Expression, exp.Expression]:
-    """Return (column_node, other_node), normalising column-on-the-right."""
+    """Return (field_node, other_node), normalising the field-on-the-right case."""
     left, right = node.this, node.expression
-    if isinstance(left, exp.Column):
+    if _is_field_node(left):
         return left, right
-    if isinstance(right, exp.Column):
+    if _is_field_node(right):
         return right, left
     raise errors.feature_not_supported(f"comparison needs a column: {node.sql()}")
 
@@ -191,48 +223,48 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
         inner = node.this
         # IS NOT NULL parses as Not(Is(col, Null)).
         if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
-            field, _ = resolve(inner.this)
+            field, _ = _field(inner.this, resolve)
             return {field: {"$ne": None}}
         return {"$nor": [_expr_to_filter(inner, resolve)]}
 
     if isinstance(node, exp.Is):
-        field, _ = resolve(node.this)
+        field, _ = _field(node.this, resolve)
         if isinstance(node.expression, exp.Null):
             return {field: None}
         raise errors.feature_not_supported(f"unsupported IS predicate: {node.sql()}")
 
     if isinstance(node, exp.EQ):
         col_node, other = _comparison(node)
-        field, tag = resolve(col_node)
+        field, tag = _field(col_node, resolve)
         return {field: typemap.coerce(_literal(other), tag)}
 
     if isinstance(node, exp.NEQ):
         col_node, other = _comparison(node)
-        field, tag = resolve(col_node)
+        field, tag = _field(col_node, resolve)
         return {field: {"$ne": typemap.coerce(_literal(other), tag)}}
 
     for cls, (op, flipped) in _CMP_OPS.items():
         if isinstance(node, cls):
             col_node, other = _comparison(node)
-            field, tag = resolve(col_node)
-            use = op if isinstance(node.this, exp.Column) else flipped
+            field, tag = _field(col_node, resolve)
+            use = op if _is_field_node(node.this) else flipped
             return {field: {use: typemap.coerce(_literal(other), tag)}}
 
     if isinstance(node, exp.In):
         if node.args.get("query") is not None:
             raise errors.feature_not_supported("IN (subquery) is not supported")
-        field, tag = resolve(node.this)
+        field, tag = _field(node.this, resolve)
         values = [typemap.coerce(_literal(e), tag) for e in node.expressions]
         return {field: {"$in": values}}
 
     if isinstance(node, exp.Between):
-        field, tag = resolve(node.this)
+        field, tag = _field(node.this, resolve)
         low = typemap.coerce(_literal(node.args["low"]), tag)
         high = typemap.coerce(_literal(node.args["high"]), tag)
         return {field: {"$gte": low, "$lte": high}}
 
     if isinstance(node, (exp.Like, exp.ILike)):
-        field, _ = resolve(node.this)
+        field, _ = _field(node.this, resolve)
         pattern = _literal(node.expression)
         spec: dict[str, Any] = {"$regex": _like_to_regex(str(pattern))}
         if isinstance(node, exp.ILike):
@@ -451,16 +483,24 @@ def plan_select(stmt: exp.Select, table: TableDef) -> SelectPlan:
             for col in table.columns:
                 out_columns.append((col.name, col))
             continue
-        if isinstance(e, exp.Alias):
-            name = e.alias
-            target = e.this
-        else:
-            name = _column_name(e)
-            target = e
-        col = table.column(_column_name(target))
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, _JSONB_CLASSES):
+            # jsonb navigation (doc->>'k', doc->'a'->>'b', doc #> '{a,b}') reads a
+            # dotted path; surface it as a synthetic column.
+            path, tag = _field(target, table_resolver(table))
+            out_name = alias or "?column?"
+            out_columns.append((out_name, Column(out_name, tag, path, pk=False, nullable=True)))
+            continue
+        cname = _column_name(target)
+        col = table.column(cname)
         if col is None:
-            raise errors.undefined_column(_column_name(target))
-        out_columns.append((name, col))
+            if table.reflected:
+                # Schema-on-read: any selected field is valid on a reflected table.
+                col = Column(cname, "any", cname, pk=False, nullable=True)
+            else:
+                raise errors.undefined_column(cname)
+        out_columns.append((alias or cname, col))
     return SelectPlan(
         table=table, filter=filt, sort=sort, limit=limit, skip=skip, out_columns=out_columns
     )

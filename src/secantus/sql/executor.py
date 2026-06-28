@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from secantus.paths import get_path
 from secantus.sql import errors, planner, typemap
 from secantus.sql.catalog import Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
@@ -83,8 +84,12 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
     ]
     rows: list[tuple[Any, ...]] = []
     for doc in docs:
+        # get_path walks dotted field paths (jsonb navigation); a plain field
+        # name resolves to a top-level lookup.
         rows.append(
-            tuple(typemap.to_py(doc.get(col.field), col.type_tag) for _, col in plan.out_columns)
+            tuple(
+                typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns
+            )
         )
     return SQLResult(
         command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
