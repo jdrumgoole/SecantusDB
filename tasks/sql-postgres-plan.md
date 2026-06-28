@@ -313,11 +313,20 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
 
 ## 7. Phasing (each phase independently testable and shippable)
 
-- **P0 — Embedded executor spike.** `sql/` parser + planner + executor with **no
-  wire**, exposed as `Storage`-backed `run_sql(db, sql) -> rows`. Covers
-  `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE` against declared tables.
-  Unit-tested directly. De-risks the translate-to-Mongo-engines thesis before
-  any protocol work. *(No client yet.)*
+- **P0 — Embedded executor spike. ✅ landed.** `src/secantus/sql/` (parser →
+  planner → executor) with **no wire**, exposed as
+  `run_sql(storage, db, sql) -> list[SQLResult]`. Covers `CREATE TABLE` /
+  `DROP TABLE` (declared tables), `INSERT`, `SELECT` (WHERE with
+  `=`/`!=`/`<`/`<=`/`>`/`>=`/`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`IS [NOT] NULL`/`AND`/
+  `OR`/`NOT`, `ORDER BY`, `LIMIT`/`OFFSET`, `COUNT(*)`), `UPDATE`, `DELETE`. PK
+  column ↔ document `_id`; literals coerced to the declared column type (the
+  BSON↔PG type map). WHERE lowers to a real Mongo filter, so SELECT rides the
+  storage layer's index/matching engines unchanged — the translate-to-Mongo
+  thesis is proven. Tests: `tests/test_sql_planner.py` (translation oracle) +
+  `tests/test_sql_spike.py` (end-to-end over an in-memory storage double backed
+  by the real `query`/`update` engines). Parser: `sqlglot` (the `[sql]` extra),
+  still an open decision (§11) — easy to swap behind `planner.parse`. *(No
+  client yet.)*
 - **P1 — Wire bring-up, trust auth, simple query.** `pgwire.py` + `pgserver.py`,
   `SSLRequest→N`, startup, `trust` auth, `Query('Q')` round-trip,
   `ParameterStatus`/`ReadyForQuery`. Gauge: **`psql -c "SELECT 1"`** connects and

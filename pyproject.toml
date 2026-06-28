@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.4b18"
+version = "0.5.4b19"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -73,6 +73,14 @@ rust = [
     # parity tests / using the engines as a library. Built from the PyO3 bindings
     # crate crates/secantus-core-py/ (wrapping crates/secantus-core/).
     "secantus-core==0.5.2b15",
+]
+sql = [
+    # The embedded SQL engine + (later) the PostgreSQL-wire server. sqlglot is
+    # a pure-Python SQL parser (no native build), so this extra is opt-in and
+    # never enters the core Mongo wheel's dependency closure. The Python server
+    # does NOT import `secantus.sql`; installing this extra is only needed to
+    # use the SQL interface. See tasks/sql-postgres-plan.md.
+    "sqlglot>=25",
 ]
 
 [project.scripts]

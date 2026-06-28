@@ -1241,6 +1241,35 @@ When you close a bucket, delete it.
     updated_on_empty_batch` test that needs it is in the skip list), but worth adding the
     flag to the binary for gauge parity.
 
+## SQL / PostgreSQL interface — P0 spike limitations
+
+The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
+`tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
+
+- [ ] **No wire server yet.** P0 is in-process `run_sql` only; the PostgreSQL v3
+  wire layer (`pgwire.py` / `pgserver.py`) is P1+.
+- [ ] **Declared tables only.** Reflected/jsonb access over existing Mongo collections
+  (the zero-DDL path) is P6 — a `SELECT` against a table with no `CREATE TABLE`
+  raises `42P01` rather than reflecting the collection.
+- [ ] **No joins / GROUP BY / aggregates beyond `COUNT(*)`.** `JOIN`, `GROUP BY`,
+  `HAVING`, `DISTINCT`, and `SUM`/`AVG`/`MIN`/`MAX` raise `0A000` feature-not-supported
+  (planned P5, lowering to `$lookup` / `$group`).
+- [ ] **WHERE is literal-only.** Comparisons must be `column OP literal` (or the mirror);
+  column-to-column predicates and arbitrary scalar expressions aren't translated.
+- [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
+  `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
+- [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the
+  PK column is rejected (mongod can't change `_id`).
+- [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
+  passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
+  in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
+- [ ] **Catalog has no `information_schema` / `pg_catalog` surface yet** — that emulation
+  (the real client-introspection tax) is P2.
+- [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
+  extension is absent so the pure SQL/operator tests import without a WT build. Inert in
+  CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without
+  dragging in the WT-backed server).
+
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
