@@ -183,3 +183,43 @@ def test_ssl_request_is_declined_then_startup_proceeds(server):
         assert parse_results(c.query("SELECT 1"))["results"][0]["rows"] == [[b"1"]]
     finally:
         c.close()
+
+
+# -- P2: session functions / SET / catalog over the wire --------------------- #
+
+
+def test_version_and_current_database_over_wire(client):
+    res = parse_results(client.query("SELECT version()"))["results"][0]
+    assert res["columns"] == ["version"]
+    assert res["rows"][0][0].startswith(b"PostgreSQL 15.0 (SecantusDB)")
+    # The startup used database "testdb".
+    db = parse_results(client.query("SELECT current_database()"))["results"][0]
+    assert db["rows"] == [[b"testdb"]]
+
+
+def test_set_emits_parameter_status(client):
+    msgs = client.query("SET client_encoding = 'LATIN1'")
+    statuses = {}
+    for m in msgs:
+        if m.type == "S":
+            name, value, _ = m.payload.split(b"\x00", 2)
+            statuses[name.decode()] = value.decode()
+    assert statuses.get("client_encoding") == "LATIN1"
+    assert any(m.type == "C" and m.payload.startswith(b"SET") for m in msgs)
+
+
+def test_show_over_wire(client):
+    client.query("SET search_path TO appschema")
+    res = parse_results(client.query("SHOW search_path"))["results"][0]
+    assert res["tag"] == "SHOW"
+    assert res["rows"] == [[b"appschema"]]
+
+
+def test_information_schema_over_wire(client):
+    client.query("CREATE TABLE widgets (id bigint primary key, label text)")
+    res = parse_results(
+        client.query(
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'widgets'"
+        )
+    )["results"][0]
+    assert res["rows"] == [[b"widgets"]]

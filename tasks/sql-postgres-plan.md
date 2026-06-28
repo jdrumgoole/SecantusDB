@@ -341,8 +341,24 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   server with a pure-Python PG3 client (startup, `SELECT 1`, CRUD round-trip,
   NULL encoding, error-then-recover, multi-statement, SSL-decline). psql/psycopg
   as real-client smokes come with P2/P3 (psycopg uses the extended protocol).
-- **P2 — Catalog + `psql` interactive.** §5 virtual tables/functions so
-  `psql` connects cleanly, `\dt` / `\d table` work, `SELECT version()` etc.
+- **P2 — Session layer + catalog virtual tables. ✅ landed (partial).**
+  Per-connection `Session` (db / user / GUC settings) threaded through
+  `run_sql`. Scalar session functions in FROM-less SELECT — `version()`,
+  `current_database()`/`current_catalog`, `current_schema()`, `current_user`/
+  `current_role`/`session_user`, `current_setting(name)`, `set_config(...)`,
+  `pg_backend_pid()` (`functions.py`). `SHOW` / `SET` / `RESET` (settings
+  persist on the session; reportable GUCs echo a `ParameterStatus`).
+  `BEGIN`/`COMMIT`/`ROLLBACK` accepted as autocommit no-ops (real txns: P5).
+  `information_schema.tables`/`.columns`/`.schemata` and
+  `pg_catalog.pg_class`/`pg_namespace`/`pg_type`/`pg_database` as **virtual
+  tables** (`virtual.py`) — computed from the catalog and run through the
+  ordinary SELECT planner via an in-memory backend, so `WHERE`/`ORDER BY`/
+  `LIMIT`/`COUNT(*)` over them work with no new query code. **Deferred:**
+  interactive `psql`'s `\dt`/`\d` emit *joins* across `pg_catalog` plus
+  functions (`format_type`, `pg_table_is_visible`), CASE, casts, and regex
+  operators — those need the join/function machinery of P5, so such catalog
+  joins currently return a faithful `0A000` rather than a wrong answer. Tests:
+  `tests/test_sql_catalog.py` + wire coverage in `tests/test_pgserver.py`.
 - **P3 — Extended protocol + psycopg.** `Parse`/`Bind`/`Execute`/`Sync`,
   prepared statements, `$1` params, portals. Gauge: **psycopg** CRUD round-trip.
 - **P4 — SCRAM-SHA-256 auth.** Reuse `secantus.auth`; gauge auth with `psql`

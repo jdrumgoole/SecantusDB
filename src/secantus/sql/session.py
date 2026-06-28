@@ -1,0 +1,65 @@
+"""Per-connection SQL session state.
+
+Carries the connection's database, authenticated user, and GUC settings (the
+``SET``/``SHOW`` parameters), plus the advertised version strings. Threaded
+through ``run_sql`` so session functions (``current_database()``,
+``current_setting(...)``, ...) and ``SHOW``/``SET`` resolve against real state.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+# Short form for the ``server_version`` ParameterStatus (libpq parses the
+# leading number to gate features); the long banner is what ``version()``
+# returns.
+SERVER_VERSION = "15.0 (SecantusDB)"
+VERSION_STRING = "PostgreSQL 15.0 (SecantusDB) on x86_64-pc-linux-gnu, compiled by python"
+
+# Default GUC values reported by SHOW / current_setting when the client hasn't
+# SET them. Enough to satisfy the common introspection probes.
+GUC_DEFAULTS: dict[str, str] = {
+    "server_version": SERVER_VERSION,
+    "server_encoding": "UTF8",
+    "client_encoding": "UTF8",
+    "DateStyle": "ISO, MDY",
+    "IntervalStyle": "postgres",
+    "TimeZone": "UTC",
+    "integer_datetimes": "on",
+    "standard_conforming_strings": "on",
+    "search_path": '"$user", public',
+    "application_name": "",
+    "is_superuser": "off",
+}
+
+# GUCs the server echoes back via a ParameterStatus message when SET (the
+# protocol's GUC_REPORT set). Clients track these for behaviour decisions.
+REPORTABLE_GUCS = frozenset(
+    {
+        "client_encoding",
+        "DateStyle",
+        "TimeZone",
+        "application_name",
+        "standard_conforming_strings",
+        "search_path",
+    }
+)
+
+
+@dataclass
+class Session:
+    database: str = "postgres"
+    user: str = "secantus"
+    backend_pid: int = 0
+    settings: dict[str, str] = field(default_factory=dict)
+
+    def get_setting(self, name: str) -> str:
+        return self.settings.get(name, GUC_DEFAULTS.get(name, ""))
+
+    @property
+    def current_schema(self) -> str:
+        first = self.get_setting("search_path").split(",")[0].strip().strip('"')
+        # "$user" resolves to the user's schema, which we collapse to public.
+        if first in ("$user", "", "$user"):
+            return "public"
+        return first

@@ -41,6 +41,33 @@ PG_OID: dict[str, int] = {
     "json": 3802,
 }
 
+# Internal type tag -> SQL type name (for information_schema.columns.data_type
+# and any place a human-facing type spelling is needed).
+SQL_TYPE_NAME: dict[str, str] = {
+    "int4": "integer",
+    "int8": "bigint",
+    "float8": "double precision",
+    "numeric": "numeric",
+    "text": "text",
+    "bool": "boolean",
+    "timestamptz": "timestamp with time zone",
+    "json": "jsonb",
+    "bytea": "bytea",
+}
+
+# Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
+PG_TYPENAME: dict[str, str] = {
+    "int4": "int4",
+    "int8": "int8",
+    "float8": "float8",
+    "numeric": "numeric",
+    "text": "text",
+    "bool": "bool",
+    "timestamptz": "timestamptz",
+    "json": "jsonb",
+    "bytea": "bytea",
+}
+
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
 # tag (varchar/char -> text; double/float -> float8) the way Postgres widens
 # them for storage purposes here.

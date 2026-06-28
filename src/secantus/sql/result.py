@@ -34,3 +34,6 @@ class SQLResult:
     columns: list[ColumnDesc] = field(default_factory=list)
     rows: list[tuple[Any, ...]] = field(default_factory=list)
     rowcount: int = 0
+    # GUCs to echo back as ParameterStatus messages (set by ``SET`` on a
+    # reportable parameter). Empty for everything else.
+    parameter_status: list[tuple[str, str]] = field(default_factory=list)

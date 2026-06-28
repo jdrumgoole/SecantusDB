@@ -13,6 +13,7 @@ Only the P0 subset is handled; anything outside it raises a
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +23,11 @@ from sqlglot import exp
 
 from secantus.sql import errors, typemap
 from secantus.sql.catalog import Column, TableDef
+
+# sqlglot logs a WARNING when it falls back to parsing ``SHOW`` / ``RESET`` as a
+# generic ``Command`` node — which is exactly how we consume them. Quiet it so
+# the server log isn't spammed for statements we handle on purpose.
+logging.getLogger("sqlglot").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Plan objects — ready-to-execute structures over Storage.
@@ -368,21 +374,34 @@ def _infer_value_tag(value: Any) -> str:
     return "text"
 
 
-def plan_constant_select(stmt: exp.Select) -> ConstantSelectPlan:
-    """Plan a FROM-less ``SELECT <literal>, ...`` into a single constant row."""
+_LITERAL_NODES = (exp.Literal, exp.Boolean, exp.Null, exp.Neg, exp.Paren)
+
+
+def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
+    """Plan a FROM-less ``SELECT <literal | function>, ...`` into one row.
+
+    Literals are read directly; session/info functions (``version()``,
+    ``current_database()``, ``current_setting(...)``, ...) resolve against the
+    connection ``session``.
+    """
+    from secantus.sql import functions
+
     if stmt.args.get("where") or stmt.args.get("group") or stmt.args.get("joins"):
         raise errors.feature_not_supported("FROM-less SELECT supports only constant projections")
     columns: list[tuple[str, str, Any]] = []
     for e in stmt.expressions:
-        if isinstance(e, exp.Alias):
-            name = e.alias
-            target = e.this
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, _LITERAL_NODES):
+            value = _literal(target)
+            columns.append((alias or "?column?", _infer_value_tag(value), value))
+        elif functions.is_scalar_function(target):
+            fname, value, tag = functions.evaluate_scalar(target, session)
+            columns.append((alias or fname, tag, value))
         else:
-            # Postgres names a bare literal column "?column?".
-            name = "?column?"
-            target = e
-        value = _literal(target)
-        columns.append((name, _infer_value_tag(value), value))
+            raise errors.feature_not_supported(
+                f"unsupported FROM-less projection: {target.sql()}"
+            )
     return ConstantSelectPlan(columns=columns)
 
 

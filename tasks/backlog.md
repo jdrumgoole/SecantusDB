@@ -1266,8 +1266,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
 - [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
   passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
   in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
-- [ ] **Catalog has no `information_schema` / `pg_catalog` surface yet** — that emulation
-  (the real client-introspection tax) is P2.
+- [ ] **Catalog surface is the no-join subset (P2).** `information_schema.tables`/
+  `.columns`/`.schemata` and `pg_catalog.pg_class`/`pg_namespace`/`pg_type`/`pg_database`
+  are served as virtual tables. Interactive `psql`'s `\dt`/`\d` issue *joins* across
+  `pg_catalog` plus functions (`format_type`, `pg_table_is_visible`), CASE, casts, and
+  regex operators — those return `0A000` until the join/function machinery (P5) lands. No
+  `pg_attribute`/`pg_index`/`pg_constraint`/`pg_get_*` yet.
+- [ ] **`SET` is accept-and-record; `BEGIN`/`COMMIT`/`ROLLBACK` are autocommit no-ops.**
+  GUCs persist on the session and reportable ones echo a `ParameterStatus`, but nothing
+  acts on them (e.g. `search_path` doesn't affect name resolution). Real transaction
+  semantics are P5.
 - [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
   extension is absent so the pure SQL/operator tests import without a WT build. Inert in
   CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without

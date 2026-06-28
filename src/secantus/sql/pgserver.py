@@ -26,15 +26,12 @@ from typing import TYPE_CHECKING, Any
 
 from secantus.sql import errors, pgwire, typemap
 from secantus.sql.engine import run_sql
+from secantus.sql.session import SERVER_VERSION, Session
 
 if TYPE_CHECKING:
     from typing import Self
 
 logger = logging.getLogger(__name__)
-
-# Advertised in the ``server_version`` ParameterStatus. libpq parses the
-# leading numeric so clients gate features off it; we front a recent major.
-SERVER_VERSION = "15.0 (SecantusDB)"
 
 DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
 
@@ -141,10 +138,10 @@ class SecantusPGServer:
             self._conns.add(conn)
         try:
             with conn:
-                db = self._handshake(conn)
-                if db is None:
+                session = self._handshake(conn)
+                if session is None:
                     return
-                self._query_loop(conn, db)
+                self._query_loop(conn, session)
         except (pgwire.PGConnectionClosed, ConnectionError, TimeoutError, OSError):
             return
         except Exception:
@@ -153,8 +150,8 @@ class SecantusPGServer:
             with self._conns_lock:
                 self._conns.discard(conn)
 
-    def _handshake(self, conn: socket.socket) -> str | None:
-        """Negotiate startup + trust auth. Returns the target db, or None to drop."""
+    def _handshake(self, conn: socket.socket) -> Session | None:
+        """Negotiate startup + trust auth. Returns the connection ``Session``."""
         # SSL/GSSENC requests precede the StartupMessage; we decline (no TLS in
         # P1) and read again. A CancelRequest on a fresh socket is a no-op drop.
         while True:
@@ -174,6 +171,10 @@ class SecantusPGServer:
         )
         user = startup.params.get("user", "secantus")
         application_name = startup.params.get("application_name", "")
+        backend_pid = os.getpid() & 0x7FFFFFFF
+        session = Session(database=db, user=user, backend_pid=backend_pid)
+        if application_name:
+            session.settings["application_name"] = application_name
 
         out = bytearray()
         out += pgwire.authentication_ok()
@@ -192,18 +193,18 @@ class SecantusPGServer:
             out += pgwire.parameter_status(name, value)
         # A nominal pid/secret so CancelRequest has something to echo (cancel
         # isn't honoured in P1, but clients store these).
-        out += pgwire.backend_key_data(os.getpid() & 0x7FFFFFFF, secrets.randbits(31))
+        out += pgwire.backend_key_data(backend_pid, secrets.randbits(31))
         out += pgwire.ready_for_query(b"I")
         conn.sendall(bytes(out))
-        return db
+        return session
 
-    def _query_loop(self, conn: socket.socket, db: str) -> None:
+    def _query_loop(self, conn: socket.socket, session: Session) -> None:
         while not self._stop_event.is_set():
             msg = pgwire.read_message(conn)
             if msg.type == "X":  # Terminate
                 return
             if msg.type == "Q":  # simple Query
-                self._handle_query(conn, db, pgwire.parse_query(msg.payload))
+                self._handle_query(conn, session, pgwire.parse_query(msg.payload))
                 continue
             if msg.type == "S":  # Sync (extended protocol) — be lenient
                 conn.sendall(pgwire.ready_for_query(b"I"))
@@ -214,10 +215,10 @@ class SecantusPGServer:
             )
             conn.sendall(pgwire.ready_for_query(b"I"))
 
-    def _handle_query(self, conn: socket.socket, db: str, sql: str) -> None:
+    def _handle_query(self, conn: socket.socket, session: Session, sql: str) -> None:
         out = bytearray()
         try:
-            results = run_sql(self.storage, db, sql)
+            results = run_sql(self.storage, session.database, sql, session=session)
             if not results:
                 out += pgwire.empty_query_response()
             else:
@@ -249,7 +250,9 @@ class SecantusPGServer:
 def _render_result(res: Any) -> bytes:
     """Serialise one ``SQLResult`` to its backend messages."""
     out = bytearray()
-    if res.command_tag.startswith("SELECT"):
+    for name, value in res.parameter_status:
+        out += pgwire.parameter_status(name, value)
+    if res.columns or res.command_tag.startswith("SELECT"):
         out += pgwire.row_description([(c.name, c.pg_oid) for c in res.columns])
         for row in res.rows:
             out += pgwire.data_row([typemap.to_pg_text(v) for v in row])
