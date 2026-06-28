@@ -377,8 +377,21 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   (unavailable in this dev env) — wire-level coverage stands in; revisit when a
   libpq-backed client is available. Result rows are text-format only (binary
   result format is a later optimisation).
-- **P4 — SCRAM-SHA-256 auth.** Reuse `secantus.auth`; gauge auth with `psql`
-  PGPASSWORD + psycopg.
+- **P4 — TLS + SCRAM-SHA-256 auth. ✅ landed.** `pgauth.py` runs the Postgres
+  SASL `SCRAM-SHA-256` exchange (AuthenticationSASL → SASLContinue → SASLFinal),
+  reusing `secantus.auth`'s `derive_credentials` / `StoredCredentials` — the same
+  RFC 5802 verifier as the Mongo side, so a client proof is checked from the
+  StoredKey/ServerKey without ever holding the plaintext. `SecantusPGServer(...,
+  require_auth=True, users={...})` derives verifiers at startup; an unknown user
+  runs a mock exchange (random verifier) so it fails identically to a wrong
+  password — no username enumeration. TLS: `tls_cert_file`/`tls_key_file` answer
+  `SSLRequest` with `S` and wrap the socket (reusing the `SecantusDBServer`
+  SSLContext pattern); without it the server declines (`N`). Channel binding
+  (`SCRAM-SHA-256-PLUS`) is not offered. Tests:
+  `tests/test_pgserver_auth.py` (pure-Python SCRAM client: success / wrong
+  password / unknown user → `28P01`; trust default; TLS query via an ephemeral
+  `trustme` CA; TLS-declined). psql/psycopg need libpq (absent here) — the wire
+  exchange stands in.
 - **P5 — Joins, aggregates, GROUP BY, transactions.** The `$lookup` / `$group`
   lowering + `BEGIN/COMMIT/ROLLBACK`.
 - **P6 — Reflected tables + jsonb.** Read Mongo-written collections via SQL,

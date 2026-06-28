@@ -216,6 +216,55 @@ def authentication_ok() -> bytes:
     return _msg("R", _INT32.pack(0))
 
 
+def authentication_sasl(mechanisms: list[str]) -> bytes:
+    """'R'(10) AuthenticationSASL — advertise the SASL mechanisms."""
+    payload = bytearray(_INT32.pack(10))
+    for mech in mechanisms:
+        payload += _cstr(mech)
+    payload += b"\x00"  # final empty string terminates the list
+    return _msg("R", bytes(payload))
+
+
+def authentication_sasl_continue(data: bytes) -> bytes:
+    """'R'(11) AuthenticationSASLContinue — the SCRAM server-first message."""
+    return _msg("R", _INT32.pack(11) + data)
+
+
+def authentication_sasl_final(data: bytes) -> bytes:
+    """'R'(12) AuthenticationSASLFinal — the SCRAM server-final message."""
+    return _msg("R", _INT32.pack(12) + data)
+
+
+def parse_sasl_initial_response(payload: bytes) -> tuple[str, bytes]:
+    """Client 'p' SASLInitialResponse: (mechanism, initial_response_bytes)."""
+    mech, offset = _read_cstr(payload, 0)
+    (length,) = _INT32.unpack_from(payload, offset)
+    offset += 4
+    data = b"" if length <= 0 else payload[offset : offset + length]
+    return mech, data
+
+
+def parse_sasl_response(payload: bytes) -> bytes:
+    """Client 'p' SASLResponse: the raw client-final message bytes."""
+    return payload
+
+
+def build_sasl_initial_response(mechanism: str, data: bytes) -> bytes:
+    """Client-side helper: 'p' SASLInitialResponse."""
+    return _msg("p", _cstr(mechanism) + _INT32.pack(len(data)) + data)
+
+
+def build_sasl_response(data: bytes) -> bytes:
+    """Client-side helper: 'p' SASLResponse."""
+    return _msg("p", data)
+
+
+def parse_authentication(payload: bytes) -> tuple[int, bytes]:
+    """Client-side helper: split an 'R' message into (subtype, data)."""
+    (subtype,) = _INT32.unpack_from(payload, 0)
+    return subtype, payload[4:]
+
+
 def parameter_status(name: str, value: str) -> bytes:
     return _msg("S", _cstr(name) + _cstr(value))
 

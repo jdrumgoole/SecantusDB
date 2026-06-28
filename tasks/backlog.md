@@ -1246,14 +1246,16 @@ When you close a bucket, delete it.
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
 
-- [ ] **Wire server: simple + extended protocol, trust auth only.** `pgserver.py`
-  speaks the v3 startup, simple `Query` (P1), and extended `Parse`/`Bind`/`Describe`/
-  `Execute`/`Close`/`Sync` (P3) paths. Still missing: TLS + SCRAM auth (P4 — trust
-  only today), **binary result format** (rows are always text; binary param *input*
-  is decoded, but results aren't encoded in binary even if a client requests it via
-  Bind result-format codes), the `Copy` subprotocol, and cursor `DECLARE`. `psycopg`
-  as a live gauge needs libpq (absent in the dev env), so P3 is covered by a
-  pure-Python wire client rather than a real driver — revisit when libpq is available.
+- [ ] **Wire server: simple + extended protocol, trust + SCRAM auth, optional TLS.**
+  `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/
+  `Describe`/`Execute`/`Close`/`Sync` (P3), `SCRAM-SHA-256` auth + TLS (P4). Still
+  missing: **binary result format** (rows are always text; binary param *input* is
+  decoded, but results aren't binary-encoded even if a client requests it via Bind
+  result-format codes), channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert auth,
+  user management via SQL (`CREATE ROLE` — users are constructor config, not stored in
+  the catalog / shared with the Mongo user store), the `Copy` subprotocol, and cursor
+  `DECLARE`. `psycopg`/`psql` as live gauges need libpq (absent in the dev env), so the
+  wire paths are covered by pure-Python clients — revisit when libpq is available.
 - [ ] **Declared tables only.** Reflected/jsonb access over existing Mongo collections
   (the zero-DDL path) is P6 — a `SELECT` against a table with no `CREATE TABLE`
   raises `42P01` rather than reflecting the collection.
