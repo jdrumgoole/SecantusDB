@@ -199,10 +199,14 @@ def error_response(sqlstate: str, message: str, severity: str = "ERROR") -> byte
     # with a single NUL. S/V severity, C SQLSTATE, M human message are the
     # minimum libpq surfaces.
     payload = (
-        b"S" + _cstr(severity)
-        + b"V" + _cstr(severity)
-        + b"C" + _cstr(sqlstate)
-        + b"M" + _cstr(message)
+        b"S"
+        + _cstr(severity)
+        + b"V"
+        + _cstr(severity)
+        + b"C"
+        + _cstr(sqlstate)
+        + b"M"
+        + _cstr(message)
         + b"\x00"
     )
     return _msg("E", payload)

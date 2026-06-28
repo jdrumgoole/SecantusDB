@@ -53,9 +53,7 @@ def execute_insert(plan: planner.InsertPlan, storage: Any, db: str) -> SQLResult
 
 
 def execute_constant_select(plan: planner.ConstantSelectPlan) -> SQLResult:
-    columns = [
-        ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag, _ in plan.columns
-    ]
+    columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag, _ in plan.columns]
     row = tuple(value for _, _, value in plan.columns)
     return SQLResult(command_tag="SELECT 1", columns=columns, rows=[row], rowcount=1)
 
@@ -94,9 +92,7 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
 
 
 def execute_update(plan: planner.UpdatePlan, storage: Any, db: str) -> SQLResult:
-    res = storage.update_matching(
-        db, plan.table.collection, plan.filter, plan.update, multi=True
-    )
+    res = storage.update_matching(db, plan.table.collection, plan.filter, plan.update, multi=True)
     matched = int(res["matched"])
     return SQLResult(command_tag=f"UPDATE {matched}", rowcount=matched)
 

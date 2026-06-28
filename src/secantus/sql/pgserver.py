@@ -127,9 +127,7 @@ class SecantusPGServer:
                 return
             with contextlib.suppress(OSError):
                 conn.settimeout(self.client_idle_timeout_s)
-            threading.Thread(
-                target=self._handle_client, args=(conn, addr), daemon=True
-            ).start()
+            threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
 
     # -- per-connection ----------------------------------------------------- #
 
@@ -164,11 +162,7 @@ class SecantusPGServer:
             startup = packet
             break
 
-        db = (
-            startup.params.get("database")
-            or startup.params.get("user")
-            or self.default_database
-        )
+        db = startup.params.get("database") or startup.params.get("user") or self.default_database
         user = startup.params.get("user", "secantus")
         application_name = startup.params.get("application_name", "")
         backend_pid = os.getpid() & 0x7FFFFFFF

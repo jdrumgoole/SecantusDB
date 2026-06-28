@@ -84,9 +84,7 @@ class DeletePlan:
     filter: dict[str, Any]
 
 
-Plan = (
-    CreateTablePlan | DropTablePlan | InsertPlan | SelectPlan | UpdatePlan | DeletePlan
-)
+Plan = CreateTablePlan | DropTablePlan | InsertPlan | SelectPlan | UpdatePlan | DeletePlan
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +397,7 @@ def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
             fname, value, tag = functions.evaluate_scalar(target, session)
             columns.append((alias or fname, tag, value))
         else:
-            raise errors.feature_not_supported(
-                f"unsupported FROM-less projection: {target.sql()}"
-            )
+            raise errors.feature_not_supported(f"unsupported FROM-less projection: {target.sql()}")
     return ConstantSelectPlan(columns=columns)
 
 

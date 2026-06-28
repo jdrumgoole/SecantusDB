@@ -47,9 +47,7 @@ def undefined_column(name: str) -> SQLError:
 
 
 def not_null_violation(column: str) -> SQLError:
-    return SQLError(
-        "23502", f'null value in column "{column}" violates not-null constraint'
-    )
+    return SQLError("23502", f'null value in column "{column}" violates not-null constraint')
 
 
 def unique_violation(message: str) -> SQLError:

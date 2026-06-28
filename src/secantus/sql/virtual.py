@@ -214,8 +214,16 @@ class MemoryBackend:
         self._rows = rows
 
     def find_matching(
-        self, db: str, coll: str, filter: Any = None, *, skip: int = 0, limit: int = 0,
-        sort: Any = None, projection: Any = None, **kw: Any
+        self,
+        db: str,
+        coll: str,
+        filter: Any = None,
+        *,
+        skip: int = 0,
+        limit: int = 0,
+        sort: Any = None,
+        projection: Any = None,
+        **kw: Any,
     ) -> list[dict[str, Any]]:
         out = [dict(r) for r in self._rows if matches(r, filter or {})]
         if sort:

@@ -114,9 +114,10 @@ def test_information_schema_columns(storage, session):
 
 def test_pg_class_and_namespace(storage, session):
     _seed(storage, session)
-    assert q(
-        storage, session, "SELECT relname FROM pg_catalog.pg_class ORDER BY relname"
-    ).rows == [("orders",), ("users",)]
+    assert q(storage, session, "SELECT relname FROM pg_catalog.pg_class ORDER BY relname").rows == [
+        ("orders",),
+        ("users",),
+    ]
     names = {r[0] for r in q(storage, session, "SELECT nspname FROM pg_catalog.pg_namespace").rows}
     assert {"pg_catalog", "public", "information_schema"} <= names
 
@@ -128,9 +129,7 @@ def test_pg_type_lists_known_oids(storage, session):
 
 def test_count_star_over_virtual_table(storage, session):
     _seed(storage, session)
-    assert q(
-        storage, session, "SELECT COUNT(*) FROM information_schema.tables"
-    ).rows == [(2,)]
+    assert q(storage, session, "SELECT COUNT(*) FROM information_schema.tables").rows == [(2,)]
 
 
 def test_unsupported_catalog_join_defers(storage, session):
