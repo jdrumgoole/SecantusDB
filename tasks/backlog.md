@@ -1254,8 +1254,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   result-format codes), channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert auth,
   user management via SQL (`CREATE ROLE` — users are constructor config, not stored in
   the catalog / shared with the Mongo user store), the `Copy` subprotocol, and cursor
-  `DECLARE`. `psycopg`/`psql` as live gauges need libpq (absent in the dev env), so the
-  wire paths are covered by pure-Python clients — revisit when libpq is available.
+  `DECLARE`. A real-driver gauge runs in CI via **pg8000** (pure-Python) + a SQLAlchemy
+  Core smoke (P7); `psycopg`/`psql`/JDBC as live gauges still need libpq/a JVM (absent in
+  the dev env). Full SQLAlchemy **reflection** (`inspect().get_table_names()` /
+  `get_columns()`) issues `pg_catalog` *joins*, which hit the catalog-join gap (0A000) —
+  needs the join surface before ORM schema reflection works end to end.
 - [ ] **Reflected tables are SELECT-only and not in the pipeline path (P6 landed the
   read path).** A collection with no `CREATE TABLE` reflects (sampled schema-on-read)
   for `SELECT` (incl. `->`/`->>`/`#>` jsonb navigation), but: INSERT/UPDATE/DELETE on an
@@ -1286,10 +1289,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `pg_catalog` plus functions (`format_type`, `pg_table_is_visible`), CASE, casts, and
   regex operators — those return `0A000` until the join/function machinery (P5) lands. No
   `pg_attribute`/`pg_index`/`pg_constraint`/`pg_get_*` yet.
-- [ ] **`SET` is accept-and-record; `BEGIN`/`COMMIT`/`ROLLBACK` are autocommit no-ops.**
-  GUCs persist on the session and reportable ones echo a `ParameterStatus`, but nothing
-  acts on them (e.g. `search_path` doesn't affect name resolution). Real transaction
-  semantics are P5.
+- [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
+  echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
+  name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
+- [ ] **Transactions: single-connection atomicity, no SAVEPOINT / isolation knobs.**
+  `BEGIN`/`COMMIT`/`ROLLBACK` open/commit/abort a real `Storage` user-transaction
+  (statements in the block run on its WT session; ROLLBACK undoes them; an error poisons
+  the block with `25P02` until it ends). Still missing: `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`,
+  `SET TRANSACTION ISOLATION LEVEL` / read-only, `BEGIN`-with-isolation, and the
+  `DECLARE CURSOR` ... `FETCH` holdable-cursor surface. DDL is transactional via the same
+  mechanism. Cross-connection isolation is the WT engine's job (the test double only
+  models atomicity).
 - [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
   extension is absent so the pure SQL/operator tests import without a WT build. Inert in
   CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without

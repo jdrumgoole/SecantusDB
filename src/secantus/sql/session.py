@@ -9,6 +9,7 @@ through ``run_sql`` so session functions (``current_database()``,
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 # Short form for the ``server_version`` ParameterStatus (libpq parses the
 # leading number to gate features); the long banner is what ``version()``
@@ -52,9 +53,21 @@ class Session:
     user: str = "secantus"
     backend_pid: int = 0
     settings: dict[str, str] = field(default_factory=dict)
+    # Multi-statement transaction state. ``txn_handle`` is the open
+    # ``Storage`` user-transaction (None outside a BEGIN block); ``txn_failed``
+    # marks an aborted block (every command except COMMIT/ROLLBACK errors with
+    # 25P02 until the block ends — Postgres semantics).
+    txn_handle: Any = None
+    txn_failed: bool = False
 
     def get_setting(self, name: str) -> str:
         return self.settings.get(name, GUC_DEFAULTS.get(name, ""))
+
+    def txn_status(self) -> bytes:
+        """The ReadyForQuery status byte: idle / in-transaction / failed."""
+        if self.txn_handle is None:
+            return b"I"
+        return b"E" if self.txn_failed else b"T"
 
     @property
     def current_schema(self) -> str:

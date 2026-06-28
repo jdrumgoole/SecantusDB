@@ -39,6 +39,10 @@ def _num(text: str) -> Any:
 def evaluate_scalar(node: exp.Expression, session: Session) -> tuple[str, Any, str]:
     if isinstance(node, exp.Paren):
         return evaluate_scalar(node.this, session)
+    if isinstance(node, exp.Dot):
+        # A schema-qualified call like ``pg_catalog.version()`` — evaluate the
+        # rightmost call and ignore the catalog qualifier.
+        return evaluate_scalar(node.expression, session)
     if isinstance(node, exp.CurrentVersion):
         return ("version", VERSION_STRING, "text")
     if isinstance(node, exp.CurrentDatabase):
@@ -85,6 +89,8 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
 
 def is_scalar_function(node: exp.Expression) -> bool:
     """Whether ``plan_constant_select`` should evaluate ``node`` as a function."""
+    if isinstance(node, exp.Dot):
+        return is_scalar_function(node.expression)
     return isinstance(
         node,
         exp.CurrentVersion

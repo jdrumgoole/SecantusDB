@@ -162,6 +162,7 @@ class SecantusPGServer:
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         with self._conns_lock:
             self._conns.add(conn)
+        session: Session | None = None
         try:
             with conn:
                 result = self._handshake(conn)
@@ -174,6 +175,11 @@ class SecantusPGServer:
         except Exception:
             logger.exception("unhandled error on pg connection from %s", addr)
         finally:
+            # A connection that drops mid-transaction must not leak the open
+            # Storage transaction (real WT session); roll it back.
+            if session is not None and session.txn_handle is not None:
+                with contextlib.suppress(Exception):
+                    self.storage.abort_user_transaction(session.txn_handle)
             with self._conns_lock:
                 self._conns.discard(conn)
 
@@ -294,7 +300,8 @@ class SecantusPGServer:
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("error executing SQL")
             out += pgwire.error_response("XX000", f"internal error: {exc}")
-        out += pgwire.ready_for_query(b"I")
+        # The ReadyForQuery status reflects the transaction block (I/T/E).
+        out += pgwire.ready_for_query(session.txn_status())
         conn.sendall(bytes(out))
 
     # -- context manager ---------------------------------------------------- #

@@ -80,7 +80,7 @@ class ExtendedSession:
         """Handle one extended-protocol message; return the bytes to send."""
         if msg_type == "S":  # Sync — always answered, clears any error state
             self.skip_until_sync = False
-            return pgwire.ready_for_query(b"I")
+            return pgwire.ready_for_query(self.session.txn_status())
         if self.skip_until_sync:
             return b""  # discard everything until the next Sync
         if msg_type == "H":  # Flush — we send eagerly, nothing to flush
