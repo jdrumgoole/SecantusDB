@@ -91,6 +91,22 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
     )
 
 
+def execute_pipeline_select(plan: planner.PipelineSelectPlan, storage: Any, db: str) -> SQLResult:
+    """Run a JOIN / GROUP BY / aggregate SELECT through the aggregation engine."""
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+    ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
+    result = apply_pipeline(docs, plan.pipeline, ctx)
+    columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
+    rows = [
+        tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result
+    ]
+    return SQLResult(
+        command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
+    )
+
+
 def execute_update(plan: planner.UpdatePlan, storage: Any, db: str) -> SQLResult:
     res = storage.update_matching(db, plan.table.collection, plan.filter, plan.update, multi=True)
     matched = int(res["matched"])

@@ -49,6 +49,10 @@ class FakeStorage:
     def list_collections(self, db):
         return sorted(c for (d, c) in self.data if d == db)
 
+    def list_indexes(self, db, coll):
+        # No secondary indexes — $lookup falls back to the hash-join path.
+        return []
+
     def insert(self, db, coll, docs, *, ordered=True, journal=False):
         store = self._coll(db, coll)
         inserted = 0

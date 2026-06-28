@@ -392,8 +392,25 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   password / unknown user → `28P01`; trust default; TLS query via an ephemeral
   `trustme` CA; TLS-declined). psql/psycopg need libpq (absent here) — the wire
   exchange stands in.
-- **P5 — Joins, aggregates, GROUP BY, transactions.** The `$lookup` / `$group`
-  lowering + `BEGIN/COMMIT/ROLLBACK`.
+- **P5 — Joins, aggregates, GROUP BY. ✅ landed.** SELECTs with a JOIN, GROUP
+  BY, HAVING, or aggregate functions now compile to a **Mongo aggregation
+  pipeline** run through the existing `apply_pipeline` engine (a second execution
+  path alongside `find_matching`). Aggregates `COUNT(*)`/`COUNT(col)`/`SUM`/`AVG`/
+  `MIN`/`MAX` → `$group` accumulators (whole-table → `_id: null`, else `_id` =
+  the GROUP BY keys); `HAVING` → a post-`$group` `$match` (an aggregate used only
+  in HAVING registers a hidden accumulator); single two-table `INNER`/`LEFT JOIN`
+  with an equality `ON` → `$lookup` + `$unwind` (`preserveNullAndEmptyArrays` for
+  LEFT), with `alias.column` resolved to the right side and joined columns read
+  from the `$<alias>` path. WHERE on a join lands as a `$match` after the lookup.
+  `ORDER BY`/`LIMIT`/`OFFSET` apply as pipeline stages. The WHERE translator was
+  refactored to a `resolve(column) -> (field, type_tag)` callable shared by the
+  single-table and join paths. **Deferred:** JOIN combined with GROUP BY,
+  three-plus-table joins, non-equi joins, `DISTINCT`, window functions, and real
+  multi-statement **transactions** (`BEGIN/COMMIT/ROLLBACK` are still autocommit
+  no-ops from P2 — moved to a later phase). Tests:
+  `tests/test_sql_aggregate.py`. Interactive `psql`'s `\d` is now closer but
+  still needs the pg_catalog *functions* (`format_type`, `pg_table_is_visible`)
+  + casts those join queries use.
 - **P6 — Reflected tables + jsonb.** Read Mongo-written collections via SQL,
   the dual-protocol view, `jsonb` for nested docs/arrays.
 - **P7 — JDBC + tooling hardening.** Postgres JDBC driver, then SQLAlchemy /

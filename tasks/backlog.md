@@ -1259,9 +1259,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
 - [ ] **Declared tables only.** Reflected/jsonb access over existing Mongo collections
   (the zero-DDL path) is P6 — a `SELECT` against a table with no `CREATE TABLE`
   raises `42P01` rather than reflecting the collection.
-- [ ] **No joins / GROUP BY / aggregates beyond `COUNT(*)`.** `JOIN`, `GROUP BY`,
-  `HAVING`, `DISTINCT`, and `SUM`/`AVG`/`MIN`/`MAX` raise `0A000` feature-not-supported
-  (planned P5, lowering to `$lookup` / `$group`).
+- [ ] **Aggregate/JOIN path has gaps (P5 landed the core).** `GROUP BY` + `HAVING` +
+  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` and single two-table `INNER`/`LEFT JOIN` (equality `ON`)
+  compile to an aggregation pipeline. Still `0A000`: JOIN *combined* with GROUP BY/
+  aggregates, 3+ table joins, non-equi / `OR` join conditions, `RIGHT`/`FULL`/`CROSS`
+  JOIN, `SELECT DISTINCT`, window functions, subqueries, and scalar expressions in the
+  SELECT list / GROUP BY (only bare columns and single aggregates are handled). SUM/MIN/MAX
+  result typing is approximate (uses the column's tag; AVG → float8).
 - [ ] **WHERE is literal-only.** Comparisons must be `column OP literal` (or the mirror);
   column-to-column predicates and arbitrary scalar expressions aren't translated.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
