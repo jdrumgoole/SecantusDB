@@ -213,6 +213,16 @@ def _run_select(
     if table_node is None:
         return executor.execute_constant_select(planner.plan_constant_select(stmt, session))
 
+    # JOIN / GROUP BY / aggregates compile to an aggregation pipeline. Route it
+    # through a CatalogBackend so the pipeline can read pg_catalog /
+    # information_schema relations (the joins interactive psql's \d emits) as
+    # well as real collections.
+    if planner.select_needs_pipeline(stmt):
+        backend = virtual.CatalogBackend(storage, catalog, session, db)
+        return executor.execute_pipeline_select(
+            planner.plan_pipeline_select(stmt, db, catalog), backend, db
+        )
+
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None
     vtable = virtual.lookup(schema_name, table_node.name)
@@ -220,19 +230,6 @@ def _run_select(
         rows = vtable.builder(db, session, storage, catalog)
         plan = planner.plan_select(stmt, vtable.table_def())
         return executor.execute_select(plan, virtual.MemoryBackend(rows), db)
-
-    # JOIN / GROUP BY / aggregates compile to an aggregation pipeline.
-    if planner.select_needs_pipeline(stmt):
-        return executor.execute_pipeline_select(
-            planner.plan_pipeline_select(stmt, db, catalog), storage, db
-        )
-
-    if schema_name in ("information_schema", "pg_catalog"):
-        # A catalog query we don't model yet (typically a \d-style join) —
-        # faithful "not supported" rather than a wrong answer.
-        raise errors.feature_not_supported(
-            f"catalog relation {schema_name}.{table_node.name} is not supported yet"
-        )
 
     # A declared table, else a reflected (schema-on-read) view of an existing
     # Mongo collection — the dual-protocol read path.

@@ -354,12 +354,14 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   `pg_catalog.pg_class`/`pg_namespace`/`pg_type`/`pg_database` as **virtual
   tables** (`virtual.py`) — computed from the catalog and run through the
   ordinary SELECT planner via an in-memory backend, so `WHERE`/`ORDER BY`/
-  `LIMIT`/`COUNT(*)` over them work with no new query code. **Deferred:**
-  interactive `psql`'s `\dt`/`\d` emit *joins* across `pg_catalog` plus
-  functions (`format_type`, `pg_table_is_visible`), CASE, casts, and regex
-  operators — those need the join/function machinery of P5, so such catalog
-  joins currently return a faithful `0A000` rather than a wrong answer. Tests:
-  `tests/test_sql_catalog.py` + wire coverage in `tests/test_pgserver.py`.
+  `LIMIT`/`COUNT(*)` over them work with no new query code. **Catalog joins ✅
+  landed** (see *Catalog joins* below): JOINs / GROUP BY across `pg_catalog` +
+  `information_schema` now route through the aggregation pipeline against a
+  `CatalogBackend`, so SQLAlchemy's `get_table_names()` / `has_table()` and
+  interactive `psql`'s `\dt` work. **Still deferred:** `\d`'s column-level
+  reflection needs `pg_attribute` / `pg_attrdef` (system catalogs we don't
+  model) plus `format_type` / `pg_get_expr` functions and multi-join subqueries.
+  Tests: `tests/test_sql_catalog.py` + wire coverage in `tests/test_pgserver.py`.
 - **P3 — Extended query protocol. ✅ landed.** `Parse`/`Bind`/`Describe`/
   `Execute`/`Close`/`Sync`/`Flush` (`pgwire.py` builders/parsers +
   `pgextended.py` state machine). Per-connection prepared-statement and portal
@@ -440,10 +442,29 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   now fixed + pinned: sqlglot mis-tokenising adjacent `$1,$2` placeholders (the
   driver emits no spaces — fixed by `planner._normalize_params`), and
   schema-qualified `pg_catalog.version()` from SQLAlchemy's init (fixed by
-  unwrapping `exp.Dot` in `functions`). **Deferred:** full SQLAlchemy *reflection*
-  (`inspect().get_table_names()` issues pg_catalog *joins* — needs the catalog-join
-  surface), the JDBC driver, and a live psql/psycopg gauge (when libpq is
+  unwrapping `exp.Dot` in `functions`). SQLAlchemy *reflection*
+  (`inspect().get_table_names()` / `has_table()`) now works via the catalog-join
+  surface (see below). **Deferred:** column-level reflection (`get_columns` needs
+  `pg_attribute`), the JDBC driver, and a live psql/psycopg gauge (when libpq is
   available). pg8000 + sqlalchemy added to the `dev` extra so the gauge runs in CI.
+- **Catalog joins (post-P7). ✅ landed.** JOINs / GROUP BY across the
+  `pg_catalog` + `information_schema` virtual tables — what SQLAlchemy's
+  reflection and interactive `psql`'s `\dt` emit — now execute. The pipeline path
+  (`select_needs_pipeline`) runs ahead of the single-virtual-table branch and is
+  fed a `virtual.CatalogBackend`: a `Storage`-shaped proxy whose `find_matching`
+  serves a virtual collection's rows in-memory (via the same `MemoryBackend`) and
+  delegates real collections to WT, with `list_indexes → []` for virtual tables so
+  `$lookup` takes the hash-join path; every other `Storage` method forwards
+  through `__getattr__`. The planner's `_lookup_table_def` resolves a table to the
+  user catalog *then* the virtual registry, so `_plan_join_select` /
+  `_plan_group_select` span the system catalogs. WHERE gained the constructs these
+  catalog queries use: `CAST` / `::type` (unwrapped to the inner literal),
+  `col = ANY(ARRAY[...])` → `$in`, and the always-true visibility predicates
+  `pg_table_is_visible` / `pg_type_is_visible`. `pg_class` grew a `relpersistence`
+  column (`'p'`) for SQLAlchemy's temp-table filter. **Deferred:** `pg_attribute` /
+  `pg_attrdef` (column reflection), `format_type` / `pg_get_expr`, three-plus-table
+  joins, and JOIN+GROUP-BY combined. Tests: `tests/test_sql_catalog.py` +
+  SQLAlchemy `get_table_names` / `has_table` in `tests/test_pgserver_pg8000.py`.
 - **Transactions (post-P7). ✅ landed.** `BEGIN`/`COMMIT`/`ROLLBACK` now open /
   commit / abort a real `Storage` user-transaction (the same
   `begin_user_transaction` / `use_user_transaction` / `commit_user_transaction`

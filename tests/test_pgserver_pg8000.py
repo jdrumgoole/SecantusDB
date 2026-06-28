@@ -198,6 +198,40 @@ def test_sqlalchemy_core_roundtrip(server):
         engine.dispose()
 
 
+def test_sqlalchemy_reflection_table_names(server):
+    # SQLAlchemy's introspection joins pg_catalog.pg_class ⋈ pg_namespace — the
+    # catalog-join path that unblocks reflection / interactive psql's \dt.
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:  # begin() commits — connect() would roll back
+            conn.execute(sa.text("CREATE TABLE widgets (id bigint primary key, label text)"))
+            conn.execute(sa.text("CREATE TABLE gadgets (id bigint primary key, n int)"))
+        insp = sa.inspect(engine)
+        assert sorted(insp.get_table_names()) == ["gadgets", "widgets"]
+        assert insp.has_table("widgets") is True
+        assert insp.has_table("nonexistent") is False
+    finally:
+        engine.dispose()
+
+
+def test_catalog_join_via_driver(server):
+    # The raw catalog join, exercised through the extended protocol.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE a (id bigint primary key)")
+    cur.execute("CREATE TABLE b (id bigint primary key)")
+    cur.execute(
+        "SELECT c.relname FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = %s ORDER BY c.relname",
+        ("public",),
+    )
+    assert cur.fetchall() == (["a"], ["b"])
+    conn.close()
+
+
 def test_transaction_commit_and_rollback(server):
     conn = connect(server)
     conn.autocommit = False

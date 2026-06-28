@@ -97,6 +97,11 @@ def _literal(node: exp.Expression) -> Any:
     """Extract a Python value from a literal-ish AST node."""
     if isinstance(node, exp.Paren):
         return _literal(node.this)
+    if isinstance(node, exp.Cast):
+        # ``'x'::varchar`` / ``CAST(NULL AS varchar)`` — drivers (and SQLAlchemy's
+        # reflection) annotate literals with a target type; the BSON value is the
+        # inner literal, coerced later by the column's type.
+        return _literal(node.this)
     if isinstance(node, exp.Neg):
         return -_literal(node.this)
     if isinstance(node, exp.Null):
@@ -206,9 +211,31 @@ def _comparison(node: exp.Expression) -> tuple[exp.Expression, exp.Expression]:
     raise errors.feature_not_supported(f"comparison needs a column: {node.sql()}")
 
 
+def _array_elements(node: exp.Expression) -> list[exp.Expression]:
+    """Unwrap an ``ARRAY[...]`` (possibly parenthesised) to its element nodes."""
+    if isinstance(node, exp.Paren):
+        return _array_elements(node.this)
+    if isinstance(node, exp.Array):
+        return list(node.expressions)
+    raise errors.feature_not_supported(f"unsupported array operand: {node.sql()}")
+
+
+# Catalog predicates that are functions of visibility/scope which, on a
+# single-node SecantusDB where every relation lives in the default search path,
+# are always true. SQLAlchemy's reflection emits these in its catalog WHEREs.
+_ALWAYS_TRUE_PREDICATES = {"pg_table_is_visible", "pg_type_is_visible"}
+
+
 def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
     if isinstance(node, exp.Paren):
         return _expr_to_filter(node.this, resolve)
+
+    # A schema-qualified function predicate (``pg_catalog.pg_table_is_visible(...)``)
+    # parses as Dot(Identifier, Anonymous); unwrap to the function call.
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
+        node = node.expression
+    if isinstance(node, exp.Anonymous) and node.name.lower() in _ALWAYS_TRUE_PREDICATES:
+        return {}
 
     if isinstance(node, exp.And):
         parts = [_expr_to_filter(node.this, resolve), _expr_to_filter(node.expression, resolve)]
@@ -236,6 +263,11 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
     if isinstance(node, exp.EQ):
         col_node, other = _comparison(node)
         field, tag = _field(col_node, resolve)
+        if isinstance(other, exp.Any):
+            # ``col = ANY(ARRAY[...])`` is Postgres' IN — SQLAlchemy's reflection
+            # emits ``relkind = ANY(ARRAY['r','p',...])``.
+            values = [typemap.coerce(_literal(e), tag) for e in _array_elements(other.this)]
+            return {field: {"$in": values}}
         return {field: typemap.coerce(_literal(other), tag)}
 
     if isinstance(node, exp.NEQ):
@@ -623,6 +655,24 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     return True
 
 
+def _lookup_table_def(catalog: Any, db: str, table_node: exp.Table) -> TableDef | None:
+    """Resolve a (possibly schema-qualified) table to a TableDef.
+
+    Tries the user catalog first, then the ``pg_catalog`` / ``information_schema``
+    virtual tables — so joins / aggregates can span the system catalogs, not just
+    user tables.
+    """
+    from secantus.sql import virtual
+
+    table = catalog.get(db, table_node.name)
+    if table is not None:
+        return table
+    schema = table_node.args.get("db")
+    schema_name = schema.name if schema is not None else None
+    vtable = virtual.lookup(schema_name, table_node.name)
+    return vtable.table_def() if vtable is not None else None
+
+
 def plan_pipeline_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSelectPlan:
     if stmt.args.get("distinct"):
         raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
@@ -631,7 +681,7 @@ def plan_pipeline_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSel
     table_node = stmt.find(exp.Table)
     if table_node is None:
         raise errors.feature_not_supported("aggregate without FROM is not supported")
-    table = catalog.get(db, table_node.name)
+    table = _lookup_table_def(catalog, db, table_node)
     if table is None:
         raise errors.undefined_table(table_node.name)
     return _plan_group_select(stmt, table)
@@ -825,7 +875,7 @@ def _plan_join_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSelect
     ):
         raise errors.feature_not_supported("JOIN with GROUP BY / aggregates is not supported yet")
     fr = stmt.find(exp.From).this
-    base = catalog.get(db, fr.name)
+    base = _lookup_table_def(catalog, db, fr)
     if base is None:
         raise errors.undefined_table(fr.name)
     base_alias = fr.alias or fr.name
@@ -834,7 +884,7 @@ def _plan_join_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSelect
         raise errors.feature_not_supported("only a single JOIN is supported")
     jn = joins[0]
     jt = jn.this
-    join_table = catalog.get(db, jt.name)
+    join_table = _lookup_table_def(catalog, db, jt)
     if join_table is None:
         raise errors.undefined_table(jt.name)
     join_alias = jt.alias or jt.name

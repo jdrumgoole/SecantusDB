@@ -104,7 +104,13 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     rows: list[dict] = []
     for i, t in enumerate(_user_tables(db, catalog), start=16384):
         rows.append(
-            {"oid": i, "relname": t.name, "relnamespace": _NS_OIDS["public"], "relkind": "r"}
+            {
+                "oid": i,
+                "relname": t.name,
+                "relnamespace": _NS_OIDS["public"],
+                "relkind": "r",
+                "relpersistence": "p",  # permanent (never temp/unlogged)
+            }
         )
     return rows
 
@@ -171,7 +177,13 @@ _register(
 _register(
     "pg_catalog",
     "pg_class",
-    [("oid", "int4"), ("relname", "text"), ("relnamespace", "int4"), ("relkind", "text")],
+    [
+        ("oid", "int4"),
+        ("relname", "text"),
+        ("relnamespace", "int4"),
+        ("relkind", "text"),
+        ("relpersistence", "text"),
+    ],
     _pg_class,
 )
 _register(
@@ -234,3 +246,60 @@ class MemoryBackend:
         if limit:
             out = out[:limit]
         return out
+
+
+class CatalogBackend:
+    """``Storage``-shaped proxy that serves virtual catalog tables in-memory and
+    delegates everything else to the real ``Storage``.
+
+    This is what lets a JOIN / GROUP BY span ``pg_catalog`` /
+    ``information_schema`` relations: when the aggregation pipeline reads a
+    virtual collection (the base ``find_matching`` or a ``$lookup`` foreign
+    collection), the rows are built on demand and filtered in memory; a real
+    user collection passes straight through. All other ``Storage`` methods the
+    aggregation engine needs are forwarded unchanged via ``__getattr__``.
+    """
+
+    def __init__(self, storage: Any, catalog: Catalog, session: Session, db: str) -> None:
+        self._storage = storage
+        self._catalog = catalog
+        self._session = session
+        self._db = db
+
+    def _virtual_rows(self, coll: str) -> list[dict[str, Any]] | None:
+        vt = lookup(None, coll)
+        if vt is None:
+            return None
+        return vt.builder(self._db, self._session, self._storage, self._catalog)
+
+    def find_matching(
+        self,
+        db: str,
+        coll: str,
+        filter: Any = None,
+        *,
+        skip: int = 0,
+        limit: int = 0,
+        sort: Any = None,
+        projection: Any = None,
+        **kw: Any,
+    ) -> list[dict[str, Any]]:
+        rows = self._virtual_rows(coll)
+        if rows is not None:
+            return MemoryBackend(rows).find_matching(
+                db, coll, filter, skip=skip, limit=limit, sort=sort, projection=projection, **kw
+            )
+        return self._storage.find_matching(
+            db, coll, filter, skip=skip, limit=limit, sort=sort, projection=projection, **kw
+        )
+
+    def list_indexes(self, db: str, coll: str) -> list[Any]:
+        if lookup(None, coll) is not None:
+            return []  # virtual tables are never indexed — force the hash-join path.
+        return self._storage.list_indexes(db, coll)
+
+    def __getattr__(self, name: str) -> Any:
+        # Forward any other Storage method (count_matching, get_collection_options,
+        # ...) to the real storage. find_matching / list_indexes are overridden
+        # above so virtual collections never reach the WT layer.
+        return getattr(self._storage, name)
