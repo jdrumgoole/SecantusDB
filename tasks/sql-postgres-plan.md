@@ -86,6 +86,64 @@ representation — same discipline as the Mongo side):
      `SELECT name, age FROM users` works against Mongo-written data. Inferred
      columns that don't exist in a given row read as SQL `NULL`.
 
+### Heterogeneous collections: how the column set is resolved
+
+The sharp edge of this whole design is that a Mongo collection has no fixed
+shape — different documents carry different fields, types, and nesting — while
+SQL expects a rectangular, typed result. One wire fact governs the entire
+answer:
+
+> **The Postgres v3 protocol sends exactly one `RowDescription` (the column list
+> + type OIDs) *before* any `DataRow`. There is no per-row schema.**
+
+So the column set for a result is decided **once, at plan time** — it cannot
+vary document-to-document. Heterogeneity is therefore never expressed as
+"different columns per row"; it is absorbed by *projecting each document onto a
+fixed column set* chosen up front. There are three ways that fixed set is
+established:
+
+1. **Declared table — authoritative.** The columns come from the `__sql_catalog__`
+   entry, not from the documents. Extra fields in a document are invisible to the
+   projection (optionally reachable through a catch-all `doc jsonb` column).
+
+2. **Reflected, whole-document `jsonb` — always correct, zero schema.**
+   `SELECT *` returns a fixed 2-column shape `(_id <type>, document jsonb)`; the
+   entire document, *whatever* its structure, lands in the one `jsonb` column.
+   Heterogeneity is a non-issue because nothing is flattened. Navigation uses
+   jsonb operators (`document->>'name'`, `document->'profile'->>'city'`,
+   `document #> '{a,b}'`), which lower to **dotted-path projection** in the query
+   engine (`profile.city` → `$profile.city`). This is the safe default for
+   genuinely messy collections.
+
+3. **Reflected, inferred/flattened columns — convenience, best-effort.** Sample
+   N documents, take the **union of top-level fields**, and resolve one type per
+   field via a type lattice: all-numeric (int32/int64/double/Decimal128) widens
+   to the common numeric type; mixed scalar kinds collapse to `text`; any nested
+   doc/array becomes `jsonb`. The resolved set is **recorded in the catalog** so
+   the column list is stable across queries and doesn't flap as the sample
+   changes.
+
+Once the column set is fixed (modes 1 and 3), each document is projected onto it
+with uniform per-row reconciliation rules:
+
+| Document reality vs. column | Result |
+|---|---|
+| field present, type matches column | coerce to the column's PG type |
+| field present, type differs | coercion ladder: numeric widening → render to `text` → `NULL` (lenient) / error (strict) |
+| field absent | SQL `NULL` (missing == NULL) |
+| field is sub-doc/array, column is scalar | `NULL`, or carried as `jsonb` if the column is `jsonb` |
+| extra field not in the column set | invisible in flattened/declared modes; reach it via `doc jsonb` or jsonb mode |
+
+**The honest limitation:** flattening (mode 3) is a convenience that degrades
+gracefully, not a guarantee — a deeply heterogeneous collection is best served by
+jsonb mode, where nothing is lost. The plan's default (§11 #2) is reflected-first
+so any existing collection is immediately queryable, with `CREATE TABLE`
+available to upgrade a collection to a typed, declared view when its shape *is*
+stable. The coercion edge cases at this exact boundary — Mongo-written loose data
+read through a strict SQL column — are precisely what the §8 cross-protocol
+parity tests (write via pymongo → read via psycopg → assert round-trip) exist to
+pin down.
+
 ### Type map (the load-bearing table)
 
 | BSON | Postgres type / OID | Notes |
