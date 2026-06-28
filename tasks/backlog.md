@@ -1241,6 +1241,46 @@ When you close a bucket, delete it.
     updated_on_empty_batch` test that needs it is in the skip list), but worth adding the
     flag to the binary for gauge parity.
 
+## SQL / PostgreSQL interface — P0 spike limitations
+
+The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
+`tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
+
+- [ ] **Wire server is simple-protocol only (P1).** `pgwire.py` / `pgserver.py`
+  speak the v3 startup + simple `Query` path with trust auth. The extended query
+  protocol (`Parse`/`Bind`/`Execute`, `$1` params — what psycopg uses) is P3, TLS
+  + SCRAM auth is P4, and the `pg_catalog`/`information_schema` surface psql/JDBC
+  introspection needs is P2. Result rows use the text format only (no binary).
+- [ ] **Declared tables only.** Reflected/jsonb access over existing Mongo collections
+  (the zero-DDL path) is P6 — a `SELECT` against a table with no `CREATE TABLE`
+  raises `42P01` rather than reflecting the collection.
+- [ ] **No joins / GROUP BY / aggregates beyond `COUNT(*)`.** `JOIN`, `GROUP BY`,
+  `HAVING`, `DISTINCT`, and `SUM`/`AVG`/`MIN`/`MAX` raise `0A000` feature-not-supported
+  (planned P5, lowering to `$lookup` / `$group`).
+- [ ] **WHERE is literal-only.** Comparisons must be `column OP literal` (or the mirror);
+  column-to-column predicates and arbitrary scalar expressions aren't translated.
+- [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
+  `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
+- [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the
+  PK column is rejected (mongod can't change `_id`).
+- [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
+  passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
+  in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
+- [ ] **Catalog surface is the no-join subset (P2).** `information_schema.tables`/
+  `.columns`/`.schemata` and `pg_catalog.pg_class`/`pg_namespace`/`pg_type`/`pg_database`
+  are served as virtual tables. Interactive `psql`'s `\dt`/`\d` issue *joins* across
+  `pg_catalog` plus functions (`format_type`, `pg_table_is_visible`), CASE, casts, and
+  regex operators — those return `0A000` until the join/function machinery (P5) lands. No
+  `pg_attribute`/`pg_index`/`pg_constraint`/`pg_get_*` yet.
+- [ ] **`SET` is accept-and-record; `BEGIN`/`COMMIT`/`ROLLBACK` are autocommit no-ops.**
+  GUCs persist on the session and reportable ones echo a `ParameterStatus`, but nothing
+  acts on them (e.g. `search_path` doesn't affect name resolution). Real transaction
+  semantics are P5.
+- [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
+  extension is absent so the pure SQL/operator tests import without a WT build. Inert in
+  CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without
+  dragging in the WT-backed server).
+
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.

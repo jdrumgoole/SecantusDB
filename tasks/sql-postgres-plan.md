@@ -313,17 +313,52 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
 
 ## 7. Phasing (each phase independently testable and shippable)
 
-- **P0 — Embedded executor spike.** `sql/` parser + planner + executor with **no
-  wire**, exposed as `Storage`-backed `run_sql(db, sql) -> rows`. Covers
-  `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE` against declared tables.
-  Unit-tested directly. De-risks the translate-to-Mongo-engines thesis before
-  any protocol work. *(No client yet.)*
-- **P1 — Wire bring-up, trust auth, simple query.** `pgwire.py` + `pgserver.py`,
-  `SSLRequest→N`, startup, `trust` auth, `Query('Q')` round-trip,
-  `ParameterStatus`/`ReadyForQuery`. Gauge: **`psql -c "SELECT 1"`** connects and
-  returns. First "a real client connected" milestone.
-- **P2 — Catalog + `psql` interactive.** §5 virtual tables/functions so
-  `psql` connects cleanly, `\dt` / `\d table` work, `SELECT version()` etc.
+- **P0 — Embedded executor spike. ✅ landed.** `src/secantus/sql/` (parser →
+  planner → executor) with **no wire**, exposed as
+  `run_sql(storage, db, sql) -> list[SQLResult]`. Covers `CREATE TABLE` /
+  `DROP TABLE` (declared tables), `INSERT`, `SELECT` (WHERE with
+  `=`/`!=`/`<`/`<=`/`>`/`>=`/`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`IS [NOT] NULL`/`AND`/
+  `OR`/`NOT`, `ORDER BY`, `LIMIT`/`OFFSET`, `COUNT(*)`), `UPDATE`, `DELETE`. PK
+  column ↔ document `_id`; literals coerced to the declared column type (the
+  BSON↔PG type map). WHERE lowers to a real Mongo filter, so SELECT rides the
+  storage layer's index/matching engines unchanged — the translate-to-Mongo
+  thesis is proven. Tests: `tests/test_sql_planner.py` (translation oracle) +
+  `tests/test_sql_spike.py` (end-to-end over an in-memory storage double backed
+  by the real `query`/`update` engines). Parser: `sqlglot` (the `[sql]` extra),
+  still an open decision (§11) — easy to swap behind `planner.parse`. *(No
+  client yet.)*
+- **P1 — Wire bring-up, trust auth, simple query. ✅ landed.**
+  `src/secantus/sql/pgwire.py` (PG v3 framing + message builders/parsers) +
+  `pgserver.py` (`SecantusPGServer`: accept loop, one daemon thread per
+  connection, `SSLRequest`/`GSSENCRequest`→`N`, startup, `trust` auth, the full
+  `ParameterStatus` set + `BackendKeyData` + `ReadyForQuery`, then the simple
+  `Query` protocol). Queries run through P0's `run_sql`; rows stream back as
+  `RowDescription`/`DataRow`/`CommandComplete` in the v3 *text* format; SQL
+  errors become `ErrorResponse` (SQLSTATE) + `ReadyForQuery` so the connection
+  survives. `SELECT 1` (FROM-less constant select) works — the headline gauge.
+  `Storage` is injectable so the server runs over the shared store in production
+  or an in-memory double in tests. Tests: `tests/test_pgserver.py` drives a real
+  server with a pure-Python PG3 client (startup, `SELECT 1`, CRUD round-trip,
+  NULL encoding, error-then-recover, multi-statement, SSL-decline). psql/psycopg
+  as real-client smokes come with P2/P3 (psycopg uses the extended protocol).
+- **P2 — Session layer + catalog virtual tables. ✅ landed (partial).**
+  Per-connection `Session` (db / user / GUC settings) threaded through
+  `run_sql`. Scalar session functions in FROM-less SELECT — `version()`,
+  `current_database()`/`current_catalog`, `current_schema()`, `current_user`/
+  `current_role`/`session_user`, `current_setting(name)`, `set_config(...)`,
+  `pg_backend_pid()` (`functions.py`). `SHOW` / `SET` / `RESET` (settings
+  persist on the session; reportable GUCs echo a `ParameterStatus`).
+  `BEGIN`/`COMMIT`/`ROLLBACK` accepted as autocommit no-ops (real txns: P5).
+  `information_schema.tables`/`.columns`/`.schemata` and
+  `pg_catalog.pg_class`/`pg_namespace`/`pg_type`/`pg_database` as **virtual
+  tables** (`virtual.py`) — computed from the catalog and run through the
+  ordinary SELECT planner via an in-memory backend, so `WHERE`/`ORDER BY`/
+  `LIMIT`/`COUNT(*)` over them work with no new query code. **Deferred:**
+  interactive `psql`'s `\dt`/`\d` emit *joins* across `pg_catalog` plus
+  functions (`format_type`, `pg_table_is_visible`), CASE, casts, and regex
+  operators — those need the join/function machinery of P5, so such catalog
+  joins currently return a faithful `0A000` rather than a wrong answer. Tests:
+  `tests/test_sql_catalog.py` + wire coverage in `tests/test_pgserver.py`.
 - **P3 — Extended protocol + psycopg.** `Parse`/`Bind`/`Execute`/`Sync`,
   prepared statements, `$1` params, portals. Gauge: **psycopg** CRUD round-trip.
 - **P4 — SCRAM-SHA-256 auth.** Reuse `secantus.auth`; gauge auth with `psql`
