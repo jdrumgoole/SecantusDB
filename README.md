@@ -109,6 +109,29 @@ multi-document transactions (with WiredTiger-native rollback), and geo
 support (`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`,
 `$geoNear`, `2dsphere` and `2d` indexes) are all in scope and shipped.
 
+## SQL / PostgreSQL interface (opt-in)
+
+SecantusDB can also speak **SQL over the PostgreSQL wire protocol**. Install the
+extra (`pip install "secantus[sql]"`), start a `SecantusPGServer` — optionally
+sharing the *same* storage as the MongoDB server — and connect with `psql`,
+pg8000, or SQLAlchemy over a `postgresql://` URL:
+
+```python
+from secantus.sql import SecantusPGServer
+
+with SecantusPGServer(port=5432) as server:
+    ...  # SELECT / INSERT / UPDATE / DELETE, JOIN, GROUP BY, transactions, ...
+```
+
+SQL is compiled down to the same query / aggregation engines the MongoDB side
+uses, so it inherits index acceleration and the type system. A collection
+written with `pymongo` is queryable as a SQL table with **no `CREATE TABLE`**
+(schema-on-read), nested documents surface as `jsonb` (`->`, `->>`, `#>`), and
+`BEGIN` / `COMMIT` / `ROLLBACK` are real transactions. Auth (SCRAM-SHA-256) and
+TLS work the same as on the Mongo side. See
+[SQL / PostgreSQL interface](https://secantusdb.readthedocs.io/en/latest/sql.html)
+for the supported-SQL matrix and examples.
+
 ## Installation
 
 ```bash
