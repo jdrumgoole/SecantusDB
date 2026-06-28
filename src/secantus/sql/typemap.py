@@ -110,6 +110,27 @@ def coerce(value: Any, tag: str) -> Any:
     return value
 
 
+def to_pg_text(value: Any) -> bytes | None:
+    """Render a (already ``to_py``-normalised) result value as Postgres text.
+
+    Returns ``None`` for SQL NULL (the wire layer encodes that as a -1 length
+    in a ``DataRow``). This is the v3 protocol's *text* result format; the
+    binary format is a later optimisation.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return b"t" if value else b"f"
+    if isinstance(value, (bytes, bytearray)):
+        return b"\\x" + bytes(value).hex().encode("ascii")
+    if isinstance(value, _dt.datetime):
+        # Postgres renders timestamptz space-separated with a UTC offset.
+        return value.isoformat(sep=" ").encode("utf-8")
+    if isinstance(value, (dict, list)):
+        return _json.dumps(value, default=str).encode("utf-8")
+    return str(value).encode("utf-8")
+
+
 def to_py(value: Any, tag: str) -> Any:
     """Render a stored BSON value back to a plain Python value for a result row.
 

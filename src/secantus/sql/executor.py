@@ -52,6 +52,14 @@ def execute_insert(plan: planner.InsertPlan, storage: Any, db: str) -> SQLResult
     return SQLResult(command_tag=f"INSERT 0 {inserted}", rowcount=inserted)
 
 
+def execute_constant_select(plan: planner.ConstantSelectPlan) -> SQLResult:
+    columns = [
+        ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag, _ in plan.columns
+    ]
+    row = tuple(value for _, _, value in plan.columns)
+    return SQLResult(command_tag="SELECT 1", columns=columns, rows=[row], rowcount=1)
+
+
 def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult:
     if plan.count_star:
         # COUNT(*) ignores LIMIT/OFFSET — count everything the filter matches.

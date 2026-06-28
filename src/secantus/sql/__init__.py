@@ -22,3 +22,13 @@ from secantus.sql.errors import SQLError
 from secantus.sql.result import ColumnDesc, SQLResult
 
 __all__ = ["ColumnDesc", "SQLError", "SQLResult", "run_sql"]
+
+
+def __getattr__(name: str) -> object:
+    # Lazy so importing ``secantus.sql`` (parser/engine) doesn't pull in the
+    # socket server. ``from secantus.sql import SecantusPGServer`` still works.
+    if name == "SecantusPGServer":
+        from secantus.sql.pgserver import SecantusPGServer
+
+        return SecantusPGServer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

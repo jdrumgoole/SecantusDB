@@ -17,8 +17,13 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import os
 import sys
 import types
+
+# Make sibling test-helper modules (e.g. ``sqlfake``) importable by bare name
+# regardless of pytest's rootdir/import-mode.
+sys.path.insert(0, os.path.dirname(__file__))
 
 if "wiredtiger" not in sys.modules and importlib.util.find_spec("wiredtiger") is None:
     _stub = types.ModuleType("wiredtiger")

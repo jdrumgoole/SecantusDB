@@ -327,10 +327,20 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   by the real `query`/`update` engines). Parser: `sqlglot` (the `[sql]` extra),
   still an open decision (§11) — easy to swap behind `planner.parse`. *(No
   client yet.)*
-- **P1 — Wire bring-up, trust auth, simple query.** `pgwire.py` + `pgserver.py`,
-  `SSLRequest→N`, startup, `trust` auth, `Query('Q')` round-trip,
-  `ParameterStatus`/`ReadyForQuery`. Gauge: **`psql -c "SELECT 1"`** connects and
-  returns. First "a real client connected" milestone.
+- **P1 — Wire bring-up, trust auth, simple query. ✅ landed.**
+  `src/secantus/sql/pgwire.py` (PG v3 framing + message builders/parsers) +
+  `pgserver.py` (`SecantusPGServer`: accept loop, one daemon thread per
+  connection, `SSLRequest`/`GSSENCRequest`→`N`, startup, `trust` auth, the full
+  `ParameterStatus` set + `BackendKeyData` + `ReadyForQuery`, then the simple
+  `Query` protocol). Queries run through P0's `run_sql`; rows stream back as
+  `RowDescription`/`DataRow`/`CommandComplete` in the v3 *text* format; SQL
+  errors become `ErrorResponse` (SQLSTATE) + `ReadyForQuery` so the connection
+  survives. `SELECT 1` (FROM-less constant select) works — the headline gauge.
+  `Storage` is injectable so the server runs over the shared store in production
+  or an in-memory double in tests. Tests: `tests/test_pgserver.py` drives a real
+  server with a pure-Python PG3 client (startup, `SELECT 1`, CRUD round-trip,
+  NULL encoding, error-then-recover, multi-statement, SSL-decline). psql/psycopg
+  as real-client smokes come with P2/P3 (psycopg uses the extended protocol).
 - **P2 — Catalog + `psql` interactive.** §5 virtual tables/functions so
   `psql` connects cleanly, `\dt` / `\d table` work, `SELECT version()` etc.
 - **P3 — Extended protocol + psycopg.** `Parse`/`Bind`/`Execute`/`Sync`,

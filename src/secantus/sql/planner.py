@@ -47,6 +47,13 @@ class InsertPlan:
 
 
 @dataclass
+class ConstantSelectPlan:
+    # A FROM-less ``SELECT <literals>`` — one row, no storage access. The
+    # headline P1 case (``SELECT 1``) and the seed for ``SELECT version()`` etc.
+    columns: list[tuple[str, str, Any]]  # (out_name, type_tag, python_value)
+
+
+@dataclass
 class SelectPlan:
     table: TableDef
     filter: dict[str, Any]
@@ -347,6 +354,36 @@ def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
     limit = int(_literal(limit_node.expression)) if limit_node is not None else 0
     skip = int(_literal(offset_node.expression)) if offset_node is not None else 0
     return limit, skip
+
+
+def _infer_value_tag(value: Any) -> str:
+    if value is None:
+        return "text"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int4" if -(2**31) <= value < 2**31 else "int8"
+    if isinstance(value, float):
+        return "float8"
+    return "text"
+
+
+def plan_constant_select(stmt: exp.Select) -> ConstantSelectPlan:
+    """Plan a FROM-less ``SELECT <literal>, ...`` into a single constant row."""
+    if stmt.args.get("where") or stmt.args.get("group") or stmt.args.get("joins"):
+        raise errors.feature_not_supported("FROM-less SELECT supports only constant projections")
+    columns: list[tuple[str, str, Any]] = []
+    for e in stmt.expressions:
+        if isinstance(e, exp.Alias):
+            name = e.alias
+            target = e.this
+        else:
+            # Postgres names a bare literal column "?column?".
+            name = "?column?"
+            target = e
+        value = _literal(target)
+        columns.append((name, _infer_value_tag(value), value))
+    return ConstantSelectPlan(columns=columns)
 
 
 def plan_select(stmt: exp.Select, table: TableDef) -> SelectPlan:

@@ -59,7 +59,10 @@ def _run_statement(
         return executor.execute_insert(planner.plan_insert(stmt, table), storage, db)
 
     if isinstance(stmt, exp.Select):
-        table = _require_table(catalog, db, stmt.find(exp.Table).name)
+        table_node = stmt.find(exp.Table)
+        if table_node is None:
+            return executor.execute_constant_select(planner.plan_constant_select(stmt))
+        table = _require_table(catalog, db, table_node.name)
         return executor.execute_select(planner.plan_select(stmt, table), storage, db)
 
     if isinstance(stmt, exp.Update):
