@@ -1289,10 +1289,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `pg_catalog` plus functions (`format_type`, `pg_table_is_visible`), CASE, casts, and
   regex operators — those return `0A000` until the join/function machinery (P5) lands. No
   `pg_attribute`/`pg_index`/`pg_constraint`/`pg_get_*` yet.
-- [ ] **`SET` is accept-and-record; `BEGIN`/`COMMIT`/`ROLLBACK` are autocommit no-ops.**
-  GUCs persist on the session and reportable ones echo a `ParameterStatus`, but nothing
-  acts on them (e.g. `search_path` doesn't affect name resolution). Real transaction
-  semantics are P5.
+- [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
+  echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
+  name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
+- [ ] **Transactions: single-connection atomicity, no SAVEPOINT / isolation knobs.**
+  `BEGIN`/`COMMIT`/`ROLLBACK` open/commit/abort a real `Storage` user-transaction
+  (statements in the block run on its WT session; ROLLBACK undoes them; an error poisons
+  the block with `25P02` until it ends). Still missing: `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`,
+  `SET TRANSACTION ISOLATION LEVEL` / read-only, `BEGIN`-with-isolation, and the
+  `DECLARE CURSOR` ... `FETCH` holdable-cursor surface. DDL is transactional via the same
+  mechanism. Cross-connection isolation is the WT engine's job (the test double only
+  models atomicity).
 - [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
   extension is absent so the pure SQL/operator tests import without a WT build. Inert in
   CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without

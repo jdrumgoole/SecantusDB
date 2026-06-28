@@ -9,7 +9,9 @@ module itself (no ``test_`` prefix), so pytest won't collect it.
 
 from __future__ import annotations
 
+import contextlib
 import copy
+from dataclasses import dataclass
 
 import bson
 
@@ -118,3 +120,28 @@ class FakeStorage:
                 keep.append(d)
         self.data[(db, coll)] = keep
         return deleted
+
+    # -- transaction emulation ---------------------------------------------- #
+    # The real Storage installs the txn's WT session for the duration of
+    # ``use_user_transaction``; the fake just snapshots the data at BEGIN and
+    # restores it on abort, which gives the same atomic all-or-nothing semantics
+    # the SQL transaction tests need (single-connection; isolation across
+    # connections is the real engine's job).
+
+    def begin_user_transaction(self):
+        return _FakeTxn(snapshot=copy.deepcopy(self.data))
+
+    @contextlib.contextmanager
+    def use_user_transaction(self, handle):
+        yield
+
+    def commit_user_transaction(self, handle, **kw):
+        return 0
+
+    def abort_user_transaction(self, handle):
+        self.data = handle.snapshot
+
+
+@dataclass
+class _FakeTxn:
+    snapshot: dict

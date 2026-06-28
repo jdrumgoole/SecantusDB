@@ -31,8 +31,72 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
     catalog = Catalog(storage)
     results: list[SQLResult] = []
     for stmt in planner.parse(sql):
-        results.append(_run_statement(stmt, storage, db, catalog, session))
+        results.append(_dispatch(stmt, storage, db, catalog, session))
     return results
+
+
+def _dispatch(
+    stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Apply transaction framing around a statement, then execute it.
+
+    BEGIN/COMMIT/ROLLBACK manage a real ``Storage`` user-transaction on the
+    session; other statements inside an open block run within it (so a ROLLBACK
+    undoes their writes), and a statement that errors poisons the block until it
+    ends (Postgres' aborted-transaction semantics).
+    """
+    if isinstance(stmt, exp.Transaction):
+        return _begin_txn(storage, session)
+    if isinstance(stmt, exp.Commit):
+        return _commit_txn(storage, session)
+    if isinstance(stmt, exp.Rollback):
+        return _rollback_txn(storage, session)
+
+    if session.txn_failed:
+        raise errors.SQLError(
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
+
+    if session.txn_handle is not None:
+        try:
+            with storage.use_user_transaction(session.txn_handle):
+                return _run_statement(stmt, storage, db, catalog, session)
+        except Exception:
+            session.txn_failed = True
+            raise
+    return _run_statement(stmt, storage, db, catalog, session)
+
+
+def _begin_txn(storage: Any, session: Session) -> SQLResult:
+    # A nested BEGIN is a no-op in Postgres (it warns and stays in the block).
+    if session.txn_handle is None:
+        session.txn_handle = storage.begin_user_transaction()
+        session.txn_failed = False
+    return SQLResult(command_tag="BEGIN")
+
+
+def _commit_txn(storage: Any, session: Session) -> SQLResult:
+    handle, failed = session.txn_handle, session.txn_failed
+    session.txn_handle = None
+    session.txn_failed = False
+    if handle is None:
+        return SQLResult(command_tag="COMMIT")  # no open block — Postgres warns, returns COMMIT
+    if failed:
+        # COMMIT of an aborted block actually rolls back (and tags ROLLBACK).
+        storage.abort_user_transaction(handle)
+        return SQLResult(command_tag="ROLLBACK")
+    storage.commit_user_transaction(handle)
+    return SQLResult(command_tag="COMMIT")
+
+
+def _rollback_txn(storage: Any, session: Session) -> SQLResult:
+    handle = session.txn_handle
+    session.txn_handle = None
+    session.txn_failed = False
+    if handle is not None:
+        storage.abort_user_transaction(handle)
+    return SQLResult(command_tag="ROLLBACK")
 
 
 def run_statement(
@@ -49,7 +113,7 @@ def run_statement(
     """
     if catalog is None:
         catalog = Catalog(storage)
-    return _run_statement(stmt, storage, db, catalog, session)
+    return _dispatch(stmt, storage, db, catalog, session)
 
 
 def describe_statement(
@@ -138,15 +202,6 @@ def _run_statement(
 
     if isinstance(stmt, exp.Command):
         return _run_command(stmt, session)
-
-    # Transaction control — accepted as autocommit no-ops in P2 (real
-    # multi-statement transaction semantics are a later phase).
-    if isinstance(stmt, exp.Transaction):
-        return SQLResult(command_tag="BEGIN")
-    if isinstance(stmt, exp.Commit):
-        return SQLResult(command_tag="COMMIT")
-    if isinstance(stmt, exp.Rollback):
-        return SQLResult(command_tag="ROLLBACK")
 
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
 

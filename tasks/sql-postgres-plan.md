@@ -348,7 +348,8 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   `current_role`/`session_user`, `current_setting(name)`, `set_config(...)`,
   `pg_backend_pid()` (`functions.py`). `SHOW` / `SET` / `RESET` (settings
   persist on the session; reportable GUCs echo a `ParameterStatus`).
-  `BEGIN`/`COMMIT`/`ROLLBACK` accepted as autocommit no-ops (real txns: P5).
+  `BEGIN`/`COMMIT`/`ROLLBACK` were accept-and-no-op here, now real (see
+  *Transactions* below).
   `information_schema.tables`/`.columns`/`.schemata` and
   `pg_catalog.pg_class`/`pg_namespace`/`pg_type`/`pg_database` as **virtual
   tables** (`virtual.py`) — computed from the catalog and run through the
@@ -405,9 +406,7 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   `ORDER BY`/`LIMIT`/`OFFSET` apply as pipeline stages. The WHERE translator was
   refactored to a `resolve(column) -> (field, type_tag)` callable shared by the
   single-table and join paths. **Deferred:** JOIN combined with GROUP BY,
-  three-plus-table joins, non-equi joins, `DISTINCT`, window functions, and real
-  multi-statement **transactions** (`BEGIN/COMMIT/ROLLBACK` are still autocommit
-  no-ops from P2 — moved to a later phase). Tests:
+  three-plus-table joins, non-equi joins, `DISTINCT`, window functions. Tests:
   `tests/test_sql_aggregate.py`. Interactive `psql`'s `\d` is now closer but
   still needs the pg_catalog *functions* (`format_type`, `pg_table_is_visible`)
   + casts those join queries use.
@@ -445,6 +444,20 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   (`inspect().get_table_names()` issues pg_catalog *joins* — needs the catalog-join
   surface), the JDBC driver, and a live psql/psycopg gauge (when libpq is
   available). pg8000 + sqlalchemy added to the `dev` extra so the gauge runs in CI.
+- **Transactions (post-P7). ✅ landed.** `BEGIN`/`COMMIT`/`ROLLBACK` now open /
+  commit / abort a real `Storage` user-transaction (the same
+  `begin_user_transaction` / `use_user_transaction` / `commit_user_transaction`
+  the Mongo multi-document path uses). A `Session` holds the open txn handle;
+  every statement inside the block runs within `use_user_transaction` (so its
+  WT session sees the in-flight writes and `ROLLBACK` undoes them — DDL
+  included), and a statement that errors poisons the block (`25P02` on every
+  command until COMMIT/ROLLBACK; COMMIT of an aborted block rolls back and tags
+  `ROLLBACK`). The wire `ReadyForQuery` status byte now reflects the block
+  (`I` idle / `T` in-transaction / `E` failed) on both the simple and extended
+  paths, and a connection that drops mid-block aborts its open transaction.
+  Tests: `tests/test_sql_transactions.py` + a real pg8000 commit/rollback over
+  the wire. **Deferred:** `SAVEPOINT`, `SET TRANSACTION ISOLATION LEVEL` /
+  read-only, and SQL-level `DECLARE CURSOR` (see backlog).
 
 ---
 

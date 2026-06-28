@@ -198,6 +198,25 @@ def test_sqlalchemy_core_roundtrip(server):
         engine.dispose()
 
 
+def test_transaction_commit_and_rollback(server):
+    conn = connect(server)
+    conn.autocommit = False
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, n int)")
+    conn.commit()
+    # Roll back an insert — it must not survive.
+    cur.execute("INSERT INTO t (id, n) VALUES (1, 10)")
+    conn.rollback()
+    cur.execute("SELECT COUNT(*) FROM t")
+    assert cur.fetchall() == ([0],)
+    # Commit an insert — it persists.
+    cur.execute("INSERT INTO t (id, n) VALUES (2, 20)")
+    conn.commit()
+    cur.execute("SELECT COUNT(*) FROM t")
+    assert cur.fetchall() == ([1],)
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address
