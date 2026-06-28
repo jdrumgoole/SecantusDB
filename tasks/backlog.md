@@ -1246,17 +1246,31 @@ When you close a bucket, delete it.
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
 
-- [ ] **Wire server is simple-protocol only (P1).** `pgwire.py` / `pgserver.py`
-  speak the v3 startup + simple `Query` path with trust auth. The extended query
-  protocol (`Parse`/`Bind`/`Execute`, `$1` params — what psycopg uses) is P3, TLS
-  + SCRAM auth is P4, and the `pg_catalog`/`information_schema` surface psql/JDBC
-  introspection needs is P2. Result rows use the text format only (no binary).
-- [ ] **Declared tables only.** Reflected/jsonb access over existing Mongo collections
-  (the zero-DDL path) is P6 — a `SELECT` against a table with no `CREATE TABLE`
-  raises `42P01` rather than reflecting the collection.
-- [ ] **No joins / GROUP BY / aggregates beyond `COUNT(*)`.** `JOIN`, `GROUP BY`,
-  `HAVING`, `DISTINCT`, and `SUM`/`AVG`/`MIN`/`MAX` raise `0A000` feature-not-supported
-  (planned P5, lowering to `$lookup` / `$group`).
+- [ ] **Wire server: simple + extended protocol, trust + SCRAM auth, optional TLS.**
+  `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/
+  `Describe`/`Execute`/`Close`/`Sync` (P3), `SCRAM-SHA-256` auth + TLS (P4). Still
+  missing: **binary result format** (rows are always text; binary param *input* is
+  decoded, but results aren't binary-encoded even if a client requests it via Bind
+  result-format codes), channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert auth,
+  user management via SQL (`CREATE ROLE` — users are constructor config, not stored in
+  the catalog / shared with the Mongo user store), the `Copy` subprotocol, and cursor
+  `DECLARE`. `psycopg`/`psql` as live gauges need libpq (absent in the dev env), so the
+  wire paths are covered by pure-Python clients — revisit when libpq is available.
+- [ ] **Reflected tables are SELECT-only and not in the pipeline path (P6 landed the
+  read path).** A collection with no `CREATE TABLE` reflects (sampled schema-on-read)
+  for `SELECT` (incl. `->`/`->>`/`#>` jsonb navigation), but: INSERT/UPDATE/DELETE on an
+  un-declared collection still `42P01` (no SQL writes to reflected tables); aggregates /
+  joins over a reflected table `42P01` (the GROUP BY / `$lookup` planner is catalog-only);
+  jsonb containment (`@>`, `?`, `?|`, `?&`) and `jsonb_*` functions aren't parsed; type
+  inference samples 50 docs and picks the first non-null type per field (no widening across
+  conflicting types — first-seen wins).
+- [ ] **Aggregate/JOIN path has gaps (P5 landed the core).** `GROUP BY` + `HAVING` +
+  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` and single two-table `INNER`/`LEFT JOIN` (equality `ON`)
+  compile to an aggregation pipeline. Still `0A000`: JOIN *combined* with GROUP BY/
+  aggregates, 3+ table joins, non-equi / `OR` join conditions, `RIGHT`/`FULL`/`CROSS`
+  JOIN, `SELECT DISTINCT`, window functions, subqueries, and scalar expressions in the
+  SELECT list / GROUP BY (only bare columns and single aggregates are handled). SUM/MIN/MAX
+  result typing is approximate (uses the column's tag; AVG → float8).
 - [ ] **WHERE is literal-only.** Comparisons must be `column OP literal` (or the mirror);
   column-to-column predicates and arbitrary scalar expressions aren't translated.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,

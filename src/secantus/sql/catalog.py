@@ -50,6 +50,10 @@ class TableDef:
     name: str
     collection: str
     columns: list[Column]
+    # Reflected tables have a sampled, schema-on-read shape: any column name
+    # resolves to a field of the same name, and an un-sampled column reads as
+    # the permissive ``any`` type rather than erroring.
+    reflected: bool = False
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:
@@ -59,15 +63,19 @@ class TableDef:
 
     def field_for(self, name: str) -> str:
         c = self.column(name)
-        if c is None:
-            raise errors.undefined_column(name)
-        return c.field
+        if c is not None:
+            return c.field
+        if self.reflected:
+            return name
+        raise errors.undefined_column(name)
 
     def type_for(self, name: str) -> str:
         c = self.column(name)
-        if c is None:
-            raise errors.undefined_column(name)
-        return c.type_tag
+        if c is not None:
+            return c.type_tag
+        if self.reflected:
+            return "any"
+        raise errors.undefined_column(name)
 
     @property
     def pk_column(self) -> Column | None:

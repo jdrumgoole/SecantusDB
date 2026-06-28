@@ -110,6 +110,10 @@ def coerce(value: Any, tag: str) -> Any:
     """
     if value is None:
         return None
+    if tag == "any":
+        # Schema-on-read (reflected tables): keep the literal's natural Python
+        # type so it compares against the stored BSON value as-is.
+        return value
     if tag == "int4":
         return int(value)
     if tag == "int8":

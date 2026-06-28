@@ -186,11 +186,12 @@ def test_undefined_column(storage):
     assert ei.value.sqlstate == "42703"
 
 
-def test_unsupported_join_reports_feature_error(storage):
+def test_self_join_is_supported(storage):
+    # JOINs landed in P5 (see tests/test_sql_aggregate.py); a self-join on the
+    # primary key returns each row once.
     _make_users(storage)
-    with pytest.raises(SQLError) as ei:
-        sql(storage, "SELECT u.name FROM users u JOIN users v ON u.id = v.id")
-    assert ei.value.sqlstate == "0A000"
+    res = sql(storage, "SELECT u.name FROM users u JOIN users v ON u.id = v.id ORDER BY u.name")
+    assert res.rows == [("alice",), ("bob",), ("carol",)]
 
 
 def test_duplicate_table_and_if_not_exists(storage):

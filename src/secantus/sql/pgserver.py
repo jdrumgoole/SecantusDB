@@ -20,12 +20,21 @@ import logging
 import os
 import secrets
 import socket
+import ssl
 import threading
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 from secantus.sql import errors, pgwire, typemap
 from secantus.sql.engine import run_sql
+from secantus.sql.pgauth import (
+    SCRAM_SHA_256,
+    PGAuthError,
+    ScramExchange,
+    UserStore,
+    mock_credentials,
+)
+from secantus.sql.pgextended import ExtendedSession
 from secantus.sql.session import SERVER_VERSION, Session
 
 if TYPE_CHECKING:
@@ -46,6 +55,10 @@ class SecantusPGServer:
         storage: Any = None,
         default_database: str = "postgres",
         client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
+        require_auth: bool = False,
+        users: dict[str, str] | None = None,
+        tls_cert_file: str | None = None,
+        tls_key_file: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -56,6 +69,21 @@ class SecantusPGServer:
         self._stop_event = threading.Event()
         self._conns: set[socket.socket] = set()
         self._conns_lock = threading.Lock()
+        # SCRAM-SHA-256 auth: when require_auth is on, clients must authenticate
+        # against a user from ``users`` (username -> plaintext, hashed into a
+        # SCRAM verifier at startup; the plaintext is not retained).
+        self.require_auth = require_auth
+        self._users = UserStore.from_passwords(users or {})
+        # Optional TLS: when a cert/key pair is given, an SSLRequest is answered
+        # 'S' and the socket is wrapped before the startup flow. Without it, the
+        # server declines TLS ('N') and stays plaintext.
+        if (tls_cert_file is None) != (tls_key_file is None):
+            raise ValueError("tls_cert_file and tls_key_file must both be set or both be None")
+        self._ssl_context: ssl.SSLContext | None = None
+        if tls_cert_file is not None and tls_key_file is not None:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=tls_cert_file, keyfile=tls_key_file)
+            self._ssl_context = ctx
         # Storage is injectable so the server is testable without a WiredTiger
         # build; when not provided we create the real WT-backed store lazily
         # (the import is deferred so importing this module never needs WT).
@@ -136,11 +164,12 @@ class SecantusPGServer:
             self._conns.add(conn)
         try:
             with conn:
-                session = self._handshake(conn)
-                if session is None:
+                result = self._handshake(conn)
+                if result is None:
                     return
-                self._query_loop(conn, session)
-        except (pgwire.PGConnectionClosed, ConnectionError, TimeoutError, OSError):
+                io, session = result
+                self._query_loop(io, session)
+        except (pgwire.PGConnectionClosed, ConnectionError, TimeoutError, ssl.SSLError, OSError):
             return
         except Exception:
             logger.exception("unhandled error on pg connection from %s", addr)
@@ -148,14 +177,24 @@ class SecantusPGServer:
             with self._conns_lock:
                 self._conns.discard(conn)
 
-    def _handshake(self, conn: socket.socket) -> Session | None:
-        """Negotiate startup + trust auth. Returns the connection ``Session``."""
-        # SSL/GSSENC requests precede the StartupMessage; we decline (no TLS in
-        # P1) and read again. A CancelRequest on a fresh socket is a no-op drop.
+    def _handshake(self, conn: socket.socket) -> tuple[socket.socket, Session] | None:
+        """Negotiate TLS (if requested) + startup + auth.
+
+        Returns ``(io_socket, session)`` — ``io_socket`` is the TLS-wrapped
+        socket when TLS was negotiated, else ``conn`` — or None to drop.
+        """
+        io = conn
+        # SSL/GSSENC requests precede the StartupMessage. We answer 'S' and wrap
+        # when TLS is configured, otherwise decline ('N') and read again. A
+        # CancelRequest on a fresh socket is a no-op drop.
         while True:
-            packet = pgwire.read_startup_packet(conn)
+            packet = pgwire.read_startup_packet(io)
+            if isinstance(packet, pgwire.SSLRequest) and self._ssl_context is not None:
+                io.sendall(b"S")
+                io = self._ssl_context.wrap_socket(io, server_side=True)
+                continue
             if isinstance(packet, pgwire.SSLRequest | pgwire.GSSENCRequest):
-                conn.sendall(b"N")
+                io.sendall(b"N")
                 continue
             if isinstance(packet, pgwire.CancelRequest):
                 return None
@@ -166,6 +205,10 @@ class SecantusPGServer:
         user = startup.params.get("user", "secantus")
         application_name = startup.params.get("application_name", "")
         backend_pid = os.getpid() & 0x7FFFFFFF
+
+        if self.require_auth and not self._authenticate(io, user):
+            return None
+
         session = Session(database=db, user=user, backend_pid=backend_pid)
         if application_name:
             session.settings["application_name"] = application_name
@@ -189,10 +232,41 @@ class SecantusPGServer:
         # isn't honoured in P1, but clients store these).
         out += pgwire.backend_key_data(backend_pid, secrets.randbits(31))
         out += pgwire.ready_for_query(b"I")
-        conn.sendall(bytes(out))
-        return session
+        io.sendall(bytes(out))
+        return io, session
+
+    def _authenticate(self, io: socket.socket, user: str) -> bool:
+        """Run the SCRAM-SHA-256 exchange. Returns True on success.
+
+        On failure an ErrorResponse (SQLSTATE 28P01) is sent so the client
+        surfaces "password authentication failed" rather than a bare hang-up.
+        """
+        # Unknown user → a throwaway verifier so the exchange fails at the same
+        # step as a wrong password (no username enumeration via the handshake).
+        creds = self._users.get(user) or mock_credentials()
+        io.sendall(pgwire.authentication_sasl([SCRAM_SHA_256]))
+        try:
+            msg = pgwire.read_message(io)
+            mech, client_first = pgwire.parse_sasl_initial_response(msg.payload)
+            if msg.type != "p" or mech != SCRAM_SHA_256:
+                raise PGAuthError("authentication failed")
+            exch = ScramExchange(creds)
+            io.sendall(pgwire.authentication_sasl_continue(exch.server_first(client_first)))
+            final_msg = pgwire.read_message(io)
+            if final_msg.type != "p":
+                raise PGAuthError("expected SASLResponse")
+            server_final = exch.server_final(pgwire.parse_sasl_response(final_msg.payload))
+            io.sendall(pgwire.authentication_sasl_final(server_final))
+            return True
+        except PGAuthError:
+            io.sendall(
+                pgwire.error_response("28P01", f'password authentication failed for user "{user}"')
+            )
+            return False
 
     def _query_loop(self, conn: socket.socket, session: Session) -> None:
+        # Per-connection extended-protocol state (prepared statements + portals).
+        ext = ExtendedSession(self.storage, session)
         while not self._stop_event.is_set():
             msg = pgwire.read_message(conn)
             if msg.type == "X":  # Terminate
@@ -200,14 +274,11 @@ class SecantusPGServer:
             if msg.type == "Q":  # simple Query
                 self._handle_query(conn, session, pgwire.parse_query(msg.payload))
                 continue
-            if msg.type == "S":  # Sync (extended protocol) — be lenient
-                conn.sendall(pgwire.ready_for_query(b"I"))
-                continue
-            # Extended-protocol / unknown messages aren't supported yet.
-            conn.sendall(
-                pgwire.error_response("0A000", f"message type '{msg.type}' is not supported")
-            )
-            conn.sendall(pgwire.ready_for_query(b"I"))
+            # Everything else is the extended query protocol
+            # (Parse/Bind/Describe/Execute/Close/Sync/Flush).
+            reply = ext.process(msg.type, msg.payload)
+            if reply:
+                conn.sendall(reply)
 
     def _handle_query(self, conn: socket.socket, session: Session, sql: str) -> None:
         out = bytearray()

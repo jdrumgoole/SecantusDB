@@ -49,6 +49,10 @@ class FakeStorage:
     def list_collections(self, db):
         return sorted(c for (d, c) in self.data if d == db)
 
+    def list_indexes(self, db, coll):
+        # No secondary indexes — $lookup falls back to the hash-join path.
+        return []
+
     def insert(self, db, coll, docs, *, ordered=True, journal=False):
         store = self._coll(db, coll)
         inserted = 0
@@ -75,7 +79,9 @@ class FakeStorage:
     def find_matching(
         self, db, coll, filter=None, *, skip=0, limit=0, sort=None, projection=None, **kw
     ):
-        store = self._coll(db, coll)
+        # Read-only: must NOT create the collection (real Storage doesn't), so
+        # reflection can tell an existing-but-empty collection from an unknown one.
+        store = self.data.get((db, coll), [])
         out = [copy.deepcopy(d) for d in store if matches(d, filter or {})]
         if sort:
             out = _sorted(out, sort)

@@ -359,14 +359,76 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   operators — those need the join/function machinery of P5, so such catalog
   joins currently return a faithful `0A000` rather than a wrong answer. Tests:
   `tests/test_sql_catalog.py` + wire coverage in `tests/test_pgserver.py`.
-- **P3 — Extended protocol + psycopg.** `Parse`/`Bind`/`Execute`/`Sync`,
-  prepared statements, `$1` params, portals. Gauge: **psycopg** CRUD round-trip.
-- **P4 — SCRAM-SHA-256 auth.** Reuse `secantus.auth`; gauge auth with `psql`
-  PGPASSWORD + psycopg.
-- **P5 — Joins, aggregates, GROUP BY, transactions.** The `$lookup` / `$group`
-  lowering + `BEGIN/COMMIT/ROLLBACK`.
-- **P6 — Reflected tables + jsonb.** Read Mongo-written collections via SQL,
-  the dual-protocol view, `jsonb` for nested docs/arrays.
+- **P3 — Extended query protocol. ✅ landed.** `Parse`/`Bind`/`Describe`/
+  `Execute`/`Close`/`Sync`/`Flush` (`pgwire.py` builders/parsers +
+  `pgextended.py` state machine). Per-connection prepared-statement and portal
+  registries; `$1` placeholders (sqlglot `exp.Parameter`) substituted into the
+  AST as literals so the existing column-type coercion types them (a text
+  `"5"` bound to an `int8` column lands as `Int64(5)`); text + binary param
+  formats decoded. `Describe` resolves result columns **without executing**
+  (`engine.describe_statement` — planning is side-effect-free, so Describe never
+  runs an INSERT/UPDATE/DELETE): statement-describe → `ParameterDescription` +
+  `RowDescription`/`NoData`, portal-describe → `RowDescription`/`NoData`.
+  `Execute` honours `max_rows` with `PortalSuspended`; errors enter the
+  protocol's skip-until-`Sync` state so a bad statement can't desync the stream.
+  Tests: `tests/test_pgserver_extended.py` (pure-Python extended client —
+  prepared-statement reuse, params, NULL binds, portal suspend/resume,
+  error-recovery, empty query). **psycopg** as a live gauge needs libpq
+  (unavailable in this dev env) — wire-level coverage stands in; revisit when a
+  libpq-backed client is available. Result rows are text-format only (binary
+  result format is a later optimisation).
+- **P4 — TLS + SCRAM-SHA-256 auth. ✅ landed.** `pgauth.py` runs the Postgres
+  SASL `SCRAM-SHA-256` exchange (AuthenticationSASL → SASLContinue → SASLFinal),
+  reusing `secantus.auth`'s `derive_credentials` / `StoredCredentials` — the same
+  RFC 5802 verifier as the Mongo side, so a client proof is checked from the
+  StoredKey/ServerKey without ever holding the plaintext. `SecantusPGServer(...,
+  require_auth=True, users={...})` derives verifiers at startup; an unknown user
+  runs a mock exchange (random verifier) so it fails identically to a wrong
+  password — no username enumeration. TLS: `tls_cert_file`/`tls_key_file` answer
+  `SSLRequest` with `S` and wrap the socket (reusing the `SecantusDBServer`
+  SSLContext pattern); without it the server declines (`N`). Channel binding
+  (`SCRAM-SHA-256-PLUS`) is not offered. Tests:
+  `tests/test_pgserver_auth.py` (pure-Python SCRAM client: success / wrong
+  password / unknown user → `28P01`; trust default; TLS query via an ephemeral
+  `trustme` CA; TLS-declined). psql/psycopg need libpq (absent here) — the wire
+  exchange stands in.
+- **P5 — Joins, aggregates, GROUP BY. ✅ landed.** SELECTs with a JOIN, GROUP
+  BY, HAVING, or aggregate functions now compile to a **Mongo aggregation
+  pipeline** run through the existing `apply_pipeline` engine (a second execution
+  path alongside `find_matching`). Aggregates `COUNT(*)`/`COUNT(col)`/`SUM`/`AVG`/
+  `MIN`/`MAX` → `$group` accumulators (whole-table → `_id: null`, else `_id` =
+  the GROUP BY keys); `HAVING` → a post-`$group` `$match` (an aggregate used only
+  in HAVING registers a hidden accumulator); single two-table `INNER`/`LEFT JOIN`
+  with an equality `ON` → `$lookup` + `$unwind` (`preserveNullAndEmptyArrays` for
+  LEFT), with `alias.column` resolved to the right side and joined columns read
+  from the `$<alias>` path. WHERE on a join lands as a `$match` after the lookup.
+  `ORDER BY`/`LIMIT`/`OFFSET` apply as pipeline stages. The WHERE translator was
+  refactored to a `resolve(column) -> (field, type_tag)` callable shared by the
+  single-table and join paths. **Deferred:** JOIN combined with GROUP BY,
+  three-plus-table joins, non-equi joins, `DISTINCT`, window functions, and real
+  multi-statement **transactions** (`BEGIN/COMMIT/ROLLBACK` are still autocommit
+  no-ops from P2 — moved to a later phase). Tests:
+  `tests/test_sql_aggregate.py`. Interactive `psql`'s `\d` is now closer but
+  still needs the pg_catalog *functions* (`format_type`, `pg_table_is_visible`)
+  + casts those join queries use.
+- **P6 — Reflected tables + jsonb. ✅ landed.** A collection with no
+  `CREATE TABLE` is queryable schema-on-read: `reflect.py` samples N docs, infers
+  a column + type per top-level field, and presents a `TableDef` flagged
+  `reflected` (un-sampled fields still resolve, as the permissive `any` type;
+  nested docs/arrays surface as `jsonb`). `SELECT *` expands to the inferred
+  columns; missing fields read as `NULL`; WHERE coercion uses the inferred type
+  (so `age > 18` compares numerically) or passes the literal through for `any`.
+  **jsonb navigation** — `->` / `->>` / `#>` (sqlglot `JSONExtract` /
+  `JSONExtractScalar` / `JSONBExtract`) lower to dotted field paths read via
+  `paths.get_path`; `->>`/`#>>` type as `text`, `->`/`#>` as `json`. Works in
+  both projection and WHERE, on reflected *and* declared `jsonb` columns. The
+  WHERE translator's `_field` helper resolves either a column or a jsonb path.
+  Reflected tables are **read-only** (no `CREATE TABLE` → INSERT/UPDATE/DELETE
+  still `42P01`); a declared table shadows reflection. This is the dual-protocol
+  payoff — data written via `pymongo` is readable via SQL with no DDL.
+  **Deferred:** aggregates / joins over reflected tables (the pipeline path is
+  still catalog-only), writes to reflected tables, and `jsonb` containment
+  operators (`@>` / `?`). Tests: `tests/test_sql_reflect.py`.
 - **P7 — JDBC + tooling hardening.** Postgres JDBC driver, then SQLAlchemy /
   an ORM reflection smoke. These are the strict introspection clients (the
   SQL analogue of the Go/PHP-ext gauges being the strictest wire checks).
