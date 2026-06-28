@@ -1246,11 +1246,14 @@ When you close a bucket, delete it.
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
 
-- [ ] **Wire server is simple-protocol only (P1).** `pgwire.py` / `pgserver.py`
-  speak the v3 startup + simple `Query` path with trust auth. The extended query
-  protocol (`Parse`/`Bind`/`Execute`, `$1` params — what psycopg uses) is P3, TLS
-  + SCRAM auth is P4, and the `pg_catalog`/`information_schema` surface psql/JDBC
-  introspection needs is P2. Result rows use the text format only (no binary).
+- [ ] **Wire server: simple + extended protocol, trust auth only.** `pgserver.py`
+  speaks the v3 startup, simple `Query` (P1), and extended `Parse`/`Bind`/`Describe`/
+  `Execute`/`Close`/`Sync` (P3) paths. Still missing: TLS + SCRAM auth (P4 — trust
+  only today), **binary result format** (rows are always text; binary param *input*
+  is decoded, but results aren't encoded in binary even if a client requests it via
+  Bind result-format codes), the `Copy` subprotocol, and cursor `DECLARE`. `psycopg`
+  as a live gauge needs libpq (absent in the dev env), so P3 is covered by a
+  pure-Python wire client rather than a real driver — revisit when libpq is available.
 - [ ] **Declared tables only.** Reflected/jsonb access over existing Mongo collections
   (the zero-DDL path) is P6 — a `SELECT` against a table with no `CREATE TABLE`
   raises `42P01` rather than reflecting the collection.

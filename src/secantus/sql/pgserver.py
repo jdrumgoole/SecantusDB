@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from secantus.sql import errors, pgwire, typemap
 from secantus.sql.engine import run_sql
+from secantus.sql.pgextended import ExtendedSession
 from secantus.sql.session import SERVER_VERSION, Session
 
 if TYPE_CHECKING:
@@ -193,6 +194,8 @@ class SecantusPGServer:
         return session
 
     def _query_loop(self, conn: socket.socket, session: Session) -> None:
+        # Per-connection extended-protocol state (prepared statements + portals).
+        ext = ExtendedSession(self.storage, session)
         while not self._stop_event.is_set():
             msg = pgwire.read_message(conn)
             if msg.type == "X":  # Terminate
@@ -200,14 +203,11 @@ class SecantusPGServer:
             if msg.type == "Q":  # simple Query
                 self._handle_query(conn, session, pgwire.parse_query(msg.payload))
                 continue
-            if msg.type == "S":  # Sync (extended protocol) — be lenient
-                conn.sendall(pgwire.ready_for_query(b"I"))
-                continue
-            # Extended-protocol / unknown messages aren't supported yet.
-            conn.sendall(
-                pgwire.error_response("0A000", f"message type '{msg.type}' is not supported")
-            )
-            conn.sendall(pgwire.ready_for_query(b"I"))
+            # Everything else is the extended query protocol
+            # (Parse/Bind/Describe/Execute/Close/Sync/Flush).
+            reply = ext.process(msg.type, msg.payload)
+            if reply:
+                conn.sendall(reply)
 
     def _handle_query(self, conn: socket.socket, session: Session, sql: str) -> None:
         out = bytearray()

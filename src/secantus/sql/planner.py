@@ -472,6 +472,46 @@ def plan_delete(stmt: exp.Delete, table: TableDef) -> DeletePlan:
     return DeletePlan(table=table, filter=_where_filter(stmt, table))
 
 
+def _value_to_node(value: Any) -> exp.Expression:
+    if value is None:
+        return exp.Null()
+    if isinstance(value, bool):
+        return exp.Boolean(this=value)
+    if isinstance(value, (int, float)):
+        return exp.Literal.number(repr(value))
+    return exp.Literal.string(str(value))
+
+
+def substitute_parameters(stmt: exp.Expression, values: list[Any]) -> exp.Expression:
+    """Replace ``$1`` / ``$2`` ... placeholders with bound literal nodes.
+
+    Bound values arrive as Python scalars (text params decode to ``str``); the
+    column-type coercion in the planner then converts them to the right BSON
+    type, so a text ``"5"`` bound into an ``int8`` column lands as ``Int64(5)``.
+    """
+    stmt = stmt.copy()
+    for param in list(stmt.find_all(exp.Parameter)):
+        try:
+            idx = int(param.name) - 1
+        except (TypeError, ValueError) as exc:
+            raise errors.syntax_error(f"invalid bind parameter ${param.name}") from exc
+        if idx < 0 or idx >= len(values):
+            raise errors.syntax_error(f"bind parameter ${param.name} has no value")
+        param.replace(_value_to_node(values[idx]))
+    return stmt
+
+
+def parameter_count(stmt: exp.Expression) -> int:
+    """Highest ``$N`` index referenced by ``stmt`` (0 if none)."""
+    indices = []
+    for param in stmt.find_all(exp.Parameter):
+        try:
+            indices.append(int(param.name))
+        except (TypeError, ValueError):
+            continue
+    return max(indices, default=0)
+
+
 def parse(sql: str) -> list[exp.Expression]:
     """Parse a (possibly multi-statement) SQL string into AST statements."""
     try:

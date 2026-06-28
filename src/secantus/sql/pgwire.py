@@ -134,6 +134,72 @@ def parse_query(payload: bytes) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Extended-protocol frontend parsers
+# --------------------------------------------------------------------------- #
+
+
+def _read_cstr(payload: bytes, offset: int) -> tuple[str, int]:
+    end = payload.index(b"\x00", offset)
+    return payload[offset:end].decode("utf-8"), end + 1
+
+
+def parse_parse(payload: bytes) -> tuple[str, str, list[int]]:
+    """'P' Parse: (statement_name, query, param_type_oids)."""
+    name, offset = _read_cstr(payload, 0)
+    query, offset = _read_cstr(payload, offset)
+    (n,) = _INT16.unpack_from(payload, offset)
+    offset += 2
+    oids = [_INT32.unpack_from(payload, offset + 4 * i)[0] for i in range(n)]
+    return name, query, oids
+
+
+def parse_bind(payload: bytes) -> tuple[str, str, list[int], list[bytes | None], list[int]]:
+    """'B' Bind: (portal, statement, param_format_codes, param_values, result_formats)."""
+    portal, offset = _read_cstr(payload, 0)
+    statement, offset = _read_cstr(payload, offset)
+    (n_fmt,) = _INT16.unpack_from(payload, offset)
+    offset += 2
+    formats = [_INT16.unpack_from(payload, offset + 2 * i)[0] for i in range(n_fmt)]
+    offset += 2 * n_fmt
+    (n_params,) = _INT16.unpack_from(payload, offset)
+    offset += 2
+    values: list[bytes | None] = []
+    for _ in range(n_params):
+        (length,) = _INT32.unpack_from(payload, offset)
+        offset += 4
+        if length == -1:
+            values.append(None)
+        else:
+            values.append(payload[offset : offset + length])
+            offset += length
+    (n_res,) = _INT16.unpack_from(payload, offset)
+    offset += 2
+    result_formats = [_INT16.unpack_from(payload, offset + 2 * i)[0] for i in range(n_res)]
+    return portal, statement, formats, values, result_formats
+
+
+def parse_describe(payload: bytes) -> tuple[str, str]:
+    """'D' Describe: (kind 'S'|'P', name)."""
+    kind = chr(payload[0])
+    name, _ = _read_cstr(payload, 1)
+    return kind, name
+
+
+def parse_execute(payload: bytes) -> tuple[str, int]:
+    """'E' Execute: (portal, max_rows)."""
+    portal, offset = _read_cstr(payload, 0)
+    (max_rows,) = _INT32.unpack_from(payload, offset)
+    return portal, max_rows
+
+
+def parse_close(payload: bytes) -> tuple[str, str]:
+    """'C' Close: (kind 'S'|'P', name)."""
+    kind = chr(payload[0])
+    name, _ = _read_cstr(payload, 1)
+    return kind, name
+
+
+# --------------------------------------------------------------------------- #
 # Backend message builders
 # --------------------------------------------------------------------------- #
 
@@ -217,6 +283,33 @@ def notice_response(message: str) -> bytes:
     return _msg("N", payload)
 
 
+def parse_complete() -> bytes:
+    return _msg("1", b"")
+
+
+def bind_complete() -> bytes:
+    return _msg("2", b"")
+
+
+def close_complete() -> bytes:
+    return _msg("3", b"")
+
+
+def parameter_description(type_oids: list[int]) -> bytes:
+    payload = bytearray(_INT16.pack(len(type_oids)))
+    for oid in type_oids:
+        payload += _INT32.pack(oid)
+    return _msg("t", bytes(payload))
+
+
+def no_data() -> bytes:
+    return _msg("n", b"")
+
+
+def portal_suspended() -> bytes:
+    return _msg("s", b"")
+
+
 def build_startup_message(params: dict[str, str]) -> bytes:
     """Client-side helper (used by tests): assemble a StartupMessage."""
     body = bytearray(_INT32.pack(PROTOCOL_VERSION_3))
@@ -233,6 +326,54 @@ def build_query(sql: str) -> bytes:
 
 def build_terminate() -> bytes:
     return _msg("X", b"")
+
+
+def build_parse(statement: str, query: str, param_oids: list[int] | None = None) -> bytes:
+    """Client-side helper: 'P' Parse."""
+    oids = param_oids or []
+    payload = bytearray(_cstr(statement) + _cstr(query) + _INT16.pack(len(oids)))
+    for oid in oids:
+        payload += _INT32.pack(oid)
+    return _msg("P", bytes(payload))
+
+
+def build_bind(
+    portal: str,
+    statement: str,
+    params: list[bytes | None],
+) -> bytes:
+    """Client-side helper: 'B' Bind with all params in text format, text results."""
+    payload = bytearray(_cstr(portal) + _cstr(statement))
+    payload += _INT16.pack(0)  # zero format codes => all params text
+    payload += _INT16.pack(len(params))
+    for p in params:
+        if p is None:
+            payload += _INT32.pack(-1)
+        else:
+            payload += _INT32.pack(len(p)) + p
+    payload += _INT16.pack(0)  # zero result format codes => all results text
+    return _msg("B", bytes(payload))
+
+
+def build_describe(kind: str, name: str = "") -> bytes:
+    return _msg("D", kind.encode("latin-1") + _cstr(name))
+
+
+def build_execute(portal: str = "", max_rows: int = 0) -> bytes:
+    return _msg("E", _cstr(portal) + _INT32.pack(max_rows))
+
+
+def build_close(kind: str, name: str = "") -> bytes:
+    return _msg("C", kind.encode("latin-1") + _cstr(name))
+
+
+def build_sync() -> bytes:
+    return _msg("S", b"")
+
+
+def parse_parameter_description(payload: bytes) -> list[int]:
+    (count,) = _INT16.unpack_from(payload, 0)
+    return [_INT32.unpack_from(payload, 2 + 4 * i)[0] for i in range(count)]
 
 
 def parse_row_description(payload: bytes) -> list[str]:

@@ -359,8 +359,24 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   operators — those need the join/function machinery of P5, so such catalog
   joins currently return a faithful `0A000` rather than a wrong answer. Tests:
   `tests/test_sql_catalog.py` + wire coverage in `tests/test_pgserver.py`.
-- **P3 — Extended protocol + psycopg.** `Parse`/`Bind`/`Execute`/`Sync`,
-  prepared statements, `$1` params, portals. Gauge: **psycopg** CRUD round-trip.
+- **P3 — Extended query protocol. ✅ landed.** `Parse`/`Bind`/`Describe`/
+  `Execute`/`Close`/`Sync`/`Flush` (`pgwire.py` builders/parsers +
+  `pgextended.py` state machine). Per-connection prepared-statement and portal
+  registries; `$1` placeholders (sqlglot `exp.Parameter`) substituted into the
+  AST as literals so the existing column-type coercion types them (a text
+  `"5"` bound to an `int8` column lands as `Int64(5)`); text + binary param
+  formats decoded. `Describe` resolves result columns **without executing**
+  (`engine.describe_statement` — planning is side-effect-free, so Describe never
+  runs an INSERT/UPDATE/DELETE): statement-describe → `ParameterDescription` +
+  `RowDescription`/`NoData`, portal-describe → `RowDescription`/`NoData`.
+  `Execute` honours `max_rows` with `PortalSuspended`; errors enter the
+  protocol's skip-until-`Sync` state so a bad statement can't desync the stream.
+  Tests: `tests/test_pgserver_extended.py` (pure-Python extended client —
+  prepared-statement reuse, params, NULL binds, portal suspend/resume,
+  error-recovery, empty query). **psycopg** as a live gauge needs libpq
+  (unavailable in this dev env) — wire-level coverage stands in; revisit when a
+  libpq-backed client is available. Result rows are text-format only (binary
+  result format is a later optimisation).
 - **P4 — SCRAM-SHA-256 auth.** Reuse `secantus.auth`; gauge auth with `psql`
   PGPASSWORD + psycopg.
 - **P5 — Joins, aggregates, GROUP BY, transactions.** The `$lookup` / `$group`

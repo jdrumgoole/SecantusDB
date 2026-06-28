@@ -35,6 +35,63 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
     return results
 
 
+def run_statement(
+    storage: Any,
+    db: str,
+    stmt: exp.Expression,
+    session: Session,
+    catalog: Catalog | None = None,
+) -> SQLResult:
+    """Execute a single already-parsed AST statement.
+
+    The extended-protocol path (Parse/Bind/Execute) parses once and binds
+    parameters into the AST, then drives this rather than re-parsing SQL text.
+    """
+    if catalog is None:
+        catalog = Catalog(storage)
+    return _run_statement(stmt, storage, db, catalog, session)
+
+
+def describe_statement(
+    storage: Any, db: str, stmt: exp.Expression, session: Session, catalog: Catalog
+) -> list[ColumnDesc] | None:
+    """Resolve a statement's result columns WITHOUT executing it.
+
+    Used by the extended protocol's Describe: planning is side-effect-free, so
+    this never reads or writes storage (important — Describe must not run an
+    INSERT/UPDATE/DELETE). Returns the column descriptors for a row-returning
+    statement (SELECT / SHOW), or None for everything else (→ NoData).
+    """
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
+        return [ColumnDesc(_show_name(stmt), "text", typemap.PG_OID["text"])]
+    if not isinstance(stmt, exp.Select):
+        return None
+    table_node = stmt.find(exp.Table)
+    if table_node is None:
+        plan = planner.plan_constant_select(stmt, session)
+        return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t, _ in plan.columns]
+    schema = table_node.args.get("db")
+    schema_name = schema.name if schema is not None else None
+    vtable = virtual.lookup(schema_name, table_node.name)
+    table = vtable.table_def() if vtable is not None else catalog.get(db, table_node.name)
+    if table is None:
+        return None  # undefined table — let Execute raise the real error
+    select_plan = planner.plan_select(stmt, table)
+    if select_plan.count_star:
+        return [ColumnDesc(select_plan.count_alias, "int8", typemap.PG_OID["int8"])]
+    return [
+        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
+        for name, col in select_plan.out_columns
+    ]
+
+
+def _show_name(stmt: exp.Command) -> str:
+    arg = stmt.expression
+    if isinstance(arg, exp.Literal):
+        return str(arg.this).strip()
+    return str(arg.name).strip() if arg is not None else ""
+
+
 def _require_table(catalog: Catalog, db: str, name: str) -> Any:
     table = catalog.get(db, name)
     if table is None:
