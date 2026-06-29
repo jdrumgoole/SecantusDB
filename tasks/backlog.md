@@ -1295,8 +1295,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   JOIN, window functions, subqueries, and scalar expressions in the SELECT list / GROUP BY
   (only bare columns and single aggregates are handled). `DISTINCT` with aggregates is also
   `0A000`. SUM/MIN/MAX result typing is approximate (uses the column's tag; AVG → float8).
-- [ ] **WHERE is literal-only.** Comparisons must be `column OP literal` (or the mirror);
-  column-to-column predicates and arbitrary scalar expressions aren't translated.
+- [ ] **WHERE: column-to-column + arithmetic landed; functions not yet.** `column OP literal`
+  keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is a
+  constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`
+  (`planner._to_agg_expr`), with `+`/`-`/`*`/`/` arithmetic over columns and literals nesting
+  inside. `$expr` filters can't use a storage index (→ COLLSCAN, correct but unoptimised).
+  Still not translated: function calls inside such a predicate (`qty = abs(shipped)` → `0A000`)
+  and `<@`-style structural predicates.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the
