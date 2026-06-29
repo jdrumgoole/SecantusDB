@@ -41,6 +41,36 @@ def execute_drop_table(
     return SQLResult(command_tag="DROP TABLE")
 
 
+def execute_create_index(
+    plan: planner.CreateIndexPlan, catalog: Catalog, storage: Any, db: str
+) -> SQLResult:
+    existing = [ix.get("name") for ix in storage.list_indexes(db, plan.collection)]
+    if plan.name in existing:
+        if plan.if_not_exists:
+            return SQLResult(command_tag="CREATE INDEX")
+        raise errors.SQLError("42P07", f'relation "{plan.name}" already exists')
+    options = {"unique": True} if plan.unique else None
+    storage.create_index(db, plan.collection, plan.name, plan.key_spec, options)
+    return SQLResult(command_tag="CREATE INDEX")
+
+
+def execute_drop_index(
+    plan: planner.DropIndexPlan, catalog: Catalog, storage: Any, db: str
+) -> SQLResult:
+    # Postgres DROP INDEX names the index, not its table — find the owning
+    # collection by scanning the catalog's tables for the index name.
+    for tname in catalog.list_tables(db):
+        table = catalog.get(db, tname)
+        if table is None:
+            continue
+        if any(ix.get("name") == plan.name for ix in storage.list_indexes(db, table.collection)):
+            storage.drop_index(db, table.collection, plan.name)
+            return SQLResult(command_tag="DROP INDEX")
+    if plan.if_exists:
+        return SQLResult(command_tag="DROP INDEX")
+    raise errors.SQLError("42704", f'index "{plan.name}" does not exist')
+
+
 def execute_insert(plan: planner.InsertPlan, storage: Any, db: str) -> SQLResult:
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:

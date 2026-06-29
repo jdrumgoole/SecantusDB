@@ -342,6 +342,21 @@ def test_transaction_commit_and_rollback(server):
     conn.close()
 
 
+def test_create_index_and_isolation_via_driver(server):
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, label text, n int)")
+    cur.execute("CREATE INDEX ix_n ON t (n)")
+    cur.execute("CREATE UNIQUE INDEX ux_label ON t (label)")
+    assert {ix["name"] for ix in server.storage.list_indexes("db", "t")} == {"ix_n", "ux_label"}
+    cur.execute("DROP INDEX ix_n")
+    assert {ix["name"] for ix in server.storage.list_indexes("db", "t")} == {"ux_label"}
+    # Isolation / read-only characteristics are accepted (single-node no-op).
+    cur.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+    cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

@@ -48,6 +48,21 @@ class DropTablePlan:
 
 
 @dataclass
+class CreateIndexPlan:
+    collection: str
+    name: str
+    key_spec: dict[str, int]
+    unique: bool
+    if_not_exists: bool
+
+
+@dataclass
+class DropIndexPlan:
+    name: str
+    if_exists: bool
+
+
+@dataclass
 class InsertPlan:
     table: TableDef
     docs: list[dict[str, Any]]
@@ -409,6 +424,38 @@ def _with_pk(col: Column, pk_name: str) -> Column:
 
 def plan_drop_table(stmt: exp.Drop) -> DropTablePlan:
     return DropTablePlan(name=stmt.this.name, if_exists=bool(stmt.args.get("exists")))
+
+
+def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
+    index = stmt.this  # exp.Index
+    params = index.args.get("params")
+    if params is None or not params.args.get("columns"):
+        raise errors.feature_not_supported("CREATE INDEX requires a column list")
+    key_spec: dict[str, int] = {}
+    for col in params.args["columns"]:
+        ordered = col if isinstance(col, exp.Ordered) else None
+        col_node = ordered.this if ordered is not None else col
+        name = _column_name(col_node)
+        direction = -1 if (ordered is not None and ordered.args.get("desc")) else 1
+        key_spec[table.field_for(name)] = direction
+    name_ident = index.this
+    index_name = name_ident.name if name_ident is not None else _default_index_name(key_spec)
+    return CreateIndexPlan(
+        collection=table.collection,
+        name=index_name,
+        key_spec=key_spec,
+        unique=bool(stmt.args.get("unique")),
+        if_not_exists=bool(stmt.args.get("exists")),
+    )
+
+
+def _default_index_name(key_spec: dict[str, int]) -> str:
+    # Mirror mongod's auto-generated index name: field_dir joined by underscores.
+    return "_".join(f"{field}_{direction}" for field, direction in key_spec.items())
+
+
+def plan_drop_index(stmt: exp.Drop) -> DropIndexPlan:
+    return DropIndexPlan(name=stmt.this.name, if_exists=bool(stmt.args.get("exists")))
 
 
 def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:

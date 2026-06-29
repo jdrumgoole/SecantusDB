@@ -1310,14 +1310,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
-- [ ] **Transactions: single-connection atomicity, no SAVEPOINT / isolation knobs.**
+- [ ] **Transactions: single-connection atomicity, no SAVEPOINT.**
   `BEGIN`/`COMMIT`/`ROLLBACK` open/commit/abort a real `Storage` user-transaction
   (statements in the block run on its WT session; ROLLBACK undoes them; an error poisons
-  the block with `25P02` until it ends). Still missing: `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`,
-  `SET TRANSACTION ISOLATION LEVEL` / read-only, `BEGIN`-with-isolation, and the
-  `DECLARE CURSOR` ... `FETCH` holdable-cursor surface. DDL is transactional via the same
+  the block with `25P02` until it ends). `SET TRANSACTION ISOLATION LEVEL` / `READ ONLY` /
+  `READ WRITE`, `SET SESSION CHARACTERISTICS`, and `BEGIN ISOLATION LEVEL …` are now
+  **accepted as no-ops** (single-node — isolation/read-only don't change behaviour). Still
+  missing: `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (sqlglot's pg dialect doesn't parse `SAVEPOINT`
+  cleanly — `RELEASE` is a hard parse error — so it needs SQL-text preprocessing) and the
+  `DECLARE CURSOR` … `FETCH` holdable-cursor surface. DDL is transactional via the same
   mechanism. Cross-connection isolation is the WT engine's job (the test double only
   models atomicity).
+- [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
+  maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
+  unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
+  scanning the catalog and calls `drop_index` (`42704` when absent). Still missing: `ALTER TABLE`,
+  partial/expression index options via SQL, and reflecting indexes back through `get_indexes`
+  (needs a `pg_index` virtual table).
 - [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
   extension is absent so the pure SQL/operator tests import without a WT build. Inert in
   CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without

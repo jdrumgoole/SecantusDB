@@ -215,3 +215,61 @@ def test_multi_statement_returns_one_result_each(storage):
     )
     assert [r.command_tag for r in results] == ["CREATE TABLE", "INSERT 0 1", "SELECT 1"]
     assert results[-1].rows == [(10,)]
+
+
+# -- CREATE / DROP INDEX + transaction characteristics ----------------------- #
+
+
+def test_create_index_maps_to_storage(storage):
+    _make_users(storage)
+    assert sql(storage, "CREATE INDEX ix_age ON users (age)").command_tag == "CREATE INDEX"
+    assert sql(storage, "CREATE UNIQUE INDEX ux_name ON users (name DESC)").command_tag == (
+        "CREATE INDEX"
+    )
+    ixs = {ix["name"]: ix for ix in storage.list_indexes(DB, "users")}
+    assert ixs["ix_age"]["key"] == {"age": 1}
+    assert ixs["ux_name"]["key"] == {"name": -1}
+    assert ixs["ux_name"].get("unique") is True
+
+
+def test_create_index_pk_column_maps_to_id(storage):
+    # The PK column maps to the stored `_id` field.
+    _make_users(storage)
+    sql(storage, "CREATE INDEX ix_id ON users (id)")
+    (ix,) = [i for i in storage.list_indexes(DB, "users") if i["name"] == "ix_id"]
+    assert ix["key"] == {"_id": 1}
+
+
+def test_create_index_duplicate_and_if_not_exists(storage):
+    _make_users(storage)
+    sql(storage, "CREATE INDEX ix_age ON users (age)")
+    with pytest.raises(SQLError) as ei:
+        sql(storage, "CREATE INDEX ix_age ON users (age)")
+    assert ei.value.sqlstate == "42P07"
+    assert sql(storage, "CREATE INDEX IF NOT EXISTS ix_age ON users (age)").command_tag == (
+        "CREATE INDEX"
+    )
+
+
+def test_drop_index(storage):
+    _make_users(storage)
+    sql(storage, "CREATE INDEX ix_age ON users (age)")
+    assert sql(storage, "DROP INDEX ix_age").command_tag == "DROP INDEX"
+    assert storage.list_indexes(DB, "users") == []
+    with pytest.raises(SQLError) as ei:
+        sql(storage, "DROP INDEX ix_age")
+    assert ei.value.sqlstate == "42704"
+    assert sql(storage, "DROP INDEX IF EXISTS ix_age").command_tag == "DROP INDEX"
+
+
+def test_transaction_characteristics_accepted(storage):
+    # Single-node: isolation / read-only characteristics are accepted no-ops.
+    assert sql(storage, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").command_tag == "SET"
+    assert sql(storage, "SET TRANSACTION READ ONLY").command_tag == "SET"
+    assert (
+        sql(
+            storage, "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
+        ).command_tag
+        == "SET"
+    )
+    assert sql(storage, "BEGIN ISOLATION LEVEL READ COMMITTED").command_tag == "BEGIN"
