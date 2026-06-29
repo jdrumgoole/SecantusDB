@@ -1304,12 +1304,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   WHERE comparison** (the `$expr` path lowers columns + arithmetic, not function nodes —
   `WHERE upper(name) = 'X'` is `0A000`). `DISTINCT` with aggregates is also `0A000`. SUM/MIN/MAX
   result typing is approximate (uses the column's tag; AVG → float8; arithmetic → numeric).
-- [ ] **WHERE: column-to-column + arithmetic landed; functions not yet.** `column OP literal`
-  keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is a
-  constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`
+- [ ] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
+  literal` keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is
+  a constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`
   (`planner._to_agg_expr`), with `+`/`-`/`*`/`/` arithmetic over columns and literals nesting
-  inside. `$expr` filters can't use a storage index (→ COLLSCAN, correct but unoptimised).
-  Still not translated: function calls inside such a predicate (`qty = abs(shipped)` → `0A000`)
+  inside. **Non-correlated subqueries**: `x IN (SELECT col FROM t [WHERE ...])` → `$in`,
+  `NOT IN` → `$nin` (via the `NOT`→`$nor` wrapper), and a scalar `x = (SELECT max(col) ...)`
+  (any comparison op) → the evaluated value. The inner SELECT runs through the engine
+  (`engine.run_inner_select` ← `planner.SubqueryCtx`), so it may itself aggregate / filter; it
+  must select exactly one column. Plumbed via the single-table `plan_select` path (a subquery in
+  a GROUP BY/JOIN query's WHERE isn't wired yet → `0A000`). `$expr` / subquery filters can't use
+  a storage index (→ COLLSCAN). Still `0A000`: `EXISTS` / `NOT EXISTS`, **correlated**
+  subqueries (need per-row WHERE eval), function calls inside a comparison (`qty = abs(shipped)`),
   and `<@`-style structural predicates.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).

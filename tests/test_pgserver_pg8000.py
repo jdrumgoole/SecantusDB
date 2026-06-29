@@ -175,6 +175,35 @@ def test_write_to_reflected_table(server):
     conn.close()
 
 
+def test_where_subquery_via_driver(server):
+    # Non-correlated IN / scalar subqueries over Mongo-written data, through the
+    # real driver.
+    server.storage.insert(
+        "db",
+        "customers",
+        [
+            {"_id": bson.Int64(1), "name": "alice"},
+            {"_id": bson.Int64(2), "name": "bob"},
+            {"_id": bson.Int64(3), "name": "carol"},
+        ],
+    )
+    server.storage.insert(
+        "db",
+        "orders",
+        [
+            {"_id": bson.Int64(10), "cust": bson.Int64(1)},
+            {"_id": bson.Int64(11), "cust": bson.Int64(3)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM customers WHERE _id IN (SELECT cust FROM orders) ORDER BY name")
+    assert cur.fetchall() == (["alice"], ["carol"])
+    cur.execute("SELECT name FROM customers WHERE _id = (SELECT max(cust) FROM orders)")
+    assert cur.fetchall() == (["carol"],)
+    conn.close()
+
+
 def test_computed_expressions_via_driver(server):
     # Arithmetic + scalar functions in the SELECT list, over Mongo-written data,
     # through the real driver.

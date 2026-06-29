@@ -284,7 +284,20 @@ def _run_select(
     table = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
     if table is None:
         raise errors.undefined_table(table_node.name)
-    return executor.execute_select(planner.plan_select(stmt, table), storage, db)
+    # A non-correlated WHERE subquery (`x IN (SELECT ...)`, `x = (SELECT ...)`) is
+    # pre-evaluated by the planner, which runs the inner SELECT through the engine.
+    subctx = planner.SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
+    return executor.execute_select(planner.plan_select(stmt, table, subctx), storage, db)
+
+
+def run_inner_select(
+    stmt: exp.Select, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Run a non-correlated subquery's inner SELECT and return its result rows.
+
+    Used by the planner's WHERE-subquery evaluation; reuses the full SELECT path
+    so the inner query may itself aggregate / filter / join."""
+    return _run_select(stmt, storage, db, catalog, session)
 
 
 def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
