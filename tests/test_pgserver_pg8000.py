@@ -175,6 +175,26 @@ def test_write_to_reflected_table(server):
     conn.close()
 
 
+def test_computed_expressions_via_driver(server):
+    # Arithmetic + scalar functions in the SELECT list, over Mongo-written data,
+    # through the real driver.
+    server.storage.insert(
+        "db",
+        "items",
+        [
+            {"_id": bson.Int64(1), "name": "Apple", "price": bson.Int64(10), "qty": bson.Int64(3)},
+            {"_id": bson.Int64(2), "name": "pear", "price": bson.Int64(7), "qty": bson.Int64(2)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT upper(name), price * qty FROM items ORDER BY _id")
+    assert cur.fetchall() == (["APPLE", 30], ["PEAR", 14])
+    cur.execute("SELECT name || ' x' AS label FROM items WHERE _id = 1")
+    assert cur.fetchall() == (["Apple x"],)
+    conn.close()
+
+
 def test_join_group_by_via_driver(server):
     # JOIN + GROUP BY + aggregate + HAVING over Mongo-written data, through the
     # real driver — the canonical analytics query.

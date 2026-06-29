@@ -198,6 +198,13 @@ SELECT name FROM users ORDER BY age DESC LIMIT 2 OFFSET 1;
 -- is supported; it evaluates per row rather than via an index.
 SELECT * FROM orders WHERE shipped_qty < ordered_qty;
 SELECT * FROM products WHERE list_price > cost * 1.5;
+
+-- Computed expressions in the SELECT list / ORDER BY: arithmetic, ||, and the
+-- common scalar functions evaluate per row.
+SELECT name, price * qty AS total, upper(name) AS shout
+FROM items
+ORDER BY price * qty DESC;
+SELECT coalesce(nickname, name) || ' (' || length(name) || ')' AS label FROM users;
 ```
 
 ## Aggregates, GROUP BY, HAVING
@@ -533,7 +540,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `MERGE`, `INSERT ... SELECT`, `RETURNING` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic (`a > b`, `a < b * 1.5`) | subqueries, function calls in a column predicate, jsonb `<@` |
-| Projection | columns, `*`, aliases, `jsonb` paths (`->`/`->>`/`#>`/`#>>`), `jsonb_*` functions, `DISTINCT` | arbitrary computed expressions |
+| Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL`/`CROSS`, non-equi / `OR` `ON` |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |

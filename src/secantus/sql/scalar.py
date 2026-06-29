@@ -17,6 +17,7 @@ current row (with outer-row fallthrough for correlation).
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -100,6 +101,14 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         )
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         return _eval_compare(node, scope, ctx)
+    if type(node) in _ARITH:
+        return _eval_arith(node, scope, ctx)
+    if isinstance(node, exp.DPipe):  # || string concatenation
+        left, right = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
+        return None if left is None or right is None else _as_text(left) + _as_text(right)
+    typed = _SCALAR_FUNC_NODES.get(type(node))
+    if typed is not None:
+        return typed(node, scope, ctx)
     # Schema-qualified function: pg_catalog.format_type(...) -> the call.
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
         return _eval_func(node.expression, scope, ctx)
@@ -115,6 +124,128 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
 def _truthy(value: Any) -> bool:
     """SQL boolean coercion — NULL/unknown is falsy in a predicate context."""
     return bool(value) if value is not None else False
+
+
+def _as_text(value: Any) -> str:
+    """Postgres text rendering of a scalar (for ``||`` / ``concat``)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _pg_div(left: Any, right: Any) -> Any:
+    # Postgres integer division truncates toward zero; ``/`` on mixed/float is real.
+    if isinstance(left, int) and isinstance(right, int):
+        q = abs(left) // abs(right)
+        return -q if (left < 0) ^ (right < 0) else q
+    return left / right
+
+
+def _pg_mod(left: Any, right: Any) -> Any:
+    # Postgres mod takes the sign of the dividend (unlike Python ``%``).
+    r = math.fmod(left, right)
+    return int(r) if isinstance(left, int) and isinstance(right, int) else r
+
+
+_ARITH: dict[type, Callable[[Any, Any], Any]] = {
+    exp.Add: lambda a, b: a + b,
+    exp.Sub: lambda a, b: a - b,
+    exp.Mul: lambda a, b: a * b,
+    exp.Div: _pg_div,
+    exp.Mod: _pg_mod,
+}
+
+
+def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    left, right = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
+    if left is None or right is None:  # NULL propagates through arithmetic
+        return None
+    return _ARITH[type(node)](left, right)
+
+
+def _variadic(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> list[Any]:
+    args = ([node.this] if node.this is not None else []) + list(node.expressions)
+    return [evaluate(a, scope, ctx) for a in args]
+
+
+def _unary(fn: Callable[[Any], Any]) -> Callable[[exp.Expression, Scope, ScalarContext], Any]:
+    def handler(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+        v = evaluate(node.this, scope, ctx)
+        return None if v is None else fn(v)
+
+    return handler
+
+
+def _eval_round(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    v = evaluate(node.this, scope, ctx)
+    if v is None:
+        return None
+    dec = node.args.get("decimals")
+    ndigits = int(evaluate(dec, scope, ctx)) if dec is not None else 0
+    return round(v, ndigits)
+
+
+def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    v = evaluate(node.this, scope, ctx)
+    if v is None:
+        return None
+    text = _as_text(v)
+    start_node, length_node = node.args.get("start"), node.args.get("length")
+    start = int(evaluate(start_node, scope, ctx)) if start_node is not None else 1
+    begin = max(start - 1, 0)  # SQL substring is 1-based
+    if length_node is not None:
+        return text[begin : begin + int(evaluate(length_node, scope, ctx))]
+    return text[begin:]
+
+
+def _eval_nullif(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    a, b = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
+    return None if a == b else a
+
+
+def _eval_coalesce(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    for v in _variadic(node, scope, ctx):
+        if v is not None:
+            return v
+    return None
+
+
+def _eval_concat(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    # Postgres ``concat`` ignores NULL arguments (renders them as empty).
+    return "".join(_as_text(v) for v in _variadic(node, scope, ctx) if v is not None)
+
+
+def _extremum(pick: Callable[[list[Any]], Any]) -> Callable[..., Any]:
+    def handler(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+        vals = [v for v in _variadic(node, scope, ctx) if v is not None]
+        return pick(vals) if vals else None
+
+    return handler
+
+
+# Typed scalar function nodes (sqlglot parses these to dedicated classes whose
+# operands live in ``this`` / named args, not ``expressions``).
+_SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
+    exp.Upper: _unary(lambda v: _as_text(v).upper()),
+    exp.Lower: _unary(lambda v: _as_text(v).lower()),
+    exp.Length: _unary(lambda v: len(_as_text(v))),
+    exp.Trim: _unary(lambda v: _as_text(v).strip()),
+    exp.Abs: _unary(abs),
+    exp.Ceil: _unary(lambda v: math.ceil(v)),
+    exp.Floor: _unary(lambda v: math.floor(v)),
+    exp.Round: _eval_round,
+    exp.Pow: lambda n, s, c: (
+        None
+        if (b := evaluate(n.this, s, c)) is None or (e := evaluate(n.expression, s, c)) is None
+        else b**e
+    ),
+    exp.Substring: _eval_substring,
+    exp.Nullif: _eval_nullif,
+    exp.Coalesce: _eval_coalesce,
+    exp.Concat: _eval_concat,
+    exp.Greatest: _extremum(max),
+    exp.Least: _extremum(min),
+}
 
 
 def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
