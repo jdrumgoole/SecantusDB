@@ -384,12 +384,33 @@ WHERE c.relname = 'users'
 ORDER BY a.attnum;
 ```
 
-`pg_attribute` / `pg_attrdef` / `pg_description` are present so column-level
-introspection joins resolve. SQLAlchemy's full `get_columns()` and psql's `\d`
-emit a single query that also needs correlated scalar subqueries, `CASE`, and
-compound multi-condition join `ON`s — not yet supported, so those specific calls
-return a `0A000` rather than a wrong answer. Use `information_schema.columns` (or
-the `pg_attribute` join above) for column reflection in the meantime.
+`pg_attribute` / `pg_attrdef` / `pg_description` (and `pg_sequence` /
+`pg_collation`) back column-level introspection. The catalog query SQLAlchemy
+and `psql \d` emit for columns — a multi-table outer join with a compound `ON`,
+`format_type(...)` in the SELECT list, correlated scalar subqueries, and `CASE`
+— runs end to end:
+
+```sql
+SELECT a.attname,
+       format_type(a.atttypid, a.atttypmod) AS type,
+       (SELECT d.adbin FROM pg_catalog.pg_attrdef d
+        WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum) AS default,
+       a.attnotnull AS not_null
+FROM pg_catalog.pg_class c
+LEFT OUTER JOIN pg_catalog.pg_attribute a
+  ON c.oid = a.attrelid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE c.relname = 'users'
+ORDER BY a.attnum;
+```
+
+Scalar SELECT-list functions (`format_type`, `pg_get_expr`, `coalesce`),
+`CASE`, comparisons, and correlated scalar subqueries are evaluated per row.
+Compound join `ON`s (multi-key joins and residual predicates on the joined
+table) compile to a `$lookup` sub-pipeline. SQLAlchemy's `inspect().get_columns()`
+*also* fires a domain/type-resolution query that uses a derived-table subquery in
+the `FROM` clause plus `array_agg` — not yet supported — so the full Python API
+call doesn't return yet; the column query above (and `information_schema.columns`)
+are the working column-reflection paths.
 
 ## Supported SQL
 

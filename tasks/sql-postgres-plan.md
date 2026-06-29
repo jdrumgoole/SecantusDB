@@ -505,6 +505,28 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   and `CASE` — each a query-engine feature beyond the current pipeline; it returns
   a faithful `0A000`. `information_schema.columns` remains the working
   column-reflection path. Tests: `tests/test_sql_catalog.py`.
+- **Scalar SELECT-list eval + compound join ON (post-column-surface). ✅ landed.**
+  The column-metadata query SQLAlchemy / `psql \d` emit now executes end to end.
+  Three pieces: (1) `secantus.sql.scalar` evaluates SELECT-list / ORDER-BY scalar
+  expressions per row — catalog functions (`format_type` via an OID→typename map,
+  `pg_get_expr`/`pg_get_serial_sequence`→NULL, `json_build_object`, `coalesce`),
+  `CASE`, comparisons (three-valued for NULL), and **correlated scalar subqueries**
+  (read inner rows through the same storage view, falling through to the outer row
+  for correlation). (2) Compound join `ON`s — multi-key joins and residual
+  predicates on the joined table — compile to the `$lookup` `let`/`pipeline` form
+  via `_OnTranslator` (single-equality stays the simple `localField`/`foreignField`
+  form for index acceleration). (3) A join whose SELECT list / ORDER BY needs
+  per-row evaluation produces an `EvaluatedSelectPlan` (`_build_evaluated_join`):
+  the pipeline does the joins + WHERE and yields full docs, then
+  `executor.execute_evaluated_select` computes each output column in Python and
+  applies DISTINCT / ORDER BY / LIMIT. Added `pg_sequence` / `pg_collation`
+  (present-but-empty) + `pg_type.typcollation`. **Still deferred — full
+  `inspect().get_columns()`:** SQLAlchemy *also* fires a domain/type query using a
+  **derived-table subquery in FROM** (`JOIN (SELECT … FROM pg_constraint GROUP BY …)
+  AS dc`) + `array_agg` + `pg_constraint`; derived-table-as-join-source is the next
+  slice. The column query itself + `information_schema.columns` are the working
+  paths. Tests: `tests/test_sql_scalar.py`, `tests/test_sql_catalog.py`, and a
+  driver-level catalog column query in `tests/test_pgserver_pg8000.py`.
 - **Transactions (post-P7). ✅ landed.** `BEGIN`/`COMMIT`/`ROLLBACK` now open /
   commit / abort a real `Storage` user-transaction (the same
   `begin_user_transaction` / `use_user_transaction` / `commit_user_transaction`

@@ -112,6 +112,68 @@ def execute_pipeline_select(plan: planner.PipelineSelectPlan, storage: Any, db: 
     )
 
 
+def execute_evaluated_select(
+    plan: planner.EvaluatedSelectPlan, storage: Any, db: str, sctx: Any
+) -> SQLResult:
+    """Run a join whose SELECT list / ORDER BY needs per-row scalar evaluation.
+
+    The pipeline yields the joined docs; each output expression is evaluated in
+    Python (``secantus.sql.scalar``), then DISTINCT / ORDER BY / LIMIT apply.
+    """
+    from secantus.aggregate import PipelineContext, apply_pipeline
+    from secantus.sql import scalar
+
+    docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+    ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
+    docs = apply_pipeline(docs, plan.pipeline, ctx)
+
+    def make_scope(doc: dict[str, Any]):
+        def scope(node: Any) -> Any:
+            path, _ = plan.resolve(node)
+            return get_path(doc, path)
+
+        return scope
+
+    evaluated: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
+    for doc in docs:
+        scope = make_scope(doc)
+        values = tuple(scalar.evaluate(e, scope, sctx) for e in plan.out_exprs)
+        keys = tuple(scalar.evaluate(oe, scope, sctx) for oe, _ in plan.order)
+        evaluated.append((keys, values))
+
+    # ORDER BY: stable sort, last key first; NULLs sort last (Postgres default).
+    for i in reversed(range(len(plan.order))):
+        direction = plan.order[i][1]
+        evaluated.sort(key=lambda r, i=i: (r[0][i] is None, r[0][i]), reverse=(direction == -1))
+
+    rows = [vals for _, vals in evaluated]
+    if plan.distinct:
+        seen: set = set()
+        deduped: list[tuple[Any, ...]] = []
+        for row in rows:
+            key = tuple(repr(v) for v in row)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(row)
+        rows = deduped
+    if plan.skip:
+        rows = rows[plan.skip :]
+    if plan.limit:
+        rows = rows[: plan.limit]
+
+    columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
+    out_rows = [
+        tuple(typemap.to_py(v, tag) for v, (_, tag) in zip(row, plan.out_columns, strict=True))
+        for row in rows
+    ]
+    return SQLResult(
+        command_tag=f"SELECT {len(out_rows)}",
+        columns=columns,
+        rows=out_rows,
+        rowcount=len(out_rows),
+    )
+
+
 def execute_update(plan: planner.UpdatePlan, storage: Any, db: str) -> SQLResult:
     res = storage.update_matching(db, plan.table.collection, plan.filter, plan.update, multi=True)
     matched = int(res["matched"])

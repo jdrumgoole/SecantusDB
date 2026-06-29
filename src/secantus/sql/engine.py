@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlglot import exp
 
-from secantus.sql import errors, executor, planner, reflect, typemap, virtual
+from secantus.sql import errors, executor, planner, reflect, scalar, typemap, virtual
 from secantus.sql.catalog import Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import REPORTABLE_GUCS, Session
@@ -219,9 +219,11 @@ def _run_select(
     # well as real collections.
     if planner.select_needs_pipeline(stmt):
         backend = virtual.CatalogBackend(storage, catalog, session, db)
-        return executor.execute_pipeline_select(
-            planner.plan_pipeline_select(stmt, db, catalog, storage), backend, db
-        )
+        plan = planner.plan_pipeline_select(stmt, db, catalog, storage)
+        if isinstance(plan, planner.EvaluatedSelectPlan):
+            sctx = scalar.ScalarContext(storage=backend, catalog=catalog, db=db, session=session)
+            return executor.execute_evaluated_select(plan, backend, db, sctx)
+        return executor.execute_pipeline_select(plan, backend, db)
 
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None

@@ -157,9 +157,20 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
     return []
 
 
+def _pg_sequence(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # No sequences / identity columns in our model — present-but-empty so the
+    # identity-options subquery in SQLAlchemy's get_columns resolves to NULL.
+    return []
+
+
+def _pg_collation(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # No non-default collations — present-but-empty.
+    return []
+
+
 def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     return [
-        {"oid": typemap.PG_OID[tag], "typname": typname}
+        {"oid": typemap.PG_OID[tag], "typname": typname, "typcollation": 0}
         for tag, typname in typemap.PG_TYPENAME.items()
     ]
 
@@ -261,8 +272,28 @@ _register(
 )
 _register(
     "pg_catalog",
+    "pg_sequence",
+    [
+        ("seqrelid", "int4"),
+        ("seqstart", "int8"),
+        ("seqincrement", "int8"),
+        ("seqmax", "int8"),
+        ("seqmin", "int8"),
+        ("seqcache", "int8"),
+        ("seqcycle", "bool"),
+    ],
+    _pg_sequence,
+)
+_register(
+    "pg_catalog",
+    "pg_collation",
+    [("oid", "int4"), ("collname", "text"), ("collnamespace", "int4")],
+    _pg_collation,
+)
+_register(
+    "pg_catalog",
     "pg_type",
-    [("oid", "int4"), ("typname", "text")],
+    [("oid", "int4"), ("typname", "text"), ("typcollation", "int4")],
     _pg_type,
 )
 _register(

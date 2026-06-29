@@ -175,6 +175,29 @@ def test_reflected_aggregate_and_join(server):
     conn.close()
 
 
+def test_catalog_column_introspection_via_driver(server):
+    # A pg_catalog column-metadata query (format_type + correlated subquery +
+    # CASE + compound ON) through the real driver — the get_columns building
+    # blocks evaluated per row on the wire path.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, label text, n int)")
+    cur.execute(
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS typ, "
+        "(SELECT d.adbin FROM pg_catalog.pg_attrdef d "
+        " WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum) AS deflt "
+        "FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "WHERE c.relname = 't' ORDER BY a.attnum"
+    )
+    assert cur.fetchall() == (
+        ["id", "bigint", None],
+        ["label", "text", None],
+        ["n", "integer", None],
+    )
+    conn.close()
+
+
 def test_session_functions(server):
     conn = connect(server)
     cur = conn.cursor()
