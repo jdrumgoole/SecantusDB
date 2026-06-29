@@ -1004,11 +1004,55 @@ def _plan_join_select(
         name = names.fresh(alias or _column_name(inner))
         project[name] = f"${path}"
         out_columns.append((name, tag))
-    pipeline.append({"$project": project})
-    if stmt.args.get("distinct"):
-        _append_distinct(pipeline, out_columns)
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    _append_join_tail(pipeline, stmt, resolve, project, out_columns)
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns)
+
+
+def _append_join_tail(
+    pipeline: list[dict[str, Any]],
+    stmt: exp.Select,
+    resolve: Resolve,
+    project: dict[str, Any],
+    out_columns: list[tuple[str, str]],
+) -> None:
+    """Project, optionally dedup (DISTINCT), then sort/skip/limit for a join.
+
+    ORDER BY may reference a column that isn't in the SELECT list (legal in
+    Postgres for a non-DISTINCT query): such a column is carried as a hidden
+    projected field, sorted on, then dropped by a final projection. With
+    DISTINCT the ordering must be by a selected output column (Postgres' rule).
+    """
+    out_names = {n for n, _ in out_columns}
+    distinct = bool(stmt.args.get("distinct"))
+    order = stmt.args.get("order")
+    sort: dict[str, int] = {}
+    hidden: list[str] = []
+    if order is not None:
+        for o in order.expressions:
+            direction = -1 if o.args.get("desc") else 1
+            name = _column_name(o.this)
+            if name in out_names:
+                sort[name] = direction
+            elif distinct:
+                raise errors.undefined_column(name)
+            else:
+                path, _ = resolve(o.this)
+                hk = f"__ord_{len(hidden)}"
+                project[hk] = f"${path}"
+                hidden.append(hk)
+                sort[hk] = direction
+    pipeline.append({"$project": project})
+    if distinct:
+        _append_distinct(pipeline, out_columns)
+    if sort:
+        pipeline.append({"$sort": sort})
+    limit, skip = _limit_skip(stmt)
+    if skip:
+        pipeline.append({"$skip": skip})
+    if limit:
+        pipeline.append({"$limit": limit})
+    if hidden:
+        pipeline.append({"$project": {**{n: 1 for n in out_names}, "_id": 0}})
 
 
 def _append_distinct(pipeline: list[dict[str, Any]], out_columns: list[tuple[str, str]]) -> None:

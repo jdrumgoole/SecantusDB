@@ -166,6 +166,38 @@ def test_catalog_join_with_where_on_namespace(storage, session):
     assert res.rows == [("orders",), ("users",)]
 
 
+def test_pg_attribute_lists_columns(storage, session):
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT attname, atttypid, attnotnull FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "WHERE c.relname = 'users' ORDER BY a.attnum",
+    )
+    # id bigint PK (oid 20, NOT NULL), name text (25, nullable), age int (23, NOT NULL).
+    assert res.rows == [("id", 20, True), ("name", 25, False), ("age", 23, True)]
+
+
+def test_pg_attribute_three_way_join(storage, session):
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND c.relname = 'orders' ORDER BY a.attnum",
+    )
+    assert res.rows == [("id",), ("total",)]
+
+
+def test_pg_attrdef_and_description_empty(storage, session):
+    _seed(storage, session)
+    assert q(storage, session, "SELECT * FROM pg_catalog.pg_attrdef").rows == []
+    assert q(storage, session, "SELECT * FROM pg_catalog.pg_description").rows == []
+
+
 def test_group_by_over_virtual_table(storage, session):
     # GROUP BY over a virtual catalog table goes through the aggregation pipeline
     # backed by CatalogBackend — count columns for a given base table.
