@@ -546,6 +546,26 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   `confrelid` + PK/index/FK reflected from the catalog). Tests:
   `tests/test_pgserver_pg8000.py::test_sqlalchemy_get_columns_reflection` (headline)
   + the text-bound-cast regression in `tests/test_sql_catalog.py`.
+- **Full ORM reflection: set-returning functions + group-over-derived-FROM. ✅
+  landed.** `get_pk_constraint` / `get_indexes` and whole-table
+  `Table(autoload_with=...)` now reflect end to end. Pieces: (1) **set-returning
+  functions** `unnest` (sqlglot `Explode`) / `generate_subscripts` — `planner._srf_of`
+  detects them and `executor._expand_srf` expands each source row into one row per
+  array element (unnest→element, generate_subscripts→1-based ordinal, parallel SRFs
+  zip); (2) **GROUP BY / aggregate / SRF / scalar over a *derived-table* FROM** —
+  `plan_pipeline_select` resolves the FROM via `_resolve_source` (table *or*
+  `(SELECT …) AS alias`) and routes to group / evaluated-single / distinct / plain
+  builders, all carrying `derived` so the executor materializes nested derived
+  tables (`_run_subplan_to_docs` now handles `EvaluatedSelectPlan` with SRF
+  expansion); (3) **`bool_and`/`bool_or`** aggregates (→ `$min`/`$max`), **bare
+  boolean-column WHERE** (`NOT indisprimary`), **`= ANY(ARRAY[...])` in a join ON**
+  (→ `$in`), and a **bool-typing fix** so a boolean expression (`conrelid IS NOT
+  NULL`) types as `bool` not `text` (else the wire `'f'` reads truthy in SQLAlchemy's
+  `if row["has_constraint"]`, wrongly folding indexes into constraints). **Deferred:**
+  actual FK constraints (reflects empty), column comments (reflect `None`),
+  `ALTER TABLE`. Tests: `tests/test_pgserver_pg8000.py::test_sqlalchemy_full_reflection`
+  (columns + PK + indexes via `Table(autoload_with=...)`) + unnest / group-over-derived
+  unit tests in `tests/test_sql_catalog.py`.
 - **Transactions (post-P7). ✅ landed.** `BEGIN`/`COMMIT`/`ROLLBACK` now open /
   commit / abort a real `Storage` user-transaction (the same
   `begin_user_transaction` / `use_user_transaction` / `commit_user_transaction`

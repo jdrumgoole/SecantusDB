@@ -323,6 +323,32 @@ def test_sqlalchemy_get_columns_reflection(server):
         engine.dispose()
 
 
+def test_sqlalchemy_full_reflection(server):
+    # The headline: full Table(autoload_with=...) reflection — columns, primary
+    # key, and indexes — via SQLAlchemy's pg_index/pg_constraint queries (which
+    # use unnest / generate_subscripts set-returning functions + array_agg over
+    # a derived table).
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE users (id bigint primary key, name text, age int)"))
+            conn.execute(sa.text("CREATE INDEX ix_name ON users (name)"))
+        insp = sa.inspect(engine)
+        assert insp.get_pk_constraint("users")["constrained_columns"] == ["id"]
+        idx = insp.get_indexes("users")
+        assert [(i["name"], i["column_names"], i["unique"]) for i in idx] == [
+            ("ix_name", ["name"], False)
+        ]
+        t = sa.Table("users", sa.MetaData(), autoload_with=engine)
+        assert [c.name for c in t.columns] == ["id", "name", "age"]
+        assert [c.name for c in t.primary_key.columns] == ["id"]
+        assert {ix.name for ix in t.indexes} == {"ix_name"}
+    finally:
+        engine.dispose()
+
+
 def test_sqlalchemy_get_foreign_keys_empty(server):
     # We model no foreign keys, so get_foreign_keys() reflects empty (no error).
     sa = pytest.importorskip("sqlalchemy")

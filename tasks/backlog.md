@@ -1301,12 +1301,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `ON`s compile to a `$lookup` sub-pipeline; a `(SELECT … GROUP BY …) AS alias` derived table
   materializes into an ephemeral collection (`CatalogBackend.register_ephemeral`); `array_agg`
   (→ `$push`) and `pg_sequence`/`pg_collation`/`pg_constraint`/`pg_enum` (present-but-empty) +
-  pg_type domain columns are modeled. **`SQLAlchemy inspect().get_columns()` / `get_table_names()`
-  / `has_table()` now work end to end.** Still missing: full `Table(autoload_with=...)` also calls
-  `get_pk_constraint` / `get_indexes` / `get_foreign_keys`, which need a `pg_index` table and more
-  `pg_constraint` columns (`conrelid`/`confrelid`) + the PK/index/FK reflected from our catalog —
-  those methods still `0A000`/`42703`. (`get_columns` + `information_schema.columns` are the working
-  column-reflection paths.)
+  pg_type domain columns are modeled. **Full SQLAlchemy reflection now works end to end** —
+  `get_columns` / `get_table_names` / `has_table` / `get_pk_constraint` / `get_indexes` /
+  `get_foreign_keys` and whole-table `Table(autoload_with=...)`. PK/index reflection rides
+  set-returning functions (`unnest` / `generate_subscripts` → row expansion in the evaluated
+  executor), GROUP BY / `array_agg` over a derived-table FROM, populated `pg_index`/`pg_constraint`/
+  `pg_am`/`pg_opclass`, and a fix so boolean expressions (`conrelid IS NOT NULL`) type as `bool`
+  (else the wire text `'f'` reads truthy in `if row["has_constraint"]`). `get_foreign_keys` reflects
+  empty (no FK constraints modeled); column comments reflect as `None`. Remaining: actual FK
+  constraints, column comments, `ALTER TABLE`.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)

@@ -222,6 +222,38 @@ def test_pg_index_and_constraint_populated(storage, session):
     assert pk.rows == [("users_pkey",)]
 
 
+def test_unnest_expands_index_key_array(storage, session):
+    # unnest(indkey) + generate_subscripts expand the index key array into one
+    # row per column with its 1-based ordinal — the core of PK/index reflection.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT unnest(i.indkey) AS attnum, generate_subscripts(i.indkey, 1) AS ord "
+        "FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON i.indexrelid = c.oid "
+        "WHERE c.relname = 'users_pkey'",
+    )
+    # users PK is on a single column (id → attnum 1, ordinal 1).
+    assert res.rows == [(1, 1)]
+
+
+def test_group_over_derived_table_with_array_agg(storage, session):
+    # GROUP BY over a (SELECT ...) AS x derived table, collecting with array_agg —
+    # the shape SQLAlchemy's get_pk_constraint uses.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT x.relname, array_agg(x.attname) AS cols FROM ("
+        "SELECT c.relname AS relname, a.attname AS attname "
+        "FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "WHERE c.relname = 'users') AS x GROUP BY x.relname",
+    )
+    assert res.rows[0][0] == "users"
+    assert sorted(res.rows[0][1]) == ["age", "id", "name"]
+
+
 def test_pg_attrdef_and_description_empty(storage, session):
     _seed(storage, session)
     assert q(storage, session, "SELECT * FROM pg_catalog.pg_attrdef").rows == []

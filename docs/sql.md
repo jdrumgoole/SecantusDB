@@ -431,18 +431,24 @@ the `FROM` clause is materialized into an ephemeral collection. With those,
 **SQLAlchemy's `inspect().get_columns()` works end to end** and returns typed
 column metadata:
 
+**Full SQLAlchemy reflection works end to end**, including primary keys and
+indexes (`get_pk_constraint` / `get_indexes` use `unnest` / `generate_subscripts`
+set-returning functions plus `array_agg` over a derived table — all supported):
+
 ```python
 insp = sqlalchemy.inspect(engine)
 insp.get_table_names()          # ['users', ...]
 insp.has_table('users')         # True
 insp.get_columns('users')       # [{'name': 'id', 'type': BIGINT(), 'nullable': False, ...}, ...]
+insp.get_pk_constraint('users') # {'constrained_columns': ['id'], 'name': 'users_pkey', ...}
+insp.get_indexes('users')       # [{'name': 'ix_name', 'column_names': ['name'], 'unique': False, ...}]
+
+# Whole-table autoload reflects columns, the primary key, and indexes:
+users = sqlalchemy.Table('users', sqlalchemy.MetaData(), autoload_with=engine)
 ```
 
-Full `Table(..., autoload_with=engine)` reflection additionally calls
-`get_pk_constraint` / `get_indexes` / `get_foreign_keys`, which need `pg_index`
-and more `pg_constraint` columns — not yet modeled, so those specific methods
-still return a `0A000`/`42703`. `get_columns`, `get_table_names`, `has_table`,
-and `information_schema.columns` are the working reflection paths.
+`get_foreign_keys()` reflects empty, since SecantusDB models no foreign-key
+constraints. Column comments aren't stored, so they reflect as `None`.
 
 ## Supported SQL
 
@@ -457,7 +463,7 @@ and `information_schema.columns` are the working reflection paths.
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL` (accepted, single-node no-op) | `SAVEPOINT`, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params, prepared statements, portals | binary result format, `COPY` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
-| Catalog | `information_schema`, `pg_catalog` (incl. `pg_index`/`pg_constraint`/`pg_am`), catalog *joins*, SQLAlchemy `get_table_names`/`has_table`/`get_columns`/`get_foreign_keys` | `get_pk_constraint`/`get_indexes` (need `unnest`) |
+| Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`) | column comments, FK reflection (no FKs modeled) |
 
 Anything outside the supported set returns a faithful SQLSTATE error rather than
 a wrong answer — the same "honest *not supported* over a half-feature" discipline

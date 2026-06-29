@@ -343,6 +343,12 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
             spec["$options"] = "i"
         return {field: spec}
 
+    # A bare boolean column used as a predicate (``WHERE flag`` / ``WHERE NOT
+    # flag``) — Postgres treats it as ``flag IS TRUE``.
+    if isinstance(node, exp.Column):
+        field, _ = resolve(node)
+        return {field: True}
+
     raise errors.feature_not_supported(f"unsupported WHERE clause: {node.sql()}")
 
 
@@ -726,6 +732,8 @@ _AGG_CLASSES: dict[type, str] = {
     exp.Avg: "avg",
     exp.Min: "min",
     exp.Max: "max",
+    exp.LogicalAnd: "bool_and",
+    exp.LogicalOr: "bool_or",
 }
 
 _HAVING_CMP: dict[type, tuple[str, str]] = {
@@ -751,6 +759,28 @@ def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
     """If ``node`` is ``array_agg(<arg>)``, return its argument expression."""
     inner = node.this if isinstance(node, exp.Alias) else node
     return inner.this if isinstance(inner, exp.ArrayAgg) else None
+
+
+def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
+    """If ``node`` is a set-returning function, return (kind, array_expr).
+
+    ``unnest(arr)`` (sqlglot ``Explode``) → ('unnest', arr); ``generate_subscripts
+    (arr, dim)`` (``Anonymous``) → ('generate_subscripts', arr). The dimension
+    argument is ignored (our arrays are one-dimensional)."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Explode):
+        return ("unnest", inner.this)
+    if isinstance(inner, exp.Dot) and isinstance(inner.expression, exp.Anonymous):
+        inner = inner.expression
+    if isinstance(inner, exp.Anonymous):
+        name = (
+            (inner.this if isinstance(inner.this, str) else inner.name).rsplit(".", 1)[-1].lower()
+        )
+        if name == "unnest" and inner.expressions:
+            return ("unnest", inner.expressions[0])
+        if name == "generate_subscripts" and inner.expressions:
+            return ("generate_subscripts", inner.expressions[0])
+    return None
 
 
 def _agg_arg_to_expr(node: exp.Expression, table: TableDef) -> Any:
@@ -793,6 +823,10 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
         or stmt.args.get("having")
         or stmt.args.get("distinct")
     ):
+        return True
+    # A SELECT list / ORDER BY with set-returning or scalar functions, CASE, or
+    # subqueries needs per-row evaluation (the pipeline path), not a plain find.
+    if _stmt_needs_evaluation(stmt):
         return True
     aggs = [
         e for e in stmt.expressions if _aggregate_of(e) is not None or _array_agg_arg(e) is not None
@@ -837,20 +871,96 @@ def _lookup_table_def(
 
 def plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
-) -> PipelineSelectPlan:
+) -> PipelineSelectPlan | EvaluatedSelectPlan:
     if stmt.args.get("joins"):
         return _plan_join_select(stmt, db, catalog, storage)
-    table_node = stmt.find(exp.Table)
-    if table_node is None:
+    from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
+    if from_node is None:
         raise errors.feature_not_supported("aggregate without FROM is not supported")
-    table = _lookup_table_def(catalog, db, table_node, storage)
-    if table is None:
-        raise errors.undefined_table(table_node.name)
-    if stmt.args.get("distinct") and not (stmt.args.get("group") or stmt.args.get("having")):
-        if any(_aggregate_of(e) is not None for e in stmt.expressions):
-            raise errors.feature_not_supported("SELECT DISTINCT with aggregates is not supported")
-        return _plan_distinct_select(stmt, table)
-    return _plan_group_select(stmt, table)
+    # The FROM may be a real table or a ``(SELECT ...) AS alias`` derived table
+    # (materialized into an ephemeral collection by the executor).
+    derived: list[DerivedTable] = []
+    _alias, table = _resolve_source(from_node.this, db, catalog, storage, derived)
+
+    has_aggregate = any(
+        _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
+    )
+    if stmt.args.get("group") or stmt.args.get("having") or has_aggregate:
+        plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_group_select(stmt, table)
+    elif _stmt_needs_evaluation(stmt):
+        plan = _build_evaluated_single(stmt, table)
+    elif stmt.args.get("distinct"):
+        plan = _plan_distinct_select(stmt, table)
+    else:
+        plan = _plan_plain_select(stmt, table)
+    plan.derived = derived
+    return plan
+
+
+def _plan_plain_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
+    """A plain projection over a (derived) table — ``$project`` the columns."""
+    base_filter = _where_filter(stmt, table)
+    resolve = table_resolver(table)
+    project: dict[str, Any] = {"_id": 0}
+    out_columns: list[tuple[str, str]] = []
+    names = _NameAllocator()
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, exp.Star):
+            for col in table.columns:
+                nm = names.fresh(col.name)
+                project[nm] = f"${col.field}"
+                out_columns.append((nm, col.type_tag))
+            continue
+        path, tag = _field(inner, resolve)
+        nm = names.fresh(alias or _column_name(inner))
+        project[nm] = f"${path}"
+        out_columns.append((nm, tag))
+    pipeline: list[dict[str, Any]] = [{"$project": project}]
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
+
+
+def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelectPlan:
+    """A single-table SELECT needing per-row evaluation (SRFs / scalar funcs).
+
+    The base collection is read with the WHERE filter; the executor evaluates
+    each output expression per row (expanding set-returning functions)."""
+    resolve = table_resolver(table)
+    base_filter = _where_filter(stmt, table)
+    out_columns: list[tuple[str, str]] = []
+    out_exprs: list[exp.Expression] = []
+    names = _NameAllocator()
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, exp.Star):
+            for col in table.columns:
+                out_columns.append((names.fresh(col.name), col.type_tag))
+                out_exprs.append(exp.column(col.name))
+            continue
+        name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
+        out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
+        out_exprs.append(inner)
+    order: list[tuple[exp.Expression, int]] = []
+    order_node = stmt.args.get("order")
+    if order_node is not None:
+        for o in order_node.expressions:
+            order.append((o.this, -1 if o.args.get("desc") else 1))
+    limit, skip = _limit_skip(stmt)
+    return EvaluatedSelectPlan(
+        base_collection=table.collection,
+        base_filter=base_filter,
+        pipeline=[],
+        out_columns=out_columns,
+        out_exprs=out_exprs,
+        resolve=resolve,
+        order=order,
+        distinct=bool(stmt.args.get("distinct")),
+        limit=limit,
+        skip=skip,
+    )
 
 
 def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
@@ -898,6 +1008,11 @@ def _accumulator(func: str, col: str | None, table: TableDef) -> tuple[dict[str,
         return {"$min": f"${field}"}, tag
     if func == "max":
         return {"$max": f"${field}"}, tag
+    # bool_and = all-true = the minimum boolean (false < true); bool_or = max.
+    if func == "bool_and":
+        return {"$min": f"${field}"}, "bool"
+    if func == "bool_or":
+        return {"$max": f"${field}"}, "bool"
     raise errors.feature_not_supported(f"aggregate {func} is not supported")
 
 
@@ -1145,6 +1260,11 @@ class _OnTranslator:
             return {"$not": [self.expr(node.this)]}
         if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
             return {"$eq": [self.expr(node.this), None]}
+        # ``col = ANY(ARRAY[...])`` → ``$in`` (Postgres IN, as in SQLAlchemy's
+        # ``contype = ANY(ARRAY['p','u','x'])`` index-reflection join condition).
+        if isinstance(node, exp.EQ) and isinstance(node.expression, exp.Any):
+            elems = [self.expr(e) for e in _array_elements(node.expression.this)]
+            return {"$in": [self.expr(node.this), elems]}
         for cls, op in self._OPS.items():
             if isinstance(node, cls):
                 return {op: [self.expr(node.this), self.expr(node.expression)]}
@@ -1217,10 +1337,8 @@ def _resolve_source(
         if not alias:
             raise errors.feature_not_supported("a derived table requires an alias")
         sub = node.this
-        if not isinstance(sub, exp.Select) or not select_needs_pipeline(sub):
-            raise errors.feature_not_supported(
-                "only an aggregate / grouped derived table is supported"
-            )
+        if not isinstance(sub, exp.Select):
+            raise errors.feature_not_supported(f"unsupported derived table: {node.sql()}")
         sub_plan = plan_pipeline_select(sub, db, catalog, storage)
         cols = sub_plan.out_columns
         tdef = TableDef(
@@ -1272,7 +1390,7 @@ def _plan_join_select(
     if where is not None:
         pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
 
-    if _join_needs_evaluation(stmt):
+    if _stmt_needs_evaluation(stmt):
         return _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
 
     project: dict[str, Any] = {"_id": 0}
@@ -1302,10 +1420,18 @@ def _is_simple_projection(node: exp.Expression) -> bool:
     return isinstance(inner, (exp.Column, exp.Star, *_JSONB_CLASSES))
 
 
-def _join_needs_evaluation(stmt: exp.Select) -> bool:
-    """Whether the join's SELECT list / ORDER BY needs Python per-row evaluation
-    (catalog functions, CASE, scalar subqueries) rather than a ``$project``."""
-    if not all(_is_simple_projection(e) for e in stmt.expressions):
+def _stmt_needs_evaluation(stmt: exp.Select) -> bool:
+    """Whether a SELECT list / ORDER BY needs Python per-row evaluation
+    (set-returning or scalar functions, CASE, scalar subqueries) rather than a
+    plain ``$project`` / ``$group``. Aggregates and ``array_agg`` are handled by
+    the group/find paths, not per-row eval, so they don't count here."""
+    for e in stmt.expressions:
+        if (
+            _is_simple_projection(e)
+            or _aggregate_of(e) is not None
+            or _array_agg_arg(e) is not None
+        ):
+            continue
         return True
     order = stmt.args.get("order")
     if order is not None:
@@ -1313,8 +1439,36 @@ def _join_needs_evaluation(stmt: exp.Select) -> bool:
     return False
 
 
+_BOOL_EXPR_TYPES = (
+    exp.Is,
+    exp.Not,
+    exp.And,
+    exp.Or,
+    exp.In,
+    exp.Boolean,
+    exp.EQ,
+    exp.NEQ,
+    exp.GT,
+    exp.GTE,
+    exp.LT,
+    exp.LTE,
+    exp.Like,
+    exp.ILike,
+)
+
+
 def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
+    if isinstance(node, exp.Paren):
+        return _infer_scalar_tag(node.this, resolve)
+    if _srf_of(node) is not None:
+        # unnest(indkey/indclass) → attnum/opclass oid; generate_subscripts → ord.
+        return "int4"
+    # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
+    # as bool, not text — else its value rides the wire as the string 'f'/'t' and
+    # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
+    if isinstance(node, _BOOL_EXPR_TYPES):
+        return "bool"
     if isinstance(node, (exp.Column, *_JSONB_CLASSES)):
         try:
             return _field(node, resolve)[1]
