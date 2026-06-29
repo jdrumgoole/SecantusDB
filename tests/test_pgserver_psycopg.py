@@ -76,6 +76,42 @@ def test_binary_parameter_type_roundtrip(server):
         assert row[3] == when
 
 
+def test_binary_result_format(server):
+    # ``binary=True`` makes psycopg request results in the BINARY format, so the
+    # server must encode each value per its type OID (the inverse of binary params).
+    with connect(server, autocommit=True) as conn:
+        conn.execute(
+            "CREATE TABLE r (id bigint primary key, n int, x float8, price numeric, "
+            "flag boolean, label text, at timestamptz)"
+        )
+        when = _dt.datetime(2021, 3, 4, 5, 6, 7, tzinfo=_dt.timezone.utc)
+        conn.execute(
+            "INSERT INTO r VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (1, 42, 3.5, Decimal("19.99"), True, "hi", when),
+        )
+        row = conn.execute(
+            "SELECT id, n, x, price, flag, label, at FROM r", binary=True
+        ).fetchone()
+        assert row == (1, 42, 3.5, Decimal("19.99"), True, "hi", when)
+
+
+def test_binary_numeric_edge_cases(server):
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE n (id bigint primary key, v numeric)")
+        for i, raw in enumerate(["0", "100", "10000", "0.5", "-12.34", "123456.789", "-0.001"]):
+            conn.execute("INSERT INTO n (id, v) VALUES (%s, %s)", (i, Decimal(raw)))
+        rows = conn.execute("SELECT v FROM n ORDER BY id", binary=True).fetchall()
+        assert [r[0] for r in rows] == [
+            Decimal("0"),
+            Decimal("100"),
+            Decimal("10000"),
+            Decimal("0.5"),
+            Decimal("-12.34"),
+            Decimal("123456.789"),
+            Decimal("-0.001"),
+        ]
+
+
 def test_prepared_statement_and_deallocate(server):
     # prepare=True forces a server-side prepared statement; psycopg later emits
     # DEALLOCATE to recycle it, which the server accepts as a no-op.

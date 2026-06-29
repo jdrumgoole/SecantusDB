@@ -277,17 +277,18 @@ def ready_for_query(status: bytes = b"I") -> bytes:
     return _msg("Z", status)
 
 
-def row_description(columns: list[tuple[str, int]]) -> bytes:
-    """``columns`` is a list of (name, type_oid). Text format, sizes left -1."""
+def row_description(columns: list[tuple[str, int]], formats: list[int] | None = None) -> bytes:
+    """``columns`` is a list of (name, type_oid); ``formats`` the per-column result
+    format codes (0=text, 1=binary), defaulting to all-text. Sizes left -1."""
     payload = bytearray(_INT16.pack(len(columns)))
-    for name, type_oid in columns:
+    for i, (name, type_oid) in enumerate(columns):
         payload += _cstr(name)
         payload += _INT32.pack(0)  # table OID (unknown)
         payload += _INT16.pack(0)  # column attribute number
         payload += _INT32.pack(type_oid)
         payload += _INT16.pack(-1)  # type size (variable)
         payload += _INT32.pack(-1)  # type modifier
-        payload += _INT16.pack(0)  # format code: text
+        payload += _INT16.pack(formats[i] if formats is not None else 0)  # 0=text, 1=binary
     return _msg("T", bytes(payload))
 
 
