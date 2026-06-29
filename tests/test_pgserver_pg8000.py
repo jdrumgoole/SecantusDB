@@ -127,6 +127,33 @@ def test_reflected_table_and_jsonb(server):
     conn.close()
 
 
+def test_reflected_aggregate_and_join(server):
+    # Mongo-written data (no CREATE TABLE) analysed with GROUP BY + JOIN through
+    # the real driver — the dual-protocol analytics path.
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(1), "region": "e", "amount": bson.Int64(10)},
+            {"_id": bson.Int64(2), "region": "e", "amount": bson.Int64(20)},
+            {"_id": bson.Int64(3), "region": "w", "amount": bson.Int64(30)},
+        ],
+    )
+    server.storage.insert("db", "people", [{"_id": bson.Int64(1), "name": "alice"}])
+    server.storage.insert(
+        "db", "purchases", [{"_id": bson.Int64(9), "buyer": bson.Int64(1), "item": "gear"}]
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY region")
+    assert cur.fetchall() == (["e", 30], ["w", 30])
+    cur.execute(
+        "SELECT p.item, pe.name FROM purchases p JOIN people pe ON p.buyer = pe._id ORDER BY p.item"
+    )
+    assert cur.fetchall() == (["gear", "alice"],)
+    conn.close()
+
+
 def test_session_functions(server):
     conn = connect(server)
     cur = conn.cursor()

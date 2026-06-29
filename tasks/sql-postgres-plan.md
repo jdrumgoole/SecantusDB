@@ -427,9 +427,22 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   Reflected tables are **read-only** (no `CREATE TABLE` → INSERT/UPDATE/DELETE
   still `42P01`); a declared table shadows reflection. This is the dual-protocol
   payoff — data written via `pymongo` is readable via SQL with no DDL.
-  **Deferred:** aggregates / joins over reflected tables (the pipeline path is
-  still catalog-only), writes to reflected tables, and `jsonb` containment
-  operators (`@>` / `?`). Tests: `tests/test_sql_reflect.py`.
+  **Aggregates / joins over reflected tables ✅ landed** (see *Reflected
+  aggregates & joins* below). **Deferred:** writes to reflected tables, and
+  `jsonb` containment operators (`@>` / `?`). Tests: `tests/test_sql_reflect.py`.
+- **Reflected aggregates & joins (post-catalog-joins). ✅ landed.** GROUP BY /
+  HAVING / aggregate functions and JOINs now work over reflected (schema-on-read)
+  collections, not just declared tables and catalogs — SQL analytics directly
+  over `pymongo`-written data. The pipeline planner gained a `storage` argument
+  (`plan_pipeline_select` / `_plan_join_select` / `_lookup_table_def`) so that,
+  after the user-catalog and `pg_catalog`/`information_schema` virtual lookups
+  miss, an *unqualified* table name reflects via `reflect.reflect`. A reflected
+  table exposes the Mongo field names (so joins key off `_id`, not a DDL `id`),
+  and a reflected aggregate column types as the permissive `any`. **Deferred:**
+  in a JOIN, an *unqualified* reference to an *un-sampled* reflected field still
+  can't be routed (qualify it `alias.field`, or have it appear in the sample).
+  Tests: reflected GROUP BY / HAVING / JOIN in `tests/test_sql_reflect.py` +
+  a driver-level reflected agg+join in `tests/test_pgserver_pg8000.py`.
 - **P7 — Real-driver gauge (pg8000 + SQLAlchemy). ✅ landed.** psql/psycopg need
   libpq (absent in the dev env), but **`pg8000`** is a *pure-Python* Postgres
   driver — a real, strict, extended-protocol client that runs here. A gauge

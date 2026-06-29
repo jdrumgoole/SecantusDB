@@ -1258,14 +1258,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   Core smoke (P7); `psycopg`/`psql`/JDBC as live gauges still need libpq/a JVM (absent in
   the dev env). SQLAlchemy **reflection** `inspect().get_table_names()` / `has_table()`
   now work (catalog joins landed — see below); `get_columns()` still needs `pg_attribute`.
-- [ ] **Reflected tables are SELECT-only and not in the pipeline path (P6 landed the
-  read path).** A collection with no `CREATE TABLE` reflects (sampled schema-on-read)
-  for `SELECT` (incl. `->`/`->>`/`#>` jsonb navigation), but: INSERT/UPDATE/DELETE on an
-  un-declared collection still `42P01` (no SQL writes to reflected tables); aggregates /
-  joins over a reflected table `42P01` (the GROUP BY / `$lookup` planner is catalog-only);
-  jsonb containment (`@>`, `?`, `?|`, `?&`) and `jsonb_*` functions aren't parsed; type
-  inference samples 50 docs and picks the first non-null type per field (no widening across
-  conflicting types — first-seen wins).
+- [ ] **Reflected tables are SELECT-only (writes still unsupported).** A collection with
+  no `CREATE TABLE` reflects (sampled schema-on-read) for `SELECT` — incl. `->`/`->>`/`#>`
+  jsonb navigation **and now GROUP BY / aggregates / JOIN** (the pipeline planner reflects
+  via `planner._lookup_table_def(..., storage)`). Remaining gaps: INSERT/UPDATE/DELETE on an
+  un-declared collection still `42P01` (no SQL writes to reflected tables); in a JOIN, an
+  *unqualified* reference to an *un-sampled* field of a reflected table can't be routed (the
+  resolver matches on sampled columns — qualify it as `alias.field`, or it must appear in the
+  50-doc sample); jsonb containment (`@>`, `?`, `?|`, `?&`) and `jsonb_*` functions aren't
+  parsed; type inference samples 50 docs and picks the first non-null type per field (no
+  widening across conflicting types — first-seen wins).
 - [ ] **Aggregate/JOIN path has gaps (P5 landed the core).** `GROUP BY` + `HAVING` +
   `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` and single two-table `INNER`/`LEFT JOIN` (equality `ON`)
   compile to an aggregation pipeline. Still `0A000`: JOIN *combined* with GROUP BY/
