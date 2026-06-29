@@ -342,9 +342,104 @@ def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
 _ALWAYS_TRUE_PREDICATES = {"pg_table_is_visible", "pg_type_is_visible"}
 
 
-def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
+@dataclass
+class SubqueryCtx:
+    """Carries what a WHERE subquery needs to evaluate itself (it runs the inner
+    SELECT through the engine, so aggregates / WHERE / etc. all work)."""
+
+    storage: Any
+    db: str
+    catalog: Any
+    session: Any
+
+
+def _subquery_select(node: exp.Expression) -> exp.Expression:
+    return node.this if isinstance(node, exp.Subquery) else node
+
+
+def _subquery_has_outer_ref(select: exp.Select) -> bool:
+    """Heuristic correlation check: a column qualified with an alias not defined
+    inside the subquery itself references the outer query (correlated)."""
+    inner: set[str | None] = set()
+    from_node = select.find(exp.From)
+    if from_node is not None:
+        src = from_node.this
+        inner.add(src.alias or getattr(src, "name", None))
+    for jn in select.args.get("joins") or []:
+        src = jn.this
+        inner.add(src.alias or getattr(src, "name", None))
+    return any(col.table and col.table not in inner for col in select.find_all(exp.Column))
+
+
+def _validate_scalar_subquery(select: exp.Expression) -> exp.Select:
+    if not isinstance(select, exp.Select):
+        raise errors.feature_not_supported("unsupported subquery")
+    exprs = select.expressions
+    bare = (
+        exprs[0].this
+        if exprs and isinstance(exprs[0], exp.Alias)
+        else (exprs[0] if exprs else None)
+    )
+    if len(exprs) != 1 or isinstance(bare, exp.Star):
+        raise errors.feature_not_supported("a subquery here must select exactly one column")
+    if _subquery_has_outer_ref(select):
+        raise errors.feature_not_supported("correlated subqueries are not supported")
+    return select
+
+
+def _run_inner_select(select: exp.Select, subctx: SubqueryCtx) -> Any:
+    # Lazy import to avoid a planner<->engine import cycle.
+    from secantus.sql import engine
+
+    return engine.run_inner_select(
+        select, subctx.storage, subctx.db, subctx.catalog, subctx.session
+    )
+
+
+def _eval_in_subquery(query_node: exp.Expression, subctx: SubqueryCtx, tag: str) -> list[Any]:
+    select = _validate_scalar_subquery(_subquery_select(query_node))
+    res = _run_inner_select(select, subctx)
+    return [typemap.coerce(row[0], tag) for row in res.rows]
+
+
+def _eval_scalar_subquery(query_node: exp.Expression, subctx: SubqueryCtx, tag: str) -> Any:
+    select = _validate_scalar_subquery(_subquery_select(query_node))
+    res = _run_inner_select(select, subctx)
+    return typemap.coerce(res.rows[0][0], tag) if res.rows else None
+
+
+_FLIP_CMP = {"$gt": "$lt", "$gte": "$lte", "$lt": "$gt", "$lte": "$gte", "$eq": "$eq", "$ne": "$ne"}
+
+
+def _comparison_subquery_filter(
+    node: exp.Expression, resolve: Resolve, subctx: SubqueryCtx | None
+) -> dict[str, Any] | None:
+    """``field OP (SELECT scalar ...)`` → ``{field: {op: value}}`` (None if neither
+    side is a subquery, so the caller falls through to the normal handling)."""
+    left, right = node.this, node.expression
+    if not (isinstance(left, exp.Subquery) or isinstance(right, exp.Subquery)):
+        return None
+    if subctx is None:
+        raise errors.feature_not_supported("scalar subquery is not supported here")
+    if isinstance(right, exp.Subquery) and _is_field_node(left):
+        fld, sub, flip = left, right, False
+    elif isinstance(left, exp.Subquery) and _is_field_node(right):
+        fld, sub, flip = right, left, True
+    else:
+        raise errors.feature_not_supported(f"unsupported subquery comparison: {node.sql()}")
+    field, tag = _field(fld, resolve)
+    value = _eval_scalar_subquery(sub, subctx, tag)
+    op = _EXPR_CMP[type(node)]
+    if flip:
+        op = _FLIP_CMP[op]
+    return {field: value} if op == "$eq" else {field: {op: value}}
+
+
+def _expr_to_filter(
+    node: exp.Expression, resolve: Resolve, subctx: SubqueryCtx | None = None
+) -> dict[str, Any]:
     if isinstance(node, exp.Paren):
-        return _expr_to_filter(node.this, resolve)
+        return _expr_to_filter(node.this, resolve, subctx)
 
     # A schema-qualified function predicate (``pg_catalog.pg_table_is_visible(...)``)
     # parses as Dot(Identifier, Anonymous); unwrap to the function call.
@@ -354,12 +449,18 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
         return {}
 
     if isinstance(node, exp.And):
-        parts = [_expr_to_filter(node.this, resolve), _expr_to_filter(node.expression, resolve)]
+        parts = [
+            _expr_to_filter(node.this, resolve, subctx),
+            _expr_to_filter(node.expression, resolve, subctx),
+        ]
         return _merge_and(parts)
 
     if isinstance(node, exp.Or):
         return {
-            "$or": [_expr_to_filter(node.this, resolve), _expr_to_filter(node.expression, resolve)]
+            "$or": [
+                _expr_to_filter(node.this, resolve, subctx),
+                _expr_to_filter(node.expression, resolve, subctx),
+            ]
         }
 
     if isinstance(node, exp.Not):
@@ -368,13 +469,21 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
         if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
             field, _ = _field(inner.this, resolve)
             return {field: {"$ne": None}}
-        return {"$nor": [_expr_to_filter(inner, resolve)]}
+        return {"$nor": [_expr_to_filter(inner, resolve, subctx)]}
+
+    if isinstance(node, exp.Exists):
+        raise errors.feature_not_supported("EXISTS (subquery) is not supported")
 
     if isinstance(node, exp.Is):
         field, _ = _field(node.this, resolve)
         if isinstance(node.expression, exp.Null):
             return {field: None}
         raise errors.feature_not_supported(f"unsupported IS predicate: {node.sql()}")
+
+    if isinstance(node, (exp.EQ, exp.NEQ, *_CMP_OPS.keys())):
+        sub = _comparison_subquery_filter(node, resolve, subctx)
+        if sub is not None:
+            return sub
 
     if isinstance(node, exp.EQ):
         left, right = node.this, node.expression
@@ -415,9 +524,11 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
             }
 
     if isinstance(node, exp.In):
-        if node.args.get("query") is not None:
-            raise errors.feature_not_supported("IN (subquery) is not supported")
         field, tag = _field(node.this, resolve)
+        if node.args.get("query") is not None:
+            if subctx is None:
+                raise errors.feature_not_supported("IN (subquery) is not supported")
+            return {field: {"$in": _eval_in_subquery(node.args["query"], subctx, tag)}}
         values = [typemap.coerce(_literal(e), tag) for e in node.expressions]
         return {field: {"$in": values}}
 
@@ -520,9 +631,11 @@ def _merge_and(parts: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
-def _where_filter(stmt: exp.Expression, table: TableDef) -> dict[str, Any]:
+def _where_filter(
+    stmt: exp.Expression, table: TableDef, subctx: SubqueryCtx | None = None
+) -> dict[str, Any]:
     where = stmt.args.get("where")
-    return _expr_to_filter(where.this, table_resolver(table)) if where is not None else {}
+    return _expr_to_filter(where.this, table_resolver(table), subctx) if where is not None else {}
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +830,7 @@ def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
     return ConstantSelectPlan(columns=columns)
 
 
-def plan_select(stmt: exp.Select, table: TableDef) -> SelectPlan:
+def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = None) -> SelectPlan:
     if stmt.args.get("joins"):
         raise errors.feature_not_supported("JOIN is not supported yet")
     if stmt.args.get("group") or stmt.args.get("having"):
@@ -725,7 +838,7 @@ def plan_select(stmt: exp.Select, table: TableDef) -> SelectPlan:
     if stmt.args.get("distinct"):
         raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
 
-    filt = _where_filter(stmt, table)
+    filt = _where_filter(stmt, table, subctx)
     sort = _order_sort(stmt, table)
     limit, skip = _limit_skip(stmt)
 

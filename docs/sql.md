@@ -205,6 +205,11 @@ SELECT name, price * qty AS total, upper(name) AS shout
 FROM items
 ORDER BY price * qty DESC;
 SELECT coalesce(nickname, name) || ' (' || length(name) || ')' AS label FROM users;
+
+-- Non-correlated subqueries in WHERE: IN / NOT IN over a single column, and a
+-- scalar `= (SELECT ...)`. The inner query runs first (it may aggregate/filter).
+SELECT name FROM customers WHERE id IN (SELECT cust_id FROM orders WHERE total > 100);
+SELECT name FROM customers WHERE id = (SELECT max(cust_id) FROM orders);
 ```
 
 ## Aggregates, GROUP BY, HAVING
@@ -539,7 +544,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Area | Supported | Not yet |
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `MERGE`, `INSERT ... SELECT`, `RETURNING` |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic (`a > b`, `a < b * 1.5`) | subqueries, function calls in a column predicate, jsonb `<@` |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, non-correlated `IN`/`NOT IN`/scalar `= (SELECT …)` subqueries | `EXISTS`, correlated subqueries, function calls in a comparison, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL`/`CROSS`, non-equi / `OR` `ON` |
