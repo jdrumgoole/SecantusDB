@@ -443,6 +443,19 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   can't be routed (qualify it `alias.field`, or have it appear in the sample).
   Tests: reflected GROUP BY / HAVING / JOIN in `tests/test_sql_reflect.py` +
   a driver-level reflected agg+join in `tests/test_pgserver_pg8000.py`.
+- **Richer queries: multi-table joins + DISTINCT (post-reflected-joins). ✅
+  landed.** `_plan_join_select` now compiles *any number* of `INNER`/`LEFT JOIN`s
+  to a chain of `$lookup` + `$unwind`, each join relating the new table to the
+  base or an already-joined alias (`a⋈b⋈c` where `c` joins on `b` works — the
+  lookup's `localField` is the dotted path into the unwound alias via
+  `_alias_field_path`). `SELECT DISTINCT` (single-table via `_plan_distinct_select`
+  and over a join) dedups on the projected columns with a trailing
+  `$group`-by-all-columns + re-`$project` (`_append_distinct`); `select_needs_pipeline`
+  now routes DISTINCT through the pipeline. **Deferred:** JOIN *combined* with
+  GROUP BY, non-equi / `OR` / `RIGHT`/`FULL`/`CROSS` joins, `DISTINCT` with
+  aggregates, window functions, subqueries, and scalar SELECT-list expressions.
+  Tests: multi-table / chained-join / DISTINCT in `tests/test_sql_aggregate.py` +
+  a driver-level 3-table-join + DISTINCT in `tests/test_pgserver_pg8000.py`.
 - **P7 — Real-driver gauge (pg8000 + SQLAlchemy). ✅ landed.** psql/psycopg need
   libpq (absent in the dev env), but **`pg8000`** is a *pure-Python* Postgres
   driver — a real, strict, extended-protocol client that runs here. A gauge

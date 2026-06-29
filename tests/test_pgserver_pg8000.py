@@ -110,6 +110,27 @@ def test_group_by_and_join(server):
     conn.close()
 
 
+def test_three_table_join_and_distinct(server):
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE customers (id bigint primary key, name text)")
+    cur.execute("CREATE TABLE products (id bigint primary key, pname text)")
+    cur.execute("CREATE TABLE orders (id bigint primary key, cust_id bigint, prod_id bigint)")
+    cur.execute("INSERT INTO customers (id,name) VALUES (%s,%s),(%s,%s)", (1, "alice", 2, "bob"))
+    cur.execute("INSERT INTO products (id,pname) VALUES (%s,%s),(%s,%s)", (100, "gear", 101, "box"))
+    for oid, cid, pid in [(10, 1, 100), (11, 1, 101), (12, 2, 100)]:
+        cur.execute("INSERT INTO orders (id,cust_id,prod_id) VALUES (%s,%s,%s)", (oid, cid, pid))
+    cur.execute(
+        "SELECT c.name, p.pname FROM orders o "
+        "JOIN customers c ON o.cust_id = c.id "
+        "JOIN products p ON o.prod_id = p.id ORDER BY c.name, p.pname"
+    )
+    assert cur.fetchall() == (["alice", "box"], ["alice", "gear"], ["bob", "gear"])
+    cur.execute("SELECT DISTINCT cust_id FROM orders ORDER BY cust_id")
+    assert cur.fetchall() == ([1], [2])
+    conn.close()
+
+
 def test_reflected_table_and_jsonb(server):
     # Mongo-written data (no CREATE TABLE) read via the real driver.
     server.storage.insert(
