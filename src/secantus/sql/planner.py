@@ -642,7 +642,12 @@ def _aggregate_of(node: exp.Expression) -> tuple[str, str | None] | None:
 
 def select_needs_pipeline(stmt: exp.Select) -> bool:
     """Whether a SELECT must be compiled to an aggregation pipeline."""
-    if stmt.args.get("joins") or stmt.args.get("group") or stmt.args.get("having"):
+    if (
+        stmt.args.get("joins")
+        or stmt.args.get("group")
+        or stmt.args.get("having")
+        or stmt.args.get("distinct")
+    ):
         return True
     aggs = [e for e in stmt.expressions if _aggregate_of(e) is not None]
     if not aggs:
@@ -686,8 +691,6 @@ def _lookup_table_def(
 def plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan:
-    if stmt.args.get("distinct"):
-        raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
     if stmt.args.get("joins"):
         return _plan_join_select(stmt, db, catalog, storage)
     table_node = stmt.find(exp.Table)
@@ -696,7 +699,37 @@ def plan_pipeline_select(
     table = _lookup_table_def(catalog, db, table_node, storage)
     if table is None:
         raise errors.undefined_table(table_node.name)
+    if stmt.args.get("distinct") and not (stmt.args.get("group") or stmt.args.get("having")):
+        if any(_aggregate_of(e) is not None for e in stmt.expressions):
+            raise errors.feature_not_supported("SELECT DISTINCT with aggregates is not supported")
+        return _plan_distinct_select(stmt, table)
     return _plan_group_select(stmt, table)
+
+
+def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
+    """A single-table ``SELECT DISTINCT`` → project the columns, then dedup."""
+    base_filter = _where_filter(stmt, table)
+    resolve = table_resolver(table)
+    project: dict[str, Any] = {"_id": 0}
+    out_columns: list[tuple[str, str]] = []
+    names = _NameAllocator()
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, exp.Star):
+            for col in table.columns:
+                nm = names.fresh(col.name)
+                project[nm] = f"${col.field}"
+                out_columns.append((nm, col.type_tag))
+            continue
+        path, tag = _field(inner, resolve)
+        nm = names.fresh(alias or _column_name(inner))
+        project[nm] = f"${path}"
+        out_columns.append((nm, tag))
+    pipeline: list[dict[str, Any]] = [{"$project": project}]
+    _append_distinct(pipeline, out_columns)
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
 def _accumulator(func: str, col: str | None, table: TableDef) -> tuple[dict[str, Any], str]:
@@ -879,6 +912,13 @@ def _alias_col(node: exp.Expression) -> tuple[str | None, str]:
     return (node.table or None), node.name
 
 
+def _alias_field_path(amap: dict[str, tuple[str, TableDef]], alias: str, col: str) -> str:
+    """Resolve ``alias.col`` to its pipeline field path (bare for the base)."""
+    role, tdef = amap[alias]
+    field = tdef.field_for(col)
+    return field if role == "base" else f"{alias}.{field}"
+
+
 def _plan_join_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan:
@@ -893,45 +933,56 @@ def _plan_join_select(
     if base is None:
         raise errors.undefined_table(fr.name)
     base_alias = fr.alias or fr.name
-    joins = stmt.args["joins"]
-    if len(joins) != 1:
-        raise errors.feature_not_supported("only a single JOIN is supported")
-    jn = joins[0]
-    jt = jn.this
-    join_table = _lookup_table_def(catalog, db, jt, storage)
-    if join_table is None:
-        raise errors.undefined_table(jt.name)
-    join_alias = jt.alias or jt.name
-    side = str(jn.args.get("side") or "").upper()
-    on = jn.args.get("on")
-    if not isinstance(on, exp.EQ):
-        raise errors.feature_not_supported("only a single equality ON condition is supported")
+    amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
+    pipeline: list[dict[str, Any]] = []
 
-    amap: dict[str, tuple[str, TableDef]] = {
-        base_alias: ("base", base),
-        join_alias: ("join", join_table),
-    }
-    la, lc = _alias_col(on.this)
-    ra, rc = _alias_col(on.expression)
-    if la is None or ra is None or {la, ra} != {base_alias, join_alias}:
-        raise errors.feature_not_supported("ON must reference both joined tables by alias")
-    if la == base_alias:
-        local_field, foreign_field = base.field_for(lc), join_table.field_for(rc)
-    else:
-        local_field, foreign_field = base.field_for(rc), join_table.field_for(lc)
+    # Each JOIN compiles to a $lookup + $unwind. The lookup's localField may point
+    # into an already-joined alias (a chain like a⋈b⋈c where c joins on b), which
+    # Mongo's dotted localField handles since b was unwound into the doc.
+    for jn in stmt.args["joins"]:
+        jt = jn.this
+        join_table = _lookup_table_def(catalog, db, jt, storage)
+        if join_table is None:
+            raise errors.undefined_table(jt.name)
+        join_alias = jt.alias or jt.name
+        side = str(jn.args.get("side") or "").upper()
+        on = jn.args.get("on")
+        if not isinstance(on, exp.EQ):
+            raise errors.feature_not_supported("only an equality ON condition is supported")
+        la, lc = _alias_col(on.this)
+        ra, rc = _alias_col(on.expression)
+        if la is None or ra is None:
+            raise errors.feature_not_supported("ON must reference the joined tables by alias")
+        # Exactly one side names the table being joined; the other names an
+        # already-known alias (the base or a previously joined table).
+        if join_alias == la and ra != join_alias:
+            new_col, known_alias, known_col = lc, ra, rc
+        elif join_alias == ra and la != join_alias:
+            new_col, known_alias, known_col = rc, la, lc
+        else:
+            raise errors.feature_not_supported(
+                f"JOIN ON must relate {join_alias} to an earlier table"
+            )
+        if known_alias not in amap:
+            raise errors.SQLError("42P01", f'missing FROM-clause entry for table "{known_alias}"')
+        local_path = _alias_field_path(amap, known_alias, known_col)
+        foreign_field = join_table.field_for(new_col)
+        pipeline.append(
+            {
+                "$lookup": {
+                    "from": join_table.collection,
+                    "localField": local_path,
+                    "foreignField": foreign_field,
+                    "as": join_alias,
+                }
+            }
+        )
+        pipeline.append(
+            {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": side == "LEFT"}}
+        )
+        amap[join_alias] = ("join", join_table)
 
     resolve = _join_resolver(amap)
-    pipeline: list[dict[str, Any]] = [
-        {
-            "$lookup": {
-                "from": join_table.collection,
-                "localField": local_field,
-                "foreignField": foreign_field,
-                "as": join_alias,
-            }
-        },
-        {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": side == "LEFT"}},
-    ]
     where = stmt.args.get("where")
     if where is not None:
         pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
@@ -954,8 +1005,25 @@ def _plan_join_select(
         project[name] = f"${path}"
         out_columns.append((name, tag))
     pipeline.append({"$project": project})
+    if stmt.args.get("distinct"):
+        _append_distinct(pipeline, out_columns)
     _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns)
+
+
+def _append_distinct(pipeline: list[dict[str, Any]], out_columns: list[tuple[str, str]]) -> None:
+    """Append a dedup stage: group by every projected column, then re-project.
+
+    Runs after the `$project` that produces the output columns, so it dedups on
+    exactly the selected values (SQL ``DISTINCT`` semantics).
+    """
+    names = [n for n, _ in out_columns]
+    group_id = {n: f"${n}" for n in names}
+    project: dict[str, Any] = {"_id": 0}
+    for n in names:
+        project[n] = f"$_id.{n}"
+    pipeline.append({"$group": {"_id": group_id}})
+    pipeline.append({"$project": project})
 
 
 def _append_sort_limit(

@@ -1268,13 +1268,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   50-doc sample); jsonb containment (`@>`, `?`, `?|`, `?&`) and `jsonb_*` functions aren't
   parsed; type inference samples 50 docs and picks the first non-null type per field (no
   widening across conflicting types — first-seen wins).
-- [ ] **Aggregate/JOIN path has gaps (P5 landed the core).** `GROUP BY` + `HAVING` +
-  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` and single two-table `INNER`/`LEFT JOIN` (equality `ON`)
-  compile to an aggregation pipeline. Still `0A000`: JOIN *combined* with GROUP BY/
-  aggregates, 3+ table joins, non-equi / `OR` join conditions, `RIGHT`/`FULL`/`CROSS`
-  JOIN, `SELECT DISTINCT`, window functions, subqueries, and scalar expressions in the
-  SELECT list / GROUP BY (only bare columns and single aggregates are handled). SUM/MIN/MAX
-  result typing is approximate (uses the column's tag; AVG → float8).
+- [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
+  `HAVING` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, **multi-table** `INNER`/`LEFT JOIN` (equality
+  `ON`, each join relating to the base or an already-joined table), and **`SELECT DISTINCT`**
+  (single-table and over a join) compile to an aggregation pipeline. Still `0A000`: JOIN
+  *combined* with GROUP BY/aggregates, non-equi / `OR` join conditions, `RIGHT`/`FULL`/`CROSS`
+  JOIN, window functions, subqueries, and scalar expressions in the SELECT list / GROUP BY
+  (only bare columns and single aggregates are handled). `DISTINCT` with aggregates is also
+  `0A000`. SUM/MIN/MAX result typing is approximate (uses the column's tag; AVG → float8).
 - [ ] **WHERE is literal-only.** Comparisons must be `column OP literal` (or the mirror);
   column-to-column predicates and arbitrary scalar expressions aren't translated.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,

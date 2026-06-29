@@ -192,3 +192,110 @@ def test_join_unknown_alias_rejected(storage, session):
     with pytest.raises(SQLError) as ei:
         q(storage, session, "SELECT x.id FROM orders o JOIN customers c ON o.cust_id = c.id")
     assert ei.value.sqlstate == "42P01"
+
+
+# -- multi-table joins ------------------------------------------------------- #
+
+
+def _orders_products(storage, session):
+    q(storage, session, "CREATE TABLE customers (id bigint primary key, name text)")
+    q(storage, session, "CREATE TABLE products (id bigint primary key, pname text)")
+    q(
+        storage,
+        session,
+        "CREATE TABLE orders (id bigint primary key, cust_id bigint, prod_id bigint)",
+    )
+    q(storage, session, "INSERT INTO customers (id, name) VALUES (1,'alice'),(2,'bob')")
+    q(storage, session, "INSERT INTO products (id, pname) VALUES (100,'gear'),(101,'widget')")
+    q(
+        storage,
+        session,
+        "INSERT INTO orders (id, cust_id, prod_id) VALUES (10,1,100),(11,1,101),(12,2,100)",
+    )
+
+
+def test_three_table_join(storage, session):
+    _orders_products(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT c.name, p.pname FROM orders o "
+        "JOIN customers c ON o.cust_id = c.id "
+        "JOIN products p ON o.prod_id = p.id ORDER BY c.name, p.pname",
+    )
+    assert [c.name for c in res.columns] == ["name", "pname"]
+    assert res.rows == [("alice", "gear"), ("alice", "widget"), ("bob", "gear")]
+
+
+def test_three_table_join_with_where(storage, session):
+    _orders_products(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT c.name, p.pname FROM orders o "
+        "JOIN customers c ON o.cust_id = c.id "
+        "JOIN products p ON o.prod_id = p.id "
+        "WHERE p.pname = 'gear' ORDER BY c.name",
+    )
+    assert res.rows == [("alice", "gear"), ("bob", "gear")]
+
+
+def test_join_chained_on_previous_table(storage, session):
+    # The third table joins on the second (a→b, b→c), not on the base.
+    q(storage, session, "CREATE TABLE a (id bigint primary key, b_id bigint)")
+    q(storage, session, "CREATE TABLE b (id bigint primary key, c_id bigint)")
+    q(storage, session, "CREATE TABLE c (id bigint primary key, label text)")
+    q(storage, session, "INSERT INTO a (id, b_id) VALUES (1, 10)")
+    q(storage, session, "INSERT INTO b (id, c_id) VALUES (10, 100)")
+    q(storage, session, "INSERT INTO c (id, label) VALUES (100, 'deep')")
+    res = q(
+        storage,
+        session,
+        "SELECT c.label FROM a JOIN b ON a.b_id = b.id JOIN c ON b.c_id = c.id",
+    )
+    assert res.rows == [("deep",)]
+
+
+def test_join_with_disconnected_table_rejected(storage, session):
+    _orders_products(storage, session)
+    with pytest.raises(SQLError) as ei:
+        # The second join's ON relates two not-yet-known aliases.
+        q(
+            storage,
+            session,
+            "SELECT c.name FROM orders o JOIN customers c ON o.cust_id = c.id "
+            "JOIN products p ON p.id = nope.x",
+        )
+    assert ei.value.sqlstate in ("0A000", "42P01")
+
+
+# -- SELECT DISTINCT --------------------------------------------------------- #
+
+
+def test_distinct_single_column(storage, session):
+    _sales(storage, session)
+    res = q(storage, session, "SELECT DISTINCT region FROM sales ORDER BY region")
+    assert res.rows == [("east",), ("west",)]
+
+
+def test_distinct_multi_column(storage, session):
+    _sales(storage, session)
+    q(storage, session, "INSERT INTO sales (id, region, amount) VALUES (5, 'east', 10)")
+    # (east,10) appears twice (ids 1 and 5) — DISTINCT collapses it.
+    res = q(
+        storage,
+        session,
+        "SELECT DISTINCT region, amount FROM sales ORDER BY region, amount",
+    )
+    assert res.rows == [("east", 10), ("east", 20), ("west", 5), ("west", 30)]
+
+
+def test_distinct_over_join(storage, session):
+    _orders(storage, session)
+    # alice has two orders; DISTINCT on her name collapses to one row.
+    res = q(
+        storage,
+        session,
+        "SELECT DISTINCT c.name FROM orders o JOIN customers c ON o.cust_id = c.id ORDER BY c.name",
+    )
+    assert res.rows == [("alice",), ("bob",)]

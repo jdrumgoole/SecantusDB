@@ -203,8 +203,8 @@ SELECT COUNT(id) FROM sales;                      -- COUNT(col) excludes NULLs
 
 ## Joins
 
-A two-table `INNER` or `LEFT JOIN` with an equality `ON` compiles to a
-`$lookup`.
+An `INNER` or `LEFT JOIN` with an equality `ON` compiles to a `$lookup`.
+Multiple joins chain — each table joins the base or an already-joined table:
 
 ```sql
 SELECT o.id, o.total, c.name
@@ -217,6 +217,23 @@ ORDER BY o.id;
 SELECT o.id, c.name
 FROM orders o
 LEFT JOIN customers c ON o.cust_id = c.id;
+
+-- Three (or more) tables — products joins via orders.prod_id:
+SELECT c.name, p.pname
+FROM orders o
+JOIN customers c ON o.cust_id = c.id
+JOIN products  p ON o.prod_id = p.id
+ORDER BY c.name;
+```
+
+## SELECT DISTINCT
+
+`SELECT DISTINCT` dedups on the projected columns (single-table or over a join):
+
+```sql
+SELECT DISTINCT region FROM sales ORDER BY region;
+SELECT DISTINCT region, status FROM orders;
+SELECT DISTINCT c.name FROM orders o JOIN customers c ON o.cust_id = c.id;
 ```
 
 ## Reflected tables and jsonb (the dual-protocol payoff)
@@ -365,14 +382,14 @@ SELECT relname FROM pg_catalog.pg_class;
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `MERGE`, `INSERT ... SELECT`, `RETURNING` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT` | subqueries, scalar expressions, column-to-column predicates |
-| Projection | columns, `*`, aliases, `jsonb` paths | computed expressions, `DISTINCT` |
+| Projection | columns, `*`, aliases, `jsonb` paths, `DISTINCT` | computed expressions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
-| Joins | single two-table `INNER`/`LEFT JOIN`, equality `ON` | 3+ tables, `RIGHT`/`FULL`/`CROSS`, non-equi, JOIN + GROUP BY |
+| Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON` | `RIGHT`/`FULL`/`CROSS`, non-equi, JOIN + GROUP BY |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX` | `ALTER TABLE`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK` | `SAVEPOINT`, isolation levels, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params, prepared statements, portals | binary result format, `COPY` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
-| Catalog | `information_schema`, `pg_catalog` (no-join) | catalog *joins* (interactive `psql \d`, full ORM reflection) |
+| Catalog | `information_schema`, `pg_catalog`, catalog *joins* (SQLAlchemy `get_table_names`, `psql \dt`) | column-level `\d` / `get_columns` (`pg_attribute`) |
 
 Anything outside the supported set returns a faithful SQLSTATE error rather than
 a wrong answer — the same "honest *not supported* over a half-feature" discipline
