@@ -121,3 +121,86 @@ def test_declared_table_takes_precedence(storage, session):
     # Only declared columns appear; the un-declared `extra` field is not surfaced.
     assert [c.name for c in res.columns] == ["id", "label"]
     assert res.rows == [(1, "x")]
+
+
+# -- aggregates / joins over reflected (schema-on-read) tables ---------------- #
+
+
+@pytest.fixture
+def sales_storage():
+    s = FakeStorage()
+    s.insert(
+        DB,
+        "sales",
+        [
+            {"_id": bson.Int64(1), "region": "east", "amount": bson.Int64(10)},
+            {"_id": bson.Int64(2), "region": "east", "amount": bson.Int64(20)},
+            {"_id": bson.Int64(3), "region": "west", "amount": bson.Int64(30)},
+        ],
+    )
+    s.insert(
+        DB,
+        "customers",
+        [{"_id": bson.Int64(1), "name": "alice"}, {"_id": bson.Int64(2), "name": "bob"}],
+    )
+    s.insert(
+        DB,
+        "orders",
+        [
+            {"_id": bson.Int64(10), "cust_id": bson.Int64(1), "total": bson.Int64(100)},
+            {"_id": bson.Int64(11), "cust_id": bson.Int64(2), "total": bson.Int64(200)},
+            {"_id": bson.Int64(12), "cust_id": bson.Int64(1), "total": bson.Int64(50)},
+        ],
+    )
+    return s
+
+
+def test_aggregate_over_reflected(sales_storage, session):
+    res = q(sales_storage, session, "SELECT SUM(amount) AS total FROM sales")
+    assert res.rows == [(60,)]
+
+
+def test_group_by_over_reflected(sales_storage, session):
+    res = q(
+        sales_storage,
+        session,
+        "SELECT region, SUM(amount) AS s, COUNT(*) AS n FROM sales GROUP BY region ORDER BY region",
+    )
+    assert res.rows == [("east", 30, 2), ("west", 30, 1)]
+
+
+def test_having_over_reflected(sales_storage, session):
+    res = q(
+        sales_storage,
+        session,
+        "SELECT region, SUM(amount) AS s FROM sales GROUP BY region HAVING SUM(amount) > 25",
+    )
+    assert res.rows == [("east", 30), ("west", 30)]
+
+
+def test_join_over_reflected(sales_storage, session):
+    # Reflected collections expose the Mongo field name `_id`, so the join keys
+    # off `c._id` (there is no DDL declaring an `id` column).
+    res = q(
+        sales_storage,
+        session,
+        "SELECT c.name, o.total FROM orders o "
+        "JOIN customers c ON o.cust_id = c._id ORDER BY c.name, o.total",
+    )
+    assert res.rows == [("alice", 50), ("alice", 100), ("bob", 200)]
+
+
+def test_join_over_reflected_with_where(sales_storage, session):
+    res = q(
+        sales_storage,
+        session,
+        "SELECT o.total FROM orders o JOIN customers c ON o.cust_id = c._id "
+        "WHERE c.name = 'alice' ORDER BY o.total",
+    )
+    assert res.rows == [(50,), (100,)]
+
+
+def test_aggregate_over_unknown_collection(session):
+    with pytest.raises(SQLError) as ei:
+        q(FakeStorage(), session, "SELECT COUNT(*) AS n, region FROM ghost GROUP BY region")
+    assert ei.value.sqlstate == "42P01"

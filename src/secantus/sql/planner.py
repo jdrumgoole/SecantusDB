@@ -655,14 +655,18 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     return True
 
 
-def _lookup_table_def(catalog: Any, db: str, table_node: exp.Table) -> TableDef | None:
+def _lookup_table_def(
+    catalog: Any, db: str, table_node: exp.Table, storage: Any = None
+) -> TableDef | None:
     """Resolve a (possibly schema-qualified) table to a TableDef.
 
     Tries the user catalog first, then the ``pg_catalog`` / ``information_schema``
-    virtual tables — so joins / aggregates can span the system catalogs, not just
-    user tables.
+    virtual tables, then — when ``storage`` is supplied and the name is not
+    schema-qualified — a reflected (schema-on-read) view of an existing Mongo
+    collection. This is what lets joins / aggregates span user tables, the system
+    catalogs, *and* un-declared collections written via ``pymongo``.
     """
-    from secantus.sql import virtual
+    from secantus.sql import reflect, virtual
 
     table = catalog.get(db, table_node.name)
     if table is not None:
@@ -670,18 +674,26 @@ def _lookup_table_def(catalog: Any, db: str, table_node: exp.Table) -> TableDef 
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None
     vtable = virtual.lookup(schema_name, table_node.name)
-    return vtable.table_def() if vtable is not None else None
+    if vtable is not None:
+        return vtable.table_def()
+    # A reflected collection only makes sense for an unqualified name (a schema
+    # qualifier means the caller asked for a specific catalog relation).
+    if storage is not None and schema_name is None:
+        return reflect.reflect(storage, db, table_node.name)
+    return None
 
 
-def plan_pipeline_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSelectPlan:
+def plan_pipeline_select(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+) -> PipelineSelectPlan:
     if stmt.args.get("distinct"):
         raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
     if stmt.args.get("joins"):
-        return _plan_join_select(stmt, db, catalog)
+        return _plan_join_select(stmt, db, catalog, storage)
     table_node = stmt.find(exp.Table)
     if table_node is None:
         raise errors.feature_not_supported("aggregate without FROM is not supported")
-    table = _lookup_table_def(catalog, db, table_node)
+    table = _lookup_table_def(catalog, db, table_node, storage)
     if table is None:
         raise errors.undefined_table(table_node.name)
     return _plan_group_select(stmt, table)
@@ -867,7 +879,9 @@ def _alias_col(node: exp.Expression) -> tuple[str | None, str]:
     return (node.table or None), node.name
 
 
-def _plan_join_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSelectPlan:
+def _plan_join_select(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+) -> PipelineSelectPlan:
     if (
         stmt.args.get("group")
         or stmt.args.get("having")
@@ -875,7 +889,7 @@ def _plan_join_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSelect
     ):
         raise errors.feature_not_supported("JOIN with GROUP BY / aggregates is not supported yet")
     fr = stmt.find(exp.From).this
-    base = _lookup_table_def(catalog, db, fr)
+    base = _lookup_table_def(catalog, db, fr, storage)
     if base is None:
         raise errors.undefined_table(fr.name)
     base_alias = fr.alias or fr.name
@@ -884,7 +898,7 @@ def _plan_join_select(stmt: exp.Select, db: str, catalog: Any) -> PipelineSelect
         raise errors.feature_not_supported("only a single JOIN is supported")
     jn = joins[0]
     jt = jn.this
-    join_table = _lookup_table_def(catalog, db, jt)
+    join_table = _lookup_table_def(catalog, db, jt, storage)
     if join_table is None:
         raise errors.undefined_table(jt.name)
     join_alias = jt.alias or jt.name

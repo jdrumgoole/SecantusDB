@@ -135,7 +135,7 @@ def describe_statement(
         plan = planner.plan_constant_select(stmt, session)
         return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t, _ in plan.columns]
     if planner.select_needs_pipeline(stmt):
-        pplan = planner.plan_pipeline_select(stmt, db, catalog)
+        pplan = planner.plan_pipeline_select(stmt, db, catalog, storage)
         return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t in pplan.out_columns]
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None
@@ -220,7 +220,7 @@ def _run_select(
     if planner.select_needs_pipeline(stmt):
         backend = virtual.CatalogBackend(storage, catalog, session, db)
         return executor.execute_pipeline_select(
-            planner.plan_pipeline_select(stmt, db, catalog), backend, db
+            planner.plan_pipeline_select(stmt, db, catalog, storage), backend, db
         )
 
     schema = table_node.args.get("db")

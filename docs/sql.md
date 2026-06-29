@@ -255,6 +255,28 @@ SELECT profile #> '{city}'   AS c FROM people WHERE _id = 2; -- LA
 **read-only**; `CREATE TABLE` a collection to write to it through SQL, and a
 declared table always shadows reflection.
 
+Reflected collections aren't limited to plain `SELECT` — **`GROUP BY`,
+aggregates, `HAVING`, and `JOIN` all work over `pymongo`-written data** with no
+DDL, so you can run SQL analytics directly against documents:
+
+```sql
+-- "sales" and "people" were written through MongoDB, never declared:
+SELECT region, SUM(amount) AS total
+FROM sales
+GROUP BY region
+ORDER BY region;
+
+-- A reflected collection exposes the Mongo field names, so a join keys off
+-- "_id" (there is no DDL-declared "id" column):
+SELECT p.item, c.name
+FROM purchases p
+JOIN people c ON p.buyer = c._id;
+```
+
+One caveat: in a join, qualify references to fields that may not appear in the
+sampled rows (`c.name`, not a bare `name`) so the planner can route them to the
+right reflected table.
+
 ## Transactions
 
 `BEGIN` / `COMMIT` / `ROLLBACK` open a real storage transaction: statements in
