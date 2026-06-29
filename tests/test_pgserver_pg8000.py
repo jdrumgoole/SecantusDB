@@ -296,7 +296,7 @@ def test_catalog_join_via_driver(server):
     cur.execute(
         "SELECT c.relname FROM pg_catalog.pg_class c "
         "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = %s ORDER BY c.relname",
+        "WHERE n.nspname = %s AND c.relkind = 'r' ORDER BY c.relname",
         ("public",),
     )
     assert cur.fetchall() == (["a"], ["b"])
