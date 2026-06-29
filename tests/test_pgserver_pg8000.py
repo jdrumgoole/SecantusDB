@@ -175,6 +175,42 @@ def test_write_to_reflected_table(server):
     conn.close()
 
 
+def test_join_group_by_via_driver(server):
+    # JOIN + GROUP BY + aggregate + HAVING over Mongo-written data, through the
+    # real driver — the canonical analytics query.
+    server.storage.insert(
+        "db",
+        "customers",
+        [
+            {"_id": bson.Int64(1), "region": "east"},
+            {"_id": bson.Int64(2), "region": "east"},
+            {"_id": bson.Int64(3), "region": "west"},
+        ],
+    )
+    server.storage.insert(
+        "db",
+        "orders",
+        [
+            {"_id": bson.Int64(10), "cust": bson.Int64(1), "total": bson.Int64(100)},
+            {"_id": bson.Int64(11), "cust": bson.Int64(2), "total": bson.Int64(200)},
+            {"_id": bson.Int64(12), "cust": bson.Int64(3), "total": bson.Int64(30)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT c.region, SUM(o.total) FROM orders o "
+        "JOIN customers c ON o.cust = c._id GROUP BY c.region ORDER BY c.region"
+    )
+    assert cur.fetchall() == (["east", 300], ["west", 30])
+    cur.execute(
+        "SELECT c.region, SUM(o.total) AS s FROM orders o "
+        "JOIN customers c ON o.cust = c._id GROUP BY c.region HAVING SUM(o.total) > 100"
+    )
+    assert cur.fetchall() == (["east", 300],)
+    conn.close()
+
+
 def test_column_to_column_where_via_driver(server):
     # A WHERE comparing two columns (and a column to an arithmetic expression),
     # over Mongo-written data, through the real driver.
