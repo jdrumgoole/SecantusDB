@@ -16,6 +16,7 @@ current row (with outer-row fallthrough for correlation).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,10 @@ from sqlglot import exp
 
 from secantus.paths import get_path
 from secantus.sql import errors, typemap
+
+# jsonb navigation (->, ->>, #>, #>>); the scalar (->> / #>>) variants render text.
+_JSONB_NAV = (exp.JSONExtract, exp.JSONExtractScalar, exp.JSONBExtract, exp.JSONBExtractScalar)
+_JSONB_NAV_SCALAR = (exp.JSONExtractScalar, exp.JSONBExtractScalar)
 
 # A scope resolves a column reference node to its value in the current row.
 Scope = Callable[[exp.Column], Any]
@@ -67,6 +72,8 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_cast(node, scope, ctx)
     if isinstance(node, exp.Column):
         return scope(node)
+    if isinstance(node, _JSONB_NAV):
+        return _eval_jsonb_nav(node, scope, ctx)
     if isinstance(node, exp.Case):
         return _eval_case(node, scope, ctx)
     if isinstance(node, exp.If):
@@ -178,17 +185,75 @@ def _call_func(name: str, args: list[Any]) -> Any:
     ):
         # No stored defaults / sequences; constraint/index defs not rendered.
         return None
-    if name == "json_build_object":
+    if name in ("json_build_object", "jsonb_build_object"):
         out: dict[str, Any] = {}
         for i in range(0, len(args) - 1, 2):
             out[str(args[i])] = args[i + 1]
         return out
+    if name in ("json_build_array", "jsonb_build_array"):
+        return list(args)
+    if name in ("jsonb_array_length", "json_array_length"):
+        v = args[0] if args else None
+        if not isinstance(v, list):
+            raise errors.SQLError("22023", "cannot get array length of a non-array")
+        return len(v)
+    if name in ("jsonb_typeof", "json_typeof"):
+        return _json_typeof(args[0] if args else None)
     if name == "coalesce":
         for a in args:
             if a is not None:
                 return a
         return None
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
+
+
+def _eval_jsonb_nav(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """Resolve a ->/->>/#>/#>> navigation against the current row value."""
+    from secantus.sql.planner import _json_keys
+
+    val = evaluate(node.this, scope, ctx)
+    for key in _json_keys(node.expression):
+        if isinstance(val, dict):
+            val = val.get(key)
+        elif isinstance(val, list):
+            try:
+                val = val[int(key)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    if isinstance(node, _JSONB_NAV_SCALAR):  # ->> / #>> return text
+        return _json_as_text(val)
+    return val
+
+
+def _json_as_text(val: Any) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, (dict, list)):
+        return json.dumps(val)
+    return str(val)
+
+
+def _json_typeof(value: Any) -> str | None:
+    """Postgres ``jsonb_typeof``: the JSON type name of a value, NULL for SQL NULL."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return None
 
 
 def _format_type(typid: Any, typmod: Any) -> str | None:

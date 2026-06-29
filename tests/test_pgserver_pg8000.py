@@ -175,6 +175,30 @@ def test_write_to_reflected_table(server):
     conn.close()
 
 
+def test_jsonb_operators_via_driver(server):
+    # jsonb containment/existence operators + a jsonb function over Mongo-written
+    # data (no CREATE TABLE), through the real driver.
+    server.storage.insert(
+        "db",
+        "docs",
+        [
+            {"_id": bson.Int64(1), "data": {"a": 1, "tags": ["x", "y"]}},
+            {"_id": bson.Int64(2), "data": {"a": 9, "c": 3, "tags": ["y", "z"]}},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT _id FROM docs WHERE data @> '{\"a\":1}' ORDER BY _id")
+    assert cur.fetchall() == ([1],)
+    cur.execute("SELECT _id FROM docs WHERE data ? 'c' ORDER BY _id")
+    assert cur.fetchall() == ([2],)
+    cur.execute("SELECT _id FROM docs WHERE data ?| array['c','z'] ORDER BY _id")
+    assert cur.fetchall() == ([2],)
+    cur.execute("SELECT jsonb_array_length(data #> '{tags}') FROM docs WHERE _id = 2")
+    assert cur.fetchall() == ([2],)
+    conn.close()
+
+
 def test_reflected_aggregate_and_join(server):
     # Mongo-written data (no CREATE TABLE) analysed with GROUP BY + JOIN through
     # the real driver — the dual-protocol analytics path.

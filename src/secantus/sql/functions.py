@@ -84,6 +84,13 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
         return ("pg_backend_pid", session.backend_pid, "int4")
     if name in ("pg_is_in_recovery",):
         return (name, False, "bool")
+    if name in ("jsonb_build_object", "json_build_object"):
+        out: dict[str, Any] = {}
+        for i in range(0, len(args) - 1, 2):
+            out[str(args[i])] = args[i + 1]
+        return (name, out, "json")
+    if name in ("jsonb_build_array", "json_build_array"):
+        return (name, list(args), "json")
     raise errors.feature_not_supported(f"function {name}() is not supported")
 
 

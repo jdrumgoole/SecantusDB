@@ -226,9 +226,14 @@ def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> lis
         if srf is None:
             continue
         kind, arr_expr = srf
-        arr = scalar.evaluate(arr_expr, scope, sctx)
-        arr = list(arr) if isinstance(arr, (list, tuple)) else ([] if arr is None else [arr])
-        srfs[idx] = (kind, arr)
+        val = scalar.evaluate(arr_expr, scope, sctx)
+        if kind == "jsonb_object_keys":
+            items = list(val.keys()) if isinstance(val, dict) else []
+        elif isinstance(val, (list, tuple)):
+            items = list(val)
+        else:
+            items = [] if val is None else [val]
+        srfs[idx] = (kind, items)
 
     if not srfs:
         return [tuple(scalar.evaluate(e, scope, sctx) for e in plan.out_exprs)]
@@ -245,10 +250,10 @@ def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> lis
         for idx in range(len(plan.out_exprs)):
             if idx in srfs:
                 kind, arr = srfs[idx]
-                if kind == "unnest":
-                    row.append(arr[k] if k < len(arr) else None)
-                else:  # generate_subscripts → 1-based ordinal
+                if kind == "generate_subscripts":  # 1-based ordinal
                     row.append(k + 1 if k < len(arr) else None)
+                else:  # unnest / jsonb_array_elements / jsonb_object_keys → element/key
+                    row.append(arr[k] if k < len(arr) else None)
             else:
                 row.append(scalars[idx])
         rows.append(tuple(row))
