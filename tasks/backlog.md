@@ -1291,9 +1291,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   across them now execute (`virtual.CatalogBackend` + `planner._lookup_table_def`), so
   SQLAlchemy `get_table_names()`/`has_table()` and `psql`'s `\dt` work. WHERE now handles
   `CAST`/`::type`, `col = ANY(ARRAY[...])`, and the always-true `pg_table_is_visible`/
-  `pg_type_is_visible` predicates. Still missing for `\d`'s column reflection:
-  `pg_attribute`/`pg_attrdef`/`pg_index`/`pg_constraint`, the `format_type`/`pg_get_expr`/
-  `pg_get_*` functions, three-plus-table joins, and JOIN+GROUP-BY combined.
+  `pg_type_is_visible` predicates. `pg_attribute`/`pg_attrdef`/`pg_description` virtual
+  tables now exist (attrelid lines up with pg_class.oid), so column-level introspection
+  *joins* resolve — e.g. `pg_attribute ⋈ pg_class ⋈ pg_namespace` returns a table's columns.
+  Still missing for the *exact* SQLAlchemy `get_columns()` / psql `\d` query: compound
+  multi-condition join `ON`s (`… AND attnum > 0 AND NOT attisdropped`), scalar functions in
+  the SELECT list (`format_type`, `pg_get_expr`), correlated scalar subqueries, and `CASE`
+  — those return `0A000`. Also no `pg_index`/`pg_constraint` yet. (`information_schema.columns`
+  is the working column-reflection path in the meantime.)
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)

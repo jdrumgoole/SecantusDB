@@ -366,15 +366,30 @@ SHOW search_path;
 SET search_path TO myschema;
 ```
 
-Programmatic schema discovery works through `information_schema` and a subset of
-`pg_catalog` (no-join queries):
+Programmatic schema discovery works through `information_schema` and `pg_catalog`,
+including joins across the catalogs (so SQLAlchemy's `get_table_names()` /
+`has_table()` and `psql \dt` work):
 
 ```sql
 SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';
 SELECT column_name, data_type, is_nullable
 FROM information_schema.columns WHERE table_name = 'users';
 SELECT relname FROM pg_catalog.pg_class;
+
+-- pg_catalog column metadata via a join (relid lines up across catalogs):
+SELECT a.attname, a.atttypid, a.attnotnull
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+WHERE c.relname = 'users'
+ORDER BY a.attnum;
 ```
+
+`pg_attribute` / `pg_attrdef` / `pg_description` are present so column-level
+introspection joins resolve. SQLAlchemy's full `get_columns()` and psql's `\d`
+emit a single query that also needs correlated scalar subqueries, `CASE`, and
+compound multi-condition join `ON`s — not yet supported, so those specific calls
+return a `0A000` rather than a wrong answer. Use `information_schema.columns` (or
+the `pg_attribute` join above) for column reflection in the meantime.
 
 ## Supported SQL
 

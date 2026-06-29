@@ -59,6 +59,12 @@ def _user_tables(db: str, catalog: Catalog) -> list[TableDef]:
     return [t for name in catalog.list_tables(db) if (t := catalog.get(db, name)) is not None]
 
 
+def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    """Stable, fictional pg_class OIDs per table — shared by every catalog that
+    keys off ``relid`` (pg_class.oid, pg_attribute.attrelid) so joins line up."""
+    return {t.name: 16384 + i for i, t in enumerate(_user_tables(db, catalog))}
+
+
 def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     return [
         {
@@ -101,18 +107,54 @@ def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> 
 
 
 def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    oids = _table_oids(db, catalog)
+    return [
+        {
+            "oid": oids[t.name],
+            "relname": t.name,
+            "relnamespace": _NS_OIDS["public"],
+            "relkind": "r",
+            "relpersistence": "p",  # permanent (never temp/unlogged)
+        }
+        for t in _user_tables(db, catalog)
+    ]
+
+
+def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """One row per column of every declared table — the pg_catalog column surface
+    tools (and ``\\d``-style queries) read. attrelid lines up with pg_class.oid."""
+    oids = _table_oids(db, catalog)
     rows: list[dict] = []
-    for i, t in enumerate(_user_tables(db, catalog), start=16384):
-        rows.append(
-            {
-                "oid": i,
-                "relname": t.name,
-                "relnamespace": _NS_OIDS["public"],
-                "relkind": "r",
-                "relpersistence": "p",  # permanent (never temp/unlogged)
-            }
-        )
+    for t in _user_tables(db, catalog):
+        for i, col in enumerate(t.columns, start=1):
+            rows.append(
+                {
+                    "attrelid": oids[t.name],
+                    "attname": col.name,
+                    "atttypid": typemap.PG_OID.get(col.type_tag, 25),
+                    "atttypmod": -1,
+                    "attnum": i,
+                    "attnotnull": not col.nullable,
+                    "atthasdef": False,
+                    "attisdropped": False,
+                    "attidentity": "",
+                    "attgenerated": "",
+                    "attcollation": 0,
+                    "attlen": -1,
+                }
+            )
     return rows
+
+
+def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # No column DEFAULTs in our model — the relation exists (so joins resolve)
+    # but is always empty.
+    return []
+
+
+def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # No object comments — empty, but present so catalog joins resolve.
+    return []
 
 
 def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -185,6 +227,37 @@ _register(
         ("relpersistence", "text"),
     ],
     _pg_class,
+)
+_register(
+    "pg_catalog",
+    "pg_attribute",
+    [
+        ("attrelid", "int4"),
+        ("attname", "text"),
+        ("atttypid", "int4"),
+        ("atttypmod", "int4"),
+        ("attnum", "int4"),
+        ("attnotnull", "bool"),
+        ("atthasdef", "bool"),
+        ("attisdropped", "bool"),
+        ("attidentity", "text"),
+        ("attgenerated", "text"),
+        ("attcollation", "int4"),
+        ("attlen", "int4"),
+    ],
+    _pg_attribute,
+)
+_register(
+    "pg_catalog",
+    "pg_attrdef",
+    [("oid", "int4"), ("adrelid", "int4"), ("adnum", "int4"), ("adbin", "text")],
+    _pg_attrdef,
+)
+_register(
+    "pg_catalog",
+    "pg_description",
+    [("objoid", "int4"), ("classoid", "int4"), ("objsubid", "int4"), ("description", "text")],
+    _pg_description,
 )
 _register(
     "pg_catalog",

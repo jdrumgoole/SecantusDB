@@ -487,10 +487,24 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   catalog queries use: `CAST` / `::type` (unwrapped to the inner literal),
   `col = ANY(ARRAY[...])` → `$in`, and the always-true visibility predicates
   `pg_table_is_visible` / `pg_type_is_visible`. `pg_class` grew a `relpersistence`
-  column (`'p'`) for SQLAlchemy's temp-table filter. **Deferred:** `pg_attribute` /
-  `pg_attrdef` (column reflection), `format_type` / `pg_get_expr`, three-plus-table
-  joins, and JOIN+GROUP-BY combined. Tests: `tests/test_sql_catalog.py` +
+  column (`'p'`) for SQLAlchemy's temp-table filter. Tests: `tests/test_sql_catalog.py` +
   SQLAlchemy `get_table_names` / `has_table` in `tests/test_pgserver_pg8000.py`.
+- **Column-introspection catalog surface (post-multi-join). ✅ landed (partial).**
+  Added the `pg_attribute` / `pg_attrdef` / `pg_description` virtual tables
+  (`_table_oids` keeps `attrelid` aligned with `pg_class.oid`), so column-level
+  introspection *joins* resolve and run on the multi-join engine — e.g.
+  `SELECT a.attname, a.atttypid, a.attnotnull FROM pg_attribute a JOIN pg_class c
+  ON a.attrelid = c.oid WHERE c.relname = 't' ORDER BY a.attnum`. `pg_attrdef` /
+  `pg_description` are present-but-empty (no defaults / comments in our model).
+  The join tail (`_append_join_tail`) gained ORDER-BY-on-a-non-selected-column
+  (carried as a hidden projected field, sorted, then dropped) — Postgres-legal and
+  needed by these catalog queries. **Still deferred — the *exact* SQLAlchemy
+  `get_columns()` / psql `\d` query:** it's a 4-table outer-join with compound
+  multi-condition `ON`s (`… AND attnum > 0 AND NOT attisdropped`), scalar functions
+  in the SELECT list (`format_type` / `pg_get_expr`), correlated scalar subqueries,
+  and `CASE` — each a query-engine feature beyond the current pipeline; it returns
+  a faithful `0A000`. `information_schema.columns` remains the working
+  column-reflection path. Tests: `tests/test_sql_catalog.py`.
 - **Transactions (post-P7). ✅ landed.** `BEGIN`/`COMMIT`/`ROLLBACK` now open /
   commit / abort a real `Storage` user-transaction (the same
   `begin_user_transaction` / `use_user_transaction` / `commit_user_transaction`
