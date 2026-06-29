@@ -125,6 +125,27 @@ def test_reflected_table_read(server):
         assert rows == [("alice", "NYC"), ("bob", "LA")]
 
 
+def test_write_to_reflected_table(server):
+    # Dual-protocol writes through libpq binary params: INSERT/UPDATE/DELETE on a
+    # Mongo-written collection with no CREATE TABLE, verified as a real document.
+    server.storage.insert(
+        "db",
+        "people",
+        [
+            {"_id": bson.Int64(1), "name": "alice", "age": bson.Int64(30)},
+            {"_id": bson.Int64(2), "name": "bob", "age": bson.Int64(17)},
+        ],
+    )
+    with connect(server, autocommit=True) as conn:
+        conn.execute("INSERT INTO people (_id, name, age) VALUES (%s, %s, %s)", (3, "dave", 40))
+        conn.execute("UPDATE people SET age = %s WHERE name = %s", (99, "alice"))
+        conn.execute("DELETE FROM people WHERE age < %s", (18,))
+        rows = conn.execute("SELECT _id, name, age FROM people ORDER BY _id").fetchall()
+        assert rows == [(1, "alice", 99), (3, "dave", 40)]
+    stored = server.storage.find_matching("db", "people", {"_id": bson.Int64(3)})
+    assert stored[0]["name"] == "dave" and stored[0]["age"] == 40
+
+
 def test_undefined_table_sqlstate(server):
     with connect(server, autocommit=True) as conn, pytest.raises(psycopg.errors.UndefinedTable):
         conn.execute("SELECT * FROM nonexistent")

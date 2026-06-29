@@ -167,8 +167,12 @@ def _show_name(stmt: exp.Command) -> str:
     return str(arg.name).strip() if arg is not None else ""
 
 
-def _require_table(catalog: Catalog, db: str, name: str) -> Any:
+def _require_table(catalog: Catalog, db: str, name: str, storage: Any = None) -> Any:
     table = catalog.get(db, name)
+    if table is None and storage is not None:
+        # Schema-on-read: a write to an un-declared collection reflects its
+        # sampled shape, so INSERT/UPDATE/DELETE reach Mongo data with no DDL.
+        table = reflect.reflect(storage, db, name)
     if table is None:
         raise errors.undefined_table(name)
     return table
@@ -206,15 +210,15 @@ def _run_statement(
         return _run_select(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Insert):
-        table = _require_table(catalog, db, stmt.find(exp.Table).name)
+        table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
         return executor.execute_insert(planner.plan_insert(stmt, table), storage, db)
 
     if isinstance(stmt, exp.Update):
-        table = _require_table(catalog, db, stmt.find(exp.Table).name)
+        table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
         return executor.execute_update(planner.plan_update(stmt, table), storage, db)
 
     if isinstance(stmt, exp.Delete):
-        table = _require_table(catalog, db, stmt.find(exp.Table).name)
+        table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
         return executor.execute_delete(planner.plan_delete(stmt, table), storage, db)
 
     if isinstance(stmt, exp.Set):

@@ -502,7 +502,12 @@ def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
         for name, cell in zip(col_names, cells, strict=True):
             col = table.column(name)
             if col is None:
-                raise errors.undefined_column(name)
+                if table.reflected:
+                    # Schema-on-read: an un-sampled field is a valid insert target
+                    # (the ``_id`` field is still the PK / NOT NULL).
+                    col = Column(name, "any", name, pk=(name == "_id"), nullable=(name != "_id"))
+                else:
+                    raise errors.undefined_column(name)
             raw = _literal(cell)
             if raw is None and not col.nullable:
                 raise errors.not_null_violation(name)
@@ -641,7 +646,12 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         col_name = _column_name(assign.this)
         col = table.column(col_name)
         if col is None:
-            raise errors.undefined_column(col_name)
+            if table.reflected:
+                # Schema-on-read: any field is a valid SET target (still can't
+                # rewrite the PK, which maps to the immutable Mongo ``_id``).
+                col = Column(col_name, "any", col_name, pk=(col_name == "_id"), nullable=True)
+            else:
+                raise errors.undefined_column(col_name)
         if col.pk:
             raise errors.feature_not_supported("updating the primary key is not supported")
         raw = _literal(assign.expression)
