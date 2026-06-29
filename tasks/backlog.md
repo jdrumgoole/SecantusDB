@@ -1294,11 +1294,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `pg_type_is_visible` predicates. `pg_attribute`/`pg_attrdef`/`pg_description` virtual
   tables now exist (attrelid lines up with pg_class.oid), so column-level introspection
   *joins* resolve — e.g. `pg_attribute ⋈ pg_class ⋈ pg_namespace` returns a table's columns.
-  Still missing for the *exact* SQLAlchemy `get_columns()` / psql `\d` query: compound
-  multi-condition join `ON`s (`… AND attnum > 0 AND NOT attisdropped`), scalar functions in
-  the SELECT list (`format_type`, `pg_get_expr`), correlated scalar subqueries, and `CASE`
-  — those return `0A000`. Also no `pg_index`/`pg_constraint` yet. (`information_schema.columns`
-  is the working column-reflection path in the meantime.)
+  The column-metadata query SQLAlchemy / `psql \d` emit now runs end to end: compound
+  multi-condition join `ON`s (`… AND attnum > 0 AND NOT attisdropped`) compile to a `$lookup`
+  sub-pipeline; scalar SELECT-list functions (`format_type`, `pg_get_expr`, `coalesce`), `CASE`,
+  and correlated scalar subqueries are evaluated per row (`secantus.sql.scalar`); `pg_sequence`
+  / `pg_collation` are present-but-empty. **Still missing — SQLAlchemy's `inspect().get_columns()`
+  *also* fires a domain/type-resolution query** using a **derived-table subquery in the FROM
+  clause** (`… JOIN (SELECT … FROM pg_constraint GROUP BY …) AS dc ON …`) plus `array_agg` and
+  `pg_constraint`, so the full Python API call still raises; the column query itself and
+  `information_schema.columns` are the working column-reflection paths. Derived-table-as-join-
+  source + `array_agg` + `pg_constraint` is the next slice. Also no `pg_index` yet.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)

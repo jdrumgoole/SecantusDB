@@ -198,6 +198,68 @@ def test_pg_attrdef_and_description_empty(storage, session):
     assert q(storage, session, "SELECT * FROM pg_catalog.pg_description").rows == []
 
 
+def test_format_type_in_join_projection(storage, session):
+    # A scalar catalog function (format_type) in the SELECT list of a join —
+    # evaluated per row in Python; maps the type OID to its SQL spelling.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS t "
+        "FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "WHERE c.relname = 'users' ORDER BY a.attnum",
+    )
+    assert res.rows == [("id", "bigint"), ("name", "text"), ("age", "integer")]
+
+
+def test_compound_on_multikey_join(storage, session):
+    # pg_attribute ⋈ pg_description on TWO equality keys (objoid=attrelid AND
+    # objsubid=attnum). pg_description is empty, so a LEFT JOIN yields NULL.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname, d.description FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "LEFT OUTER JOIN pg_catalog.pg_description d "
+        "ON d.objoid = a.attrelid AND d.objsubid = a.attnum "
+        "WHERE c.relname = 'users' ORDER BY a.attnum",
+    )
+    assert res.rows == [("id", None), ("name", None), ("age", None)]
+
+
+def test_residual_on_predicate(storage, session):
+    # A compound ON with a residual filter on the joined table (attnum > 0) —
+    # folded into the $lookup sub-pipeline.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname FROM pg_catalog.pg_class c "
+        "LEFT OUTER JOIN pg_catalog.pg_attribute a "
+        "ON c.oid = a.attrelid AND a.attnum > 0 AND NOT a.attisdropped "
+        "WHERE c.relname = 'users' ORDER BY a.attnum",
+    )
+    assert res.rows == [("id",), ("name",), ("age",)]
+
+
+def test_case_and_correlated_subquery_in_projection(storage, session):
+    # CASE + a correlated scalar subquery (over the empty pg_attrdef) — both
+    # evaluated per row; default has no rows so the subquery is NULL.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname, "
+        "(SELECT d.adbin FROM pg_catalog.pg_attrdef d "
+        " WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum) AS deflt, "
+        "CASE WHEN a.attnotnull THEN 'NN' ELSE 'null' END AS nn "
+        "FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "WHERE c.relname = 'users' ORDER BY a.attnum",
+    )
+    assert res.rows == [("id", None, "NN"), ("name", None, "null"), ("age", None, "NN")]
+
+
 def test_group_by_over_virtual_table(storage, session):
     # GROUP BY over a virtual catalog table goes through the aggregation pipeline
     # backed by CatalogBackend — count columns for a given base table.

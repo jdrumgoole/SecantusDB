@@ -613,6 +613,28 @@ class PipelineSelectPlan:
     out_columns: list[tuple[str, str]]  # (output_name, type_tag)
 
 
+@dataclass
+class EvaluatedSelectPlan:
+    """A join whose SELECT list / ORDER BY has scalar expressions (functions,
+    CASE, correlated subqueries) that can't be lowered to a ``$project``.
+
+    The ``pipeline`` performs the joins + WHERE and yields the full joined docs;
+    the executor evaluates each output expression in Python per row (via
+    ``secantus.sql.scalar``), then applies DISTINCT / ORDER BY / LIMIT.
+    """
+
+    base_collection: str
+    base_filter: dict[str, Any]
+    pipeline: list[dict[str, Any]]  # join + where; NO final $project
+    out_columns: list[tuple[str, str]]  # (output_name, type_tag)
+    out_exprs: list[exp.Expression]  # parallel to out_columns; AST per output
+    resolve: Resolve  # join resolver: Column node -> (field_path, tag)
+    order: list[tuple[exp.Expression, int]]  # (expr, direction)
+    distinct: bool
+    limit: int
+    skip: int
+
+
 _AGG_CLASSES: dict[type, str] = {
     exp.Count: "count",
     exp.Sum: "sum",
@@ -919,6 +941,137 @@ def _alias_field_path(amap: dict[str, tuple[str, TableDef]], alias: str, col: st
     return field if role == "base" else f"{alias}.{field}"
 
 
+def _and_conjuncts(node: exp.Expression) -> list[exp.Expression]:
+    if isinstance(node, exp.Paren):
+        return _and_conjuncts(node.this)
+    if isinstance(node, exp.And):
+        return _and_conjuncts(node.this) + _and_conjuncts(node.expression)
+    return [node]
+
+
+class _OnTranslator:
+    """Translate a (possibly compound) JOIN ON into an aggregation ``$expr`` for
+    a ``$lookup`` ``let``/``pipeline`` stage.
+
+    References to the *new* (being-joined) table become ``$field`` paths inside
+    the lookup sub-pipeline; references to already-known tables become ``$$vN``
+    let variables bound to the outer document's field paths.
+    """
+
+    _OPS = {
+        exp.EQ: "$eq",
+        exp.NEQ: "$ne",
+        exp.GT: "$gt",
+        exp.GTE: "$gte",
+        exp.LT: "$lt",
+        exp.LTE: "$lte",
+    }
+
+    def __init__(self, new_alias: str, new_table: TableDef, amap: dict[str, tuple[str, TableDef]]):
+        self.new_alias = new_alias
+        self.new_table = new_table
+        self.amap = amap
+        self.lets: dict[str, str] = {}  # outer field path -> let var name
+
+    def _let_for(self, path: str) -> str:
+        if path not in self.lets:
+            self.lets[path] = f"v{len(self.lets)}"
+        return self.lets[path]
+
+    def _is_new(self, alias: str | None, name: str) -> bool:
+        if alias is not None:
+            return alias == self.new_alias
+        return self.new_table.column(name) is not None
+
+    def _column(self, node: exp.Column) -> str:
+        alias, name = node.table or None, node.name
+        if self._is_new(alias, name):
+            return f"${self.new_table.field_for(name)}"
+        # A known (outer) table reference -> a let-bound variable.
+        if alias is None:
+            cands = [a for a, (_r, t) in self.amap.items() if t.column(name) is not None]
+            if len(cands) != 1:
+                raise errors.SQLError("42702", f'column reference "{name}" is ambiguous')
+            alias = cands[0]
+        if alias not in self.amap:
+            raise errors.SQLError("42P01", f'missing FROM-clause entry for table "{alias}"')
+        return f"$${self._let_for(_alias_field_path(self.amap, alias, name))}"
+
+    def expr(self, node: exp.Expression) -> Any:
+        if isinstance(node, exp.Paren):
+            return self.expr(node.this)
+        if isinstance(node, exp.Column):
+            return self._column(node)
+        if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
+            return _literal(node)
+        if isinstance(node, exp.Cast):
+            return self.expr(node.this)
+        if isinstance(node, exp.And):
+            return {"$and": [self.expr(node.this), self.expr(node.expression)]}
+        if isinstance(node, exp.Or):
+            return {"$or": [self.expr(node.this), self.expr(node.expression)]}
+        if isinstance(node, exp.Not):
+            return {"$not": [self.expr(node.this)]}
+        if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
+            return {"$eq": [self.expr(node.this), None]}
+        for cls, op in self._OPS.items():
+            if isinstance(node, cls):
+                return {op: [self.expr(node.this), self.expr(node.expression)]}
+        raise errors.feature_not_supported(f"unsupported JOIN ON term: {node.sql()}")
+
+
+def _on_is_simple_equality(
+    on: exp.Expression, join_alias: str, amap: dict[str, tuple[str, TableDef]]
+) -> tuple[str, str, str] | None:
+    """If ``on`` is a single equality relating the new table to a known one,
+    return (new_col, known_alias, known_col); else None (→ pipeline form)."""
+    conjuncts = _and_conjuncts(on)
+    if len(conjuncts) != 1 or not isinstance(conjuncts[0], exp.EQ):
+        return None
+    eq = conjuncts[0]
+    la, lc = _alias_col(eq.this)
+    ra, rc = _alias_col(eq.expression)
+    if la is None or ra is None:
+        return None
+    if join_alias == la and ra != join_alias and ra in amap:
+        return lc, ra, rc
+    if join_alias == ra and la != join_alias and la in amap:
+        return rc, la, lc
+    return None
+
+
+def _lookup_stage(
+    on: exp.Expression, join_alias: str, join_table: TableDef, amap: dict[str, tuple[str, TableDef]]
+) -> dict[str, Any]:
+    """Build the ``$lookup`` stage for one JOIN.
+
+    A single equality uses the simple ``localField``/``foreignField`` form (so a
+    user-table join keeps index acceleration). A compound ON (multi-key join or
+    residual predicates on the joined table) uses the ``let``/``pipeline`` form.
+    """
+    simple = _on_is_simple_equality(on, join_alias, amap)
+    if simple is not None:
+        new_col, known_alias, known_col = simple
+        return {
+            "$lookup": {
+                "from": join_table.collection,
+                "localField": _alias_field_path(amap, known_alias, known_col),
+                "foreignField": join_table.field_for(new_col),
+                "as": join_alias,
+            }
+        }
+    tr = _OnTranslator(join_alias, join_table, amap)
+    cond = tr.expr(on)
+    return {
+        "$lookup": {
+            "from": join_table.collection,
+            "let": {var: f"${path}" for path, var in tr.lets.items()},
+            "pipeline": [{"$match": {"$expr": cond}}],
+            "as": join_alias,
+        }
+    }
+
+
 def _plan_join_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan:
@@ -947,36 +1100,9 @@ def _plan_join_select(
         join_alias = jt.alias or jt.name
         side = str(jn.args.get("side") or "").upper()
         on = jn.args.get("on")
-        if not isinstance(on, exp.EQ):
-            raise errors.feature_not_supported("only an equality ON condition is supported")
-        la, lc = _alias_col(on.this)
-        ra, rc = _alias_col(on.expression)
-        if la is None or ra is None:
-            raise errors.feature_not_supported("ON must reference the joined tables by alias")
-        # Exactly one side names the table being joined; the other names an
-        # already-known alias (the base or a previously joined table).
-        if join_alias == la and ra != join_alias:
-            new_col, known_alias, known_col = lc, ra, rc
-        elif join_alias == ra and la != join_alias:
-            new_col, known_alias, known_col = rc, la, lc
-        else:
-            raise errors.feature_not_supported(
-                f"JOIN ON must relate {join_alias} to an earlier table"
-            )
-        if known_alias not in amap:
-            raise errors.SQLError("42P01", f'missing FROM-clause entry for table "{known_alias}"')
-        local_path = _alias_field_path(amap, known_alias, known_col)
-        foreign_field = join_table.field_for(new_col)
-        pipeline.append(
-            {
-                "$lookup": {
-                    "from": join_table.collection,
-                    "localField": local_path,
-                    "foreignField": foreign_field,
-                    "as": join_alias,
-                }
-            }
-        )
+        if on is None:
+            raise errors.feature_not_supported("JOIN without ON is not supported")
+        pipeline.append(_lookup_stage(on, join_alias, join_table, amap))
         pipeline.append(
             {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": side == "LEFT"}}
         )
@@ -986,6 +1112,9 @@ def _plan_join_select(
     where = stmt.args.get("where")
     if where is not None:
         pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
+
+    if _join_needs_evaluation(stmt):
+        return _build_evaluated_join(stmt, base, amap, resolve, pipeline)
 
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
@@ -1006,6 +1135,86 @@ def _plan_join_select(
         out_columns.append((name, tag))
     _append_join_tail(pipeline, stmt, resolve, project, out_columns)
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns)
+
+
+def _is_simple_projection(node: exp.Expression) -> bool:
+    """A SELECT item that lowers to a plain ``$project`` field (no per-row eval)."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    return isinstance(inner, (exp.Column, exp.Star, *_JSONB_CLASSES))
+
+
+def _join_needs_evaluation(stmt: exp.Select) -> bool:
+    """Whether the join's SELECT list / ORDER BY needs Python per-row evaluation
+    (catalog functions, CASE, scalar subqueries) rather than a ``$project``."""
+    if not all(_is_simple_projection(e) for e in stmt.expressions):
+        return True
+    order = stmt.args.get("order")
+    if order is not None:
+        return any(not isinstance(o.this, exp.Column) for o in order.expressions)
+    return False
+
+
+def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
+    """Best-effort output type tag for a computed SELECT expression."""
+    if isinstance(node, (exp.Column, *_JSONB_CLASSES)):
+        try:
+            return _field(node, resolve)[1]
+        except errors.SQLError:
+            return "text"
+    name = None
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
+        name = node.expression.name
+    elif isinstance(node, exp.Anonymous):
+        name = node.this if isinstance(node.this, str) else node.name
+    if name is not None and str(name).rsplit(".", 1)[-1].lower() == "json_build_object":
+        return "json"
+    return "text"
+
+
+def _build_evaluated_join(
+    stmt: exp.Select,
+    base: TableDef,
+    amap: dict[str, tuple[str, TableDef]],
+    resolve: Resolve,
+    pipeline: list[dict[str, Any]],
+) -> EvaluatedSelectPlan:
+    out_columns: list[tuple[str, str]] = []
+    out_exprs: list[exp.Expression] = []
+    names = _NameAllocator()
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, exp.Star):
+            for a, (_role, tdef) in amap.items():
+                for c in tdef.columns:
+                    out_columns.append((names.fresh(c.name), c.type_tag))
+                    out_exprs.append(exp.column(c.name, table=a))
+            continue
+        if isinstance(inner, exp.Column):
+            name = alias or _column_name(inner)
+        else:
+            name = alias or "?column?"
+        out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
+        out_exprs.append(inner)
+
+    order: list[tuple[exp.Expression, int]] = []
+    order_node = stmt.args.get("order")
+    if order_node is not None:
+        for o in order_node.expressions:
+            order.append((o.this, -1 if o.args.get("desc") else 1))
+    limit, skip = _limit_skip(stmt)
+    return EvaluatedSelectPlan(
+        base_collection=base.collection,
+        base_filter={},
+        pipeline=pipeline,
+        out_columns=out_columns,
+        out_exprs=out_exprs,
+        resolve=resolve,
+        order=order,
+        distinct=bool(stmt.args.get("distinct")),
+        limit=limit,
+        skip=skip,
+    )
 
 
 def _append_join_tail(
