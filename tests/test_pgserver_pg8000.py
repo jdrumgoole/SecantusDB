@@ -296,7 +296,7 @@ def test_catalog_join_via_driver(server):
     cur.execute(
         "SELECT c.relname FROM pg_catalog.pg_class c "
         "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = %s ORDER BY c.relname",
+        "WHERE n.nspname = %s AND c.relkind = 'r' ORDER BY c.relname",
         ("public",),
     )
     assert cur.fetchall() == (["a"], ["b"])
@@ -319,6 +319,19 @@ def test_sqlalchemy_get_columns_reflection(server):
         assert [type(c["type"]).__name__ for c in cols] == ["BIGINT", "TEXT", "INTEGER"]
         # The PK column reflects NOT NULL; the others nullable.
         assert [c["nullable"] for c in cols] == [False, True, True]
+    finally:
+        engine.dispose()
+
+
+def test_sqlalchemy_get_foreign_keys_empty(server):
+    # We model no foreign keys, so get_foreign_keys() reflects empty (no error).
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE users (id bigint primary key, name text)"))
+        assert sa.inspect(engine).get_foreign_keys("users") == []
     finally:
         engine.dispose()
 

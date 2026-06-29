@@ -457,7 +457,7 @@ and `information_schema.columns` are the working reflection paths.
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL` (accepted, single-node no-op) | `SAVEPOINT`, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params, prepared statements, portals | binary result format, `COPY` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
-| Catalog | `information_schema`, `pg_catalog`, catalog *joins*, SQLAlchemy `get_table_names`/`has_table`/`get_columns` | `get_pk_constraint`/`get_indexes`/`get_foreign_keys` (`pg_index`) |
+| Catalog | `information_schema`, `pg_catalog` (incl. `pg_index`/`pg_constraint`/`pg_am`), catalog *joins*, SQLAlchemy `get_table_names`/`has_table`/`get_columns`/`get_foreign_keys` | `get_pk_constraint`/`get_indexes` (need `unnest`) |
 
 Anything outside the supported set returns a faithful SQLSTATE error rather than
 a wrong answer — the same "honest *not supported* over a half-feature" discipline

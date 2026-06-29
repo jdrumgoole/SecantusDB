@@ -121,7 +121,11 @@ def test_information_schema_columns(storage, session):
 
 def test_pg_class_and_namespace(storage, session):
     _seed(storage, session)
-    assert q(storage, session, "SELECT relname FROM pg_catalog.pg_class ORDER BY relname").rows == [
+    assert q(
+        storage,
+        session,
+        "SELECT relname FROM pg_catalog.pg_class WHERE relkind = 'r' ORDER BY relname",
+    ).rows == [
         ("orders",),
         ("users",),
     ]
@@ -148,7 +152,7 @@ def test_catalog_join_class_namespace(storage, session):
         session,
         "SELECT c.relname, n.nspname FROM pg_catalog.pg_class c "
         "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-        "ORDER BY c.relname",
+        "WHERE c.relkind = 'r' ORDER BY c.relname",
     )
     assert res.rows == [("orders", "public"), ("users", "public")]
 
@@ -161,7 +165,7 @@ def test_catalog_join_with_where_on_namespace(storage, session):
         session,
         "SELECT c.relname FROM pg_catalog.pg_class c "
         "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = 'public' ORDER BY c.relname",
+        "WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY c.relname",
     )
     assert res.rows == [("orders",), ("users",)]
 
@@ -190,6 +194,32 @@ def test_pg_attribute_three_way_join(storage, session):
         "WHERE n.nspname = 'public' AND c.relname = 'orders' ORDER BY a.attnum",
     )
     assert res.rows == [("id",), ("total",)]
+
+
+def test_pg_index_and_constraint_populated(storage, session):
+    # A declared table with a PK has an implicit PK index relation + a 'p'
+    # constraint; a user CREATE INDEX adds another (non-primary) index.
+    _seed(storage, session)
+    q(storage, session, "CREATE INDEX ix_age ON users (age)")
+    idx = q(
+        storage,
+        session,
+        "SELECT i.indisprimary, i.indisunique FROM pg_catalog.pg_index i "
+        "JOIN pg_catalog.pg_class c ON i.indexrelid = c.oid "
+        "JOIN pg_catalog.pg_class t ON i.indrelid = t.oid "
+        "WHERE t.relname = 'users' ORDER BY i.indisprimary DESC",
+    )
+    assert (True, True) in idx.rows  # the PK index (primary + unique)
+    assert (False, False) in idx.rows  # the user index on age
+    # The PK surfaces as a contype 'p' constraint.
+    pk = q(
+        storage,
+        session,
+        "SELECT con.conname FROM pg_catalog.pg_constraint con "
+        "JOIN pg_catalog.pg_class t ON con.conrelid = t.oid "
+        "WHERE t.relname = 'users' AND con.contype = 'p'",
+    )
+    assert pk.rows == [("users_pkey",)]
 
 
 def test_pg_attrdef_and_description_empty(storage, session):

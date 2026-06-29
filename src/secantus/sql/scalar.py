@@ -170,8 +170,13 @@ def _eval_typed_func(node: exp.Func, scope: Scope, ctx: ScalarContext) -> Any:
 def _call_func(name: str, args: list[Any]) -> Any:
     if name == "format_type":
         return _format_type(args[0] if args else None, args[1] if len(args) > 1 else None)
-    if name in ("pg_get_expr", "pg_get_serial_sequence", "pg_get_constraintdef"):
-        # No stored defaults / sequences / constraints in our model.
+    if name in (
+        "pg_get_expr",
+        "pg_get_serial_sequence",
+        "pg_get_constraintdef",
+        "pg_get_indexdef",
+    ):
+        # No stored defaults / sequences; constraint/index defs not rendered.
         return None
     if name == "json_build_object":
         out: dict[str, Any] = {}
