@@ -98,10 +98,12 @@ def _literal(node: exp.Expression) -> Any:
     if isinstance(node, exp.Paren):
         return _literal(node.this)
     if isinstance(node, exp.Cast):
-        # ``'x'::varchar`` / ``CAST(NULL AS varchar)`` — drivers (and SQLAlchemy's
-        # reflection) annotate literals with a target type; the BSON value is the
-        # inner literal, coerced later by the column's type.
-        return _literal(node.this)
+        # ``'x'::varchar`` / ``CAST($1 AS SMALLINT)`` — drivers (and SQLAlchemy's
+        # reflection) annotate values with a target type. Honour a *numeric* cast
+        # so a text-bound param (extended protocol decodes ``$1`` as a string)
+        # compares numerically rather than as a string (Mongo orders numbers
+        # before strings, so ``attnum > '0'`` would be wrongly false).
+        return _coerce_cast(_literal(node.this), node.to)
     if isinstance(node, exp.Neg):
         return -_literal(node.this)
     if isinstance(node, exp.Null):
@@ -114,6 +116,29 @@ def _literal(node: exp.Expression) -> Any:
         text = node.this
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
     raise errors.feature_not_supported(f"unsupported value expression: {node.sql()}")
+
+
+def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
+    """Coerce a value to a Python number when a CAST targets a numeric type.
+
+    Non-numeric casts (varchar/text/etc.) leave the value unchanged — the
+    column-type coercion downstream handles those.
+    """
+    if value is None or datatype is None:
+        return value
+    tag = typemap.type_tag_for_sql(datatype) if isinstance(datatype, exp.DataType) else None
+    try:
+        if tag in ("int4", "int8"):
+            return int(value)
+        if tag == "float8":
+            return float(value)
+        if tag == "numeric":
+            from decimal import Decimal
+
+            return value if isinstance(value, Decimal) else Decimal(str(value))
+    except (TypeError, ValueError):
+        return value
+    return value
 
 
 def _column_name(node: exp.Expression) -> str:
@@ -606,11 +631,23 @@ def parameter_count(stmt: exp.Expression) -> int:
 
 
 @dataclass
+class DerivedTable:
+    """A ``(SELECT ...) AS alias`` join source, materialized before the main
+    pipeline runs. ``name`` is the ephemeral collection the executor registers
+    the sub-plan's rows under (and the join's ``$lookup`` reads from)."""
+
+    name: str
+    plan: Any  # a sub-plan (PipelineSelectPlan / EvaluatedSelectPlan)
+    columns: list[tuple[str, str]]  # (output_name, type_tag)
+
+
+@dataclass
 class PipelineSelectPlan:
     base_collection: str
     base_filter: dict[str, Any]
     pipeline: list[dict[str, Any]]
     out_columns: list[tuple[str, str]]  # (output_name, type_tag)
+    derived: list[DerivedTable] = field(default_factory=list)
 
 
 @dataclass
@@ -633,6 +670,7 @@ class EvaluatedSelectPlan:
     distinct: bool
     limit: int
     skip: int
+    derived: list[DerivedTable] = field(default_factory=list)
 
 
 _AGG_CLASSES: dict[type, str] = {
@@ -662,6 +700,44 @@ def _aggregate_of(node: exp.Expression) -> tuple[str, str | None] | None:
     return None
 
 
+def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
+    """If ``node`` is ``array_agg(<arg>)``, return its argument expression."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    return inner.this if isinstance(inner, exp.ArrayAgg) else None
+
+
+def _agg_arg_to_expr(node: exp.Expression, table: TableDef) -> Any:
+    """Lower an aggregate argument to a Mongo aggregation expression.
+
+    Used by ``array_agg`` (``$push``). Catalog functions with no Mongo analogue
+    that are always NULL in our model (``pg_get_constraintdef`` / ``pg_get_expr``)
+    lower to a literal NULL — sound because we store no constraints/defaults.
+    """
+    if isinstance(node, exp.Paren):
+        return _agg_arg_to_expr(node.this, table)
+    if isinstance(node, exp.Order):
+        # ``array_agg(x ORDER BY y)`` — the intra-aggregate ordering isn't modeled
+        # (our only use is over empty catalogs); aggregate the bare expression.
+        return _agg_arg_to_expr(node.this, table)
+    if isinstance(node, exp.Cast):
+        return _agg_arg_to_expr(node.this, table)
+    if isinstance(node, exp.Column):
+        return f"${table.field_for(node.name)}"
+    if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
+        return {"$literal": _literal(node)}
+    fname = None
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
+        fname = node.expression.name
+    elif isinstance(node, exp.Anonymous):
+        fname = node.this if isinstance(node.this, str) else node.name
+    if fname is not None and str(fname).rsplit(".", 1)[-1].lower() in (
+        "pg_get_constraintdef",
+        "pg_get_expr",
+    ):
+        return {"$literal": None}
+    raise errors.feature_not_supported(f"unsupported array_agg argument: {node.sql()}")
+
+
 def select_needs_pipeline(stmt: exp.Select) -> bool:
     """Whether a SELECT must be compiled to an aggregation pipeline."""
     if (
@@ -671,7 +747,9 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
         or stmt.args.get("distinct")
     ):
         return True
-    aggs = [e for e in stmt.expressions if _aggregate_of(e) is not None]
+    aggs = [
+        e for e in stmt.expressions if _aggregate_of(e) is not None or _array_agg_arg(e) is not None
+    ]
     if not aggs:
         return False
     # A lone COUNT(*) (no GROUP BY) is served by the simpler find path.
@@ -805,8 +883,14 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
 
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
+        arr_arg = _array_agg_arg(e)
         agg = _aggregate_of(e)
-        if agg is not None:
+        if arr_arg is not None:
+            fname = names.fresh(alias or "array_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
+            project[fname] = f"${fname}"
+            out_columns.append((fname, "json"))
+        elif agg is not None:
             func, col = agg
             acc, tag = _accumulator(func, col, table)
             fname = names.fresh(alias or func)
@@ -1005,7 +1089,7 @@ class _OnTranslator:
         if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
             return _literal(node)
         if isinstance(node, exp.Cast):
-            return self.expr(node.this)
+            return _coerce_cast(self.expr(node.this), node.to)
         if isinstance(node, exp.And):
             return {"$and": [self.expr(node.this), self.expr(node.expression)]}
         if isinstance(node, exp.Or):
@@ -1072,20 +1156,51 @@ def _lookup_stage(
     }
 
 
+def _resolve_source(
+    node: exp.Expression, db: str, catalog: Any, storage: Any, derived: list[DerivedTable]
+) -> tuple[str, TableDef]:
+    """Resolve a FROM / JOIN source to (alias, TableDef).
+
+    A plain table resolves through the catalog / virtual / reflection lookup. A
+    ``(SELECT ...) AS alias`` derived table is planned as a sub-plan and recorded
+    in ``derived`` (the executor materializes it into an ephemeral collection
+    named by the alias before running the main pipeline)."""
+    if isinstance(node, exp.Subquery):
+        alias = node.alias
+        if not alias:
+            raise errors.feature_not_supported("a derived table requires an alias")
+        sub = node.this
+        if not isinstance(sub, exp.Select) or not select_needs_pipeline(sub):
+            raise errors.feature_not_supported(
+                "only an aggregate / grouped derived table is supported"
+            )
+        sub_plan = plan_pipeline_select(sub, db, catalog, storage)
+        cols = sub_plan.out_columns
+        tdef = TableDef(
+            name=alias,
+            collection=alias,
+            columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+        )
+        derived.append(DerivedTable(name=alias, plan=sub_plan, columns=cols))
+        return alias, tdef
+    tdef = _lookup_table_def(catalog, db, node, storage)
+    if tdef is None:
+        raise errors.undefined_table(node.name)
+    return (node.alias or node.name), tdef
+
+
 def _plan_join_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
-) -> PipelineSelectPlan:
+) -> PipelineSelectPlan | EvaluatedSelectPlan:
     if (
         stmt.args.get("group")
         or stmt.args.get("having")
         or any(_aggregate_of(e) is not None for e in stmt.expressions)
     ):
         raise errors.feature_not_supported("JOIN with GROUP BY / aggregates is not supported yet")
+    derived: list[DerivedTable] = []
     fr = stmt.find(exp.From).this
-    base = _lookup_table_def(catalog, db, fr, storage)
-    if base is None:
-        raise errors.undefined_table(fr.name)
-    base_alias = fr.alias or fr.name
+    base_alias, base = _resolve_source(fr, db, catalog, storage, derived)
     amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
     pipeline: list[dict[str, Any]] = []
 
@@ -1094,10 +1209,7 @@ def _plan_join_select(
     # Mongo's dotted localField handles since b was unwound into the doc.
     for jn in stmt.args["joins"]:
         jt = jn.this
-        join_table = _lookup_table_def(catalog, db, jt, storage)
-        if join_table is None:
-            raise errors.undefined_table(jt.name)
-        join_alias = jt.alias or jt.name
+        join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
         side = str(jn.args.get("side") or "").upper()
         on = jn.args.get("on")
         if on is None:
@@ -1114,7 +1226,7 @@ def _plan_join_select(
         pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
 
     if _join_needs_evaluation(stmt):
-        return _build_evaluated_join(stmt, base, amap, resolve, pipeline)
+        return _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
 
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
@@ -1134,7 +1246,7 @@ def _plan_join_select(
         project[name] = f"${path}"
         out_columns.append((name, tag))
     _append_join_tail(pipeline, stmt, resolve, project, out_columns)
-    return PipelineSelectPlan(base.collection, {}, pipeline, out_columns)
+    return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
 
 
 def _is_simple_projection(node: exp.Expression) -> bool:
@@ -1177,6 +1289,7 @@ def _build_evaluated_join(
     amap: dict[str, tuple[str, TableDef]],
     resolve: Resolve,
     pipeline: list[dict[str, Any]],
+    derived: list[DerivedTable],
 ) -> EvaluatedSelectPlan:
     out_columns: list[tuple[str, str]] = []
     out_exprs: list[exp.Expression] = []
@@ -1214,6 +1327,7 @@ def _build_evaluated_join(
         distinct=bool(stmt.args.get("distinct")),
         limit=limit,
         skip=skip,
+        derived=derived,
     )
 
 

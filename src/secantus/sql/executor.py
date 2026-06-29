@@ -96,10 +96,33 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
     )
 
 
+def _materialize_derived(plan: Any, storage: Any, db: str) -> None:
+    """Materialize a plan's derived-table subqueries into ephemeral collections.
+
+    Each ``(SELECT ...) AS alias`` join source is run to rows (its own derived
+    tables first) and registered under its alias so the main pipeline's
+    ``$lookup`` can read it."""
+    for dt in getattr(plan, "derived", []):
+        rows = _run_subplan_to_docs(dt.plan, storage, db)
+        storage.register_ephemeral(dt.name, rows)
+
+
+def _run_subplan_to_docs(plan: Any, storage: Any, db: str) -> list[dict[str, Any]]:
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    _materialize_derived(plan, storage, db)
+    if isinstance(plan, planner.PipelineSelectPlan):
+        docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+        ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
+        return apply_pipeline(docs, plan.pipeline, ctx)
+    raise errors.feature_not_supported("unsupported derived-table plan")
+
+
 def execute_pipeline_select(plan: planner.PipelineSelectPlan, storage: Any, db: str) -> SQLResult:
     """Run a JOIN / GROUP BY / aggregate SELECT through the aggregation engine."""
     from secantus.aggregate import PipelineContext, apply_pipeline
 
+    _materialize_derived(plan, storage, db)
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
     result = apply_pipeline(docs, plan.pipeline, ctx)
@@ -123,6 +146,7 @@ def execute_evaluated_select(
     from secantus.aggregate import PipelineContext, apply_pipeline
     from secantus.sql import scalar
 
+    _materialize_derived(plan, storage, db)
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
     docs = apply_pipeline(docs, plan.pipeline, ctx)

@@ -260,6 +260,26 @@ def test_case_and_correlated_subquery_in_projection(storage, session):
     assert res.rows == [("id", None, "NN"), ("name", None, "null"), ("age", None, "NN")]
 
 
+def test_residual_on_with_text_bound_int(storage, session):
+    # Regression: a residual ON predicate comparing a numeric column to a value
+    # that arrives as text (extended-protocol bind) must compare numerically, via
+    # the CAST's target type — not as a string (Mongo orders numbers < strings),
+    # else the join would silently drop every row.
+    from secantus.sql import planner
+    from secantus.sql.engine import run_statement
+
+    _seed(storage, session)
+    stmt = planner.parse(
+        "SELECT a.attname FROM pg_catalog.pg_class c "
+        "LEFT OUTER JOIN pg_catalog.pg_attribute a "
+        "ON c.oid = a.attrelid AND a.attnum > CAST($1 AS SMALLINT) AND NOT a.attisdropped "
+        "WHERE c.relname = 'users' ORDER BY a.attnum"
+    )[0]
+    bound = planner.substitute_parameters(stmt, ["0"])  # text-bound, as the wire does
+    out = run_statement(storage, DB, bound, session)
+    assert out.rows == [("id",), ("name",), ("age",)]
+
+
 def test_group_by_over_virtual_table(storage, session):
     # GROUP BY over a virtual catalog table goes through the aggregation pipeline
     # backed by CatalogBackend — count columns for a given base table.

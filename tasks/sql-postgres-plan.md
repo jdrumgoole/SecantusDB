@@ -527,6 +527,25 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   slice. The column query itself + `information_schema.columns` are the working
   paths. Tests: `tests/test_sql_scalar.py`, `tests/test_sql_catalog.py`, and a
   driver-level catalog column query in `tests/test_pgserver_pg8000.py`.
+- **Derived tables + array_agg → `get_columns()` end to end. ✅ landed.** The last
+  pieces so SQLAlchemy's `inspect().get_columns()` returns typed column metadata:
+  (1) a `(SELECT … GROUP BY …) AS alias` **derived table** as a join source is
+  planned as a sub-plan (`DerivedTable`) and materialized into an ephemeral
+  collection the executor registers (`virtual.CatalogBackend.register_ephemeral`)
+  before running the main pipeline; (2) **`array_agg`** lowers to `$push` (argument
+  via `_agg_arg_to_expr`, ignoring any intra-aggregate ORDER BY; always-NULL catalog
+  funcs like `pg_get_constraintdef` → literal NULL); (3) the empty `pg_constraint` /
+  `pg_enum` virtual tables + pg_type domain columns (`typnamespace`/`typtype`/...).
+  **Root-cause fix:** a numeric `CAST` now coerces its inner value (`_coerce_cast`),
+  so an extended-protocol text-bound param (`attnum > CAST($1 AS SMALLINT)`,
+  `$1='0'`) compares numerically instead of as a string (Mongo orders numbers
+  before strings, which had silently dropped every joined row). `get_columns` /
+  `get_table_names` / `has_table` now all work over pg8000 + SQLAlchemy.
+  **Deferred:** full `Table(autoload_with=...)` also needs `get_pk_constraint` /
+  `get_indexes` / `get_foreign_keys` (a `pg_index` table + `pg_constraint.conrelid`/
+  `confrelid` + PK/index/FK reflected from the catalog). Tests:
+  `tests/test_pgserver_pg8000.py::test_sqlalchemy_get_columns_reflection` (headline)
+  + the text-bound-cast regression in `tests/test_sql_catalog.py`.
 - **Transactions (post-P7). ✅ landed.** `BEGIN`/`COMMIT`/`ROLLBACK` now open /
   commit / abort a real `Storage` user-transaction (the same
   `begin_user_transaction` / `use_user_transaction` / `commit_user_transaction`
