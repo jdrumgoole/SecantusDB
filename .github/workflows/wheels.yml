@@ -31,12 +31,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-x86_64 (macos-13 runners) is not supported. The runner
-          # queue is too scarce for reliable CI, and Apple Silicon is the
-          # active development target.
-          - os: macos-14
-            platform: macos-arm64
-            cibw_archs: arm64
+          # macOS (macos-14 / arm64) is intentionally absent from this
+          # continuous matrix: the runner queue is scarce and the from-source
+          # WiredTiger build is slow/flaky, so it's too costly to run on every
+          # push. macOS wheels ARE built and validated at release time
+          # (publish.yml's matrix still includes macos-14 / macos-arm64).
+          # macos-x86_64 (macos-13) is unsupported regardless — Apple Silicon
+          # is the active target.
           - os: ubuntu-22.04
             platform: linux-x86_64
             cibw_archs: x86_64
