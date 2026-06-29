@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-06-20 — SecantusDB 0.5.4b9 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
+Generated 2026-06-29 — SecantusDB 0.5.4b30 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -9,10 +9,10 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | Suite | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 92 | 1 | 10 | 103 | 98.9% |
-| `/Client` | 96 | 9 | 14 | 119 | 91.4% |
-| `/Collection` | 140 | 5 | 11 | 156 | 96.6% |
+| `/Client` | 97 | 8 | 16 | 121 | 92.4% |
+| `/Collection` | 146 | 0 | 11 | 157 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
-| `/Database` | 17 | 2 | 0 | 19 | 89.5% |
+| `/Database` | 19 | 0 | 0 | 19 | 100.0% |
 | `/ReadConcern` | 6 | 0 | 0 | 6 | 100.0% |
 | `/ReadPrefs` | 16 | 0 | 0 | 16 | 100.0% |
 | `/WriteCommand` | 6 | 0 | 0 | 6 | 100.0% |
@@ -24,18 +24,17 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/find_and_modify` | 8 | 0 | 1 | 9 | 100.0% |
 | `/gridfs` | 10 | 0 | 1 | 11 | 100.0% |
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
-| `/index-management` | 3 | 3 | 0 | 6 | 50.0% |
+| `/index-management` | 6 | 0 | 0 | 6 | 100.0% |
 | `/long_namespace` | 7 | 0 | 2 | 9 | 100.0% |
-| **Overall** | **712** | **21** | **69** | **802** | **97.1%** |
+| **Overall** | **724** | **10** | **71** | **805** | **98.6%** |
 
-## Failures (21)
+## Failures (10)
 
 First 30 failed tests for triage:
 
 ```
 /Client/ipv6/single
 /Client/ipv6/single
-/Client/command_w_write_concern
 /Client/select_server/single
 /Client/select_server/pooled
 /Client/select_server/err/single
@@ -43,17 +42,7 @@ First 30 failed tests for triage:
 /Client/last_write_date_absent
 /Client/last_write_date_absent/pooled
 /BulkOperation/OP_MSG/max_msg_size
-/Collection/index
-/Collection/index_w_write_concern
-/Collection/drop
-/Collection/rename
-/Collection/tailable/timeout/single
 /command_monitoring/unified/writeConcernError
-/Database/create_with_write_concern
-/Database/drop
-/index-management/updateSearchIndex
-/index-management/listSearchIndexes
-/index-management/dropSearchIndex
 ```
 
 ## How this is generated

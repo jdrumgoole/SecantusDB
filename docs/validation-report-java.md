@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-06-20 — SecantusDB 0.5.4b9 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-06-29 — SecantusDB 0.5.4b30 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -13,8 +13,19 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `driver-core` | 10 | 0 | 0 | 10 | 100.0% |
-| `driver-sync` | 437 | 0 | 453 | 890 | 100.0% |
-| **Overall** | **447** | **0** | **453** | **900** | **100.0%** |
+| `driver-sync` | 433 | 4 | 453 | 890 | 99.1% |
+| **Overall** | **443** | **4** | **453** | **900** | **99.1%** |
+
+## Failures (4)
+
+First 30 failed tests for triage:
+
+```
+driver-sync :: com.mongodb.client.ClientMetadataTest#client metadata is not propagated to the server: metadata append does not create new connections or close existing ones and no hello command is sent
+driver-sync :: com.mongodb.client.unified.UnifiedCrudTest#bulkWrite-errorResponse: bulkWrite operations support errorResponse assertions
+driver-sync :: com.mongodb.client.unified.ConnectionPoolLoggingTest#connection-logging: Create a client, run a command, and close the client
+driver-sync :: com.mongodb.client.unified.SessionsTest#driver-sessions-server-support: Server supports implicit sessions
+```
 
 ## How this is generated
 
