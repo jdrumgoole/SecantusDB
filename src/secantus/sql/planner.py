@@ -259,16 +259,6 @@ def _field(node: exp.Expression, resolve: Resolve) -> tuple[str, str]:
     raise errors.feature_not_supported(f"expected a column or jsonb path: {node.sql()}")
 
 
-def _comparison(node: exp.Expression) -> tuple[exp.Expression, exp.Expression]:
-    """Return (field_node, other_node), normalising the field-on-the-right case."""
-    left, right = node.this, node.expression
-    if _is_field_node(left):
-        return left, right
-    if _is_field_node(right):
-        return right, left
-    raise errors.feature_not_supported(f"comparison needs a column: {node.sql()}")
-
-
 def _array_elements(node: exp.Expression) -> list[exp.Expression]:
     """Unwrap an ``ARRAY[...]`` (possibly parenthesised) to its element nodes."""
     if isinstance(node, exp.Paren):
@@ -276,6 +266,74 @@ def _array_elements(node: exp.Expression) -> list[exp.Expression]:
     if isinstance(node, exp.Array):
         return list(node.expressions)
     raise errors.feature_not_supported(f"unsupported array operand: {node.sql()}")
+
+
+_LITERAL_SENTINEL = object()
+
+
+def _try_literal(node: exp.Expression) -> Any:
+    """``_literal(node)`` or the sentinel if it isn't a constant expression."""
+    try:
+        return _literal(node)
+    except errors.SQLError:
+        return _LITERAL_SENTINEL
+
+
+def _is_literalish(node: exp.Expression) -> bool:
+    return _try_literal(node) is not _LITERAL_SENTINEL
+
+
+def _field_literal_pair(
+    left: exp.Expression, right: exp.Expression
+) -> tuple[exp.Expression, exp.Expression] | None:
+    """For ``field OP const`` (either order), return ``(field_node, const_node)``."""
+    if _is_field_node(left) and _is_literalish(right):
+        return (left, right)
+    if _is_field_node(right) and _is_literalish(left):
+        return (right, left)
+    return None
+
+
+# Comparison op -> the aggregation-expression operator used inside ``$expr`` when
+# neither side is a constant (column-to-column / arithmetic predicates).
+_EXPR_CMP: dict[type, str] = {
+    exp.EQ: "$eq",
+    exp.NEQ: "$ne",
+    exp.GT: "$gt",
+    exp.GTE: "$gte",
+    exp.LT: "$lt",
+    exp.LTE: "$lte",
+}
+_ARITH_OPS: dict[type, str] = {
+    exp.Add: "$add",
+    exp.Sub: "$subtract",
+    exp.Mul: "$multiply",
+    exp.Div: "$divide",
+}
+
+
+def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
+    """Lower a scalar WHERE operand to a Mongo aggregation expression for ``$expr``.
+
+    Columns / jsonb paths become ``$field`` refs, arithmetic nests, and constants
+    pass through (strings wrapped in ``$literal`` so a leading ``$`` isn't read as
+    a field path). Anything else (function calls, etc.) raises — those predicates
+    aren't supported yet."""
+    if isinstance(node, exp.Paren):
+        return _to_agg_expr(node.this, resolve)
+    if _is_field_node(node):
+        return "$" + _field(node, resolve)[0]
+    if isinstance(node, exp.Cast):
+        return _to_agg_expr(node.this, resolve)
+    if type(node) in _ARITH_OPS:
+        return {
+            _ARITH_OPS[type(node)]: [
+                _to_agg_expr(node.this, resolve),
+                _to_agg_expr(node.expression, resolve),
+            ]
+        }
+    val = _literal(node)
+    return {"$literal": val} if isinstance(val, str) else val
 
 
 # Catalog predicates that are functions of visibility/scope which, on a
@@ -319,26 +377,42 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
         raise errors.feature_not_supported(f"unsupported IS predicate: {node.sql()}")
 
     if isinstance(node, exp.EQ):
-        col_node, other = _comparison(node)
-        field, tag = _field(col_node, resolve)
-        if isinstance(other, exp.Any):
+        left, right = node.this, node.expression
+        if isinstance(left, exp.Any) or isinstance(right, exp.Any):
             # ``col = ANY(ARRAY[...])`` is Postgres' IN — SQLAlchemy's reflection
             # emits ``relkind = ANY(ARRAY['r','p',...])``.
-            values = [typemap.coerce(_literal(e), tag) for e in _array_elements(other.this)]
+            anynode, fld = (left, right) if isinstance(left, exp.Any) else (right, left)
+            field, tag = _field(fld, resolve)
+            values = [typemap.coerce(_literal(e), tag) for e in _array_elements(anynode.this)]
             return {field: {"$in": values}}
-        return {field: typemap.coerce(_literal(other), tag)}
+        pair = _field_literal_pair(left, right)
+        if pair is not None:
+            field, tag = _field(pair[0], resolve)
+            return {field: typemap.coerce(_literal(pair[1]), tag)}
+        return {"$expr": {"$eq": [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]}}
 
     if isinstance(node, exp.NEQ):
-        col_node, other = _comparison(node)
-        field, tag = _field(col_node, resolve)
-        return {field: {"$ne": typemap.coerce(_literal(other), tag)}}
+        left, right = node.this, node.expression
+        pair = _field_literal_pair(left, right)
+        if pair is not None:
+            field, tag = _field(pair[0], resolve)
+            return {field: {"$ne": typemap.coerce(_literal(pair[1]), tag)}}
+        return {"$expr": {"$ne": [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]}}
 
     for cls, (op, flipped) in _CMP_OPS.items():
         if isinstance(node, cls):
-            col_node, other = _comparison(node)
-            field, tag = _field(col_node, resolve)
-            use = op if _is_field_node(node.this) else flipped
-            return {field: {use: typemap.coerce(_literal(other), tag)}}
+            left, right = node.this, node.expression
+            if _is_field_node(left) and _is_literalish(right):
+                field, tag = _field(left, resolve)
+                return {field: {op: typemap.coerce(_literal(right), tag)}}
+            if _is_field_node(right) and _is_literalish(left):
+                field, tag = _field(right, resolve)
+                return {field: {flipped: typemap.coerce(_literal(left), tag)}}
+            return {
+                "$expr": {
+                    _EXPR_CMP[cls]: [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]
+                }
+            }
 
     if isinstance(node, exp.In):
         if node.args.get("query") is not None:

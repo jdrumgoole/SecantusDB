@@ -175,6 +175,26 @@ def test_write_to_reflected_table(server):
     conn.close()
 
 
+def test_column_to_column_where_via_driver(server):
+    # A WHERE comparing two columns (and a column to an arithmetic expression),
+    # over Mongo-written data, through the real driver.
+    server.storage.insert(
+        "db",
+        "orders",
+        [
+            {"_id": bson.Int64(1), "qty": bson.Int64(5), "shipped": bson.Int64(5)},
+            {"_id": bson.Int64(2), "qty": bson.Int64(8), "shipped": bson.Int64(3)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT _id FROM orders WHERE qty > shipped ORDER BY _id")
+    assert cur.fetchall() == ([2],)
+    cur.execute("SELECT _id FROM orders WHERE qty = shipped ORDER BY _id")
+    assert cur.fetchall() == ([1],)
+    conn.close()
+
+
 def test_jsonb_operators_via_driver(server):
     # jsonb containment/existence operators + a jsonb function over Mongo-written
     # data (no CREATE TABLE), through the real driver.

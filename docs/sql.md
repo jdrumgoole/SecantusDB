@@ -193,6 +193,11 @@ SELECT * FROM users WHERE age BETWEEN 18 AND 40;
 SELECT * FROM users WHERE name LIKE 'a%';      -- ILIKE too
 SELECT * FROM users WHERE name IS NOT NULL;
 SELECT name FROM users ORDER BY age DESC LIMIT 2 OFFSET 1;
+
+-- A comparison between two columns (or a column and an arithmetic expression)
+-- is supported; it evaluates per row rather than via an index.
+SELECT * FROM orders WHERE shipped_qty < ordered_qty;
+SELECT * FROM products WHERE list_price > cost * 1.5;
 ```
 
 ## Aggregates, GROUP BY, HAVING
@@ -517,7 +522,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Area | Supported | Not yet |
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `MERGE`, `INSERT ... SELECT`, `RETURNING` |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&` | subqueries, scalar expressions, column-to-column predicates, jsonb `<@` |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic (`a > b`, `a < b * 1.5`) | subqueries, function calls in a column predicate, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths (`->`/`->>`/`#>`/`#>>`), `jsonb_*` functions, `DISTINCT` | arbitrary computed expressions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON` | `RIGHT`/`FULL`/`CROSS`, non-equi, JOIN + GROUP BY |
