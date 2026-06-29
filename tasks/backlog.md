@@ -1294,10 +1294,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `array_agg`** compile to an aggregation pipeline. The join builds `$lookup`/`$unwind`, then
   `_plan_join_group_select` appends a `$group` whose keys + accumulators resolve through the
   join resolver (`a.region`, `SUM(b.amt)` → post-unwind paths); WHERE applies pre-group, HAVING
-  post-group. Still `0A000`: non-equi / `OR` join conditions, `RIGHT`/`FULL`/`CROSS` JOIN,
-  window functions, subqueries, and scalar/computed expressions in the SELECT list / GROUP BY
-  (only bare columns and single aggregates are handled). `DISTINCT` with aggregates is also
-  `0A000`. SUM/MIN/MAX result typing is approximate (uses the column's tag; AVG → float8).
+  post-group. **Computed scalar expressions in the SELECT list / ORDER BY** — arithmetic
+  (`+`/`-`/`*`/`/`/`%`, PG int-division / mod semantics), `||`, and the common functions
+  (`upper`/`lower`/`length`/`trim`/`substring`/`concat`/`abs`/`round`/`ceil`/`floor`/`power`/
+  `coalesce`/`nullif`/`greatest`/`least`) now evaluate per row via the evaluated-select path
+  (single-table and over a join). Still `0A000`: non-equi / `OR` join conditions,
+  `RIGHT`/`FULL`/`CROSS` JOIN, window functions, subqueries, **computed GROUP BY *keys*** and
+  **scalar expressions *over* an aggregate** (e.g. `SUM(x) * 2`), and **function calls inside a
+  WHERE comparison** (the `$expr` path lowers columns + arithmetic, not function nodes —
+  `WHERE upper(name) = 'X'` is `0A000`). `DISTINCT` with aggregates is also `0A000`. SUM/MIN/MAX
+  result typing is approximate (uses the column's tag; AVG → float8; arithmetic → numeric).
 - [ ] **WHERE: column-to-column + arithmetic landed; functions not yet.** `column OP literal`
   keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is a
   constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`

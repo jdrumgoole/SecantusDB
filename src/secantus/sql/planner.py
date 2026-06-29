@@ -1827,6 +1827,36 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
     if isinstance(node, _BOOL_EXPR_TYPES):
         return "bool"
+    if isinstance(
+        node,
+        (
+            exp.Add,
+            exp.Sub,
+            exp.Mul,
+            exp.Div,
+            exp.Mod,
+            exp.Abs,
+            exp.Round,
+            exp.Ceil,
+            exp.Floor,
+            exp.Pow,
+        ),
+    ):
+        return "numeric"
+    if isinstance(node, (exp.DPipe, exp.Upper, exp.Lower, exp.Trim, exp.Substring, exp.Concat)):
+        return "text"
+    if isinstance(node, exp.Length):
+        return "int4"
+    if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
+        # Type from the first operand (its own tag, recursively).
+        first = (
+            node.this
+            if node.this is not None
+            else (node.expressions[0] if node.expressions else None)
+        )
+        return _infer_scalar_tag(first, resolve) if first is not None else "text"
+    if isinstance(node, exp.Nullif):
+        return _infer_scalar_tag(node.this, resolve)
     if isinstance(node, (exp.Column, *_JSONB_CLASSES)):
         try:
             return _field(node, resolve)[1]
