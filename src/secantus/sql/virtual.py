@@ -65,6 +65,58 @@ def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return {t.name: 16384 + i for i, t in enumerate(_user_tables(db, catalog))}
 
 
+# Access-method / opclass OIDs (the real Postgres values for btree).
+_BTREE_AM_OID = 403
+_HEAP_AM_OID = 2
+_DEFAULT_OPCLASS_OID = 1978
+_INDEX_OID_BASE = 24576
+
+
+def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
+    """Enumerate every index relation (the implicit primary-key index plus each
+    user ``CREATE INDEX``) with the fields pg_index / pg_class / pg_constraint
+    reflection needs: a stable ``indexrelid``, its table ``indrelid``, the
+    ``indkey`` attnum array, and unique/primary flags."""
+    table_oids = _table_oids(db, catalog)
+    out: list[dict[str, Any]] = []
+    oid = _INDEX_OID_BASE
+    for t in _user_tables(db, catalog):
+        relid = table_oids[t.name]
+        field_to_attnum = {col.field: i for i, col in enumerate(t.columns, start=1)}
+        pk = t.pk_column
+        if pk is not None:
+            out.append(
+                {
+                    "indexrelid": oid,
+                    "indrelid": relid,
+                    "relname": f"{t.name}_pkey",
+                    "indkey": [field_to_attnum.get(pk.field, 1)],
+                    "unique": True,
+                    "primary": True,
+                    "conname": f"{t.name}_pkey",
+                }
+            )
+            oid += 1
+        for ix in storage.list_indexes(db, t.collection):
+            key = ix.get("key") or {}
+            indkey = [field_to_attnum.get(f) for f in key]
+            if not indkey or any(a is None for a in indkey):
+                continue  # index over a non-column field — not reflectable as SQL
+            out.append(
+                {
+                    "indexrelid": oid,
+                    "indrelid": relid,
+                    "relname": ix["name"],
+                    "indkey": indkey,
+                    "unique": bool(ix.get("unique")),
+                    "primary": False,
+                    "conname": None,
+                }
+            )
+            oid += 1
+    return out
+
+
 def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     return [
         {
@@ -108,16 +160,33 @@ def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> 
 
 def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     oids = _table_oids(db, catalog)
-    return [
+    rows = [
         {
             "oid": oids[t.name],
             "relname": t.name,
             "relnamespace": _NS_OIDS["public"],
             "relkind": "r",
             "relpersistence": "p",  # permanent (never temp/unlogged)
+            "relam": _HEAP_AM_OID,
+            "reloptions": None,
         }
         for t in _user_tables(db, catalog)
     ]
+    # Index relations are also pg_class rows (relkind 'i') — reflection joins
+    # pg_index.indexrelid = pg_class.oid to read an index's name + access method.
+    for ix in _index_relations(db, storage, catalog):
+        rows.append(
+            {
+                "oid": ix["indexrelid"],
+                "relname": ix["relname"],
+                "relnamespace": _NS_OIDS["public"],
+                "relkind": "i",
+                "relpersistence": "p",
+                "relam": _BTREE_AM_OID,
+                "reloptions": None,
+            }
+        )
+    return rows
 
 
 def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -186,9 +255,61 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
 
 
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    # No SQL constraints in our model (PKs ride the _id index) — present-but-empty
-    # so the domain-constraint subquery in SQLAlchemy's type reflection resolves.
-    return []
+    # Primary-key constraints (contype 'p'), one per table with a PK, keyed to
+    # the implicit PK index via conindid. No foreign keys / check / unique
+    # *constraints* in our model (a CREATE UNIQUE INDEX is an index, not a
+    # constraint), so contype 'f'/'u'/'c' rows are absent.
+    rows: list[dict] = []
+    oid = 30000
+    for ix in _index_relations(db, storage, catalog):
+        if not ix["primary"]:
+            continue
+        rows.append(
+            {
+                "oid": oid,
+                "conname": ix["conname"],
+                "conrelid": ix["indrelid"],
+                "confrelid": 0,
+                "conindid": ix["indexrelid"],
+                "contype": "p",
+                "contypid": 0,  # not a domain constraint
+                "conkey": list(ix["indkey"]),
+                "confkey": None,
+            }
+        )
+        oid += 1
+    return rows
+
+
+def _pg_index(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    rows: list[dict] = []
+    for ix in _index_relations(db, storage, catalog):
+        n = len(ix["indkey"])
+        rows.append(
+            {
+                "indexrelid": ix["indexrelid"],
+                "indrelid": ix["indrelid"],
+                "indkey": list(ix["indkey"]),
+                "indclass": [_DEFAULT_OPCLASS_OID] * n,
+                "indoption": [0] * n,
+                "indnatts": n,
+                "indnkeyatts": n,
+                "indisunique": ix["unique"],
+                "indisprimary": ix["primary"],
+                "indnullsnotdistinct": False,
+                "indpred": None,
+                "indexprs": None,
+            }
+        )
+    return rows
+
+
+def _pg_am(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    return [{"oid": _BTREE_AM_OID, "amname": "btree"}, {"oid": _HEAP_AM_OID, "amname": "heap"}]
+
+
+def _pg_opclass(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    return [{"oid": _DEFAULT_OPCLASS_OID, "opcname": "default_ops", "opcdefault": True}]
 
 
 def _pg_enum(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -257,6 +378,8 @@ _register(
         ("relnamespace", "int4"),
         ("relkind", "text"),
         ("relpersistence", "text"),
+        ("relam", "int4"),
+        ("reloptions", "text"),
     ],
     _pg_class,
 )
@@ -335,9 +458,44 @@ _register(
         ("contypid", "int4"),
         ("conname", "text"),
         ("conrelid", "int4"),
+        ("confrelid", "int4"),
+        ("conindid", "int4"),
         ("contype", "text"),
+        ("conkey", "json"),
+        ("confkey", "json"),
     ],
     _pg_constraint,
+)
+_register(
+    "pg_catalog",
+    "pg_index",
+    [
+        ("indexrelid", "int4"),
+        ("indrelid", "int4"),
+        ("indkey", "json"),
+        ("indclass", "json"),
+        ("indoption", "json"),
+        ("indnatts", "int4"),
+        ("indnkeyatts", "int4"),
+        ("indisunique", "bool"),
+        ("indisprimary", "bool"),
+        ("indnullsnotdistinct", "bool"),
+        ("indpred", "text"),
+        ("indexprs", "text"),
+    ],
+    _pg_index,
+)
+_register(
+    "pg_catalog",
+    "pg_am",
+    [("oid", "int4"), ("amname", "text")],
+    _pg_am,
+)
+_register(
+    "pg_catalog",
+    "pg_opclass",
+    [("oid", "int4"), ("opcname", "text"), ("opcdefault", "bool")],
+    _pg_opclass,
 )
 _register(
     "pg_catalog",

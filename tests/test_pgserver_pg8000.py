@@ -323,6 +323,19 @@ def test_sqlalchemy_get_columns_reflection(server):
         engine.dispose()
 
 
+def test_sqlalchemy_get_foreign_keys_empty(server):
+    # We model no foreign keys, so get_foreign_keys() reflects empty (no error).
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE users (id bigint primary key, name text)"))
+        assert sa.inspect(engine).get_foreign_keys("users") == []
+    finally:
+        engine.dispose()
+
+
 def test_transaction_commit_and_rollback(server):
     conn = connect(server)
     conn.autocommit = False
