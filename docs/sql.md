@@ -278,9 +278,8 @@ SELECT profile->'tags' AS tags FROM people WHERE _id = 1;   -- ["a", "b"]
 SELECT profile #> '{city}'   AS c FROM people WHERE _id = 2; -- LA
 ```
 
-`->`/`->>`/`#>` also work on a declared `jsonb` column. A reflected table is
-**read-only**; `CREATE TABLE` a collection to write to it through SQL, and a
-declared table always shadows reflection.
+`->`/`->>`/`#>` also work on a declared `jsonb` column. A declared table always
+shadows reflection.
 
 Reflected collections aren't limited to plain `SELECT` — **`GROUP BY`,
 aggregates, `HAVING`, and `JOIN` all work over `pymongo`-written data** with no
@@ -303,6 +302,27 @@ JOIN people c ON p.buyer = c._id;
 One caveat: in a join, qualify references to fields that may not appear in the
 sampled rows (`c.name`, not a bare `name`) so the planner can route them to the
 right reflected table.
+
+### Writing to reflected collections
+
+Reflected tables are **read-write**: `INSERT`, `UPDATE`, and `DELETE` reach a
+`pymongo`-written collection with no `CREATE TABLE`. The change is a genuine
+MongoDB document mutation — visible immediately through `pymongo` — which is the
+other half of the dual-protocol payoff:
+
+```sql
+-- "people" exists only as a Mongo collection, never declared:
+INSERT INTO people (_id, name, age) VALUES (3, 'dave', 40);
+UPDATE people SET age = 41 WHERE name = 'dave';
+DELETE FROM people WHERE age < 18;
+```
+
+A field that wasn't in the sampled rows is still a valid write target (it stores
+as-is). The reflected primary key is the Mongo `_id`: it's `NOT NULL` (an
+`INSERT` must supply it — there's no server-side auto-id through SQL) and
+immutable (`SET _id = …` is rejected). Writing to a collection that doesn't
+exist yet returns `undefined_table` — `CREATE TABLE` it first, or create it
+through `pymongo`.
 
 ## Indexes
 
@@ -470,7 +490,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON` | `RIGHT`/`FULL`/`CROSS`, non-equi, JOIN + GROUP BY |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
-| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL` (accepted, single-node no-op) | `SAVEPOINT`, `DECLARE CURSOR` |
+| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params, prepared statements, portals | binary result format, `COPY` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
 | Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`) | column comments, FK reflection (no FKs modeled) |

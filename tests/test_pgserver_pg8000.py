@@ -148,6 +148,33 @@ def test_reflected_table_and_jsonb(server):
     conn.close()
 
 
+def test_write_to_reflected_table(server):
+    # Dual-protocol writes: INSERT/UPDATE/DELETE on a Mongo-written collection
+    # with no CREATE TABLE, then confirm the change is visible as a real document.
+    server.storage.insert(
+        "db",
+        "people",
+        [
+            {"_id": bson.Int64(1), "name": "alice", "age": bson.Int64(30)},
+            {"_id": bson.Int64(2), "name": "bob", "age": bson.Int64(17)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO people (_id, name, age) VALUES (3, 'dave', 40)")
+    conn.commit()
+    cur.execute("UPDATE people SET age = 99 WHERE name = 'alice'")
+    conn.commit()
+    cur.execute("DELETE FROM people WHERE age < 18")
+    conn.commit()
+    cur.execute("SELECT _id, name, age FROM people ORDER BY _id")
+    assert cur.fetchall() == ([1, "alice", 99], [3, "dave", 40])
+    # The inserted row is a genuine Mongo document (what pymongo would read).
+    stored = server.storage.find_matching("db", "people", {"_id": bson.Int64(3)})
+    assert stored[0]["name"] == "dave" and stored[0]["age"] == 40
+    conn.close()
+
+
 def test_reflected_aggregate_and_join(server):
     # Mongo-written data (no CREATE TABLE) analysed with GROUP BY + JOIN through
     # the real driver — the dual-protocol analytics path.

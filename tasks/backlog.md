@@ -1262,11 +1262,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   SQLAlchemy dialect), each with a SQLAlchemy Core reflection smoke; `psql`/JDBC as live
   gauges still need a libpq CLI / a JVM (absent in the dev env). SQLAlchemy **reflection**
   works end to end (see below).
-- [ ] **Reflected tables are SELECT-only (writes still unsupported).** A collection with
+- [ ] **Reflected tables are now read-write.** A collection with
   no `CREATE TABLE` reflects (sampled schema-on-read) for `SELECT` — incl. `->`/`->>`/`#>`
-  jsonb navigation **and now GROUP BY / aggregates / JOIN** (the pipeline planner reflects
-  via `planner._lookup_table_def(..., storage)`). Remaining gaps: INSERT/UPDATE/DELETE on an
-  un-declared collection still `42P01` (no SQL writes to reflected tables); in a JOIN, an
+  jsonb navigation **and GROUP BY / aggregates / JOIN** (the pipeline planner reflects
+  via `planner._lookup_table_def(..., storage)`) — **and for INSERT / UPDATE / DELETE**: the
+  write gate (`engine._require_table(..., storage)`) falls back to `reflect.reflect`, and the
+  INSERT/UPDATE planners are permissive for reflected tables (an un-sampled field is a valid
+  write target of the `any` type; the reflected `_id` PK is NOT NULL and immutable, so an
+  INSERT must supply it and `SET _id = …` is rejected `0A000`). A write to a *non-existent*
+  collection still `42P01` (no implicit collection creation — `CREATE TABLE` first). Remaining
+  gaps: in a JOIN, an
   *unqualified* reference to an *un-sampled* field of a reflected table can't be routed (the
   resolver matches on sampled columns — qualify it as `alias.field`, or it must appear in the
   50-doc sample); jsonb containment (`@>`, `?`, `?|`, `?&`) and `jsonb_*` functions aren't

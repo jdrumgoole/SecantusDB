@@ -106,10 +106,61 @@ def test_unknown_collection_is_undefined_table(storage, session):
     assert ei.value.sqlstate == "42P01"
 
 
-def test_reflected_tables_are_read_only(storage, session):
-    # No CREATE TABLE, so writes still report the relation as undefined.
+def test_insert_into_reflected_table(storage, session):
+    # No CREATE TABLE: the write reflects the collection's sampled shape.
+    res = q(storage, session, "INSERT INTO people (_id, name, age) VALUES (9, 'dave', 40)")
+    assert res.command_tag == "INSERT 0 1"
+    # Read it back through SQL, and confirm it landed as a real Mongo doc.
+    rows = q(storage, session, "SELECT name, age FROM people WHERE _id = 9").rows
+    assert rows == [("dave", 40)]
+    stored = storage.find_matching(DB, "people", {"_id": bson.Int64(9)})
+    assert stored[0]["name"] == "dave" and stored[0]["age"] == 40
+
+
+def test_insert_unsampled_field_into_reflected_table(storage, session):
+    # A field that wasn't in the sample is still a valid insert target.
+    q(storage, session, "INSERT INTO people (_id, name, nickname) VALUES (9, 'dave', 'dav')")
+    rows = q(storage, session, "SELECT nickname FROM people WHERE _id = 9").rows
+    assert rows == [("dav",)]
+
+
+def test_insert_reflected_requires_id(storage, session):
+    # The reflected PK (_id) is NOT NULL — an insert that omits it is rejected.
     with pytest.raises(SQLError) as ei:
-        q(storage, session, "INSERT INTO people (_id, name) VALUES (9, 'dave')")
+        q(storage, session, "INSERT INTO people (name) VALUES ('dave')")
+    assert ei.value.sqlstate == "23502"
+
+
+def test_update_reflected_table(storage, session):
+    res = q(storage, session, "UPDATE people SET age = 99 WHERE name = 'bob'")
+    assert res.command_tag == "UPDATE 1"
+    assert q(storage, session, "SELECT age FROM people WHERE _id = 2").rows == [(99,)]
+
+
+def test_update_reflected_unsampled_field(storage, session):
+    q(storage, session, "UPDATE people SET status = 'active' WHERE _id = 1")
+    assert q(storage, session, "SELECT status FROM people WHERE _id = 1").rows == [("active",)]
+
+
+def test_update_reflected_pk_rejected(storage, session):
+    with pytest.raises(SQLError) as ei:
+        q(storage, session, "UPDATE people SET _id = 99 WHERE _id = 1")
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_delete_from_reflected_table(storage, session):
+    res = q(storage, session, "DELETE FROM people WHERE age < 18")
+    assert res.command_tag == "DELETE 1"
+    assert q(storage, session, "SELECT name FROM people ORDER BY _id").rows == [
+        ("alice",),
+        ("carol",),
+    ]
+
+
+def test_write_to_unknown_collection_is_undefined_table(storage, session):
+    # An INSERT into a truly non-existent collection still reports 42P01.
+    with pytest.raises(SQLError) as ei:
+        q(storage, session, "DELETE FROM nonexistent WHERE _id = 1")
     assert ei.value.sqlstate == "42P01"
 
 

@@ -18,9 +18,13 @@ on:
       - 'LICENSE*'
       - 'docs/**'
   # Weekly full-matrix run: every Monday 06:00 UTC, exercises all
-  # supported CPython versions (3.10–3.13) across Linux/macOS/Windows.
+  # supported CPython versions (3.10–3.13) across Linux/Windows.
   # Push/PR runs only test 3.10 on each OS to keep latency tight; this
   # cron catches version-specific regressions before they accumulate.
+  # macOS is intentionally excluded from this CI workflow — its runners
+  # build vendored WiredTiger from source on a slow, contended pool (10–40+
+  # min, occasionally hanging), which is too costly to gate every push/PR on.
+  # macOS wheels are still built and validated at release time (publish.yml).
   schedule:
     - cron: '0 6 * * 1'
   # Manual full-matrix trigger from the Actions tab. Same effect as the
@@ -38,10 +42,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        # Push / PR: 3.10 only (one cell per OS = 3 cells, fast feedback).
+        # macOS excluded — built at release only (see top-of-file note).
+        os: [ubuntu-latest, windows-latest]
+        # Push / PR: 3.10 only (one cell per OS = 2 cells, fast feedback).
         # Schedule / workflow_dispatch: full version sweep
-        # (4 Pythons × 3 OSes = 12 cells).
+        # (4 Pythons × 2 OSes = 8 cells).
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
     steps:
       - uses: actions/checkout@v5
@@ -293,14 +298,16 @@ jobs:
   # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
   # extension links the SAME bundled WiredTiger this wheel already builds and
   # ships inside it. Proves the "bundle behind a build flag" packaging end to end
-  # across Linux / macOS / Windows. The DEFAULT wheel build (flag OFF, no
-  # Rust/clang needed) is covered by the `test` matrix and wheels.yml.
+  # across Linux / Windows (macOS at release only — see top-of-file note). The
+  # DEFAULT wheel build (flag OFF, no Rust/clang needed) is covered by the
+  # `test` matrix and wheels.yml.
   storage-engine:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS excluded — built at release only (see top-of-file note).
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
         with:
