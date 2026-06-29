@@ -1297,13 +1297,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   The column-metadata query SQLAlchemy / `psql \d` emit now runs end to end: compound
   multi-condition join `ON`s (`… AND attnum > 0 AND NOT attisdropped`) compile to a `$lookup`
   sub-pipeline; scalar SELECT-list functions (`format_type`, `pg_get_expr`, `coalesce`), `CASE`,
-  and correlated scalar subqueries are evaluated per row (`secantus.sql.scalar`); `pg_sequence`
-  / `pg_collation` are present-but-empty. **Still missing — SQLAlchemy's `inspect().get_columns()`
-  *also* fires a domain/type-resolution query** using a **derived-table subquery in the FROM
-  clause** (`… JOIN (SELECT … FROM pg_constraint GROUP BY …) AS dc ON …`) plus `array_agg` and
-  `pg_constraint`, so the full Python API call still raises; the column query itself and
-  `information_schema.columns` are the working column-reflection paths. Derived-table-as-join-
-  source + `array_agg` + `pg_constraint` is the next slice. Also no `pg_index` yet.
+  and correlated scalar subqueries are evaluated per row (`secantus.sql.scalar`); compound join
+  `ON`s compile to a `$lookup` sub-pipeline; a `(SELECT … GROUP BY …) AS alias` derived table
+  materializes into an ephemeral collection (`CatalogBackend.register_ephemeral`); `array_agg`
+  (→ `$push`) and `pg_sequence`/`pg_collation`/`pg_constraint`/`pg_enum` (present-but-empty) +
+  pg_type domain columns are modeled. **`SQLAlchemy inspect().get_columns()` / `get_table_names()`
+  / `has_table()` now work end to end.** Still missing: full `Table(autoload_with=...)` also calls
+  `get_pk_constraint` / `get_indexes` / `get_foreign_keys`, which need a `pg_index` table and more
+  `pg_constraint` columns (`conrelid`/`confrelid`) + the PK/index/FK reflected from our catalog —
+  those methods still `0A000`/`42703`. (`get_columns` + `information_schema.columns` are the working
+  column-reflection paths.)
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)

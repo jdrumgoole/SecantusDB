@@ -303,6 +303,26 @@ def test_catalog_join_via_driver(server):
     conn.close()
 
 
+def test_sqlalchemy_get_columns_reflection(server):
+    # The headline: SQLAlchemy's inspect().get_columns() runs its full pg_catalog
+    # column query (4-table outer join, compound ON, format_type, correlated
+    # subqueries, CASE) plus the domain/enum derived-table queries, and returns
+    # typed column metadata.
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE users (id bigint primary key, name text, age int)"))
+        cols = sa.inspect(engine).get_columns("users")
+        assert [c["name"] for c in cols] == ["id", "name", "age"]
+        assert [type(c["type"]).__name__ for c in cols] == ["BIGINT", "TEXT", "INTEGER"]
+        # The PK column reflects NOT NULL; the others nullable.
+        assert [c["nullable"] for c in cols] == [False, True, True]
+    finally:
+        engine.dispose()
+
+
 def test_transaction_commit_and_rollback(server):
     conn = connect(server)
     conn.autocommit = False

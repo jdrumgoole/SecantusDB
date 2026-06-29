@@ -404,13 +404,25 @@ ORDER BY a.attnum;
 ```
 
 Scalar SELECT-list functions (`format_type`, `pg_get_expr`, `coalesce`),
-`CASE`, comparisons, and correlated scalar subqueries are evaluated per row.
-Compound join `ON`s (multi-key joins and residual predicates on the joined
-table) compile to a `$lookup` sub-pipeline. SQLAlchemy's `inspect().get_columns()`
-*also* fires a domain/type-resolution query that uses a derived-table subquery in
-the `FROM` clause plus `array_agg` — not yet supported — so the full Python API
-call doesn't return yet; the column query above (and `information_schema.columns`)
-are the working column-reflection paths.
+`CASE`, comparisons, and correlated scalar subqueries are evaluated per row;
+compound join `ON`s (multi-key joins and residual predicates) compile to a
+`$lookup` sub-pipeline; and a `(SELECT … GROUP BY …) AS alias` derived table in
+the `FROM` clause is materialized into an ephemeral collection. With those,
+**SQLAlchemy's `inspect().get_columns()` works end to end** and returns typed
+column metadata:
+
+```python
+insp = sqlalchemy.inspect(engine)
+insp.get_table_names()          # ['users', ...]
+insp.has_table('users')         # True
+insp.get_columns('users')       # [{'name': 'id', 'type': BIGINT(), 'nullable': False, ...}, ...]
+```
+
+Full `Table(..., autoload_with=engine)` reflection additionally calls
+`get_pk_constraint` / `get_indexes` / `get_foreign_keys`, which need `pg_index`
+and more `pg_constraint` columns — not yet modeled, so those specific methods
+still return a `0A000`/`42703`. `get_columns`, `get_table_names`, `has_table`,
+and `information_schema.columns` are the working reflection paths.
 
 ## Supported SQL
 

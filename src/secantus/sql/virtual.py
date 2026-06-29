@@ -170,9 +170,30 @@ def _pg_collation(db: str, session: Session, storage: Any, catalog: Catalog) -> 
 
 def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     return [
-        {"oid": typemap.PG_OID[tag], "typname": typname, "typcollation": 0}
+        {
+            "oid": typemap.PG_OID[tag],
+            "typname": typname,
+            "typcollation": 0,
+            "typnamespace": _NS_OIDS["pg_catalog"],
+            "typbasetype": 0,  # not a domain
+            "typtypmod": -1,
+            "typnotnull": False,
+            "typdefault": None,
+            "typtype": "b",  # base type (never a domain 'd')
+        }
         for tag, typname in typemap.PG_TYPENAME.items()
     ]
+
+
+def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # No SQL constraints in our model (PKs ride the _id index) — present-but-empty
+    # so the domain-constraint subquery in SQLAlchemy's type reflection resolves.
+    return []
+
+
+def _pg_enum(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # No enum types — present-but-empty so SQLAlchemy's enum-label subquery resolves.
+    return []
 
 
 def _pg_database(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -293,8 +314,41 @@ _register(
 _register(
     "pg_catalog",
     "pg_type",
-    [("oid", "int4"), ("typname", "text"), ("typcollation", "int4")],
+    [
+        ("oid", "int4"),
+        ("typname", "text"),
+        ("typcollation", "int4"),
+        ("typnamespace", "int4"),
+        ("typbasetype", "int4"),
+        ("typtypmod", "int4"),
+        ("typnotnull", "bool"),
+        ("typdefault", "text"),
+        ("typtype", "text"),
+    ],
     _pg_type,
+)
+_register(
+    "pg_catalog",
+    "pg_constraint",
+    [
+        ("oid", "int4"),
+        ("contypid", "int4"),
+        ("conname", "text"),
+        ("conrelid", "int4"),
+        ("contype", "text"),
+    ],
+    _pg_constraint,
+)
+_register(
+    "pg_catalog",
+    "pg_enum",
+    [
+        ("oid", "int4"),
+        ("enumtypid", "int4"),
+        ("enumsortorder", "float8"),
+        ("enumlabel", "text"),
+    ],
+    _pg_enum,
 )
 _register(
     "pg_catalog",
@@ -369,8 +423,16 @@ class CatalogBackend:
         self._catalog = catalog
         self._session = session
         self._db = db
+        # Materialized derived tables (a (SELECT ...) AS alias join source), keyed
+        # by their alias; served like a virtual table for the duration of a query.
+        self._ephemeral: dict[str, list[dict[str, Any]]] = {}
+
+    def register_ephemeral(self, name: str, rows: list[dict[str, Any]]) -> None:
+        self._ephemeral[name] = rows
 
     def _virtual_rows(self, coll: str) -> list[dict[str, Any]] | None:
+        if coll in self._ephemeral:
+            return self._ephemeral[coll]
         vt = lookup(None, coll)
         if vt is None:
             return None
@@ -398,8 +460,8 @@ class CatalogBackend:
         )
 
     def list_indexes(self, db: str, coll: str) -> list[Any]:
-        if lookup(None, coll) is not None:
-            return []  # virtual tables are never indexed — force the hash-join path.
+        if coll in self._ephemeral or lookup(None, coll) is not None:
+            return []  # virtual / ephemeral tables are never indexed — force hash-join.
         return self._storage.list_indexes(db, coll)
 
     def __getattr__(self, name: str) -> Any:
