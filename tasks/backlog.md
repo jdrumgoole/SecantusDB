@@ -1274,9 +1274,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   gaps: in a JOIN, an
   *unqualified* reference to an *un-sampled* field of a reflected table can't be routed (the
   resolver matches on sampled columns — qualify it as `alias.field`, or it must appear in the
-  50-doc sample); jsonb containment (`@>`, `?`, `?|`, `?&`) and `jsonb_*` functions aren't
-  parsed; type inference samples 50 docs and picks the first non-null type per field (no
+  50-doc sample); type inference samples 50 docs and picks the first non-null type per field (no
   widening across conflicting types — first-seen wins).
+- [ ] **jsonb operator surface landed (one gap + one parser quirk).** Containment/existence
+  operators in WHERE compile to Mongo filters: `@>` (object → dotted-path equalities, array →
+  `$all`, scalar → equality), `?` / `?|` / `?&` (key-or-element existence via `$exists` + array-aware
+  equality). `jsonb_build_object` / `jsonb_build_array` / `jsonb_array_length` / `jsonb_typeof`
+  (scalar) and `jsonb_array_elements` / `jsonb_object_keys` (set-returning) are evaluated per row;
+  `->`/`->>`/`#>`/`#>>` navigation now also works inside the per-row scalar evaluator (not just the
+  find projection / WHERE). **Gaps:** `<@` (contained-by) is `0A000` — "field is a subset of a
+  constant" isn't expressible as a pushed-down filter (rewrite as `<const> @> field`); `jsonb_each`
+  (key+value record SRF) and the `jsonb_*_text` family aren't modeled. **Parser quirk:** sqlglot reads
+  a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
+  (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
   `HAVING` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, **multi-table** `INNER`/`LEFT JOIN` (equality
   `ON`, each join relating to the base or an already-joined table), and **`SELECT DISTINCT`**

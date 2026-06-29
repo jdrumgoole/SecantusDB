@@ -281,6 +281,38 @@ SELECT profile #> '{city}'   AS c FROM people WHERE _id = 2; -- LA
 `->`/`->>`/`#>` also work on a declared `jsonb` column. A declared table always
 shadows reflection.
 
+### jsonb containment, existence, and functions
+
+The containment and key-existence operators are supported in `WHERE` (they
+compile to Mongo filters), along with the common `jsonb_*` functions:
+
+```sql
+-- containment (@>): object keys, array membership, scalars
+SELECT _id FROM docs WHERE data @> '{"a": 1}';
+SELECT _id FROM docs WHERE data @> '{"tags": ["y"]}';   -- array contains "y"
+
+-- key / element existence
+SELECT _id FROM docs WHERE data ? 'c';                  -- has top-level key "c"
+SELECT _id FROM docs WHERE data ?| array['b', 'c'];     -- any of these keys
+SELECT _id FROM docs WHERE data ?& array['a', 'b'];     -- all of these keys
+
+-- builders, length, type, and set-returning functions
+SELECT jsonb_build_object('k', 5) AS o;
+SELECT jsonb_build_array(1, 2, 3) AS a;
+SELECT jsonb_array_length(data #> '{tags}') FROM docs WHERE _id = 1;
+SELECT jsonb_typeof(data) FROM docs WHERE _id = 1;       -- 'object'
+SELECT jsonb_array_elements((data->'tags')) FROM docs;   -- one row per element
+SELECT jsonb_object_keys(data) FROM docs;                -- one row per key
+```
+
+Two caveats. `<@` (contained-by) is **not supported** — "this field is a subset
+of a constant" can't be pushed down as a filter; rewrite it as `'<const>' @>
+field` where possible. And because sqlglot reads a bare `->` inside a function
+call as a lambda arrow, a *navigated function argument* must be parenthesised
+(`jsonb_array_length((data->'tags'))`) or use the `#>` form
+(`jsonb_array_length(data #> '{tags}')`); bare `->` in `WHERE`/projection is
+unaffected.
+
 Reflected collections aren't limited to plain `SELECT` — **`GROUP BY`,
 aggregates, `HAVING`, and `JOIN` all work over `pymongo`-written data** with no
 DDL, so you can run SQL analytics directly against documents:
@@ -485,8 +517,8 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Area | Supported | Not yet |
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `MERGE`, `INSERT ... SELECT`, `RETURNING` |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT` | subqueries, scalar expressions, column-to-column predicates |
-| Projection | columns, `*`, aliases, `jsonb` paths, `DISTINCT` | computed expressions |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&` | subqueries, scalar expressions, column-to-column predicates, jsonb `<@` |
+| Projection | columns, `*`, aliases, `jsonb` paths (`->`/`->>`/`#>`/`#>>`), `jsonb_*` functions, `DISTINCT` | arbitrary computed expressions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON` | `RIGHT`/`FULL`/`CROSS`, non-equi, JOIN + GROUP BY |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |

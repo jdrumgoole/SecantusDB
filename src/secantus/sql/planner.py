@@ -13,6 +13,7 @@ Only the P0 subset is handled; anything outside it raises a
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Callable
@@ -360,6 +361,35 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
             spec["$options"] = "i"
         return {field: spec}
 
+    if isinstance(node, exp.ArrayContainsAll):  # jsonb @> (contains)
+        field, _ = _field(node.this, resolve)
+        return _jsonb_contains_filter(field, _json_value(node.expression))
+
+    if isinstance(node, exp.ArrayContainedBy):  # jsonb <@ (contained by)
+        # "field is a subset of <constant>" is a constraint on the stored value's
+        # whole shape, not a value lookup, so it can't be pushed down as a Mongo
+        # filter. Faithful not-supported beats a silent divergence.
+        raise errors.feature_not_supported(
+            "the jsonb <@ (contained by) operator is not supported; "
+            "rewrite as <constant> @> field where possible"
+        )
+
+    if isinstance(node, exp.JSONBContains):  # jsonb ? (top-level key / element exists)
+        field, _ = _field(node.this, resolve)
+        return {"$or": _jsonb_key_exists_clauses(field, str(_literal(node.expression)))}
+
+    if isinstance(node, exp.JSONBContainsAnyTopKeys):  # jsonb ?| (any key exists)
+        field, _ = _field(node.this, resolve)
+        clauses: list[dict[str, Any]] = []
+        for e in _array_elements(node.expression):
+            clauses.extend(_jsonb_key_exists_clauses(field, str(_literal(e))))
+        return {"$or": clauses}
+
+    if isinstance(node, exp.JSONBContainsAllTopKeys):  # jsonb ?& (all keys exist)
+        field, _ = _field(node.this, resolve)
+        keys = [str(_literal(e)) for e in _array_elements(node.expression)]
+        return {"$and": [{"$or": _jsonb_key_exists_clauses(field, k)} for k in keys]}
+
     # A bare boolean column used as a predicate (``WHERE flag`` / ``WHERE NOT
     # flag``) — Postgres treats it as ``flag IS TRUE``.
     if isinstance(node, exp.Column):
@@ -367,6 +397,38 @@ def _expr_to_filter(node: exp.Expression, resolve: Resolve) -> dict[str, Any]:
         return {field: True}
 
     raise errors.feature_not_supported(f"unsupported WHERE clause: {node.sql()}")
+
+
+def _json_value(node: exp.Expression) -> Any:
+    """Decode a jsonb literal operand (``'{"a":1}'`` / ``'[1,2]'::jsonb``)."""
+    raw = _literal(node)
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            raise errors.feature_not_supported(f"invalid jsonb literal: {raw!r}") from exc
+    return raw
+
+
+def _jsonb_key_exists_clauses(path: str, key: str) -> list[dict[str, Any]]:
+    """Mongo clauses for Postgres ``jsonb ? key`` at ``path``: the value is an
+    object with top-level key ``key``, OR an array containing the string ``key``,
+    OR the string ``key`` itself (``{path: key}`` matches the array / scalar cases
+    by Mongo's array-aware equality)."""
+    return [{f"{path}.{key}": {"$exists": True}}, {path: key}]
+
+
+def _jsonb_contains_filter(path: str, value: Any) -> dict[str, Any]:
+    """Translate Postgres ``field @> value`` containment into a Mongo filter.
+
+    An object RHS becomes a conjunction of dotted-path equalities (recursively);
+    an array RHS becomes ``$all`` (the field array contains every element); a
+    scalar RHS becomes a plain equality."""
+    if isinstance(value, dict):
+        return _merge_and([_jsonb_contains_filter(f"{path}.{k}", v) for k, v in value.items()])
+    if isinstance(value, list):
+        return {path: {"$all": value}}
+    return {path: value}
 
 
 def _merge_and(parts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -807,6 +869,11 @@ def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
             return ("unnest", inner.expressions[0])
         if name == "generate_subscripts" and inner.expressions:
             return ("generate_subscripts", inner.expressions[0])
+        # jsonb set-returning functions: one row per array element / object key.
+        if name in ("jsonb_array_elements", "json_array_elements") and inner.expressions:
+            return ("jsonb_array_elements", inner.expressions[0])
+        if name in ("jsonb_object_keys", "json_object_keys") and inner.expressions:
+            return ("jsonb_object_keys", inner.expressions[0])
     return None
 
 
@@ -1488,9 +1555,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)
-    if _srf_of(node) is not None:
+    srf = _srf_of(node)
+    if srf is not None:
+        # jsonb_array_elements → json elements; jsonb_object_keys → text keys;
         # unnest(indkey/indclass) → attnum/opclass oid; generate_subscripts → ord.
-        return "int4"
+        return {"jsonb_array_elements": "json", "jsonb_object_keys": "text"}.get(srf[0], "int4")
     # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
     # as bool, not text — else its value rides the wire as the string 'f'/'t' and
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
@@ -1506,8 +1575,17 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         name = node.expression.name
     elif isinstance(node, exp.Anonymous):
         name = node.this if isinstance(node.this, str) else node.name
-    if name is not None and str(name).rsplit(".", 1)[-1].lower() == "json_build_object":
-        return "json"
+    if name is not None:
+        fname = str(name).rsplit(".", 1)[-1].lower()
+        if fname in (
+            "json_build_object",
+            "jsonb_build_object",
+            "json_build_array",
+            "jsonb_build_array",
+        ):
+            return "json"
+        if fname in ("jsonb_array_length", "json_array_length"):
+            return "int4"
     return "text"
 
 
