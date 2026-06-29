@@ -104,10 +104,20 @@ Any libpq-based client connects too:
 $ psql "postgresql://postgres@127.0.0.1:5432/shop" -c "SELECT name FROM products"
 ```
 
+```python
+import psycopg
+
+with psycopg.connect(host="127.0.0.1", port=5432, dbname="shop", user="postgres") as conn:
+    rows = conn.execute("SELECT name FROM products WHERE price > %s", (10,)).fetchall()
+```
+
 :::{note}
-The bundled conformance gauge runs **pg8000** and a **SQLAlchemy** Core
-round-trip (they are pure-Python, so they run in CI). libpq-based clients
-(`psql`, `psycopg`) use the same wire protocol but aren't exercised in CI.
+The bundled conformance gauges run **pg8000** (pure-Python, text parameters) and
+**psycopg 3** (libpq via the `psycopg[binary]` wheel — the strictest wire exercise:
+binary-format parameters, server-side prepared statements, and the psycopg SQLAlchemy
+dialect's catalog reflection), each paired with a **SQLAlchemy** Core round-trip. `psql`
+and a JVM/JDBC client speak the same protocol but need a system libpq / a JVM, so they
+aren't run in CI.
 :::
 
 ## Declared tables

@@ -130,7 +130,24 @@ def _literal(node: exp.Expression) -> Any:
             return node.this
         text = node.this
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
+        # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
+        # SQLAlchemy's psycopg dialect probes ``t.oid = to_regtype('hstore')`` at
+        # connect time; an unknown type must yield NULL → matches no pg_type row.
+        arg = node.expressions[0] if node.expressions else None
+        return _to_regtype(_literal(arg)) if arg is not None else None
     raise errors.feature_not_supported(f"unsupported value expression: {node.sql()}")
+
+
+def _to_regtype(name: Any) -> int | None:
+    """Map a type name (as ``to_regtype`` takes) to its OID, or None if unknown."""
+    if not isinstance(name, str):
+        return None
+    key = name.strip().lower()
+    for tag, typname in typemap.PG_TYPENAME.items():
+        if key in (typname, tag, typemap.SQL_TYPE_NAME.get(tag)):
+            return typemap.PG_OID.get(tag)
+    return None
 
 
 def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:

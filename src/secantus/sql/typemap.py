@@ -39,7 +39,16 @@ PG_OID: dict[str, int] = {
     "timestamptz": 1184,
     "numeric": 1700,
     "json": 3802,
+    # System vector types: a space-separated list of ints in text format. Used by
+    # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
+    # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
+    "int2vector": 22,
+    "oidvector": 30,
 }
+
+# Type tags whose value is a list rendered as a Postgres ``int2vector`` /
+# ``oidvector`` (space-separated, not array braces / JSON).
+_VECTOR_TAGS = frozenset({"int2vector", "oidvector"})
 
 # Internal type tag -> SQL type name (for information_schema.columns.data_type
 # and any place a human-facing type spelling is needed).
@@ -141,7 +150,7 @@ def coerce(value: Any, tag: str) -> Any:
     return value
 
 
-def to_pg_text(value: Any) -> bytes | None:
+def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     """Render a (already ``to_py``-normalised) result value as Postgres text.
 
     Returns ``None`` for SQL NULL (the wire layer encodes that as a -1 length
@@ -150,6 +159,10 @@ def to_pg_text(value: Any) -> bytes | None:
     """
     if value is None:
         return None
+    if tag in _VECTOR_TAGS and isinstance(value, (list, tuple)):
+        # int2vector / oidvector render as space-separated ints ("1 2"), the
+        # form libpq clients parse for pg_index.indkey/indoption/indclass.
+        return " ".join(str(int(v)) for v in value).encode("ascii")
     if isinstance(value, bool):
         return b"t" if value else b"f"
     if isinstance(value, (bytes, bytearray)):

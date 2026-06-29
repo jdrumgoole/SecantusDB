@@ -50,6 +50,11 @@ def _dispatch(
     if isinstance(stmt, exp.Commit):
         return _commit_txn(storage, session)
     if isinstance(stmt, exp.Rollback):
+        if stmt.args.get("savepoint") is not None:
+            # ROLLBACK TO SAVEPOINT recovers the block from an error and keeps it
+            # open. We don't track per-savepoint state, so un-poison and continue.
+            session.txn_failed = False
+            return SQLResult(command_tag="ROLLBACK")
         return _rollback_txn(storage, session)
 
     if session.txn_failed:
@@ -218,7 +223,29 @@ def _run_statement(
     if isinstance(stmt, exp.Command):
         return _run_command(stmt, session)
 
+    # DEALLOCATE / DISCARD / SAVEPOINT / RELEASE parse as a bare Alias in
+    # sqlglot's pg dialect (e.g. ``SAVEPOINT "x"`` → ``SAVEPOINT AS "x"``); libpq
+    # clients (psycopg) and SQLAlchemy emit them to manage prepared statements and
+    # nested transaction savepoints. Accept as a no-op — our prepared statements
+    # live for the connection, and ROLLBACK TO SAVEPOINT (handled above) is what
+    # actually recovers an aborted block.
+    noop = _noop_command_word(stmt)
+    if noop is not None:
+        return SQLResult(command_tag=noop)
+
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
+
+
+_NOOP_WORDS = {"DEALLOCATE", "DISCARD", "SAVEPOINT", "RELEASE"}
+
+
+def _noop_command_word(stmt: exp.Expression) -> str | None:
+    """Return the no-op command word (DEALLOCATE/DISCARD/SAVEPOINT/RELEASE) or None."""
+    head = stmt.this if isinstance(stmt, exp.Alias) else stmt
+    name = head.name if isinstance(head, exp.Column) else None
+    if name is not None and name.upper() in _NOOP_WORDS:
+        return name.upper()
+    return None
 
 
 def _run_select(

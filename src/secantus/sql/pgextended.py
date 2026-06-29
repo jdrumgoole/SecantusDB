@@ -13,9 +13,11 @@ returning the bytes to send back. On error it enters the protocol's
 
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import struct
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 from sqlglot import exp
@@ -46,15 +48,48 @@ class Portal:
     executed: bool = False
 
 
-# Binary parameter decoders by Postgres type OID. Text format (the common case,
-# and what our client uses) decodes to str and rides column-type coercion.
+# Postgres binary timestamps count microseconds from 2000-01-01 00:00:00 UTC;
+# dates count days from the same epoch.
+_PG_EPOCH = _dt.datetime(2000, 1, 1, tzinfo=_dt.timezone.utc)
+_PG_EPOCH_DATE = _dt.date(2000, 1, 1)
+
+
+def _decode_numeric(b: bytes) -> Decimal:
+    """Decode Postgres' binary ``numeric`` (base-10000 digits)."""
+    ndigits, weight, sign, dscale = struct.unpack_from("!HhHH", b, 0)
+    digits = [struct.unpack_from("!H", b, 8 + 2 * i)[0] for i in range(ndigits)]
+    if sign == 0xC000:  # NaN
+        return Decimal("NaN")
+    s = "".join(f"{d:04d}" for d in digits) or "0"
+    # The first digit group sits at base-10000 position ``weight``.
+    value = Decimal(s).scaleb((weight - (ndigits - 1)) * 4) if digits else Decimal(0)
+    if sign == 0x4000:
+        value = -value
+    # Round to the declared display scale so 19.99 doesn't become 19.9900...
+    return value.quantize(Decimal(1).scaleb(-dscale)) if dscale else value
+
+
+def _decode_timestamptz(b: bytes) -> _dt.datetime:
+    return _PG_EPOCH + _dt.timedelta(microseconds=struct.unpack("!q", b)[0])
+
+
+# Binary parameter decoders by Postgres type OID. The text format (fmt 0) decodes
+# to str and rides column-type coercion; libpq clients (psycopg) send many types
+# in binary, so the common set is decoded here to the native Python value.
 _BINARY = {
     16: lambda b: b == b"\x01",  # bool
+    17: lambda b: bytes(b),  # bytea
     20: lambda b: struct.unpack("!q", b)[0],  # int8
     21: lambda b: struct.unpack("!h", b)[0],  # int2
     23: lambda b: struct.unpack("!i", b)[0],  # int4
+    25: lambda b: b.decode("utf-8"),  # text
     700: lambda b: struct.unpack("!f", b)[0],  # float4
     701: lambda b: struct.unpack("!d", b)[0],  # float8
+    1043: lambda b: b.decode("utf-8"),  # varchar
+    1082: lambda b: _PG_EPOCH_DATE + _dt.timedelta(days=struct.unpack("!i", b)[0]),  # date
+    1114: _decode_timestamptz,  # timestamp (no tz) — same wire layout
+    1184: _decode_timestamptz,  # timestamptz
+    1700: _decode_numeric,  # numeric
 }
 
 
@@ -179,9 +214,12 @@ class ExtendedSession:
             out += pgwire.parameter_status(pname, pvalue)
         if _is_row_returning(res):
             rows = res.rows
+            tags = [c.type_tag for c in res.columns]
             end = len(rows) if max_rows <= 0 else min(len(rows), portal.offset + max_rows)
             for row in rows[portal.offset : end]:
-                out += pgwire.data_row([typemap.to_pg_text(v) for v in row])
+                out += pgwire.data_row(
+                    [typemap.to_pg_text(v, t) for v, t in zip(row, tags, strict=False)]
+                )
             if max_rows > 0 and end < len(rows):
                 portal.offset = end
                 out += pgwire.portal_suspended()
