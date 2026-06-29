@@ -560,6 +560,20 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   Tests: `tests/test_sql_transactions.py` + a real pg8000 commit/rollback over
   the wire. **Deferred:** `SAVEPOINT`, `SET TRANSACTION ISOLATION LEVEL` /
   read-only, and SQL-level `DECLARE CURSOR` (see backlog).
+- **Wire polish: CREATE/DROP INDEX + transaction characteristics. ✅ landed.**
+  `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)` plans to a Mongo `key_spec`
+  (PK column → `_id`, per-column ASC/DESC, auto `field_dir` name when unnamed) and
+  calls `Storage.create_index` (`execute_create_index`; duplicate → `42P07`,
+  `IF NOT EXISTS` idempotent); `DROP INDEX [IF EXISTS] name` finds the owning
+  collection by scanning the catalog and calls `drop_index` (`42704` when absent).
+  `SET TRANSACTION ISOLATION LEVEL …`/`READ ONLY`/`READ WRITE`,
+  `SET SESSION CHARACTERISTICS …`, and `BEGIN ISOLATION LEVEL …` are accepted as
+  no-ops (single-node). **Deferred:** `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (sqlglot's
+  pg dialect doesn't parse them — `RELEASE` is a hard parse error — needs SQL-text
+  preprocessing) and **binary result format** (rows are always text; all current
+  drivers/gauges accept text, so it's an optimisation, not a correctness gap).
+  Tests: CREATE/DROP INDEX + isolation acceptance in `tests/test_sql_spike.py` +
+  a driver-level index/isolation test in `tests/test_pgserver_pg8000.py`.
 
 ---
 

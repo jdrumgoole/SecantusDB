@@ -294,6 +294,20 @@ One caveat: in a join, qualify references to fields that may not appear in the
 sampled rows (`c.name`, not a bare `name`) so the planner can route them to the
 right reflected table.
 
+## Indexes
+
+`CREATE INDEX` (optionally `UNIQUE`) maps to a real Mongo secondary index on the
+underlying collection; the query planner then accelerates matching `WHERE` /
+`ORDER BY` exactly as it does for indexes created through the MongoDB API. The
+primary-key column maps to the `_id` index. `DROP INDEX` removes it.
+
+```sql
+CREATE INDEX ix_age ON users (age);
+CREATE UNIQUE INDEX ux_email ON users (email);
+CREATE INDEX ix_name_desc ON users (name DESC);
+DROP INDEX ix_age;
+```
+
 ## Transactions
 
 `BEGIN` / `COMMIT` / `ROLLBACK` open a real storage transaction: statements in
@@ -322,6 +336,12 @@ conn.commit()        # kept
 After a failed statement inside a block, every command except `COMMIT` /
 `ROLLBACK` returns SQLSTATE `25P02` until the block ends; a `COMMIT` of an
 aborted block rolls back.
+
+`SET TRANSACTION ISOLATION LEVEL …` / `… READ ONLY` / `… READ WRITE`,
+`SET SESSION CHARACTERISTICS AS TRANSACTION …`, and `BEGIN ISOLATION LEVEL …`
+are accepted but are no-ops: SecantusDB is single-node, so isolation level and
+read-only mode don't change behaviour. `SAVEPOINT` / `RELEASE` /
+`ROLLBACK TO SAVEPOINT` are not yet supported.
 
 ## Authentication and TLS
 
@@ -433,11 +453,11 @@ and `information_schema.columns` are the working reflection paths.
 | Projection | columns, `*`, aliases, `jsonb` paths, `DISTINCT` | computed expressions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON` | `RIGHT`/`FULL`/`CROSS`, non-equi, JOIN + GROUP BY |
-| DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX` | `ALTER TABLE`, views, constraints (enforced) |
-| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK` | `SAVEPOINT`, isolation levels, `DECLARE CURSOR` |
+| DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
+| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL` (accepted, single-node no-op) | `SAVEPOINT`, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params, prepared statements, portals | binary result format, `COPY` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
-| Catalog | `information_schema`, `pg_catalog`, catalog *joins* (SQLAlchemy `get_table_names`, `psql \dt`) | column-level `\d` / `get_columns` (`pg_attribute`) |
+| Catalog | `information_schema`, `pg_catalog`, catalog *joins*, SQLAlchemy `get_table_names`/`has_table`/`get_columns` | `get_pk_constraint`/`get_indexes`/`get_foreign_keys` (`pg_index`) |
 
 Anything outside the supported set returns a faithful SQLSTATE error rather than
 a wrong answer — the same "honest *not supported* over a half-feature" discipline

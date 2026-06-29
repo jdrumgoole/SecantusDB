@@ -37,6 +37,7 @@ class FakeStorage:
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], list[dict]] = {}
+        self.indexes: dict[tuple[str, str], list[dict]] = {}
 
     def _coll(self, db: str, coll: str) -> list[dict]:
         return self.data.setdefault((db, coll), [])
@@ -51,9 +52,23 @@ class FakeStorage:
     def list_collections(self, db):
         return sorted(c for (d, c) in self.data if d == db)
 
+    def create_index(self, db, coll, name, key_spec, options=None):
+        entries = self.indexes.setdefault((db, coll), [])
+        if any(ix["name"] == name for ix in entries):
+            return False
+        entries.append({"name": name, "key": dict(key_spec), **(dict(options) if options else {})})
+        return True
+
+    def drop_index(self, db, coll, name):
+        entries = self.indexes.get((db, coll), [])
+        for i, ix in enumerate(entries):
+            if ix["name"] == name:
+                del entries[i]
+                return True
+        return False
+
     def list_indexes(self, db, coll):
-        # No secondary indexes — $lookup falls back to the hash-join path.
-        return []
+        return [dict(ix) for ix in self.indexes.get((db, coll), [])]
 
     def insert(self, db, coll, docs, *, ordered=True, journal=False):
         store = self._coll(db, coll)

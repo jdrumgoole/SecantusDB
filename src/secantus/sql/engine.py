@@ -173,14 +173,29 @@ def _run_statement(
     stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
     if isinstance(stmt, exp.Create):
-        if (stmt.args.get("kind") or "TABLE").upper() != "TABLE":
-            raise errors.feature_not_supported(f"CREATE {stmt.args.get('kind')} is not supported")
-        return executor.execute_create_table(planner.plan_create_table(stmt), catalog, storage, db)
+        kind = (stmt.args.get("kind") or "TABLE").upper()
+        if kind == "TABLE":
+            return executor.execute_create_table(
+                planner.plan_create_table(stmt), catalog, storage, db
+            )
+        if kind == "INDEX":
+            index = stmt.this
+            tname = index.args["table"].name
+            table = catalog.get(db, tname) or reflect.reflect(storage, db, tname)
+            if table is None:
+                raise errors.undefined_table(tname)
+            return executor.execute_create_index(
+                planner.plan_create_index(stmt, table), catalog, storage, db
+            )
+        raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
     if isinstance(stmt, exp.Drop):
-        if (stmt.args.get("kind") or "TABLE").upper() != "TABLE":
-            raise errors.feature_not_supported(f"DROP {stmt.args.get('kind')} is not supported")
-        return executor.execute_drop_table(planner.plan_drop_table(stmt), catalog, storage, db)
+        kind = (stmt.args.get("kind") or "TABLE").upper()
+        if kind == "TABLE":
+            return executor.execute_drop_table(planner.plan_drop_table(stmt), catalog, storage, db)
+        if kind == "INDEX":
+            return executor.execute_drop_index(planner.plan_drop_index(stmt), catalog, storage, db)
+        raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
     if isinstance(stmt, exp.Select):
         return _run_select(stmt, storage, db, catalog, session)
@@ -244,6 +259,14 @@ def _run_select(
 def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
     reported: list[tuple[str, str]] = []
     for item in stmt.expressions:
+        # SET TRANSACTION [ISOLATION LEVEL ...|READ ONLY|READ WRITE|DEFERRABLE]:
+        # accepted as a no-op — SecantusDB is single-node, so isolation/read-only
+        # characteristics don't change behaviour.
+        if (
+            isinstance(item, exp.SetItem)
+            and str(item.args.get("kind") or "").upper() == "TRANSACTION"
+        ):
+            continue
         inner = item.this if isinstance(item, exp.SetItem) else item
         if not isinstance(inner, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {item.sql()}")
@@ -262,7 +285,14 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
 def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
     verb = str(stmt.this).upper()
     arg = stmt.expression
-    name = arg.this if isinstance(arg, exp.Literal) else (arg.name if arg is not None else "")
+    if isinstance(arg, exp.Literal):
+        name = arg.this
+    elif isinstance(arg, str):
+        name = arg  # a Command fallback carries its tail as a bare string
+    elif arg is not None:
+        name = arg.name
+    else:
+        name = ""
     name = str(name).strip()
     if verb == "SHOW":
         value = session.get_setting(name)
@@ -276,4 +306,8 @@ def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
         session.settings.pop(name, None)
         reported = [(name, session.get_setting(name))] if name in REPORTABLE_GUCS else []
         return SQLResult(command_tag="RESET", parameter_status=reported)
+    if verb == "SET":
+        # SET SESSION CHARACTERISTICS AS TRANSACTION ... falls back to a Command;
+        # accepted as a no-op (single-node — no isolation/read-only semantics).
+        return SQLResult(command_tag="SET")
     raise errors.feature_not_supported(f"command {verb} is not supported")
