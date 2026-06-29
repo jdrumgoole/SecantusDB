@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import SQLError, run_sql
+from secantus.sql import run_sql
 from secantus.sql.session import Session
 from sqlfake import FakeStorage
 
@@ -139,13 +139,42 @@ def test_count_star_over_virtual_table(storage, session):
     assert q(storage, session, "SELECT COUNT(*) FROM information_schema.tables").rows == [(2,)]
 
 
-def test_unsupported_catalog_join_defers(storage, session):
+def test_catalog_join_class_namespace(storage, session):
+    # The join interactive psql's \d emits: pg_class ⋈ pg_namespace on the
+    # namespace oid. Every user table lives in ``public`` (relnamespace 2200).
     _seed(storage, session)
-    with pytest.raises(SQLError) as ei:
-        q(
-            storage,
-            session,
-            "SELECT c.relname FROM pg_catalog.pg_class c "
-            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
-        )
-    assert ei.value.sqlstate == "0A000"
+    res = q(
+        storage,
+        session,
+        "SELECT c.relname, n.nspname FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "ORDER BY c.relname",
+    )
+    assert res.rows == [("orders", "public"), ("users", "public")]
+
+
+def test_catalog_join_with_where_on_namespace(storage, session):
+    # Filtering by the joined namespace name restricts to public's relations.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT c.relname FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' ORDER BY c.relname",
+    )
+    assert res.rows == [("orders",), ("users",)]
+
+
+def test_group_by_over_virtual_table(storage, session):
+    # GROUP BY over a virtual catalog table goes through the aggregation pipeline
+    # backed by CatalogBackend — count columns for a given base table.
+    _seed(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT c.table_name, COUNT(*) AS n "
+        "FROM information_schema.columns c "
+        "WHERE c.table_name = 'users' GROUP BY c.table_name",
+    )
+    assert res.rows == [("users", 3)]

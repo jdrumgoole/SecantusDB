@@ -1256,9 +1256,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   the catalog / shared with the Mongo user store), the `Copy` subprotocol, and cursor
   `DECLARE`. A real-driver gauge runs in CI via **pg8000** (pure-Python) + a SQLAlchemy
   Core smoke (P7); `psycopg`/`psql`/JDBC as live gauges still need libpq/a JVM (absent in
-  the dev env). Full SQLAlchemy **reflection** (`inspect().get_table_names()` /
-  `get_columns()`) issues `pg_catalog` *joins*, which hit the catalog-join gap (0A000) —
-  needs the join surface before ORM schema reflection works end to end.
+  the dev env). SQLAlchemy **reflection** `inspect().get_table_names()` / `has_table()`
+  now work (catalog joins landed — see below); `get_columns()` still needs `pg_attribute`.
 - [ ] **Reflected tables are SELECT-only and not in the pipeline path (P6 landed the
   read path).** A collection with no `CREATE TABLE` reflects (sampled schema-on-read)
   for `SELECT` (incl. `->`/`->>`/`#>` jsonb navigation), but: INSERT/UPDATE/DELETE on an
@@ -1283,12 +1282,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
 - [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
   passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
   in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
-- [ ] **Catalog surface is the no-join subset (P2).** `information_schema.tables`/
-  `.columns`/`.schemata` and `pg_catalog.pg_class`/`pg_namespace`/`pg_type`/`pg_database`
-  are served as virtual tables. Interactive `psql`'s `\dt`/`\d` issue *joins* across
-  `pg_catalog` plus functions (`format_type`, `pg_table_is_visible`), CASE, casts, and
-  regex operators — those return `0A000` until the join/function machinery (P5) lands. No
-  `pg_attribute`/`pg_index`/`pg_constraint`/`pg_get_*` yet.
+- [ ] **Catalog surface: joins landed, column-level reflection still missing.**
+  `information_schema.tables`/`.columns`/`.schemata` and `pg_catalog.pg_class`/
+  `pg_namespace`/`pg_type`/`pg_database` are served as virtual tables, and JOINs / GROUP BY
+  across them now execute (`virtual.CatalogBackend` + `planner._lookup_table_def`), so
+  SQLAlchemy `get_table_names()`/`has_table()` and `psql`'s `\dt` work. WHERE now handles
+  `CAST`/`::type`, `col = ANY(ARRAY[...])`, and the always-true `pg_table_is_visible`/
+  `pg_type_is_visible` predicates. Still missing for `\d`'s column reflection:
+  `pg_attribute`/`pg_attrdef`/`pg_index`/`pg_constraint`, the `format_type`/`pg_get_expr`/
+  `pg_get_*` functions, three-plus-table joins, and JOIN+GROUP-BY combined.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
