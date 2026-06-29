@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.4b35"
+version = "0.5.4b37"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,7 +39,8 @@ dev = [
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "sqlglot>=25",  # SQL parser for the secantus.sql tests (mirrors the [sql] extra)
     "pg8000>=1.31",  # pure-Python Postgres driver: real-driver gauge for the SQL server
-    "sqlalchemy>=2.0",  # ORM smoke for the SQL server (drives pg8000)
+    "psycopg[binary]>=3.1",  # libpq-based driver: strictest wire gauge (binary params, prepared stmts)
+    "sqlalchemy>=2.0",  # ORM smoke for the SQL server (drives pg8000 + psycopg)
     "invoke>=2.2",
     "ruff>=0.6",
     "sphinx>=7.2",

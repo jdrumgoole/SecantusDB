@@ -126,26 +126,133 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
     )
 
 
-def _materialize_derived(plan: Any, storage: Any, db: str) -> None:
+def _scalar_ctx(storage: Any, db: str, sctx: Any) -> Any:
+    """The ScalarContext for evaluating derived sub-plans — reuse the caller's
+    when present, else build one over the (catalog-backed) storage."""
+    if sctx is not None:
+        return sctx
+    from secantus.sql import scalar
+    from secantus.sql.catalog import Catalog
+
+    return scalar.ScalarContext(storage=storage, catalog=Catalog(storage), db=db, session=None)
+
+
+def _materialize_derived(plan: Any, storage: Any, db: str, sctx: Any = None) -> None:
     """Materialize a plan's derived-table subqueries into ephemeral collections.
 
     Each ``(SELECT ...) AS alias`` join source is run to rows (its own derived
     tables first) and registered under its alias so the main pipeline's
     ``$lookup`` can read it."""
     for dt in getattr(plan, "derived", []):
-        rows = _run_subplan_to_docs(dt.plan, storage, db)
+        rows = _run_subplan_to_docs(dt.plan, storage, db, sctx)
         storage.register_ephemeral(dt.name, rows)
 
 
-def _run_subplan_to_docs(plan: Any, storage: Any, db: str) -> list[dict[str, Any]]:
+def _run_subplan_to_docs(
+    plan: Any, storage: Any, db: str, sctx: Any = None
+) -> list[dict[str, Any]]:
     from secantus.aggregate import PipelineContext, apply_pipeline
 
-    _materialize_derived(plan, storage, db)
+    _materialize_derived(plan, storage, db, sctx)
     if isinstance(plan, planner.PipelineSelectPlan):
         docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
         ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
         return apply_pipeline(docs, plan.pipeline, ctx)
+    if isinstance(plan, planner.EvaluatedSelectPlan):
+        rows = _evaluated_value_rows(plan, storage, db, _scalar_ctx(storage, db, sctx))
+        names = [n for n, _ in plan.out_columns]
+        return [dict(zip(names, row, strict=True)) for row in rows]
     raise errors.feature_not_supported("unsupported derived-table plan")
+
+
+def _evaluated_value_rows(
+    plan: planner.EvaluatedSelectPlan, storage: Any, db: str, sctx: Any
+) -> list[tuple[Any, ...]]:
+    """Run an evaluated plan's pipeline, evaluate each output expression per row
+    (expanding set-returning functions), then apply ORDER BY / DISTINCT / LIMIT."""
+    from secantus.aggregate import PipelineContext, apply_pipeline
+    from secantus.sql import scalar
+
+    _materialize_derived(plan, storage, db, sctx)
+    docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+    ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
+    docs = apply_pipeline(docs, plan.pipeline, ctx)
+
+    def make_scope(doc: dict[str, Any]):
+        def scope(node: Any) -> Any:
+            path, _ = plan.resolve(node)
+            return get_path(doc, path)
+
+        return scope
+
+    scored: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
+    for doc in docs:
+        scope = make_scope(doc)
+        keys = tuple(scalar.evaluate(oe, scope, sctx) for oe, _ in plan.order)
+        for vt in _expand_srf(plan, scope, sctx):
+            scored.append((keys, vt))
+
+    for i in reversed(range(len(plan.order))):
+        direction = plan.order[i][1]
+        scored.sort(key=lambda r, i=i: (r[0][i] is None, r[0][i]), reverse=(direction == -1))
+
+    rows = [vt for _, vt in scored]
+    if plan.distinct:
+        seen: set = set()
+        deduped: list[tuple[Any, ...]] = []
+        for row in rows:
+            key = tuple(repr(v) for v in row)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(row)
+        rows = deduped
+    if plan.skip:
+        rows = rows[plan.skip :]
+    if plan.limit:
+        rows = rows[: plan.limit]
+    return rows
+
+
+def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> list[tuple[Any, ...]]:
+    """Evaluate one source row's output columns, expanding set-returning
+    functions (unnest / generate_subscripts) into one row per array element.
+    Multiple SRFs over the same array zip in parallel; the longest wins, shorter
+    arrays pad with NULL (Postgres semantics)."""
+    from secantus.sql import scalar
+
+    srfs: dict[int, tuple[str, list[Any]]] = {}
+    for idx, expr in enumerate(plan.out_exprs):
+        srf = planner._srf_of(expr)
+        if srf is None:
+            continue
+        kind, arr_expr = srf
+        arr = scalar.evaluate(arr_expr, scope, sctx)
+        arr = list(arr) if isinstance(arr, (list, tuple)) else ([] if arr is None else [arr])
+        srfs[idx] = (kind, arr)
+
+    if not srfs:
+        return [tuple(scalar.evaluate(e, scope, sctx) for e in plan.out_exprs)]
+
+    scalars = {
+        idx: scalar.evaluate(e, scope, sctx)
+        for idx, e in enumerate(plan.out_exprs)
+        if idx not in srfs
+    }
+    length = max((len(arr) for _, arr in srfs.values()), default=0)
+    rows: list[tuple[Any, ...]] = []
+    for k in range(length):
+        row: list[Any] = []
+        for idx in range(len(plan.out_exprs)):
+            if idx in srfs:
+                kind, arr = srfs[idx]
+                if kind == "unnest":
+                    row.append(arr[k] if k < len(arr) else None)
+                else:  # generate_subscripts → 1-based ordinal
+                    row.append(k + 1 if k < len(arr) else None)
+            else:
+                row.append(scalars[idx])
+        rows.append(tuple(row))
+    return rows
 
 
 def execute_pipeline_select(plan: planner.PipelineSelectPlan, storage: Any, db: str) -> SQLResult:
@@ -168,53 +275,9 @@ def execute_pipeline_select(plan: planner.PipelineSelectPlan, storage: Any, db: 
 def execute_evaluated_select(
     plan: planner.EvaluatedSelectPlan, storage: Any, db: str, sctx: Any
 ) -> SQLResult:
-    """Run a join whose SELECT list / ORDER BY needs per-row scalar evaluation.
-
-    The pipeline yields the joined docs; each output expression is evaluated in
-    Python (``secantus.sql.scalar``), then DISTINCT / ORDER BY / LIMIT apply.
-    """
-    from secantus.aggregate import PipelineContext, apply_pipeline
-    from secantus.sql import scalar
-
-    _materialize_derived(plan, storage, db)
-    docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
-    ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
-    docs = apply_pipeline(docs, plan.pipeline, ctx)
-
-    def make_scope(doc: dict[str, Any]):
-        def scope(node: Any) -> Any:
-            path, _ = plan.resolve(node)
-            return get_path(doc, path)
-
-        return scope
-
-    evaluated: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
-    for doc in docs:
-        scope = make_scope(doc)
-        values = tuple(scalar.evaluate(e, scope, sctx) for e in plan.out_exprs)
-        keys = tuple(scalar.evaluate(oe, scope, sctx) for oe, _ in plan.order)
-        evaluated.append((keys, values))
-
-    # ORDER BY: stable sort, last key first; NULLs sort last (Postgres default).
-    for i in reversed(range(len(plan.order))):
-        direction = plan.order[i][1]
-        evaluated.sort(key=lambda r, i=i: (r[0][i] is None, r[0][i]), reverse=(direction == -1))
-
-    rows = [vals for _, vals in evaluated]
-    if plan.distinct:
-        seen: set = set()
-        deduped: list[tuple[Any, ...]] = []
-        for row in rows:
-            key = tuple(repr(v) for v in row)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(row)
-        rows = deduped
-    if plan.skip:
-        rows = rows[plan.skip :]
-    if plan.limit:
-        rows = rows[: plan.limit]
-
+    """Run a SELECT whose list / ORDER BY needs per-row evaluation (scalar /
+    set-returning functions, CASE, correlated subqueries)."""
+    rows = _evaluated_value_rows(plan, storage, db, sctx)
     columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
     out_rows = [
         tuple(typemap.to_py(v, tag) for v, (_, tag) in zip(row, plan.out_columns, strict=True))

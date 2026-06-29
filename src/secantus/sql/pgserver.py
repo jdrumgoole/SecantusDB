@@ -326,7 +326,10 @@ def _render_result(res: Any) -> bytes:
         out += pgwire.parameter_status(name, value)
     if res.columns or res.command_tag.startswith("SELECT"):
         out += pgwire.row_description([(c.name, c.pg_oid) for c in res.columns])
+        tags = [c.type_tag for c in res.columns]
         for row in res.rows:
-            out += pgwire.data_row([typemap.to_pg_text(v) for v in row])
+            out += pgwire.data_row(
+                [typemap.to_pg_text(v, t) for v, t in zip(row, tags, strict=False)]
+            )
     out += pgwire.command_complete(res.command_tag)
     return bytes(out)

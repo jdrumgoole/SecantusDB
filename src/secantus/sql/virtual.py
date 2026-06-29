@@ -472,9 +472,9 @@ _register(
     [
         ("indexrelid", "int4"),
         ("indrelid", "int4"),
-        ("indkey", "json"),
-        ("indclass", "json"),
-        ("indoption", "json"),
+        ("indkey", "int2vector"),
+        ("indclass", "oidvector"),
+        ("indoption", "int2vector"),
         ("indnatts", "int4"),
         ("indnkeyatts", "int4"),
         ("indisunique", "bool"),

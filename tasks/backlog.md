@@ -1250,14 +1250,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/
   `Describe`/`Execute`/`Close`/`Sync` (P3), `SCRAM-SHA-256` auth + TLS (P4). Still
   missing: **binary result format** (rows are always text; binary param *input* is
-  decoded, but results aren't binary-encoded even if a client requests it via Bind
-  result-format codes), channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert auth,
-  user management via SQL (`CREATE ROLE` — users are constructor config, not stored in
-  the catalog / shared with the Mongo user store), the `Copy` subprotocol, and cursor
-  `DECLARE`. A real-driver gauge runs in CI via **pg8000** (pure-Python) + a SQLAlchemy
-  Core smoke (P7); `psycopg`/`psql`/JDBC as live gauges still need libpq/a JVM (absent in
-  the dev env). SQLAlchemy **reflection** `inspect().get_table_names()` / `has_table()`
-  now work (catalog joins landed — see below); `get_columns()` still needs `pg_attribute`.
+  decoded — `int2`/`int4`/`int8`/`float4`/`float8`/`bool`/`bytea`/`text`/`varchar`/
+  `date`/`timestamp`/`timestamptz`/`numeric` in `pgextended._BINARY` — but results
+  aren't binary-encoded even if a client requests it via Bind result-format codes),
+  channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert auth, user management via
+  SQL (`CREATE ROLE` — users are constructor config, not stored in the catalog / shared
+  with the Mongo user store), the `Copy` subprotocol, and cursor `DECLARE`. Real-driver
+  gauges run in CI via **pg8000** (pure-Python, text params) **and psycopg 3**
+  (`tests/test_pgserver_psycopg.py` — libpq via the `psycopg[binary]` wheel, the
+  strictest wire exercise: binary params + server-side prepared statements + the psycopg
+  SQLAlchemy dialect), each with a SQLAlchemy Core reflection smoke; `psql`/JDBC as live
+  gauges still need a libpq CLI / a JVM (absent in the dev env). SQLAlchemy **reflection**
+  works end to end (see below).
 - [ ] **Reflected tables are SELECT-only (writes still unsupported).** A collection with
   no `CREATE TABLE` reflects (sampled schema-on-read) for `SELECT` — incl. `->`/`->>`/`#>`
   jsonb navigation **and now GROUP BY / aggregates / JOIN** (the pipeline planner reflects
@@ -1301,32 +1305,41 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `ON`s compile to a `$lookup` sub-pipeline; a `(SELECT … GROUP BY …) AS alias` derived table
   materializes into an ephemeral collection (`CatalogBackend.register_ephemeral`); `array_agg`
   (→ `$push`) and `pg_sequence`/`pg_collation`/`pg_constraint`/`pg_enum` (present-but-empty) +
-  pg_type domain columns are modeled. **`SQLAlchemy inspect().get_columns()` / `get_table_names()`
-  / `has_table()` now work end to end.** Still missing: full `Table(autoload_with=...)` also calls
-  `get_pk_constraint` / `get_indexes` / `get_foreign_keys`, which need a `pg_index` table and more
-  `pg_constraint` columns (`conrelid`/`confrelid`) + the PK/index/FK reflected from our catalog —
-  those methods still `0A000`/`42703`. (`get_columns` + `information_schema.columns` are the working
-  column-reflection paths.)
+  pg_type domain columns are modeled. **Full SQLAlchemy reflection now works end to end** —
+  `get_columns` / `get_table_names` / `has_table` / `get_pk_constraint` / `get_indexes` /
+  `get_foreign_keys` and whole-table `Table(autoload_with=...)`. PK/index reflection rides
+  set-returning functions (`unnest` / `generate_subscripts` → row expansion in the evaluated
+  executor), GROUP BY / `array_agg` over a derived-table FROM, populated `pg_index`/`pg_constraint`/
+  `pg_am`/`pg_opclass`, and a fix so boolean expressions (`conrelid IS NOT NULL`) type as `bool`
+  (else the wire text `'f'` reads truthy in `if row["has_constraint"]`). `get_foreign_keys` reflects
+  empty (no FK constraints modeled); column comments reflect as `None`. Remaining: actual FK
+  constraints, column comments, `ALTER TABLE`.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
-- [ ] **Transactions: single-connection atomicity, no SAVEPOINT.**
+- [ ] **Transactions: single-connection atomicity; SAVEPOINT is a no-op.**
   `BEGIN`/`COMMIT`/`ROLLBACK` open/commit/abort a real `Storage` user-transaction
   (statements in the block run on its WT session; ROLLBACK undoes them; an error poisons
   the block with `25P02` until it ends). `SET TRANSACTION ISOLATION LEVEL` / `READ ONLY` /
-  `READ WRITE`, `SET SESSION CHARACTERISTICS`, and `BEGIN ISOLATION LEVEL …` are now
-  **accepted as no-ops** (single-node — isolation/read-only don't change behaviour). Still
-  missing: `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (sqlglot's pg dialect doesn't parse `SAVEPOINT`
-  cleanly — `RELEASE` is a hard parse error — so it needs SQL-text preprocessing) and the
-  `DECLARE CURSOR` … `FETCH` holdable-cursor surface. DDL is transactional via the same
-  mechanism. Cross-connection isolation is the WT engine's job (the test double only
-  models atomicity).
+  `READ WRITE`, `SET SESSION CHARACTERISTICS`, and `BEGIN ISOLATION LEVEL …` are
+  **accepted as no-ops** (single-node — isolation/read-only don't change behaviour).
+  `SAVEPOINT name` / `RELEASE name` parse as a bare `Alias` in sqlglot's pg dialect and
+  are accepted as **no-ops** (`engine._noop_command_word`); `ROLLBACK TO [SAVEPOINT] name`
+  (parsed as `exp.Rollback` with a `savepoint` arg) clears `txn_failed` and keeps the block
+  open — enough for psycopg's `conn.transaction()` / SQLAlchemy's dialect probes, but there's
+  **no real per-savepoint state** (a `ROLLBACK TO` doesn't undo writes made after the
+  savepoint — it only un-poisons an aborted block). `DEALLOCATE`/`DISCARD` are likewise
+  no-ops. Still missing: true nested-savepoint rollback and the `DECLARE CURSOR` … `FETCH`
+  holdable-cursor surface. DDL is transactional via the same mechanism. Cross-connection
+  isolation is the WT engine's job (the test double only models atomicity).
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
-  scanning the catalog and calls `drop_index` (`42704` when absent). Still missing: `ALTER TABLE`,
-  partial/expression index options via SQL, and reflecting indexes back through `get_indexes`
-  (needs a `pg_index` virtual table).
+  scanning the catalog and calls `drop_index` (`42704` when absent). Indexes now reflect back
+  through `get_indexes` / `Table(autoload_with=…).indexes` (the populated `pg_index` virtual
+  table — `indkey`/`indclass`/`indoption` are typed as `int2vector`/`oidvector` so a libpq
+  client renders them as the space-separated text its catalog reflection parses). Still
+  missing: `ALTER TABLE` and partial/expression index options via SQL.
 - [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
   extension is absent so the pure SQL/operator tests import without a WT build. Inert in
   CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without
