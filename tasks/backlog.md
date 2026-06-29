@@ -1289,10 +1289,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
   `HAVING` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, **multi-table** `INNER`/`LEFT JOIN` (equality
-  `ON`, each join relating to the base or an already-joined table), and **`SELECT DISTINCT`**
-  (single-table and over a join) compile to an aggregation pipeline. Still `0A000`: JOIN
-  *combined* with GROUP BY/aggregates, non-equi / `OR` join conditions, `RIGHT`/`FULL`/`CROSS`
-  JOIN, window functions, subqueries, and scalar expressions in the SELECT list / GROUP BY
+  `ON`, each join relating to the base or an already-joined table), **`SELECT DISTINCT`**
+  (single-table and over a join), **and JOIN *combined* with GROUP BY / aggregates / HAVING /
+  `array_agg`** compile to an aggregation pipeline. The join builds `$lookup`/`$unwind`, then
+  `_plan_join_group_select` appends a `$group` whose keys + accumulators resolve through the
+  join resolver (`a.region`, `SUM(b.amt)` → post-unwind paths); WHERE applies pre-group, HAVING
+  post-group. Still `0A000`: non-equi / `OR` join conditions, `RIGHT`/`FULL`/`CROSS` JOIN,
+  window functions, subqueries, and scalar/computed expressions in the SELECT list / GROUP BY
   (only bare columns and single aggregates are handled). `DISTINCT` with aggregates is also
   `0A000`. SUM/MIN/MAX result typing is approximate (uses the column's tag; AVG → float8).
 - [ ] **WHERE: column-to-column + arithmetic landed; functions not yet.** `column OP literal`

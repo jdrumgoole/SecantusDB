@@ -239,6 +239,16 @@ FROM orders o
 JOIN customers c ON o.cust_id = c.id
 JOIN products  p ON o.prod_id = p.id
 ORDER BY c.name;
+
+-- JOIN combined with GROUP BY / aggregates / HAVING — the canonical analytics
+-- query. WHERE filters joined rows before grouping; HAVING filters after:
+SELECT c.region, SUM(o.total) AS revenue
+FROM orders o
+JOIN customers c ON o.cust_id = c.id
+WHERE o.total > 0
+GROUP BY c.region
+HAVING SUM(o.total) > 1000
+ORDER BY c.region;
 ```
 
 ## SELECT DISTINCT
@@ -525,7 +535,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic (`a > b`, `a < b * 1.5`) | subqueries, function calls in a column predicate, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths (`->`/`->>`/`#>`/`#>>`), `jsonb_*` functions, `DISTINCT` | arbitrary computed expressions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
-| Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON` | `RIGHT`/`FULL`/`CROSS`, non-equi, JOIN + GROUP BY |
+| Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL`/`CROSS`, non-equi / `OR` `ON` |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params, prepared statements, portals | binary result format, `COPY` |

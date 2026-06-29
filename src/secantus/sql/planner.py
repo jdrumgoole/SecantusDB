@@ -1041,6 +1041,11 @@ def plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
     if stmt.args.get("joins"):
+        has_agg = any(
+            _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
+        )
+        if stmt.args.get("group") or stmt.args.get("having") or has_agg:
+            return _plan_join_group_select(stmt, db, catalog, storage)
         return _plan_join_select(stmt, db, catalog, storage)
     from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
     if from_node is None:
@@ -1157,15 +1162,17 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
-def _accumulator(func: str, col: str | None, table: TableDef) -> tuple[dict[str, Any], str]:
+def _accumulator_for(func: str, field: str | None, tag: str | None) -> tuple[dict[str, Any], str]:
+    """Build a ``$group`` accumulator from an already-resolved field path + tag.
+
+    ``field`` is the pipeline field path (e.g. ``amt`` or ``b.amt`` after a join)
+    and is None only for ``COUNT(*)``. This is the field-resolved core shared by
+    the single-table (`_accumulator`) and join (`_join_accumulator`) paths."""
     if func == "count":
-        if col is None:
+        if field is None:
             return {"$sum": 1}, "int8"
-        field = table.field_for(col)
         # COUNT(col) counts non-null values.
         return {"$sum": {"$cond": [{"$ne": [f"${field}", None]}, 1, 0]}}, "int8"
-    field = table.field_for(col)
-    tag = table.type_for(col)
     if func == "sum":
         return {"$sum": f"${field}"}, (
             tag if tag in ("int4", "int8", "numeric", "float8") else "float8"
@@ -1173,15 +1180,21 @@ def _accumulator(func: str, col: str | None, table: TableDef) -> tuple[dict[str,
     if func == "avg":
         return {"$avg": f"${field}"}, "float8"
     if func == "min":
-        return {"$min": f"${field}"}, tag
+        return {"$min": f"${field}"}, (tag or "text")
     if func == "max":
-        return {"$max": f"${field}"}, tag
+        return {"$max": f"${field}"}, (tag or "text")
     # bool_and = all-true = the minimum boolean (false < true); bool_or = max.
     if func == "bool_and":
         return {"$min": f"${field}"}, "bool"
     if func == "bool_or":
         return {"$max": f"${field}"}, "bool"
     raise errors.feature_not_supported(f"aggregate {func} is not supported")
+
+
+def _accumulator(func: str, col: str | None, table: TableDef) -> tuple[dict[str, Any], str]:
+    if col is None:
+        return _accumulator_for(func, None, None)
+    return _accumulator_for(func, table.field_for(col), table.type_for(col))
 
 
 class _NameAllocator:
@@ -1522,15 +1535,13 @@ def _resolve_source(
     return (node.alias or node.name), tdef
 
 
-def _plan_join_select(
-    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
-) -> PipelineSelectPlan | EvaluatedSelectPlan:
-    if (
-        stmt.args.get("group")
-        or stmt.args.get("having")
-        or any(_aggregate_of(e) is not None for e in stmt.expressions)
-    ):
-        raise errors.feature_not_supported("JOIN with GROUP BY / aggregates is not supported yet")
+def _build_join_pipeline(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any
+) -> tuple[
+    TableDef, dict[str, tuple[str, TableDef]], Resolve, list[dict[str, Any]], list[DerivedTable]
+]:
+    """Build the $lookup/$unwind (+ WHERE $match) prefix shared by the join
+    builders. Returns (base, amap, resolve, pipeline, derived)."""
     derived: list[DerivedTable] = []
     fr = stmt.find(exp.From).this
     base_alias, base = _resolve_source(fr, db, catalog, storage, derived)
@@ -1557,6 +1568,13 @@ def _plan_join_select(
     where = stmt.args.get("where")
     if where is not None:
         pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
+    return base, amap, resolve, pipeline, derived
+
+
+def _plan_join_select(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+) -> PipelineSelectPlan | EvaluatedSelectPlan:
+    base, amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
 
     if _stmt_needs_evaluation(stmt):
         return _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
@@ -1580,6 +1598,176 @@ def _plan_join_select(
         out_columns.append((name, tag))
     _append_join_tail(pipeline, stmt, resolve, project, out_columns)
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
+
+
+def _join_aggregate_of(node: exp.Expression) -> tuple[str, exp.Expression | None] | None:
+    """Like ``_aggregate_of`` but keeps the argument NODE so the join resolver can
+    map a qualified column (``b.amt``). A None argument means ``COUNT(*)``."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    for cls, name in _AGG_CLASSES.items():
+        if isinstance(inner, cls):
+            arg = inner.this
+            return name, (None if arg is None or isinstance(arg, exp.Star) else arg)
+    return None
+
+
+def _join_accumulator(
+    func: str, arg: exp.Expression | None, resolve: Resolve
+) -> tuple[dict[str, Any], str]:
+    if arg is None:
+        return _accumulator_for(func, None, None)
+    path, tag = resolve(arg)
+    return _accumulator_for(func, path, tag)
+
+
+def _agg_key(func: str, arg: exp.Expression | None, resolve: Resolve) -> str:
+    """A hashable identity for an aggregate (for HAVING accumulator dedup)."""
+    return f"{func}:{'*' if arg is None else resolve(arg)[0]}"
+
+
+def _plan_join_group_select(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+) -> PipelineSelectPlan:
+    """JOIN combined with GROUP BY / aggregates: build the $lookup/$unwind/$match
+    prefix, then a $group whose keys and accumulators resolve through the join
+    resolver (so ``a.region`` / ``SUM(b.amt)`` map to the post-unwind paths)."""
+    base, _amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
+
+    group_node = stmt.args.get("group")
+    group_keys: dict[str, str] = {}  # _id key name -> resolved "$path"
+    key_tag: dict[str, str] = {}
+    if group_node is not None:
+        for c in group_node.expressions:
+            if not isinstance(c, exp.Column):
+                raise errors.feature_not_supported(f"GROUP BY expression not supported: {c.sql()}")
+            keyname = _column_name(c)
+            path, tag = resolve(c)
+            group_keys[keyname] = f"${path}"
+            key_tag[keyname] = tag
+    group_id = group_keys or None
+
+    accumulators: dict[str, Any] = {}
+    project: dict[str, Any] = {"_id": 0}
+    out_columns: list[tuple[str, str]] = []
+    names = _NameAllocator()
+    agg_fields: dict[str, str] = {}
+
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        arr_arg = _array_agg_arg(e)
+        agg = _join_aggregate_of(e)
+        if arr_arg is not None:
+            fname = names.fresh(alias or "array_agg")
+            path, _ = resolve(arr_arg)
+            accumulators[fname] = {"$push": f"${path}"}
+            project[fname] = f"${fname}"
+            out_columns.append((fname, "json"))
+        elif agg is not None:
+            func, arg = agg
+            acc, tag = _join_accumulator(func, arg, resolve)
+            fname = names.fresh(alias or func)
+            accumulators[fname] = acc
+            agg_fields[_agg_key(func, arg, resolve)] = fname
+            project[fname] = f"${fname}"
+            out_columns.append((fname, tag))
+        else:
+            inner = e.this if isinstance(e, exp.Alias) else e
+            if isinstance(inner, exp.Star):
+                raise errors.feature_not_supported("SELECT * with GROUP BY is not supported")
+            if not isinstance(inner, exp.Column):
+                raise errors.feature_not_supported(
+                    f"non-aggregate SELECT expression not supported with GROUP BY: {inner.sql()}"
+                )
+            keyname = _column_name(inner)
+            if keyname not in group_keys:
+                raise errors.SQLError(
+                    "42803",
+                    f'column "{keyname}" must appear in the GROUP BY clause '
+                    "or be used in an aggregate function",
+                )
+            out_name = names.fresh(alias or keyname)
+            project[out_name] = f"$_id.{keyname}"
+            out_columns.append((out_name, key_tag[keyname]))
+
+    having = stmt.args.get("having")
+    having_match = (
+        _join_having_to_match(having.this, resolve, accumulators, agg_fields, group_keys, key_tag)
+        if having is not None
+        else None
+    )
+    pipeline.append({"$group": {"_id": group_id, **accumulators}})
+    if having_match is not None:
+        pipeline.append({"$match": having_match})
+    pipeline.append({"$project": project})
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
+
+
+def _join_having_to_match(
+    node: exp.Expression,
+    resolve: Resolve,
+    accumulators: dict[str, Any],
+    agg_fields: dict[str, str],
+    group_keys: dict[str, str],
+    key_tag: dict[str, str],
+) -> dict[str, Any]:
+    """HAVING for the JOIN+GROUP path — mirrors ``_having_to_match`` but resolves
+    columns / aggregate args through the join resolver."""
+    rec = _join_having_to_match
+    if isinstance(node, exp.Paren):
+        return rec(node.this, resolve, accumulators, agg_fields, group_keys, key_tag)
+    if isinstance(node, exp.And):
+        return _merge_and(
+            [
+                rec(node.this, resolve, accumulators, agg_fields, group_keys, key_tag),
+                rec(node.expression, resolve, accumulators, agg_fields, group_keys, key_tag),
+            ]
+        )
+    if isinstance(node, exp.Or):
+        return {
+            "$or": [
+                rec(node.this, resolve, accumulators, agg_fields, group_keys, key_tag),
+                rec(node.expression, resolve, accumulators, agg_fields, group_keys, key_tag),
+            ]
+        }
+
+    def field_tag(term: exp.Expression) -> tuple[str, str]:
+        if isinstance(term, exp.Column):
+            keyname = _column_name(term)
+            if keyname not in group_keys:
+                raise errors.SQLError(
+                    "42803",
+                    f'column "{keyname}" must appear in the GROUP BY clause '
+                    "or be used in an aggregate function",
+                )
+            return f"_id.{keyname}", key_tag[keyname]
+        agg = _join_aggregate_of(term)
+        if agg is None:
+            raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
+        func, arg = agg
+        acc, tag = _join_accumulator(func, arg, resolve)
+        key = _agg_key(func, arg, resolve)
+        if key not in agg_fields:
+            fname = f"__having_{len(agg_fields)}"
+            accumulators[fname] = acc
+            agg_fields[key] = fname
+        return agg_fields[key], tag
+
+    if isinstance(node, (exp.EQ, exp.NEQ)) or type(node) in _HAVING_CMP:
+        left, right = node.this, node.expression
+        term, lit, on_left = left, right, True
+        if not isinstance(left, (exp.Column, *_AGG_CLASSES.keys())):
+            term, lit, on_left = right, left, False
+        field, tag = field_tag(term)
+        value = typemap.coerce(_literal(lit), tag)
+        if isinstance(node, exp.EQ):
+            return {field: value}
+        if isinstance(node, exp.NEQ):
+            return {field: {"$ne": value}}
+        op, flipped = _HAVING_CMP[type(node)]
+        return {field: {(op if on_left else flipped): value}}
+
+    raise errors.feature_not_supported(f"unsupported HAVING clause: {node.sql()}")
 
 
 def _is_simple_projection(node: exp.Expression) -> bool:
