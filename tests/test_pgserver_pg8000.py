@@ -237,6 +237,29 @@ def test_cte_via_driver(server):
     conn.close()
 
 
+def test_recursive_cte_via_driver(server):
+    # WITH RECURSIVE: walk an org hierarchy over Mongo-written data via the driver.
+    server.storage.insert(
+        "db",
+        "emp",
+        [
+            {"_id": bson.Int64(i), "name": n, "mgr": bson.Int64(m)}
+            for i, n, m in [(1, "ceo", 0), (2, "vp", 1), (3, "eng", 2)]
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "WITH RECURSIVE chain(id, name, lvl) AS ("
+        "  SELECT _id, name, 0 FROM emp WHERE _id = 1"
+        "  UNION ALL"
+        "  SELECT e._id, e.name, c.lvl + 1 FROM emp e JOIN chain c ON e.mgr = c.id"
+        ") SELECT id, name, lvl FROM chain ORDER BY id"
+    )
+    assert cur.fetchall() == ([1, "ceo", 0], [2, "vp", 1], [3, "eng", 2])
+    conn.close()
+
+
 def test_count_distinct_via_driver(server):
     # COUNT(DISTINCT) / SUM(DISTINCT) over Mongo-written data, through the driver.
     server.storage.insert(

@@ -2366,6 +2366,10 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)
+    if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
+        # A bare literal in the SELECT list (``SELECT 0 AS lvl``) must type from its
+        # value, else an int rides the wire as text.
+        return _infer_value_tag(_literal(node))
     if isinstance(node, exp.Window):
         func = node.this
         if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count, exp.Ntile)):
