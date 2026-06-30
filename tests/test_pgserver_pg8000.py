@@ -87,6 +87,31 @@ def test_returning_via_driver(server):
     conn.close()
 
 
+def test_cte_via_driver(server):
+    # WITH ... AS (...) over Mongo-written data, through the real driver.
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(i), "region": r, "amount": bson.Int64(a)}
+            for i, (r, a) in enumerate([("e", 10), ("e", 20), ("w", 30), ("w", 5)], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "WITH big AS (SELECT region, amount FROM sales WHERE amount >= 20) "
+        "SELECT region, amount FROM big ORDER BY amount"
+    )
+    assert cur.fetchall() == (["e", 20], ["w", 30])
+    cur.execute(
+        "WITH t AS (SELECT region, amount FROM sales) "
+        "SELECT region, SUM(amount) FROM t GROUP BY region ORDER BY region"
+    )
+    assert cur.fetchall() == (["e", 30], ["w", 35])
+    conn.close()
+
+
 def test_count_distinct_via_driver(server):
     # COUNT(DISTINCT) / SUM(DISTINCT) over Mongo-written data, through the driver.
     server.storage.insert(

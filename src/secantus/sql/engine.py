@@ -14,7 +14,7 @@ from typing import Any
 from sqlglot import exp
 
 from secantus.sql import errors, executor, planner, reflect, scalar, typemap, virtual
-from secantus.sql.catalog import Catalog
+from secantus.sql.catalog import Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import REPORTABLE_GUCS, Session
 
@@ -133,6 +133,11 @@ def describe_statement(
     """
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
         return [ColumnDesc(_show_name(stmt), "text", typemap.PG_OID["text"])]
+    if _own_with(stmt) is not None:
+        # Resolving a CTE query's columns would require materializing the CTEs
+        # (execution), which Describe must not do — defer to Execute's
+        # RowDescription by reporting NoData here.
+        return None
     if isinstance(stmt, exp.SetOperation):
         # A set operation's result shape is its first arm's (descend chained ops).
         arm = stmt
@@ -211,6 +216,9 @@ def _run_statement(
         if kind == "INDEX":
             return executor.execute_drop_index(planner.plan_drop_index(stmt), catalog, storage, db)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
+
+    if _own_with(stmt) is not None:
+        return _run_with(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.SetOperation):
         return _run_set_operation(stmt, storage, db, catalog, session)
@@ -319,11 +327,96 @@ def _run_query(
     node: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
     """Evaluate a SELECT or a (possibly nested) set operation to a SQLResult."""
+    if _own_with(node) is not None:
+        return _run_with(node, storage, db, catalog, session)
     if isinstance(node, exp.SetOperation):
         return _run_set_operation(node, storage, db, catalog, session)
     if isinstance(node, exp.Select):
         return _run_select(node, storage, db, catalog, session)
     raise errors.feature_not_supported(f"unsupported set-operation arm: {type(node).__name__}")
+
+
+def _own_with(stmt: exp.Expression) -> exp.With | None:
+    """The ``WITH`` clause attached directly to ``stmt`` (not one nested inside a
+    subquery), or None. Found by identity among the statement's own args so it's
+    robust to the sqlglot arg-key name."""
+    for value in stmt.args.values():
+        if isinstance(value, exp.With):
+            return value
+    return None
+
+
+class _CTECatalog(Catalog):
+    """A catalog overlay that resolves CTE names to their materialized TableDefs
+    and delegates everything else to the base catalog (so declared / reflected
+    tables still resolve). Scoped to one statement's execution."""
+
+    def __init__(self, base: Catalog, ctes: dict[str, TableDef]) -> None:
+        self._base = base
+        self._ctes = ctes
+
+    def get(self, db: str, table: str) -> TableDef | None:
+        if table in self._ctes:
+            return self._ctes[table]
+        return self._base.get(db, table)
+
+    def exists(self, db: str, table: str) -> bool:
+        return table in self._ctes or self._base.exists(db, table)
+
+    def put(self, db: str, table: TableDef) -> None:
+        self._base.put(db, table)
+
+    def drop(self, db: str, table: str) -> bool:
+        return self._base.drop(db, table)
+
+    def list_tables(self, db: str) -> list[str]:
+        return self._base.list_tables(db)
+
+
+def _run_with(
+    stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Run a ``WITH name AS (...) [, ...] <query>`` statement (non-recursive CTEs).
+
+    Each CTE is materialized to rows and registered as an ephemeral collection on
+    a ``CatalogBackend``; a catalog overlay maps the CTE names to TableDefs built
+    from each inner query's result shape. The WITH is then stripped and the main
+    query runs against that backend + overlay, so CTE names resolve like tables
+    in every path (single-table, pipeline/join, set operations). CTEs are
+    materialized in order, so a later CTE may reference an earlier one."""
+    with_node = _own_with(stmt)
+    if with_node.args.get("recursive"):
+        raise errors.feature_not_supported("WITH RECURSIVE is not supported")
+    if not isinstance(stmt, (exp.Select, exp.SetOperation)):
+        raise errors.feature_not_supported(
+            "WITH is supported only with SELECT / set-operation queries"
+        )
+
+    backend = virtual.CatalogBackend(storage, catalog, session, db)
+    cte_defs: dict[str, TableDef] = {}
+    cte_catalog = _CTECatalog(catalog, cte_defs)
+    for cte in with_node.expressions:
+        name = cte.alias
+        if not name:
+            raise errors.feature_not_supported("a CTE must be named")
+        result = _run_query(cte.this, backend, db, cte_catalog, session)
+        col_names = [c.name for c in result.columns]
+        backend.register_ephemeral(
+            name, [dict(zip(col_names, row, strict=True)) for row in result.rows]
+        )
+        # reflected=True so any column resolves; the explicit columns carry the
+        # inner query's names + types (and make `SELECT *` / an empty CTE work).
+        cte_defs[name] = TableDef(
+            name=name,
+            collection=name,
+            columns=[
+                Column(c.name, c.type_tag, c.name, pk=False, nullable=True) for c in result.columns
+            ],
+            reflected=True,
+        )
+
+    with_node.pop()  # detach the WITH so the main query plans as a plain statement
+    return _run_query(stmt, backend, db, cte_catalog, session)
 
 
 def _run_set_operation(
