@@ -19,6 +19,34 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### A malformed OP_QUERY frame returns BadValue instead of dropping the connection
+
+A legacy `OP_QUERY` frame whose `fullCollectionName` carried no NUL
+terminator made `bytes.index(b"\x00", ...)` raise an uncaught `ValueError`
+that escaped the wire layer's `(InvalidBSON, _BodyBoundsError)` handler,
+killed the connection handler without sending a reply, and logged a Python
+traceback. The same gap existed for several siblings on the same
+attacker-controlled path: a non-UTF-8 collection name (`UnicodeDecodeError`),
+a frame truncated before the skip/return/query fields (`struct.error`), and a
+negative/oversized declared query-doc length (the `OP_MSG` path already
+guarded this with `_check_doc_len`, but `OP_QUERY` did not). The OP_MSG
+kind-1 section-identifier `.index()` / `.decode()` had the identical
+unterminated-cstring gap.
+
+`_parse_op_query` is now hardened the same way `_parse_op_msg` already was —
+every read on the network buffer raises `_BodyBoundsError` / `struct.error`,
+which `read_message` translates into a `BadValue` (2) wire reply while keeping
+the connection alive (matching `mongod`). `read_message` also now catches
+`struct.error` as a backstop so no malformed frame can escape as an uncaught
+exception. Found by the nightly security review (issue #116).
+
+#### Security
+- `wire._parse_op_query` / `_parse_op_msg`: malformed OP_QUERY/OP_MSG frames
+  (missing cstring NUL, invalid UTF-8, truncation, bad BSON length) now yield
+  a `BadValue` reply and a surviving connection instead of a dropped socket +
+  logged traceback. Regression: `tests/test_wire_malformed.py` (5 new
+  OP_QUERY cases).
+
 ### Admin UI security hardening (two CVEs + a stored-XSS fix)
 
 Three findings from the nightly security review, all confined to the
