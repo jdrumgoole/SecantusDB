@@ -89,9 +89,7 @@ def test_binary_result_format(server):
             "INSERT INTO r VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (1, 42, 3.5, Decimal("19.99"), True, "hi", when),
         )
-        row = conn.execute(
-            "SELECT id, n, x, price, flag, label, at FROM r", binary=True
-        ).fetchone()
+        row = conn.execute("SELECT id, n, x, price, flag, label, at FROM r", binary=True).fetchone()
         assert row == (1, 42, 3.5, Decimal("19.99"), True, "hi", when)
 
 
