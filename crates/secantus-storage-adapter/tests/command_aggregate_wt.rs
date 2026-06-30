@@ -577,6 +577,44 @@ fn bucket_auto_chunks_by_count() {
 }
 
 #[test]
+fn union_with_concatenates_collections() {
+    // $unionWith appends docs from another collection (bare-name and
+    // {coll, pipeline} forms), input docs first.
+    with_wt(|c| {
+        seed(
+            c,
+            "a",
+            vec![doc! {"_id": 1, "src": "a"}, doc! {"_id": 2, "src": "a"}],
+        );
+        seed(
+            c,
+            "b",
+            vec![doc! {"_id": 10, "n": 5}, doc! {"_id": 11, "n": 1}],
+        );
+        let ids = |r: &Document| -> Vec<i32> {
+            docs_of(r)
+                .iter()
+                .map(|d| d.get_i32("_id").unwrap())
+                .collect()
+        };
+        // Bare form: all of a, then all of b.
+        let r = dispatch(
+            &doc! {"aggregate": "a", "pipeline": [{"$unionWith": "b"}], "cursor": {}},
+            c,
+        );
+        assert_eq!(ids(&r), vec![1, 2, 10, 11], "{r:?}");
+        // {coll, pipeline} form: b filtered by a sub-pipeline.
+        let r = dispatch(
+            &doc! {"aggregate": "a", "pipeline": [
+                {"$unionWith": {"coll": "b", "pipeline": [{"$match": {"n": {"$gt": 1}}}]}}
+            ], "cursor": {}},
+            c,
+        );
+        assert_eq!(ids(&r), vec![1, 2, 10], "filtered union {r:?}");
+    });
+}
+
+#[test]
 fn redact_prunes_and_descends() {
     // $redact with $$PRUNE/$$DESCEND prunes a high-level sub-doc, keeps the rest
     // (mongo-cxx-driver redact/aggregation).
