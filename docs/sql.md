@@ -500,6 +500,36 @@ DELETE FROM t WHERE n > 100 RETURNING *;
 `RETURNING` is limited to the projection vocabulary above (no computed
 expressions); the rows reflect the values actually stored.
 
+### INSERT … ON CONFLICT (upsert)
+
+`INSERT` accepts an `ON CONFLICT` clause to make a colliding row an upsert
+instead of a unique-constraint error. The conflict target names the column(s)
+whose existing value the proposed row would duplicate — typically the primary
+key:
+
+```sql
+-- skip the row if it already exists
+INSERT INTO t (id, n) VALUES (1, 5) ON CONFLICT (id) DO NOTHING;
+
+-- update the existing row instead; EXCLUDED is the row proposed for insertion
+INSERT INTO t (id, n) VALUES (1, 5)
+  ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n;
+
+-- the SET expressions can mix the existing row and EXCLUDED, with an optional WHERE gate
+INSERT INTO t (id, n) VALUES (1, 5)
+  ON CONFLICT (id) DO UPDATE SET n = t.n + EXCLUDED.n WHERE t.n < 100;
+```
+
+`DO NOTHING` skips a conflicting row (and, with no conflict target, absorbs a
+collision on *any* unique index). `DO UPDATE` updates the existing row: bare or
+target-qualified columns (`n`, `t.n`) resolve to the existing row, and
+`EXCLUDED.<col>` to the value that would have been inserted; an optional `WHERE`
+gates the update. The command tag counts rows inserted *or* updated — skipped
+rows don't count — and a `RETURNING` clause projects the inserted and updated
+rows (not the skipped ones). `ON CONFLICT ON CONSTRAINT <name>` is not supported
+(SecantusDB has no named-constraint registry — name the column(s) instead), and
+`DO UPDATE` requires an explicit conflict target.
+
 ## Indexes
 
 `CREATE INDEX` (optionally `UNIQUE`) maps to a real Mongo secondary index on the
@@ -660,7 +690,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 
 | Area | Supported | Not yet |
 |---|---|---|
-| DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `ON CONFLICT` |
+| DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`), `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `ON CONFLICT ON CONSTRAINT` |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | non-recursive `WITH name AS (...)` (multiple, chained) on `SELECT` / set-op queries | `WITH RECURSIVE`, `WITH` on `INSERT`/`UPDATE`/`DELETE` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |

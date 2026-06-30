@@ -124,6 +124,24 @@ def test_insert_select_via_driver(server):
     conn.close()
 
 
+def test_on_conflict_via_driver(server):
+    # INSERT ... ON CONFLICT DO UPDATE upsert through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, n int)")
+    cur.execute("INSERT INTO t (id, n) VALUES (1, 5)")
+    cur.execute(
+        "INSERT INTO t (id, n) VALUES (1, 10) "
+        "ON CONFLICT (id) DO UPDATE SET n = t.n + EXCLUDED.n RETURNING id, n"
+    )
+    assert cur.fetchall() == ([1, 15],)
+    cur.execute("INSERT INTO t (id, n) VALUES (1, 99) ON CONFLICT (id) DO NOTHING")
+    assert cur.rowcount == 0
+    cur.execute("SELECT id, n FROM t ORDER BY id")
+    assert cur.fetchall() == ([1, 15],)
+    conn.close()
+
+
 def test_cte_via_driver(server):
     # WITH ... AS (...) over Mongo-written data, through the real driver.
     server.storage.insert(

@@ -332,8 +332,8 @@ def _run_insert(
                 f"returns {len(result.columns)}",
             )
         plan = planner.plan_insert_rows(stmt, table, result.rows)
-        return executor.execute_insert(plan, storage, db)
-    return executor.execute_insert(planner.plan_insert(stmt, table), storage, db)
+        return executor.execute_insert(plan, storage, db, catalog, session)
+    return executor.execute_insert(planner.plan_insert(stmt, table), storage, db, catalog, session)
 
 
 def run_inner_select(
