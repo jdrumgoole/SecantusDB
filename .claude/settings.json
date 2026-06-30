@@ -21,7 +21,8 @@
       "Bash(.venv/bin/python -m ruff *)",
       "Bash(.venv-test/bin/python -m ruff *)",
       "Bash(invoke lint*)",
-      "Bash(invoke fmt*)"
+      "Bash(invoke fmt*)",
+      "Bash(gh *)"
     ]
   }
 }
