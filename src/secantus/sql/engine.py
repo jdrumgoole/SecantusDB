@@ -284,6 +284,12 @@ def _run_select(
     table = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
     if table is None:
         raise errors.undefined_table(table_node.name)
+    # A WHERE with EXISTS or a correlated subquery can't lower to a pushdown
+    # filter — evaluate it per row (the inner query reads through the same
+    # storage view, with outer-row references resolved by the scalar evaluator).
+    if planner.where_needs_per_row(stmt):
+        plan = planner.plan_correlated_select(stmt, table)
+        return executor.execute_correlated_select(plan, storage, db, catalog, session)
     # A non-correlated WHERE subquery (`x IN (SELECT ...)`, `x = (SELECT ...)`) is
     # pre-evaluated by the planner, which runs the inner SELECT through the engine.
     subctx = planner.SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)

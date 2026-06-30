@@ -1317,9 +1317,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`engine.run_inner_select` ← `planner.SubqueryCtx`), so it may itself aggregate / filter; it
   must select exactly one column. Plumbed via the single-table `plan_select` path (a subquery in
   a GROUP BY/JOIN query's WHERE isn't wired yet → `0A000`). `$expr` / subquery filters can't use
-  a storage index (→ COLLSCAN). Still `0A000`: `EXISTS` / `NOT EXISTS`, **correlated**
-  subqueries (need per-row WHERE eval), function calls inside a comparison (`qty = abs(shipped)`),
-  and `<@`-style structural predicates.
+  a storage index (→ COLLSCAN). **EXISTS / correlated subqueries landed** (b45): a WHERE with
+  `EXISTS`/`NOT EXISTS` or a subquery that references the outer row can't push down, so
+  `planner.where_needs_per_row` routes it to `executor.execute_correlated_select`, which scans the
+  outer table and evaluates the whole WHERE per row via `secantus.sql.scalar` — the inner query
+  reads inner-table rows with outer-row references falling through (`scalar._inner_row_scopes` /
+  `_eval_exists` / `_eval_in`, aggregate inner projections reduced by `_SUBQUERY_AGG_REDUCERS`).
+  Correlation is single-table-outer only (an outer JOIN/GROUP BY with a correlated WHERE → `0A000`)
+  and the inner query is a simple `SELECT … FROM one_table [WHERE …]`; the per-row scan is
+  `O(outer × inner)` (no index use). Still `0A000`: function calls inside a comparison
+  (`qty = abs(shipped)`) and `<@`-style structural predicates.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the

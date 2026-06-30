@@ -126,6 +126,63 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
     )
 
 
+def execute_correlated_select(
+    plan: planner.CorrelatedSelectPlan, storage: Any, db: str, catalog: Catalog, session: Any
+) -> SQLResult:
+    """Execute a single-table SELECT whose WHERE references the outer row.
+
+    The WHERE can't push down to a Mongo filter, so we fetch every candidate row
+    (in ORDER BY order) and evaluate the predicate per row with the scalar
+    evaluator — a correlated subquery reads inner-table rows through the same
+    storage view, with outer-row references falling through to ``scope``."""
+    from secantus.sql import scalar
+
+    sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    table = plan.table
+    # Sort first (storage orders the scan), then filter — Python filtering keeps
+    # the order, so skip/limit slice the survivors in ORDER BY order.
+    docs = storage.find_matching(db, table.collection, {}, sort=plan.sort)
+
+    def make_scope(doc: dict[str, Any]):
+        # Only outer-table columns reach this scope; a correlated subquery's own
+        # inner columns are resolved inside scalar._inner_row_scopes.
+        def scope(node: Any) -> Any:
+            return get_path(doc, table.field_for(node.name))
+
+        return scope
+
+    def keep(doc: dict[str, Any]) -> bool:
+        result = scalar.evaluate(plan.where, make_scope(doc), sctx)
+        return bool(result) if result is not None else False
+
+    matched = [doc for doc in docs if keep(doc)]
+
+    if plan.count_star:
+        return SQLResult(
+            command_tag="SELECT 1",
+            columns=[ColumnDesc(plan.count_alias, "int8", typemap.PG_OID["int8"])],
+            rows=[(len(matched),)],
+            rowcount=1,
+        )
+
+    if plan.skip:
+        matched = matched[plan.skip :]
+    if plan.limit:
+        matched = matched[: plan.limit]
+
+    columns = [
+        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
+        for name, col in plan.out_columns
+    ]
+    rows = [
+        tuple(typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns)
+        for doc in matched
+    ]
+    return SQLResult(
+        command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
+    )
+
+
 def _scalar_ctx(storage: Any, db: str, sctx: Any) -> Any:
     """The ScalarContext for evaluating derived sub-plans — reuse the caller's
     when present, else build one over the (catalog-backed) storage."""
