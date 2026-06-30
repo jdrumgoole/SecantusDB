@@ -269,7 +269,8 @@ FROM sales GROUP BY region;
 ## Joins
 
 An `INNER` or `LEFT JOIN` with an equality `ON` compiles to a `$lookup`.
-Multiple joins chain — each table joins the base or an already-joined table:
+Multiple joins chain — each table joins the base or an already-joined table.
+`RIGHT` and `FULL OUTER` joins are supported between **two** tables:
 
 ```sql
 SELECT o.id, o.total, c.name
@@ -282,6 +283,16 @@ ORDER BY o.id;
 SELECT o.id, c.name
 FROM orders o
 LEFT JOIN customers c ON o.cust_id = c.id;
+
+-- RIGHT keeps unmatched right rows; FULL OUTER keeps unmatched rows from both
+-- sides (two-table only — a chain mixing in a RIGHT/FULL is rejected):
+SELECT c.name, o.id
+FROM orders o
+RIGHT JOIN customers c ON o.cust_id = c.id;
+
+SELECT c.name, o.id
+FROM orders o
+FULL JOIN customers c ON o.cust_id = c.id;
 
 -- Three (or more) tables — products joins via orders.prod_id:
 SELECT c.name, p.pname
@@ -697,7 +708,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY` | explicit frames (`ROWS`/`RANGE BETWEEN`), `NTILE`/`FIRST_VALUE`/..., window + `GROUP BY` |
-| Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL`/`CROSS`, non-equi / `OR` `ON` |
+| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `CROSS`, `RIGHT`/`FULL` in a 3+ table chain, non-equi / `OR` `ON` |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
