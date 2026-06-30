@@ -1312,8 +1312,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   no A match (an anti-join sub-pipeline that nests B under its alias so A's columns read NULL);
   `_build_outer_join_pipeline` / `_full_join_anti_branch` in the planner, `amap` kept in FROM order
   so `SELECT *` preserves Postgres column order. Works with WHERE / GROUP BY / aggregates / scalar
-  exprs. Still `0A000`: non-equi / `OR` join conditions,
-  `RIGHT`/`FULL` in a 3+ table chain, `CROSS` JOIN, subqueries, **computed GROUP BY *keys*** and
+  exprs. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
+  `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
+  foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
+  is a `42601`. Non-equi (`a.x < b.y`) and `OR` join conditions already rode the `$lookup` `let`/
+  `pipeline` form via `_OnTranslator` (the backlog was stale). Still `0A000`:
+  `RIGHT`/`FULL` in a 3+ table chain, subqueries, **computed GROUP BY *keys*** and
   **scalar expressions *over* an aggregate** (e.g. `SUM(x) * 2`), and **function calls inside a
   WHERE comparison** (the `$expr` path lowers columns + arithmetic, not function nodes —
   `WHERE upper(name) = 'X'` is `0A000`). SUM/MIN/MAX
