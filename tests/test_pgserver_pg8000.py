@@ -70,6 +70,23 @@ def test_crud_with_bound_parameters(server):
     conn.close()
 
 
+def test_returning_via_driver(server):
+    # RETURNING makes a DML statement emit a result set, so the driver fetches
+    # rows from INSERT / UPDATE / DELETE just like a SELECT.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, name text, n int)")
+    cur.execute("INSERT INTO t (id, name, n) VALUES (1, 'a', 10), (2, 'b', 20) RETURNING id, name")
+    assert cur.fetchall() == ([1, "a"], [2, "b"])
+    cur.execute("UPDATE t SET n = 99 WHERE id = 1 RETURNING id, n")
+    assert cur.fetchall() == ([1, 99],)
+    cur.execute("DELETE FROM t WHERE n > 50 RETURNING *")
+    assert cur.fetchall() == ([1, "a", 99],)
+    cur.execute("SELECT id FROM t ORDER BY id")
+    assert cur.fetchall() == ([2],)
+    conn.close()
+
+
 def test_types_roundtrip(server):
     conn = connect(server)
     cur = conn.cursor()
