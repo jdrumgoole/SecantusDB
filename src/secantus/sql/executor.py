@@ -8,6 +8,7 @@ the planner stays pure translation.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import bson
@@ -16,6 +17,34 @@ from secantus.paths import get_path
 from secantus.sql import errors, planner, typemap
 from secantus.sql.catalog import Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
+
+
+def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> None:
+    """Stable in-place sort with Postgres ORDER BY semantics.
+
+    ``key_of(item)`` returns the tuple of ordering-key values; ``specs`` is the
+    parallel list of ``(direction, nulls_first)`` (direction 1 asc / -1 desc).
+    NULLs sort to the front or back per ``nulls_first`` independent of direction —
+    Postgres orders NULL as though it were the largest value, so this can't be
+    delegated to Mongo's sort (which treats NULL/missing as the smallest)."""
+
+    def cmp(a: Any, b: Any) -> int:
+        ka, kb = key_of(a), key_of(b)
+        for i, (direction, nulls_first) in enumerate(specs):
+            x, y = ka[i], kb[i]
+            if x is None and y is None:
+                continue
+            if x is None:
+                return -1 if nulls_first else 1
+            if y is None:
+                return 1 if nulls_first else -1
+            if x == y:
+                continue
+            base = -1 if x < y else 1
+            return -base if direction == -1 else base
+        return 0
+
+    items.sort(key=functools.cmp_to_key(cmp))
 
 
 def execute_create_table(
@@ -232,14 +261,23 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
             rowcount=1,
         )
 
-    docs = storage.find_matching(
-        db,
-        plan.table.collection,
-        plan.filter,
-        skip=plan.skip,
-        limit=plan.limit,
-        sort=plan.sort,
-    )
+    if plan.order:
+        # NULL placement follows Postgres, not Mongo sort order, so order in
+        # Python; that also pulls OFFSET/LIMIT off the storage fetch.
+        docs = storage.find_matching(db, plan.table.collection, plan.filter)
+        _pg_sort(
+            docs,
+            lambda d: tuple(get_path(d, f) for f, _, _ in plan.order),
+            [(direction, nf) for _, direction, nf in plan.order],
+        )
+        if plan.skip:
+            docs = docs[plan.skip :]
+        if plan.limit:
+            docs = docs[: plan.limit]
+    else:
+        docs = storage.find_matching(
+            db, plan.table.collection, plan.filter, skip=plan.skip, limit=plan.limit
+        )
     columns = [
         ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
         for name, col in plan.out_columns
@@ -271,9 +309,7 @@ def execute_correlated_select(
 
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     table = plan.table
-    # Sort first (storage orders the scan), then filter — Python filtering keeps
-    # the order, so skip/limit slice the survivors in ORDER BY order.
-    docs = storage.find_matching(db, table.collection, {}, sort=plan.sort)
+    docs = storage.find_matching(db, table.collection, {})
 
     def make_scope(doc: dict[str, Any]):
         # Only outer-table columns reach this scope; a correlated subquery's own
@@ -297,6 +333,13 @@ def execute_correlated_select(
             rowcount=1,
         )
 
+    # Order the survivors (Postgres NULL placement), then slice OFFSET/LIMIT.
+    if plan.order:
+        _pg_sort(
+            matched,
+            lambda d: tuple(get_path(d, f) for f, _, _ in plan.order),
+            [(direction, nf) for _, direction, nf in plan.order],
+        )
     if plan.skip:
         matched = matched[plan.skip :]
     if plan.limit:
@@ -384,13 +427,11 @@ def _evaluated_value_rows(
     scored: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
     for doc in docs:
         scope = make_scope(doc)
-        keys = tuple(scalar.evaluate(oe, scope, sctx) for oe, _ in plan.order)
+        keys = tuple(scalar.evaluate(oe, scope, sctx) for oe, _, _ in plan.order)
         for vt in _expand_srf(plan, scope, sctx):
             scored.append((keys, vt))
 
-    for i in reversed(range(len(plan.order))):
-        direction = plan.order[i][1]
-        scored.sort(key=lambda r, i=i: (r[0][i] is None, r[0][i]), reverse=(direction == -1))
+    _pg_sort(scored, lambda r: r[0], [(direction, nf) for _, direction, nf in plan.order])
 
     rows = [vt for _, vt in scored]
     if plan.distinct:

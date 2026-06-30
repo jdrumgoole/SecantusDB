@@ -102,7 +102,9 @@ class ConstantSelectPlan:
 class SelectPlan:
     table: TableDef
     filter: dict[str, Any]
-    sort: dict[str, int] | None
+    # ORDER BY as (field_path, direction, nulls_first); realized by a
+    # Postgres-semantics Python sort in the executor.
+    order: list[tuple[str, int, bool]]
     limit: int
     skip: int
     out_columns: list[tuple[str, Column]] = field(default_factory=list)
@@ -119,7 +121,7 @@ class CorrelatedSelectPlan:
     table: TableDef
     where: Any  # exp.Expression — the raw WHERE predicate
     out_columns: list[tuple[str, Column]] = field(default_factory=list)
-    sort: dict[str, int] | None = None
+    order: list[tuple[str, int, bool]] = field(default_factory=list)
     limit: int = 0
     skip: int = 0
     count_star: bool = False
@@ -894,15 +896,52 @@ def _plan_on_conflict(stmt: exp.Insert, table: TableDef) -> OnConflict | None:
     )
 
 
-def _order_sort(stmt: exp.Expression, table: TableDef) -> dict[str, int] | None:
+def _nulls_first(o: exp.Ordered) -> bool:
+    """Whether NULLs sort ahead of non-NULLs for this ORDER BY term. sqlglot fills
+    ``nulls_first`` with Postgres's default when the clause is implicit (DESC →
+    first, ASC → last), and with the explicit value for ``NULLS FIRST/LAST``."""
+    nf = o.args.get("nulls_first")
+    return bool(nf) if nf is not None else bool(o.args.get("desc"))
+
+
+def _order_terms(stmt: exp.Expression, table: TableDef) -> list[tuple[str, int, bool]]:
+    """ORDER BY lowered to ``(field_path, direction, nulls_first)`` triples — the
+    single-table / correlated form, realized by a Postgres-semantics Python sort
+    in the executor (so NULL placement matches Postgres, not Mongo sort order)."""
     order = stmt.args.get("order")
     if order is None:
-        return None
+        return []
+    terms: list[tuple[str, int, bool]] = []
+    for o in order.expressions:
+        col = _column_name(o.this)
+        terms.append((table.field_for(col), -1 if o.args.get("desc") else 1, _nulls_first(o)))
+    return terms
+
+
+def _emit_pipeline_sort(pipeline: list[dict[str, Any]], terms: list[tuple[str, int, bool]]) -> None:
+    """Append a NULL-aware ``$sort`` for ``terms`` (``(field, direction,
+    nulls_first)``). Mongo's ``$sort`` orders NULL/missing as the lowest value, so
+    each term gets a companion ``$cond`` null-rank field sorted ahead of it — that
+    places NULLs first or last per ``nulls_first``, independent of direction, the
+    way Postgres does. The rank fields are dropped again after the sort."""
+    if not terms:
+        return
+    nullranks: dict[str, Any] = {}
     sort: dict[str, int] = {}
-    for ordered in order.expressions:
-        col = _column_name(ordered.this)
-        sort[table.field_for(col)] = -1 if ordered.args.get("desc") else 1
-    return sort
+    for k, (name, direction, nulls_first) in enumerate(terms):
+        nr = f"__nr_{k}"
+        nullranks[nr] = {
+            "$cond": [
+                {"$eq": [{"$ifNull": [f"${name}", None]}, None]},
+                0 if nulls_first else 1,
+                1 if nulls_first else 0,
+            ]
+        }
+        sort[nr] = 1
+        sort[name] = direction
+    pipeline.append({"$addFields": nullranks})
+    pipeline.append({"$sort": sort})
+    pipeline.append({"$unset": list(nullranks)})
 
 
 def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
@@ -963,7 +1002,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
         raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
 
     filt = _where_filter(stmt, table, subctx)
-    sort = _order_sort(stmt, table)
+    order = _order_terms(stmt, table)
     limit, skip = _limit_skip(stmt)
 
     count_alias = _count_star_alias(stmt)
@@ -971,7 +1010,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
         return SelectPlan(
             table=table,
             filter=filt,
-            sort=sort,
+            order=order,
             limit=limit,
             skip=skip,
             count_star=True,
@@ -980,7 +1019,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
     return SelectPlan(
         table=table,
         filter=filt,
-        sort=sort,
+        order=order,
         limit=limit,
         skip=skip,
         out_columns=_select_out_columns(stmt, table),
@@ -1070,7 +1109,7 @@ def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelec
         )
     if stmt.args.get("distinct"):
         raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
-    sort = _order_sort(stmt, table)
+    order = _order_terms(stmt, table)
     limit, skip = _limit_skip(stmt)
     from_node = stmt.find(exp.From)
     outer_alias = from_node.this.alias or None if from_node is not None else None
@@ -1079,7 +1118,7 @@ def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelec
         table=table,
         where=stmt.args["where"].this,
         out_columns=[] if count_alias is not None else _select_out_columns(stmt, table),
-        sort=sort,
+        order=order,
         limit=limit,
         skip=skip,
         count_star=count_alias is not None,
@@ -1205,7 +1244,7 @@ class EvaluatedSelectPlan:
     out_columns: list[tuple[str, str]]  # (output_name, type_tag)
     out_exprs: list[exp.Expression]  # parallel to out_columns; AST per output
     resolve: Resolve  # join resolver: Column node -> (field_path, tag)
-    order: list[tuple[exp.Expression, int]]  # (expr, direction)
+    order: list[tuple[exp.Expression, int, bool]]  # (expr, direction, nulls_first)
     distinct: bool
     limit: int
     skip: int
@@ -1445,11 +1484,11 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
         out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
-    order: list[tuple[exp.Expression, int]] = []
+    order: list[tuple[exp.Expression, int, bool]] = []
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
-            order.append((o.this, -1 if o.args.get("desc") else 1))
+            order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
     return EvaluatedSelectPlan(
         base_collection=table.collection,
@@ -2430,11 +2469,11 @@ def _build_evaluated_join(
         out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
 
-    order: list[tuple[exp.Expression, int]] = []
+    order: list[tuple[exp.Expression, int, bool]] = []
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
-            order.append((o.this, -1 if o.args.get("desc") else 1))
+            order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
     return EvaluatedSelectPlan(
         base_collection=base.collection,
@@ -2468,27 +2507,26 @@ def _append_join_tail(
     out_names = {n for n, _ in out_columns}
     distinct = bool(stmt.args.get("distinct"))
     order = stmt.args.get("order")
-    sort: dict[str, int] = {}
+    terms: list[tuple[str, int, bool]] = []
     hidden: list[str] = []
     if order is not None:
         for o in order.expressions:
             direction = -1 if o.args.get("desc") else 1
             name = _column_name(o.this)
             if name in out_names:
-                sort[name] = direction
+                key = name
             elif distinct:
                 raise errors.undefined_column(name)
             else:
                 path, _ = resolve(o.this)
-                hk = f"__ord_{len(hidden)}"
-                project[hk] = f"${path}"
-                hidden.append(hk)
-                sort[hk] = direction
+                key = f"__ord_{len(hidden)}"
+                project[key] = f"${path}"
+                hidden.append(key)
+            terms.append((key, direction, _nulls_first(o)))
     pipeline.append({"$project": project})
     if distinct:
         _append_distinct(pipeline, out_columns)
-    if sort:
-        pipeline.append({"$sort": sort})
+    _emit_pipeline_sort(pipeline, terms)
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})
@@ -2518,13 +2556,13 @@ def _append_sort_limit(
 ) -> None:
     order = stmt.args.get("order")
     if order is not None:
-        sort: dict[str, int] = {}
+        terms: list[tuple[str, int, bool]] = []
         for o in order.expressions:
             col = _column_name(o.this)
             if col not in valid_names:
                 raise errors.undefined_column(col)
-            sort[col] = -1 if o.args.get("desc") else 1
-        pipeline.append({"$sort": sort})
+            terms.append((col, -1 if o.args.get("desc") else 1, _nulls_first(o)))
+        _emit_pipeline_sort(pipeline, terms)
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})

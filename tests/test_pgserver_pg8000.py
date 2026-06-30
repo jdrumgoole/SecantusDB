@@ -157,16 +157,35 @@ def test_outer_join_via_driver(server):
     )
     conn = connect(server)
     cur = conn.cursor()
+    # ORDER BY ... NULLS LAST is now honored, so the server returns a stable order.
+    cur.execute("SELECT a.av, b.bv FROM a RIGHT JOIN b ON a._id = b.aid ORDER BY a.av NULLS LAST")
+    assert cur.fetchall() == (["a1", "b1"], [None, "b3"])
+    cur.execute(
+        "SELECT a.av, b.bv FROM a FULL JOIN b ON a._id = b.aid ORDER BY a.av NULLS LAST, b.bv"
+    )
+    assert cur.fetchall() == (["a1", "b1"], ["a2", None], [None, "b3"])
+    conn.close()
 
-    # Sort client-side with a null-safe key (the engine orders NULLs first, unlike
-    # Postgres NULLS LAST — an unrelated sort divergence).
-    def key(r):
-        return tuple((v is None, v) for v in r)
 
-    cur.execute("SELECT a.av, b.bv FROM a RIGHT JOIN b ON a._id = b.aid")
-    assert sorted(cur.fetchall(), key=key) == [["a1", "b1"], [None, "b3"]]
-    cur.execute("SELECT a.av, b.bv FROM a FULL JOIN b ON a._id = b.aid")
-    assert sorted(cur.fetchall(), key=key) == [["a1", "b1"], ["a2", None], [None, "b3"]]
+def test_nulls_ordering_via_driver(server):
+    # ORDER BY NULL placement (Postgres default + explicit NULLS FIRST/LAST).
+    server.storage.insert(
+        "db",
+        "t",
+        [
+            {"_id": bson.Int64(1), "n": bson.Int64(5)},
+            {"_id": bson.Int64(2)},
+            {"_id": bson.Int64(3), "n": bson.Int64(3)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT n FROM t ORDER BY n")  # ASC default -> NULLs last
+    assert cur.fetchall() == ([3], [5], [None])
+    cur.execute("SELECT n FROM t ORDER BY n DESC")  # DESC default -> NULLs first
+    assert cur.fetchall() == ([None], [5], [3])
+    cur.execute("SELECT n FROM t ORDER BY n NULLS FIRST")
+    assert cur.fetchall() == ([None], [3], [5])
     conn.close()
 
 
