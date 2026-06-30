@@ -2368,14 +2368,21 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return _infer_scalar_tag(node.this, resolve)
     if isinstance(node, exp.Window):
         func = node.this
-        if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count)):
+        if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count, exp.Ntile)):
             return "int8"
         if isinstance(func, exp.Avg):
             return "float8"
-        if (
-            isinstance(func, (exp.Sum, exp.Min, exp.Max, exp.Lag, exp.Lead))
-            and func.this is not None
-        ):
+        value_funcs = (
+            exp.Sum,
+            exp.Min,
+            exp.Max,
+            exp.Lag,
+            exp.Lead,
+            exp.FirstValue,
+            exp.LastValue,
+            exp.NthValue,
+        )
+        if isinstance(func, value_funcs) and func.this is not None:
             return _infer_scalar_tag(func.this, resolve)
         return "numeric"
     srf = _srf_of(node)
