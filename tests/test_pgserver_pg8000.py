@@ -142,6 +142,34 @@ def test_on_conflict_via_driver(server):
     conn.close()
 
 
+def test_outer_join_via_driver(server):
+    # RIGHT and FULL OUTER joins over Mongo-written data, through the real driver.
+    server.storage.insert(
+        "db", "a", [{"_id": bson.Int64(1), "av": "a1"}, {"_id": bson.Int64(2), "av": "a2"}]
+    )
+    server.storage.insert(
+        "db",
+        "b",
+        [
+            {"_id": bson.Int64(10), "aid": bson.Int64(1), "bv": "b1"},
+            {"_id": bson.Int64(11), "aid": bson.Int64(99), "bv": "b3"},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+
+    # Sort client-side with a null-safe key (the engine orders NULLs first, unlike
+    # Postgres NULLS LAST — an unrelated sort divergence).
+    def key(r):
+        return tuple((v is None, v) for v in r)
+
+    cur.execute("SELECT a.av, b.bv FROM a RIGHT JOIN b ON a._id = b.aid")
+    assert sorted(cur.fetchall(), key=key) == [["a1", "b1"], [None, "b3"]]
+    cur.execute("SELECT a.av, b.bv FROM a FULL JOIN b ON a._id = b.aid")
+    assert sorted(cur.fetchall(), key=key) == [["a1", "b1"], ["a2", None], [None, "b3"]]
+    conn.close()
+
+
 def test_cte_via_driver(server):
     # WITH ... AS (...) over Mongo-written data, through the real driver.
     server.storage.insert(

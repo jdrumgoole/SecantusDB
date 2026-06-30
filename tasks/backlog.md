@@ -1306,8 +1306,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`+`/`-`/`*`/`/`/`%`, PG int-division / mod semantics), `||`, and the common functions
   (`upper`/`lower`/`length`/`trim`/`substring`/`concat`/`abs`/`round`/`ceil`/`floor`/`power`/
   `coalesce`/`nullif`/`greatest`/`least`) now evaluate per row via the evaluated-select path
-  (single-table and over a join). Still `0A000`: non-equi / `OR` join conditions,
-  `RIGHT`/`FULL`/`CROSS` JOIN, window functions, subqueries, **computed GROUP BY *keys*** and
+  (single-table and over a join). **Two-table `RIGHT` / `FULL OUTER JOIN`** now land (b53):
+  `$lookup` is left-driven, so `A RIGHT JOIN B` is planned as `B LEFT JOIN A` (drive from B,
+  preserve unmatched B) and `A FULL JOIN B` is the LEFT join from A `$unionWith` the B rows with
+  no A match (an anti-join sub-pipeline that nests B under its alias so A's columns read NULL);
+  `_build_outer_join_pipeline` / `_full_join_anti_branch` in the planner, `amap` kept in FROM order
+  so `SELECT *` preserves Postgres column order. Works with WHERE / GROUP BY / aggregates / scalar
+  exprs. Still `0A000`: non-equi / `OR` join conditions,
+  `RIGHT`/`FULL` in a 3+ table chain, `CROSS` JOIN, subqueries, **computed GROUP BY *keys*** and
   **scalar expressions *over* an aggregate** (e.g. `SUM(x) * 2`), and **function calls inside a
   WHERE comparison** (the `$expr` path lowers columns + arithmetic, not function nodes —
   `WHERE upper(name) = 'X'` is `0A000`). SUM/MIN/MAX

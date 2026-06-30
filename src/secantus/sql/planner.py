@@ -1947,13 +1947,28 @@ def _build_join_pipeline(
     derived: list[DerivedTable] = []
     fr = stmt.find(exp.From).this
     base_alias, base = _resolve_source(fr, db, catalog, storage, derived)
+    joins = stmt.args["joins"]
+
+    # ``$lookup`` is inherently left-driven (for each base doc, fetch matching
+    # foreign docs), so RIGHT / FULL OUTER need the base swapped and (for FULL) an
+    # anti-join union. That only composes cleanly for a single two-table join — a
+    # chain mixing in a RIGHT/FULL is rejected rather than silently mis-joined.
+    if any(str(jn.args.get("side") or "").upper() in ("RIGHT", "FULL") for jn in joins):
+        if len(joins) != 1:
+            raise errors.feature_not_supported(
+                "RIGHT / FULL OUTER JOIN is only supported between two tables"
+            )
+        return _build_outer_join_pipeline(
+            stmt, base_alias, base, joins[0], db, catalog, storage, derived
+        )
+
     amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
     pipeline: list[dict[str, Any]] = []
 
     # Each JOIN compiles to a $lookup + $unwind. The lookup's localField may point
     # into an already-joined alias (a chain like a⋈b⋈c where c joins on b), which
     # Mongo's dotted localField handles since b was unwound into the doc.
-    for jn in stmt.args["joins"]:
+    for jn in joins:
         jt = jn.this
         join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
         side = str(jn.args.get("side") or "").upper()
@@ -1971,6 +1986,75 @@ def _build_join_pipeline(
     if where is not None:
         pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
     return base, amap, resolve, pipeline, derived
+
+
+def _build_outer_join_pipeline(
+    stmt: exp.Select,
+    a_alias: str,
+    a_table: TableDef,
+    jn: exp.Expression,
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> tuple[
+    TableDef, dict[str, tuple[str, TableDef]], Resolve, list[dict[str, Any]], list[DerivedTable]
+]:
+    """Build the prefix for a single ``A <RIGHT|FULL> JOIN B ON …``.
+
+    ``A RIGHT JOIN B`` is ``B LEFT JOIN A``: drive the pipeline from B, look A up,
+    and preserve unmatched B rows. ``A FULL JOIN B`` is the LEFT join from A
+    (preserving unmatched A) unioned with the B rows that found no A match
+    (reshaped so B's columns sit under its alias and A's columns read as NULL).
+    The ``amap`` is always inserted in FROM order (A then B) so ``SELECT *`` keeps
+    Postgres's left-to-right column order regardless of which side drives."""
+    side = str(jn.args.get("side") or "").upper()
+    b_alias, b_table = _resolve_source(jn.this, db, catalog, storage, derived)
+    on = jn.args.get("on")
+    if on is None:
+        raise errors.feature_not_supported("JOIN without ON is not supported")
+
+    if side == "RIGHT":
+        amap = {a_alias: ("join", a_table), b_alias: ("base", b_table)}
+        pipeline = [
+            _lookup_stage(on, a_alias, a_table, amap),
+            {"$unwind": {"path": f"${a_alias}", "preserveNullAndEmptyArrays": True}},
+        ]
+        base = b_table
+    else:  # FULL
+        amap = {a_alias: ("base", a_table), b_alias: ("join", b_table)}
+        pipeline = [
+            _lookup_stage(on, b_alias, b_table, amap),
+            {"$unwind": {"path": f"${b_alias}", "preserveNullAndEmptyArrays": True}},
+            {
+                "$unionWith": {
+                    "coll": b_table.collection,
+                    "pipeline": _full_join_anti_branch(on, a_alias, a_table, b_alias, b_table),
+                }
+            },
+        ]
+        base = a_table
+
+    resolve = _join_resolver(amap)
+    where = stmt.args.get("where")
+    if where is not None:
+        pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
+    return base, amap, resolve, pipeline, derived
+
+
+def _full_join_anti_branch(
+    on: exp.Expression, a_alias: str, a_table: TableDef, b_alias: str, b_table: TableDef
+) -> list[dict[str, Any]]:
+    """The FULL-join's right anti-join arm: B rows with no A match, reshaped to the
+    main branch's layout. Driving from B, look A up; keep only the B rows whose
+    lookup came back empty; then nest the whole B doc under its alias so ``b.col``
+    paths resolve and A's (base) bare-field paths are absent (→ NULL)."""
+    amap_b = {b_alias: ("base", b_table)}
+    return [
+        _lookup_stage(on, a_alias, a_table, amap_b),
+        {"$match": {a_alias: {"$size": 0}}},
+        {"$replaceWith": {b_alias: "$$ROOT"}},
+    ]
 
 
 def _plan_join_select(
