@@ -1371,8 +1371,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (single-table, pipeline/join, set-op). CTEs materialize in order (later may reference earlier);
   names are statement-scoped (overlay, no catalog mutation). `describe_statement` returns NoData for a
   `WITH` query (resolving columns would require executing the CTEs), so the extended protocol relies
-  on Execute's RowDescription. **Still `0A000`:** `WITH RECURSIVE`, and `WITH` on
-  `INSERT`/`UPDATE`/`DELETE` (only `SELECT` / set-op queries).
+  on Execute's RowDescription. **`WITH RECURSIVE` landed** (b56): `engine._run_recursive_cte` evaluates
+  a CTE whose body is a `UNION [ALL]` of an anchor + a recursive term (detected by
+  `_is_recursive_cte` — the right arm references the CTE name) via semi-naive iteration — run the anchor,
+  then repeatedly run the recursive term against just the prior step's new rows (re-registered under the
+  CTE name) until empty. `UNION` dedups vs all rows seen (cyclic graphs terminate); `UNION ALL` keeps
+  every row, guarded by `_MAX_RECURSION_ROWS` (1M → `54001`). Optional column aliases (`name(a,b)`,
+  `_cte_column_aliases`) rename the output and now apply to non-recursive CTEs too (`_register_cte`).
+  A bare integer/bool literal in a SELECT list now types from its value (`_infer_scalar_tag` →
+  `_infer_value_tag`) so `SELECT 0 AS lvl` rides the wire as an int, not text. **Still `0A000`:**
+  `WITH` on `INSERT`/`UPDATE`/`DELETE` (only `SELECT` / set-op queries).
 - [ ] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
   `engine._run_insert`: the source query (a SELECT / set operation; may join / aggregate / CTE) runs
   via `_run_query`, and its result rows map positionally onto the target columns through the shared

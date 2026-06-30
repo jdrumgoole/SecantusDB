@@ -408,8 +408,7 @@ def _run_with(
     in every path (single-table, pipeline/join, set operations). CTEs are
     materialized in order, so a later CTE may reference an earlier one."""
     with_node = _own_with(stmt)
-    if with_node.args.get("recursive"):
-        raise errors.feature_not_supported("WITH RECURSIVE is not supported")
+    recursive = bool(with_node.args.get("recursive"))
     if not isinstance(stmt, (exp.Select, exp.SetOperation)):
         raise errors.feature_not_supported(
             "WITH is supported only with SELECT / set-operation queries"
@@ -422,24 +421,146 @@ def _run_with(
         name = cte.alias
         if not name:
             raise errors.feature_not_supported("a CTE must be named")
-        result = _run_query(cte.this, backend, db, cte_catalog, session)
-        col_names = [c.name for c in result.columns]
-        backend.register_ephemeral(
-            name, [dict(zip(col_names, row, strict=True)) for row in result.rows]
+        col_aliases = _cte_column_aliases(cte)
+        if recursive and _is_recursive_cte(cte, name):
+            result = _run_recursive_cte(
+                cte, name, col_aliases, backend, db, cte_catalog, cte_defs, session
+            )
+        else:
+            result = _run_query(cte.this, backend, db, cte_catalog, session)
+        _register_cte(backend, cte_defs, name, result.columns, result.rows, col_aliases)
+
+    with_node.pop()  # detach the WITH so the main query plans as a plain statement
+    return _run_query(stmt, backend, db, cte_catalog, session)
+
+
+# Guard against a runaway recursive CTE (a cyclic graph under UNION ALL recurses
+# forever). Postgres relies on the user, but a surrogate must fail loudly rather
+# than hang.
+_MAX_RECURSION_ROWS = 1_000_000
+
+
+def _cte_column_aliases(cte: exp.Expression) -> list[str]:
+    """The explicit column names of ``WITH name(a, b, …) AS (…)``, or ``[]``."""
+    ta = cte.args.get("alias")
+    return [c.name for c in ta.columns] if ta is not None and ta.columns else []
+
+
+def _is_recursive_cte(cte: exp.Expression, name: str) -> bool:
+    """A CTE is recursive when its body is a UNION whose recursive term references
+    the CTE's own name (a ``WITH RECURSIVE`` may still hold non-recursive CTEs)."""
+    body = cte.this
+    if not isinstance(body, exp.SetOperation):
+        return False
+    return any(t.name == name for t in body.right.find_all(exp.Table))
+
+
+def _register_cte(
+    backend: Any,
+    cte_defs: dict[str, TableDef],
+    name: str,
+    columns: list[Any],
+    rows: list[tuple[Any, ...]],
+    col_aliases: list[str],
+) -> None:
+    """Materialize a CTE's rows into an ephemeral collection and record its
+    TableDef. Explicit column aliases (``WITH name(a, b) AS …``) rename the inner
+    query's output columns; otherwise the inner names carry through."""
+    if col_aliases and len(col_aliases) != len(columns):
+        raise errors.SQLError(
+            "42601",
+            f'WITH query "{name}" has {len(col_aliases)} columns available '
+            f"but {len(columns)} columns specified",
         )
-        # reflected=True so any column resolves; the explicit columns carry the
-        # inner query's names + types (and make `SELECT *` / an empty CTE work).
+    names = col_aliases or [c.name for c in columns]
+    backend.register_ephemeral(name, [dict(zip(names, row, strict=True)) for row in rows])
+    # reflected=True so any column resolves; the explicit columns carry the
+    # inner query's names + types (and make `SELECT *` / an empty CTE work).
+    cte_defs[name] = TableDef(
+        name=name,
+        collection=name,
+        columns=[
+            Column(nm, c.type_tag, nm, pk=False, nullable=True)
+            for nm, c in zip(names, columns, strict=True)
+        ],
+        reflected=True,
+    )
+
+
+def _run_recursive_cte(
+    cte: exp.Expression,
+    name: str,
+    col_aliases: list[str],
+    backend: Any,
+    db: str,
+    cte_catalog: Catalog,
+    cte_defs: dict[str, TableDef],
+    session: Session,
+) -> SQLResult:
+    """Evaluate a recursive CTE by semi-naive iteration: run the anchor term for
+    the seed rows, then repeatedly run the recursive term against just the rows
+    produced by the previous step (registered under the CTE name) until it yields
+    nothing new. ``UNION`` dedups against all rows seen; ``UNION ALL`` keeps every
+    row."""
+    body = cte.this
+    if not isinstance(body, exp.Union):
+        raise errors.feature_not_supported(
+            "a recursive CTE must be UNION [ALL] of an anchor and a recursive term"
+        )
+    union_all = not bool(body.args.get("distinct"))
+
+    anchor = _run_query(body.left, backend, db, cte_catalog, session)
+    columns = anchor.columns
+    if col_aliases and len(col_aliases) != len(columns):
+        raise errors.SQLError(
+            "42601",
+            f'WITH query "{name}" has {len(columns)} columns available '
+            f"but {len(col_aliases)} columns specified",
+        )
+    names = col_aliases or [c.name for c in columns]
+    all_rows: list[tuple[Any, ...]] = list(anchor.rows)
+    seen = {_setop_key(r) for r in all_rows}
+    if not union_all:
+        all_rows = _dedup_rows(all_rows)
+        working = list(all_rows)
+    else:
+        working = list(all_rows)
+
+    while working:
+        backend.register_ephemeral(name, [dict(zip(names, row, strict=True)) for row in working])
         cte_defs[name] = TableDef(
             name=name,
             collection=name,
             columns=[
-                Column(c.name, c.type_tag, c.name, pk=False, nullable=True) for c in result.columns
+                Column(nm, c.type_tag, nm, pk=False, nullable=True)
+                for nm, c in zip(names, columns, strict=True)
             ],
             reflected=True,
         )
+        step = _run_query(body.right, backend, db, cte_catalog, session)
+        if len(step.columns) != len(columns):
+            raise errors.SQLError(
+                "42601", f'recursive query "{name}" column count does not match the anchor'
+            )
+        fresh: list[tuple[Any, ...]] = []
+        for row in step.rows:
+            if union_all:
+                fresh.append(row)
+            else:
+                key = _setop_key(row)
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(row)
+        all_rows.extend(fresh)
+        if len(all_rows) > _MAX_RECURSION_ROWS:
+            raise errors.SQLError(
+                "54001",
+                f'recursive query "{name}" exceeded {_MAX_RECURSION_ROWS} rows '
+                "(possible infinite recursion)",
+            )
+        working = fresh
 
-    with_node.pop()  # detach the WITH so the main query plans as a plain statement
-    return _run_query(stmt, backend, db, cte_catalog, session)
+    return SQLResult(command_tag=f"SELECT {len(all_rows)}", columns=columns, rows=all_rows)
 
 
 def _run_set_operation(
