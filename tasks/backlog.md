@@ -1359,6 +1359,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   leftmost arm so the extended protocol's Describe works. Arity mismatch → `42601`. **Limits:** no
   cross-arm type reconciliation (columns/types taken verbatim from the first arm); `ORDER BY` after
   a set op only accepts an output column name or ordinal, not an arbitrary expression.
+- [ ] **Non-recursive CTEs landed** (b49). `WITH name AS (...) [, ...] <query>` in
+  `engine._run_with`: each CTE is materialized to rows (run through `_run_query`) and registered as
+  an ephemeral collection on a `CatalogBackend`, with a `_CTECatalog` overlay mapping CTE names to
+  TableDefs built from each inner query's result shape; the `WITH` is stripped (`node.pop()`) and the
+  main query runs against that backend + overlay, so CTE names resolve like tables in every path
+  (single-table, pipeline/join, set-op). CTEs materialize in order (later may reference earlier);
+  names are statement-scoped (overlay, no catalog mutation). `describe_statement` returns NoData for a
+  `WITH` query (resolving columns would require executing the CTEs), so the extended protocol relies
+  on Execute's RowDescription. **Still `0A000`:** `WITH RECURSIVE`, and `WITH` on
+  `INSERT`/`UPDATE`/`DELETE` (only `SELECT` / set-op queries).
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the

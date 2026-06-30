@@ -321,6 +321,27 @@ SELECT n FROM a UNION ALL SELECT n FROM b ORDER BY 1 LIMIT 10;
 The combine happens in Python over each arm's result rows, so it composes with
 any query the arms can express (joins, aggregates, subqueries).
 
+## Common table expressions (WITH)
+
+A `WITH name AS (...) [, ...] <query>` prefix defines one or more named,
+non-recursive CTEs. Each CTE is materialized to rows once and then resolves like
+a table in the main query — so a CTE composes with everything: filters, joins,
+`GROUP BY`, and set operations. CTEs materialize in order, so a later one may
+reference an earlier one. The CTE name is scoped to its statement:
+
+```sql
+WITH recent AS (SELECT * FROM orders WHERE created > '2024-01-01')
+SELECT region, count(*) FROM recent GROUP BY region;
+
+-- chained, and joined against a real table:
+WITH big AS (SELECT cust_id, total FROM orders WHERE total > 100),
+     vip AS (SELECT cust_id FROM big GROUP BY cust_id HAVING count(*) > 3)
+SELECT c.name FROM vip JOIN customers c ON vip.cust_id = c.id;
+```
+
+`WITH RECURSIVE` is not supported, and a `WITH` prefix is accepted only on a
+`SELECT` / set-operation query (not on `INSERT` / `UPDATE` / `DELETE`).
+
 ## Reflected tables and jsonb (the dual-protocol payoff)
 
 A collection with **no `CREATE TABLE`** is still queryable. SecantusDB samples
@@ -610,6 +631,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `INSERT ... SELECT` |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
+| CTEs | non-recursive `WITH name AS (...)` (multiple, chained) on `SELECT` / set-op queries | `WITH RECURSIVE`, `WITH` on `INSERT`/`UPDATE`/`DELETE` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | window functions, `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
