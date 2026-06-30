@@ -183,6 +183,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$last" => op_first_last(arg, ctx, false),
         "$concatArrays" => op_concat_arrays(arg, ctx),
         "$reverseArray" => op_reverse_array(arg, ctx),
+        "$sortArray" => op_sort_array(arg, ctx),
         "$in" => op_in(arg, ctx),
         "$slice" => op_slice(arg, ctx),
         "$indexOfArray" => op_index_of_array(arg, ctx),
@@ -1653,6 +1654,81 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
             Ok(Bson::Double((nf * factor).trunc() / factor))
         }
     }
+}
+
+// The sort key for one `$sortArray` element under a `sortBy` field: the field
+// value for a document element (missing -> null), else the whole element. Mirrors
+// `expressions._make_sort_key`.
+fn sort_array_field_value(elem: &Bson, field: &str) -> Bson {
+    match elem {
+        Bson::Document(d) => paths::get_path(d, field).cloned().unwrap_or(Bson::Null),
+        other => other.clone(),
+    }
+}
+
+// `$sortArray`: {input, sortBy}. `sortBy` is `1`/`-1` (sort whole elements) or a
+// `{field: dir, …}` document (sort by fields). Sorting uses BSON sort order
+// (`order::cmp`, the same order as `$sort` / Python's `_SortKey`) and is stable.
+// Defers when any sort value isn't totally orderable (bool / NaN / Decimal128 /
+// …) — `order::cmp`'s precondition — matching the "defer to Python" engine
+// contract. Mirrors `expressions._op_sort_array`.
+fn op_sort_array(arg: &Bson, ctx: &Ctx) -> R {
+    let spec = arg.as_document().ok_or(Fallback)?;
+    let (Some(input), Some(sort_by)) = (spec.get("input"), spec.get("sortBy")) else {
+        return Err(Fallback); // Python raises: requires {input, sortBy}
+    };
+    let mut out = match eval(input, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Array(a) => a,
+        _ => return Err(Fallback), // Python raises: input must be an array
+    };
+    match sort_by {
+        Bson::Int32(_) | Bson::Int64(_) => {
+            if !out.iter().all(crate::order::is_sortable) {
+                return Err(Fallback);
+            }
+            let desc = as_int_like(sort_by) == Some(-1);
+            // `cmp(b, a)` for descending keeps equal elements in original order
+            // (stable), matching Python's `sorted(reverse=True)`.
+            out.sort_by(|a, b| {
+                if desc {
+                    crate::order::cmp(b, a)
+                } else {
+                    crate::order::cmp(a, b)
+                }
+            });
+        }
+        Bson::Document(fields) => {
+            // bson's Document iterator isn't double-ended, so collect to reverse.
+            let field_list: Vec<(&String, &Bson)> = fields.iter().collect();
+            for (field, _) in &field_list {
+                if !out
+                    .iter()
+                    .all(|e| crate::order::is_sortable(&sort_array_field_value(e, field)))
+                {
+                    return Err(Fallback);
+                }
+            }
+            // Reversed multi-pass stable sort (sort by the last field first), so
+            // earlier fields take precedence — mirrors the Python impl.
+            for (field, direction) in field_list.iter().rev() {
+                let desc = as_int_like(direction) == Some(-1);
+                out.sort_by(|a, b| {
+                    let o = crate::order::cmp(
+                        &sort_array_field_value(a, field),
+                        &sort_array_field_value(b, field),
+                    );
+                    if desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                });
+            }
+        }
+        _ => return Err(Fallback), // Python raises: sortBy must be int or document
+    }
+    Ok(Bson::Array(out))
 }
 
 // --- $dateToParts (UTC; ignores timezone/iso8601 like the Python impl) ---
