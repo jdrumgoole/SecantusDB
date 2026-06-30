@@ -1367,6 +1367,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `WITH` query (resolving columns would require executing the CTEs), so the extended protocol relies
   on Execute's RowDescription. **Still `0A000`:** `WITH RECURSIVE`, and `WITH` on
   `INSERT`/`UPDATE`/`DELETE` (only `SELECT` / set-op queries).
+- [ ] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
+  `engine._run_insert`: the source query (a SELECT / set operation; may join / aggregate / CTE) runs
+  via `_run_query`, and its result rows map positionally onto the target columns through the shared
+  `planner._insert_doc` (same coercion / NOT NULL / PK→`_id` path as VALUES, factored out alongside
+  `insert_target_columns` / `plan_insert_rows`). Column-count mismatch (target vs query) → `42601`;
+  `RETURNING` works (the source is materialized first, so a self-insert reads a stable snapshot).
+  **Still `0A000`:** `WITH` before an `INSERT` (the source SELECT's own `WITH` is fine), `ON CONFLICT`,
+  `MERGE`.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the

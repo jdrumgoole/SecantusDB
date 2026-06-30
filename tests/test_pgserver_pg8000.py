@@ -87,6 +87,23 @@ def test_returning_via_driver(server):
     conn.close()
 
 
+def test_insert_select_via_driver(server):
+    # INSERT ... SELECT over Mongo-written data, through the real driver.
+    server.storage.insert(
+        "db",
+        "src",
+        [{"_id": bson.Int64(i), "n": bson.Int64(v)} for i, v in enumerate([10, 20, 30], 1)],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE dst (id bigint primary key, n int)")
+    cur.execute("INSERT INTO dst (id, n) SELECT _id, n FROM src WHERE n >= 20")
+    assert cur.rowcount == 2
+    cur.execute("SELECT id, n FROM dst ORDER BY id")
+    assert cur.fetchall() == ([2, 20], [3, 30])
+    conn.close()
+
+
 def test_cte_via_driver(server):
     # WITH ... AS (...) over Mongo-written data, through the real driver.
     server.storage.insert(
