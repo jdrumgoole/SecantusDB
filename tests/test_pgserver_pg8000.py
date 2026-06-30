@@ -107,6 +107,29 @@ def test_window_functions_via_driver(server):
     conn.close()
 
 
+def test_window_frames_via_driver(server):
+    # Explicit ROWS frame + value/NTILE functions over the real driver.
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(i), "amount": bson.Int64(a)}
+            for i, a in enumerate([10, 20, 30, 40], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT _id, "
+        "SUM(amount) OVER (ORDER BY _id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS run, "
+        "FIRST_VALUE(amount) OVER (ORDER BY _id) AS fv, "
+        "NTILE(2) OVER (ORDER BY _id) AS nt "
+        "FROM sales ORDER BY _id"
+    )
+    assert cur.fetchall() == ([1, 10, 10, 1], [2, 30, 10, 1], [3, 50, 10, 2], [4, 70, 10, 2])
+    conn.close()
+
+
 def test_insert_select_via_driver(server):
     # INSERT ... SELECT over Mongo-written data, through the real driver.
     server.storage.insert(

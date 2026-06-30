@@ -369,7 +369,8 @@ SELECT c.name FROM vip JOIN customers c ON vip.cust_id = c.id;
 ## Window functions
 
 `func(...) OVER (PARTITION BY … ORDER BY …)` computes a value per row from its
-partition. Supported: `ROW_NUMBER`, `RANK`, `DENSE_RANK`; the aggregate windows
+partition. Supported: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`; the value
+functions `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE`; the aggregate windows
 `SUM` / `COUNT` / `AVG` / `MIN` / `MAX`; and `LAG` / `LEAD`. An aggregate window
 with no `ORDER BY` aggregates the whole partition; with an `ORDER BY` it's a
 running aggregate under the default `RANGE` frame (rows tied on the order key
@@ -383,9 +384,23 @@ SELECT id, region,
 FROM sales;
 ```
 
-Explicit frame clauses (`ROWS` / `RANGE BETWEEN …`) and `WITH RECURSIVE` are not
-supported; a window function can't be combined with `GROUP BY` in the same
-SELECT.
+Explicit frames are supported — `ROWS` frames with any
+`UNBOUNDED` / `CURRENT ROW` / `n PRECEDING` / `n FOLLOWING` bound, and `RANGE`
+frames with `UNBOUNDED` / `CURRENT ROW` bounds (a numeric `RANGE` offset is
+rejected — use `ROWS`):
+
+```sql
+SELECT id,
+       SUM(amount)  OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS sliding,
+       SUM(amount)  OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)                 AS running,
+       LAST_VALUE(amount) OVER (PARTITION BY region ORDER BY id
+                                ROWS BETWEEN UNBOUNDED PRECEDING
+                                         AND UNBOUNDED FOLLOWING)               AS region_last
+FROM sales;
+```
+
+`WITH RECURSIVE` is not supported, and a window function can't be combined with
+`GROUP BY` in the same SELECT.
 
 ## Reflected tables and jsonb (the dual-protocol payoff)
 
@@ -710,7 +725,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
-| Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY` | explicit frames (`ROWS`/`RANGE BETWEEN`), `NTILE`/`FIRST_VALUE`/..., window + `GROUP BY` |
+| Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `CROSS`, `RIGHT`/`FULL` in a 3+ table chain, non-equi / `OR` `ON` |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |

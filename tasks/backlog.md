@@ -1388,8 +1388,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   window can nest inside a larger expression). Supported: `ROW_NUMBER`/`RANK`/`DENSE_RANK`,
   `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` (whole-partition, or running under the default RANGE frame — peers
   tied on the order key share the cumulative value), `LAG`/`LEAD` (offset + default). `_infer_scalar_tag`
-  types them (rank/count→int8, avg→float8, sum/min/max/lag/lead→arg tag). **Still `0A000`/unsupported:**
-  explicit frames (`ROWS`/`RANGE BETWEEN` → `spec` present), `NTILE`/`FIRST_VALUE`/`NTH_VALUE`/...,
+  types them (rank/count→int8, avg→float8, sum/min/max/lag/lead→arg tag). **Frames + value/rank funcs
+  landed** (b55): `NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, and explicit frames — `window._frames`
+  builds each row's inclusive `[lo, hi]` index range; ROWS frames take any `UNBOUNDED`/`CURRENT ROW`/
+  `n PRECEDING`/`n FOLLOWING` bound, RANGE frames take `UNBOUNDED`/`CURRENT ROW` (peer-group) bounds.
+  Aggregate windows and the value functions reduce/select over the frame; rank-like funcs ignore it.
+  **Still `0A000`/unsupported:** numeric `RANGE` offset (needs interval arithmetic on the order key),
   window + `GROUP BY` in one SELECT (routes to the group path and errors), and `ORDER BY <window alias>`
   (the general alias-in-ORDER-BY gap in the evaluated path).
 - [ ] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …

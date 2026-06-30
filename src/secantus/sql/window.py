@@ -8,11 +8,16 @@ within the partition, then apply the function — and stores the result on each
 row under a synthetic field. The scalar evaluator then resolves an ``exp.Window``
 node to its precomputed value (so a window may also nest inside an expression).
 
-Supported: ``ROW_NUMBER`` / ``RANK`` / ``DENSE_RANK``; aggregate windows
-``SUM`` / ``COUNT`` / ``AVG`` / ``MIN`` / ``MAX`` (whole-partition, or a running
-aggregate under the default ``RANGE`` frame when the window has its own
-``ORDER BY``); and ``LAG`` / ``LEAD``. Explicit frame clauses (``ROWS`` /
-``RANGE BETWEEN``) are rejected.
+Supported: ``ROW_NUMBER`` / ``RANK`` / ``DENSE_RANK`` / ``NTILE``; the value
+functions ``FIRST_VALUE`` / ``LAST_VALUE`` / ``NTH_VALUE``; aggregate windows
+``SUM`` / ``COUNT`` / ``AVG`` / ``MIN`` / ``MAX``; and ``LAG`` / ``LEAD``.
+Explicit frame clauses are supported: ``ROWS`` frames with any
+``UNBOUNDED`` / ``CURRENT ROW`` / ``n PRECEDING`` / ``n FOLLOWING`` bound, and
+``RANGE`` frames with ``UNBOUNDED`` / ``CURRENT ROW`` bounds (a numeric
+``RANGE`` offset, which needs interval arithmetic on the order key, is
+rejected). The default frame matches Postgres: whole partition with no
+``ORDER BY``, else ``RANGE UNBOUNDED PRECEDING`` to ``CURRENT ROW`` (peers tied
+on the order key share the value).
 """
 
 from __future__ import annotations
@@ -77,11 +82,8 @@ def _eval_window(w: exp.Window, docs: list[dict[str, Any]], scope_of: Any, sctx:
     """Return the window's value for each doc (parallel to ``docs``)."""
     from secantus.sql import scalar
 
-    if w.args.get("spec") is not None:
-        raise errors.feature_not_supported(
-            "explicit window frames (ROWS/RANGE BETWEEN) are not supported"
-        )
     func = w.this
+    spec = w.args.get("spec")
     partition_by = w.args.get("partition_by") or []
     order_node = w.args.get("order")
     order_terms = (
@@ -96,7 +98,7 @@ def _eval_window(w: exp.Window, docs: list[dict[str, Any]], scope_of: Any, sctx:
         okeys = [
             tuple(scalar.evaluate(oe, scope_of(d), sctx) for oe, _ in order_terms) for d in ordered
         ]
-        values = _window_values(func, ordered, okeys, bool(order_terms), scope_of, sctx)
+        values = _window_values(func, spec, ordered, okeys, bool(order_terms), scope_of, sctx)
         for d, v in zip(ordered, values, strict=True):
             result[id(d)] = v
     return [result[id(d)] for d in docs]
@@ -146,24 +148,144 @@ def _null_key(v: Any) -> tuple[int, Any]:
 
 def _window_values(
     func: exp.Expression,
+    spec: exp.Expression | None,
     ordered: list[dict[str, Any]],
     okeys: list[tuple],
     has_order: bool,
     scope_of: Any,
     sctx: Any,
 ) -> list[Any]:
-
     n = len(ordered)
+    # Rank-like functions are frame-insensitive (Postgres ignores any frame on
+    # them), so they don't consult the frame at all.
     if isinstance(func, exp.RowNumber):
         return [i + 1 for i in range(n)]
     if isinstance(func, (exp.Rank, exp.DenseRank)):
         return _rank_values(func, okeys)
+    if isinstance(func, exp.Ntile):
+        return _ntile_values(func, n, scope_of, sctx)
     if isinstance(func, (exp.Lag, exp.Lead)):
         return _lag_lead_values(func, ordered, scope_of, sctx)
+
+    # Everything else is frame-sensitive: build each row's frame [lo, hi].
+    frames = _frames(spec, n, okeys, has_order)
+    if isinstance(func, (exp.FirstValue, exp.LastValue, exp.NthValue)):
+        return _value_window(func, ordered, frames, scope_of, sctx)
     agg = _AGG_WINDOWS.get(type(func))
     if agg is not None:
-        return _agg_window_values(agg, func, ordered, okeys, has_order, scope_of, sctx)
+        return _agg_window_values(agg, func, ordered, frames, scope_of, sctx)
     raise errors.feature_not_supported(f"window function {type(func).__name__} is not supported")
+
+
+def _ntile_values(func: exp.Expression, n: int, scope_of: Any, sctx: Any) -> list[Any]:
+    """NTILE(k): split the ordered partition into ``k`` buckets as evenly as
+    possible (the first ``n % k`` buckets get one extra row) and label each row
+    with its 1-based bucket number."""
+    from secantus.sql import scalar
+
+    if n == 0:
+        return []
+    buckets = int(scalar.evaluate(func.this, scope_of({}), sctx))
+    if buckets <= 0:
+        raise errors.feature_not_supported("NTILE requires a positive bucket count")
+    base, rem = divmod(n, buckets)
+    out: list[int] = []
+    for b in range(1, buckets + 1):
+        size = base + (1 if b <= rem else 0)
+        out.extend([b] * size)
+    return out
+
+
+def _frames(
+    spec: exp.Expression | None, n: int, okeys: list[tuple], has_order: bool
+) -> list[tuple[int, int]]:
+    """The inclusive ``[lo, hi]`` frame index range for each row. With no explicit
+    frame the Postgres default applies: the whole partition when there's no
+    ORDER BY, else ``RANGE UNBOUNDED PRECEDING`` to ``CURRENT ROW`` (peer-shared)."""
+    if spec is None:
+        if not has_order:
+            return [(0, n - 1) for _ in range(n)]
+        return [(0, _peer_end(okeys, i, n)) for i in range(n)]
+    kind = (spec.args.get("kind") or "RANGE").upper()
+    start, start_side = spec.args.get("start"), spec.args.get("start_side")
+    # A frame with only a start bound runs through CURRENT ROW.
+    end = spec.args.get("end") if "end" in spec.args else "CURRENT ROW"
+    end_side = spec.args.get("end_side")
+    frames: list[tuple[int, int]] = []
+    for i in range(n):
+        if kind == "ROWS":
+            lo = _rows_bound(start, start_side, i, n, is_start=True)
+            hi = _rows_bound(end, end_side, i, n, is_start=False)
+        else:
+            lo = _range_bound(start, start_side, i, n, okeys, is_start=True)
+            hi = _range_bound(end, end_side, i, n, okeys, is_start=False)
+        frames.append((max(0, lo), min(n - 1, hi)))
+    return frames
+
+
+def _peer_end(okeys: list[tuple], i: int, n: int) -> int:
+    j = i
+    while j + 1 < n and okeys[j + 1] == okeys[i]:
+        j += 1
+    return j
+
+
+def _peer_start(okeys: list[tuple], i: int) -> int:
+    j = i
+    while j > 0 and okeys[j - 1] == okeys[i]:
+        j -= 1
+    return j
+
+
+def _rows_bound(val: Any, side: Any, i: int, n: int, *, is_start: bool) -> int:
+    if val is None or val == "CURRENT ROW":
+        return i
+    if val == "UNBOUNDED":
+        return 0 if side == "PRECEDING" else n - 1
+    k = int(val.this) if isinstance(val, exp.Literal) else int(val)
+    return i - k if side == "PRECEDING" else i + k
+
+
+def _range_bound(val: Any, side: Any, i: int, n: int, okeys: list[tuple], *, is_start: bool) -> int:
+    if isinstance(val, exp.Literal):
+        raise errors.feature_not_supported(
+            "RANGE frame with a numeric offset is not supported (use ROWS)"
+        )
+    if val is None or val == "CURRENT ROW":
+        return _peer_start(okeys, i) if is_start else _peer_end(okeys, i, n)
+    if val == "UNBOUNDED":
+        return 0 if side == "PRECEDING" else n - 1
+    raise errors.feature_not_supported(f"unsupported RANGE frame bound: {val}")
+
+
+def _value_window(
+    func: exp.Expression,
+    ordered: list[dict[str, Any]],
+    frames: list[tuple[int, int]],
+    scope_of: Any,
+    sctx: Any,
+) -> list[Any]:
+    """FIRST_VALUE / LAST_VALUE / NTH_VALUE: read the argument at the first, last,
+    or n-th (1-based) row of each row's frame (NULL when the frame is short)."""
+    from secantus.sql import scalar
+
+    vals = [scalar.evaluate(func.this, scope_of(d), sctx) for d in ordered]
+    nth = None
+    if isinstance(func, exp.NthValue):
+        nth = int(scalar.evaluate(func.args["offset"], scope_of(ordered[0]), sctx))
+    out: list[Any] = []
+    for lo, hi in frames:
+        if lo > hi:
+            out.append(None)
+            continue
+        if isinstance(func, exp.FirstValue):
+            out.append(vals[lo])
+        elif isinstance(func, exp.LastValue):
+            out.append(vals[hi])
+        else:  # NthValue — 1-based within the frame
+            idx = lo + nth - 1
+            out.append(vals[idx] if lo <= idx <= hi else None)
+    return out
 
 
 def _rank_values(func: exp.Expression, okeys: list[tuple]) -> list[Any]:
@@ -204,8 +326,7 @@ def _agg_window_values(
     agg: str,
     func: exp.Expression,
     ordered: list[dict[str, Any]],
-    okeys: list[tuple],
-    has_order: bool,
+    frames: list[tuple[int, int]],
     scope_of: Any,
     sctx: Any,
 ) -> list[Any]:
@@ -214,23 +335,7 @@ def _agg_window_values(
     arg = None if isinstance(func.this, (exp.Star, type(None))) else func.this
     count_star = agg == "count" and arg is None
     raw = [None if count_star else scalar.evaluate(arg, scope_of(d), sctx) for d in ordered]
-    n = len(ordered)
-    out: list[Any] = [None] * n
-    if not has_order:
-        whole = _reduce(agg, raw, count_star)
-        return [whole] * n
-    # Default RANGE frame: rows with equal ORDER BY keys (peers) share the value
-    # computed through the end of their peer group (UNBOUNDED PRECEDING → CURRENT).
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and okeys[j + 1] == okeys[i]:
-            j += 1
-        gval = _reduce(agg, raw[: j + 1], count_star)
-        for t in range(i, j + 1):
-            out[t] = gval
-        i = j + 1
-    return out
+    return [_reduce(agg, raw[lo : hi + 1], count_star) for lo, hi in frames]
 
 
 def _reduce(agg: str, values: list[Any], count_star: bool) -> Any:
