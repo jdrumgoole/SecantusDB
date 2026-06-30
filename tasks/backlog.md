@@ -1305,8 +1305,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `RIGHT`/`FULL`/`CROSS` JOIN, window functions, subqueries, **computed GROUP BY *keys*** and
   **scalar expressions *over* an aggregate** (e.g. `SUM(x) * 2`), and **function calls inside a
   WHERE comparison** (the `$expr` path lowers columns + arithmetic, not function nodes —
-  `WHERE upper(name) = 'X'` is `0A000`). `DISTINCT` with aggregates is also `0A000`. SUM/MIN/MAX
+  `WHERE upper(name) = 'X'` is `0A000`). SUM/MIN/MAX
   result typing is approximate (uses the column's tag; AVG → float8; arithmetic → numeric).
+  **`DISTINCT` aggregates landed** (b48): `COUNT`/`SUM`/`AVG(DISTINCT col)` compile to a
+  `$addToSet` accumulator plus a post-`$group` `$addFields` that reduces the set
+  (`_distinct_reduction`: `$size`+`$filter` for count, `$reduce` for sum, `$reduce`/`$size`+`$cond`
+  for avg; NULLs filtered to match SQL). `MIN`/`MAX(DISTINCT)` run the ordinary accumulator (a set's
+  extremum equals the raw extremum). Wired in both the single-table (`_plan_group_select`) and
+  join (`_plan_join_group_select`) paths via the shared `_register_distinct_agg`; `_aggregate_of` /
+  `_join_aggregate_of` now return `(func, col, distinct)`. **Still `0A000`:** a `DISTINCT` aggregate
+  inside `HAVING` (the SELECT-list reduction stage isn't shared with the HAVING `$match`).
 - [ ] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
   literal` keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is
   a constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`

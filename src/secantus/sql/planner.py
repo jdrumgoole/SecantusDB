@@ -1126,14 +1126,20 @@ _HAVING_CMP: dict[type, tuple[str, str]] = {
 }
 
 
-def _aggregate_of(node: exp.Expression) -> tuple[str, str | None] | None:
-    """If ``node`` (or its alias target) is an aggregate, return (func, column)."""
+def _aggregate_of(node: exp.Expression) -> tuple[str, str | None, bool] | None:
+    """If ``node`` (or its alias target) is an aggregate, return
+    ``(func, column, distinct)``. ``column`` is None for ``COUNT(*)``; the
+    argument of a ``COUNT(DISTINCT x)`` is unwrapped from its ``exp.Distinct``."""
     inner = node.this if isinstance(node, exp.Alias) else node
     for cls, name in _AGG_CLASSES.items():
         if isinstance(inner, cls):
             arg = inner.this
+            distinct = isinstance(arg, exp.Distinct)
+            if distinct:
+                exprs = arg.expressions
+                arg = exprs[0] if exprs else None
             col = _column_name(arg) if isinstance(arg, exp.Column) else None
-            return name, col
+            return name, col, distinct
     return None
 
 
@@ -1223,7 +1229,7 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     # A lone COUNT(*) (no GROUP BY) is served by the simpler find path.
     if len(stmt.expressions) == 1:
         only = _aggregate_of(stmt.expressions[0])
-        if only is not None and only == ("count", None):
+        if only is not None and only == ("count", None, False):
             return False
     return True
 
@@ -1416,6 +1422,57 @@ def _accumulator(func: str, col: str | None, table: TableDef) -> tuple[dict[str,
     return _accumulator_for(func, table.field_for(col), table.type_for(col))
 
 
+# DISTINCT changes the result only for these — MIN/MAX of a set equal MIN/MAX of
+# the raw values, so a DISTINCT min/max just runs the ordinary accumulator.
+_DISTINCT_FUNCS = {"count", "sum", "avg"}
+
+
+def _agg_out_tag(func: str, tag: str | None) -> str:
+    if func == "count":
+        return "int8"
+    if func == "sum":
+        return tag if tag in ("int4", "int8", "numeric", "float8") else "float8"
+    if func == "avg":
+        return "float8"
+    return tag or "text"
+
+
+def _distinct_reduction(func: str, set_field: str) -> dict[str, Any]:
+    """Reduce a ``$addToSet`` result (at ``set_field``, e.g. ``$tmp``) to the
+    DISTINCT aggregate value, dropping NULLs (SQL aggregates ignore NULL)."""
+    nonnull = {"$filter": {"input": set_field, "as": "v", "cond": {"$ne": ["$$v", None]}}}
+    if func == "count":
+        return {"$size": nonnull}
+    total = {
+        "$reduce": {"input": nonnull, "initialValue": 0, "in": {"$add": ["$$value", "$$this"]}}
+    }
+    if func == "sum":
+        return total
+    if func == "avg":
+        cnt = {"$size": nonnull}
+        return {"$cond": [{"$eq": [cnt, 0]}, None, {"$divide": [total, cnt]}]}
+    raise errors.feature_not_supported(f"DISTINCT is not supported for {func}()")
+
+
+def _register_distinct_agg(
+    func: str,
+    field: str,
+    tag: str | None,
+    alias: str | None,
+    names: _NameAllocator,
+    accumulators: dict[str, Any],
+    reductions: dict[str, Any],
+) -> tuple[str, str]:
+    """Wire a DISTINCT count/sum/avg: a ``$addToSet`` accumulator collects the
+    distinct values; a post-``$group`` ``$addFields`` reduces the set. Returns
+    the output field name and its type tag."""
+    set_name = names.fresh(f"{alias or func}__distinct")
+    accumulators[set_name] = {"$addToSet": f"${field}"}
+    fname = names.fresh(alias or func)
+    reductions[fname] = _distinct_reduction(func, f"${set_name}")
+    return fname, _agg_out_tag(func, tag)
+
+
 class _NameAllocator:
     def __init__(self) -> None:
         self._used: set[str] = set()
@@ -1438,10 +1495,11 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     group_id = {c: f"${table.field_for(c)}" for c in group_cols} or None
 
     accumulators: dict[str, Any] = {}
+    reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
     names = _NameAllocator()
-    agg_fields: dict[tuple[str, str | None], str] = {}
+    agg_fields: dict[tuple[str, str | None, bool], str] = {}
 
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -1453,11 +1511,24 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             project[fname] = f"${fname}"
             out_columns.append((fname, "json"))
         elif agg is not None:
-            func, col = agg
-            acc, tag = _accumulator(func, col, table)
-            fname = names.fresh(alias or func)
-            accumulators[fname] = acc
-            agg_fields[(func, col)] = fname
+            func, col, distinct = agg
+            if distinct and func in _DISTINCT_FUNCS:
+                if col is None:
+                    raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                fname, tag = _register_distinct_agg(
+                    func,
+                    table.field_for(col),
+                    table.type_for(col),
+                    alias,
+                    names,
+                    accumulators,
+                    reductions,
+                )
+            else:
+                acc, tag = _accumulator(func, col, table)
+                fname = names.fresh(alias or func)
+                accumulators[fname] = acc
+            agg_fields[(func, col, distinct)] = fname
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         else:
@@ -1484,6 +1555,9 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         else None
     )
     pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+    # Reduce any DISTINCT sets to their scalar value before HAVING / projection.
+    if reductions:
+        pipeline.append({"$addFields": reductions})
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
@@ -1525,7 +1599,12 @@ def _having_to_match(
         agg = _aggregate_of(term)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
-        acc, tag = _accumulator(agg[0], agg[1], table)
+        func, col, distinct = agg
+        if distinct and func in _DISTINCT_FUNCS:
+            raise errors.feature_not_supported(
+                f"DISTINCT inside {func}() is not supported in HAVING"
+            )
+        acc, tag = _accumulator(func, col, table)
         if agg not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc
@@ -1819,14 +1898,21 @@ def _plan_join_select(
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
 
 
-def _join_aggregate_of(node: exp.Expression) -> tuple[str, exp.Expression | None] | None:
+def _join_aggregate_of(
+    node: exp.Expression,
+) -> tuple[str, exp.Expression | None, bool] | None:
     """Like ``_aggregate_of`` but keeps the argument NODE so the join resolver can
-    map a qualified column (``b.amt``). A None argument means ``COUNT(*)``."""
+    map a qualified column (``b.amt``). Returns ``(func, arg_node, distinct)``; a
+    None argument means ``COUNT(*)`` and a ``DISTINCT`` argument is unwrapped."""
     inner = node.this if isinstance(node, exp.Alias) else node
     for cls, name in _AGG_CLASSES.items():
         if isinstance(inner, cls):
             arg = inner.this
-            return name, (None if arg is None or isinstance(arg, exp.Star) else arg)
+            distinct = isinstance(arg, exp.Distinct)
+            if distinct:
+                exprs = arg.expressions
+                arg = exprs[0] if exprs else None
+            return name, (None if arg is None or isinstance(arg, exp.Star) else arg), distinct
     return None
 
 
@@ -1839,9 +1925,11 @@ def _join_accumulator(
     return _accumulator_for(func, path, tag)
 
 
-def _agg_key(func: str, arg: exp.Expression | None, resolve: Resolve) -> str:
+def _agg_key(
+    func: str, arg: exp.Expression | None, resolve: Resolve, distinct: bool = False
+) -> str:
     """A hashable identity for an aggregate (for HAVING accumulator dedup)."""
-    return f"{func}:{'*' if arg is None else resolve(arg)[0]}"
+    return f"{func}:{'d' if distinct else ''}:{'*' if arg is None else resolve(arg)[0]}"
 
 
 def _plan_join_group_select(
@@ -1866,6 +1954,7 @@ def _plan_join_group_select(
     group_id = group_keys or None
 
     accumulators: dict[str, Any] = {}
+    reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
     names = _NameAllocator()
@@ -1882,11 +1971,19 @@ def _plan_join_group_select(
             project[fname] = f"${fname}"
             out_columns.append((fname, "json"))
         elif agg is not None:
-            func, arg = agg
-            acc, tag = _join_accumulator(func, arg, resolve)
-            fname = names.fresh(alias or func)
-            accumulators[fname] = acc
-            agg_fields[_agg_key(func, arg, resolve)] = fname
+            func, arg, distinct = agg
+            if distinct and func in _DISTINCT_FUNCS:
+                if arg is None:
+                    raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                path, tag = resolve(arg)
+                fname, tag = _register_distinct_agg(
+                    func, path, tag, alias, names, accumulators, reductions
+                )
+            else:
+                acc, tag = _join_accumulator(func, arg, resolve)
+                fname = names.fresh(alias or func)
+                accumulators[fname] = acc
+            agg_fields[_agg_key(func, arg, resolve, distinct)] = fname
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         else:
@@ -1915,6 +2012,8 @@ def _plan_join_group_select(
         else None
     )
     pipeline.append({"$group": {"_id": group_id, **accumulators}})
+    if reductions:
+        pipeline.append({"$addFields": reductions})
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
@@ -1963,9 +2062,13 @@ def _join_having_to_match(
         agg = _join_aggregate_of(term)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
-        func, arg = agg
+        func, arg, distinct = agg
+        if distinct and func in _DISTINCT_FUNCS:
+            raise errors.feature_not_supported(
+                f"DISTINCT inside {func}() is not supported in HAVING"
+            )
         acc, tag = _join_accumulator(func, arg, resolve)
-        key = _agg_key(func, arg, resolve)
+        key = _agg_key(func, arg, resolve, distinct)
         if key not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc

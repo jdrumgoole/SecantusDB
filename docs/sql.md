@@ -244,6 +244,18 @@ SELECT COUNT(*), SUM(amount) FROM sales;          -- whole-table aggregate
 SELECT COUNT(id) FROM sales;                      -- COUNT(col) excludes NULLs
 ```
 
+`DISTINCT` inside an aggregate is supported for `COUNT` / `SUM` / `AVG` (and is a
+no-op for `MIN` / `MAX`, which are unaffected by duplicates). It deduplicates the
+non-NULL values within each group before applying the function:
+
+```sql
+SELECT COUNT(DISTINCT customer_id) AS unique_buyers FROM orders;
+SELECT region, COUNT(DISTINCT product) AS skus, SUM(DISTINCT price) AS price_sum
+FROM sales GROUP BY region;
+```
+
+(`DISTINCT` inside an aggregate is not yet supported in a `HAVING` clause.)
+
 ## Joins
 
 An `INNER` or `LEFT JOIN` with an equality `ON` compiles to a `$lookup`.
@@ -600,7 +612,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
-| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
+| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | window functions, `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL`/`CROSS`, non-equi / `OR` `ON` |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
