@@ -1373,8 +1373,7 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `planner._insert_doc` (same coercion / NOT NULL / PK→`_id` path as VALUES, factored out alongside
   `insert_target_columns` / `plan_insert_rows`). Column-count mismatch (target vs query) → `42601`;
   `RETURNING` works (the source is materialized first, so a self-insert reads a stable snapshot).
-  **Still `0A000`:** `WITH` before an `INSERT` (the source SELECT's own `WITH` is fine), `ON CONFLICT`,
-  `MERGE`.
+  **Still `0A000`:** `WITH` before an `INSERT` (the source SELECT's own `WITH` is fine), `MERGE`.
 - [ ] **Window functions landed** (b51). `func(...) OVER (PARTITION BY … ORDER BY …)` routes through
   the evaluated-select path (a window expr already trips `_stmt_needs_evaluation`). `secantus.sql.window`
   computes each window over the fetched rows — partition (repr-keyed groups), order within partition
@@ -1387,6 +1386,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   explicit frames (`ROWS`/`RANGE BETWEEN` → `spec` present), `NTILE`/`FIRST_VALUE`/`NTH_VALUE`/...,
   window + `GROUP BY` in one SELECT (routes to the group path and errors), and `ORDER BY <window alias>`
   (the general alias-in-ORDER-BY gap in the evaluated path).
+- [ ] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
+  [WHERE …]` via `planner._plan_on_conflict` (an `OnConflict` on `InsertPlan`) + `executor.
+  _execute_insert_on_conflict`: each proposed row probes the conflict target with `find_matching`; a
+  clean row inserts, a conflicting row is skipped (`DO NOTHING`) or updated in place (`DO UPDATE`). SET
+  expressions evaluate per-row through `scalar.evaluate` with a scope binding `EXCLUDED.<col>` to the
+  proposed row and bare/target-qualified columns to the existing row (so `n = t.n + EXCLUDED.n` works);
+  an optional `WHERE` gates the update. A bare `ON CONFLICT DO NOTHING` (no target) inserts and swallows
+  any `11000` duplicate. Command tag counts rows inserted *or* updated (skipped don't count); `RETURNING`
+  projects the inserted + updated rows. **Still unsupported:** `ON CONFLICT ON CONSTRAINT <name>` (→
+  `0A000`; no named-constraint registry), `DO UPDATE` with no conflict target (→ `42601`), `MERGE`.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the

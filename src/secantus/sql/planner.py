@@ -64,10 +64,31 @@ class DropIndexPlan:
 
 
 @dataclass
+class OnConflict:
+    """An ``ON CONFLICT`` clause lowered for execution.
+
+    ``conflict_fields`` are the storage field names of the conflict target
+    (``ON CONFLICT (a, b)``); empty when none was given — a bare
+    ``ON CONFLICT DO NOTHING`` matches *any* unique conflict, which the executor
+    handles by inserting and swallowing the duplicate-key error. For
+    ``action == "update"``, ``set_exprs`` is the list of
+    ``(field, type_tag, raw expr)`` SET assignments — evaluated per conflicting
+    row with ``EXCLUDED`` bound to the proposed insert row and the target table
+    bound to the existing row — and ``where`` is an optional predicate that gates
+    the update."""
+
+    action: str  # "nothing" | "update"
+    conflict_fields: list[str]
+    set_exprs: list[tuple[str, str, Any]] = field(default_factory=list)
+    where: Any = None
+
+
+@dataclass
 class InsertPlan:
     table: TableDef
     docs: list[dict[str, Any]]
     returning: list[tuple[str, Column]] | None = None
+    on_conflict: OnConflict | None = None
 
 
 @dataclass
@@ -799,7 +820,12 @@ def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
                 f"INSERT has {len(cells)} values but {len(col_names)} columns"
             )
         docs.append(_insert_doc(col_names, [_literal(c) for c in cells], table))
-    return InsertPlan(table=table, docs=docs, returning=_returning_columns(stmt, table))
+    return InsertPlan(
+        table=table,
+        docs=docs,
+        returning=_returning_columns(stmt, table),
+        on_conflict=_plan_on_conflict(stmt, table),
+    )
 
 
 def plan_insert_rows(stmt: exp.Insert, table: TableDef, rows: list[tuple[Any, ...]]) -> InsertPlan:
@@ -808,7 +834,64 @@ def plan_insert_rows(stmt: exp.Insert, table: TableDef, rows: list[tuple[Any, ..
     row's values map positionally onto the target columns."""
     col_names = insert_target_columns(stmt, table)
     docs = [_insert_doc(col_names, list(row), table) for row in rows]
-    return InsertPlan(table=table, docs=docs, returning=_returning_columns(stmt, table))
+    return InsertPlan(
+        table=table,
+        docs=docs,
+        returning=_returning_columns(stmt, table),
+        on_conflict=_plan_on_conflict(stmt, table),
+    )
+
+
+def _ordered_target(node: exp.Expression) -> exp.Expression:
+    """Unwrap an ``ON CONFLICT (col)`` key, which sqlglot wraps in ``Ordered``."""
+    return node.this if isinstance(node, exp.Ordered) else node
+
+
+def _plan_on_conflict(stmt: exp.Insert, table: TableDef) -> OnConflict | None:
+    """Lower an ``ON CONFLICT`` clause to an :class:`OnConflict`, or None.
+
+    Supports ``DO NOTHING`` (with or without a conflict target) and
+    ``DO UPDATE SET … [WHERE …]`` with a column conflict target. ``ON CONSTRAINT
+    <name>`` is rejected — we have no named-constraint registry, so the user must
+    name the conflicting column(s)."""
+    clause = stmt.args.get("conflict")
+    if clause is None:
+        return None
+    if clause.args.get("constraint") is not None:
+        raise errors.feature_not_supported(
+            "ON CONFLICT ON CONSTRAINT is not supported; name the conflict column(s) instead"
+        )
+    action = clause.args.get("action")
+    action_text = (action.name if action is not None else "").upper()
+    conflict_fields = [
+        table.field_for(_column_name(_ordered_target(k)))
+        for k in (clause.args.get("conflict_keys") or [])
+    ]
+    if "NOTHING" in action_text:
+        return OnConflict(action="nothing", conflict_fields=conflict_fields)
+    if "UPDATE" not in action_text:
+        raise errors.feature_not_supported(f"unsupported ON CONFLICT action: {action_text}")
+    if not conflict_fields:
+        # Postgres requires an arbiter index for DO UPDATE — i.e. a conflict
+        # target — so it knows which row to update.
+        raise errors.syntax_error("ON CONFLICT DO UPDATE requires a conflict target")
+    set_exprs: list[tuple[str, str, Any]] = []
+    for assignment in clause.args.get("expressions") or []:
+        if not isinstance(assignment, exp.EQ):
+            raise errors.feature_not_supported(
+                f"unsupported ON CONFLICT SET assignment: {assignment.sql()}"
+            )
+        col_name = _column_name(assignment.this)
+        set_exprs.append(
+            (table.field_for(col_name), table.type_for(col_name), assignment.expression)
+        )
+    where_node = clause.args.get("where")
+    return OnConflict(
+        action="update",
+        conflict_fields=conflict_fields,
+        set_exprs=set_exprs,
+        where=where_node.this if where_node is not None else None,
+    )
 
 
 def _order_sort(stmt: exp.Expression, table: TableDef) -> dict[str, int] | None:

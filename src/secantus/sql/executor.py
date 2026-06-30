@@ -92,7 +92,15 @@ def _returning_result(
     return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
 
 
-def execute_insert(plan: planner.InsertPlan, storage: Any, db: str) -> SQLResult:
+def execute_insert(
+    plan: planner.InsertPlan,
+    storage: Any,
+    db: str,
+    catalog: Catalog | None = None,
+    session: Any = None,
+) -> SQLResult:
+    if plan.on_conflict is not None:
+        return _execute_insert_on_conflict(plan, storage, db, catalog, session)
     if plan.returning is not None:
         # Pin an ``_id`` on every doc up front so the in-hand list is the
         # authoritative inserted set to project from (storage may deep-copy on
@@ -101,17 +109,110 @@ def execute_insert(plan: planner.InsertPlan, storage: Any, db: str) -> SQLResult
             doc.setdefault("_id", bson.ObjectId())
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
-        first = write_errors[0]
-        if first.get("code") == 11000:
-            raise errors.unique_violation(
-                f'duplicate key value violates unique constraint on "{plan.table.name}"'
-            )
-        raise errors.SQLError("XX000", first.get("errmsg", "insert failed"))
+        _raise_write_error(write_errors[0], plan.table)
     if plan.returning is not None:
         return _returning_result(
             plan.docs[:inserted], plan.returning, f"INSERT 0 {inserted}", inserted
         )
     return SQLResult(command_tag=f"INSERT 0 {inserted}", rowcount=inserted)
+
+
+def _raise_write_error(err: dict[str, Any], table: planner.TableDef) -> None:
+    if err.get("code") == 11000:
+        raise errors.unique_violation(
+            f'duplicate key value violates unique constraint on "{table.name}"'
+        )
+    raise errors.SQLError("XX000", err.get("errmsg", "insert failed"))
+
+
+def _execute_insert_on_conflict(
+    plan: planner.InsertPlan, storage: Any, db: str, catalog: Catalog | None, session: Any
+) -> SQLResult:
+    """Execute ``INSERT … ON CONFLICT``. Each proposed row is probed against the
+    conflict target: a clean row inserts; a conflicting row is skipped
+    (``DO NOTHING``) or updated in place (``DO UPDATE``). The command tag counts
+    rows inserted *or* updated (matching Postgres); skipped rows don't count.
+    ``RETURNING`` projects the inserted and updated rows, not the skipped ones."""
+    from secantus.sql import scalar
+
+    oc = plan.on_conflict
+    coll = plan.table.collection
+    sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    affected = 0
+    result_docs: list[dict[str, Any]] = []
+    for doc in plan.docs:
+        if plan.returning is not None:
+            doc.setdefault("_id", bson.ObjectId())
+        existing = _find_conflict(storage, db, coll, oc, doc)
+        if existing is None:
+            inserted, write_errors = storage.insert(db, coll, [doc])
+            if write_errors:
+                # A bare ``DO NOTHING`` (no conflict target) absorbs any unique
+                # collision — including one on an index other than the probed
+                # target; with a target, a collision elsewhere is still an error.
+                if not oc.conflict_fields and write_errors[0].get("code") == 11000:
+                    continue
+                _raise_write_error(write_errors[0], plan.table)
+            affected += inserted
+            if inserted:
+                result_docs.append(doc)
+            continue
+        if oc.action == "nothing":
+            continue
+        updated = _apply_conflict_update(plan.table, storage, db, oc, existing, doc, sctx)
+        if updated is not None:
+            affected += 1
+            result_docs.append(updated)
+    tag = f"INSERT 0 {affected}"
+    if plan.returning is not None:
+        return _returning_result(result_docs, plan.returning, tag, affected)
+    return SQLResult(command_tag=tag, rowcount=affected)
+
+
+def _find_conflict(
+    storage: Any, db: str, coll: str, oc: planner.OnConflict, doc: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The existing row that ``doc`` would conflict with on the conflict target,
+    or None. A row with any target field unset can't collide (a fresh PK is
+    unique), so it short-circuits to an insert."""
+    if not oc.conflict_fields or any(f not in doc for f in oc.conflict_fields):
+        return None
+    found = storage.find_matching(db, coll, {f: doc[f] for f in oc.conflict_fields}, limit=1)
+    return found[0] if found else None
+
+
+def _apply_conflict_update(
+    table: planner.TableDef,
+    storage: Any,
+    db: str,
+    oc: planner.OnConflict,
+    existing: dict[str, Any],
+    excluded: dict[str, Any],
+    sctx: Any,
+) -> dict[str, Any] | None:
+    """Apply a ``DO UPDATE`` to the conflicting ``existing`` row. ``EXCLUDED``
+    references resolve to the proposed ``excluded`` row; bare / target-qualified
+    columns to the existing row. Returns the post-update doc, or None when a
+    ``WHERE`` predicate gates the update out (the row is left untouched)."""
+    import copy
+
+    from secantus.sql import scalar
+
+    def scope(node: Any) -> Any:
+        field = table.field_for(node.name)
+        tbl = (node.table or "").lower()
+        source = excluded if tbl == "excluded" else existing
+        return source.get(field)
+
+    if oc.where is not None and not scalar._truthy(scalar.evaluate(oc.where, scope, sctx)):
+        return None
+    set_doc: dict[str, Any] = {}
+    for field, type_tag, expr in oc.set_exprs:
+        set_doc[field] = typemap.coerce(scalar.evaluate(expr, scope, sctx), type_tag)
+    storage.update_matching(db, table.collection, {"_id": existing["_id"]}, {"$set": set_doc})
+    updated = copy.deepcopy(existing)
+    updated.update(set_doc)
+    return updated
 
 
 def execute_constant_select(plan: planner.ConstantSelectPlan) -> SQLResult:
