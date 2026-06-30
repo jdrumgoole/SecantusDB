@@ -19,6 +19,36 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Capped-collection eviction survives a backup taken mid-stream
+
+A capped collection restored from a `backupArchive` could evict the wrong
+document on its next insert — dropping the freshly-inserted row instead of the
+oldest one. The cause was a stale recovery hint: the oplog-meta row that records
+the next insertion sequence is only refreshed on `hello`, `prune_oplog`, and
+`close` (the per-write path stopped re-persisting it because it WT-rollbacks
+under concurrent writers), so a checkpoint taken between two refreshes captures a
+sequence counter that lags the actual data. On reopen the server *trusted* that
+stale value, re-minting an already-used natural-order sequence; the collision
+overwrote a live document's entry in the insertion-order index and corrupted
+capped FIFO eviction. The symptom was load- and timing-dependent — it surfaced
+only when the driver's background topology `hello` happened to fall before the
+last insert rather than after it.
+
+Recovery now treats the persisted `next_seq` / `next_nat_seq` as a *hint that can
+only be corrected upward*: it clamps each counter to what the oplog and
+natural-order tables actually contain, so a lagging meta row can never lower the
+sequence and re-mint a used value. The oplog maximum is read with a single
+`prev()` (the table is keyed on the bare sequence), keeping reopen cheap.
+
+#### Fixed
+
+- Capped-collection FIFO eviction after restoring a `backupArchive` that was
+  taken between oplog-meta refreshes — the recovered insertion-sequence counter
+  is now clamped up to the natural-order table's maximum rather than trusting a
+  stale persisted value, eliminating the sequence collision that dropped a
+  just-inserted document. The same clamp guards the oplog `next_seq` against
+  re-minting a used sequence (which would silently overwrite an oplog row).
+
 ### Atlas Search index commands are rejected with an "Atlas" error
 
 Atlas Search index management — the `createSearchIndexes`, `updateSearchIndex`,
