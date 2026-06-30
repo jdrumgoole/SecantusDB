@@ -468,7 +468,7 @@ def gh_merge(c: Context, pr: str, sync_branch: str = "rust-tasks") -> None:
     name="gh-ship",
     help={
         "branch": "feature branch to commit/push and open the PR from",
-        "paths": "git pathspec to stage (default: crates)",
+        "paths": "git pathspec to stage (default: everything but vendor / data / reports)",
         "msg-file": "file holding the commit message (line 1 becomes the PR title)",
         "body-file": "file holding the PR body markdown (PR skipped if absent)",
         "base": "PR base branch (default: main)",
@@ -477,7 +477,7 @@ def gh_merge(c: Context, pr: str, sync_branch: str = "rust-tasks") -> None:
 def gh_ship(
     c: Context,
     branch: str,
-    paths: str = "crates",
+    paths: str = "",
     msg_file: str = "/tmp/secantus-commit.txt",
     body_file: str = "/tmp/secantus-pr.md",
     base: str = "main",
@@ -485,9 +485,24 @@ def gh_ship(
     """Stage ``paths``, commit with the message in ``msg_file``, push ``branch``,
     and open a PR (title = first line of ``msg_file``, body from ``body_file``).
     Write the two files with the editor first, then one ``./inv gh-ship -b
-    <branch>`` runs the whole commit → push → PR lifecycle on the allowlist."""
+    <branch>`` runs the whole commit → push → PR lifecycle on the allowlist.
+
+    The default ``paths`` stages **everything** tracked-or-new except ``vendor``,
+    local ``secantus-data``, and the regenerated ``*-rust-server.md`` gauge
+    reports — so a slice's crates + parity tests + backlog edits all go in
+    together (passing ``--paths crates`` only staged crates and silently dropped
+    sibling test/backlog changes)."""
     title = pathlib.Path(msg_file).read_text().splitlines()[0]
-    c.run(f"git add {paths}", pty=True)
+    if paths:
+        c.run(f"git add {paths}", pty=True)
+    else:
+        c.run(
+            "git add -A -- . "
+            "':(exclude)vendor' "
+            "':(exclude)secantus-data' "
+            "':(exclude,glob)docs/validation-report-*-rust-server.md'",
+            pty=True,
+        )
     c.run(f"git commit -F {shlex.quote(msg_file)}", pty=True)
     c.run(f"git push -u origin {shlex.quote(branch)}", pty=True)
     if pathlib.Path(body_file).exists():
