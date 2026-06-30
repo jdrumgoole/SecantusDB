@@ -150,6 +150,16 @@ DELETE FROM users WHERE age < 18;
 SELECT COUNT(*) FROM users;        -- 2
 ```
 
+`INSERT` also accepts a query as its source — `INSERT INTO target [(cols)]
+SELECT …`. The source runs first (it may filter, join, aggregate, or be a set
+operation / CTE) and its result columns map positionally onto the target
+columns, coerced to each target column's type:
+
+```sql
+INSERT INTO archived_users (id, name) SELECT id, name FROM users WHERE active = false;
+INSERT INTO region_totals (region, total) SELECT region, SUM(amount) FROM sales GROUP BY region;
+```
+
 Parameterised statements work over the extended protocol (`%s` in pg8000 /
 psycopg, `$1` on the wire):
 
@@ -629,7 +639,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 
 | Area | Supported | Not yet |
 |---|---|---|
-| DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `INSERT ... SELECT` |
+| DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `ON CONFLICT` |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | non-recursive `WITH name AS (...)` (multiple, chained) on `SELECT` / set-op queries | `WITH RECURSIVE`, `WITH` on `INSERT`/`UPDATE`/`DELETE` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |

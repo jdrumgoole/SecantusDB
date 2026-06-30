@@ -750,12 +750,44 @@ def plan_drop_index(stmt: exp.Drop) -> DropIndexPlan:
     return DropIndexPlan(name=stmt.this.name, if_exists=bool(stmt.args.get("exists")))
 
 
-def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
+def insert_target_columns(stmt: exp.Insert, table: TableDef) -> list[str]:
+    """The target column names for an INSERT: the explicit ``(a, b)`` list, or
+    every column of the table when no list is given."""
     schema = stmt.this
     if isinstance(schema, exp.Schema):
-        col_names = [_column_name(c) for c in schema.expressions]
-    else:
-        col_names = [c.name for c in table.columns]
+        return [_column_name(c) for c in schema.expressions]
+    return [c.name for c in table.columns]
+
+
+def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) -> dict[str, Any]:
+    """Build one insert doc from raw Python values mapped positionally onto
+    ``col_names`` — shared by the VALUES and INSERT…SELECT paths. Coerces per the
+    target column's type, maps the PK column to ``_id``, and rejects a NULL (or
+    omitted) NOT NULL column."""
+    doc: dict[str, Any] = {}
+    provided = set()
+    for name, raw in zip(col_names, raw_values, strict=True):
+        col = table.column(name)
+        if col is None:
+            if table.reflected:
+                # Schema-on-read: an un-sampled field is a valid insert target
+                # (the ``_id`` field is still the PK / NOT NULL).
+                col = Column(name, "any", name, pk=(name == "_id"), nullable=(name != "_id"))
+            else:
+                raise errors.undefined_column(name)
+        if raw is None and not col.nullable:
+            raise errors.not_null_violation(name)
+        doc[col.field] = typemap.coerce(raw, col.type_tag)
+        provided.add(name)
+    # NOT NULL columns omitted entirely are a violation (no DEFAULT support).
+    for col in table.columns:
+        if col.name not in provided and not col.nullable:
+            raise errors.not_null_violation(col.name)
+    return doc
+
+
+def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
+    col_names = insert_target_columns(stmt, table)
     values = stmt.expression
     if not isinstance(values, exp.Values):
         raise errors.feature_not_supported("INSERT requires a VALUES clause")
@@ -766,27 +798,16 @@ def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
             raise errors.syntax_error(
                 f"INSERT has {len(cells)} values but {len(col_names)} columns"
             )
-        doc: dict[str, Any] = {}
-        provided = set()
-        for name, cell in zip(col_names, cells, strict=True):
-            col = table.column(name)
-            if col is None:
-                if table.reflected:
-                    # Schema-on-read: an un-sampled field is a valid insert target
-                    # (the ``_id`` field is still the PK / NOT NULL).
-                    col = Column(name, "any", name, pk=(name == "_id"), nullable=(name != "_id"))
-                else:
-                    raise errors.undefined_column(name)
-            raw = _literal(cell)
-            if raw is None and not col.nullable:
-                raise errors.not_null_violation(name)
-            doc[col.field] = typemap.coerce(raw, col.type_tag)
-            provided.add(name)
-        # NOT NULL columns omitted entirely are a violation (no DEFAULT support).
-        for col in table.columns:
-            if col.name not in provided and not col.nullable:
-                raise errors.not_null_violation(col.name)
-        docs.append(doc)
+        docs.append(_insert_doc(col_names, [_literal(c) for c in cells], table))
+    return InsertPlan(table=table, docs=docs, returning=_returning_columns(stmt, table))
+
+
+def plan_insert_rows(stmt: exp.Insert, table: TableDef, rows: list[tuple[Any, ...]]) -> InsertPlan:
+    """Plan an ``INSERT … SELECT`` from the source query's already-evaluated rows
+    (the engine runs the source query, since planning is storage-free). Each
+    row's values map positionally onto the target columns."""
+    col_names = insert_target_columns(stmt, table)
+    docs = [_insert_doc(col_names, list(row), table) for row in rows]
     return InsertPlan(table=table, docs=docs, returning=_returning_columns(stmt, table))
 
 

@@ -227,8 +227,7 @@ def _run_statement(
         return _run_select(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Insert):
-        table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
-        return executor.execute_insert(planner.plan_insert(stmt, table), storage, db)
+        return _run_insert(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Update):
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
@@ -311,6 +310,30 @@ def _run_select(
     # pre-evaluated by the planner, which runs the inner SELECT through the engine.
     subctx = planner.SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
     return executor.execute_select(planner.plan_select(stmt, table, subctx), storage, db)
+
+
+def _run_insert(
+    stmt: exp.Insert, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Dispatch an INSERT: ``VALUES`` plans directly; ``INSERT … SELECT`` runs the
+    source query first (it may join / aggregate / be a set operation), then maps
+    its result rows positionally onto the target columns."""
+    target = stmt.this
+    name = target.this.name if isinstance(target, exp.Schema) else target.name
+    table = _require_table(catalog, db, name, storage)
+    source = stmt.expression
+    if isinstance(source, (exp.Select, exp.SetOperation)):
+        result = _run_query(source, storage, db, catalog, session)
+        ncols = len(planner.insert_target_columns(stmt, table))
+        if len(result.columns) != ncols:
+            raise errors.SQLError(
+                "42601",
+                f"INSERT has {ncols} target columns but the source query "
+                f"returns {len(result.columns)}",
+            )
+        plan = planner.plan_insert_rows(stmt, table, result.rows)
+        return executor.execute_insert(plan, storage, db)
+    return executor.execute_insert(planner.plan_insert(stmt, table), storage, db)
 
 
 def run_inner_select(
