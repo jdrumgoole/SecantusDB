@@ -367,6 +367,12 @@ def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:
     rust_storage_test(c)
     rust_adapter_test(c)
     rust_parity(c)
+    # Python lint + format — the parity suites are Python, but the cargo
+    # fmt/clippy above only cover the Rust workspace, so a ruff slip in a parity
+    # test (e.g. a too-long line) would pass the gate and red CI. Mirror CI's
+    # `Lint` / `Format check` steps so it's caught before push.
+    c.run("uv run ruff check src tests", pty=True)
+    c.run("uv run ruff format --check src tests", pty=True)
     if pytest:
         cmd = "uv run --no-sync --extra dev --extra admin python -m pytest -q"
         for nodeid in (d for d in deselect.split(",") if d.strip()):
