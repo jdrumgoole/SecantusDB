@@ -39,6 +39,13 @@ concurrency:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # The whole suite runs in ~4 min locally; 30 min is generous for CI. Without
+    # this, a hung run (a daemon/thread not reaped — historically a rust-server
+    # stop() / change-stream-tail wedge, see the faulthandler watchdog in
+    # tests/conftest.py) blocks the runner until GitHub's 6-hour kill with no
+    # diagnostics. macOS is dropped from this matrix for the same flakiness
+    # (9e16e49); the cap also protects the release-time macOS run.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
