@@ -87,6 +87,31 @@ def test_returning_via_driver(server):
     conn.close()
 
 
+def test_set_operations_via_driver(server):
+    # UNION / INTERSECT / EXCEPT over Mongo-written data, through the real driver.
+    server.storage.insert(
+        "db",
+        "a",
+        [{"_id": bson.Int64(i), "n": bson.Int64(v)} for i, v in enumerate([1, 2, 2, 3], 1)],
+    )
+    server.storage.insert(
+        "db",
+        "b",
+        [{"_id": bson.Int64(i), "n": bson.Int64(v)} for i, v in enumerate([2, 3, 4], 1)],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT n FROM a UNION SELECT n FROM b ORDER BY n")
+    assert cur.fetchall() == ([1], [2], [3], [4])
+    cur.execute("SELECT n FROM a INTERSECT SELECT n FROM b ORDER BY n")
+    assert cur.fetchall() == ([2], [3])
+    cur.execute("SELECT n FROM a EXCEPT SELECT n FROM b ORDER BY n")
+    assert cur.fetchall() == ([1],)
+    cur.execute("SELECT n FROM a UNION ALL SELECT n FROM b ORDER BY n")
+    assert cur.fetchall() == ([1], [2], [2], [2], [3], [3], [4])
+    conn.close()
+
+
 def test_types_roundtrip(server):
     conn = connect(server)
     cur = conn.cursor()

@@ -133,6 +133,12 @@ def describe_statement(
     """
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
         return [ColumnDesc(_show_name(stmt), "text", typemap.PG_OID["text"])]
+    if isinstance(stmt, exp.SetOperation):
+        # A set operation's result shape is its first arm's (descend chained ops).
+        arm = stmt
+        while isinstance(arm, exp.SetOperation):
+            arm = arm.left
+        return describe_statement(storage, db, arm, session, catalog)
     if not isinstance(stmt, exp.Select):
         return None
     table_node = stmt.find(exp.Table)
@@ -205,6 +211,9 @@ def _run_statement(
         if kind == "INDEX":
             return executor.execute_drop_index(planner.plan_drop_index(stmt), catalog, storage, db)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
+
+    if isinstance(stmt, exp.SetOperation):
+        return _run_set_operation(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Select):
         return _run_select(stmt, storage, db, catalog, session)
@@ -304,6 +313,148 @@ def run_inner_select(
     Used by the planner's WHERE-subquery evaluation; reuses the full SELECT path
     so the inner query may itself aggregate / filter / join."""
     return _run_select(stmt, storage, db, catalog, session)
+
+
+def _run_query(
+    node: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Evaluate a SELECT or a (possibly nested) set operation to a SQLResult."""
+    if isinstance(node, exp.SetOperation):
+        return _run_set_operation(node, storage, db, catalog, session)
+    if isinstance(node, exp.Select):
+        return _run_select(node, storage, db, catalog, session)
+    raise errors.feature_not_supported(f"unsupported set-operation arm: {type(node).__name__}")
+
+
+def _run_set_operation(
+    stmt: exp.SetOperation, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Run ``A UNION|INTERSECT|EXCEPT [ALL] B`` (chains nest on the left).
+
+    Each arm runs through the full SELECT path; the rows are combined with the
+    operation's multiset semantics, the output columns are taken from the first
+    arm (Postgres' rule), and any ORDER BY / LIMIT on the set-operation node
+    applies to the combined result."""
+    left = _run_query(stmt.left, storage, db, catalog, session)
+    right = _run_query(stmt.right, storage, db, catalog, session)
+    op = type(stmt).__name__.upper()
+    if len(left.columns) != len(right.columns):
+        raise errors.SQLError("42601", f"each {op} query must have the same number of columns")
+    distinct = bool(stmt.args.get("distinct"))
+    rows = _combine_setop_rows(stmt, left.rows, right.rows, distinct)
+    rows = _setop_order_limit(stmt, rows, left.columns)
+    return SQLResult(
+        command_tag=f"SELECT {len(rows)}", columns=left.columns, rows=rows, rowcount=len(rows)
+    )
+
+
+def _setop_key(row: tuple[Any, ...]) -> tuple[str, ...]:
+    """A hashable identity for a result row (matches the SELECT DISTINCT dedup)."""
+    return tuple(repr(v) for v in row)
+
+
+def _dedup_rows(rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+    seen: set = set()
+    out: list[tuple[Any, ...]] = []
+    for row in rows:
+        key = _setop_key(row)
+        if key not in seen:
+            seen.add(key)
+            out.append(row)
+    return out
+
+
+def _multiset_filter(
+    left: list[tuple[Any, ...]],
+    right: list[tuple[Any, ...]],
+    *,
+    keep_when_present: bool,
+    distinct: bool,
+) -> list[tuple[Any, ...]]:
+    """INTERSECT (``keep_when_present=True``) / EXCEPT (``False``) over rows.
+
+    DISTINCT collapses the result to set semantics; ``ALL`` keeps multiplicities
+    (min of the two counts for INTERSECT, left-minus-right for EXCEPT)."""
+    if distinct:
+        right_keys = {_setop_key(r) for r in right}
+        seen: set = set()
+        out: list[tuple[Any, ...]] = []
+        for row in left:
+            key = _setop_key(row)
+            if (key in right_keys) == keep_when_present and key not in seen:
+                seen.add(key)
+                out.append(row)
+        return out
+    from collections import Counter
+
+    counts = Counter(_setop_key(r) for r in right)
+    out = []
+    for row in left:
+        key = _setop_key(row)
+        if counts[key] > 0:
+            counts[key] -= 1
+            if keep_when_present:  # INTERSECT ALL: a matched copy survives
+                out.append(row)
+        elif not keep_when_present:  # EXCEPT ALL: an unmatched copy survives
+            out.append(row)
+    return out
+
+
+def _combine_setop_rows(
+    stmt: exp.SetOperation,
+    left: list[tuple[Any, ...]],
+    right: list[tuple[Any, ...]],
+    distinct: bool,
+) -> list[tuple[Any, ...]]:
+    if isinstance(stmt, exp.Union):
+        rows = left + right
+        return _dedup_rows(rows) if distinct else rows
+    if isinstance(stmt, exp.Intersect):
+        return _multiset_filter(left, right, keep_when_present=True, distinct=distinct)
+    if isinstance(stmt, exp.Except):
+        return _multiset_filter(left, right, keep_when_present=False, distinct=distinct)
+    raise errors.feature_not_supported(f"unsupported set operation: {type(stmt).__name__}")
+
+
+def _setop_order_index(node: exp.Expression, columns: list[Any]) -> int:
+    """Resolve an ORDER BY term on a set operation to an output-column index:
+    an integer literal is an ordinal position; otherwise it matches a column by
+    output name (set-operation ORDER BY can only reference the result columns)."""
+    if isinstance(node, exp.Literal) and not node.is_string:
+        i = int(node.this) - 1
+        if not 0 <= i < len(columns):
+            raise errors.SQLError("42P10", f"ORDER BY position {i + 1} is not in select list")
+        return i
+    name = node.name if isinstance(node, exp.Column) else None
+    if name is not None:
+        for i, col in enumerate(columns):
+            if col.name == name:
+                return i
+    raise errors.SQLError("42703", f'ORDER BY column "{node.sql()}" does not exist')
+
+
+def _setop_order_limit(
+    stmt: exp.SetOperation, rows: list[tuple[Any, ...]], columns: list[Any]
+) -> list[tuple[Any, ...]]:
+    order = stmt.args.get("order")
+    if order is not None:
+        terms = [
+            (_setop_order_index(o.this, columns), -1 if o.args.get("desc") else 1)
+            for o in order.expressions
+        ]
+        # Stable multi-key sort: apply each key from least to most significant.
+        for idx, direction in reversed(terms):
+            rows = sorted(
+                rows,
+                key=lambda r, idx=idx: (r[idx] is None, r[idx]),
+                reverse=(direction == -1),
+            )
+    limit, skip = planner._limit_skip(stmt)
+    if skip:
+        rows = rows[skip:]
+    if limit:
+        rows = rows[:limit]
+    return rows
 
 
 def _run_set(stmt: exp.Set, session: Session) -> SQLResult:

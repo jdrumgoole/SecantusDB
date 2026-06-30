@@ -289,6 +289,26 @@ SELECT DISTINCT region, status FROM orders;
 SELECT DISTINCT c.name FROM orders o JOIN customers c ON o.cust_id = c.id;
 ```
 
+## Set operations
+
+`UNION`, `INTERSECT`, and `EXCEPT` combine the rows of two (or more, chained)
+queries. The plain forms are `DISTINCT`; the `ALL` forms keep multiplicities
+(`INTERSECT ALL` → the min of the two counts, `EXCEPT ALL` → left minus right).
+Output column names come from the **first** query, and the arms must have the
+same number of columns (a mismatch is a `42601` error). A trailing `ORDER BY`
+(by output-column name or ordinal position) and `LIMIT` / `OFFSET` apply to the
+combined result:
+
+```sql
+SELECT region FROM sales_2023 UNION SELECT region FROM sales_2024 ORDER BY region;
+SELECT id FROM active EXCEPT SELECT id FROM banned;
+SELECT sku FROM warehouse_a INTERSECT SELECT sku FROM warehouse_b;
+SELECT n FROM a UNION ALL SELECT n FROM b ORDER BY 1 LIMIT 10;
+```
+
+The combine happens in Python over each arm's result rows, so it composes with
+any query the arms can express (joins, aggregates, subqueries).
+
 ## Reflected tables and jsonb (the dual-protocol payoff)
 
 A collection with **no `CREATE TABLE`** is still queryable. SecantusDB samples
@@ -577,6 +597,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Area | Supported | Not yet |
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `INSERT ... SELECT` |
+| Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
