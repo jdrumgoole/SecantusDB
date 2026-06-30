@@ -101,6 +101,14 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         )
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         return _eval_compare(node, scope, ctx)
+    if isinstance(node, exp.Exists):
+        return _eval_exists(node, scope, ctx)
+    if isinstance(node, exp.In):
+        return _eval_in(node, scope, ctx)
+    if isinstance(node, exp.Between):
+        return _eval_between(node, scope, ctx)
+    if isinstance(node, (exp.Like, exp.ILike)):
+        return _eval_like(node, scope, ctx)
     if type(node) in _ARITH:
         return _eval_arith(node, scope, ctx)
     if isinstance(node, exp.DPipe):  # || string concatenation
@@ -403,31 +411,117 @@ def _lookup_inner_table(ctx: ScalarContext, table_node: exp.Table) -> Any:
     return planner._lookup_table_def(ctx.catalog, ctx.db, table_node, ctx.storage)
 
 
-def _eval_subquery(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
-    """Evaluate a scalar subquery: first projected value of the first matching
-    inner row, else NULL. Correlation falls through to the outer scope."""
-    select = node.this if isinstance(node, exp.Subquery) else node
+def _subquery_select(node: exp.Expression) -> exp.Expression:
+    return node.this if isinstance(node, exp.Subquery) else node
+
+
+def _inner_row_scopes(select: exp.Expression, outer: Scope, ctx: ScalarContext):
+    """Yield a ``Scope`` for each inner-table row that satisfies the subquery's
+    WHERE. Correlated references in that WHERE fall through to ``outer``. Shared
+    by scalar-subquery / EXISTS / IN evaluation (a generator so EXISTS/IN can
+    stop at the first match)."""
     if not isinstance(select, exp.Select):
-        raise errors.feature_not_supported(f"unsupported subquery: {node.sql()}")
+        raise errors.feature_not_supported(f"unsupported subquery: {select.sql()}")
     if select.args.get("joins") or select.args.get("group"):
-        raise errors.feature_not_supported("only a simple scalar subquery is supported")
+        raise errors.feature_not_supported("only a simple subquery is supported")
+    where = select.args.get("where")
     from_node = next((v for v in select.args.values() if isinstance(v, exp.From)), None)
     if from_node is None:
-        # FROM-less scalar subquery — evaluate its single projection directly.
-        return evaluate(select.expressions[0], outer, ctx)
+        # FROM-less subquery — a single synthetic row over the outer scope.
+        if where is None or _truthy(evaluate(where.this, outer, ctx)):
+            yield outer
+        return
     table_node = from_node.this
     tdef = _lookup_inner_table(ctx, table_node)
     if tdef is None:
         raise errors.undefined_table(table_node.name)
     inner_alias = table_node.alias or table_node.name
-    rows = ctx.storage.find_matching(ctx.db, tdef.collection, {})
-    where = select.args.get("where")
-    proj = select.expressions[0]
-    for row in rows:
+    for row in ctx.storage.find_matching(ctx.db, tdef.collection, {}):
         scope = _sub_scope(inner_alias, tdef, row, outer)
         if where is None or _truthy(evaluate(where.this, scope, ctx)):
-            return evaluate(proj, scope, ctx)
+            yield scope
+
+
+# Aggregate projections in a scalar subquery reduce the matched inner rows to a
+# single value (the common ``= (SELECT max(x) FROM … WHERE …)`` shape).
+_SUBQUERY_AGG_REDUCERS: dict[type, Callable[[list[Any]], Any]] = {
+    exp.Max: max,
+    exp.Min: min,
+    exp.Sum: sum,
+    exp.Avg: lambda vals: sum(vals) / len(vals),
+}
+
+
+def _eval_subquery(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
+    """Evaluate a scalar subquery to a single value. An aggregate projection
+    (``max``/``min``/``sum``/``avg``/``count``) reduces every matching inner row;
+    otherwise it's the projection of the first matching row, else NULL.
+    Correlation falls through to the outer scope."""
+    select = _subquery_select(node)
+    proj = select.expressions[0]
+    target = proj.this if isinstance(proj, exp.Alias) else proj
+    if isinstance(target, exp.Count):
+        scopes = list(_inner_row_scopes(select, outer, ctx))
+        if isinstance(target.this, exp.Star):
+            return len(scopes)
+        return sum(1 for s in scopes if evaluate(target.this, s, ctx) is not None)
+    reducer = _SUBQUERY_AGG_REDUCERS.get(type(target))
+    if reducer is not None:
+        vals = [
+            v
+            for v in (evaluate(target.this, s, ctx) for s in _inner_row_scopes(select, outer, ctx))
+            if v is not None
+        ]
+        return reducer(vals) if vals else None
+    for scope in _inner_row_scopes(select, outer, ctx):
+        return evaluate(proj, scope, ctx)
     return None
+
+
+def _eval_exists(node: exp.Exists, outer: Scope, ctx: ScalarContext) -> bool:
+    """``EXISTS (subquery)`` — True if any inner row satisfies the (possibly
+    correlated) subquery WHERE. ``NOT EXISTS`` is handled by the ``exp.Not``
+    branch wrapping this."""
+    for _ in _inner_row_scopes(_subquery_select(node.this), outer, ctx):
+        return True
+    return False
+
+
+def _eval_in(node: exp.In, outer: Scope, ctx: ScalarContext) -> Any:
+    """``x IN (...)`` — a value list or a (possibly correlated) subquery."""
+    left = evaluate(node.this, outer, ctx)
+    query = node.args.get("query")
+    if query is not None:
+        select = _subquery_select(query)
+        proj = select.expressions[0]
+        candidates = [evaluate(proj, scope, ctx) for scope in _inner_row_scopes(select, outer, ctx)]
+    else:
+        candidates = [evaluate(e, outer, ctx) for e in node.expressions]
+    if left is None:
+        return None  # NULL IN (...) is unknown
+    return any(left == v for v in candidates)
+
+
+def _eval_between(node: exp.Between, outer: Scope, ctx: ScalarContext) -> Any:
+    v = evaluate(node.this, outer, ctx)
+    low = evaluate(node.args["low"], outer, ctx)
+    high = evaluate(node.args["high"], outer, ctx)
+    if v is None or low is None or high is None:
+        return None
+    return low <= v <= high
+
+
+def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
+    import re
+
+    from secantus.sql.planner import _like_to_regex
+
+    val = evaluate(node.this, outer, ctx)
+    pattern = evaluate(node.expression, outer, ctx)
+    if val is None or pattern is None:
+        return None
+    flags = re.IGNORECASE if isinstance(node, exp.ILike) else 0
+    return re.match(_like_to_regex(_as_text(pattern)), _as_text(val), flags) is not None
 
 
 def _sub_scope(inner_alias: str, tdef: Any, row: dict[str, Any], outer: Scope) -> Scope:

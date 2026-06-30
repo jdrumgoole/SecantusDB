@@ -89,6 +89,23 @@ class SelectPlan:
 
 
 @dataclass
+class CorrelatedSelectPlan:
+    """A single-table SELECT whose WHERE references the outer row (EXISTS /
+    correlated subquery), so it can't lower to a pushdown Mongo filter — the
+    executor evaluates ``where`` per candidate row."""
+
+    table: TableDef
+    where: Any  # exp.Expression — the raw WHERE predicate
+    out_columns: list[tuple[str, Column]] = field(default_factory=list)
+    sort: dict[str, int] | None = None
+    limit: int = 0
+    skip: int = 0
+    count_star: bool = False
+    count_alias: str = "count"
+    outer_alias: str | None = None
+
+
+@dataclass
 class UpdatePlan:
     table: TableDef
     filter: dict[str, Any]
@@ -842,24 +859,45 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
     sort = _order_sort(stmt, table)
     limit, skip = _limit_skip(stmt)
 
-    exprs = stmt.expressions
-    # COUNT(*) as the sole projection (no GROUP BY) -> whole-table count.
-    if len(exprs) == 1 and isinstance(exprs[0], (exp.Count, exp.Alias)):
-        inner = exprs[0].this if isinstance(exprs[0], exp.Alias) else exprs[0]
-        if isinstance(inner, exp.Count) and isinstance(inner.this, exp.Star):
-            alias = exprs[0].alias if isinstance(exprs[0], exp.Alias) else "count"
-            return SelectPlan(
-                table=table,
-                filter=filt,
-                sort=sort,
-                limit=limit,
-                skip=skip,
-                count_star=True,
-                count_alias=alias or "count",
-            )
+    count_alias = _count_star_alias(stmt)
+    if count_alias is not None:
+        return SelectPlan(
+            table=table,
+            filter=filt,
+            sort=sort,
+            limit=limit,
+            skip=skip,
+            count_star=True,
+            count_alias=count_alias,
+        )
+    return SelectPlan(
+        table=table,
+        filter=filt,
+        sort=sort,
+        limit=limit,
+        skip=skip,
+        out_columns=_select_out_columns(stmt, table),
+    )
 
+
+def _count_star_alias(stmt: exp.Select) -> str | None:
+    """The output alias if this SELECT is a sole ``COUNT(*)`` (no GROUP BY), else
+    None."""
+    exprs = stmt.expressions
+    if len(exprs) != 1 or not isinstance(exprs[0], (exp.Count, exp.Alias)):
+        return None
+    inner = exprs[0].this if isinstance(exprs[0], exp.Alias) else exprs[0]
+    if isinstance(inner, exp.Count) and isinstance(inner.this, exp.Star):
+        alias = exprs[0].alias if isinstance(exprs[0], exp.Alias) else "count"
+        return alias or "count"
+    return None
+
+
+def _select_out_columns(stmt: exp.Select, table: TableDef) -> list[tuple[str, Column]]:
+    """The projected ``(output_name, Column)`` list for a plain (non-aggregate)
+    SELECT — shared by the pushdown and correlated-WHERE plans."""
     out_columns: list[tuple[str, Column]] = []
-    for e in exprs:
+    for e in stmt.expressions:
         if isinstance(e, exp.Star):
             for col in table.columns:
                 out_columns.append((col.name, col))
@@ -882,8 +920,48 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
             else:
                 raise errors.undefined_column(cname)
         out_columns.append((alias or cname, col))
-    return SelectPlan(
-        table=table, filter=filt, sort=sort, limit=limit, skip=skip, out_columns=out_columns
+    return out_columns
+
+
+def where_needs_per_row(stmt: exp.Select) -> bool:
+    """Whether the WHERE clause must be evaluated per-row in Python rather than
+    pushed down as a Mongo filter: it contains an ``EXISTS`` predicate or a
+    correlated subquery (one that references the outer row). Non-correlated
+    ``IN`` / scalar ``= (SELECT …)`` subqueries stay on the fast pushdown path."""
+    where = stmt.args.get("where")
+    if where is None:
+        return False
+    node = where.this
+    if node.find(exp.Exists) is not None:
+        return True
+    return any(_subquery_has_outer_ref(sub) for sub in node.find_all(exp.Select))
+
+
+def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelectPlan:
+    """Plan a single-table SELECT whose WHERE needs per-row evaluation (EXISTS /
+    correlated subquery). The whole WHERE is carried verbatim and evaluated by
+    the executor against each candidate row via the scalar evaluator."""
+    if stmt.args.get("joins") or stmt.args.get("group") or stmt.args.get("having"):
+        raise errors.feature_not_supported(
+            "correlated subqueries are supported only in a single-table SELECT"
+        )
+    if stmt.args.get("distinct"):
+        raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
+    sort = _order_sort(stmt, table)
+    limit, skip = _limit_skip(stmt)
+    from_node = stmt.find(exp.From)
+    outer_alias = from_node.this.alias or None if from_node is not None else None
+    count_alias = _count_star_alias(stmt)
+    return CorrelatedSelectPlan(
+        table=table,
+        where=stmt.args["where"].this,
+        out_columns=[] if count_alias is not None else _select_out_columns(stmt, table),
+        sort=sort,
+        limit=limit,
+        skip=skip,
+        count_star=count_alias is not None,
+        count_alias=count_alias or "count",
+        outer_alias=outer_alias,
     )
 
 

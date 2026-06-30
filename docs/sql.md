@@ -210,7 +210,23 @@ SELECT coalesce(nickname, name) || ' (' || length(name) || ')' AS label FROM use
 -- scalar `= (SELECT ...)`. The inner query runs first (it may aggregate/filter).
 SELECT name FROM customers WHERE id IN (SELECT cust_id FROM orders WHERE total > 100);
 SELECT name FROM customers WHERE id = (SELECT max(cust_id) FROM orders);
+
+-- EXISTS / NOT EXISTS and correlated subqueries (the inner query references the
+-- outer row) are evaluated per row: each candidate row is tested against the
+-- inner query, whose outer-row references resolve to that row. IN and scalar
+-- `OP (SELECT ...)` may both be correlated; an aggregate inner projection
+-- (`max`/`min`/`sum`/`avg`/`count`) reduces the matching inner rows.
+SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id);
+SELECT name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id);
+SELECT name FROM customers c
+WHERE c.id = (SELECT max(o.cust_id) FROM orders o WHERE o.region = c.region);
 ```
+
+Correlated subqueries are limited to a **single-table** outer SELECT (no outer
+JOIN / GROUP BY), and the inner query is a simple `SELECT … FROM one_table
+[WHERE …]` (no inner join / GROUP BY). The per-row evaluation is a full scan of
+the outer table, so it's `O(outer × inner)` — fine for the ephemeral test data
+SecantusDB targets, not a query planner.
 
 ## Aggregates, GROUP BY, HAVING
 
@@ -544,7 +560,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Area | Supported | Not yet |
 |---|---|---|
 | DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `MERGE`, `INSERT ... SELECT`, `RETURNING` |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, non-correlated `IN`/`NOT IN`/scalar `= (SELECT …)` subqueries | `EXISTS`, correlated subqueries, function calls in a comparison, jsonb `<@` |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL`/`CROSS`, non-equi / `OR` `ON` |

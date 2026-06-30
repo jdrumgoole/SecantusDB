@@ -1,8 +1,11 @@
-"""Non-correlated WHERE subqueries: IN / NOT IN and scalar `= (SELECT ...)`.
+"""WHERE subqueries.
 
-The inner SELECT is run through the engine and pre-evaluated to a list (`$in`)
-or a single value, so it may itself filter / aggregate. Correlated subqueries
-and EXISTS are deferred (faithful 0A000).
+Non-correlated ``IN`` / ``NOT IN`` / scalar ``= (SELECT …)`` are pre-evaluated by
+the planner (the inner SELECT runs through the engine, so it may itself filter /
+aggregate). ``EXISTS`` and *correlated* subqueries (those that reference the
+outer row) can't push down to a Mongo filter, so they're evaluated per row by
+the scalar evaluator — the inner query reads inner-table rows with outer-row
+references falling through to the enclosing row.
 """
 
 from __future__ import annotations
@@ -100,21 +103,92 @@ def test_subquery_combines_with_outer_predicate(storage, session):
     ) == ["alice"]
 
 
-def test_exists_is_deferred(storage, session):
-    with pytest.raises(SQLError) as ei:
-        names(storage, session, "SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders)")
-    assert ei.value.sqlstate == "0A000"
+def test_exists_non_correlated_non_empty(storage, session):
+    # A non-correlated EXISTS over a non-empty relation is true for every row.
+    assert names(
+        storage,
+        session,
+        "SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders) ORDER BY name",
+    ) == ["alice", "bob", "carol"]
 
 
-def test_correlated_subquery_is_deferred(storage, session):
-    with pytest.raises(SQLError) as ei:
+def test_exists_non_correlated_empty_is_false(storage, session):
+    assert (
         names(
             storage,
             session,
-            "SELECT name FROM customers c WHERE _id IN "
-            "(SELECT cust FROM orders o WHERE o.total = c._id)",
+            "SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE total > 1000)",
         )
-    assert ei.value.sqlstate == "0A000"
+        == []
+    )
+
+
+def test_correlated_exists(storage, session):
+    # Customers that have at least one order (cust 1 and 3 do; 2 doesn't).
+    assert names(
+        storage,
+        session,
+        "SELECT name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.cust = c._id) ORDER BY name",
+    ) == ["alice", "carol"]
+
+
+def test_correlated_not_exists(storage, session):
+    assert names(
+        storage,
+        session,
+        "SELECT name FROM customers c WHERE NOT EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.cust = c._id) ORDER BY name",
+    ) == ["bob"]
+
+
+def test_correlated_exists_with_outer_predicate(storage, session):
+    # region='east' AND has-an-order: alice qualifies, bob has no order.
+    assert names(
+        storage,
+        session,
+        "SELECT name FROM customers c WHERE region = 'east' AND EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.cust = c._id) ORDER BY name",
+    ) == ["alice"]
+
+
+def test_correlated_in_subquery(storage, session):
+    # c._id IN (custs whose order total exceeds c._id): alice(1) and carol(3).
+    assert names(
+        storage,
+        session,
+        "SELECT name FROM customers c WHERE c._id IN "
+        "(SELECT o.cust FROM orders o WHERE o.total > c._id) ORDER BY name",
+    ) == ["alice", "carol"]
+
+
+def test_correlated_scalar_subquery(storage, session):
+    # c._id = max(cust over orders whose total exceeds c._id) -> only carol (3=3).
+    assert names(
+        storage,
+        session,
+        "SELECT name FROM customers c WHERE c._id = "
+        "(SELECT max(o.cust) FROM orders o WHERE o.total > c._id) ORDER BY name",
+    ) == ["carol"]
+
+
+def test_correlated_exists_count_star(storage, session):
+    assert names(
+        storage,
+        session,
+        "SELECT count(*) FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.cust = c._id)",
+    ) == [2]
+
+
+def test_correlated_exists_order_by_limit(storage, session):
+    # ORDER BY / LIMIT apply to the per-row-filtered survivors, in order.
+    assert names(
+        storage,
+        session,
+        "SELECT name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.cust = c._id) ORDER BY name DESC LIMIT 1",
+    ) == ["carol"]
 
 
 def test_multi_column_subquery_rejected(storage, session):

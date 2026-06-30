@@ -204,6 +204,41 @@ def test_where_subquery_via_driver(server):
     conn.close()
 
 
+def test_correlated_subquery_via_driver(server):
+    # Correlated EXISTS / NOT EXISTS over Mongo-written data, through the real
+    # driver: customers with (or without) a matching order.
+    server.storage.insert(
+        "db",
+        "customers",
+        [
+            {"_id": bson.Int64(1), "name": "alice"},
+            {"_id": bson.Int64(2), "name": "bob"},
+            {"_id": bson.Int64(3), "name": "carol"},
+        ],
+    )
+    server.storage.insert(
+        "db",
+        "orders",
+        [
+            {"_id": bson.Int64(10), "cust": bson.Int64(1)},
+            {"_id": bson.Int64(11), "cust": bson.Int64(3)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.cust = c._id) ORDER BY name"
+    )
+    assert cur.fetchall() == (["alice"], ["carol"])
+    cur.execute(
+        "SELECT name FROM customers c WHERE NOT EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.cust = c._id) ORDER BY name"
+    )
+    assert cur.fetchall() == (["bob"],)
+    conn.close()
+
+
 def test_computed_expressions_via_driver(server):
     # Arithmetic + scalar functions in the SELECT list, over Mongo-written data,
     # through the real driver.
