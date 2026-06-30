@@ -203,6 +203,9 @@ SELECT * FROM users WHERE age BETWEEN 18 AND 40;
 SELECT * FROM users WHERE name LIKE 'a%';      -- ILIKE too
 SELECT * FROM users WHERE name IS NOT NULL;
 SELECT name FROM users ORDER BY age DESC LIMIT 2 OFFSET 1;
+-- NULL placement follows Postgres: ASC orders NULLs last, DESC orders them
+-- first, and NULLS FIRST / NULLS LAST override (across every query shape).
+SELECT name FROM users ORDER BY age NULLS FIRST;
 
 -- A comparison between two columns (or a column and an arithmetic expression)
 -- is supported; it evaluates per row rather than via an index.

@@ -1402,6 +1402,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   any `11000` duplicate. Command tag counts rows inserted *or* updated (skipped don't count); `RETURNING`
   projects the inserted + updated rows. **Still unsupported:** `ON CONFLICT ON CONSTRAINT <name>` (→
   `0A000`; no named-constraint registry), `DO UPDATE` with no conflict target (→ `42601`), `MERGE`.
+- [ ] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
+  NULLs last, DESC → NULLs first) with `NULLS FIRST`/`NULLS LAST` overriding; Mongo sort treats
+  NULL/missing as the *smallest*, so the SQL layer no longer delegates NULL placement to storage.
+  `planner._nulls_first` reads sqlglot's per-term flag (already PG-defaulted); the single-table,
+  correlated, evaluated, and set-op paths sort in Python via the shared `executor._pg_sort`
+  (`cmp_to_key`, NULL placement independent of direction) — which also pulls OFFSET/LIMIT off the
+  storage fetch for an ordered single-table SELECT — and the join / GROUP BY pipeline paths get a
+  companion null-rank `$addFields`/`$cond` field sorted ahead of each ORDER BY key
+  (`planner._emit_pipeline_sort`), then `$unset`. **Note:** index-accelerated ORDER BY+LIMIT pushdown
+  no longer applies to a single-table ordered SELECT (correctness over the storage-side sort
+  optimisation — the SQL layer is a dev/test surface).
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the

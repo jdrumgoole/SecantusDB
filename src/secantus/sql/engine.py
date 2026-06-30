@@ -554,17 +554,12 @@ def _setop_order_limit(
 ) -> list[tuple[Any, ...]]:
     order = stmt.args.get("order")
     if order is not None:
-        terms = [
-            (_setop_order_index(o.this, columns), -1 if o.args.get("desc") else 1)
-            for o in order.expressions
+        idxs = [_setop_order_index(o.this, columns) for o in order.expressions]
+        specs = [
+            (-1 if o.args.get("desc") else 1, planner._nulls_first(o)) for o in order.expressions
         ]
-        # Stable multi-key sort: apply each key from least to most significant.
-        for idx, direction in reversed(terms):
-            rows = sorted(
-                rows,
-                key=lambda r, idx=idx: (r[idx] is None, r[idx]),
-                reverse=(direction == -1),
-            )
+        rows = list(rows)
+        executor._pg_sort(rows, lambda r: tuple(r[i] for i in idxs), specs)
     limit, skip = planner._limit_skip(stmt)
     if skip:
         rows = rows[skip:]
