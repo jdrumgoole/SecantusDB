@@ -1248,12 +1248,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
 
 - [ ] **Wire server: simple + extended protocol, trust + SCRAM auth, optional TLS.**
   `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/
-  `Describe`/`Execute`/`Close`/`Sync` (P3), `SCRAM-SHA-256` auth + TLS (P4). Still
-  missing: **binary result format** (rows are always text; binary param *input* is
-  decoded — `int2`/`int4`/`int8`/`float4`/`float8`/`bool`/`bytea`/`text`/`varchar`/
-  `date`/`timestamp`/`timestamptz`/`numeric` in `pgextended._BINARY` — but results
-  aren't binary-encoded even if a client requests it via Bind result-format codes),
-  channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert auth, user management via
+  `Describe`/`Execute`/`Close`/`Sync` (P3), `SCRAM-SHA-256` auth + TLS (P4). Binary
+  parameter *input* (`pgextended._BINARY`) **and binary result *output*** are both
+  decoded/encoded for the common type-OID set
+  (`int2`/`int4`/`int8`/`float4`/`float8`/`bool`/`bytea`/`text`/`varchar`/`date`/
+  `timestamp`/`timestamptz`/`numeric`/`jsonb`): the extended protocol honours Bind's
+  per-column result-format codes (`pgextended._OUT_BINARY` / `_result_value`, and the
+  portal-Describe `RowDescription` reports the chosen formats). The simple-query path is
+  always text. Still missing: channel binding (`SCRAM-SHA-256-PLUS`), mTLS client-cert
+  auth, user management via
   SQL (`CREATE ROLE` — users are constructor config, not stored in the catalog / shared
   with the Mongo user store), the `Copy` subprotocol, and cursor `DECLARE`. Real-driver
   gauges run in CI via **pg8000** (pure-Python, text params) **and psycopg 3**
