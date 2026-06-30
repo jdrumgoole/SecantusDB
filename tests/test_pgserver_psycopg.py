@@ -110,6 +110,29 @@ def test_binary_numeric_edge_cases(server):
         ]
 
 
+def test_set_operations(server):
+    # Set operations through libpq's extended protocol — exercises Describe
+    # resolving the result shape from the first arm.
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE a (id bigint primary key, n int)")
+        conn.execute("CREATE TABLE b (id bigint primary key, n int)")
+        for i, v in enumerate([1, 2, 2, 3], 1):
+            conn.execute("INSERT INTO a (id, n) VALUES (%s, %s)", (i, v))
+        for i, v in enumerate([2, 3, 4], 1):
+            conn.execute("INSERT INTO b (id, n) VALUES (%s, %s)", (i, v))
+        assert conn.execute("SELECT n FROM a UNION SELECT n FROM b ORDER BY n").fetchall() == [
+            (1,),
+            (2,),
+            (3,),
+            (4,),
+        ]
+        assert conn.execute("SELECT n FROM a INTERSECT SELECT n FROM b ORDER BY n").fetchall() == [
+            (2,),
+            (3,),
+        ]
+        assert conn.execute("SELECT n FROM a EXCEPT SELECT n FROM b").fetchall() == [(1,)]
+
+
 def test_prepared_statement_and_deallocate(server):
     # prepare=True forces a server-side prepared statement; psycopg later emits
     # DEALLOCATE to recycle it, which the server accepts as a no-op.

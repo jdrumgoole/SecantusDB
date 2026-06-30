@@ -1335,6 +1335,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   before deleting. The wire layer already emits RowDescription+DataRows whenever `res.columns` is
   non-empty, so no pgserver change. **Limited to the projection vocabulary** (no computed
   expressions in `RETURNING`, e.g. `RETURNING n*2`).
+- [ ] **Set operations landed** (b47). `UNION` / `INTERSECT` / `EXCEPT` (+ `ALL` variants, chained)
+  in `engine._run_set_operation`: each arm runs through the full SELECT path, rows are combined
+  with multiset semantics (`_combine_setop_rows` / `_multiset_filter` — DISTINCT collapses to set
+  semantics, `ALL` keeps min-count for INTERSECT / left-minus-right for EXCEPT), output columns
+  come from the first arm, and a trailing `ORDER BY` (output-column name or ordinal) + `LIMIT`/
+  `OFFSET` apply to the combined result. `describe_statement` resolves the result shape from the
+  leftmost arm so the extended protocol's Describe works. Arity mismatch → `42601`. **Limits:** no
+  cross-arm type reconciliation (columns/types taken verbatim from the first arm); `ORDER BY` after
+  a set op only accepts an output column name or ordinal, not an arbitrary expression.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the
