@@ -1186,31 +1186,12 @@ Authoritative `invoke validate-all-servers --jobs 4` run (every gauge on **both*
 Python and Rust, same day, JDK 17 for java) — so each "rust-only" item below is a
 failure the Rust server has that the **Python server does not**, not a stale-baseline
 artifact. **Clean (0 rust-only): c, cxx, dotnet, kotlin, node, mongo-rust-driver.**
-Remaining rust-only = ~21 actionable in 4 themes (+ 4 out-of-scope session tests).
-When you close a bucket, delete it.
+All four actionable themes are now fixed and merged: the geo `$center` / `$near` /
+`$nearSphere` query operators (#66), php-ext write-reply shapes + cursor metrics +
+Code `_id` (#67), ruby index-option validation/echo (#69), and
+`splitLargeChangeStreamEvents` (#64). What remains is **only** the out-of-scope
+session tests + the go harness race below.
 
-- [ ] **Geo `$center` / `$near` / `$nearSphere` query operators (3 tests, java).**
-  java `GeoFiltersFunctionalSpecification#$geoWithin $center / $near / $nearSphere` fail
-  on Rust; Python passes them (its java geo specs are 10/10). The Rust geo *index* path
-  and `2dsphere`/`2d` creation work (§7.3-era), but these planar/near query operators
-  diverge — likely the `$center` planar-disk and `$near`/`$nearSphere` distance-sort
-  field paths in `secantus_core::geo` + the query/aggregate wiring. Verify against the
-  Python `secantus.geo` operators.
-- [ ] **php-ext write-reply wire shapes (6 tests, php-ext — strictest gauge).**
-  `WriteError` debug output + `WriteError::getMessage()`; `WriteResult::getWriteErrors()`
-  (ordered + unordered) + `getUpsertedIds()` with client-generated values; and
-  `Cursor` destruct-should-kill-a-live-cursor. The first five are how the Rust server
-  encodes `writeErrors` / upserted ids in the write reply (shape/field divergence the
-  libmongoc-level gauge catches that pymongo's permissive client misses); the last is
-  killing a still-open cursor when the driver tears it down (killCursors-on-destruct).
-- [ ] **ruby index-option validation + echo (7 tests, ruby).**
-  `Index::View#create_one/create_many` should *raise* on unsupported `commit_quorum`
-  values and on invalid wildcard projections (`create_one ... invalid wildcard projection`
-  ×2, `commit_quorum value is not supported` ×2); `hidden: false` should not apply the
-  hidden option (×2); capped-collection `create` should apply the options; and
-  `Index::View#each` on a nonexistent collection should raise a nonexistent-collection
-  error. All are validation/echo gaps in the Rust `createIndexes` / `create` / `listIndexes`
-  handlers, not query-engine bugs.
 - **Out of scope (session plumbing, do not chase):** ruby "behaves like a failed
   operation using a session raises an error" (×3, `Collection#create` / `#indexes` /
   `Index::View#create_one`) and php-lib `WatchFunctionalTest::testSessionFreed` (×1,
@@ -1247,6 +1228,23 @@ When you close a bucket, delete it.
     runs Rust without periodic noop heartbeats. Not the cause here (the `resume_token_
     updated_on_empty_batch` test that needs it is in the skip list), but worth adding the
     flag to the binary for gauge parity.
+
+### 7.5 Remaining Rust-server feature gaps (defer audit, 2026-06-26)
+
+From the `Fallback`-site audit (#2): constructs the Python server supports but the
+Rust core defers (so they error on the Rust server). None are *correctness* bugs —
+the actionable gauge tail is closed; these are feature completeness. **Shipped since
+the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#76),
+`$unionWith` (#77). **Remaining:**
+
+- [ ] **Expression operators:** `$convert` (general type conversion), `$dateFromString`
+  (date parsing), `$toDecimal` (Decimal128 construction — the deferred edge type), and
+  the regex family `$regexFind` / `$regexFindAll` / `$regexMatch` (could reuse the query
+  `$regex` `fancy-regex` path; regex parity vs Python `re` is the documented hard-defer
+  class).
+- [ ] **Aggregate stages:** `$setWindowFields` (partitioning + window functions —
+  large) and `$fill` (locf / linear gap-filling — a command-layer stage like `$unionWith`).
+- [ ] **Query operator:** `$jsonSchema` (document-level; complex JSON-Schema subset).
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 
