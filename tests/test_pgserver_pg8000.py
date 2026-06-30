@@ -87,6 +87,25 @@ def test_returning_via_driver(server):
     conn.close()
 
 
+def test_count_distinct_via_driver(server):
+    # COUNT(DISTINCT) / SUM(DISTINCT) over Mongo-written data, through the driver.
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(i), "region": r, "amount": bson.Int64(a)}
+            for i, (r, a) in enumerate([("e", 10), ("e", 20), ("e", 20), ("w", 30), ("w", 30)], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(DISTINCT amount) FROM sales")
+    assert cur.fetchall() == ([3],)
+    cur.execute("SELECT region, COUNT(DISTINCT amount) FROM sales GROUP BY region ORDER BY region")
+    assert cur.fetchall() == (["e", 2], ["w", 1])
+    conn.close()
+
+
 def test_set_operations_via_driver(server):
     # UNION / INTERSECT / EXCEPT over Mongo-written data, through the real driver.
     server.storage.insert(
