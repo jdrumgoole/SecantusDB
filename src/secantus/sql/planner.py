@@ -67,6 +67,7 @@ class DropIndexPlan:
 class InsertPlan:
     table: TableDef
     docs: list[dict[str, Any]]
+    returning: list[tuple[str, Column]] | None = None
 
 
 @dataclass
@@ -110,12 +111,14 @@ class UpdatePlan:
     table: TableDef
     filter: dict[str, Any]
     update: dict[str, Any]
+    returning: list[tuple[str, Column]] | None = None
 
 
 @dataclass
 class DeletePlan:
     table: TableDef
     filter: dict[str, Any]
+    returning: list[tuple[str, Column]] | None = None
 
 
 Plan = CreateTablePlan | DropTablePlan | InsertPlan | SelectPlan | UpdatePlan | DeletePlan
@@ -784,7 +787,7 @@ def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
             if col.name not in provided and not col.nullable:
                 raise errors.not_null_violation(col.name)
         docs.append(doc)
-    return InsertPlan(table=table, docs=docs)
+    return InsertPlan(table=table, docs=docs, returning=_returning_columns(stmt, table))
 
 
 def _order_sort(stmt: exp.Expression, table: TableDef) -> dict[str, int] | None:
@@ -893,11 +896,12 @@ def _count_star_alias(stmt: exp.Select) -> str | None:
     return None
 
 
-def _select_out_columns(stmt: exp.Select, table: TableDef) -> list[tuple[str, Column]]:
-    """The projected ``(output_name, Column)`` list for a plain (non-aggregate)
-    SELECT — shared by the pushdown and correlated-WHERE plans."""
+def _out_columns(exprs: list[exp.Expression], table: TableDef) -> list[tuple[str, Column]]:
+    """The projected ``(output_name, Column)`` list for a column / ``*`` / jsonb
+    projection over ``table`` — shared by the SELECT pushdown, correlated-WHERE,
+    and ``RETURNING`` plans."""
     out_columns: list[tuple[str, Column]] = []
-    for e in stmt.expressions:
+    for e in exprs:
         if isinstance(e, exp.Star):
             for col in table.columns:
                 out_columns.append((col.name, col))
@@ -921,6 +925,21 @@ def _select_out_columns(stmt: exp.Select, table: TableDef) -> list[tuple[str, Co
                 raise errors.undefined_column(cname)
         out_columns.append((alias or cname, col))
     return out_columns
+
+
+def _select_out_columns(stmt: exp.Select, table: TableDef) -> list[tuple[str, Column]]:
+    """The projected columns for a plain (non-aggregate) SELECT."""
+    return _out_columns(stmt.expressions, table)
+
+
+def _returning_columns(stmt: exp.Expression, table: TableDef) -> list[tuple[str, Column]] | None:
+    """The projected columns for a write statement's ``RETURNING`` clause, or
+    None when there is no ``RETURNING``. Supports ``*``, column references (with
+    aliases), and jsonb navigation — the same projection vocabulary as SELECT."""
+    returning = stmt.args.get("returning")
+    if returning is None:
+        return None
+    return _out_columns(returning.expressions, table)
 
 
 def where_needs_per_row(stmt: exp.Select) -> bool:
@@ -985,11 +1004,20 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         if raw is None and not col.nullable:
             raise errors.not_null_violation(col_name)
         set_doc[col.field] = typemap.coerce(raw, col.type_tag)
-    return UpdatePlan(table=table, filter=_where_filter(stmt, table), update={"$set": set_doc})
+    return UpdatePlan(
+        table=table,
+        filter=_where_filter(stmt, table),
+        update={"$set": set_doc},
+        returning=_returning_columns(stmt, table),
+    )
 
 
 def plan_delete(stmt: exp.Delete, table: TableDef) -> DeletePlan:
-    return DeletePlan(table=table, filter=_where_filter(stmt, table))
+    return DeletePlan(
+        table=table,
+        filter=_where_filter(stmt, table),
+        returning=_returning_columns(stmt, table),
+    )
 
 
 def _value_to_node(value: Any) -> exp.Expression:

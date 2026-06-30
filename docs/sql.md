@@ -399,6 +399,23 @@ immutable (`SET _id = …` is rejected). Writing to a collection that doesn't
 exist yet returns `undefined_table` — `CREATE TABLE` it first, or create it
 through `pymongo`.
 
+### RETURNING
+
+`INSERT`, `UPDATE`, and `DELETE` accept a `RETURNING` clause that projects the
+affected rows back as a result set — the same projection vocabulary as a SELECT
+list (`*`, columns, aliases, jsonb navigation). `INSERT` returns the inserted
+rows, `UPDATE` the **post-image** of the updated rows, and `DELETE` the deleted
+rows. Works on declared and reflected tables alike:
+
+```sql
+INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b') RETURNING id, name;
+UPDATE t SET n = n + 1 WHERE id = 1 RETURNING id, n;     -- the new n
+DELETE FROM t WHERE n > 100 RETURNING *;
+```
+
+`RETURNING` is limited to the projection vocabulary above (no computed
+expressions); the rows reflect the values actually stored.
+
 ## Indexes
 
 `CREATE INDEX` (optionally `UNIQUE`) maps to a real Mongo secondary index on the
@@ -559,7 +576,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 
 | Area | Supported | Not yet |
 |---|---|---|
-| DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `MERGE`, `INSERT ... SELECT`, `RETURNING` |
+| DML | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `INSERT ... SELECT` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING` | window functions, `GROUPING SETS` |

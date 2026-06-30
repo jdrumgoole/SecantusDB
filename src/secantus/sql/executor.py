@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import bson
+
 from secantus.paths import get_path
 from secantus.sql import errors, planner, typemap
 from secantus.sql.catalog import Catalog
@@ -71,7 +73,32 @@ def execute_drop_index(
     raise errors.SQLError("42704", f'index "{plan.name}" does not exist')
 
 
+def _returning_result(
+    docs: list[dict[str, Any]],
+    returning: list[tuple[str, Any]],
+    command_tag: str,
+    rowcount: int,
+) -> SQLResult:
+    """Shape a write statement's ``RETURNING`` rows the same way a SELECT does —
+    so the wire layer emits a RowDescription + DataRows ahead of CommandComplete."""
+    columns = [
+        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
+        for name, col in returning
+    ]
+    rows = [
+        tuple(typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in returning)
+        for doc in docs
+    ]
+    return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
+
+
 def execute_insert(plan: planner.InsertPlan, storage: Any, db: str) -> SQLResult:
+    if plan.returning is not None:
+        # Pin an ``_id`` on every doc up front so the in-hand list is the
+        # authoritative inserted set to project from (storage may deep-copy on
+        # insert, so we can't rely on it back-filling ``_id`` into plan.docs).
+        for doc in plan.docs:
+            doc.setdefault("_id", bson.ObjectId())
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
         first = write_errors[0]
@@ -80,6 +107,10 @@ def execute_insert(plan: planner.InsertPlan, storage: Any, db: str) -> SQLResult
                 f'duplicate key value violates unique constraint on "{plan.table.name}"'
             )
         raise errors.SQLError("XX000", first.get("errmsg", "insert failed"))
+    if plan.returning is not None:
+        return _returning_result(
+            plan.docs[:inserted], plan.returning, f"INSERT 0 {inserted}", inserted
+        )
     return SQLResult(command_tag=f"INSERT 0 {inserted}", rowcount=inserted)
 
 
@@ -354,11 +385,24 @@ def execute_evaluated_select(
 
 
 def execute_update(plan: planner.UpdatePlan, storage: Any, db: str) -> SQLResult:
-    res = storage.update_matching(db, plan.table.collection, plan.filter, plan.update, multi=True)
+    coll = plan.table.collection
+    if plan.returning is not None:
+        # RETURNING yields the post-image, so capture the matched ``_id``s first,
+        # apply the update, then re-read those rows.
+        ids = [d["_id"] for d in storage.find_matching(db, coll, plan.filter)]
+    res = storage.update_matching(db, coll, plan.filter, plan.update, multi=True)
     matched = int(res["matched"])
+    if plan.returning is not None:
+        post = storage.find_matching(db, coll, {"_id": {"$in": ids}}) if ids else []
+        return _returning_result(post, plan.returning, f"UPDATE {matched}", matched)
     return SQLResult(command_tag=f"UPDATE {matched}", rowcount=matched)
 
 
 def execute_delete(plan: planner.DeletePlan, storage: Any, db: str) -> SQLResult:
-    n = storage.delete_matching(db, plan.table.collection, plan.filter)
+    coll = plan.table.collection
+    # RETURNING yields the deleted rows, so snapshot them before the delete.
+    victims = storage.find_matching(db, coll, plan.filter) if plan.returning is not None else []
+    n = storage.delete_matching(db, coll, plan.filter)
+    if plan.returning is not None:
+        return _returning_result(victims, plan.returning, f"DELETE {n}", n)
     return SQLResult(command_tag=f"DELETE {n}", rowcount=n)

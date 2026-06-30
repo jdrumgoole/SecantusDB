@@ -1327,6 +1327,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   and the inner query is a simple `SELECT … FROM one_table [WHERE …]`; the per-row scan is
   `O(outer × inner)` (no index use). Still `0A000`: function calls inside a comparison
   (`qty = abs(shipped)`) and `<@`-style structural predicates.
+- [ ] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
+  affected rows back as a result set (`planner._returning_columns` reuses the SELECT projection
+  vocabulary `_out_columns`: `*`, columns, aliases, jsonb nav). `execute_insert` pins an `_id` on
+  each doc before insert so the in-hand list is the authoritative inserted set; `execute_update`
+  captures matched `_id`s and re-reads the **post-image**; `execute_delete` snapshots the victims
+  before deleting. The wire layer already emits RowDescription+DataRows whenever `res.columns` is
+  non-empty, so no pgserver change. **Limited to the projection vocabulary** (no computed
+  expressions in `RETURNING`, e.g. `RETURNING n*2`).
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the
