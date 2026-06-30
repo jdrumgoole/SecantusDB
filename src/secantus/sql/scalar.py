@@ -57,6 +57,10 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return evaluate(node.this, scope, ctx)
     if isinstance(node, exp.Alias):
         return evaluate(node.this, scope, ctx)
+    if isinstance(node, exp.Window):
+        # Window values are precomputed over the whole partition before per-row
+        # evaluation; the evaluated-select scope resolves the node to its value.
+        return scope(node)
     if isinstance(node, exp.Null):
         return None
     if isinstance(node, exp.Boolean):

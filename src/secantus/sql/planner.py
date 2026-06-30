@@ -2160,6 +2160,18 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)
+    if isinstance(node, exp.Window):
+        func = node.this
+        if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count)):
+            return "int8"
+        if isinstance(func, exp.Avg):
+            return "float8"
+        if (
+            isinstance(func, (exp.Sum, exp.Min, exp.Max, exp.Lag, exp.Lead))
+            and func.this is not None
+        ):
+            return _infer_scalar_tag(func.this, resolve)
+        return "numeric"
     srf = _srf_of(node)
     if srf is not None:
         # jsonb_array_elements → json elements; jsonb_object_keys → text keys;

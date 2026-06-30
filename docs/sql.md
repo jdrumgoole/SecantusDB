@@ -352,6 +352,27 @@ SELECT c.name FROM vip JOIN customers c ON vip.cust_id = c.id;
 `WITH RECURSIVE` is not supported, and a `WITH` prefix is accepted only on a
 `SELECT` / set-operation query (not on `INSERT` / `UPDATE` / `DELETE`).
 
+## Window functions
+
+`func(...) OVER (PARTITION BY … ORDER BY …)` computes a value per row from its
+partition. Supported: `ROW_NUMBER`, `RANK`, `DENSE_RANK`; the aggregate windows
+`SUM` / `COUNT` / `AVG` / `MIN` / `MAX`; and `LAG` / `LEAD`. An aggregate window
+with no `ORDER BY` aggregates the whole partition; with an `ORDER BY` it's a
+running aggregate under the default `RANGE` frame (rows tied on the order key
+share the cumulative value):
+
+```sql
+SELECT id, region,
+       ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rank_in_region,
+       SUM(amount)  OVER (PARTITION BY region)                      AS region_total,
+       amount - LAG(amount) OVER (ORDER BY id)                      AS delta
+FROM sales;
+```
+
+Explicit frame clauses (`ROWS` / `RANGE BETWEEN …`) and `WITH RECURSIVE` are not
+supported; a window function can't be combined with `GROUP BY` in the same
+SELECT.
+
 ## Reflected tables and jsonb (the dual-protocol payoff)
 
 A collection with **no `CREATE TABLE`** is still queryable. SecantusDB samples
@@ -643,8 +664,9 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | non-recursive `WITH name AS (...)` (multiple, chained) on `SELECT` / set-op queries | `WITH RECURSIVE`, `WITH` on `INSERT`/`UPDATE`/`DELETE` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
-| Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate, window functions |
-| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | window functions, `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
+| Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
+| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
+| Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY` | explicit frames (`ROWS`/`RANGE BETWEEN`), `NTILE`/`FIRST_VALUE`/..., window + `GROUP BY` |
 | Joins | multi-table `INNER`/`LEFT JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL`/`CROSS`, non-equi / `OR` `ON` |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |

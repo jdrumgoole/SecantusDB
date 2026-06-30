@@ -259,15 +259,22 @@ def _evaluated_value_rows(
     """Run an evaluated plan's pipeline, evaluate each output expression per row
     (expanding set-returning functions), then apply ORDER BY / DISTINCT / LIMIT."""
     from secantus.aggregate import PipelineContext, apply_pipeline
-    from secantus.sql import scalar
+    from secantus.sql import scalar, window
 
     _materialize_derived(plan, storage, db, sctx)
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
     docs = apply_pipeline(docs, plan.pipeline, ctx)
+    # Window functions depend on the whole partition, so they're computed over all
+    # rows up front and stored on each doc; the scope resolves an exp.Window node
+    # (keyed by id) to that precomputed field.
+    win_field = window.compute_windows(plan.out_exprs, docs, plan.resolve, sctx)
 
     def make_scope(doc: dict[str, Any]):
         def scope(node: Any) -> Any:
+            field = win_field.get(id(node))
+            if field is not None:
+                return get_path(doc, field)
             path, _ = plan.resolve(node)
             return get_path(doc, path)
 
