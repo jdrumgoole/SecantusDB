@@ -87,6 +87,26 @@ def test_returning_via_driver(server):
     conn.close()
 
 
+def test_window_functions_via_driver(server):
+    # Window functions over Mongo-written data, through the real driver.
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(i), "region": r, "amount": bson.Int64(a)}
+            for i, (r, a) in enumerate([("e", 10), ("e", 30), ("w", 20), ("w", 50)], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT _id, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn, "
+        "SUM(amount) OVER (PARTITION BY region) AS tot FROM sales ORDER BY _id"
+    )
+    assert cur.fetchall() == ([1, 1, 40], [2, 2, 40], [3, 1, 70], [4, 2, 70])
+    conn.close()
+
+
 def test_insert_select_via_driver(server):
     # INSERT ... SELECT over Mongo-written data, through the real driver.
     server.storage.insert(

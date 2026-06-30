@@ -1375,6 +1375,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `RETURNING` works (the source is materialized first, so a self-insert reads a stable snapshot).
   **Still `0A000`:** `WITH` before an `INSERT` (the source SELECT's own `WITH` is fine), `ON CONFLICT`,
   `MERGE`.
+- [ ] **Window functions landed** (b51). `func(...) OVER (PARTITION BY … ORDER BY …)` routes through
+  the evaluated-select path (a window expr already trips `_stmt_needs_evaluation`). `secantus.sql.window`
+  computes each window over the fetched rows — partition (repr-keyed groups), order within partition
+  (stable multi-key sort), then apply the function — and stores the value on each doc under a synthetic
+  `__win_<k>` field; `scalar.evaluate` resolves an `exp.Window` node to that value via the scope (so a
+  window can nest inside a larger expression). Supported: `ROW_NUMBER`/`RANK`/`DENSE_RANK`,
+  `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` (whole-partition, or running under the default RANGE frame — peers
+  tied on the order key share the cumulative value), `LAG`/`LEAD` (offset + default). `_infer_scalar_tag`
+  types them (rank/count→int8, avg→float8, sum/min/max/lag/lead→arg tag). **Still `0A000`/unsupported:**
+  explicit frames (`ROWS`/`RANGE BETWEEN` → `spec` present), `NTILE`/`FIRST_VALUE`/`NTH_VALUE`/...,
+  window + `GROUP BY` in one SELECT (routes to the group path and errors), and `ORDER BY <window alias>`
+  (the general alias-in-ORDER-BY gap in the evaluated path).
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the
