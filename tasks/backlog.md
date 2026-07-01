@@ -1414,9 +1414,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   builds each row's inclusive `[lo, hi]` index range; ROWS frames take any `UNBOUNDED`/`CURRENT ROW`/
   `n PRECEDING`/`n FOLLOWING` bound, RANGE frames take `UNBOUNDED`/`CURRENT ROW` (peer-group) bounds.
   Aggregate windows and the value functions reduce/select over the frame; rank-like funcs ignore it.
+  **Window + `GROUP BY` in one SELECT landed** (b69): `planner._plan_group_window_select` runs a two-phase
+  plan — a `$group` computes the grouping columns + every group aggregate (collected anywhere in the SELECT
+  list / ORDER BY via `_group_agg_nodes`, which excludes a window's own aggregate operand), then the
+  evaluated executor computes the windows over the grouped rows. Each group aggregate is replaced in the
+  AST by a reference to its computed field (so `RANK() OVER (ORDER BY SUM(sal))`, `SUM(SUM(sal)) OVER ()`,
+  and `PARTITION BY <group col>` all resolve), `HAVING` prunes groups before the window, and `ORDER BY
+  <window alias>` is resolved in this planner (a bare alias term is substituted with its output expression).
   **Still `0A000`/unsupported:** numeric `RANGE` offset (needs interval arithmetic on the order key),
-  window + `GROUP BY` in one SELECT (routes to the group path and errors), and `ORDER BY <window alias>`
-  (the general alias-in-ORDER-BY gap in the evaluated path).
+  window + `GROUP BY` combined with a `JOIN` in one SELECT (the join+group path doesn't yet run the
+  window phase), and the general `ORDER BY <alias>` gap in the plain evaluated (non-group-window) path.
 - [ ] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
   [WHERE …]` via `planner._plan_on_conflict` (an `OnConflict` on `InsertPlan`) + `executor.
   _execute_insert_on_conflict`: each proposed row probes the conflict target with `find_matching`; a
