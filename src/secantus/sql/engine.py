@@ -423,22 +423,31 @@ def _run_merge(
     )
     on = stmt.args["on"]
     whens = stmt.args["whens"].expressions
+    returning = planner._returning_columns(stmt, target)
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     target_docs = storage.find_matching(db, target.collection, {})
     affected = 0
-    done: set[int] = set()
+    affected_docs: list[dict[str, Any]] = []  # post/pre-images for RETURNING
+    done: set[int] = set()  # target docs already acted on
+    source_matched: set[int] = set()  # target docs some source row matched
 
-    def scope_for(tdoc: dict[str, Any] | None, srow: dict[str, Any]):
+    def scope_for(tdoc: dict[str, Any] | None, srow: dict[str, Any] | None):
         def scope(node: Any) -> Any:
             alias = (node.table or "").lower() or None
             name = node.name
             if alias == target_alias or (alias is None and target.column(name) is not None):
                 return None if tdoc is None else get_path(tdoc, target.field_for(name))
             if alias == src_alias or alias is None or name in source_cols:
-                return srow.get(name)
+                return srow.get(name) if srow is not None else None
             raise errors.undefined_column(name)
 
         return scope
+
+    def record(count: int, doc: dict[str, Any] | None) -> None:
+        nonlocal affected
+        affected += count
+        if returning is not None and doc is not None:
+            affected_docs.append(doc)
 
     for srow in source_rows:
         matched = [
@@ -446,21 +455,42 @@ def _run_merge(
             for td in target_docs
             if id(td) not in done and scalar._truthy(scalar.evaluate(on, scope_for(td, srow), sctx))
         ]
+        for td in matched:
+            source_matched.add(id(td))
         if matched:
-            when = _merge_pick_when(whens, True, scope_for(matched[0], srow), sctx)
+            when = _merge_pick_when(whens, True, False, scope_for(matched[0], srow), sctx)
             if when is None:
                 continue
             for td in matched:
-                affected += _merge_apply_matched(
-                    when, target, td, storage, db, scope_for(td, srow), sctx
+                record(
+                    *_merge_apply_matched(when, target, td, storage, db, scope_for(td, srow), sctx)
                 )
                 done.add(id(td))
         else:
-            when = _merge_pick_when(whens, False, scope_for(None, srow), sctx)
+            when = _merge_pick_when(whens, False, False, scope_for(None, srow), sctx)
             if when is not None:
-                affected += _merge_apply_not_matched(
-                    when, target, storage, db, scope_for(None, srow), sctx
+                record(
+                    *_merge_apply_not_matched(
+                        when, target, storage, db, scope_for(None, srow), sctx
+                    )
                 )
+
+    # WHEN NOT MATCHED BY SOURCE — target rows no source row matched.
+    if any(not w.args.get("matched") and w.args.get("source") for w in whens):
+        for td in target_docs:
+            if id(td) in source_matched or id(td) in done:
+                continue
+            when = _merge_pick_when(whens, False, True, scope_for(td, None), sctx)
+            if when is not None:
+                record(
+                    *_merge_apply_matched(when, target, td, storage, db, scope_for(td, None), sctx)
+                )
+                done.add(id(td))
+
+    if returning is not None:
+        return executor._returning_result(
+            affected_docs, returning, f"MERGE {affected}", affected, target, storage, db
+        )
     return SQLResult(command_tag=f"MERGE {affected}", rowcount=affected)
 
 
@@ -487,14 +517,14 @@ def _merge_source(
 
 
 def _merge_pick_when(
-    whens: list[exp.Expression], matched: bool, scope: Any, sctx: Any
+    whens: list[exp.Expression], matched: bool, by_source: bool, scope: Any, sctx: Any
 ) -> exp.Expression | None:
-    """The first WHEN clause of the right kind whose optional AND-condition holds."""
+    """The first WHEN clause of the right kind (``matched`` / not, and — for a
+    non-match — WHEN NOT MATCHED BY SOURCE vs BY TARGET) whose optional
+    ``AND``-condition holds."""
     for w in whens:
-        if bool(w.args.get("matched")) != matched:
+        if bool(w.args.get("matched")) != matched or bool(w.args.get("source")) != by_source:
             continue
-        if w.args.get("source"):
-            raise errors.feature_not_supported("MERGE ... BY SOURCE is not supported")
         cond = w.args.get("condition")
         if cond is None or scalar._truthy(scalar.evaluate(cond, scope, sctx)):
             return w
@@ -503,7 +533,11 @@ def _merge_pick_when(
 
 def _merge_apply_matched(
     when: exp.Expression, target: TableDef, td: dict[str, Any], storage: Any, db: str, scope, sctx
-) -> int:
+) -> tuple[int, dict[str, Any] | None]:
+    """Apply an UPDATE / DELETE / DO NOTHING to the matched (or not-matched-by-
+    source) target row ``td``. Returns ``(rows_affected, image)`` where ``image``
+    is the post-update / pre-delete row for a RETURNING projection (None if no
+    row changed)."""
     then = when.args["then"]
     if isinstance(then, exp.Update):
         set_doc: dict[str, Any] = {}
@@ -514,25 +548,25 @@ def _merge_apply_matched(
             )
         if set_doc:
             storage.update_matching(db, target.collection, {"_id": td["_id"]}, {"$set": set_doc})
-        return 1
+        return 1, {**td, **set_doc}
     action = then.sql().strip().upper()
     if action == "DELETE":
         storage.delete_matching(db, target.collection, {"_id": td["_id"]})
-        return 1
+        return 1, td
     if action == "DO NOTHING":
-        return 0
+        return 0, None
     raise errors.feature_not_supported(f"unsupported MERGE matched action: {then.sql()}")
 
 
 def _merge_apply_not_matched(
     when: exp.Expression, target: TableDef, storage: Any, db: str, scope, sctx
-) -> int:
+) -> tuple[int, dict[str, Any] | None]:
     import bson
 
     then = when.args["then"]
     if not isinstance(then, exp.Insert):
         if then.sql().strip().upper() == "DO NOTHING":
-            return 0
+            return 0, None
         raise errors.feature_not_supported(f"unsupported MERGE not-matched action: {then.sql()}")
     col_node = then.this
     cols = (
@@ -550,7 +584,7 @@ def _merge_apply_not_matched(
         )
     doc.setdefault("_id", bson.ObjectId())
     storage.insert(db, target.collection, [doc])
-    return 1
+    return 1, doc
 
 
 def run_statement(

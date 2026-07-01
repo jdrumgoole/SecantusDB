@@ -261,6 +261,30 @@ def test_merge_via_driver(server):
     conn.close()
 
 
+def test_merge_returning_and_by_source_via_driver(server):
+    # MERGE with RETURNING and WHEN NOT MATCHED BY SOURCE, through the driver.
+    server.storage.insert(
+        "db",
+        "tgt",
+        [{"_id": bson.Int64(i), "amt": bson.Int64(a)} for i, a in [(1, 10), (2, 20), (3, 30)]],
+    )
+    server.storage.insert("db", "src", [{"_id": bson.Int64(1), "amt": bson.Int64(100)}])
+    conn = connect(server)
+    cur = conn.cursor()
+    # id1 matched → UPDATE; id2/id3 unmatched by source → set to 0; RETURNING the
+    # affected rows' post-images.
+    cur.execute(
+        "MERGE INTO tgt t USING src s ON t._id = s._id "
+        "WHEN MATCHED THEN UPDATE SET amt = s.amt "
+        "WHEN NOT MATCHED BY SOURCE THEN UPDATE SET amt = 0 "
+        "RETURNING t._id, t.amt"
+    )
+    assert sorted(cur.fetchall()) == [[1, 100], [2, 0], [3, 0]]
+    cur.execute("SELECT _id, amt FROM tgt ORDER BY _id")
+    assert cur.fetchall() == ([1, 100], [2, 0], [3, 0])
+    conn.close()
+
+
 def test_with_insert_via_driver(server):
     # WITH ... INSERT ... SELECT FROM cte over the real driver.
     server.storage.insert(

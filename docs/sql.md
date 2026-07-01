@@ -666,8 +666,24 @@ and the `WHEN` conditions, target and source columns resolve by their alias
 (`a.id` / `d.id`); an `UPDATE`'s right-hand sides and an `INSERT`'s `VALUES` may
 reference either side. The command tag counts every row inserted, updated, or
 deleted (`MERGE n`). Matching is evaluated against the target snapshot at the
-statement's start and each target row is affected at most once; `MERGE … WHEN
-NOT MATCHED BY SOURCE` and a `RETURNING` clause are not yet supported.
+statement's start and each target row is affected at most once.
+
+`WHEN NOT MATCHED BY SOURCE` acts on **target** rows that no source row matched
+(`UPDATE` / `DELETE` / `DO NOTHING`), and a `RETURNING` clause projects the
+affected rows — an updated row's post-image, an inserted row, a deleted row's
+pre-image — like a write statement's `RETURNING`:
+
+```sql
+MERGE INTO inventory i USING shipment s ON i.sku = s.sku
+WHEN MATCHED THEN UPDATE SET qty = i.qty + s.qty
+WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (s.sku, s.qty)
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET qty = 0   -- items absent from the shipment
+RETURNING i.sku, i.qty;
+```
+
+`RETURNING` resolves target columns (and computed expressions over them); the
+`merge_action()` function and source-column references in `RETURNING` aren't
+supported.
 
 ## Indexes
 
