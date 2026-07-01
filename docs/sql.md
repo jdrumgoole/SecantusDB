@@ -211,6 +211,47 @@ name — the field stays `_id`. Column *type* changes and multiple actions in on
 statement are not supported (sqlglot parses a comma-separated action list as an
 opaque command); issue one action per statement.
 
+### Foreign keys (declared, not enforced)
+
+Column-level `REFERENCES` and table-level `FOREIGN KEY` are recorded in the
+catalog and surfaced through reflection, so ORMs and migration tools see the
+relationships. SecantusDB does **not** enforce referential integrity on write —
+a foreign key here is a schema-shape record, not a runtime guard.
+
+```sql
+CREATE TABLE users (id bigint PRIMARY KEY, name text);
+
+CREATE TABLE orders (
+    id      bigint PRIMARY KEY,
+    user_id bigint REFERENCES users(id) ON DELETE CASCADE,   -- column-level
+    total   int
+);
+
+CREATE TABLE items (
+    id       bigint PRIMARY KEY,
+    order_id bigint,
+    FOREIGN KEY (order_id) REFERENCES orders(id)             -- table-level
+);
+```
+
+Foreign keys reflect through the standard catalogs:
+`information_schema.referential_constraints` / `.table_constraints` /
+`.key_column_usage` / `.constraint_column_usage`, and `pg_catalog.pg_constraint`
+(`contype = 'f'`) with `pg_get_constraintdef()` rendering the `FOREIGN KEY (…)
+REFERENCES …` text. SQLAlchemy's inspector reflects them end to end:
+
+```python
+insp = sqlalchemy.inspect(engine)
+insp.get_foreign_keys("orders")
+# [{'name': 'orders_user_id_fkey', 'constrained_columns': ['user_id'],
+#   'referred_table': 'users', 'referred_columns': ['id'],
+#   'options': {'ondelete': 'CASCADE'}, ...}]
+```
+
+`ON DELETE` / `ON UPDATE` actions are recorded and reflected but never acted on.
+`REFERENCES t` with no column list targets `t`'s primary key. Composite foreign
+keys parse, but adding a foreign key via `ALTER TABLE` is not yet supported.
+
 ## Querying
 
 `WHERE` supports the common operators; they lower to the same match engine the
@@ -956,7 +997,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain |
-| DDL | `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER COLUMN … TYPE`, multi-action `ALTER`, views, constraints (enforced) |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY`, declared not enforced), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER COLUMN … TYPE`, multi-action `ALTER`, `ALTER TABLE … ADD FOREIGN KEY`, enforced constraints, views |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |

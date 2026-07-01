@@ -308,25 +308,33 @@ def _func_name(node: exp.Anonymous) -> str:
 def _eval_func(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> Any:
     name = _func_name(node)
     args = [evaluate(a, scope, ctx) for a in node.expressions]
-    return _call_func(name, args)
+    return _call_func(name, args, ctx)
 
 
 def _eval_typed_func(node: exp.Func, scope: Scope, ctx: ScalarContext) -> Any:
     name = node.sql_name().lower()
     args = [evaluate(a, scope, ctx) for a in node.expressions if isinstance(a, exp.Expression)]
-    return _call_func(name, args)
+    return _call_func(name, args, ctx)
 
 
-def _call_func(name: str, args: list[Any]) -> Any:
+def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
     if name == "format_type":
         return _format_type(args[0] if args else None, args[1] if len(args) > 1 else None)
+    if name == "pg_get_constraintdef":
+        # Render a foreign-key constraint (by oid) the way Postgres does so
+        # SQLAlchemy's inspector can reflect it; unknown oid / no ctx → NULL
+        # (we store no CHECK constraints or defaults).
+        if ctx is not None and args and isinstance(args[0], int):
+            from secantus.sql import virtual
+
+            return virtual.constraint_def_for_oid(ctx.db, ctx.catalog, args[0])
+        return None
     if name in (
         "pg_get_expr",
         "pg_get_serial_sequence",
-        "pg_get_constraintdef",
         "pg_get_indexdef",
     ):
-        # No stored defaults / sequences; constraint/index defs not rendered.
+        # No stored defaults / sequences; index defs not rendered.
         return None
     if name in ("json_build_object", "jsonb_build_object"):
         out: dict[str, Any] = {}

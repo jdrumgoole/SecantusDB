@@ -21,7 +21,7 @@ from typing import Any
 from secantus.paths import get_path
 from secantus.query import matches
 from secantus.sql import typemap
-from secantus.sql.catalog import Catalog, Column, TableDef
+from secantus.sql.catalog import Catalog, Column, ForeignKey, TableDef
 from secantus.sql.session import Session
 
 # Stable, fictional OIDs for the namespaces we advertise.
@@ -166,6 +166,67 @@ def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list
     return out
 
 
+_FK_OID_BASE = 40000
+
+
+def _fk_condef(fk: ForeignKey, ref_cols: list[str]) -> str:
+    """Render a foreign key the way ``pg_get_constraintdef`` does — SQLAlchemy's
+    inspector regex-parses exactly this string to reflect the constraint."""
+    cols = ", ".join(fk.columns)
+    rcols = ", ".join(ref_cols)
+    text = f"FOREIGN KEY ({cols}) REFERENCES {fk.ref_table}({rcols})"
+    if fk.on_update:
+        text += f" ON UPDATE {fk.on_update}"
+    if fk.on_delete:
+        text += f" ON DELETE {fk.on_delete}"
+    return text
+
+
+def _foreign_keys(db: str, catalog: Catalog) -> list[dict[str, Any]]:
+    """Every declared foreign key with the fields the ``pg_constraint`` /
+    ``information_schema`` / ``pg_get_constraintdef`` reflection paths need: a
+    stable ``oid``, owner/referenced table OIDs, ``conkey``/``confkey`` attnum
+    arrays, the resolved referenced columns, and the rendered ``condef``."""
+    table_oids = _table_oids(db, catalog)
+    tables = {t.name: t for t in _user_tables(db, catalog)}
+    out: list[dict[str, Any]] = []
+    oid = _FK_OID_BASE
+    for t in _user_tables(db, catalog):
+        owner_attnum = {c.name: i for i, c in enumerate(t.columns, start=1)}
+        for fk in t.foreign_keys:
+            ref = tables.get(fk.ref_table)
+            ref_cols = list(fk.ref_columns)
+            if not ref_cols and ref is not None and ref.pk_column is not None:
+                ref_cols = [ref.pk_column.name]  # REFERENCES t → its PRIMARY KEY
+            ref_attnum = {c.name: i for i, c in enumerate(ref.columns, start=1)} if ref else {}
+            out.append(
+                {
+                    "oid": oid,
+                    "conname": fk.name,
+                    "table": t,
+                    "fk": fk,
+                    "conrelid": table_oids.get(t.name, 0),
+                    "confrelid": table_oids.get(fk.ref_table, 0),
+                    "conkey": [owner_attnum.get(c, 0) for c in fk.columns],
+                    "confkey": [ref_attnum.get(c, 0) for c in ref_cols],
+                    "ref_cols": ref_cols,
+                    "ref_pk_name": f"{fk.ref_table}_pkey" if ref is not None else None,
+                    "condef": _fk_condef(fk, ref_cols),
+                }
+            )
+            oid += 1
+    return out
+
+
+def constraint_def_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
+    """``pg_get_constraintdef(oid)`` — the rendered constraint definition for a
+    foreign-key constraint OID, or ``None`` when the OID isn't an FK we know."""
+    for fk in _foreign_keys(db, catalog):
+        if fk["oid"] == oid:
+            return fk["condef"]
+    return None
+
+
 def _info_table_constraints(
     db: str, session: Session, storage: Any, catalog: Catalog
 ) -> list[dict]:
@@ -182,6 +243,19 @@ def _info_table_constraints(
             "initially_deferred": "NO",
         }
         for t, conname, _cols in _pk_constraints(db, catalog)
+    ] + [
+        {
+            "constraint_catalog": db,
+            "constraint_schema": "public",
+            "constraint_name": fk["conname"],
+            "table_catalog": db,
+            "table_schema": "public",
+            "table_name": fk["table"].name,
+            "constraint_type": "FOREIGN KEY",
+            "is_deferrable": "NO",
+            "initially_deferred": "NO",
+        }
+        for fk in _foreign_keys(db, catalog)
     ]
 
 
@@ -200,6 +274,23 @@ def _info_key_column_usage(db: str, session: Session, storage: Any, catalog: Cat
                     "column_name": col,
                     "ordinal_position": pos,
                     "position_in_unique_constraint": None,
+                }
+            )
+    # FK local columns: position_in_unique_constraint points at the ordinal of
+    # the matching referenced (unique) column.
+    for fk in _foreign_keys(db, catalog):
+        for pos, col in enumerate(fk["fk"].columns, start=1):
+            rows.append(
+                {
+                    "constraint_catalog": db,
+                    "constraint_schema": "public",
+                    "constraint_name": fk["conname"],
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": fk["table"].name,
+                    "column_name": col,
+                    "ordinal_position": pos,
+                    "position_in_unique_constraint": pos,
                 }
             )
     return rows
@@ -222,15 +313,43 @@ def _info_constraint_column_usage(
                     "constraint_name": conname,
                 }
             )
+    # For an FK, constraint_column_usage names the *referenced* table's columns.
+    for fk in _foreign_keys(db, catalog):
+        for col in fk["ref_cols"]:
+            rows.append(
+                {
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": fk["fk"].ref_table,
+                    "column_name": col,
+                    "constraint_catalog": db,
+                    "constraint_schema": "public",
+                    "constraint_name": fk["conname"],
+                }
+            )
     return rows
 
 
 def _info_referential_constraints(
     db: str, session: Session, storage: Any, catalog: Catalog
 ) -> list[dict]:
-    # No foreign-key constraints in our model — present-but-empty so an ORM's FK
-    # reflection join resolves to "no foreign keys" instead of erroring.
-    return []
+    # One row per declared foreign key. The referenced unique constraint is the
+    # target table's PRIMARY KEY. Rules default to NO ACTION (Postgres' default)
+    # when the FK didn't spell out ON UPDATE / ON DELETE.
+    return [
+        {
+            "constraint_catalog": db,
+            "constraint_schema": "public",
+            "constraint_name": fk["conname"],
+            "unique_constraint_catalog": db,
+            "unique_constraint_schema": "public",
+            "unique_constraint_name": fk["ref_pk_name"],
+            "match_option": "NONE",
+            "update_rule": fk["fk"].on_update or "NO ACTION",
+            "delete_rule": fk["fk"].on_delete or "NO ACTION",
+        }
+        for fk in _foreign_keys(db, catalog)
+    ]
 
 
 def _info_sequences(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -340,9 +459,9 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
 
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     # Primary-key constraints (contype 'p'), one per table with a PK, keyed to
-    # the implicit PK index via conindid. No foreign keys / check / unique
-    # *constraints* in our model (a CREATE UNIQUE INDEX is an index, not a
-    # constraint), so contype 'f'/'u'/'c' rows are absent.
+    # the implicit PK index via conindid, plus declared foreign keys (contype
+    # 'f'). No check / unique *constraints* in our model (a CREATE UNIQUE INDEX
+    # is an index, not a constraint), so contype 'u'/'c' rows are absent.
     rows: list[dict] = []
     oid = 30000
     for ix in _index_relations(db, storage, catalog):
@@ -362,6 +481,20 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
             }
         )
         oid += 1
+    for fk in _foreign_keys(db, catalog):
+        rows.append(
+            {
+                "oid": fk["oid"],
+                "conname": fk["conname"],
+                "conrelid": fk["conrelid"],
+                "confrelid": fk["confrelid"],
+                "conindid": 0,
+                "contype": "f",
+                "contypid": 0,
+                "conkey": fk["conkey"],
+                "confkey": fk["confkey"],
+            }
+        )
     return rows
 
 

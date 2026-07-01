@@ -1049,7 +1049,7 @@ def test_sqlalchemy_full_reflection(server):
 
 
 def test_sqlalchemy_get_foreign_keys_empty(server):
-    # We model no foreign keys, so get_foreign_keys() reflects empty (no error).
+    # A table with no FK reflects empty (no error).
     sa = pytest.importorskip("sqlalchemy")
     host, port = server.address
     engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
@@ -1059,6 +1059,64 @@ def test_sqlalchemy_get_foreign_keys_empty(server):
         assert sa.inspect(engine).get_foreign_keys("users") == []
     finally:
         engine.dispose()
+
+
+def test_sqlalchemy_reflects_foreign_keys(server):
+    # A declared FK reflects through SQLAlchemy's inspector: constrained columns,
+    # referred table/columns, and ON DELETE / ON UPDATE actions. SQLAlchemy's PG
+    # dialect regex-parses pg_get_constraintdef(oid), so this proves that renders.
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE users (id bigint primary key, name text)"))
+            conn.execute(
+                sa.text(
+                    "CREATE TABLE orders (id bigint primary key, "
+                    "user_id bigint REFERENCES users(id) ON DELETE CASCADE, total int)"
+                )
+            )
+        fks = sa.inspect(engine).get_foreign_keys("orders")
+        assert len(fks) == 1
+        fk = fks[0]
+        assert fk["name"] == "orders_user_id_fkey"
+        assert fk["constrained_columns"] == ["user_id"]
+        assert fk["referred_table"] == "users"
+        assert fk["referred_columns"] == ["id"]
+        assert fk["options"] == {"ondelete": "CASCADE"}
+        # Full MetaData reflection resolves the relationship end to end.
+        md = sa.MetaData()
+        md.reflect(bind=engine)
+        targets = [
+            (fk.column.table.name, fk.column.name) for fk in md.tables["orders"].foreign_keys
+        ]
+        assert targets == [("users", "id")]
+    finally:
+        engine.dispose()
+
+
+def test_table_level_foreign_key_via_driver(server):
+    # Table-level FOREIGN KEY (col) REFERENCES t(col), surfaced in
+    # information_schema.referential_constraints through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users (id bigint primary key, name text)")
+    cur.execute(
+        "CREATE TABLE orders (id bigint primary key, user_id bigint, total int, "
+        "FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL)"
+    )
+    cur.execute(
+        "SELECT constraint_name, unique_constraint_name, update_rule, delete_rule "
+        "FROM information_schema.referential_constraints"
+    )
+    assert cur.fetchall() == (["orders_user_id_fkey", "users_pkey", "CASCADE", "SET NULL"],)
+    cur.execute(
+        "SELECT constraint_type FROM information_schema.table_constraints "
+        "WHERE constraint_name = 'orders_user_id_fkey'"
+    )
+    assert cur.fetchall() == (["FOREIGN KEY"],)
+    conn.close()
 
 
 def test_transaction_commit_and_rollback(server):
