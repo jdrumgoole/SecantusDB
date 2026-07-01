@@ -680,6 +680,32 @@ After a failed statement inside a block, every command except `COMMIT` /
 `ROLLBACK` returns SQLSTATE `25P02` until the block ends; a `COMMIT` of an
 aborted block rolls back.
 
+### Savepoints
+
+`SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` / `RELEASE SAVEPOINT name` give
+real nested, partial rollback inside a transaction — the machinery SQLAlchemy's
+nested-transaction / unit-of-work blocks lean on. `ROLLBACK TO SAVEPOINT` undoes
+every write since the savepoint (keeping earlier ones), leaves the savepoint
+open, and un-poisons a block that a prior statement aborted. `RELEASE` forgets a
+savepoint but keeps its writes.
+
+```sql
+BEGIN;
+INSERT INTO accounts (id, balance) VALUES (1, 100);
+SAVEPOINT sp1;
+INSERT INTO accounts (id, balance) VALUES (2, 50);
+ROLLBACK TO SAVEPOINT sp1;   -- id=2 undone; id=1 kept
+INSERT INTO accounts (id, balance) VALUES (3, 20);
+COMMIT;                      -- persists id=1 and id=3
+```
+
+Each savepoint captures a touched table's pre-image the first time it's written
+after the savepoint is established, and `ROLLBACK TO` restores those pre-images —
+so it undoes `INSERT` / `UPDATE` / `DELETE` (and upserts). A `SAVEPOINT` /
+`RELEASE` / `ROLLBACK TO` outside a transaction block errors with `25P01`; an
+unknown savepoint name errors with `3B001`. DDL issued inside a savepoint (e.g.
+`CREATE TABLE`) is **not** rolled back by `ROLLBACK TO SAVEPOINT` — only DML is.
+
 `SET TRANSACTION ISOLATION LEVEL …` / `… READ ONLY` / `… READ WRITE`,
 `SET SESSION CHARACTERISTICS AS TRANSACTION …`, and `BEGIN ISOLATION LEVEL …`
 are accepted but are no-ops: SecantusDB is single-node, so isolation level and

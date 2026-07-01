@@ -1510,14 +1510,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   the block with `25P02` until it ends). `SET TRANSACTION ISOLATION LEVEL` / `READ ONLY` /
   `READ WRITE`, `SET SESSION CHARACTERISTICS`, and `BEGIN ISOLATION LEVEL …` are
   **accepted as no-ops** (single-node — isolation/read-only don't change behaviour).
-  `SAVEPOINT name` / `RELEASE name` parse as a bare `Alias` in sqlglot's pg dialect and
-  are accepted as **no-ops** (`engine._noop_command_word`); `ROLLBACK TO [SAVEPOINT] name`
-  (parsed as `exp.Rollback` with a `savepoint` arg) clears `txn_failed` and keeps the block
-  open — enough for psycopg's `conn.transaction()` / SQLAlchemy's dialect probes, but there's
-  **no real per-savepoint state** (a `ROLLBACK TO` doesn't undo writes made after the
-  savepoint — it only un-poisons an aborted block). `DEALLOCATE`/`DISCARD` are likewise
-  no-ops. Still missing: true nested-savepoint rollback and the `DECLARE CURSOR` … `FETCH`
-  holdable-cursor surface. DDL is transactional via the same mechanism. Cross-connection
+  **Real nested savepoints landed** (b71): `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` /
+  `RELEASE SAVEPOINT name` do actual partial rollback. Each open savepoint (`session.savepoints`,
+  a stack of `_Savepoint`) lazily captures a touched collection's deep-copied pre-image the first
+  time it's written after the savepoint (`engine._capture_savepoint_snapshots`, run before every
+  DML inside the txn — the snapshot pins to the savepoint's establishment state since nothing wrote
+  in between). `ROLLBACK TO` restores each collection to the oldest captured snapshot among the
+  target savepoint and the nested ones (`delete_matching({})` + re-`insert`), drops the nested
+  savepoints, un-poisons the block, and keeps the savepoint open; `RELEASE` merges a savepoint's
+  snapshots down into its parent (oldest-per-collection wins) so the parent can still undo them.
+  `parse()` rewrites `RELEASE SAVEPOINT x` → `RELEASE x` (sqlglot parses only the latter). Outside a
+  txn block → `25P01`; unknown savepoint → `3B001`. **Limitations:** it's a collection-granularity
+  snapshot (fine for the ephemeral test data SecantusDB targets, `O(rows-in-touched-collection)` per
+  first-write-per-savepoint, not a WT-native savepoint); **DDL inside a savepoint is not undone**
+  (`CREATE`/`DROP`/`CREATE INDEX` — only DML restores); and recovery after a storage-engine
+  `WT_ROLLBACK`-class error (vs an ordinary constraint violation) may leave the WT txn unusable for
+  the restore writes. `DEALLOCATE`/`DISCARD` remain no-ops. Still missing: the `DECLARE CURSOR` …
+  `FETCH` holdable-cursor surface. DDL is transactional via BEGIN/COMMIT/ROLLBACK. Cross-connection
   isolation is the WT engine's job (the test double only models atomicity).
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when

@@ -48,6 +48,16 @@ REPORTABLE_GUCS = frozenset(
 
 
 @dataclass
+class _Savepoint:
+    """One open savepoint. ``snapshots`` maps a collection name to the deep-copied
+    documents it held at this savepoint's establishment (captured lazily, on the
+    first write to that collection while this savepoint is open)."""
+
+    name: str
+    snapshots: dict[str, list] = field(default_factory=dict)
+
+
+@dataclass
 class Session:
     database: str = "postgres"
     user: str = "secantus"
@@ -59,6 +69,10 @@ class Session:
     # 25P02 until the block ends — Postgres semantics).
     txn_handle: Any = None
     txn_failed: bool = False
+    # Open savepoints, innermost last. Each is a ``_Savepoint`` carrying the
+    # pre-image snapshot (collection -> docs) captured on the first write to that
+    # collection after the savepoint was established, so ROLLBACK TO can restore.
+    savepoints: list[Any] = field(default_factory=list)
 
     def get_setting(self, name: str) -> str:
         return self.settings.get(name, GUC_DEFAULTS.get(name, ""))
