@@ -49,6 +49,18 @@ class FakeStorage:
     def drop_collection(self, db, coll):
         return self.data.pop((db, coll), None) is not None
 
+    def rename_collection(self, src_db, src_coll, dst_db, dst_coll, *, drop_target=False):
+        if (src_db, src_coll) not in self.data:
+            return False, f"source namespace does not exist: {src_db}.{src_coll}"
+        if (src_db, src_coll) == (dst_db, dst_coll):
+            return True, None
+        if (dst_db, dst_coll) in self.data and not drop_target:
+            return False, f"target namespace exists: {dst_db}.{dst_coll}"
+        self.data[(dst_db, dst_coll)] = self.data.pop((src_db, src_coll))
+        if (src_db, src_coll) in self.indexes:
+            self.indexes[(dst_db, dst_coll)] = self.indexes.pop((src_db, src_coll))
+        return True, None
+
     def list_collections(self, db):
         return sorted(c for (d, c) in self.data if d == db)
 

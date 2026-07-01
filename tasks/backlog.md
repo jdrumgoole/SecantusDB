@@ -1547,7 +1547,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   row per PRIMARY KEY — the only constraint modeled — so the standard PK reflection join
   (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit resolves;
   `referential_constraints` and `sequences` are present-but-empty (no FKs, no sequences). Remaining:
-  actual FK constraints, column comments, `ALTER TABLE`.
+  actual FK constraints, column comments.
+- [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
+  (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
+  the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
+  backing collection via `Storage.rename_collection`, so the old name stops resolving — otherwise the
+  leftover collection reflects as a phantom table), and `ALTER COLUMN … SET/DROP NOT NULL`.
+  `ALTER TABLE IF EXISTS` on a missing table is a no-op; dropping the PK column is rejected
+  (`0A000`). `execute_alter_table` / `_apply_alter_action` in `executor.py`; catalog rewrite via
+  `Catalog.replace`. **Limitations:** `ALTER COLUMN … TYPE`/`SET DEFAULT` and **multiple actions in
+  one statement** are unsupported — sqlglot parses a comma-separated action list (`ADD …, DROP …`)
+  as an opaque `Command`, so each action must be its own statement.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)

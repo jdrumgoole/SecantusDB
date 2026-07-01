@@ -700,6 +700,9 @@ def _run_statement(
             return executor.execute_drop_index(planner.plan_drop_index(stmt), catalog, storage, db)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
+    if isinstance(stmt, exp.Alter):
+        return executor.execute_alter_table(planner.plan_alter_table(stmt), catalog, storage, db)
+
     if _own_with(stmt) is not None:
         return _run_with(stmt, storage, db, catalog, session)
 

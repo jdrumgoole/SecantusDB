@@ -136,6 +136,12 @@ class Catalog:
     def put(self, db: str, table: TableDef) -> None:
         self._storage.insert(db, CATALOG_COLLECTION, [_to_doc(table)])
 
+    def replace(self, db: str, table: TableDef, *, old_name: str | None = None) -> None:
+        """Overwrite a table's catalog doc (for ALTER). ``old_name`` lets a
+        RENAME drop the entry under the previous name before writing the new."""
+        self._storage.delete_matching(db, CATALOG_COLLECTION, {"_id": old_name or table.name})
+        self._storage.insert(db, CATALOG_COLLECTION, [_to_doc(table)])
+
     def drop(self, db: str, table: str) -> bool:
         return self._storage.delete_matching(db, CATALOG_COLLECTION, {"_id": table}) > 0
 
