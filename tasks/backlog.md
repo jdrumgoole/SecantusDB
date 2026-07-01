@@ -1387,8 +1387,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   every row, guarded by `_MAX_RECURSION_ROWS` (1M → `54001`). Optional column aliases (`name(a,b)`,
   `_cte_column_aliases`) rename the output and now apply to non-recursive CTEs too (`_register_cte`).
   A bare integer/bool literal in a SELECT list now types from its value (`_infer_scalar_tag` →
-  `_infer_value_tag`) so `SELECT 0 AS lvl` rides the wire as an int, not text. **Still `0A000`:**
-  `WITH` on `INSERT`/`UPDATE`/`DELETE` (only `SELECT` / set-op queries).
+  `_infer_value_tag`) so `SELECT 0 AS lvl` rides the wire as an int, not text. **`WITH` on writes
+  landed** (b68): `_run_with` accepts an `INSERT`/`UPDATE`/`DELETE` body — the CTEs materialize the
+  same way, then the write is dispatched via `_run_statement` against the `CatalogBackend` (whose writes
+  forward to real storage) + `_CTECatalog` overlay, with the CTE-aware `SubqueryCtx` published on
+  `planner._pipeline_subctx` so an `UPDATE`/`DELETE` WHERE subquery over a CTE resolves. So
+  `WITH cte AS (…) INSERT INTO t SELECT … FROM cte` and `… UPDATE/DELETE … WHERE id IN (SELECT … FROM
+  cte)` work. **Still `0A000`:** `WITH RECURSIVE` on a write body (only on `SELECT` / set-op).
 - [ ] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
   `engine._run_insert`: the source query (a SELECT / set operation; may join / aggregate / CTE) runs
   via `_run_query`, and its result rows map positionally onto the target columns through the shared
