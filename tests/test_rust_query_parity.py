@@ -373,6 +373,55 @@ CURATED = [
     # $nearSphere legacy sibling form ($maxDistance in radians on the unit sphere).
     ({"loc": [0.0, 0.0]}, {"loc": {"$nearSphere": [0.0, 0.0], "$maxDistance": 0.1}}),
     ({"loc": [10.0, 10.0]}, {"loc": {"$nearSphere": [0.0, 0.0], "$maxDistance": 0.1}}),
+    # $jsonSchema — the bounded keyword subset the pure server validates.
+    # bsonType (alias + numeric code + list), type (JSON type).
+    ({"name": "Joe"}, {"$jsonSchema": {"properties": {"name": {"bsonType": "string"}}}}),
+    ({"name": 5}, {"$jsonSchema": {"properties": {"name": {"bsonType": "string"}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"bsonType": ["int", "long"]}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"bsonType": 16}}}}),  # numeric code
+    ({"n": 5.0}, {"$jsonSchema": {"properties": {"n": {"type": "number"}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),
+    ({"n": 5.5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),  # double !integer
+    # required + top-level.
+    ({"a": 1, "b": 2}, {"$jsonSchema": {"required": ["a", "b"]}}),
+    ({"a": 1}, {"$jsonSchema": {"required": ["a", "b"]}}),  # missing b -> False
+    ({"a": 1}, {"$jsonSchema": {"bsonType": "object", "required": ["a"]}}),
+    # numeric bounds (min/max/exclusive) — only apply to numeric values.
+    ({"age": 30}, {"$jsonSchema": {"properties": {"age": {"minimum": 0, "maximum": 120}}}}),
+    ({"age": -1}, {"$jsonSchema": {"properties": {"age": {"minimum": 0}}}}),  # below min
+    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMinimum": 5}}}}),  # == excl
+    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMaximum": 10}}}}),
+    # string length + pattern.
+    ({"s": "abc"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2, "maxLength": 4}}}}),
+    ({"s": "a"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2}}}}),  # too short
+    ({"s": "hello"}, {"$jsonSchema": {"properties": {"s": {"pattern": "^h"}}}}),
+    ({"s": "world"}, {"$jsonSchema": {"properties": {"s": {"pattern": "^h"}}}}),  # no match
+    # array items + counts.
+    ({"xs": [1, 2, 3]}, {"$jsonSchema": {"properties": {"xs": {"minItems": 2, "maxItems": 5}}}}),
+    ({"xs": [1]}, {"$jsonSchema": {"properties": {"xs": {"minItems": 2}}}}),  # too few
+    ({"xs": [1, 2]}, {"$jsonSchema": {"properties": {"xs": {"items": {"bsonType": "int"}}}}}),
+    ({"xs": [1, "x"]}, {"$jsonSchema": {"properties": {"xs": {"items": {"bsonType": "int"}}}}}),
+    # enum.
+    ({"c": "red"}, {"$jsonSchema": {"properties": {"c": {"enum": ["red", "green"]}}}}),
+    ({"c": "blue"}, {"$jsonSchema": {"properties": {"c": {"enum": ["red", "green"]}}}}),
+    # object property counts.
+    ({"o": {"a": 1, "b": 2}}, {"$jsonSchema": {"properties": {"o": {"maxProperties": 3}}}}),
+    ({"o": {"a": 1, "b": 2}}, {"$jsonSchema": {"properties": {"o": {"minProperties": 3}}}}),
+    # nested: properties within properties + required.
+    (
+        {"user": {"name": "Al", "age": 3}},
+        {
+            "$jsonSchema": {
+                "properties": {
+                    "user": {
+                        "bsonType": "object",
+                        "required": ["name"],
+                        "properties": {"age": {"minimum": 0}},
+                    }
+                }
+            }
+        },
+    ),
 ]
 
 
