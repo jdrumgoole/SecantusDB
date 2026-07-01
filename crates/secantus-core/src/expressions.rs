@@ -1215,21 +1215,20 @@ fn bounded_datetime(millis: i128) -> R {
 
 /// `$dateFromString` — bounded port of `expressions._op_date_from_string`.
 ///
-/// Handles only the parity-safe slice: **no `format`, no `timezone`**, and a
-/// `dateString` in strict canonical naive ISO-8601 — `YYYY-MM-DD` or
-/// `YYYY-MM-DDTHH:MM:SS` (second precision, no fraction). Both forms parse
-/// identically across Python 3.10–3.12's `fromisoformat` and yield a *naive*
-/// whole-second datetime, so the result equals a bson-decoded UTC millis.
+/// Handles a `dateString` in canonical ISO-8601 (no `format`, no separate
+/// `timezone` field): `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS`, optionally with a
+/// trailing `Z` (UTC) or a fixed `±HH:MM` offset. All produce a whole-second UTC
+/// instant, which equals the bson-normalised form of the pure oracle's (possibly
+/// tz-aware) datetime.
 ///
-/// Defers (`Fallback` → Python) on everything else: a `format` (strptime) or
-/// `timezone` (both produce tz-aware results a naive bson date can't equal), a
-/// `Z`/offset designator, a space separator, **fractional seconds** (BSON is
-/// millisecond-only but `fromisoformat` keeps microseconds → mismatch), an
-/// out-of-range/invalid field, or a non-string `dateString`. A null
-/// `dateString` returns `onNull` (or null).
+/// Defers (`Fallback` → Python) on: a `format` (strptime) or a separate
+/// `timezone` field (named zones need a tz database), **fractional seconds**
+/// (BSON is millisecond-only but `fromisoformat` keeps microseconds), a space
+/// separator or other non-canonical/offset shape, an out-of-range/invalid field,
+/// or a non-string `dateString`. A null `dateString` returns `onNull` (or null).
 fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback)?;
-    // format -> strptime; timezone -> tz-aware result. Both defer.
+    // format -> strptime; a separate timezone field -> named-zone db. Both defer.
     if spec.contains_key("format") || spec.contains_key("timezone") {
         return Err(Fallback);
     }
@@ -1246,16 +1245,58 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = raw else {
         return Err(Fallback); // Python raises "dateString must be a string"
     };
-    match parse_iso_naive(&s) {
+    match parse_iso(&s) {
         Some(millis) => bounded_datetime(millis),
         None => Err(Fallback), // non-canonical / invalid -> Python (onError or raise)
     }
 }
 
-/// Parse strict canonical naive ISO-8601 into epoch milliseconds, or `None` if
-/// the string isn't one of the three accepted fixed-width shapes or holds an
-/// out-of-range field. Fixed-width so it can't drift from `fromisoformat`.
-fn parse_iso_naive(s: &str) -> Option<i128> {
+/// Parse ISO-8601 into epoch milliseconds (UTC). Accepts the naive canonical
+/// forms treated as UTC, plus a full datetime with a trailing `Z` or a fixed
+/// `±HH:MM` offset (`utc = wall - offset`). Fractional seconds / other shapes →
+/// `None` (defer).
+fn parse_iso(s: &str) -> Option<i128> {
+    if let Some(base) = s.strip_suffix('Z') {
+        // A `Z` designator only follows a full datetime.
+        return if base.len() == 19 {
+            parse_naive(base)
+        } else {
+            None
+        };
+    }
+    // A full datetime followed by a `±HH:MM` offset is exactly 25 chars.
+    if s.len() == 25 && matches!(s.as_bytes()[19], b'+' | b'-') {
+        let (base, tz) = s.split_at(19);
+        let off_min = parse_offset(tz)?;
+        return parse_naive(base).map(|ms| ms - off_min as i128 * 60_000);
+    }
+    parse_naive(s)
+}
+
+/// A fixed `±HH:MM` UTC offset in signed minutes, or `None` if malformed.
+fn parse_offset(tz: &str) -> Option<i64> {
+    let b = tz.as_bytes();
+    if b.len() != 6 || b[3] != b':' {
+        return None;
+    }
+    let sign = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hh: i64 = tz.get(1..3)?.parse().ok()?;
+    let mm: i64 = tz.get(4..6)?.parse().ok()?;
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    Some(sign * (hh * 60 + mm))
+}
+
+/// Parse strict canonical naive ISO-8601 (`YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS`)
+/// into epoch milliseconds (treating the wall clock as UTC), or `None` for a
+/// non-fixed-width shape or out-of-range field. Fixed-width so it can't drift
+/// from `fromisoformat`.
+fn parse_naive(s: &str) -> Option<i128> {
     let b = s.as_bytes();
     // Only date-only or whole-second forms (fractional seconds defer — see above).
     if b.len() != 10 && b.len() != 19 {

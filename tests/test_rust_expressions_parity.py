@@ -59,6 +59,16 @@ def _rust_eval(expr, doc, vars=None):
     return None if res is None else bson.decode(res)["r"]
 
 
+def _bson_norm(v):
+    """Normalise a pure-Python result the way BSON storage would — the wire form
+    both servers actually return. In particular a tz-aware ``datetime`` collapses
+    to its UTC instant (naive), matching the Rust value which is already
+    bson-decoded; identity for every other BSON type. This is the faithful
+    comparison (stored value), and it can't hide a real value bug — a wrong
+    instant still differs after normalisation."""
+    return bson.decode(bson.encode({"v": v}))["v"]
+
+
 _DT = datetime.datetime(2026, 6, 5, 12, 34, 56, tzinfo=datetime.timezone.utc)
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
@@ -329,8 +339,14 @@ CURATED = [
     ({"$dateFromString": {"dateString": "$s"}}, {"s": "2020-02-29T23:59:59"}),  # leap day
     ({"$dateFromString": {"dateString": None}}, {}),  # null -> null
     ({"$dateFromString": {"dateString": None, "onNull": "was null"}}, {}),  # -> onNull
-    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z"}}, {}),  # tz-aware -> defer
+    # tz designators compute — result normalised to its UTC instant (naive) both
+    # sides. Z (UTC), + offset (wall - offset), - offset (wall + offset).
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00+05:00"}}, {}),  # -> 05:30Z
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00-08:00"}}, {}),  # -> 18:30Z
+    ({"$dateFromString": {"dateString": "2024-01-15T00:30:00+05:00"}}, {}),  # crosses to prev day
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.123456"}}, {}),  # frac -> defer
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.5Z"}}, {}),  # frac+Z -> defer
     ({"$dateFromString": {"dateString": "2024-13-01"}}, {}),  # bad month -> defer
     (
         {"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}},
@@ -443,7 +459,7 @@ def test_curated_parity(expr, doc):
     rust = _rust_eval(expr, doc)
     if rust is None:
         return
-    py = _pure.evaluate(expr, doc)
+    py = _bson_norm(_pure.evaluate(expr, doc))
     assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
 
 
