@@ -42,7 +42,14 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        path = request.url.path
+        # Use the ASGI-parsed request path (set by the server from the request
+        # line), NOT request.url.path. The latter is rebuilt from the Host
+        # header, which CVE-2026-48710 ("BadHost") showed can be spoofed with
+        # path separators (`Host: x/healthz?t=`) to make request.url.path
+        # return a bypass prefix and skip the token check. scope["path"] is
+        # immune to Host spoofing. (starlette>=1.0.1 also fixes the URL build;
+        # this is defence-in-depth.)
+        path = request.scope.get("path", request.url.path)
         if any(path == p or path.startswith(p) for p in _BYPASS_PREFIXES):
             return await call_next(request)
 

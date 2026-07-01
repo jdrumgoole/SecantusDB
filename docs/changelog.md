@@ -19,6 +19,36 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Admin UI security hardening (two CVEs + a stored-XSS fix)
+
+Three findings from the nightly security review, all confined to the
+optional `[admin]` extra (the loopback FastAPI console):
+
+- **CVE-2026-48710 "BadHost" (issue #114):** the admin token middleware
+  gated its `/healthz` + `/static/` bypass allowlist on `request.url.path`,
+  which pre-`starlette` 1.0.1 is rebuilt from an unvalidated `Host` header —
+  a request with `Host: x/healthz?t=` could shift `request.url.path` to a
+  bypass prefix and reach protected admin endpoints unauthenticated. Bumped
+  the `starlette` floor to `>=1.0.1`, **and** the middleware now reads the
+  ASGI `scope["path"]` (immune to `Host` spoofing) as defence-in-depth.
+- **CVE-2026-53539 (issue #113):** `python-multipart` `<0.0.30` has a
+  quadratic-CPU DoS in its urlencoded-form parser. Bumped the floor to
+  `>=0.0.30`.
+- **Stored XSS in the geo viewer (issue #115):** the geo page injected
+  sampled document data into an inline `<script>` via `json_util.dumps` — a
+  document whose string `_id` contained `</script><script>…` closed the
+  block and injected arbitrary JS (with access to pywebview's `js_api`).
+  Feature JSON is now escaped for the script context (`<`/`>`/`&`/U+2028/
+  U+2029 → `\uXXXX`) so a payload can never break out of the block.
+
+#### Security
+- `admin/middleware.py`: token-bypass check reads `scope["path"]`, not the
+  Host-derived `request.url.path`.
+- `admin/routers/extras.py`: `_json_for_script` escapes geo feature JSON for
+  safe inline-`<script>` embedding.
+- `pyproject.toml` `[admin]`: `starlette>=1.0.1`, `python-multipart>=0.0.30`.
+- Regressions: `tests/test_admin_security.py`.
+
 ### Capped-collection eviction survives a backup taken mid-stream
 
 A capped collection restored from a `backupArchive` could evict the wrong

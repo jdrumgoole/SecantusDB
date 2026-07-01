@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.4b58"
+version = "0.5.4b64"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -60,11 +60,21 @@ admin = [
     # Local FastAPI app served behind a pywebview window. Loopback-only
     # with a per-launch token; no external services. See docs/admin.md.
     "fastapi>=0.110",
+    # starlette>=1.0.1 fixes CVE-2026-48710 ("BadHost"): pre-1.0.1 builds
+    # request.url from an unvalidated Host header, letting a crafted Host
+    # shift request.url.path and bypass the admin token middleware's
+    # /healthz + /static/ prefix allowlist. Pinned explicitly (fastapi pulls
+    # starlette transitively, but an explicit floor guarantees the patched
+    # version). The middleware also reads the ASGI scope path directly now
+    # (admin/middleware.py) as defence-in-depth.
+    "starlette>=1.0.1",
     "uvicorn[standard]>=0.27",
     "jinja2>=3.1",
     "httpx>=0.27",
     "pywebview>=5.0",
-    "python-multipart>=0.0.9",
+    # python-multipart>=0.0.30 fixes CVE-2026-53539: a quadratic-CPU DoS in
+    # the urlencoded-form parser on bodies containing semicolons.
+    "python-multipart>=0.0.30",
     # OS-level process-name override — makes the macOS menu bar / Dock
     # / Activity Monitor say "SecantusDB admin" instead of "Python".
     "setproctitle>=1.3",
