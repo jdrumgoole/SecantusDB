@@ -10,6 +10,7 @@ and ``SHOW`` / ``SET`` resolve against real state.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 from sqlglot import exp
@@ -17,7 +18,7 @@ from sqlglot import exp
 from secantus.sql import errors, executor, planner, reflect, scalar, typemap, virtual
 from secantus.sql.catalog import Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
-from secantus.sql.session import REPORTABLE_GUCS, Session, _Savepoint
+from secantus.sql.session import REPORTABLE_GUCS, Session, _Cursor, _Savepoint
 
 
 def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) -> list[SQLResult]:
@@ -95,6 +96,7 @@ def _commit_txn(storage: Any, session: Session) -> SQLResult:
     session.txn_handle = None
     session.txn_failed = False
     session.savepoints = []
+    _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
     if handle is None:
         return SQLResult(command_tag="COMMIT")  # no open block — Postgres warns, returns COMMIT
     if failed:
@@ -110,6 +112,7 @@ def _rollback_txn(storage: Any, session: Session) -> SQLResult:
     session.txn_handle = None
     session.txn_failed = False
     session.savepoints = []
+    _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
     if handle is not None:
         storage.abort_user_transaction(handle)
     return SQLResult(command_tag="ROLLBACK")
@@ -227,6 +230,171 @@ def _write_target_collection(
     name = table_node.name
     table = catalog.get(db, name)
     return table.collection if table is not None else name
+
+
+# --------------------------------------------------------------------------- #
+# Server-side cursors: DECLARE … CURSOR / FETCH / MOVE / CLOSE.
+# The query is materialized once at DECLARE; FETCH/MOVE walk a scroll position
+# over the stored rows (so forward/backward/absolute/relative all work).
+# --------------------------------------------------------------------------- #
+
+_CURSOR_TAIL = re.compile(r"^(?P<opts>.*?)\bFOR\b\s+(?P<query>.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _command_tail(stmt: exp.Command) -> str:
+    arg = stmt.expression
+    return str(arg.name if isinstance(arg, exp.Literal) else (arg or "")).strip()
+
+
+def _unquote_ident(tok: str) -> str:
+    return tok[1:-1] if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"' else tok
+
+
+def _declare_cursor(
+    stmt: exp.Command, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``DECLARE name [opts] CURSOR [opts] FOR <query>`` — run the query now and
+    store its rows under ``name`` for later FETCH/MOVE."""
+    tail = _command_tail(stmt)  # e.g. ``c CURSOR FOR SELECT …``
+    m = _CURSOR_TAIL.match(tail)
+    if m is None:
+        raise errors.syntax_error(f"malformed DECLARE CURSOR: {tail}")
+    opts = m.group("opts")
+    parts = opts.split(None, 1)
+    if not parts:
+        raise errors.syntax_error("DECLARE CURSOR requires a cursor name")
+    name = _unquote_ident(parts[0])
+    hold = re.search(r"\bWITH\s+HOLD\b", opts, re.IGNORECASE) is not None
+    stmts = planner.parse(m.group("query"))
+    if len(stmts) != 1:
+        raise errors.syntax_error("DECLARE CURSOR expects a single query")
+    result = _run_query(stmts[0], storage, db, catalog, session)
+    session.cursors[name] = _Cursor(
+        name=name, columns=result.columns, rows=list(result.rows), pos=-1, hold=hold
+    )
+    return SQLResult(command_tag="DECLARE CURSOR")
+
+
+_FETCH_DIRECTIONS = frozenset(
+    {"NEXT", "PRIOR", "FIRST", "LAST", "ABSOLUTE", "RELATIVE", "FORWARD", "BACKWARD"}
+)
+
+
+def _parse_fetch(tail: str) -> tuple[str, int | None, str]:
+    """Parse a FETCH/MOVE tail into ``(kind, count, cursor_name)``. ``kind`` is one
+    of forward / backward / absolute / relative; ``count`` is the row count (None =
+    ALL). The cursor name is the final token; an optional ``FROM`` / ``IN`` before
+    it is dropped."""
+    toks = tail.split()
+    if not toks:
+        raise errors.syntax_error("FETCH requires a cursor name")
+    name = _unquote_ident(toks.pop())
+    if toks and toks[-1].upper() in ("FROM", "IN"):
+        toks.pop()
+    spec = [t.upper() for t in toks]
+
+    def as_count(tokens: list[str]) -> int | None:
+        if not tokens:
+            return 1
+        if tokens[0] == "ALL":
+            return None
+        try:
+            return int(tokens[0])
+        except ValueError as exc:
+            raise errors.syntax_error(f"invalid FETCH count: {tokens[0]}") from exc
+
+    if not spec:
+        return "forward", 1, name  # bare FETCH cursor → next row
+    head = spec[0]
+    if head not in _FETCH_DIRECTIONS:
+        return "forward", as_count(spec), name  # FETCH n / FETCH ALL
+    rest = spec[1:]
+    if head == "NEXT":
+        return "forward", 1, name
+    if head == "PRIOR":
+        return "backward", 1, name
+    if head == "FIRST":
+        return "absolute", 1, name
+    if head == "LAST":
+        return "absolute", -1, name
+    if head == "FORWARD":
+        return "forward", as_count(rest), name
+    if head == "BACKWARD":
+        return "backward", as_count(rest), name
+    # ABSOLUTE / RELATIVE require a count.
+    if not rest:
+        raise errors.syntax_error(f"{head} requires a count")
+    return head.lower(), int(rest[0]), name
+
+
+def _cursor_slice(cur: Any, kind: str, count: int | None) -> list:
+    """Advance ``cur.pos`` per ``(kind, count)`` and return the rows moved over."""
+    n = len(cur.rows)
+    if kind == "forward":
+        start = cur.pos + 1
+        end = n if count is None else min(start + count, n)
+        rows = cur.rows[start:end] if end > start else []
+        cur.pos = end - 1 if rows else n
+        return rows
+    if kind == "backward":
+        start = cur.pos - 1
+        stop = -1 if count is None else max(start - count, -1)
+        idxs = [i for i in range(start, stop, -1) if 0 <= i < n]
+        cur.pos = idxs[-1] if idxs else -1
+        return [cur.rows[i] for i in idxs]
+    if kind == "absolute":
+        target = count - 1 if count > 0 else n + count  # 1-based; negatives from end
+        if 0 <= target < n:
+            cur.pos = target
+            return [cur.rows[target]]
+        cur.pos = -1 if target < 0 else n
+        return []
+    # relative
+    target = cur.pos + count
+    if 0 <= target < n:
+        cur.pos = target
+        return [cur.rows[target]]
+    cur.pos = -1 if target < 0 else n
+    return []
+
+
+def _fetch_cursor(stmt: exp.Command, session: Session, *, move: bool = False) -> SQLResult:
+    """``FETCH`` returns the moved-over rows; ``MOVE`` performs the same
+    positioning but returns only the count (no result set)."""
+    kind, count, name = _parse_fetch(_command_tail(stmt))
+    cur = session.cursors.get(name)
+    if cur is None:
+        raise errors.SQLError("34000", f'cursor "{name}" does not exist')
+    rows = _cursor_slice(cur, kind, count)
+    verb = "MOVE" if move else "FETCH"
+    if move:
+        return SQLResult(command_tag=f"{verb} {len(rows)}", rowcount=len(rows))
+    return SQLResult(
+        command_tag=f"{verb} {len(rows)}", columns=cur.columns, rows=rows, rowcount=len(rows)
+    )
+
+
+def _close_cursor_target(stmt: exp.Expression) -> str | None:
+    """A bare ``CLOSE name`` / ``CLOSE ALL`` — parses as a top-level ``Alias``."""
+    if not isinstance(stmt, exp.Alias):
+        return None
+    head = stmt.this
+    if isinstance(head, exp.Column) and head.name.upper() == "CLOSE":
+        return stmt.alias
+    return None
+
+
+def _close_cursor(name: str, session: Session) -> SQLResult:
+    if name.upper() == "ALL":
+        session.cursors.clear()
+        return SQLResult(command_tag="CLOSE CURSOR")
+    if session.cursors.pop(name, None) is None:
+        raise errors.SQLError("34000", f'cursor "{name}" does not exist')
+    return SQLResult(command_tag="CLOSE CURSOR")
+
+
+def _close_non_hold_cursors(session: Session) -> None:
+    session.cursors = {n: c for n, c in session.cursors.items() if c.hold}
 
 
 def run_statement(
@@ -366,7 +534,17 @@ def _run_statement(
         return _run_set(stmt, session)
 
     if isinstance(stmt, exp.Command):
+        verb = str(stmt.this).upper()
+        if verb == "DECLARE":
+            return _declare_cursor(stmt, storage, db, catalog, session)
+        if verb in ("FETCH", "MOVE"):
+            return _fetch_cursor(stmt, session, move=verb == "MOVE")
         return _run_command(stmt, session)
+
+    # CLOSE cursor / CLOSE ALL parses as a bare Alias (``CLOSE AS name``).
+    close = _close_cursor_target(stmt)
+    if close is not None:
+        return _close_cursor(close, session)
 
     # DEALLOCATE / DISCARD parse as a bare Alias in sqlglot's pg dialect (e.g.
     # ``DEALLOCATE "x"`` → ``DEALLOCATE AS "x"``); libpq clients (psycopg) and

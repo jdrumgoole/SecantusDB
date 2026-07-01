@@ -58,6 +58,20 @@ class _Savepoint:
 
 
 @dataclass
+class _Cursor:
+    """A server-side cursor (``DECLARE … CURSOR``). The query is materialized once
+    at declaration; ``pos`` is the index of the row the cursor is currently on
+    (-1 = before the first row, len(rows) = after the last), which ``FETCH`` /
+    ``MOVE`` advance. ``hold`` cursors survive COMMIT (``WITH HOLD``)."""
+
+    name: str
+    columns: list = field(default_factory=list)
+    rows: list = field(default_factory=list)
+    pos: int = -1
+    hold: bool = False
+
+
+@dataclass
 class Session:
     database: str = "postgres"
     user: str = "secantus"
@@ -73,6 +87,8 @@ class Session:
     # pre-image snapshot (collection -> docs) captured on the first write to that
     # collection after the savepoint was established, so ROLLBACK TO can restore.
     savepoints: list[Any] = field(default_factory=list)
+    # Open server-side cursors by name (``DECLARE … CURSOR`` / ``FETCH`` / ``CLOSE``).
+    cursors: dict[str, Any] = field(default_factory=dict)
 
     def get_setting(self, name: str) -> str:
         return self.settings.get(name, GUC_DEFAULTS.get(name, ""))

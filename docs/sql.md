@@ -706,11 +706,39 @@ so it undoes `INSERT` / `UPDATE` / `DELETE` (and upserts). A `SAVEPOINT` /
 unknown savepoint name errors with `3B001`. DDL issued inside a savepoint (e.g.
 `CREATE TABLE`) is **not** rolled back by `ROLLBACK TO SAVEPOINT` — only DML is.
 
+### Server-side cursors
+
+`DECLARE name [WITH HOLD] CURSOR FOR <query>` runs the query and stores its rows;
+`FETCH` / `MOVE` walk a scroll position over them, and `CLOSE` drops the cursor.
+The cursor is fully scrollable — forward, backward, and by absolute / relative
+position:
+
+```sql
+BEGIN;
+DECLARE c CURSOR FOR SELECT id, name FROM users ORDER BY id;
+FETCH 2 FROM c;            -- first two rows
+FETCH NEXT FROM c;         -- the third
+FETCH BACKWARD 1 FROM c;   -- back to the second
+MOVE 2 FROM c;             -- advance without returning rows
+FETCH ALL FROM c;          -- the rest
+CLOSE c;
+COMMIT;
+```
+
+`FETCH` accepts `NEXT` (default), a bare count, `ALL`, `PRIOR`, `FIRST`, `LAST`,
+`FORWARD [n | ALL]`, `BACKWARD [n | ALL]`, `ABSOLUTE n`, and `RELATIVE n`; `MOVE`
+takes the same directions but returns only a `MOVE n` count, no result set.
+`CLOSE name` drops one cursor; `CLOSE ALL` drops them all. A `WITHOUT HOLD`
+cursor (the default) closes at `COMMIT` / `ROLLBACK`; a `WITH HOLD` cursor
+survives, since its rows are already materialized. Fetching from an unknown or
+closed cursor errors with `34000`. The query is materialized once at `DECLARE`,
+so a cursor is a snapshot — later writes in the same transaction aren't visible
+through it.
+
 `SET TRANSACTION ISOLATION LEVEL …` / `… READ ONLY` / `… READ WRITE`,
 `SET SESSION CHARACTERISTICS AS TRANSACTION …`, and `BEGIN ISOLATION LEVEL …`
 are accepted but are no-ops: SecantusDB is single-node, so isolation level and
-read-only mode don't change behaviour. `SAVEPOINT` / `RELEASE` /
-`ROLLBACK TO SAVEPOINT` are not yet supported.
+read-only mode don't change behaviour.
 
 ## Authentication and TLS
 
