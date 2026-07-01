@@ -2206,6 +2206,9 @@ class Storage:
         if self._noop_thread is not None and self._noop_thread.is_alive():
             self._noop_thread.join(timeout=2.0)
             self._noop_thread = None
+        import logging
+
+        log = logging.getLogger("secantus.storage.close")
         with self._lock:
             if self._closed:
                 return
@@ -2215,8 +2218,18 @@ class Storage:
             # storms under concurrent writers), so this is the
             # canonical place to write the in-memory ``_next_seq``
             # and timestamp counters down to disk before shutdown.
-            with contextlib.suppress(Exception):
+            #
+            # Teardown continues past any single failure so close()
+            # stays idempotent and releases as many resources as it
+            # can — but every failure is *logged*, never swallowed
+            # silently. In a database a checkpoint or connection-close
+            # error is a durability signal (see CLAUDE.md "Never ignore
+            # an error"), so the embedder gets a trace telling them the
+            # last durable image may be incomplete.
+            try:
                 self._persist_oplog_meta()
+            except Exception:
+                log.exception("failed to persist oplog meta during close")
             # Force a checkpoint before tearing the connection down.
             # ``WT_CONNECTION->close`` does this implicitly, but only
             # when logging is off (or hits the connection's
@@ -2228,14 +2241,20 @@ class Storage:
             # rejects checkpoint() with a noisy stderr log
             # (``__wt_inmem_unsupported_op``) on every call.
             if not self._in_memory:
-                with contextlib.suppress(Exception):
+                try:
                     self._session().checkpoint()
+                except Exception:
+                    log.exception("final checkpoint failed during close")
             for s in self._all_sessions:
-                with contextlib.suppress(Exception):
+                try:
                     s.close()
+                except Exception:
+                    log.exception("WT session close failed during close")
             self._all_sessions.clear()
-            with contextlib.suppress(Exception):
+            try:
                 self._conn.close()
+            except Exception:
+                log.exception("WT connection close failed during close")
             if self._tempdir is not None:
                 # Don't follow symlinks during cleanup. A local attacker
                 # racing the mkdtemp could replace `_tempdir` with a

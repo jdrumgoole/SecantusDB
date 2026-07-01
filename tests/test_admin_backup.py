@@ -93,6 +93,50 @@ def test_run_mongodump_propagates_failure(tmp_path) -> None:
     assert "boom" in out.stderr
 
 
+def test_run_mongodump_redacts_password_from_output(tmp_path) -> None:
+    # mongodump echoes the credentialed URI into stderr on a connection
+    # error; the captured output must never carry the plaintext password
+    # (issue #140). The real URI still reaches the subprocess argv.
+    uri = "mongodb://alice:s3cret@host:27017/?authSource=admin"
+
+    def echoing_runner(cmd: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr=f"Failed: can't connect to {uri}",
+        )
+
+    out = run_mongodump(
+        uri=uri,
+        root=tmp_path,
+        runner=echoing_runner,
+        which=_fake_which_present,
+    )
+    assert "s3cret" not in out.stderr
+    assert "***" in out.stderr
+
+
+def test_run_mongorestore_redacts_password_from_output(tmp_path) -> None:
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+    uri = "mongodb://bob:hunter2@host/"
+
+    def echoing_runner(cmd: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout=f"connecting {uri}", stderr=""
+        )
+
+    out = run_mongorestore(
+        uri=uri,
+        dump_dir=dump_dir,
+        runner=echoing_runner,
+        which=_fake_which_present,
+    )
+    assert "hunter2" not in out.stdout
+    assert "***" in out.stdout
+
+
 def test_run_mongodump_aborts_when_tools_missing(tmp_path) -> None:
     captured: list[list[str]] = []
     out = run_mongodump(
