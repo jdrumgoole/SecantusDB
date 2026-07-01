@@ -9,6 +9,7 @@ and ``SHOW`` / ``SET`` resolve against real state.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from sqlglot import exp
@@ -16,7 +17,7 @@ from sqlglot import exp
 from secantus.sql import errors, executor, planner, reflect, scalar, typemap, virtual
 from secantus.sql.catalog import Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
-from secantus.sql.session import REPORTABLE_GUCS, Session
+from secantus.sql.session import REPORTABLE_GUCS, Session, _Savepoint
 
 
 def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) -> list[SQLResult]:
@@ -51,10 +52,9 @@ def _dispatch(
         return _commit_txn(storage, session)
     if isinstance(stmt, exp.Rollback):
         if stmt.args.get("savepoint") is not None:
-            # ROLLBACK TO SAVEPOINT recovers the block from an error and keeps it
-            # open. We don't track per-savepoint state, so un-poison and continue.
-            session.txn_failed = False
-            return SQLResult(command_tag="ROLLBACK")
+            # ROLLBACK TO SAVEPOINT recovers the block from an error, so it runs
+            # even when the transaction is poisoned (unlike SAVEPOINT / RELEASE).
+            return _rollback_to_savepoint(stmt.args["savepoint"].name, storage, db, session)
         return _rollback_txn(storage, session)
 
     if session.txn_failed:
@@ -63,9 +63,17 @@ def _dispatch(
             "current transaction is aborted, commands ignored until end of transaction block",
         )
 
+    sp = _savepoint_command(stmt)
+    if sp is not None:
+        word, name = sp
+        return (
+            _savepoint(name, session) if word == "SAVEPOINT" else _release_savepoint(name, session)
+        )
+
     if session.txn_handle is not None:
         try:
             with storage.use_user_transaction(session.txn_handle):
+                _capture_savepoint_snapshots(stmt, storage, db, catalog, session)
                 return _run_statement(stmt, storage, db, catalog, session)
         except Exception:
             session.txn_failed = True
@@ -78,6 +86,7 @@ def _begin_txn(storage: Any, session: Session) -> SQLResult:
     if session.txn_handle is None:
         session.txn_handle = storage.begin_user_transaction()
         session.txn_failed = False
+        session.savepoints = []
     return SQLResult(command_tag="BEGIN")
 
 
@@ -85,6 +94,7 @@ def _commit_txn(storage: Any, session: Session) -> SQLResult:
     handle, failed = session.txn_handle, session.txn_failed
     session.txn_handle = None
     session.txn_failed = False
+    session.savepoints = []
     if handle is None:
         return SQLResult(command_tag="COMMIT")  # no open block — Postgres warns, returns COMMIT
     if failed:
@@ -99,9 +109,124 @@ def _rollback_txn(storage: Any, session: Session) -> SQLResult:
     handle = session.txn_handle
     session.txn_handle = None
     session.txn_failed = False
+    session.savepoints = []
     if handle is not None:
         storage.abort_user_transaction(handle)
     return SQLResult(command_tag="ROLLBACK")
+
+
+def _savepoint_command(stmt: exp.Expression) -> tuple[str, str] | None:
+    """A bare ``SAVEPOINT name`` / ``RELEASE name`` — sqlglot parses both as a
+    top-level ``Alias`` (``SAVEPOINT AS name``). Returns ``(word, name)`` or None
+    (``RELEASE SAVEPOINT name`` is normalized to ``RELEASE name`` in ``parse``)."""
+    if not isinstance(stmt, exp.Alias):
+        return None
+    head = stmt.this
+    if isinstance(head, exp.Column) and head.name.upper() in ("SAVEPOINT", "RELEASE"):
+        return head.name.upper(), stmt.alias
+    return None
+
+
+def _savepoint(name: str, session: Session) -> SQLResult:
+    if session.txn_handle is None:
+        raise errors.SQLError("25P01", "SAVEPOINT can only be used in transaction blocks")
+    session.savepoints.append(_Savepoint(name=name))
+    return SQLResult(command_tag="SAVEPOINT")
+
+
+def _find_savepoint(session: Session, name: str) -> int | None:
+    """Index of the innermost (topmost) open savepoint named ``name``, or None."""
+    for i in range(len(session.savepoints) - 1, -1, -1):
+        if session.savepoints[i].name == name:
+            return i
+    return None
+
+
+def _release_savepoint(name: str, session: Session) -> SQLResult:
+    """``RELEASE SAVEPOINT name`` — destroy it (and any nested inside it), keeping
+    their writes. Merge their pre-image snapshots down into the enclosing
+    savepoint so it can still undo them (oldest snapshot per collection wins)."""
+    if session.txn_handle is None:
+        raise errors.SQLError("25P01", "RELEASE SAVEPOINT can only be used in transaction blocks")
+    idx = _find_savepoint(session, name)
+    if idx is None:
+        raise errors.SQLError("3B001", f'savepoint "{name}" does not exist')
+    released = session.savepoints[idx:]
+    del session.savepoints[idx:]
+    if session.savepoints:
+        parent = session.savepoints[-1]
+        for fr in released:  # lowest first → its snapshot wins under setdefault
+            for coll, snap in fr.snapshots.items():
+                parent.snapshots.setdefault(coll, snap)
+    return SQLResult(command_tag="RELEASE")
+
+
+def _rollback_to_savepoint(name: str, storage: Any, db: str, session: Session) -> SQLResult:
+    """``ROLLBACK TO SAVEPOINT name`` — undo every write since the savepoint by
+    restoring each touched collection to its captured pre-image, discard the
+    nested savepoints, un-poison the block, and keep the savepoint itself open."""
+    if session.txn_handle is None:
+        raise errors.SQLError(
+            "25P01", "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"
+        )
+    idx = _find_savepoint(session, name)
+    if idx is None:
+        raise errors.SQLError("3B001", f'savepoint "{name}" does not exist')
+    # Restore each collection to the OLDEST snapshot among this savepoint and the
+    # nested ones (the lowest frame's snapshot == the state at ``name``).
+    restore: dict[str, list] = {}
+    for fr in session.savepoints[idx:]:
+        for coll, snap in fr.snapshots.items():
+            restore.setdefault(coll, snap)
+    with storage.use_user_transaction(session.txn_handle):
+        for coll, snap in restore.items():
+            storage.delete_matching(db, coll, {})
+            if snap:
+                storage.insert(db, coll, [copy.deepcopy(d) for d in snap])
+    # Drop the nested savepoints; keep ``name`` (a repeat ROLLBACK TO must work,
+    # and its snapshots still hold the pre-``name`` state).
+    del session.savepoints[idx + 1 :]
+    session.txn_failed = False
+    return SQLResult(command_tag="ROLLBACK")
+
+
+def _capture_savepoint_snapshots(
+    stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
+) -> None:
+    """Before a write runs, snapshot its target collection into every open
+    savepoint that hasn't captured it yet — that pins each savepoint's view of the
+    collection to its establishment state (nothing wrote to it in between)."""
+    if not session.savepoints:
+        return
+    coll = _write_target_collection(stmt, catalog, db, storage)
+    if coll is None:
+        return
+    snap: list | None = None
+    for fr in session.savepoints:
+        if coll in fr.snapshots:
+            continue
+        if snap is None:
+            snap = [copy.deepcopy(d) for d in storage.find_matching(db, coll, {})]
+        fr.snapshots[coll] = snap
+
+
+def _write_target_collection(
+    stmt: exp.Expression, catalog: Catalog, db: str, storage: Any
+) -> str | None:
+    """The collection a DML statement writes to (INSERT / UPDATE / DELETE, incl. a
+    ``WITH`` prefix), or None for a read / DDL / other statement."""
+    if isinstance(stmt, exp.Insert):
+        target = stmt.this  # a Schema(Table, cols) or a bare Table
+        table_node = target.find(exp.Table) if target is not None else None
+    elif isinstance(stmt, (exp.Update, exp.Delete)):
+        table_node = stmt.find(exp.Table)
+    else:
+        return None
+    if table_node is None:
+        return None
+    name = table_node.name
+    table = catalog.get(db, name)
+    return table.collection if table is not None else name
 
 
 def run_statement(
@@ -243,12 +368,11 @@ def _run_statement(
     if isinstance(stmt, exp.Command):
         return _run_command(stmt, session)
 
-    # DEALLOCATE / DISCARD / SAVEPOINT / RELEASE parse as a bare Alias in
-    # sqlglot's pg dialect (e.g. ``SAVEPOINT "x"`` → ``SAVEPOINT AS "x"``); libpq
-    # clients (psycopg) and SQLAlchemy emit them to manage prepared statements and
-    # nested transaction savepoints. Accept as a no-op — our prepared statements
-    # live for the connection, and ROLLBACK TO SAVEPOINT (handled above) is what
-    # actually recovers an aborted block.
+    # DEALLOCATE / DISCARD parse as a bare Alias in sqlglot's pg dialect (e.g.
+    # ``DEALLOCATE "x"`` → ``DEALLOCATE AS "x"``); libpq clients (psycopg) and
+    # SQLAlchemy emit them to manage prepared statements. Accept as a no-op — our
+    # prepared statements live for the connection. (SAVEPOINT / RELEASE are real
+    # commands, handled in ``_dispatch``.)
     noop = _noop_command_word(stmt)
     if noop is not None:
         return SQLResult(command_tag=noop)
@@ -256,11 +380,11 @@ def _run_statement(
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
 
 
-_NOOP_WORDS = {"DEALLOCATE", "DISCARD", "SAVEPOINT", "RELEASE"}
+_NOOP_WORDS = {"DEALLOCATE", "DISCARD"}
 
 
 def _noop_command_word(stmt: exp.Expression) -> str | None:
-    """Return the no-op command word (DEALLOCATE/DISCARD/SAVEPOINT/RELEASE) or None."""
+    """Return the no-op command word (DEALLOCATE / DISCARD) or None."""
     head = stmt.this if isinstance(stmt, exp.Alias) else stmt
     name = head.name if isinstance(head, exp.Column) else None
     if name is not None and name.upper() in _NOOP_WORDS:

@@ -942,6 +942,28 @@ def test_transaction_commit_and_rollback(server):
     conn.close()
 
 
+def test_savepoints_via_driver(server):
+    # SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE through the real driver — the
+    # standard `RELEASE SAVEPOINT name` keyword form SQLAlchemy / psycopg emit.
+    conn = connect(server)
+    conn.autocommit = False
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, n int)")
+    conn.commit()
+    cur.execute("INSERT INTO t (id, n) VALUES (1, 10)")
+    cur.execute("SAVEPOINT sp1")
+    cur.execute("INSERT INTO t (id, n) VALUES (2, 20)")
+    cur.execute("ROLLBACK TO SAVEPOINT sp1")  # undoes id=2 only
+    cur.execute("INSERT INTO t (id, n) VALUES (3, 30)")
+    cur.execute("SAVEPOINT sp2")
+    cur.execute("INSERT INTO t (id, n) VALUES (4, 40)")
+    cur.execute("RELEASE SAVEPOINT sp2")  # keeps id=4
+    conn.commit()
+    cur.execute("SELECT id FROM t ORDER BY id")
+    assert cur.fetchall() == ([1], [3], [4])
+    conn.close()
+
+
 def test_create_index_and_isolation_via_driver(server):
     conn = connect(server)
     cur = conn.cursor()

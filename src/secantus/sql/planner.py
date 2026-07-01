@@ -2937,8 +2937,15 @@ def _normalize_params(sql: str) -> str:
     return "".join(out)
 
 
+_RELEASE_SAVEPOINT_RE = re.compile(r"(?i)\brelease\s+savepoint\b")
+
+
 def parse(sql: str) -> list[exp.Expression]:
     """Parse a (possibly multi-statement) SQL string into AST statements."""
+    # sqlglot parses ``RELEASE x`` but not the equivalent ``RELEASE SAVEPOINT x``
+    # (the standard form SQLAlchemy / psycopg emit) — drop the redundant keyword.
+    # Savepoint commands are standalone, so this can't touch a string literal.
+    sql = _RELEASE_SAVEPOINT_RE.sub("RELEASE", sql)
     try:
         return [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
     except sqlglot.errors.ParseError as exc:
