@@ -45,6 +45,7 @@
       <header class="page-header">
         <h1>{{ title }}</h1>
         {% set embedded_uri = request.app.state.embedded.status().uri %}
+        {% set caps = request.app.state.capabilities %}
         {% if embedded_uri and embedded_uri == request.app.state.mongo_uri %}
           <a class="server-badge server-badge-embedded" href="/server"
              title="Embedded SecantusDB ({{ request.app.state.mongo_uri_display }})">
@@ -56,6 +57,10 @@
             <span class="server-badge-dot" aria-hidden="true"></span>
             <code>{{ request.app.state.mongo_uri_display }}</code>
           </a>
+        {% endif %}
+        {% if caps.identified %}
+          <span class="server-kind server-kind-{{ caps.kind }}"
+                title="Detected server type — some admin features are gated to what this server supports">{{ caps.label }}</span>
         {% endif %}
       </header>
       {% block content %}{% endblock %}

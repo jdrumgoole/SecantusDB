@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "partials/_macros.html" import empty_row %}
 {% block content %}
+{% set caps = request.app.state.capabilities %}
 <p class="modal-meta">
   Backups land in <code>{{ backup_root }}</code>. Two paths:
   <strong>mongodump / mongorestore</strong> for a portable BSON dump
@@ -37,6 +38,7 @@
       <span x-show="busy" x-cloak><span class="spinner"></span> Running mongodump…</span>
     </button>
   </form>
+  {% if caps.native_backup_archive %}
   <form
     method="post"
     action="/backup/archive"
@@ -54,6 +56,14 @@
       <span x-show="busy" x-cloak><span class="spinner"></span> Archiving…</span>
     </button>
   </form>
+  {% else %}
+  <button
+    type="button"
+    class="btn-secondary"
+    disabled
+    title="Native checkpoint backup is a SecantusDB-only command (secantusAdmin.backupArchive) — not supported by {{ caps.label }}. Use mongodump instead."
+  >Native checkpoint backup unavailable</button>
+  {% endif %}
 </div>
 
 <h2 class="section-title">Existing backups</h2>
@@ -72,6 +82,7 @@
         <td class="num">{{ r.size }}</td>
         <td class="doc-actions">
           {% if r.name.endswith('.tar.gz') %}
+            {% if caps.native_restore_archive %}
             <form
               method="post"
               action="/backup/restore-archive"
@@ -97,6 +108,14 @@
                 <span x-show="busy" x-cloak><span class="spinner"></span> Extracting…</span>
               </button>
             </form>
+            {% else %}
+              <button
+                type="button"
+                class="btn-danger"
+                disabled
+                title="Native archive restore (secantusAdmin.restoreArchive) is not supported by {{ caps.label }}."
+              >Extract unavailable</button>
+            {% endif %}
           {% else %}
             <form
               method="post"

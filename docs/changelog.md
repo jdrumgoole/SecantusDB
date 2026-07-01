@@ -183,6 +183,41 @@ backup result.
   raw credentialed `mongo_uri`; mongodump/mongorestore captured output has the
   password redacted (security issue #140).
 
+### Admin console detects the target server and gates features it can't do
+
+The admin UI is a plain pymongo client, so it can point at any of the
+three MongoDB-wire servers: the SecantusDB Python server, the SecantusDB
+Rust server, or a real `mongod`. They differ in which commands they
+implement — most visibly the four proprietary `secantusAdmin.*`
+backup/maintenance commands (no `mongod` has them) and a handful of
+standard admin commands the Rust server hasn't ported yet. Until now the
+console advertised every button regardless of target, so clicking
+"native checkpoint backup" against a `mongod`, or "prune oplog" against
+the Rust server, returned a bare `CommandNotFound`.
+
+The console now probes the target once at connect (and on every target
+swap) via `buildInfo` + `serverStatus`, classifies it as Python / Rust /
+MongoDB from the server's own self-identification
+(`serverStatus.secantus.server` and `buildInfo.secantusVersion`), and
+derives a capability set the templates consult. A detected-server pill
+appears next to the target badge, and features the target can't honour
+are disabled with an explanatory tooltip instead of failing on click:
+native backup archive / restore and manual oplog/TTL prune (all
+`secantusAdmin.*`, SecantusDB-only), plus role grant/revoke and
+connection-kill (`killOp`) where the Rust server hasn't ported them. An
+unreachable or not-yet-probed target stays fully permissive, so a
+transiently-down server never hides a working button.
+
+#### Added
+
+- `secantus.admin.capabilities`: server-capability probe + classifier
+  (`classify` / `probe` / `ServerCapabilities` / `UNKNOWN`), wired into
+  the app lifespan startup and `swap_target`, exposed to templates as
+  `request.app.state.capabilities`.
+- Admin templates gate `secantusAdmin.*` backup/maintenance buttons,
+  role grant/revoke, and connection-kill to the detected server's
+  capabilities, and show a server-type badge.
+
 ### Atlas Search index commands are rejected with an "Atlas" error
 
 Atlas Search index management — the `createSearchIndexes`, `updateSearchIndex`,
