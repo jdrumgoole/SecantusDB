@@ -141,6 +141,25 @@ def test_window_frames_via_driver(server):
     conn.close()
 
 
+def test_join_where_subquery_via_driver(server):
+    # A scalar WHERE-subquery inside a JOIN query, through the real driver.
+    server.storage.insert(
+        "db",
+        "o",
+        [
+            {"_id": bson.Int64(i), "cid": bson.Int64(c), "amt": bson.Int64(a)}
+            for i, c, a in [(1, 1, 10), (2, 1, 50)]
+        ],
+    )
+    server.storage.insert("db", "c", [{"_id": bson.Int64(1), "region": "e"}])
+    server.storage.insert("db", "lim", [{"_id": bson.Int64(1), "cap": bson.Int64(40)}])
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT o._id FROM o JOIN c ON o.cid = c._id WHERE o.amt > (SELECT cap FROM lim)")
+    assert cur.fetchall() == ([2],)
+    conn.close()
+
+
 def test_insert_select_via_driver(server):
     # INSERT ... SELECT over Mongo-written data, through the real driver.
     server.storage.insert(
