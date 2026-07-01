@@ -446,8 +446,29 @@ SELECT id,
 FROM sales;
 ```
 
-`WITH RECURSIVE` is not supported, and a window function can't be combined with
-`GROUP BY` in the same SELECT.
+### Window functions over `GROUP BY`
+
+A window function may be computed **over the aggregated rows** of a `GROUP BY`
+(or an implicit whole-table aggregation) in the same SELECT — Postgres evaluates
+windows after grouping, so a window's arguments, `PARTITION BY`, and `ORDER BY`
+can all reference the group aggregates. The grouping runs first; the window then
+ranks / accumulates over the grouped rows:
+
+```sql
+SELECT region,
+       SUM(amount)                              AS region_total,
+       RANK() OVER (ORDER BY SUM(amount) DESC)  AS rank_by_total,
+       SUM(SUM(amount)) OVER ()                 AS grand_total
+FROM sales
+GROUP BY region
+ORDER BY rank_by_total;
+```
+
+An aggregate may nest inside a window aggregate (`SUM(SUM(amount)) OVER ()` —
+the grand total of the per-group sums), and `ORDER BY` can reference a window's
+output alias. `HAVING` prunes groups before the window sees them. This is
+single-table only; combining a window with a `GROUP BY` that also has a `JOIN`
+is not yet supported.
 
 ## Reflected tables and jsonb (the dual-protocol payoff)
 

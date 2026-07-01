@@ -1505,8 +1505,13 @@ def _plan_pipeline_select(
     has_aggregate = any(
         _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
     )
-    if stmt.args.get("group") or stmt.args.get("having") or has_aggregate:
-        plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_group_select(stmt, table)
+    grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_aggregate)
+    if _select_has_window(stmt) and (grouped or _group_agg_nodes(stmt)):
+        # Window functions computed over GROUP BY aggregates (or an implicit
+        # whole-table aggregation) — a two-phase group-then-window plan.
+        plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_group_window_select(stmt, table)
+    elif grouped:
+        plan = _plan_group_select(stmt, table)
     elif _stmt_needs_evaluation(stmt):
         plan = _build_evaluated_single(stmt, table)
     elif stmt.args.get("distinct"):
@@ -1785,6 +1790,185 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     pipeline.append({"$project": project})
     _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
+
+
+def _select_has_window(stmt: exp.Select) -> bool:
+    """Whether any SELECT item or ORDER BY term contains a window (``OVER``)."""
+    roots: list[exp.Expression] = list(stmt.expressions)
+    order = stmt.args.get("order")
+    if order is not None:
+        roots.extend(o.this for o in order.expressions)
+    return any(next(r.find_all(exp.Window), None) is not None for r in roots)
+
+
+def _group_agg_nodes(stmt: exp.Select) -> list[exp.AggFunc]:
+    """Every aggregate (``SUM``/``COUNT``/… / ``array_agg``) in the SELECT list and
+    ORDER BY that is *not* itself a window function — i.e. not the direct operand
+    of an ``OVER`` clause. These are the GROUP BY aggregates; a window aggregate
+    like ``SUM(...) OVER (...)`` is computed later, over the grouped rows. An
+    aggregate nested inside a window aggregate (``SUM(SUM(x)) OVER ()``) is still
+    a group aggregate — only the outermost, window-owned one is excluded."""
+    roots: list[exp.Expression] = list(stmt.expressions)
+    order = stmt.args.get("order")
+    if order is not None:
+        roots.extend(o.this for o in order.expressions)
+    found: list[exp.AggFunc] = []
+    for root in roots:
+        for n in root.find_all(exp.AggFunc):
+            parent = n.parent
+            if isinstance(parent, exp.Window) and parent.this is n:
+                continue  # a window aggregate — resolved over the grouped rows
+            found.append(n)
+    return found
+
+
+def _synthetic_resolver(field_tags: dict[str, str]) -> Resolve:
+    """A column resolver over the flat, post-``$group`` document — group columns
+    and synthetic aggregate fields resolve to themselves; anything else is a
+    non-grouped column reference, which Postgres rejects with 42803."""
+
+    def resolve(node: exp.Expression) -> tuple[str, str]:
+        col = _column_name(node)
+        if col in field_tags:
+            return col, field_tags[col]
+        raise errors.SQLError(
+            "42803",
+            f'column "{col}" must appear in the GROUP BY clause '
+            "or be used in an aggregate function",
+        )
+
+    return resolve
+
+
+def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSelectPlan:
+    """GROUP BY (or an implicit whole-table aggregation) combined with window
+    functions in the same SELECT — e.g. ``SELECT dept, SUM(sal),
+    RANK() OVER (ORDER BY SUM(sal)) FROM emp GROUP BY dept``.
+
+    Phase 1 (aggregation pipeline): a ``$group`` computes the grouping columns and
+    every group aggregate into flat fields. Phase 2 (the evaluated executor): the
+    window functions run over those grouped rows, and each aggregate reference —
+    inside the window's args / PARTITION BY / ORDER BY, or standing alone in the
+    SELECT list — resolves to its precomputed field."""
+    stmt = stmt.copy()  # we mutate the tree, replacing aggregates with columns
+    base_filter = _where_filter(stmt, table)
+    group_node = stmt.args.get("group")
+    group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
+    for c in group_cols:
+        table.field_for(c)  # validate
+    group_id = {c: f"${table.field_for(c)}" for c in group_cols} or None
+
+    accumulators: dict[str, Any] = {}
+    reductions: dict[str, Any] = {}
+    names = _NameAllocator()
+    for c in group_cols:  # reserve group names so synthetic fields never collide
+        names.fresh(c)
+    field_tags: dict[str, str] = {c: table.type_for(c) for c in group_cols}
+    agg_fields: dict[tuple[str, str | None, bool], str] = {}
+    agg_field_names: list[str] = []
+
+    def register_agg(node: exp.AggFunc) -> str:
+        arr_arg = _array_agg_arg(node)
+        if arr_arg is not None:
+            fname = names.fresh("array_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
+            field_tags[fname] = "json"
+            agg_field_names.append(fname)
+            return fname
+        agg = _aggregate_of(node)
+        if agg is None:
+            raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        if agg in agg_fields:
+            return agg_fields[agg]
+        func, col, distinct = agg
+        if distinct and func in _DISTINCT_FUNCS:
+            if col is None:
+                raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+            fname, tag = _register_distinct_agg(
+                func,
+                table.field_for(col),
+                table.type_for(col),
+                None,
+                names,
+                accumulators,
+                reductions,
+            )
+        else:
+            acc, tag = _accumulator(func, col, table)
+            fname = names.fresh(func)
+            accumulators[fname] = acc
+        agg_fields[agg] = fname
+        field_tags[fname] = tag
+        agg_field_names.append(fname)
+        return fname
+
+    # Replace each group aggregate with a reference to its computed field. The
+    # nodes were collected from the original tree (parents intact); group
+    # aggregates never nest without a window between them, so replacement order
+    # is immaterial.
+    for node in _group_agg_nodes(stmt):
+        node.replace(exp.column(register_agg(node)))
+
+    having = stmt.args.get("having")
+    having_match = (
+        _having_to_match(having.this, table, accumulators, agg_fields, group_cols)
+        if having is not None
+        else None
+    )
+
+    pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+    if reductions:
+        pipeline.append({"$addFields": reductions})
+    if having_match is not None:
+        pipeline.append({"$match": having_match})
+    project: dict[str, Any] = {"_id": 0}
+    for c in group_cols:
+        project[c] = f"$_id.{c}"
+    for fname in agg_field_names:
+        project[fname] = f"${fname}"
+    pipeline.append({"$project": project})
+
+    resolve = _synthetic_resolver(field_tags)
+    out_columns: list[tuple[str, str]] = []
+    out_exprs: list[exp.Expression] = []
+    alias_exprs: dict[str, exp.Expression] = {}
+    onames = _NameAllocator()
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, exp.Star):
+            raise errors.feature_not_supported("SELECT * with GROUP BY is not supported")
+        name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
+        out_columns.append((onames.fresh(name), _infer_scalar_tag(inner, resolve)))
+        out_exprs.append(inner)
+        if alias is not None:
+            alias_exprs[alias] = inner
+
+    # ORDER BY may reference a SELECT output alias (``ORDER BY rk``) — Postgres
+    # resolves it to that output expression, so sorting on a window/aggregate
+    # alias works even though the grouped rows carry no such field.
+    order: list[tuple[exp.Expression, int, bool]] = []
+    order_node = stmt.args.get("order")
+    if order_node is not None:
+        for o in order_node.expressions:
+            term = o.this
+            if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
+                term = alias_exprs[term.name]
+            order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
+
+    limit, skip = _limit_skip(stmt)
+    return EvaluatedSelectPlan(
+        base_collection=table.collection,
+        base_filter=base_filter,
+        pipeline=pipeline,
+        out_columns=out_columns,
+        out_exprs=out_exprs,
+        resolve=resolve,
+        order=order,
+        distinct=bool(stmt.args.get("distinct")),
+        limit=limit,
+        skip=skip,
+    )
 
 
 def _having_to_match(

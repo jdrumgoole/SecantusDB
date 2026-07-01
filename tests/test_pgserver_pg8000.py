@@ -146,6 +146,29 @@ def test_window_frames_via_driver(server):
     conn.close()
 
 
+def test_window_over_group_by_via_driver(server):
+    # A window function that ranks GROUP BY aggregates, through the real driver.
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(i), "region": r, "amount": bson.Int64(a)}
+            for i, (r, a) in enumerate([("e", 10), ("e", 20), ("w", 30), ("w", 5), ("w", 15)], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT region, SUM(amount) AS s, "
+        "RANK() OVER (ORDER BY SUM(amount) DESC) AS rk, "
+        "SUM(SUM(amount)) OVER () AS total "
+        "FROM sales GROUP BY region ORDER BY region"
+    )
+    # e: 30, w: 50 → ranked desc w=1, e=2; grand total = 80 on every row.
+    assert cur.fetchall() == (["e", 30, 2, 80], ["w", 50, 1, 80])
+    conn.close()
+
+
 def test_join_where_subquery_via_driver(server):
     # A scalar WHERE-subquery inside a JOIN query, through the real driver.
     server.storage.insert(
