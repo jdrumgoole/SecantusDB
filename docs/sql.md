@@ -474,9 +474,17 @@ ORDER BY rank_by_total;
 
 An aggregate may nest inside a window aggregate (`SUM(SUM(amount)) OVER ()` —
 the grand total of the per-group sums), and `ORDER BY` can reference a window's
-output alias. `HAVING` prunes groups before the window sees them. This is
-single-table only; combining a window with a `GROUP BY` that also has a `JOIN`
-is not yet supported.
+output alias. `HAVING` prunes groups before the window sees them. This also works
+when the `GROUP BY` spans a `JOIN` — the window then ranks / accumulates over the
+grouped rows of the joined tables:
+
+```sql
+SELECT c.region,
+       SUM(o.amount)                             AS region_total,
+       RANK() OVER (ORDER BY SUM(o.amount) DESC)  AS rank_by_total
+FROM orders o JOIN customers c ON o.cust_id = c.id
+GROUP BY c.region;
+```
 
 ## Reflected tables and jsonb (the dual-protocol payoff)
 

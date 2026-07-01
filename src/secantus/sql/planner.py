@@ -1499,7 +1499,11 @@ def _plan_pipeline_select(
         has_agg = any(
             _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
         )
-        if stmt.args.get("group") or stmt.args.get("having") or has_agg:
+        grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_agg)
+        if _select_has_window(stmt) and (grouped or _group_agg_nodes(stmt)):
+            # Window functions over a JOIN + GROUP BY (or implicit aggregation).
+            return _plan_join_group_window_select(stmt, db, catalog, storage)
+        if grouped:
             return _plan_join_group_select(stmt, db, catalog, storage)
         return _plan_join_select(stmt, db, catalog, storage)
     from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
@@ -1955,7 +1959,20 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
     for fname in agg_field_names:
         project[fname] = f"${fname}"
     pipeline.append({"$project": project})
+    return _finish_group_window(stmt, table.collection, base_filter, pipeline, field_tags)
 
+
+def _finish_group_window(
+    stmt: exp.Select,
+    base_collection: str,
+    base_filter: dict[str, Any],
+    pipeline: list[dict[str, Any]],
+    field_tags: dict[str, str],
+    derived: list[DerivedTable] | None = None,
+) -> EvaluatedSelectPlan:
+    """Shared tail of the group-then-window planners: with the grouped rows'
+    field→tag map in hand, build the per-row output expressions, the window-alias
+    aware ORDER BY, and the ``EvaluatedSelectPlan`` that runs the window phase."""
     resolve = _synthetic_resolver(field_tags)
     out_columns: list[tuple[str, str]] = []
     out_exprs: list[exp.Expression] = []
@@ -1986,7 +2003,7 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
 
     limit, skip = _limit_skip(stmt)
     return EvaluatedSelectPlan(
-        base_collection=table.collection,
+        base_collection=base_collection,
         base_filter=base_filter,
         pipeline=pipeline,
         out_columns=out_columns,
@@ -1996,6 +2013,7 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         distinct=bool(stmt.args.get("distinct")),
         limit=limit,
         skip=skip,
+        derived=derived or [],
     )
 
 
@@ -2554,6 +2572,93 @@ def _plan_join_group_select(
     pipeline.append({"$project": project})
     _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
+
+
+def _plan_join_group_window_select(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+) -> EvaluatedSelectPlan:
+    """JOIN + GROUP BY combined with window functions — the join analogue of
+    ``_plan_group_window_select``. The $lookup/$unwind/$match/$group/$project
+    pipeline produces the grouped rows (aggregates resolved through the join
+    resolver), then the evaluated executor runs the windows over them."""
+    stmt = stmt.copy()  # we mutate the tree, replacing aggregates with columns
+    base, _amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
+
+    group_node = stmt.args.get("group")
+    group_keys: dict[str, str] = {}
+    key_tag: dict[str, str] = {}
+    field_tags: dict[str, str] = {}
+    names = _NameAllocator()
+    if group_node is not None:
+        for c in group_node.expressions:
+            if not isinstance(c, exp.Column):
+                raise errors.feature_not_supported(f"GROUP BY expression not supported: {c.sql()}")
+            keyname = _column_name(c)
+            path, tag = resolve(c)
+            group_keys[keyname] = f"${path}"
+            key_tag[keyname] = tag
+            field_tags[keyname] = tag
+            names.fresh(keyname)  # reserve so synthetic agg fields never collide
+    group_id = group_keys or None
+
+    accumulators: dict[str, Any] = {}
+    reductions: dict[str, Any] = {}
+    agg_fields: dict[str, str] = {}  # _agg_key -> field name
+    agg_field_names: list[str] = []
+
+    def register_agg(node: exp.AggFunc) -> str:
+        arr_arg = _array_agg_arg(node)
+        if arr_arg is not None:
+            fname = names.fresh("array_agg")
+            path, _ = resolve(arr_arg)
+            accumulators[fname] = {"$push": f"${path}"}
+            field_tags[fname] = "json"
+            agg_field_names.append(fname)
+            return fname
+        agg = _join_aggregate_of(node)
+        if agg is None:
+            raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        func, arg, distinct = agg
+        key = _agg_key(func, arg, resolve, distinct)
+        if key in agg_fields:
+            return agg_fields[key]
+        if distinct and func in _DISTINCT_FUNCS:
+            if arg is None:
+                raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+            path, tag = resolve(arg)
+            fname, tag = _register_distinct_agg(
+                func, path, tag, None, names, accumulators, reductions
+            )
+        else:
+            acc, tag = _join_accumulator(func, arg, resolve)
+            fname = names.fresh(func)
+            accumulators[fname] = acc
+        agg_fields[key] = fname
+        field_tags[fname] = tag
+        agg_field_names.append(fname)
+        return fname
+
+    for node in _group_agg_nodes(stmt):
+        node.replace(exp.column(register_agg(node)))
+
+    having = stmt.args.get("having")
+    having_match = (
+        _join_having_to_match(having.this, resolve, accumulators, agg_fields, group_keys, key_tag)
+        if having is not None
+        else None
+    )
+    pipeline.append({"$group": {"_id": group_id, **accumulators}})
+    if reductions:
+        pipeline.append({"$addFields": reductions})
+    if having_match is not None:
+        pipeline.append({"$match": having_match})
+    project: dict[str, Any] = {"_id": 0}
+    for keyname in group_keys:
+        project[keyname] = f"$_id.{keyname}"
+    for fname in agg_field_names:
+        project[fname] = f"${fname}"
+    pipeline.append({"$project": project})
+    return _finish_group_window(stmt, base.collection, {}, pipeline, field_tags, derived)
 
 
 def _join_having_to_match(
