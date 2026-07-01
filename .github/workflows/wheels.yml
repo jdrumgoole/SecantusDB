@@ -48,7 +48,7 @@ jobs:
             platform: windows-x86_64
             cibw_archs: AMD64
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           submodules: recursive
 
@@ -63,7 +63,7 @@ jobs:
 
       - name: Restore ccache
         if: matrix.platform != 'windows-x86_64'
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/ccache
           key: ccache-${{ matrix.platform }}-wt-${{ steps.wt-sha.outputs.sha }}
@@ -71,7 +71,7 @@ jobs:
             ccache-${{ matrix.platform }}-
 
       - name: Build wheels with cibuildwheel
-        uses: pypa/cibuildwheel@7940a4c0e76eb2030e473a5f864f291f63ee879b  # v2.21
+        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55  # v4.1.0
         env:
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
           CIBW_BEFORE_ALL_LINUX: |
@@ -107,7 +107,7 @@ jobs:
             SECANTUS_CARGO_TARGET=$HOME/.cache/ccache/cargo-target
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels-${{ matrix.platform }}
           path: wheelhouse/*.whl
@@ -116,17 +116,17 @@ jobs:
     name: Build sdist
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           submodules: recursive
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: sdist
           path: dist/*.tar.gz
