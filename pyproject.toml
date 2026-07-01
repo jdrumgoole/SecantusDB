@@ -266,6 +266,17 @@ addopts = "-n auto --dist=loadgroup -m 'not perf and not online and not slow'"
 # gauges' `-o addopts=`.
 timeout = 600
 timeout_method = "thread"
+# Delete each PASSED test's ``tmp_path`` immediately instead of retaining
+# every one for the whole session (pytest's default ``all``). The default
+# accumulates disk without bound here: the suite is on-disk WiredTiger and
+# each test's WT home is ~30 MB — almost entirely WT log files
+# (WiredTigerLog + two 10 MB WiredTigerPreplog pre-allocations), not data.
+# ~2000 tests x 30 MB retained = ~60 GB, which exhausts the Windows runner's
+# disk mid-run → WT can't write its log → ``No space left on device`` →
+# ``WT_PANIC`` (a real intermittent CI failure). ``failed`` keeps only the
+# tmp dirs of failing tests (for post-mortem debugging) and reclaims the
+# rest as the run proceeds, capping peak usage at ~(workers x 30 MB).
+tmp_path_retention_policy = "failed"
 markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
     "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",
