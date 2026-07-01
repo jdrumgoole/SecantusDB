@@ -106,3 +106,58 @@ def test_insert_without_column_list(storage):
     )
     assert res.command_tag == "MERGE 1"
     assert (8, "h", 80) in tgt(storage)
+
+
+def test_merge_returning(storage):
+    load_src(storage, [(2, "e", 200), (4, "n", 40)])
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET amt = s.amt "
+        "WHEN NOT MATCHED THEN INSERT (id, region, amt) VALUES (s.id, s.region, s.amt) "
+        "RETURNING t.id, t.amt"
+    )
+    assert res.command_tag == "MERGE 2"
+    assert [c.name for c in res.columns] == ["id", "amt"]
+    assert sorted(res.rows) == [(2, 200), (4, 40)]  # updated post-image + inserted row
+
+
+def test_merge_returning_computed_and_star(storage):
+    load_src(storage, [(1, "e", 5)])
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET amt = t.amt + s.amt "
+        "RETURNING t.id, t.amt * 2 AS dbl"
+    )
+    assert res.rows == [(1, 30)]  # amt 10 + 5 = 15, doubled = 30
+
+
+def test_when_not_matched_by_source_update(storage):
+    # Target rows with no matching source row get the BY SOURCE action.
+    load_src(storage, [(1, "e", 111)])  # matches only tgt id 1
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET amt = s.amt "
+        "WHEN NOT MATCHED BY SOURCE THEN UPDATE SET amt = 0"
+    )
+    assert res.command_tag == "MERGE 3"  # id1 matched, id2/id3 by-source
+    assert tgt(storage) == [(1, "e", 111), (2, "e", 0), (3, "w", 0)]
+
+
+def test_when_not_matched_by_source_delete(storage):
+    load_src(storage, [(2, "e", 20)])  # matches only tgt id 2
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE"
+    )
+    assert res.command_tag == "MERGE 2"  # id1 and id3 deleted
+    assert tgt(storage) == [(2, "e", 20)]
+
+
+def test_by_source_returning(storage):
+    load_src(storage, [(1, "e", 10)])
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id "
+        "WHEN NOT MATCHED BY SOURCE THEN DELETE "
+        "RETURNING t.id, t.region"
+    )
+    assert sorted(res.rows) == [(2, "e"), (3, "w")]  # the deleted rows' pre-images
+    assert tgt(storage) == [(1, "e", 10)]

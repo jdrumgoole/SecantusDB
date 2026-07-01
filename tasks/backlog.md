@@ -1469,10 +1469,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   a scope that resolves target vs source columns by alias (`_merge_pick_when` / `_merge_apply_matched` /
   `_merge_apply_not_matched`). Command tag `MERGE n` counts inserts + updates + deletes; each target row is
   affected at most once (`done` id-set), and MERGE targets are captured for savepoint snapshots
-  (`_write_target_collection` recognises `exp.Merge`). **Limitations:** no `WHEN [NOT] MATCHED BY SOURCE`
-  (→ `0A000`), no `RETURNING`, no multi-target-match cardinality error (Postgres raises 21000 when a source
-  row matches >1 target; SecantusDB applies to all matched, once each), and an unqualified column ambiguous
-  between target and source resolves to the target.
+  (`_write_target_collection` recognises `exp.Merge`). **`RETURNING` + `WHEN NOT MATCHED BY SOURCE`
+  landed** (b77): `_merge_pick_when` now keys on both the `matched` and `source` (BY SOURCE) flags; after
+  the source loop a BY-SOURCE pass applies `UPDATE`/`DELETE`/`DO NOTHING` to target rows no source row
+  matched (`source_matched` id-set). The apply helpers return `(count, image)` — an updated row's
+  post-image, an inserted row, or a deleted row's pre-image — and `RETURNING` projects them via
+  `planner._returning_columns` + `executor._returning_result` (plain + computed target-column items).
+  **Limitations:** no multi-target-match cardinality error (Postgres raises 21000 when a source row matches
+  >1 target; SecantusDB applies to all matched, once each), an unqualified column ambiguous between target
+  and source resolves to the target, and `RETURNING` doesn't support `merge_action()` or source-column
+  references.
 - [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
   (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`
