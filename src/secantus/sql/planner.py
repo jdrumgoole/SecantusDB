@@ -25,7 +25,7 @@ import sqlglot
 from sqlglot import exp
 
 from secantus.sql import errors, typemap
-from secantus.sql.catalog import Column, TableDef
+from secantus.sql.catalog import Column, ForeignKey, TableDef
 
 # sqlglot logs a WARNING when it falls back to parsing ``SHOW`` / ``RESET`` as a
 # generic ``Command`` node — which is exactly how we consume them. Quiet it so
@@ -732,6 +732,9 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
             columns = [_with_pk(c, names[0]) for c in columns]
             pk_seen = True
             continue
+        if isinstance(coldef, exp.ForeignKey):
+            # Table-level FOREIGN KEY — collected by _extract_foreign_keys below.
+            continue
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")
         tag = typemap.type_tag_for_sql(coldef.args["kind"])
@@ -757,8 +760,68 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         # No PK: the _id is auto-assigned by storage and not surfaced as a
         # column. Fine for the spike.
         pass
-    table = TableDef(name=table_name, collection=table_name, columns=columns)
+    fks = _extract_foreign_keys(schema, table_name)
+    table = TableDef(name=table_name, collection=table_name, columns=columns, foreign_keys=fks)
     return CreateTablePlan(table=table, if_not_exists=bool(stmt.args.get("exists")))
+
+
+def _ref_target(ref: exp.Reference) -> tuple[str, tuple[str, ...]]:
+    """A ``REFERENCES`` clause → ``(ref_table, (ref_col, ...))``. An empty column
+    list (``REFERENCES t``) points at the target's PRIMARY KEY, left empty here
+    and resolved to ``_id`` by reflection."""
+    schema = ref.this  # exp.Schema or exp.Table
+    if isinstance(schema, exp.Schema):
+        return schema.this.name, tuple(_column_name(c) for c in schema.expressions)
+    if isinstance(schema, exp.Table):
+        return schema.name, ()
+    raise errors.feature_not_supported(f"unsupported REFERENCES target: {ref.sql()}")
+
+
+def _ref_actions(ref: exp.Reference) -> tuple[str | None, str | None]:
+    """Parse ``ON DELETE`` / ``ON UPDATE`` referential actions out of a
+    ``Reference``'s option strings (e.g. ``"ON DELETE CASCADE"``)."""
+    on_delete = on_update = None
+    for opt in ref.args.get("options") or []:
+        text = str(opt).upper()
+        if text.startswith("ON DELETE "):
+            on_delete = text[len("ON DELETE ") :].strip()
+        elif text.startswith("ON UPDATE "):
+            on_update = text[len("ON UPDATE ") :].strip()
+    return on_delete, on_update
+
+
+def _make_fk(table_name: str, cols: tuple[str, ...], ref: exp.Reference) -> ForeignKey:
+    ref_table, ref_cols = _ref_target(ref)
+    on_delete, on_update = _ref_actions(ref)
+    # Postgres' default constraint name: <table>_<firstcol>_fkey.
+    name = f"{table_name}_{cols[0]}_fkey" if cols else f"{table_name}_fkey"
+    return ForeignKey(
+        name=name,
+        columns=cols,
+        ref_table=ref_table,
+        ref_columns=ref_cols,
+        on_delete=on_delete,
+        on_update=on_update,
+    )
+
+
+def _extract_foreign_keys(schema: exp.Schema, table_name: str) -> list[ForeignKey]:
+    """Collect declared foreign keys from a ``CREATE TABLE`` column list — both
+    column-level ``col type REFERENCES t(c)`` and table-level ``FOREIGN KEY (c)
+    REFERENCES t(c)``."""
+    fks: list[ForeignKey] = []
+    for coldef in schema.expressions:
+        if isinstance(coldef, exp.ForeignKey):  # table-level
+            cols = tuple(_column_name(c) for c in coldef.args.get("expressions") or [])
+            ref = coldef.args.get("reference")
+            if ref is not None:
+                fks.append(_make_fk(table_name, cols, ref))
+            continue
+        if isinstance(coldef, exp.ColumnDef):  # column-level REFERENCES
+            for con in coldef.args.get("constraints") or []:
+                if isinstance(con.kind, exp.Reference):
+                    fks.append(_make_fk(table_name, (coldef.name,), con.kind))
+    return fks
 
 
 def _with_pk(col: Column, pk_name: str) -> Column:

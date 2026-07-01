@@ -14,7 +14,7 @@ column maps to a field of its own name.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from secantus.sql import errors
@@ -45,6 +45,22 @@ class Column:
     nullable: bool
 
 
+@dataclass(frozen=True)
+class ForeignKey:
+    """A declared (never enforced) foreign-key constraint.
+
+    Recorded so reflection (``information_schema`` / ``pg_catalog`` / SQLAlchemy's
+    inspector) can see it. SecantusDB does not check referential integrity on
+    write — this is a schema-shape record, not a runtime guard."""
+
+    name: str  # constraint name, e.g. "orders_user_id_fkey"
+    columns: tuple[str, ...]  # local column(s)
+    ref_table: str
+    ref_columns: tuple[str, ...]
+    on_delete: str | None = None  # "CASCADE" / "SET NULL" / ... (informational)
+    on_update: str | None = None
+
+
 @dataclass
 class TableDef:
     name: str
@@ -54,6 +70,7 @@ class TableDef:
     # resolves to a field of the same name, and an un-sampled column reads as
     # the permissive ``any`` type rather than erroring.
     reflected: bool = False
+    foreign_keys: list[ForeignKey] = field(default_factory=list)
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:
@@ -100,6 +117,17 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
             }
             for c in table.columns
         ],
+        "foreign_keys": [
+            {
+                "name": fk.name,
+                "columns": list(fk.columns),
+                "ref_table": fk.ref_table,
+                "ref_columns": list(fk.ref_columns),
+                "on_delete": fk.on_delete,
+                "on_update": fk.on_update,
+            }
+            for fk in table.foreign_keys
+        ],
     }
 
 
@@ -116,6 +144,17 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 nullable=bool(c["nullable"]),
             )
             for c in doc["columns"]
+        ],
+        foreign_keys=[
+            ForeignKey(
+                name=fk["name"],
+                columns=tuple(fk["columns"]),
+                ref_table=fk["ref_table"],
+                ref_columns=tuple(fk["ref_columns"]),
+                on_delete=fk.get("on_delete"),
+                on_update=fk.get("on_update"),
+            )
+            for fk in doc.get("foreign_keys", [])
         ],
     )
 

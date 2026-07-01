@@ -1540,14 +1540,25 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   set-returning functions (`unnest` / `generate_subscripts` → row expansion in the evaluated
   executor), GROUP BY / `array_agg` over a derived-table FROM, populated `pg_index`/`pg_constraint`/
   `pg_am`/`pg_opclass`, and a fix so boolean expressions (`conrelid IS NOT NULL`) type as `bool`
-  (else the wire text `'f'` reads truthy in `if row["has_constraint"]`). `get_foreign_keys` reflects
-  empty (no FK constraints modeled); column comments reflect as `None`. **Constraint / sequence
-  `information_schema` views landed** (b75): `information_schema.table_constraints`,
-  `key_column_usage`, and `constraint_column_usage` (built from `virtual._pk_constraints`) surface one
-  row per PRIMARY KEY — the only constraint modeled — so the standard PK reflection join
-  (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit resolves;
-  `referential_constraints` and `sequences` are present-but-empty (no FKs, no sequences). Remaining:
-  actual FK constraints, column comments.
+  (else the wire text `'f'` reads truthy in `if row["has_constraint"]`). Column comments reflect as
+  `None`. **Constraint / sequence `information_schema` views landed** (b75):
+  `information_schema.table_constraints`, `key_column_usage`, and `constraint_column_usage` (built from
+  `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
+  reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
+  resolves; `sequences` is present-but-empty (no sequences). Remaining: column comments.
+- [ ] **Foreign keys — declared, reflected, NOT enforced** (b81): column-level `col type REFERENCES
+  t(c)` and table-level `FOREIGN KEY (c) REFERENCES t(c)` (incl. `ON DELETE` / `ON UPDATE` actions and
+  the columnless `REFERENCES t` → target-PK form) are parsed by `planner._extract_foreign_keys`, stored
+  on `TableDef.foreign_keys` (`catalog.ForeignKey`), and persisted in the catalog doc. Reflection:
+  `information_schema.referential_constraints` (one row per FK), FK rows added to `table_constraints` /
+  `key_column_usage` / `constraint_column_usage`, `pg_catalog.pg_constraint` gains `contype='f'` rows
+  (`conrelid`/`confrelid`/`conkey`/`confkey`), and `pg_get_constraintdef(oid)` renders the `FOREIGN KEY
+  (…) REFERENCES …` string (`virtual._foreign_keys` / `constraint_def_for_oid`, called from
+  `scalar._call_func`). SQLAlchemy's `Inspector.get_foreign_keys()` + full `MetaData.reflect()` resolve
+  the relationship end to end. **Not enforced:** no referential-integrity check on insert/update/delete
+  — this is a schema-shape record only. **Limitations:** adding a FK via `ALTER TABLE … ADD FOREIGN
+  KEY` isn't wired (ALTER only does column ops); FK actions never fire; `MATCH`/`DEFERRABLE` render as
+  the defaults.
 - [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
