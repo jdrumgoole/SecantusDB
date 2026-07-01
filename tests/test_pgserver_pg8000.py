@@ -1140,6 +1140,27 @@ def test_create_index_and_isolation_via_driver(server):
     conn.close()
 
 
+def test_alter_table_via_driver(server):
+    # ADD / DROP / RENAME COLUMN + RENAME TO through the real driver, with the
+    # data following (dropped field $unset, renamed field $rename).
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, a text, b int)")
+    cur.execute("INSERT INTO t (id, a, b) VALUES (1, 'x', 10), (2, 'y', 20)")
+    cur.execute("ALTER TABLE t ADD COLUMN c text")
+    cur.execute("UPDATE t SET c = 'hi' WHERE id = 1")
+    cur.execute("SELECT id, a, b, c FROM t ORDER BY id")
+    assert cur.fetchall() == ([1, "x", 10, "hi"], [2, "y", 20, None])
+    cur.execute("ALTER TABLE t DROP COLUMN b")
+    cur.execute("ALTER TABLE t RENAME COLUMN a TO label")
+    cur.execute("SELECT id, label, c FROM t ORDER BY id")
+    assert cur.fetchall() == ([1, "x", "hi"], [2, "y", None])
+    cur.execute("ALTER TABLE t RENAME TO t2")
+    cur.execute("SELECT id, label FROM t2 ORDER BY id")
+    assert cur.fetchall() == ([1, "x"], [2, "y"])
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

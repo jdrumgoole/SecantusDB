@@ -50,6 +50,13 @@ class DropTablePlan:
 
 
 @dataclass
+class AlterTablePlan:
+    name: str
+    if_exists: bool
+    actions: list[Any]  # the raw sqlglot action nodes, applied by the executor
+
+
+@dataclass
 class CreateIndexPlan:
     collection: str
     name: str
@@ -762,6 +769,17 @@ def _with_pk(col: Column, pk_name: str) -> Column:
 
 def plan_drop_table(stmt: exp.Drop) -> DropTablePlan:
     return DropTablePlan(name=stmt.this.name, if_exists=bool(stmt.args.get("exists")))
+
+
+def plan_alter_table(stmt: exp.Alter) -> AlterTablePlan:
+    kind = str(stmt.args.get("kind") or "TABLE").upper()
+    if kind != "TABLE":
+        raise errors.feature_not_supported(f"ALTER {kind} is not supported")
+    return AlterTablePlan(
+        name=stmt.this.name,
+        if_exists=bool(stmt.args.get("exists")),
+        actions=list(stmt.args.get("actions") or []),
+    )
 
 
 def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:

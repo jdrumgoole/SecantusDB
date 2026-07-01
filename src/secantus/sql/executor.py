@@ -72,6 +72,115 @@ def execute_drop_table(
     return SQLResult(command_tag="DROP TABLE")
 
 
+def execute_alter_table(
+    plan: planner.AlterTablePlan, catalog: Catalog, storage: Any, db: str
+) -> SQLResult:
+    """Apply ``ALTER TABLE`` actions to the catalog (and the backing collection
+    where the data must follow — a dropped column's field is ``$unset``, a renamed
+    non-PK column's field is ``$rename``d)."""
+    table = catalog.get(db, plan.name)
+    if table is None:
+        if plan.if_exists:
+            return SQLResult(command_tag="ALTER TABLE")
+        raise errors.undefined_table(plan.name)
+    old_name = table.name
+    for action in plan.actions:
+        _apply_alter_action(action, table, storage, db)
+    catalog.replace(db, table, old_name=old_name)
+    return SQLResult(command_tag="ALTER TABLE")
+
+
+def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
+    from sqlglot import exp
+
+    from secantus.sql.catalog import Column
+
+    coll = table.collection
+    if isinstance(action, exp.ColumnDef):  # ADD COLUMN [IF NOT EXISTS] name type
+        name = action.name
+        if table.column(name) is not None:
+            if action.args.get("exists"):
+                return
+            raise errors.SQLError(
+                "42701", f'column "{name}" of relation "{table.name}" already exists'
+            )
+        tag = typemap.type_tag_for_sql(action.args["kind"])
+        if tag is None:
+            raise errors.feature_not_supported(
+                f"unsupported column type: {action.args['kind'].sql()}"
+            )
+        cons = [type(c.kind).__name__ for c in (action.args.get("constraints") or [])]
+        table.columns.append(
+            Column(
+                name=name,
+                type_tag=tag,
+                field=name,
+                pk=False,
+                nullable="NotNullColumnConstraint" not in cons,
+            )
+        )
+        return
+    if isinstance(action, exp.Drop):  # DROP COLUMN [IF EXISTS] name
+        name = action.this.name
+        col = table.column(name)
+        if col is None:
+            if action.args.get("exists"):
+                return
+            raise errors.undefined_column(name)
+        if col.pk:
+            raise errors.feature_not_supported("dropping the PRIMARY KEY column is not supported")
+        table.columns = [c for c in table.columns if c.name != name]
+        storage.update_matching(db, coll, {}, {"$unset": {col.field: ""}}, multi=True)
+        return
+    if isinstance(action, exp.RenameColumn):  # RENAME COLUMN a TO b
+        old = action.this.name
+        new = action.args["to"].name
+        col = table.column(old)
+        if col is None:
+            if action.args.get("exists"):
+                return
+            raise errors.undefined_column(old)
+        if table.column(new) is not None:
+            raise errors.SQLError(
+                "42701", f'column "{new}" of relation "{table.name}" already exists'
+            )
+        new_field = col.field if col.pk else new
+        table.columns = [
+            Column(new, c.type_tag, new_field, c.pk, c.nullable) if c.name == old else c
+            for c in table.columns
+        ]
+        if not col.pk and col.field != new_field:
+            storage.update_matching(db, coll, {}, {"$rename": {col.field: new_field}}, multi=True)
+        return
+    if isinstance(action, exp.AlterRename):  # RENAME TO newname
+        new_name = action.this.name
+        if table.collection == table.name:
+            # A declared table maps 1:1 to a same-named collection — move the
+            # collection too, so the old name stops resolving (a leftover
+            # collection would otherwise reflect as a phantom table).
+            ok, err = storage.rename_collection(db, table.collection, db, new_name)
+            if not ok:
+                raise errors.SQLError("42P07", err or f'relation "{new_name}" already exists')
+            table.collection = new_name
+        table.name = new_name
+        return
+    if isinstance(action, exp.AlterColumn):  # ALTER COLUMN c SET/DROP NOT NULL
+        name = action.this.name
+        col = table.column(name)
+        if col is None:
+            raise errors.undefined_column(name)
+        if action.args.get("allow_null") is None and not action.args.get("drop"):
+            # Neither SET NOT NULL nor DROP NOT NULL — a TYPE / DEFAULT change.
+            raise errors.feature_not_supported(f"unsupported ALTER COLUMN action: {action.sql()}")
+        nullable = bool(action.args.get("allow_null"))
+        table.columns = [
+            Column(c.name, c.type_tag, c.field, c.pk, nullable) if c.name == name else c
+            for c in table.columns
+        ]
+        return
+    raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
+
+
 def execute_create_index(
     plan: planner.CreateIndexPlan, catalog: Catalog, storage: Any, db: str
 ) -> SQLResult:

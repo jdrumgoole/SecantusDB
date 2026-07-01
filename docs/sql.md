@@ -189,6 +189,28 @@ SELECT price, at FROM m;
 -- price -> Decimal('19.99'),  at -> datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
 ```
 
+### Evolving a table (`ALTER TABLE`)
+
+`ALTER TABLE` rewrites the catalog entry and, where the data must follow, the
+backing collection:
+
+```sql
+ALTER TABLE users ADD COLUMN email text;            -- new field, reads NULL until set
+ALTER TABLE users ADD COLUMN score int NOT NULL;    -- marks the column non-nullable
+ALTER TABLE users DROP COLUMN age;                  -- $unsets the field on every doc
+ALTER TABLE users RENAME COLUMN name TO full_name;  -- $renames the field
+ALTER TABLE users ALTER COLUMN email SET NOT NULL;  -- / DROP NOT NULL
+ALTER TABLE users RENAME TO members;                -- renames the table + collection
+```
+
+Supported actions: `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`,
+`RENAME COLUMN`, `RENAME TO`, and `ALTER COLUMN … SET/DROP NOT NULL`.
+`ALTER TABLE IF EXISTS` on a missing table is a no-op. Dropping the `PRIMARY
+KEY` column is rejected (it maps to `_id`); renaming it changes only the SQL
+name — the field stays `_id`. Column *type* changes and multiple actions in one
+statement are not supported (sqlglot parses a comma-separated action list as an
+opaque command); issue one action per statement.
+
 ## Querying
 
 `WHERE` supports the common operators; they lower to the same match engine the
@@ -934,7 +956,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain |
-| DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
+| DDL | `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER COLUMN … TYPE`, multi-action `ALTER`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
