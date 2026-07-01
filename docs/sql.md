@@ -886,6 +886,24 @@ users = sqlalchemy.Table('users', sqlalchemy.MetaData(), autoload_with=engine)
 `get_foreign_keys()` reflects empty, since SecantusDB models no foreign-key
 constraints. Column comments aren't stored, so they reflect as `None`.
 
+The SQL-standard constraint views are also present, so tooling that reflects
+through `information_schema` (rather than `pg_catalog`) resolves too:
+
+```sql
+-- the canonical primary-key reflection join
+SELECT tc.table_name, kcu.column_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_name = kcu.constraint_name
+WHERE tc.constraint_type = 'PRIMARY KEY';
+```
+
+`table_constraints`, `key_column_usage`, and `constraint_column_usage` surface
+one row per PRIMARY KEY (the only constraint SecantusDB models — a
+`CREATE UNIQUE INDEX` is an index, not a constraint). `referential_constraints`
+and `sequences` are present but empty (no foreign keys, no sequences), so an
+ORM's FK / sequence reflection resolves to "none" instead of erroring.
+
 ## Supported SQL
 
 | Area | Supported | Not yet |
