@@ -42,6 +42,7 @@ use bson::{Bson, Document};
 
 use crate::numeric::{self, as_float_like, as_int_like, int_to_bson};
 use crate::paths;
+use crate::regexutil;
 
 #[derive(Debug)]
 pub struct Fallback;
@@ -232,6 +233,9 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$convert" => op_convert(arg, ctx),
         "$toBool" => op_to_bool(arg, ctx),
         "$toString" => op_to_string(arg, ctx),
+        "$regexMatch" => op_regex_match(arg, ctx),
+        "$regexFind" => op_regex_find(arg, ctx),
+        "$regexFindAll" => op_regex_find_all(arg, ctx),
         // math (exactly-deterministic only; $round/$pow/$trunc and the
         // transcendentals — exp/ln/log/log10 — are deferred for rounding / ULP
         // fidelity, $sqrt is IEEE exactly-rounded so it's safe)
@@ -1621,6 +1625,89 @@ fn op_to_string(arg: &Bson, ctx: &Ctx) -> R {
         // float str() / Decimal128 / datetime isoformat / ObjectId etc. -> Python.
         _ => return Err(Fallback),
     })
+}
+
+// --- regex expression operators -----------------------------------------
+// $regexMatch / $regexFind / $regexFindAll, mirroring the pure-Python ops. Each
+// evaluates `input` first and, if it isn't a string, returns the empty result
+// (false / null / []) *before* touching the regex — matching Python's
+// short-circuit. `regex` + optional `options` are compiled via the shared
+// `regexutil` (linear engine, else backtracking). $regexMatch uses `is_match`
+// (both engines, same guarantee as query `$regex`); the positional finds use the
+// linear engine only (fancy-regex capture semantics are a parity risk → defer).
+
+/// Compile `{regex, options?}` from an already-validated (input-is-string) spec.
+fn compile_regex(spec: &Document, ctx: &Ctx) -> Result<regexutil::CompiledRegex, Fallback> {
+    let pattern = match spec.get("regex") {
+        Some(e) => eval(e, ctx)?,
+        None => return Err(Fallback), // Python `_resolve_regex` raises
+    };
+    let options = match spec.get("options") {
+        Some(e) => Some(eval(e, ctx)?),
+        None => None,
+    };
+    regexutil::compile(&pattern, options.as_ref()).map_err(|_| Fallback)
+}
+
+/// The evaluated `input`, or `None` when it isn't a string (caller returns the
+/// operator's empty value without compiling the regex — Python's short-circuit).
+fn regex_input(spec: &Document, ctx: &Ctx) -> Result<Option<String>, Fallback> {
+    let input = match spec.get("input") {
+        Some(e) => eval(e, ctx)?,
+        None => Bson::Null,
+    };
+    Ok(match input {
+        Bson::String(s) => Some(s),
+        _ => None,
+    })
+}
+
+/// `{match, idx, captures}` for one hit — `idx` is a code-point index, captures
+/// are the matched substring or `null` (Python `m.groups()`).
+fn regex_match_doc(m: regexutil::RegexMatch) -> Bson {
+    let captures: Vec<Bson> = m
+        .captures
+        .into_iter()
+        .map(|c| c.map(Bson::String).unwrap_or(Bson::Null))
+        .collect();
+    let mut d = Document::new();
+    d.insert("match", Bson::String(m.text));
+    d.insert("idx", Bson::Int32(m.codepoint_idx as i32));
+    d.insert("captures", Bson::Array(captures));
+    Bson::Document(d)
+}
+
+fn op_regex_match(arg: &Bson, ctx: &Ctx) -> R {
+    let spec = arg.as_document().ok_or(Fallback)?;
+    let Some(s) = regex_input(spec, ctx)? else {
+        return Ok(Bson::Boolean(false));
+    };
+    let re = compile_regex(spec, ctx)?;
+    Ok(Bson::Boolean(re.is_match(&s)))
+}
+
+fn op_regex_find(arg: &Bson, ctx: &Ctx) -> R {
+    let spec = arg.as_document().ok_or(Fallback)?;
+    let Some(s) = regex_input(spec, ctx)? else {
+        return Ok(Bson::Null);
+    };
+    let re = compile_regex(spec, ctx)?;
+    match re.find_first(&s).map_err(|_| Fallback)? {
+        None => Ok(Bson::Null),
+        Some(m) => Ok(regex_match_doc(m)),
+    }
+}
+
+fn op_regex_find_all(arg: &Bson, ctx: &Ctx) -> R {
+    let spec = arg.as_document().ok_or(Fallback)?;
+    let Some(s) = regex_input(spec, ctx)? else {
+        return Ok(Bson::Array(Vec::new()));
+    };
+    let re = compile_regex(spec, ctx)?;
+    let matches = re.find_all(&s).map_err(|_| Fallback)?;
+    Ok(Bson::Array(
+        matches.into_iter().map(regex_match_doc).collect(),
+    ))
 }
 
 // --- math ---------------------------------------------------------------

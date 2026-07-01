@@ -39,6 +39,7 @@ mod group;
 mod numeric;
 mod order;
 mod paths;
+mod regexutil;
 mod windowfields;
 
 // Re-export the read-only dotted-path helpers (only) so the Rust storage layer's

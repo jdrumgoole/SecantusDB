@@ -1237,12 +1237,16 @@ the actionable gauge tail is closed; these are feature completeness. **Shipped s
 the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#76),
 `$unionWith` (#77), `$fill` (#123), `$toDecimal` + `$convert` (#132),
 `$setWindowFields` (bounded: rank funcs + `$group` accumulators over document-based
-windows; range windows / time-series ops defer). **Remaining:**
+windows; range windows / time-series ops defer), the regex family `$regexMatch` /
+`$regexFind` / `$regexFindAll` (shared `regexutil`: `$regexMatch` uses both engines;
+positional finds use the linear engine and defer fancy-regex capture semantics).
+**Remaining:**
 
 - [ ] **Expression operators:** `$dateFromString` (date parsing — tz-aware/naive and
-  format-string parity vs Python is the hazard) and the regex family `$regexFind` /
-  `$regexFindAll` / `$regexMatch` (could reuse the query `$regex` `fancy-regex` path;
-  regex parity vs Python `re` is the documented hard-defer class).
+  format-string parity vs Python is the hazard). Regex `$regexFind` / `$regexFindAll`
+  over a *fancy-regex* pattern (lookaround / backreferences) still defers — the linear
+  engine covers the common patterns; the backtracking engine's capture semantics vs
+  Python `re` are the open parity risk.
 - [ ] **Aggregate stages:** `$setWindowFields` range-based windows + time-series window
   operators (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) — the
   bounded port ships the common document-window + rank/accumulator subset and defers
