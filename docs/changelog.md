@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Smaller on-disk footprint: WiredTiger log pre-allocation disabled
+
+Each on-disk SecantusDB instance used to reserve ~30 MB of WiredTiger log
+files regardless of how little data it held — the active `WiredTigerLog`
+plus two 10 MB `WiredTigerPreplog` files WT pre-allocates ahead of the
+active log. That pre-allocation is a write-latency optimisation for
+long-running, high-throughput servers; SecantusDB's instances are small,
+ephemeral, in-process test databases, so it bought nothing and cost disk —
+acutely on CI, where a full ~2000-test on-disk run retained thousands of
+instances and exhausted the Windows runner's disk (`No space left on
+device` → `WT_PANIC`). Disabling `log=(prealloc=false)` drops each
+instance's log footprint from ~30 MB to ~10 MB with no durability change
+(recovery replays the same log records; WT just allocates each segment on
+demand). `file_max` stays 10 MB so a near-`maxBsonObjectSize` document
+still fits in one segment.
+
+#### Changed
+- `Storage`: on-disk WiredTiger opens with `log=(...,prealloc=false)` —
+  ~3x smaller per-instance log footprint, no durability impact.
+
+
 ### A malformed OP_QUERY frame returns BadValue instead of dropping the connection
 
 A legacy `OP_QUERY` frame whose `fullCollectionName` carried no NUL
