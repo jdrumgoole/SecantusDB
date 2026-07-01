@@ -104,20 +104,40 @@ def execute_drop_index(
 
 def _returning_result(
     docs: list[dict[str, Any]],
-    returning: list[tuple[str, Any]],
+    returning: list[tuple[str, Any, Any]],
     command_tag: str,
     rowcount: int,
+    table: Any = None,
+    storage: Any = None,
+    db: str | None = None,
 ) -> SQLResult:
     """Shape a write statement's ``RETURNING`` rows the same way a SELECT does —
-    so the wire layer emits a RowDescription + DataRows ahead of CommandComplete."""
+    so the wire layer emits a RowDescription + DataRows ahead of CommandComplete.
+
+    Each returning item is ``(name, Column, expr)``; a plain item (``expr`` None)
+    reads straight from the doc, a computed one is evaluated per row against a
+    scope over the returned doc."""
     columns = [
         ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-        for name, col in returning
+        for name, col, _ in returning
     ]
-    rows = [
-        tuple(typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in returning)
-        for doc in docs
-    ]
+    ctx = None
+    if any(expr is not None for _, _, expr in returning):
+        from secantus.sql import scalar
+
+        ctx = scalar.ScalarContext(storage=storage, catalog=None, db=db, session=None)
+
+    def cell(doc: dict[str, Any], col: Any, expr: Any) -> Any:
+        if expr is None:
+            return typemap.to_py(get_path(doc, col.field), col.type_tag)
+        from secantus.sql import scalar
+
+        def scope(node: Any) -> Any:
+            return get_path(doc, table.field_for(node.name))
+
+        return typemap.to_py(scalar.evaluate(expr, scope, ctx), col.type_tag)
+
+    rows = [tuple(cell(doc, col, expr) for _, col, expr in returning) for doc in docs]
     return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
 
 
@@ -141,7 +161,13 @@ def execute_insert(
         _raise_write_error(write_errors[0], plan.table)
     if plan.returning is not None:
         return _returning_result(
-            plan.docs[:inserted], plan.returning, f"INSERT 0 {inserted}", inserted
+            plan.docs[:inserted],
+            plan.returning,
+            f"INSERT 0 {inserted}",
+            inserted,
+            plan.table,
+            storage,
+            db,
         )
     return SQLResult(command_tag=f"INSERT 0 {inserted}", rowcount=inserted)
 
@@ -194,7 +220,9 @@ def _execute_insert_on_conflict(
             result_docs.append(updated)
     tag = f"INSERT 0 {affected}"
     if plan.returning is not None:
-        return _returning_result(result_docs, plan.returning, tag, affected)
+        return _returning_result(
+            result_docs, plan.returning, tag, affected, plan.table, storage, db
+        )
     return SQLResult(command_tag=tag, rowcount=affected)
 
 
@@ -545,7 +573,9 @@ def execute_update(plan: planner.UpdatePlan, storage: Any, db: str) -> SQLResult
     matched = int(res["matched"])
     if plan.returning is not None:
         post = storage.find_matching(db, coll, {"_id": {"$in": ids}}) if ids else []
-        return _returning_result(post, plan.returning, f"UPDATE {matched}", matched)
+        return _returning_result(
+            post, plan.returning, f"UPDATE {matched}", matched, plan.table, storage, db
+        )
     return SQLResult(command_tag=f"UPDATE {matched}", rowcount=matched)
 
 
@@ -555,5 +585,5 @@ def execute_delete(plan: planner.DeletePlan, storage: Any, db: str) -> SQLResult
     victims = storage.find_matching(db, coll, plan.filter) if plan.returning is not None else []
     n = storage.delete_matching(db, coll, plan.filter)
     if plan.returning is not None:
-        return _returning_result(victims, plan.returning, f"DELETE {n}", n)
+        return _returning_result(victims, plan.returning, f"DELETE {n}", n, plan.table, storage, db)
     return SQLResult(command_tag=f"DELETE {n}", rowcount=n)

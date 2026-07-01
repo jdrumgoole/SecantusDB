@@ -1356,8 +1356,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   each doc before insert so the in-hand list is the authoritative inserted set; `execute_update`
   captures matched `_id`s and re-reads the **post-image**; `execute_delete` snapshots the victims
   before deleting. The wire layer already emits RowDescription+DataRows whenever `res.columns` is
-  non-empty, so no pgserver change. **Limited to the projection vocabulary** (no computed
-  expressions in `RETURNING`, e.g. `RETURNING n*2`).
+  non-empty, so no pgserver change. **Computed expressions in `RETURNING` landed** (b67): each
+  returning item is now `(name, Column, expr)`; `expr` is None for a plain column / `*` / jsonb (read
+  straight from the doc), else the raw node evaluated per returned row by `executor._returning_result`
+  against a scope over that row (arithmetic, `||`, function calls, `CASE`, …). Works for INSERT /
+  UPDATE (post-image) / DELETE and `INSERT … ON CONFLICT`. A subquery inside `RETURNING` isn't
+  supported (the eval ctx has no catalog/session).
 - [ ] **Set operations landed** (b47). `UNION` / `INTERSECT` / `EXCEPT` (+ `ALL` variants, chained)
   in `engine._run_set_operation`: each arm runs through the full SELECT path, rows are combined
   with multiset semantics (`_combine_setop_rows` / `_multiset_filter` — DISTINCT collapses to set
