@@ -235,6 +235,82 @@ def test_group_numeric_key_collision():
     assert rust == py, f"rust={rust} pure={py}"
 
 
+@pytest.mark.parametrize(
+    "docs,pipeline",
+    [
+        # value fill (missing + null -> value), and value-as-expression.
+        (
+            [{"_id": 1, "a": 1}, {"_id": 2, "a": None}, {"_id": 3}],
+            [{"$fill": {"output": {"a": {"value": 0}}}}],
+        ),
+        (
+            [{"_id": 1, "a": 1, "b": 5}, {"_id": 2, "a": None, "b": 7}],
+            [{"$fill": {"output": {"a": {"value": "$b"}}}}],
+        ),
+        # locf — leading null stays null, later gaps carry forward.
+        (
+            [
+                {"_id": 1, "t": 1, "v": None},
+                {"_id": 2, "t": 2, "v": 10},
+                {"_id": 3, "t": 3},
+                {"_id": 4, "t": 4, "v": 30},
+                {"_id": 5, "t": 5},
+            ],
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "locf"}}}}],
+        ),
+        # linear — numeric anchors with clean fractions; trailing null stays null.
+        (
+            [
+                {"_id": 1, "t": 0, "v": 0},
+                {"_id": 2, "t": 1},
+                {"_id": 3, "t": 2},
+                {"_id": 4, "t": 4, "v": 8},
+                {"_id": 5, "t": 5},
+            ],
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}],
+        ),
+        # partitionByFields + locf — output in partition-discovery order.
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": 10},
+                {"_id": 2, "g": "b", "t": 1, "v": 5},
+                {"_id": 3, "g": "a", "t": 2},
+                {"_id": 4, "g": "b", "t": 2},
+            ],
+            [
+                {
+                    "$fill": {
+                        "partitionByFields": ["g"],
+                        "sortBy": {"t": 1},
+                        "output": {"v": {"method": "locf"}},
+                    }
+                }
+            ],
+        ),
+        # partitionBy expression.
+        (
+            [{"_id": 1, "g": "a", "t": 1, "v": 10}, {"_id": 2, "g": "a", "t": 2}],
+            [
+                {
+                    "$fill": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"v": {"method": "locf"}},
+                    }
+                }
+            ],
+        ),
+    ],
+)
+def test_fill_parity(docs, pipeline):
+    docs = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, f"expected Rust $fill to handle {pipeline}"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+
+
 @pytest.mark.parametrize("direction", [1, -1])
 def test_sort_mixed_types(direction):
     docs = bson.decode(bson.encode({"d": SORT_DOCS}))["d"]

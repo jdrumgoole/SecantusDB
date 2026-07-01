@@ -34,6 +34,7 @@ pub mod update;
 // part of the crate's public surface (kept crate-private so their deliberate
 // `Result<_, ()>` "defer" signals stay internal rather than public API).
 mod densify;
+mod fill;
 mod group;
 mod numeric;
 mod order;

@@ -577,6 +577,34 @@ fn bucket_auto_chunks_by_count() {
 }
 
 #[test]
+fn fill_locf_over_sorted_docs() {
+    // $fill locf carries the last observed value forward over the sorted docs.
+    with_wt(|c| {
+        seed(
+            c,
+            "c",
+            vec![
+                doc! {"_id": 1, "t": 1, "v": 10},
+                doc! {"_id": 2, "t": 2},
+                doc! {"_id": 3, "t": 3, "v": 30},
+                doc! {"_id": 4, "t": 4},
+            ],
+        );
+        let r = dispatch(
+            &doc! {"aggregate": "c", "pipeline": [
+                {"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "locf"}}}}
+            ], "cursor": {}},
+            c,
+        );
+        let vs: Vec<i32> = docs_of(&r)
+            .iter()
+            .map(|d| d.get_i32("v").unwrap())
+            .collect();
+        assert_eq!(vs, vec![10, 10, 30, 30], "{r:?}");
+    });
+}
+
+#[test]
 fn union_with_concatenates_collections() {
     // $unionWith appends docs from another collection (bare-name and
     // {coll, pipeline} forms), input docs first.
