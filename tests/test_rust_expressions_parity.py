@@ -315,6 +315,22 @@ CURATED = [
     # $dateToParts (UTC).
     ({"$dateToParts": {"date": "$d"}}, {"d": _DT}),
     ({"$dateToParts": {"date": "$x"}}, {}),  # missing -> null
+    # $dateFromString — parity-safe slice: naive canonical ISO (date-only /
+    # whole-second), no format/timezone. Fractional / Z / offset / format /
+    # timezone / invalid all defer.
+    ({"$dateFromString": {"dateString": "2024-01-15"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00"}}, {}),
+    ({"$dateFromString": {"dateString": "$s"}}, {"s": "2020-02-29T23:59:59"}),  # leap day
+    ({"$dateFromString": {"dateString": None}}, {}),  # null -> null
+    ({"$dateFromString": {"dateString": None, "onNull": "was null"}}, {}),  # -> onNull
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z"}}, {}),  # tz-aware -> defer
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.123456"}}, {}),  # frac -> defer
+    ({"$dateFromString": {"dateString": "2024-13-01"}}, {}),  # bad month -> defer
+    (
+        {"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}},
+        {},
+    ),  # format -> defer
+    ({"$dateFromString": {"dateString": "2024-01-15", "timezone": "America/New_York"}}, {}),  # tz
     # $range.
     ({"$range": [0, 5]}, {}),
     ({"$range": [0, 10, 2]}, {}),

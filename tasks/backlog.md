@@ -1243,13 +1243,18 @@ positional finds use the linear engine and defer fancy-regex capture semantics),
 `$jsonSchema` (bounded: the keyword subset the pure server validates — `bsonType` /
 `type` / `enum` / numeric bounds / string length + `pattern` / array + object counts
 + `items` / `required` / `properties`; other JSON-Schema keywords are ignored exactly
-as the pure impl ignores them, and unreproducible shapes defer). **Remaining:**
+as the pure impl ignores them, and unreproducible shapes defer), `$dateFromString`
+(bounded: strict canonical naive ISO — `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS` — plus
+`null`→`onNull`; `format` / `timezone` / `Z`/offset / fractional seconds /
+non-canonical strings defer). **Remaining:**
 
-- [ ] **Expression operators:** `$dateFromString` (date parsing — tz-aware/naive and
-  format-string parity vs Python is the hazard). Regex `$regexFind` / `$regexFindAll`
-  over a *fancy-regex* pattern (lookaround / backreferences) still defers — the linear
-  engine covers the common patterns; the backtracking engine's capture semantics vs
-  Python `re` are the open parity risk.
+- [ ] **Expression operators:** `$dateFromString` beyond the naive-ISO slice —
+  `format` (strptime), `timezone`, and `Z`/offset designators all produce tz-aware
+  datetimes a naive bson date can't equal (would need a tz-aware bson-decode seam in
+  the parity harness). Regex `$regexFind` / `$regexFindAll` over a *fancy-regex*
+  pattern (lookaround / backreferences) still defers — the linear engine covers the
+  common patterns; the backtracking engine's capture semantics vs Python `re` are the
+  open parity risk.
 - [ ] **Aggregate stages:** `$setWindowFields` range-based windows + time-series window
   operators (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) — the
   bounded port ships the common document-window + rank/accumulator subset and defers

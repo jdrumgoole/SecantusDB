@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.100"
+version = "0.5.3-beta.101"
 dependencies = [
  "bson",
  "fancy-regex",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.100"
+version = "0.5.3-beta.101"
 dependencies = [
  "bson",
  "flate2",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.100"
+version = "0.5.3-beta.101"
 dependencies = [
  "bindgen",
 ]

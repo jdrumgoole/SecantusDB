@@ -249,6 +249,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$pow" => op_pow(arg, ctx),
         "$round" => op_round(arg, ctx),
         "$trunc" => op_trunc(arg, ctx),
+        "$dateFromString" => op_date_from_string(arg, ctx),
         // misc structural / deterministic
         "$dateToParts" => op_date_to_parts(arg, ctx),
         "$range" => op_range(arg, ctx),
@@ -1210,6 +1211,88 @@ fn bounded_datetime(millis: i128) -> R {
     } else {
         Err(Fallback)
     }
+}
+
+/// `$dateFromString` — bounded port of `expressions._op_date_from_string`.
+///
+/// Handles only the parity-safe slice: **no `format`, no `timezone`**, and a
+/// `dateString` in strict canonical naive ISO-8601 — `YYYY-MM-DD` or
+/// `YYYY-MM-DDTHH:MM:SS` (second precision, no fraction). Both forms parse
+/// identically across Python 3.10–3.12's `fromisoformat` and yield a *naive*
+/// whole-second datetime, so the result equals a bson-decoded UTC millis.
+///
+/// Defers (`Fallback` → Python) on everything else: a `format` (strptime) or
+/// `timezone` (both produce tz-aware results a naive bson date can't equal), a
+/// `Z`/offset designator, a space separator, **fractional seconds** (BSON is
+/// millisecond-only but `fromisoformat` keeps microseconds → mismatch), an
+/// out-of-range/invalid field, or a non-string `dateString`. A null
+/// `dateString` returns `onNull` (or null).
+fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
+    let spec = arg.as_document().ok_or(Fallback)?;
+    // format -> strptime; timezone -> tz-aware result. Both defer.
+    if spec.contains_key("format") || spec.contains_key("timezone") {
+        return Err(Fallback);
+    }
+    let raw = match spec.get("dateString") {
+        Some(e) => eval(e, ctx)?,
+        None => Bson::Null,
+    };
+    if matches!(raw, Bson::Null) {
+        return match spec.get("onNull") {
+            Some(e) => eval(e, ctx),
+            None => Ok(Bson::Null),
+        };
+    }
+    let Bson::String(s) = raw else {
+        return Err(Fallback); // Python raises "dateString must be a string"
+    };
+    match parse_iso_naive(&s) {
+        Some(millis) => bounded_datetime(millis),
+        None => Err(Fallback), // non-canonical / invalid -> Python (onError or raise)
+    }
+}
+
+/// Parse strict canonical naive ISO-8601 into epoch milliseconds, or `None` if
+/// the string isn't one of the three accepted fixed-width shapes or holds an
+/// out-of-range field. Fixed-width so it can't drift from `fromisoformat`.
+fn parse_iso_naive(s: &str) -> Option<i128> {
+    let b = s.as_bytes();
+    // Only date-only or whole-second forms (fractional seconds defer — see above).
+    if b.len() != 10 && b.len() != 19 {
+        return None;
+    }
+    let digits = |lo: usize, hi: usize| -> Option<i64> {
+        let part = s.get(lo..hi)?;
+        if part.bytes().all(|c| c.is_ascii_digit()) {
+            part.parse().ok()
+        } else {
+            None
+        }
+    };
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y = digits(0, 4)?;
+    let m = digits(5, 7)?;
+    let d = digits(8, 10)?;
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    let (mut hh, mut mi, mut ss) = (0i64, 0i64, 0i64);
+    if b.len() == 19 {
+        if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+            return None;
+        }
+        hh = digits(11, 13)?;
+        mi = digits(14, 16)?;
+        ss = digits(17, 19)?;
+        if hh > 23 || mi > 59 || ss > 59 {
+            return None;
+        }
+    }
+    let day_ms = days_from_civil(y, m, d) as i128 * 86_400_000;
+    let time_ms = ((hh * 3600 + mi * 60 + ss) * 1000) as i128;
+    Some(day_ms + time_ms)
 }
 
 fn shift_ms(start: i64, amount: i128, unit_ms: i128) -> R {
