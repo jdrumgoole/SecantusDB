@@ -1525,8 +1525,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   first-write-per-savepoint, not a WT-native savepoint); **DDL inside a savepoint is not undone**
   (`CREATE`/`DROP`/`CREATE INDEX` — only DML restores); and recovery after a storage-engine
   `WT_ROLLBACK`-class error (vs an ordinary constraint violation) may leave the WT txn unusable for
-  the restore writes. `DEALLOCATE`/`DISCARD` remain no-ops. Still missing: the `DECLARE CURSOR` …
-  `FETCH` holdable-cursor surface. DDL is transactional via BEGIN/COMMIT/ROLLBACK. Cross-connection
+  the restore writes. `DEALLOCATE`/`DISCARD` remain no-ops. **Server-side cursors landed** (b72):
+  `DECLARE name [WITH HOLD] CURSOR FOR <query>` materializes the query at declaration
+  (`engine._declare_cursor`, stored as a `session._Cursor`); `FETCH` / `MOVE` walk a scroll position
+  (`_cursor_slice` — forward / backward / absolute / relative, so cursors are fully scrollable) and
+  `CLOSE name` / `CLOSE ALL` drop them. `FETCH` accepts `NEXT` / bare-count / `ALL` / `PRIOR` /
+  `FIRST` / `LAST` / `FORWARD [n|ALL]` / `BACKWARD [n|ALL]` / `ABSOLUTE n` / `RELATIVE n`; `MOVE`
+  positions without a result set. `WITHOUT HOLD` cursors close at COMMIT/ROLLBACK, `WITH HOLD`
+  survive. `MOVE` is hand-built in `planner.parse` (sqlglot can't tokenize it); FETCH/DECLARE come
+  through as `exp.Command`, CLOSE as a bare `Alias`. Unknown/closed cursor → `34000`. **Limitations:**
+  the cursor is a materialized snapshot at DECLARE (later same-txn writes aren't visible through it),
+  and it isn't wired into the extended protocol's Portal machinery (it's a SQL-level cursor, like
+  psycopg's named server-side cursors). DDL is transactional via BEGIN/COMMIT/ROLLBACK. Cross-connection
   isolation is the WT engine's job (the test double only models atomicity).
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when

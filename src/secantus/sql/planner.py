@@ -2938,10 +2938,16 @@ def _normalize_params(sql: str) -> str:
 
 
 _RELEASE_SAVEPOINT_RE = re.compile(r"(?i)\brelease\s+savepoint\b")
+# sqlglot's Postgres dialect can't parse ``MOVE`` (cursor positioning) at all, so
+# a lone MOVE statement is hand-built into the same ``Command`` shape FETCH gets.
+_MOVE_RE = re.compile(r"^\s*MOVE\b\s*(?P<tail>.*?)\s*;?\s*$", re.IGNORECASE | re.DOTALL)
 
 
 def parse(sql: str) -> list[exp.Expression]:
     """Parse a (possibly multi-statement) SQL string into AST statements."""
+    move = _MOVE_RE.match(sql)
+    if move is not None:
+        return [exp.Command(this="MOVE", expression=exp.Literal.string(move.group("tail")))]
     # sqlglot parses ``RELEASE x`` but not the equivalent ``RELEASE SAVEPOINT x``
     # (the standard form SQLAlchemy / psycopg emit) — drop the redundant keyword.
     # Savepoint commands are standalone, so this can't touch a string literal.

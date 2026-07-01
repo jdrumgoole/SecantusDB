@@ -964,6 +964,29 @@ def test_savepoints_via_driver(server):
     conn.close()
 
 
+def test_cursors_via_driver(server):
+    # DECLARE / FETCH / MOVE / CLOSE server-side cursor through the real driver.
+    server.storage.insert(
+        "db",
+        "t",
+        [{"_id": bson.Int64(i), "n": bson.Int64(i * 10)} for i in range(1, 6)],
+    )
+    conn = connect(server)
+    conn.autocommit = False
+    cur = conn.cursor()
+    cur.execute("DECLARE c CURSOR FOR SELECT _id, n FROM t ORDER BY _id")
+    cur.execute("FETCH 2 FROM c")
+    assert cur.fetchall() == ([1, 10], [2, 20])
+    cur.execute("MOVE 1 FROM c")  # skip _id=3
+    cur.execute("FETCH NEXT FROM c")
+    assert cur.fetchall() == ([4, 40],)
+    cur.execute("FETCH BACKWARD 2 FROM c")
+    assert cur.fetchall() == ([3, 30], [2, 20])
+    cur.execute("CLOSE c")
+    conn.commit()
+    conn.close()
+
+
 def test_create_index_and_isolation_via_driver(server):
     conn = connect(server)
     cur = conn.cursor()
