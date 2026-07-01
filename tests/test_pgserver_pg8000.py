@@ -571,6 +571,44 @@ def test_correlated_subquery_via_driver(server):
     conn.close()
 
 
+def test_correlated_subquery_in_join_and_group_via_driver(server):
+    # A correlated EXISTS in the WHERE of a JOIN and of a GROUP BY, through the
+    # real driver — the two pipeline paths this slice added.
+    server.storage.insert(
+        "db",
+        "customers",
+        [
+            {"_id": bson.Int64(1), "name": "alice", "region": "e"},
+            {"_id": bson.Int64(2), "name": "bob", "region": "w"},
+            {"_id": bson.Int64(3), "name": "carol", "region": "e"},
+        ],
+    )
+    server.storage.insert(
+        "db",
+        "orders",
+        [
+            {"_id": bson.Int64(10), "cust": bson.Int64(1)},
+            {"_id": bson.Int64(11), "cust": bson.Int64(3)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    # JOIN + correlated EXISTS: keep joined rows whose customer has an order.
+    cur.execute(
+        "SELECT o._id, c.name FROM orders o JOIN customers c ON o.cust = c._id "
+        "WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.cust = c._id) ORDER BY o._id"
+    )
+    assert cur.fetchall() == ([10, "alice"], [11, "carol"])
+    # GROUP BY + correlated EXISTS: count per region, only customers with orders.
+    cur.execute(
+        "SELECT c.region, COUNT(*) AS n FROM customers c "
+        "WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust = c._id) "
+        "GROUP BY c.region ORDER BY c.region"
+    )
+    assert cur.fetchall() == (["e", 2],)
+    conn.close()
+
+
 def test_computed_expressions_via_driver(server):
     # Arithmetic + scalar functions in the SELECT list, over Mongo-written data,
     # through the real driver.

@@ -1293,6 +1293,11 @@ class PipelineSelectPlan:
     pipeline: list[dict[str, Any]]
     out_columns: list[tuple[str, str]]  # (output_name, type_tag)
     derived: list[DerivedTable] = field(default_factory=list)
+    # A WHERE that references the outer row (EXISTS / correlated subquery) can't
+    # lower to a Mongo ``$match``; it's carried here and evaluated per base doc by
+    # the executor *before* the pipeline runs (so a GROUP BY groups the survivors).
+    residual_where: exp.Expression | None = None
+    residual_resolve: Resolve | None = None
 
 
 @dataclass
@@ -1316,6 +1321,9 @@ class EvaluatedSelectPlan:
     limit: int
     skip: int
     derived: list[DerivedTable] = field(default_factory=list)
+    # A correlated / EXISTS WHERE that couldn't lower to a ``$match`` — evaluated
+    # per joined row (via ``resolve`` as the outer scope) after the pipeline.
+    where: exp.Expression | None = None
 
 
 _AGG_CLASSES: dict[type, str] = {
@@ -1714,7 +1722,10 @@ class _NameAllocator:
 
 
 def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
-    base_filter = _where_filter(stmt, table)
+    # A correlated / EXISTS WHERE can't push to a Mongo filter — carry it for
+    # per-base-doc evaluation before the $group (the executor filters, then groups).
+    residual = _residual_where(stmt, table)
+    base_filter = {} if residual is not None else _where_filter(stmt, table)
     group_node = stmt.args.get("group")
     group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
     for c in group_cols:
@@ -1789,7 +1800,24 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
     _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
-    return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
+    return PipelineSelectPlan(
+        table.collection,
+        base_filter,
+        pipeline,
+        out_columns,
+        residual_where=residual,
+        residual_resolve=table_resolver(table) if residual is not None else None,
+    )
+
+
+def _residual_where(stmt: exp.Select, table: TableDef) -> exp.Expression | None:
+    """The WHERE predicate to evaluate per-row (rather than push down) when it
+    references the outer row — an ``EXISTS`` or correlated subquery. ``None`` when
+    the WHERE (if any) lowers cleanly to a Mongo filter."""
+    where = stmt.args.get("where")
+    if where is None or not where_needs_per_row(stmt):
+        return None
+    return where.this
 
 
 def _select_has_window(stmt: exp.Select) -> bool:
@@ -2298,7 +2326,9 @@ def _build_join_pipeline(
 
     resolve = _join_resolver(amap)
     where = stmt.args.get("where")
-    if where is not None:
+    # A correlated / EXISTS WHERE is left for per-row evaluation (see
+    # ``_build_evaluated_join``); only a pushdown-able WHERE becomes a ``$match``.
+    if where is not None and not where_needs_per_row(stmt):
         pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
     return base, amap, resolve, pipeline, derived
 
@@ -2352,7 +2382,7 @@ def _build_outer_join_pipeline(
 
     resolve = _join_resolver(amap)
     where = stmt.args.get("where")
-    if where is not None:
+    if where is not None and not where_needs_per_row(stmt):
         pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
     return base, amap, resolve, pipeline, derived
 
@@ -2377,7 +2407,9 @@ def _plan_join_select(
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
     base, amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
 
-    if _stmt_needs_evaluation(stmt):
+    # A scalar SELECT list / ORDER BY, or a correlated / EXISTS WHERE (which the
+    # pipeline builder deliberately left un-pushed), needs the per-row evaluator.
+    if _stmt_needs_evaluation(stmt) or where_needs_per_row(stmt):
         return _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
 
     project: dict[str, Any] = {"_id": 0}
@@ -2762,6 +2794,10 @@ def _build_evaluated_join(
         for o in order_node.expressions:
             order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
+    # A correlated / EXISTS WHERE wasn't pushed into the pipeline (see
+    # ``_build_join_pipeline``); carry it for per-joined-row evaluation.
+    where_node = stmt.args.get("where")
+    residual = where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
     return EvaluatedSelectPlan(
         base_collection=base.collection,
         base_filter={},
@@ -2774,6 +2810,7 @@ def _build_evaluated_join(
         limit=limit,
         skip=skip,
         derived=derived,
+        where=residual,
     )
 
 

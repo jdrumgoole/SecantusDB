@@ -1346,10 +1346,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   outer table and evaluates the whole WHERE per row via `secantus.sql.scalar` — the inner query
   reads inner-table rows with outer-row references falling through (`scalar._inner_row_scopes` /
   `_eval_exists` / `_eval_in`, aggregate inner projections reduced by `_SUBQUERY_AGG_REDUCERS`).
-  Correlation is single-table-outer only (an outer JOIN/GROUP BY with a correlated WHERE → `0A000`)
-  and the inner query is a simple `SELECT … FROM one_table [WHERE …]`; the per-row scan is
-  `O(outer × inner)` (no index use). Still `0A000`: function calls inside a comparison
-  (`qty = abs(shipped)`) and `<@`-style structural predicates.
+  **Correlated WHERE in the pipeline paths landed** (b70): a JOIN or single-table GROUP BY whose
+  WHERE is correlated / `EXISTS` no longer errors. `planner.where_needs_per_row` now short-circuits
+  the pushdown `$match` in `_build_join_pipeline` and `_plan_group_select`; the WHERE is carried as
+  `EvaluatedSelectPlan.where` (a JOIN — evaluated per joined row *after* the pipeline, outer scope via
+  the join resolver) or `PipelineSelectPlan.residual_where` + `residual_resolve` (a GROUP BY —
+  evaluated per base doc *before* the `$group`, so only survivors group). The inner query is still a
+  simple `SELECT … FROM one_table [WHERE …]`; the per-row scan is `O(outer × inner)` (no index use).
+  Still `0A000`: a correlated WHERE combined with JOIN **and** GROUP BY together (or with a window) in
+  one SELECT, function calls inside a comparison (`qty = abs(shipped)`), and `<@`-style structural
+  predicates.
 - [ ] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
   affected rows back as a result set (`planner._returning_columns` reuses the SELECT projection
   vocabulary `_out_columns`: `*`, columns, aliases, jsonb nav). `execute_insert` pins an `_id` on

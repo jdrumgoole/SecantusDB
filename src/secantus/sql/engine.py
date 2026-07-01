@@ -282,10 +282,10 @@ def _run_select(
     if planner.select_needs_pipeline(stmt):
         backend = virtual.CatalogBackend(storage, catalog, session, db)
         plan = planner.plan_pipeline_select(stmt, db, catalog, storage)
+        sctx = scalar.ScalarContext(storage=backend, catalog=catalog, db=db, session=session)
         if isinstance(plan, planner.EvaluatedSelectPlan):
-            sctx = scalar.ScalarContext(storage=backend, catalog=catalog, db=db, session=session)
             return executor.execute_evaluated_select(plan, backend, db, sctx)
-        return executor.execute_pipeline_select(plan, backend, db)
+        return executor.execute_pipeline_select(plan, backend, db, sctx)
 
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None

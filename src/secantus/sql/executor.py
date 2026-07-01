@@ -417,7 +417,7 @@ def _run_subplan_to_docs(
 
     _materialize_derived(plan, storage, db, sctx)
     if isinstance(plan, planner.PipelineSelectPlan):
-        docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+        docs = _pipeline_input_docs(plan, storage, db, sctx)
         ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
         return apply_pipeline(docs, plan.pipeline, ctx)
     if isinstance(plan, planner.EvaluatedSelectPlan):
@@ -439,6 +439,20 @@ def _evaluated_value_rows(
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
     docs = apply_pipeline(docs, plan.pipeline, ctx)
+    # A correlated / EXISTS WHERE that couldn't push into the pipeline is applied
+    # per joined row here (before windows / projection see the survivors); the
+    # scope resolves outer columns via the join resolver, and the subquery reads
+    # its inner rows through the same storage view.
+    if plan.where is not None:
+
+        def keep(doc: dict[str, Any]) -> bool:
+            def scope(node: Any) -> Any:
+                return get_path(doc, plan.resolve(node)[0])
+
+            r = scalar.evaluate(plan.where, scope, sctx)
+            return bool(r) if r is not None else False
+
+        docs = [d for d in docs if keep(d)]
     # Window functions depend on the whole partition, so they're computed over all
     # rows up front and stored on each doc; the scope resolves an exp.Window node
     # (keyed by id) to that precomputed field.
@@ -527,12 +541,38 @@ def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> lis
     return rows
 
 
-def execute_pipeline_select(plan: planner.PipelineSelectPlan, storage: Any, db: str) -> SQLResult:
+def _pipeline_input_docs(
+    plan: planner.PipelineSelectPlan, storage: Any, db: str, sctx: Any
+) -> list[dict[str, Any]]:
+    """Fetch the pipeline's input docs, applying a correlated / EXISTS residual
+    WHERE per base doc *before* the aggregation runs (so a GROUP BY groups only
+    the survivors). A plan without a residual WHERE just returns the fetch."""
+    from secantus.sql import scalar
+
+    docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+    if plan.residual_where is None:
+        return docs
+    sc = sctx or _scalar_ctx(storage, db, None)
+    resolve = plan.residual_resolve
+
+    def keep(doc: dict[str, Any]) -> bool:
+        def scope(node: Any) -> Any:
+            return get_path(doc, resolve(node)[0])
+
+        r = scalar.evaluate(plan.residual_where, scope, sc)
+        return bool(r) if r is not None else False
+
+    return [d for d in docs if keep(d)]
+
+
+def execute_pipeline_select(
+    plan: planner.PipelineSelectPlan, storage: Any, db: str, sctx: Any = None
+) -> SQLResult:
     """Run a JOIN / GROUP BY / aggregate SELECT through the aggregation engine."""
     from secantus.aggregate import PipelineContext, apply_pipeline
 
-    _materialize_derived(plan, storage, db)
-    docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+    _materialize_derived(plan, storage, db, sctx)
+    docs = _pipeline_input_docs(plan, storage, db, sctx)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
     result = apply_pipeline(docs, plan.pipeline, ctx)
     columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
