@@ -54,3 +54,41 @@ def test_recent_limit_clamps_low(tmp_path) -> None:
     rows = store.recent("mongodb://x", limit=0)
     # ``limit`` is clamped to >= 1; we still get the one entry.
     assert len(rows) == 1
+
+
+def test_credentialed_uri_is_scrubbed_at_rest(tmp_path) -> None:
+    # A credentialed connection string must never land in the on-disk
+    # admin.db in plaintext — the password is stripped to the display
+    # form before it becomes a lookup key (issue #140).
+    import sqlite3
+
+    db_path = tmp_path / "admin.db"
+    store = HistoryStore(db_path)
+    store.record("mongodb://alice:s3cret@host:27017/?authSource=admin", "find", "1")
+
+    raw = db_path.read_bytes()
+    assert b"s3cret" not in raw
+
+    conn = sqlite3.connect(db_path)
+    try:
+        stored = [row[0] for row in conn.execute("SELECT uri FROM recent_queries")]
+    finally:
+        conn.close()
+    assert stored == ["mongodb://alice@host:27017"]
+
+
+def test_scrubbed_key_still_round_trips(tmp_path) -> None:
+    # record() and recent() scrub identically, so a caller passing the
+    # raw credentialed URI to both still finds its own history.
+    store = HistoryStore(tmp_path / "admin.db")
+    uri = "mongodb://bob:pw@host/?retryWrites=true"
+    store.record(uri, "find", "payload-1")
+    rows = store.recent(uri)
+    assert [r.payload for r in rows] == ["payload-1"]
+
+
+def test_uncredentialed_uri_stored_unchanged(tmp_path) -> None:
+    store = HistoryStore(tmp_path / "admin.db")
+    store.record("mongodb://127.0.0.1:27017", "find", "1")
+    rows = store.recent("mongodb://127.0.0.1:27017")
+    assert len(rows) == 1

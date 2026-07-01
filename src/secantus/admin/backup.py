@@ -97,6 +97,29 @@ def _stamp(now: _dt.datetime | None = None) -> str:
     return when.strftime("%Y%m%dT%H%M%SZ")
 
 
+def _redact_password(text: str, uri: str) -> str:
+    """Mask the password from a credentialed URI in captured tool output.
+
+    ``mongodump`` / ``mongorestore`` echo the connection string
+    (including the embedded password) into stderr on a connection
+    failure. That output is captured into ``BackupResult`` and rendered
+    in the admin UI, so a plaintext password could otherwise surface
+    there. The URI must still reach the subprocess in the clear (it's the
+    live credential), but nothing it prints back should carry the secret.
+    """
+    if not text:
+        return text
+    from urllib.parse import urlsplit
+
+    try:
+        password = urlsplit(uri).password
+    except ValueError:
+        password = None
+    if password:
+        text = text.replace(password, "***")
+    return text
+
+
 def run_mongodump(
     *,
     uri: str,
@@ -124,8 +147,8 @@ def run_mongodump(
     return BackupResult(
         ok=proc.returncode == 0,
         path=out_dir,
-        stdout=proc.stdout or "",
-        stderr=proc.stderr or "",
+        stdout=_redact_password(proc.stdout or "", uri),
+        stderr=_redact_password(proc.stderr or "", uri),
         returncode=int(proc.returncode),
     )
 
@@ -161,8 +184,8 @@ def run_mongorestore(
     return BackupResult(
         ok=proc.returncode == 0,
         path=dump_dir,
-        stdout=proc.stdout or "",
-        stderr=proc.stderr or "",
+        stdout=_redact_password(proc.stdout or "", uri),
+        stderr=_redact_password(proc.stderr or "", uri),
         returncode=int(proc.returncode),
     )
 

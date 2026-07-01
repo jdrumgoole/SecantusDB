@@ -792,3 +792,33 @@ def test_timeseries_allows_duplicate_ids(tmp_path) -> None:
         assert list(s.find_matching("ts", "m", {})) == []
     finally:
         s.close()
+
+
+def test_close_logs_teardown_errors_instead_of_swallowing(tmp_path, caplog) -> None:
+    # A failure during the close() teardown (checkpoint, session/conn
+    # close, oplog-meta persist) must be logged, never silently
+    # discarded — a checkpoint error on the final flush is a durability
+    # signal (issue #138). close() still completes idempotently.
+    import logging
+
+    s = Storage(str(tmp_path))
+    s.insert("db", "c", [{"x": 1}])
+
+    def _boom() -> None:
+        raise RuntimeError("simulated checkpoint failure")
+
+    s._persist_oplog_meta = _boom  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.ERROR, logger="secantus.storage.close"):
+        s.close()  # must not raise
+
+    assert s._closed is True
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "secantus.storage.close" and r.levelno >= logging.ERROR
+    ]
+    assert matching, "close() teardown error was swallowed without logging"
+    assert any("simulated checkpoint failure" in (r.exc_text or "") for r in matching) or any(
+        "oplog meta" in r.getMessage() for r in matching
+    )

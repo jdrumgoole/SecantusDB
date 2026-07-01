@@ -128,6 +128,38 @@ sequence and re-mint a used value. The oplog maximum is read with a single
   just-inserted document. The same clamp guards the oplog `next_seq` against
   re-minting a used sequence (which would silently overwrite an oplog row).
 
+### Storage close no longer swallows durability errors; admin history/backup never persist credentials
+
+Two security findings from the nightly review are closed. `Storage.close()`
+used to wrap its final teardown — the last oplog-meta persist, the shutdown
+checkpoint, and every WiredTiger session/connection close — in bare
+`contextlib.suppress(Exception)`, discarding a checkpoint or connection-close
+failure with no trace at all. In a database that is a durability signal, not
+noise: the embedder had no way to know the last on-disk image might be
+incomplete. The teardown now logs every caught failure via
+`log.exception(...)` (matching the TTL-sweep and noop-heartbeat loops) while
+still completing idempotently.
+
+The admin console's query-history store and backup helpers no longer let a
+credentialed connection string reach disk or the UI in plaintext. `HistoryStore`
+scrubs the URI to its password-free `display_uri()` form at the store boundary
+before it becomes a SQLite lookup key, so `~/.secantus/admin.db` can never hold
+a `mongodb://user:pass@host` string (and a caller passing the raw URI can't
+reintroduce the leak). The mongodump/mongorestore helpers still hand the live
+credential to the subprocess — they need it to authenticate — but now redact the
+password from any captured stdout/stderr, closing the path where a tool that
+echoes the connection string on error surfaces the secret in the rendered
+backup result.
+
+#### Fixed
+
+- `Storage.close()` teardown errors (oplog-meta persist, shutdown checkpoint,
+  WT session/connection close) are logged instead of silently suppressed
+  (security issue #138).
+- Admin `HistoryStore` persists the scrubbed `display_uri()` form instead of the
+  raw credentialed `mongo_uri`; mongodump/mongorestore captured output has the
+  password redacted (security issue #140).
+
 ### Atlas Search index commands are rejected with an "Atlas" error
 
 Atlas Search index management — the `createSearchIndexes`, `updateSearchIndex`,
