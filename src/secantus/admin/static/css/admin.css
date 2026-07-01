@@ -217,6 +217,37 @@ body {
   font-size: 0.78rem;
 }
 
+/* Detected server-type pill next to the target badge — tells the user
+ * which backend they're driving (SecantusDB Python/Rust, or MongoDB)
+ * and hence which admin features are available. */
+.server-kind {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.5rem;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.server-kind-python {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.server-kind-rust {
+  border-color: #c9704a;
+  color: #c9704a;
+}
+
+.server-kind-mongodb {
+  border-color: #4a9b57;
+  color: #4a9b57;
+}
+
 .tiles {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
@@ -1053,6 +1084,11 @@ body {
 .flash-err {
   border-color: var(--error);
   color: var(--error);
+}
+
+.flash-warn {
+  border-color: #b7791f;
+  color: #b7791f;
 }
 
 /* Embedded-server widget on the dashboard */

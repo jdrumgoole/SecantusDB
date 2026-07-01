@@ -16,6 +16,7 @@ import asyncio
 import logging
 from typing import Any
 
+from secantus.admin import capabilities
 from secantus.admin.client import MongoError, MongoFacade, display_uri
 from secantus.admin.sampler import Sampler
 
@@ -76,6 +77,14 @@ def swap_target(app: Any, new_uri: str, *, ping: bool = True) -> None:
         app.state.mongo = new_facade
         app.state.mongo_uri = new_uri
         app.state.mongo_uri_display = display_uri(new_uri)
+        # Re-detect what the new target supports so the UI gates its
+        # feature buttons for this server. The ping above already
+        # confirmed reachability; on any probe hiccup fall back to the
+        # permissive UNKNOWN set rather than the old target's caps.
+        try:
+            app.state.capabilities = capabilities.probe(new_facade)
+        except Exception:  # pragma: no cover — defensive
+            app.state.capabilities = capabilities.UNKNOWN
 
         loop = getattr(app.state, "_swap_loop", None)
         if loop is None:

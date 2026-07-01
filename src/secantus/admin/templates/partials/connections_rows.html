@@ -1,4 +1,5 @@
 {% from "partials/_macros.html" import empty_row %}
+{% set caps = request.app.state.capabilities %}
 <tbody
   id="connections-tbody"
   hx-get="/connections/_rows"
@@ -16,6 +17,7 @@
       <td>{% if r.active %}<span class="badge">active</span>{% else %}<span class="muted">idle</span>{% endif %}</td>
       <td><code>{{ r.opened_at }}</code></td>
       <td class="doc-actions">
+        {% if caps.kill_op %}
         <button
           type="button"
           class="btn-danger"
@@ -23,6 +25,10 @@
           hx-target="#modal"
           hx-swap="innerHTML"
         >Kill</button>
+        {% else %}
+        <button type="button" class="btn-danger" disabled
+                title="killOp is not supported by {{ caps.label }}.">Kill</button>
+        {% endif %}
       </td>
     </tr>
   {% else %}
