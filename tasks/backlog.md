@@ -1238,8 +1238,9 @@ the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#
 `$unionWith` (#77), `$fill` (#123), `$toDecimal` + `$convert` (#132),
 `$setWindowFields` (bounded: rank funcs + `$group` accumulators over document-based
 windows; range windows / time-series ops defer), the regex family `$regexMatch` /
-`$regexFind` / `$regexFindAll` (shared `regexutil`: `$regexMatch` uses both engines;
-positional finds use the linear engine and defer fancy-regex capture semantics),
+`$regexFind` / `$regexFindAll` (shared `regexutil`; all three served by both the
+linear and backtracking `fancy-regex` engines — lookaround / backreference finds
+compute, matching Python `re`),
 `$jsonSchema` (bounded: the keyword subset the pure server validates — `bsonType` /
 `type` / `enum` / numeric bounds / string length + `pattern` / array + object counts
 + `items` / `required` / `properties`; other JSON-Schema keywords are ignored exactly
@@ -1250,11 +1251,9 @@ non-canonical strings defer). **Remaining:**
 
 - [ ] **Expression operators:** `$dateFromString` beyond the naive-ISO slice —
   `format` (strptime), `timezone`, and `Z`/offset designators all produce tz-aware
-  datetimes a naive bson date can't equal (would need a tz-aware bson-decode seam in
-  the parity harness). Regex `$regexFind` / `$regexFindAll` over a *fancy-regex*
-  pattern (lookaround / backreferences) still defers — the linear engine covers the
-  common patterns; the backtracking engine's capture semantics vs Python `re` are the
-  open parity risk.
+  datetimes a naive bson date can't equal (blocked: the parity harness round-trips
+  docs through BSON, which has no naive/aware distinction, so naive- and aware-
+  producing operators can't both be checked under one codec — see the harness note).
 - [ ] **Aggregate stages:** `$setWindowFields` range-based windows + time-series window
   operators (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) — the
   bounded port ships the common document-window + rank/accumulator subset and defers
