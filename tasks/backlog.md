@@ -1246,15 +1246,16 @@ compute, matching Python `re`),
 `type` / `enum` / numeric bounds / string length + `pattern` / array + object counts
 + `items` / `required` / `properties`; other JSON-Schema keywords are ignored exactly
 as the pure impl ignores them, and unreproducible shapes defer), `$dateFromString`
-(bounded: strict canonical naive ISO — `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS` — plus
-`null`→`onNull`; `format` / `timezone` / `Z`/offset / fractional seconds /
-non-canonical strings defer). **Remaining:**
+(canonical ISO — `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS`, optional trailing `Z` or
+fixed `±HH:MM` offset → UTC instant — plus `null`→`onNull`; the parity harness now
+compares the *bson-normalised* stored form so tz-aware results compare cleanly.
+`format` / separate `timezone` field / fractional seconds / non-canonical strings
+defer). **Remaining:**
 
-- [ ] **Expression operators:** `$dateFromString` beyond the naive-ISO slice —
-  `format` (strptime), `timezone`, and `Z`/offset designators all produce tz-aware
-  datetimes a naive bson date can't equal (blocked: the parity harness round-trips
-  docs through BSON, which has no naive/aware distinction, so naive- and aware-
-  producing operators can't both be checked under one codec — see the harness note).
+- [ ] **Expression operators:** `$dateFromString` `format` (strptime) and the
+  separate `timezone` field (named IANA zones need a tz database — `chrono-tz` or
+  similar). Fractional seconds stay deferred (BSON is millisecond-only). The
+  `Z` / `±HH:MM` offset tz slice now ships.
 - [ ] **Aggregate stages:** `$setWindowFields` time-series window operators
   (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) and range windows
   with a time `unit` — absent from *both* servers, so each needs a Python oracle
