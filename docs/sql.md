@@ -237,13 +237,21 @@ SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust_i
 SELECT name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id);
 SELECT name FROM customers c
 WHERE c.id = (SELECT max(o.cust_id) FROM orders o WHERE o.region = c.region);
+
+-- A correlated / EXISTS WHERE also works when the outer query JOINs or GROUP BYs:
+SELECT o.id, c.name FROM orders o JOIN customers c ON o.cust_id = c.id
+WHERE EXISTS (SELECT 1 FROM shipments s WHERE s.order_id = o.id);
+SELECT c.region, count(*) FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id) GROUP BY c.region;
 ```
 
-Correlated subqueries are limited to a **single-table** outer SELECT (no outer
-JOIN / GROUP BY), and the inner query is a simple `SELECT … FROM one_table
-[WHERE …]` (no inner join / GROUP BY). The per-row evaluation is a full scan of
-the outer table, so it's `O(outer × inner)` — fine for the ephemeral test data
-SecantusDB targets, not a query planner.
+The correlated WHERE is evaluated per row: in a JOIN it filters the joined rows
+after the join; in a GROUP BY it filters the base rows *before* grouping (so
+only the survivors are grouped). The inner query is a simple `SELECT … FROM
+one_table [WHERE …]` (no inner join / GROUP BY). The per-row evaluation is a full
+scan, so it's `O(outer × inner)` — fine for the ephemeral test data SecantusDB
+targets, not a query planner. Combining a correlated WHERE with a JOIN **and** a
+GROUP BY in one SELECT (or with a window) is not yet supported.
 
 ## Aggregates, GROUP BY, HAVING
 
