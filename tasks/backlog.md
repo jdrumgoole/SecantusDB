@@ -1519,8 +1519,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   executor), GROUP BY / `array_agg` over a derived-table FROM, populated `pg_index`/`pg_constraint`/
   `pg_am`/`pg_opclass`, and a fix so boolean expressions (`conrelid IS NOT NULL`) type as `bool`
   (else the wire text `'f'` reads truthy in `if row["has_constraint"]`). `get_foreign_keys` reflects
-  empty (no FK constraints modeled); column comments reflect as `None`. Remaining: actual FK
-  constraints, column comments, `ALTER TABLE`.
+  empty (no FK constraints modeled); column comments reflect as `None`. **Constraint / sequence
+  `information_schema` views landed** (b75): `information_schema.table_constraints`,
+  `key_column_usage`, and `constraint_column_usage` (built from `virtual._pk_constraints`) surface one
+  row per PRIMARY KEY — the only constraint modeled — so the standard PK reflection join
+  (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit resolves;
+  `referential_constraints` and `sequences` are present-but-empty (no FKs, no sequences). Remaining:
+  actual FK constraints, column comments, `ALTER TABLE`.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)

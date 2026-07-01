@@ -920,6 +920,27 @@ def test_catalog_join_via_driver(server):
     conn.close()
 
 
+def test_information_schema_constraints_via_driver(server):
+    # The information_schema constraint views ORM/migration tooling reflects with.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE items (id bigint primary key, sku text)")
+    cur.execute(
+        "SELECT tc.constraint_type, kcu.column_name "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "ON tc.constraint_name = kcu.constraint_name "
+        "WHERE tc.table_name = 'items'"
+    )
+    assert cur.fetchall() == (["PRIMARY KEY", "id"],)
+    # FK / sequence views resolve (empty) rather than erroring.
+    cur.execute("SELECT count(*) FROM information_schema.referential_constraints")
+    assert cur.fetchall() == ([0],)
+    cur.execute("SELECT count(*) FROM information_schema.sequences")
+    assert cur.fetchall() == ([0],)
+    conn.close()
+
+
 def test_sqlalchemy_get_columns_reflection(server):
     # The headline: SQLAlchemy's inspect().get_columns() runs its full pg_catalog
     # column query (4-table outer join, compound ON, format_type, correlated

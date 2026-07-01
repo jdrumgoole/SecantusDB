@@ -154,6 +154,90 @@ def _info_schemata(db: str, session: Session, storage: Any, catalog: Catalog) ->
     ]
 
 
+def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list[str]]]:
+    """Each table's PRIMARY KEY constraint as ``(table, constraint_name, [cols])``.
+    The PK is the only real constraint in our model (a ``CREATE UNIQUE INDEX`` is
+    an index, not a constraint), so these builders surface PK rows only."""
+    out: list[tuple[TableDef, str, list[str]]] = []
+    for t in _user_tables(db, catalog):
+        pk = t.pk_column
+        if pk is not None:
+            out.append((t, f"{t.name}_pkey", [pk.name]))
+    return out
+
+
+def _info_table_constraints(
+    db: str, session: Session, storage: Any, catalog: Catalog
+) -> list[dict]:
+    return [
+        {
+            "constraint_catalog": db,
+            "constraint_schema": "public",
+            "constraint_name": conname,
+            "table_catalog": db,
+            "table_schema": "public",
+            "table_name": t.name,
+            "constraint_type": "PRIMARY KEY",
+            "is_deferrable": "NO",
+            "initially_deferred": "NO",
+        }
+        for t, conname, _cols in _pk_constraints(db, catalog)
+    ]
+
+
+def _info_key_column_usage(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    rows: list[dict] = []
+    for t, conname, cols in _pk_constraints(db, catalog):
+        for pos, col in enumerate(cols, start=1):
+            rows.append(
+                {
+                    "constraint_catalog": db,
+                    "constraint_schema": "public",
+                    "constraint_name": conname,
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": t.name,
+                    "column_name": col,
+                    "ordinal_position": pos,
+                    "position_in_unique_constraint": None,
+                }
+            )
+    return rows
+
+
+def _info_constraint_column_usage(
+    db: str, session: Session, storage: Any, catalog: Catalog
+) -> list[dict]:
+    rows: list[dict] = []
+    for t, conname, cols in _pk_constraints(db, catalog):
+        for col in cols:
+            rows.append(
+                {
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": t.name,
+                    "column_name": col,
+                    "constraint_catalog": db,
+                    "constraint_schema": "public",
+                    "constraint_name": conname,
+                }
+            )
+    return rows
+
+
+def _info_referential_constraints(
+    db: str, session: Session, storage: Any, catalog: Catalog
+) -> list[dict]:
+    # No foreign-key constraints in our model — present-but-empty so an ORM's FK
+    # reflection join resolves to "no foreign keys" instead of erroring.
+    return []
+
+
+def _info_sequences(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # No sequences / identity columns — present-but-empty for the same reason.
+    return []
+
+
 def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     return [{"oid": oid, "nspname": name} for name, oid in _NS_OIDS.items()]
 
@@ -362,6 +446,86 @@ _register(
     "schemata",
     [("catalog_name", "text"), ("schema_name", "text")],
     _info_schemata,
+)
+_register(
+    "information_schema",
+    "table_constraints",
+    [
+        ("constraint_catalog", "text"),
+        ("constraint_schema", "text"),
+        ("constraint_name", "text"),
+        ("table_catalog", "text"),
+        ("table_schema", "text"),
+        ("table_name", "text"),
+        ("constraint_type", "text"),
+        ("is_deferrable", "text"),
+        ("initially_deferred", "text"),
+    ],
+    _info_table_constraints,
+)
+_register(
+    "information_schema",
+    "key_column_usage",
+    [
+        ("constraint_catalog", "text"),
+        ("constraint_schema", "text"),
+        ("constraint_name", "text"),
+        ("table_catalog", "text"),
+        ("table_schema", "text"),
+        ("table_name", "text"),
+        ("column_name", "text"),
+        ("ordinal_position", "int4"),
+        ("position_in_unique_constraint", "int4"),
+    ],
+    _info_key_column_usage,
+)
+_register(
+    "information_schema",
+    "constraint_column_usage",
+    [
+        ("table_catalog", "text"),
+        ("table_schema", "text"),
+        ("table_name", "text"),
+        ("column_name", "text"),
+        ("constraint_catalog", "text"),
+        ("constraint_schema", "text"),
+        ("constraint_name", "text"),
+    ],
+    _info_constraint_column_usage,
+)
+_register(
+    "information_schema",
+    "referential_constraints",
+    [
+        ("constraint_catalog", "text"),
+        ("constraint_schema", "text"),
+        ("constraint_name", "text"),
+        ("unique_constraint_catalog", "text"),
+        ("unique_constraint_schema", "text"),
+        ("unique_constraint_name", "text"),
+        ("match_option", "text"),
+        ("update_rule", "text"),
+        ("delete_rule", "text"),
+    ],
+    _info_referential_constraints,
+)
+_register(
+    "information_schema",
+    "sequences",
+    [
+        ("sequence_catalog", "text"),
+        ("sequence_schema", "text"),
+        ("sequence_name", "text"),
+        ("data_type", "text"),
+        ("numeric_precision", "int4"),
+        ("numeric_scale", "int4"),
+        ("start_value", "text"),
+        ("minimum_value", "text"),
+        ("maximum_value", "text"),
+        ("increment", "text"),
+        ("cycle_option", "text"),
+    ],
+    _info_sequences,
 )
 _register(
     "pg_catalog",
