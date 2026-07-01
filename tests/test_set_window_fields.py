@@ -6,14 +6,16 @@ First-cut subset that matches the common driver-test surface:
   ``$max`` / ``$first`` / ``$last`` / ``$push`` / ``$addToSet`` /
   ``$count``).
 * Position-based windows via ``window: {documents: [<lower>, <upper>]}``.
+* Value-based windows via ``window: {range: [<lower>, <upper>]}`` over a single
+  ascending numeric sortBy field (bounds ``[cur+lo, cur+hi]``).
 * Bound forms: integer offsets, ``"current"``, ``"unbounded"``.
 * Default window (when not specified) covers the whole partition.
 
-Deferred (raises ``AggregateError`` with a clear message): range-based
-windows (``window: {range: [...]}``), time-series functions
-(``$derivative`` / ``$integral`` / ``$linearFill`` / ``$locf`` /
-``$shift`` / ``$expMovingAvg``), and rank functions (``$rank`` /
-``$denseRank`` / ``$documentNumber``).
+Deferred (raises ``AggregateError`` with a clear message): range windows with a
+time ``unit`` or a non-ascending / multi-field / non-numeric sortBy, time-series
+functions (``$derivative`` / ``$integral`` / ``$linearFill`` / ``$locf`` /
+``$shift`` / ``$expMovingAvg``), and rank functions (``$rank`` / ``$denseRank`` /
+``$documentNumber`` — see ``tests/test_window_rank_functions.py``).
 """
 
 from __future__ import annotations
@@ -327,23 +329,70 @@ def test_unsupported_time_series_function_raises(client) -> None:
         )
 
 
-def test_range_window_not_yet_implemented(client) -> None:
-    """Range-based windows raise rather than silently doing the wrong thing."""
-    coll = client["swf_db"]["range"]
-    coll.insert_one({"_id": 1, "ts": 1, "v": 1})
+def test_range_window_rolling_sum(client) -> None:
+    """Value-based window: include rows whose sortBy value is within
+    ``[cur - 1, cur]``. A gap in the sort values (no t=4) shrinks the window."""
+    coll = client["swf_db"]["range_roll"]
+    coll.insert_many(
+        [
+            {"_id": 1, "t": 1, "v": 10},
+            {"_id": 2, "t": 2, "v": 20},
+            {"_id": 3, "t": 3, "v": 30},
+            {"_id": 4, "t": 5, "v": 50},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    # t=1 -> {t in [0,1]} = 10; t=2 -> {1,2} = 30; t=3 -> {2,3} = 50;
+    # t=5 -> {t in [4,5]} = 50 (t=3 is outside, no t=4).
+    assert [d["s"] for d in out] == [10, 30, 50, 50]
 
+
+def test_range_window_unbounded_to_current_running_total(client) -> None:
+    coll = client["swf_db"]["range_run"]
+    coll.insert_many([{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)])
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "r": {"$sum": "$v", "window": {"range": ["unbounded", "current"]}}
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["r"] for d in out] == [10, 30, 60, 100]
+
+
+def test_range_window_with_time_unit_raises(client) -> None:
+    """A range window with a time ``unit`` is still deferred."""
+    coll = client["swf_db"]["range_unit"]
+    coll.insert_one({"_id": 1, "t": 1, "v": 1})
     with pytest.raises(OperationFailure):
         list(
             coll.aggregate(
                 [
                     {
                         "$setWindowFields": {
-                            "sortBy": {"ts": 1},
+                            "sortBy": {"t": 1},
                             "output": {
-                                "x": {
-                                    "$sum": "$v",
-                                    "window": {"range": [-1, 1]},
-                                }
+                                "x": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "day"}}
                             },
                         }
                     }

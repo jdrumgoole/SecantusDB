@@ -407,6 +407,62 @@ def test_fill_parity(docs, pipeline):
                 }
             ],
         ),
+        # Range windows: value-based bounds over a single ascending numeric sort.
+        # Rolling [-1, 0] with a gap (no t=4), running [unbounded, current],
+        # forward [current, unbounded], and a symmetric [-1, 1].
+        (
+            [
+                {"_id": 1, "t": 1, "v": 10},
+                {"_id": 2, "t": 2, "v": 20},
+                {"_id": 3, "t": 3, "v": 30},
+                {"_id": 4, "t": 5, "v": 50},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                    }
+                }
+            ],
+        ),
+        (
+            [{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "r": {"$sum": "$v", "window": {"range": ["unbounded", "current"]}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "f": {"$sum": "$v", "window": {"range": ["current", "unbounded"]}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [{"_id": 1, "t": 10, "v": 1}, {"_id": 2, "t": 11, "v": 2}, {"_id": 3, "t": 13, "v": 4}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"a": {"$avg": "$v", "window": {"range": [-1, 1]}}},
+                    }
+                }
+            ],
+        ),
     ],
 )
 def test_set_window_fields_parity(docs, pipeline):
@@ -418,18 +474,33 @@ def test_set_window_fields_parity(docs, pipeline):
     assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
 
 
-def test_set_window_fields_range_window_defers():
-    # range-based windows are not ported (mongod-valid but unimplemented) → the
-    # Rust stage defers rather than guessing.
-    docs = bson.decode(bson.encode({"d": [{"_id": 1, "t": 1, "v": 1}]}))["d"]
-    pipeline = [
-        {
-            "$setWindowFields": {
-                "sortBy": {"t": 1},
-                "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        # Range window with a time unit — not ported (Python raises).
+        [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"t": 1},
+                    "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "day"}}},
+                }
             }
-        }
-    ]
+        ],
+        # Descending sort — range windows only support a single ascending field.
+        [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"t": -1},
+                    "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                }
+            }
+        ],
+    ],
+)
+def test_set_window_fields_range_unsupported_defers(pipeline):
+    # These range shapes are mongod-valid but not ported → the Rust stage defers.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "t": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
     assert _rust_pipeline(docs, pipeline) is None
 
 

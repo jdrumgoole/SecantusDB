@@ -1236,8 +1236,9 @@ Rust core defers (so they error on the Rust server). None are *correctness* bugs
 the actionable gauge tail is closed; these are feature completeness. **Shipped since
 the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#76),
 `$unionWith` (#77), `$fill` (#123), `$toDecimal` + `$convert` (#132),
-`$setWindowFields` (bounded: rank funcs + `$group` accumulators over document-based
-windows; range windows / time-series ops defer), the regex family `$regexMatch` /
+`$setWindowFields` (rank funcs + `$group` accumulators over document-based **and
+value-based `range`** windows — both servers, single ascending numeric sortBy;
+time-series window ops still defer), the regex family `$regexMatch` /
 `$regexFind` / `$regexFindAll` (shared `regexutil`; all three served by both the
 linear and backtracking `fancy-regex` engines — lookaround / backreference finds
 compute, matching Python `re`),
@@ -1254,10 +1255,11 @@ non-canonical strings defer). **Remaining:**
   datetimes a naive bson date can't equal (blocked: the parity harness round-trips
   docs through BSON, which has no naive/aware distinction, so naive- and aware-
   producing operators can't both be checked under one codec — see the harness note).
-- [ ] **Aggregate stages:** `$setWindowFields` range-based windows + time-series window
-  operators (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) — the
-  bounded port ships the common document-window + rank/accumulator subset and defers
-  these to Python.
+- [ ] **Aggregate stages:** `$setWindowFields` time-series window operators
+  (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) and range windows
+  with a time `unit` — absent from *both* servers, so each needs a Python oracle
+  first, then the Rust port (document + value-`range` windows and rank/accumulators
+  already ship on both).
 - [ ] **Query operator:** `$jsonSchema` extended keywords the pure server doesn't yet
   validate either (`additionalProperties` / `patternProperties` / `allOf` / `anyOf` /
   `oneOf` / `not` / `dependencies` / ...) — would need porting on **both** servers.
