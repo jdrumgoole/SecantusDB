@@ -645,6 +645,28 @@ rows (not the skipped ones). `ON CONFLICT ON CONSTRAINT <name>` is not supported
 (SecantusDB has no named-constraint registry — name the column(s) instead), and
 `DO UPDATE` requires an explicit conflict target.
 
+### MERGE
+
+`MERGE` is the SQL-standard multi-action upsert. For each source row it finds the
+target rows the `ON` condition matches, then applies the **first** `WHEN` clause
+of the right kind whose optional `AND` condition holds — `UPDATE` / `DELETE` /
+`DO NOTHING` for a match, `INSERT` / `DO NOTHING` for a non-match:
+
+```sql
+MERGE INTO accounts a USING deltas d ON a.id = d.id
+WHEN MATCHED AND d.amount = 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET balance = a.balance + d.amount
+WHEN NOT MATCHED THEN INSERT (id, balance) VALUES (d.id, d.amount);
+```
+
+The source is a table, a reflected collection, or a `(SELECT …) alias`. In `ON`
+and the `WHEN` conditions, target and source columns resolve by their alias
+(`a.id` / `d.id`); an `UPDATE`'s right-hand sides and an `INSERT`'s `VALUES` may
+reference either side. The command tag counts every row inserted, updated, or
+deleted (`MERGE n`). Matching is evaluated against the target snapshot at the
+statement's start and each target row is affected at most once; `MERGE … WHEN
+NOT MATCHED BY SOURCE` and a `RETURNING` clause are not yet supported.
+
 ## Indexes
 
 `CREATE INDEX` (optionally `UNIQUE`) maps to a real Mongo secondary index on the

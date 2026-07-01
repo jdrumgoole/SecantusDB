@@ -233,6 +233,34 @@ def test_insert_select_via_driver(server):
     conn.close()
 
 
+def test_merge_via_driver(server):
+    # MERGE upsert (matched UPDATE + not-matched INSERT + conditional DELETE)
+    # over Mongo-written data, through the real driver.
+    server.storage.insert(
+        "db",
+        "tgt",
+        [{"_id": bson.Int64(i), "amt": bson.Int64(a)} for i, a in [(1, 10), (2, 20), (3, 30)]],
+    )
+    server.storage.insert(
+        "db",
+        "src",
+        [{"_id": bson.Int64(i), "amt": bson.Int64(a)} for i, a in [(1, 0), (2, 200), (5, 50)]],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "MERGE INTO tgt t USING src s ON t._id = s._id "
+        "WHEN MATCHED AND s.amt = 0 THEN DELETE "
+        "WHEN MATCHED THEN UPDATE SET amt = t.amt + s.amt "
+        "WHEN NOT MATCHED THEN INSERT (_id, amt) VALUES (s._id, s.amt)"
+    )
+    assert cur.rowcount == 3  # 1 deleted, 1 updated, 1 inserted
+    cur.execute("SELECT _id, amt FROM tgt ORDER BY _id")
+    # id1 deleted, id2 = 20+200, id3 untouched, id5 inserted.
+    assert cur.fetchall() == ([2, 220], [3, 30], [5, 50])
+    conn.close()
+
+
 def test_with_insert_via_driver(server):
     # WITH ... INSERT ... SELECT FROM cte over the real driver.
     server.storage.insert(
