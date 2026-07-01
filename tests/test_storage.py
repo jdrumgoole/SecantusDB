@@ -216,6 +216,51 @@ def test_sort_cross_type_order(storage: Storage) -> None:
     assert pos[7] < pos[3]  # ObjectId < bool
 
 
+def test_reopen_clamps_seq_counters_past_stale_meta(tmp_path) -> None:
+    """A stale persisted meta row must never lower the recovered counters.
+
+    ``_emit_oplog`` deliberately stops re-persisting the oplog-meta row on
+    every write (it WT-rollbacks under concurrent writers). The row is only
+    refreshed by ``current_cluster_time`` (every ``hello``), ``prune_oplog``,
+    and ``close`` — so a checkpoint taken by ``backupArchive`` between two
+    refreshes captures a ``next_seq`` / ``next_nat_seq`` that lags the actual
+    oplog / natural-order tables. If recovery *trusts* that stale value it
+    re-mints an already-used seq: a duplicate oplog seq, or a natural-order
+    seq collision that overwrites a live doc's nat entry and corrupts
+    capped-collection FIFO eviction after restore. Recovery must clamp each
+    counter UP to what the tables contain.
+    """
+    s1 = Storage(str(tmp_path))
+    try:
+        s1.insert("db", "c", [{"_id": i} for i in range(6)])
+        real_nat = s1._next_nat_seq
+        real_seq = s1._next_seq
+        assert real_nat > 1  # the inserts minted nat seqs
+        # Simulate a hello/current_cluster_time that ran *before* the inserts:
+        # it would have persisted these low counters, and the insert path
+        # never refreshed them. Force that exact on-disk state, checkpoint,
+        # and leave the in-memory counters stale so close() re-persists them.
+        s1._next_nat_seq = 1
+        s1._next_seq = 1
+        s1._persist_oplog_meta()
+        s1.checkpoint()
+    finally:
+        s1.close()
+
+    s2 = Storage(str(tmp_path))
+    try:
+        # The stale meta (next_*=1) must be overridden by the table scans.
+        assert s2._next_nat_seq >= real_nat
+        assert s2._next_seq >= real_seq
+        # A fresh insert mints a nat seq strictly above every existing one,
+        # so the natural-order index stays collision-free.
+        before = s2._next_nat_seq
+        s2.insert("db", "c", [{"_id": 99}])
+        assert s2._next_nat_seq == before + 1
+    finally:
+        s2.close()
+
+
 def test_storage_persists_across_reopen(tmp_path) -> None:
     """Close the WT connection and reopen at the same path; data survives.
 

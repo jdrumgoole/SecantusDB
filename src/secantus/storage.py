@@ -991,14 +991,33 @@ class Storage:
             blob = bytes(c.get_value())
             if blob:
                 state = bson.decode(blob)
-                nat = state.get("next_nat_seq")
-                if nat is None:
-                    nat = self._scan_max_nat_seq() + 1
-                return (
+                # The persisted counters are a *hint*, not the source of
+                # truth: ``_emit_oplog`` no longer re-persists the meta row
+                # on every write (it WT-rollbacks under concurrent writers —
+                # see ``_emit_oplog``), so the on-disk ``next_seq`` /
+                # ``next_nat_seq`` lag behind the actual tables whenever a
+                # checkpoint (e.g. ``backupArchive``) lands between the last
+                # meta persist and the next one. Trusting a stale value would
+                # re-mint an already-used seq: a duplicate oplog seq (lost
+                # change events) or — for the natural-order index — a seq
+                # collision that overwrites a live doc's nat entry and
+                # corrupts capped-collection FIFO eviction after restore.
+                # So clamp each counter UP to what the tables actually
+                # contain; the hint only ever saves a scan, never lowers us.
+                next_seq = max(
                     int(state.get("next_seq", 1)),
+                    self._scan_max_oplog_seq() + 1,
+                )
+                nat = state.get("next_nat_seq")
+                next_nat = max(
+                    self._scan_max_nat_seq() + 1,
+                    1 if nat is None else int(nat),
+                )
+                return (
+                    next_seq,
                     int(state.get("last_ts_secs", 0)),
                     int(state.get("last_ts_ord", 0)),
-                    int(nat),
+                    next_nat,
                 )
         # Fallback: scan oplog table for max key + reconstruct from entry.
         c2 = self._cursor(_OPLOG_TABLE)
@@ -1019,6 +1038,19 @@ class Storage:
                         last_secs, last_ord = ts.time, ts.inc
             rc = c2.next()
         return last_seq + 1, last_secs, last_ord, self._scan_max_nat_seq() + 1
+
+    def _scan_max_oplog_seq(self) -> int:
+        """Largest ``seq`` present in ``_OPLOG_TABLE`` (0 if empty).
+
+        Cheap: the oplog table is keyed on the bare ``seq`` (``key_format=q``),
+        so a single ``prev()`` from the end yields the global maximum. Used to
+        clamp the recovered ``next_seq`` up past any stale persisted hint so a
+        reopen can never re-mint an already-used oplog seq.
+        """
+        c = self._cursor(_OPLOG_TABLE)
+        if c.prev() == 0:
+            return int(c.get_key())
+        return 0
 
     def _scan_max_nat_seq(self) -> int:
         """Largest insertion ``seq`` present in ``_NAT_TABLE`` (0 if empty).
