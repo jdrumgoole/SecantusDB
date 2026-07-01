@@ -1239,8 +1239,11 @@ the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#
 `$setWindowFields` (bounded: rank funcs + `$group` accumulators over document-based
 windows; range windows / time-series ops defer), the regex family `$regexMatch` /
 `$regexFind` / `$regexFindAll` (shared `regexutil`: `$regexMatch` uses both engines;
-positional finds use the linear engine and defer fancy-regex capture semantics).
-**Remaining:**
+positional finds use the linear engine and defer fancy-regex capture semantics),
+`$jsonSchema` (bounded: the keyword subset the pure server validates — `bsonType` /
+`type` / `enum` / numeric bounds / string length + `pattern` / array + object counts
++ `items` / `required` / `properties`; other JSON-Schema keywords are ignored exactly
+as the pure impl ignores them, and unreproducible shapes defer). **Remaining:**
 
 - [ ] **Expression operators:** `$dateFromString` (date parsing — tz-aware/naive and
   format-string parity vs Python is the hazard). Regex `$regexFind` / `$regexFindAll`
@@ -1251,7 +1254,9 @@ positional finds use the linear engine and defer fancy-regex capture semantics).
   operators (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) — the
   bounded port ships the common document-window + rank/accumulator subset and defers
   these to Python.
-- [ ] **Query operator:** `$jsonSchema` (document-level; complex JSON-Schema subset).
+- [ ] **Query operator:** `$jsonSchema` extended keywords the pure server doesn't yet
+  validate either (`additionalProperties` / `patternProperties` / `allOf` / `anyOf` /
+  `oneOf` / `not` / `dependencies` / ...) — would need porting on **both** servers.
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 

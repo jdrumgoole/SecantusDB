@@ -6,8 +6,11 @@
 //! which the Python shim turns into "run the pure-Python matcher instead". That
 //! keeps the port strictly correct: the operators handled here match the Python
 //! implementation exactly (pinned by `tests/test_rust_query_parity.py`), and
-//! everything else (`$jsonSchema`, geo, structural/compound equality, exotic
-//! BSON types) defers to Python. `$expr` is handled via the Rust expression
+//! everything else (geo, structural/compound equality, exotic BSON types) defers
+//! to Python. `$jsonSchema` is handled for the bounded keyword subset the pure
+//! server validates (`bsonType`/`type`/`enum`/numeric bounds/string length +
+//! `pattern`/array + object counts + `items`/`required`/`properties`), deferring
+//! any shape it can't reproduce. `$expr` is handled via the Rust expression
 //! evaluator; `$all` via its Python-`==`. A `collation` is threaded through
 //! string comparisons and handled for the ASCII-safe cases (see
 //! `crate::collation`), deferring non-ASCII / `numericOrdering` to Python.
@@ -98,7 +101,8 @@ fn match_clause(
             let value = expressions::evaluate(doc, cond, vars).map_err(|_| Fallback)?;
             Ok(expressions::truthy(&value))
         }
-        // $jsonSchema, $where, $text, ... -> Python.
+        "$jsonSchema" => validate_json_schema(&Bson::Document(doc.clone()), cond),
+        // $where, $text, ... -> Python.
         _ if key.starts_with('$') => Err(Fallback),
         _ => field_matches(&resolve_path(doc, key), cond, coll),
     }
@@ -640,6 +644,206 @@ pub fn bson_type_name(v: &Bson) -> &'static str {
         Bson::Binary(_) => "binData",
         Bson::Array(_) => "array",
         _ => "object",
+    }
+}
+
+/// `$jsonSchema` document-level validation — mirrors
+/// `secantus.query._validate_json_schema`, a bounded JSON-Schema subset: exactly
+/// the keywords in the pure impl's if-ladder (`bsonType` / `type` / `enum` /
+/// numeric bounds / string length + `pattern` / array items + counts / object
+/// `required` / `properties` / counts). Other keywords are ignored, matching the
+/// Python server. Any schema shape whose result we can't reproduce faithfully — a
+/// non-numeric bound, a non-int count, an uncompilable `pattern`, a non-string
+/// `type`, a malformed `enum` / `required` / `properties`, or an `enum` /
+/// bound comparison that defers — returns `Fallback` (Python runs instead).
+fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
+    let Bson::Document(sch) = schema else {
+        return Ok(false); // Python: `not isinstance(schema, Mapping)` -> False
+    };
+    // bsonType (BSON type alias/code, or a list of them).
+    if let Some(bt) = sch.get("bsonType") {
+        let ok = match bt {
+            Bson::Array(types) => types.iter().any(|t| matches_type(value, t)),
+            single => matches_type(value, single),
+        };
+        if !ok {
+            return Ok(false);
+        }
+    }
+    // type (JSON type name, or a list of them).
+    if let Some(jt) = sch.get("type") {
+        let types: Vec<&Bson> = match jt {
+            Bson::Array(a) => a.iter().collect(),
+            single => vec![single],
+        };
+        let mut ok = false;
+        for t in types {
+            let Bson::String(name) = t else {
+                return Err(Fallback); // non-string json type -> defer
+            };
+            if matches_json_type(value, name) {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            return Ok(false);
+        }
+    }
+    // enum — membership via Python `==`.
+    if let Some(en) = sch.get("enum") {
+        let Bson::Array(items) = en else {
+            return Err(Fallback); // `value not in <non-list>` -> defer
+        };
+        let mut found = false;
+        for e in items {
+            if expressions::py_eq(value, e).map_err(|_| Fallback)? {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+    }
+    // Numeric bounds — only for int/double values (Python: `int/float and not
+    // bool`; Decimal128 is excluded there too).
+    if matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
+        for (kw, reject) in [
+            ("minimum", &[Ordering::Less][..]),
+            ("maximum", &[Ordering::Greater][..]),
+            ("exclusiveMinimum", &[Ordering::Less, Ordering::Equal][..]),
+            (
+                "exclusiveMaximum",
+                &[Ordering::Greater, Ordering::Equal][..],
+            ),
+        ] {
+            if let Some(bound) = sch.get(kw) {
+                if reject.contains(&numeric_order(value, bound)?) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    // String constraints.
+    if let Bson::String(s) = value {
+        let len = s.chars().count() as i64; // code-point length, like Python `len`
+        if let Some(min) = sch.get("minLength") {
+            if len < as_schema_int(min)? {
+                return Ok(false);
+            }
+        }
+        if let Some(max) = sch.get("maxLength") {
+            if len > as_schema_int(max)? {
+                return Ok(false);
+            }
+        }
+        if let Some(pat) = sch.get("pattern") {
+            let re = regexutil::compile(pat, None).map_err(|_| Fallback)?;
+            if !re.is_match(s) {
+                return Ok(false);
+            }
+        }
+    }
+    // Array constraints.
+    if let Bson::Array(arr) = value {
+        let len = arr.len() as i64;
+        if let Some(min) = sch.get("minItems") {
+            if len < as_schema_int(min)? {
+                return Ok(false);
+            }
+        }
+        if let Some(max) = sch.get("maxItems") {
+            if len > as_schema_int(max)? {
+                return Ok(false);
+            }
+        }
+        if let Some(items) = sch.get("items") {
+            for item in arr {
+                if !validate_json_schema(item, items)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    // Object constraints.
+    if let Bson::Document(obj) = value {
+        if let Some(req) = sch.get("required") {
+            let Bson::Array(keys) = req else {
+                return Err(Fallback);
+            };
+            for k in keys {
+                let Bson::String(name) = k else {
+                    return Err(Fallback);
+                };
+                if !obj.contains_key(name) {
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(props) = sch.get("properties") {
+            let Bson::Document(pd) = props else {
+                return Err(Fallback);
+            };
+            for (prop, prop_schema) in pd {
+                if let Some(pv) = obj.get(prop) {
+                    if !validate_json_schema(pv, prop_schema)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        let n = obj.len() as i64;
+        if let Some(min) = sch.get("minProperties") {
+            if n < as_schema_int(min)? {
+                return Ok(false);
+            }
+        }
+        if let Some(max) = sch.get("maxProperties") {
+            if n > as_schema_int(max)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// JSON-Schema `type` predicate — mirrors `query._matches_json_type`.
+fn matches_json_type(value: &Bson, name: &str) -> bool {
+    match name {
+        "string" => matches!(value, Bson::String(_)),
+        "number" => matches!(
+            value,
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+        ),
+        "integer" => matches!(value, Bson::Int32(_) | Bson::Int64(_)),
+        "boolean" => matches!(value, Bson::Boolean(_)),
+        "null" => matches!(value, Bson::Null),
+        "array" => matches!(value, Bson::Array(_)),
+        "object" => matches!(value, Bson::Document(_)),
+        _ => false,
+    }
+}
+
+/// Order a numeric value against a schema bound; the bound must itself be numeric
+/// (Python `int/float < non-number` raises -> defer), and an uncomparable pair
+/// (`py_order` -> `None`) also defers.
+fn numeric_order(value: &Bson, bound: &Bson) -> Result<Ordering, Fallback> {
+    if !matches!(bound, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
+        return Err(Fallback);
+    }
+    expressions::py_order(value, bound)
+        .map_err(|_| Fallback)?
+        .ok_or(Fallback)
+}
+
+/// A schema keyword that must be an integer count (`minLength` / `maxItems` /
+/// ...); a non-int makes the Python `len < schema[...]` comparison raise -> defer.
+fn as_schema_int(b: &Bson) -> Result<i64, Fallback> {
+    match b {
+        Bson::Int32(n) => Ok(*n as i64),
+        Bson::Int64(n) => Ok(*n),
+        _ => Err(Fallback),
     }
 }
 
