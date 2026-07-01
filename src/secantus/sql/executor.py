@@ -577,25 +577,40 @@ def _evaluated_value_rows(
 
         return scope
 
-    scored: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
+    scored: list[tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]] = []
     for doc in docs:
         scope = make_scope(doc)
         keys = tuple(scalar.evaluate(oe, scope, sctx) for oe, _, _ in plan.order)
+        # DISTINCT ON key (row-level, evaluated before any SRF expansion).
+        don_key = (
+            tuple(repr(scalar.evaluate(e, scope, sctx)) for e in plan.distinct_on)
+            if plan.distinct_on
+            else ()
+        )
         for vt in _expand_srf(plan, scope, sctx):
-            scored.append((keys, vt))
+            scored.append((keys, don_key, vt))
 
     _pg_sort(scored, lambda r: r[0], [(direction, nf) for _, direction, nf in plan.order])
 
-    rows = [vt for _, vt in scored]
-    if plan.distinct:
-        seen: set = set()
-        deduped: list[tuple[Any, ...]] = []
-        for row in rows:
-            key = tuple(repr(v) for v in row)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(row)
-        rows = deduped
+    if plan.distinct_on:
+        # Keep the first row (in the sorted order above) per DISTINCT ON key.
+        seen_on: set = set()
+        rows = []
+        for _keys, don_key, vt in scored:
+            if don_key not in seen_on:
+                seen_on.add(don_key)
+                rows.append(vt)
+    else:
+        rows = [vt for _, _, vt in scored]
+        if plan.distinct:
+            seen: set = set()
+            deduped: list[tuple[Any, ...]] = []
+            for row in rows:
+                key = tuple(repr(v) for v in row)
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(row)
+            rows = deduped
     if plan.skip:
         rows = rows[plan.skip :]
     if plan.limit:

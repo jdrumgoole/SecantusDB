@@ -1219,6 +1219,48 @@ def test_alter_table_via_driver(server):
     conn.close()
 
 
+def test_distinct_on_via_driver(server):
+    # DISTINCT ON keeps the first row per key in ORDER BY order, through the driver.
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(i), "region": r, "amount": bson.Int64(a)}
+            for i, (r, a) in enumerate([("e", 10), ("e", 30), ("w", 20), ("w", 50)], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT ON (region) region, amount FROM sales ORDER BY region, amount DESC"
+    )
+    assert cur.fetchall() == (["e", 30], ["w", 50])
+    conn.close()
+
+
+def test_lateral_join_via_driver(server):
+    # A correlated LATERAL subquery (top-1 per outer row) through the real driver.
+    server.storage.insert(
+        "db", "t", [{"_id": bson.Int64(i), "name": n} for i, n in [(1, "a"), (2, "b")]]
+    )
+    server.storage.insert(
+        "db",
+        "u",
+        [
+            {"_id": bson.Int64(i), "tid": bson.Int64(tid), "val": bson.Int64(v)}
+            for i, (tid, v) in enumerate([(1, 10), (1, 40), (2, 30), (2, 5)], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT t.name, s.val FROM t CROSS JOIN LATERAL "
+        "(SELECT val FROM u WHERE u.tid = t._id ORDER BY val DESC LIMIT 1) s ORDER BY t.name"
+    )
+    assert cur.fetchall() == (["a", 40], ["b", 30])
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

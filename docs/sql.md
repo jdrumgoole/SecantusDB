@@ -411,6 +411,54 @@ SELECT DISTINCT region, status FROM orders;
 SELECT DISTINCT c.name FROM orders o JOIN customers c ON o.cust_id = c.id;
 ```
 
+`DISTINCT ON (exprs)` keeps the first row per distinct value of `exprs`, in the
+query's `ORDER BY` order — the idiomatic "one row per group" (e.g. the newest
+order per customer). The `ORDER BY` should lead with the `DISTINCT ON`
+expressions so the surviving row is well-defined:
+
+```sql
+-- highest-amount sale per region
+SELECT DISTINCT ON (region) region, amount
+FROM sales ORDER BY region, amount DESC;
+
+-- across a join
+SELECT DISTINCT ON (c.name) c.name, o.total
+FROM orders o JOIN customers c ON o.cust_id = c.id
+ORDER BY c.name, o.total DESC;
+```
+
+## LATERAL joins
+
+A `LATERAL` subquery may reference columns from the FROM items to its left, so
+it runs once per outer row — the standard way to expand related rows or take a
+top-N per group. Correlate inside the subquery's `WHERE`:
+
+```sql
+-- expand each customer into its orders
+SELECT c.name, o.total
+FROM customers c, LATERAL (SELECT total FROM orders WHERE orders.cust_id = c.id) o;
+
+-- top-3 orders per customer
+SELECT c.name, o.total
+FROM customers c
+CROSS JOIN LATERAL (
+    SELECT total FROM orders WHERE orders.cust_id = c.id ORDER BY total DESC LIMIT 3
+) o
+ORDER BY c.name, o.total DESC;
+
+-- LEFT JOIN LATERAL keeps customers with no orders (lateral columns read NULL)
+SELECT c.name, o.total
+FROM customers c
+LEFT JOIN LATERAL (
+    SELECT total FROM orders WHERE orders.cust_id = c.id ORDER BY total DESC LIMIT 1
+) o ON true;
+```
+
+The subquery is single-table with an optional `WHERE` / `ORDER BY` / `LIMIT`; it
+lowers to a correlated `$lookup`. `JOIN LATERAL … ON <cond>` must use `ON true`
+(the correlation lives in the subquery's `WHERE`); a `LATERAL` subquery
+containing a join, `GROUP BY`, or aggregate is not supported.
+
 ## Set operations
 
 `UNION`, `INTERSECT`, and `EXCEPT` combine the rows of two (or more, chained)
@@ -993,10 +1041,10 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` | `WITH RECURSIVE` on a write body |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
-| Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
+| Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
-| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain |
+| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY`, declared not enforced), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER COLUMN … TYPE`, multi-action `ALTER`, `ALTER TABLE … ADD FOREIGN KEY`, enforced constraints, views |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |

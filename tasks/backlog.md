@@ -1559,6 +1559,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   — this is a schema-shape record only. **Limitations:** adding a FK via `ALTER TABLE … ADD FOREIGN
   KEY` isn't wired (ALTER only does column ops); FK actions never fire; `MATCH`/`DEFERRABLE` render as
   the defaults.
+- [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
+  per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
+  path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
+  before this it was silently mistreated as plain full-row DISTINCT. **`LATERAL`** (comma / `CROSS JOIN
+  LATERAL` / `JOIN LATERAL … ON true` / `LEFT JOIN LATERAL … ON true`) lowers a single-table correlated
+  subquery to a `$lookup` (`let` outer bindings + sub-`pipeline` with a `$match {$expr}` correlation via
+  the existing `_OnTranslator`, optional `$sort`/`$limit` for top-N, `$project`) + `$unwind`
+  (`planner._lateral_stage`, dispatched in `_build_join_pipeline`'s join loop). **Limitations:** the
+  `LATERAL` subquery must be single-table (no join / GROUP BY / aggregate / scalar-fn subquery →
+  `feature_not_supported`); `JOIN LATERAL` with a non-`TRUE` ON is rejected (correlate in the subquery
+  WHERE); `DISTINCT ON` doesn't enforce Postgres' "ORDER BY must start with the DISTINCT ON exprs" rule
+  (lenient — keeps whatever the sort order gives).
 - [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
