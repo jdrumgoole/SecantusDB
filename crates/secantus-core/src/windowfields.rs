@@ -5,8 +5,9 @@
 //! Supported: `partitionBy` (an expression, or absent → one partition), an
 //! optional `sortBy`, and an `output` map of `{field: {<accumulator>: arg,
 //! window?: {...}}}`. The three rank functions (`$rank` / `$denseRank` /
-//! `$documentNumber`) plus every `$group` accumulator the shared `group` module
-//! knows (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`/`$addToSet`/
+//! `$documentNumber`), the position-based `$shift` (`{output, by, default?}`),
+//! plus every `$group` accumulator the shared `group` module knows
+//! (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`/`$addToSet`/
 //! `$count`) evaluate over document-based windows (`documents: [lo, hi]`, with
 //! `"unbounded"` / `"current"` / integer bounds; a missing/empty window → the
 //! whole partition, matching mongod's default) and value-based windows
@@ -14,8 +15,9 @@
 //! is in `[cur+lo, cur+hi]`, with `"unbounded"` / `"current"` / numeric bounds).
 //!
 //! Defers (`Err(())` → Python) on: range windows with a time `unit` or a
-//! non-ascending / multi-field / non-numeric sortBy, time-series operators
-//! (`$shift` / `$integral` / `$derivative` / ...), any unsupported accumulator,
+//! non-ascending / multi-field / non-numeric sortBy, the remaining time-series
+//! operators (`$integral` / `$derivative` / `$expMovingAvg` / ...), any
+//! unsupported accumulator,
 //! a non-document/empty `output`, an unsortable `sortBy` value, and a
 //! `partitionBy` expression the evaluator can't reproduce. Output preserves the
 //! *original* input order (only per-partition ordering drives the windows).
@@ -94,6 +96,16 @@ pub fn set_window_fields_stage(
             if (op == "$rank" || op == "$denseRank") && sort_by.is_none() {
                 return Err(());
             }
+        } else if op == "$shift" {
+            // Position-based (like the rank funcs): requires a sortBy, no window,
+            // and an `{output, by: <int>, default?}` spec.
+            let spec = arg.as_document().ok_or(())?;
+            if window.is_some() || sort_by.is_none() || !spec.contains_key("output") {
+                return Err(());
+            }
+            if !matches!(spec.get("by"), Some(Bson::Int32(_)) | Some(Bson::Int64(_))) {
+                return Err(());
+            }
         } else {
             group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
         }
@@ -156,6 +168,8 @@ pub fn set_window_fields_stage(
                         "$rank" => r.rank[pos],
                         _ => r.dense[pos], // "$denseRank"
                     })
+                } else if c.op == "$shift" {
+                    shift_value(c.arg.as_document().ok_or(())?, pos, &slots, &docs, vars)?
                 } else {
                     let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
                         range_window_bounds(pos, n, c.window.unwrap(), range_vals.as_deref())?
@@ -288,6 +302,32 @@ fn window_bounds(slot: usize, n: usize, window: Option<&Document>) -> R<(i64, i6
     let low = resolve(&bounds[0], true)?.max(0);
     let high = resolve(&bounds[1], false)?.min(last);
     Ok((low, high))
+}
+
+/// `$shift` — the `output` expression evaluated on the row `by` positions away in
+/// the sorted partition, or `default` (a constant, evaluated on the current row)
+/// / `null` when that position is out of the partition. Mirrors `_shift_value`.
+fn shift_value(
+    spec: &Document,
+    pos: usize,
+    slots: &[usize],
+    docs: &[Document],
+    vars: &Document,
+) -> R<Bson> {
+    let by = match spec.get("by") {
+        Some(Bson::Int32(n)) => *n as i64,
+        Some(Bson::Int64(n)) => *n,
+        _ => return Err(()),
+    };
+    let output = spec.get("output").ok_or(())?;
+    let idx = pos as i64 + by;
+    if idx >= 0 && (idx as usize) < slots.len() {
+        expressions::evaluate(&docs[slots[idx as usize]], output, vars).map_err(|_| ())
+    } else if let Some(default) = spec.get("default") {
+        expressions::evaluate(&docs[slots[pos]], default, vars).map_err(|_| ())
+    } else {
+        Ok(Bson::Null)
+    }
 }
 
 /// A numeric BSON value as `f64` (int / long / double, never bool / Decimal128 —

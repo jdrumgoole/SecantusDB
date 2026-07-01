@@ -19,6 +19,26 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$setWindowFields` gains the `$shift` window operator
+
+`$setWindowFields` now supports `$shift` — the first of MongoDB's time-series
+window operators. `$shift` reaches across the sorted partition to read a value
+from a neighbouring row: `{$shift: {output: <expr>, by: <n>, default: <expr>}}`
+evaluates `output` on the row `n` positions away (negative looks back, positive
+looks ahead), falling to `default` (or `null`) when that position is past the
+partition edge. It's the idiomatic way to compute a delta from the previous row,
+peek at the next value, or lag/lead a series — without a self-join. Shifts never
+cross a partition boundary.
+
+The same semantics ship in both the Python and Rust servers, pinned by the
+aggregation parity suite. The remaining time-series operators (`$derivative`,
+`$integral`, `$expMovingAvg`, …) still raise a clear error.
+
+#### Added
+
+- `$setWindowFields` `$shift` window operator (`{output, by, default?}`) —
+  position-based, per-partition, requires a `sortBy`.
+
 ### `$setWindowFields` learns value-based (range) windows
 
 The `$setWindowFields` aggregation stage now supports value-based windows —

@@ -307,10 +307,62 @@ def test_partition_sort_changes_running_total_order(client) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_shift_prev_next_with_default(client) -> None:
+    """`$shift` reads the `output` expression from the row `by` positions away in
+    the sorted partition, falling to `default` / null past the edge."""
+    coll = client["swf_db"]["shift"]
+    coll.insert_many([{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)])  # v: 10,20,30,40
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "prev": {"$shift": {"output": "$v", "by": -1, "default": 0}},
+                            "next": {"$shift": {"output": "$v", "by": 1}},
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["prev"] for d in out] == [0, 10, 20, 30]
+    assert [d["next"] for d in out] == [20, 30, 40, None]
+
+
+def test_shift_partitioned(client) -> None:
+    """`$shift` is per-partition — it never reads across a partition boundary."""
+    coll = client["swf_db"]["shift_part"]
+    coll.insert_many(
+        [
+            {"_id": 1, "g": "a", "t": 1, "v": 1},
+            {"_id": 2, "g": "a", "t": 2, "v": 2},
+            {"_id": 3, "g": "b", "t": 1, "v": 9},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"nxt": {"$shift": {"output": "$v", "by": 1, "default": -1}}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    # a: [1->2, 2->default], b: single row -> default.
+    assert [d["nxt"] for d in out] == [2, -1, -1]
+
+
 def test_unsupported_time_series_function_raises(client) -> None:
-    """Time-series functions are still deferred — raise so the gap is
-    visible. (Rank functions shipped separately — see
-    ``tests/test_window_rank_functions.py`` for their semantics.)"""
+    """The remaining time-series functions ($derivative / $integral /
+    $expMovingAvg / ...) are still deferred — raise so the gap is visible."""
     coll = client["swf_db"]["timeseries"]
     coll.insert_one({"_id": 1, "v": 1, "ts": 1})
 

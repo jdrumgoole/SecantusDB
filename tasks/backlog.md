@@ -1236,9 +1236,10 @@ Rust core defers (so they error on the Rust server). None are *correctness* bugs
 the actionable gauge tail is closed; these are feature completeness. **Shipped since
 the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#76),
 `$unionWith` (#77), `$fill` (#123), `$toDecimal` + `$convert` (#132),
-`$setWindowFields` (rank funcs + `$group` accumulators over document-based **and
-value-based `range`** windows — both servers, single ascending numeric sortBy;
-time-series window ops still defer), the regex family `$regexMatch` /
+`$setWindowFields` (rank funcs + `$shift` + `$group` accumulators over
+document-based **and value-based `range`** windows — both servers, single
+ascending numeric sortBy; remaining time-series ops still defer), the regex
+family `$regexMatch` /
 `$regexFind` / `$regexFindAll` (shared `regexutil`; all three served by both the
 linear and backtracking `fancy-regex` engines — lookaround / backreference finds
 compute, matching Python `re`),
@@ -1256,11 +1257,11 @@ defer). **Remaining:**
   separate `timezone` field (named IANA zones need a tz database — `chrono-tz` or
   similar). Fractional seconds stay deferred (BSON is millisecond-only). The
   `Z` / `±HH:MM` offset tz slice now ships.
-- [ ] **Aggregate stages:** `$setWindowFields` time-series window operators
-  (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) and range windows
-  with a time `unit` — absent from *both* servers, so each needs a Python oracle
-  first, then the Rust port (document + value-`range` windows and rank/accumulators
-  already ship on both).
+- [ ] **Aggregate stages:** the remaining `$setWindowFields` time-series window
+  operators (`$integral` / `$derivative` / `$expMovingAvg` / `$linearFill` /
+  `$locf` / ...) and range windows with a time `unit` — absent from *both* servers,
+  so each needs a Python oracle first, then the Rust port. (`$shift`, document +
+  value-`range` windows, and rank/accumulators already ship on both.)
 - [ ] **Query operator:** `$jsonSchema` extended keywords the pure server doesn't yet
   validate either (`additionalProperties` / `patternProperties` / `allOf` / `anyOf` /
   `oneOf` / `not` / `dependencies` / ...) — would need porting on **both** servers.
