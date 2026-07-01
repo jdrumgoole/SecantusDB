@@ -247,11 +247,13 @@ WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id) GROUP BY c.region;
 
 The correlated WHERE is evaluated per row: in a JOIN it filters the joined rows
 after the join; in a GROUP BY it filters the base rows *before* grouping (so
-only the survivors are grouped). The inner query is a simple `SELECT … FROM
+only the survivors are grouped). When a query has **both** a JOIN and a GROUP BY,
+the WHERE filters the joined rows after the join and before the `$group` — again,
+only the survivors are grouped. The inner query is a simple `SELECT … FROM
 one_table [WHERE …]` (no inner join / GROUP BY). The per-row evaluation is a full
 scan, so it's `O(outer × inner)` — fine for the ephemeral test data SecantusDB
-targets, not a query planner. Combining a correlated WHERE with a JOIN **and** a
-GROUP BY in one SELECT (or with a window) is not yet supported.
+targets, not a query planner. Combining a correlated WHERE with a JOIN, a
+GROUP BY, **and** a window function all in one SELECT is not yet supported.
 
 ## Aggregates, GROUP BY, HAVING
 

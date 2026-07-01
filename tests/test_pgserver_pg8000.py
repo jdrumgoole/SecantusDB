@@ -665,6 +665,43 @@ def test_correlated_subquery_in_join_and_group_via_driver(server):
     conn.close()
 
 
+def test_correlated_where_in_join_and_group_via_driver(server):
+    # A correlated EXISTS in the WHERE of a query that BOTH joins AND groups,
+    # through the real driver — only shipped orders are grouped per region.
+    server.storage.insert(
+        "db",
+        "orders",
+        [
+            {"_id": bson.Int64(i), "cust": bson.Int64(c), "amt": bson.Int64(a)}
+            for i, (c, a) in enumerate([(1, 10), (1, 20), (2, 30), (2, 5)], 1)
+        ],
+    )
+    server.storage.insert(
+        "db",
+        "customers",
+        [{"_id": bson.Int64(i), "region": r} for i, r in [(1, "e"), (2, "w")]],
+    )
+    server.storage.insert(
+        "db",
+        "shipments",
+        [
+            {"_id": bson.Int64(1), "oid": bson.Int64(1)},
+            {"_id": bson.Int64(2), "oid": bson.Int64(3)},
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT c.region, SUM(o.amt) AS s, COUNT(*) AS n "
+        "FROM orders o JOIN customers c ON o.cust = c._id "
+        "WHERE EXISTS (SELECT 1 FROM shipments sh WHERE sh.oid = o._id) "
+        "GROUP BY c.region ORDER BY c.region"
+    )
+    # Only order 1 (region e, 10) and order 3 (region w, 30) have shipments.
+    assert cur.fetchall() == (["e", 10, 1], ["w", 30, 1])
+    conn.close()
+
+
 def test_computed_expressions_via_driver(server):
     # Arithmetic + scalar functions in the SELECT list, over Mongo-written data,
     # through the real driver.

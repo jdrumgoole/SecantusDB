@@ -1360,9 +1360,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   the join resolver) or `PipelineSelectPlan.residual_where` + `residual_resolve` (a GROUP BY —
   evaluated per base doc *before* the `$group`, so only survivors group). The inner query is still a
   simple `SELECT … FROM one_table [WHERE …]`; the per-row scan is `O(outer × inner)` (no index use).
-  Still `0A000`: a correlated WHERE combined with JOIN **and** GROUP BY together (or with a window) in
-  one SELECT, function calls inside a comparison (`qty = abs(shipped)`), and `<@`-style structural
-  predicates.
+  **Correlated WHERE + JOIN + GROUP BY landed** (b76, also a correctness fix — b70 silently *dropped*
+  the WHERE for this shape): `PipelineSelectPlan.residual_split` records how many leading pipeline
+  stages (the join prefix) run before the Python filter, so `_plan_join_group_select` runs the
+  `$lookup`/`$unwind`, filters the joined rows by the correlated WHERE (outer scope via the join
+  resolver), then runs the `$group` over the survivors (`executor._pipeline_input_docs` applies the
+  split). Still `0A000`: a correlated WHERE combined with JOIN, GROUP BY, **and** a window function all
+  in one SELECT (`_plan_join_group_window_select` raises rather than silently dropping the WHERE),
+  function calls inside a comparison (`qty = abs(shipped)`), and `<@`-style structural predicates.
 - [ ] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
   affected rows back as a result set (`planner._returning_columns` reuses the SELECT projection
   vocabulary `_out_columns`: `*`, columns, aliases, jsonb nav). `execute_insert` pins an `_id` on

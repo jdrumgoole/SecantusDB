@@ -417,9 +417,9 @@ def _run_subplan_to_docs(
 
     _materialize_derived(plan, storage, db, sctx)
     if isinstance(plan, planner.PipelineSelectPlan):
-        docs = _pipeline_input_docs(plan, storage, db, sctx)
+        docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)
         ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
-        return apply_pipeline(docs, plan.pipeline, ctx)
+        return apply_pipeline(docs, remaining, ctx)
     if isinstance(plan, planner.EvaluatedSelectPlan):
         rows = _evaluated_value_rows(plan, storage, db, _scalar_ctx(storage, db, sctx))
         names = [n for n, _ in plan.out_columns]
@@ -543,15 +543,23 @@ def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> lis
 
 def _pipeline_input_docs(
     plan: planner.PipelineSelectPlan, storage: Any, db: str, sctx: Any
-) -> list[dict[str, Any]]:
-    """Fetch the pipeline's input docs, applying a correlated / EXISTS residual
-    WHERE per base doc *before* the aggregation runs (so a GROUP BY groups only
-    the survivors). A plan without a residual WHERE just returns the fetch."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch the docs to feed the aggregation and return ``(docs, remaining_stages)``.
+
+    A correlated / EXISTS residual WHERE can't lower to a ``$match``, so it's
+    applied in Python: the leading ``residual_split`` stages (a JOIN prefix, or
+    none for a single-table GROUP BY) run first, the rows are filtered, and the
+    remaining stages (the ``$group`` etc.) run over the survivors."""
+    from secantus.aggregate import PipelineContext, apply_pipeline
     from secantus.sql import scalar
 
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
     if plan.residual_where is None:
-        return docs
+        return docs, plan.pipeline
+    if plan.residual_split:
+        ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
+        docs = apply_pipeline(docs, plan.pipeline[: plan.residual_split], ctx)
+    remaining = plan.pipeline[plan.residual_split :]
     sc = sctx or _scalar_ctx(storage, db, None)
     resolve = plan.residual_resolve
 
@@ -562,7 +570,7 @@ def _pipeline_input_docs(
         r = scalar.evaluate(plan.residual_where, scope, sc)
         return bool(r) if r is not None else False
 
-    return [d for d in docs if keep(d)]
+    return [d for d in docs if keep(d)], remaining
 
 
 def execute_pipeline_select(
@@ -572,9 +580,9 @@ def execute_pipeline_select(
     from secantus.aggregate import PipelineContext, apply_pipeline
 
     _materialize_derived(plan, storage, db, sctx)
-    docs = _pipeline_input_docs(plan, storage, db, sctx)
+    docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
-    result = apply_pipeline(docs, plan.pipeline, ctx)
+    result = apply_pipeline(docs, remaining, ctx)
     columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
     rows = [
         tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result
