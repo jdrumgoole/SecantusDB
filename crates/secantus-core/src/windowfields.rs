@@ -9,9 +9,12 @@
 //! knows (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`/`$addToSet`/
 //! `$count`) evaluate over document-based windows (`documents: [lo, hi]`, with
 //! `"unbounded"` / `"current"` / integer bounds; a missing/empty window → the
-//! whole partition, matching mongod's default).
+//! whole partition, matching mongod's default) and value-based windows
+//! (`range: [lo, hi]` over a single ascending numeric sortBy — rows whose value
+//! is in `[cur+lo, cur+hi]`, with `"unbounded"` / `"current"` / numeric bounds).
 //!
-//! Defers (`Err(())` → Python) on: `range`-based windows, time-series operators
+//! Defers (`Err(())` → Python) on: range windows with a time `unit` or a
+//! non-ascending / multi-field / non-numeric sortBy, time-series operators
 //! (`$shift` / `$integral` / `$derivative` / ...), any unsupported accumulator,
 //! a non-document/empty `output`, an unsortable `sortBy` value, and a
 //! `partitionBy` expression the evaluator can't reproduce. Output preserves the
@@ -103,6 +106,9 @@ pub fn set_window_fields_stage(
     }
 
     let needs_rank = compiled.iter().any(|c| RANK_FUNCS.contains(&c.op));
+    let needs_range = compiled
+        .iter()
+        .any(|c| c.window.is_some_and(|w| w.contains_key("range")));
 
     // Partition, preserving partition-discovery order; each partition holds the
     // *original* indices of its members (in input order).
@@ -133,6 +139,14 @@ pub fn set_window_fields_stage(
         } else {
             None
         };
+        // Range windows resolve bounds against the single ascending numeric
+        // sortBy value; `None` (multi-field / descending / non-numeric) makes a
+        // range window defer.
+        let range_vals = if needs_range {
+            range_values(&slots, &docs, sort_by)
+        } else {
+            None
+        };
         for (pos, &orig_i) in slots.iter().enumerate() {
             for c in &compiled {
                 let value = if RANK_FUNCS.contains(&c.op) {
@@ -143,7 +157,11 @@ pub fn set_window_fields_stage(
                         _ => r.dense[pos], // "$denseRank"
                     })
                 } else {
-                    let (low, high) = window_bounds(pos, n, c.window)?;
+                    let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
+                        range_window_bounds(pos, n, c.window.unwrap(), range_vals.as_deref())?
+                    } else {
+                        window_bounds(pos, n, c.window)?
+                    };
                     let mut acc = group::new_acc(c.op)?;
                     if high >= low {
                         for &s in &slots[low as usize..=high as usize] {
@@ -245,20 +263,16 @@ fn compute_ranks(slots: &[usize], docs: &[Document], sort_by: Option<&Document>)
     }
 }
 
-/// Inclusive `(low, high)` window indices into the sorted partition for the row
-/// at `slot`. Missing/empty `window` or one without `documents` → the whole
-/// partition (`range` present → defer). Bounds: `"unbounded"` → partition edge,
-/// `"current"` → `slot`, integer `b` → `slot + b`; anything else (incl. bool) →
-/// defer. `high < low` signals an empty window (caller uses the empty value).
+/// Inclusive `(low, high)` document-window indices into the sorted partition for
+/// the row at `slot`. Missing/empty `window` or one without `documents` → the
+/// whole partition. Bounds: `"unbounded"` → partition edge, `"current"` →
+/// `slot`, integer `b` → `slot + b`; anything else (incl. bool) → defer.
+/// `high < low` signals an empty window (caller uses the empty value). Range
+/// windows are routed to [`range_window_bounds`] before this is reached.
 fn window_bounds(slot: usize, n: usize, window: Option<&Document>) -> R<(i64, i64)> {
     let last = n as i64 - 1;
     let bounds = match window.and_then(|w| w.get("documents")) {
-        None => {
-            if window.is_some_and(|w| w.contains_key("range")) {
-                return Err(()); // range-based windows defer to Python
-            }
-            return Ok((0, last));
-        }
+        None => return Ok((0, last)),
         Some(Bson::Array(b)) if b.len() == 2 => b,
         Some(_) => return Err(()),
     };
@@ -273,5 +287,78 @@ fn window_bounds(slot: usize, n: usize, window: Option<&Document>) -> R<(i64, i6
     };
     let low = resolve(&bounds[0], true)?.max(0);
     let high = resolve(&bounds[1], false)?.min(last);
+    Ok((low, high))
+}
+
+/// A numeric BSON value as `f64` (int / long / double, never bool / Decimal128 —
+/// matching the pure `_is_number`). `None` otherwise.
+fn as_number(v: &Bson) -> Option<f64> {
+    match v {
+        Bson::Int32(n) => Some(*n as f64),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Double(d) => Some(*d),
+        _ => None,
+    }
+}
+
+/// The per-slot sortBy values for a range window: `Some` only for a single
+/// **ascending** sort field whose values are all numeric (the shape range
+/// windows support); anything else → `None`, which makes a range window defer.
+fn range_values(
+    slots: &[usize],
+    docs: &[Document],
+    sort_by: Option<&Document>,
+) -> Option<Vec<f64>> {
+    let sb = sort_by?;
+    if sb.len() != 1 {
+        return None;
+    }
+    let (field, dir) = sb.iter().next().unwrap();
+    if !matches!(dir, Bson::Int32(1) | Bson::Int64(1)) {
+        return None; // ascending only
+    }
+    slots
+        .iter()
+        .map(|&i| as_number(&field_value(&docs[i], field)))
+        .collect()
+}
+
+/// Inclusive `(low, high)` value-window indices: rows whose (ascending) sortBy
+/// value falls in `[cur + lo, cur + hi]`. Bounds: `"unbounded"` → open,
+/// `"current"` → `cur`, numeric offset → `cur + b`. A time `unit`, a missing
+/// single-ascending-numeric sort (`range_vals` is `None`), or a non-numeric
+/// bound → defer.
+fn range_window_bounds(
+    slot: usize,
+    n: usize,
+    window: &Document,
+    range_vals: Option<&[f64]>,
+) -> R<(i64, i64)> {
+    if window.contains_key("unit") {
+        return Err(()); // time-unit ranges defer to Python
+    }
+    let vals = range_vals.ok_or(())?;
+    let bounds = match window.get("range") {
+        Some(Bson::Array(b)) if b.len() == 2 => b,
+        _ => return Err(()),
+    };
+    let cur = vals[slot];
+    let edge = |b: &Bson| -> R<Option<f64>> {
+        match b {
+            Bson::String(s) if s == "unbounded" => Ok(None),
+            Bson::String(s) if s == "current" => Ok(Some(cur)),
+            _ => as_number(b).map(|x| Some(cur + x)).ok_or(()),
+        }
+    };
+    let lo = edge(&bounds[0])?;
+    let hi = edge(&bounds[1])?;
+    let mut low = 0i64;
+    while (low as usize) < n && lo.is_some_and(|l| vals[low as usize] < l) {
+        low += 1;
+    }
+    let mut high = n as i64 - 1;
+    while high >= 0 && hi.is_some_and(|h| vals[high as usize] > h) {
+        high -= 1;
+    }
     Ok((low, high))
 }

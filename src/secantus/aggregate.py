@@ -1850,13 +1850,22 @@ def _stage_set_window_fields(
         # Precompute per-partition rank vectors only when a rank function
         # is referenced. One linear walk covers all three.
         rank_state = _compute_rank_state(partition_docs, sort_by, compiled)
+        # Range-based windows resolve their bounds against the sortBy *value*, so
+        # they need the per-slot values of a single ascending sort field. Anything
+        # else (multi-field / descending / no sortBy) leaves this None, and a range
+        # window then raises in ``_range_window_bounds``.
+        range_vals = None
+        if sort_by and len(sort_by) == 1:
+            sort_field, sort_dir = next(iter(sort_by.items()))
+            if sort_dir == 1:
+                range_vals = [get_path(doc, sort_field) for doc in partition_docs]
         for slot, (orig_i, _) in enumerate(members):
             target = out_docs[orig_i]
             for field, op, arg, window in compiled:
                 if op in _RANK_FUNCS:
                     target[field] = rank_state[op][slot]
                     continue
-                low, high = _window_bounds(slot, n, window)
+                low, high = _resolve_window(slot, n, window, range_vals)
                 if high < low:
                     target[field] = _empty_window_value(op)
                     continue
@@ -1932,16 +1941,85 @@ def _sort_key_values(doc: Mapping[str, Any], sort_by: Mapping[str, Any]) -> tupl
     return tuple(get_path(dict(doc), field, default=None) for field in sort_by)
 
 
+def _resolve_window(
+    slot: int,
+    n: int,
+    window: Mapping[str, Any] | None,
+    range_vals: list[Any] | None,
+) -> tuple[int, int]:
+    """Dispatch a window spec to the document-based or range-based resolver."""
+    if window is not None and "range" in window:
+        return _range_window_bounds(slot, n, window, range_vals)
+    return _window_bounds(slot, n, window)
+
+
+def _range_window_bounds(
+    slot: int,
+    n: int,
+    window: Mapping[str, Any],
+    range_vals: list[Any] | None,
+) -> tuple[int, int]:
+    """Resolve a ``range``-based window: include rows whose sortBy value falls in
+    ``[cur + lower, cur + upper]`` (``cur`` = this row's value). Bounds may be
+    ``"unbounded"`` (open), ``"current"`` (this row's value), or a number offset.
+
+    Supported only for a single ascending numeric sortBy field (``range_vals``);
+    a time ``unit``, a missing/descending/multi-field sort, or a non-numeric value
+    raises (mongod-valid shapes we don't yet reproduce).
+    """
+    if "unit" in window:
+        raise AggregateError(
+            "$setWindowFields range windows with a time 'unit' are not yet implemented"
+        )
+    if range_vals is None:
+        raise AggregateError(
+            "$setWindowFields range windows require a single ascending sortBy field"
+        )
+    bounds = window["range"]
+    if not isinstance(bounds, list) or len(bounds) != 2:
+        raise AggregateError("$setWindowFields window.range must be a [lower, upper] pair")
+    cur = range_vals[slot]
+    if not _is_number(cur):
+        raise AggregateError("$setWindowFields range windows require numeric sortBy values")
+
+    def edge(b: Any) -> Any:
+        if b == "unbounded":
+            return None
+        if b == "current":
+            return cur
+        if not _is_number(b):
+            raise AggregateError(
+                f"$setWindowFields window.range bound {b!r} must be a number "
+                "or 'unbounded' / 'current'"
+            )
+        return cur + b
+
+    lo, hi = edge(bounds[0]), edge(bounds[1])
+    # range_vals is ascending; walk in from both ends. A non-numeric value in the
+    # partition makes the comparison ill-defined -> raise (mongod rejects it too).
+    if any(not _is_number(v) for v in range_vals):
+        raise AggregateError("$setWindowFields range windows require numeric sortBy values")
+    low = 0
+    while low < n and lo is not None and range_vals[low] < lo:
+        low += 1
+    high = n - 1
+    while high >= 0 and hi is not None and range_vals[high] > hi:
+        high -= 1
+    return low, high
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def _window_bounds(slot: int, n: int, window: Mapping[str, Any] | None) -> tuple[int, int]:
-    """Resolve a window spec for a given row position.
+    """Resolve a document-based window spec for a given row position.
 
     Returns inclusive ``(lower, upper)`` indices into the partition.
     ``window=None`` or missing ``documents`` → the whole partition
     (matches mongod's default window).
     """
     if window is None or "documents" not in window:
-        if window is not None and "range" in window:
-            raise AggregateError("$setWindowFields range-based windows are not yet implemented")
         return 0, n - 1
     bounds = window["documents"]
     if not isinstance(bounds, list) or len(bounds) != 2:

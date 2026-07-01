@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$setWindowFields` learns value-based (range) windows
+
+The `$setWindowFields` aggregation stage now supports value-based windows —
+`window: {range: [lower, upper]}` — alongside the position-based `documents`
+windows it already had. Where a `documents` window counts rows relative to the
+current one, a `range` window is defined by the sortBy *value*: it includes every
+row whose value falls in `[current + lower, current + upper]`. That's the natural
+way to express "sum everything within 10 units of this point" or a gap-aware
+running total, and it's what analytics pipelines reach for. Bounds may be a
+number, `"current"` (this row's value), or `"unbounded"`.
+
+The window resolves against a single ascending numeric sortBy field; a range
+window with a time `unit`, or over a descending / multi-field / non-numeric sort,
+still raises a clear error rather than guessing. The same semantics ship in both
+the Python and Rust servers, pinned together by the aggregation parity suite.
+
+#### Added
+
+- `$setWindowFields` value-based windows (`window: {range: [lo, hi]}`) over a
+  single ascending numeric `sortBy`, with `"unbounded"` / `"current"` / numeric
+  bounds. Time-unit ranges and non-ascending / multi-field / non-numeric sorts
+  remain deferred with a clear `AggregateError`.
+
 ### Smaller on-disk footprint: WiredTiger log pre-allocation disabled
 
 Each on-disk SecantusDB instance used to reserve ~30 MB of WiredTiger log
