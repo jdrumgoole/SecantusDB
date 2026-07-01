@@ -1294,10 +1294,14 @@ class PipelineSelectPlan:
     out_columns: list[tuple[str, str]]  # (output_name, type_tag)
     derived: list[DerivedTable] = field(default_factory=list)
     # A WHERE that references the outer row (EXISTS / correlated subquery) can't
-    # lower to a Mongo ``$match``; it's carried here and evaluated per base doc by
-    # the executor *before* the pipeline runs (so a GROUP BY groups the survivors).
+    # lower to a Mongo ``$match``; it's carried here and evaluated in Python by the
+    # executor. ``residual_split`` is how many leading pipeline stages run *before*
+    # the filter — 0 for a single-table GROUP BY (filter the base docs, then group),
+    # or the join-prefix length for a JOIN + GROUP BY (join, filter the joined rows,
+    # then group), so the survivors are what gets grouped.
     residual_where: exp.Expression | None = None
     residual_resolve: Resolve | None = None
+    residual_split: int = 0
 
 
 @dataclass
@@ -2492,6 +2496,12 @@ def _plan_join_group_select(
     prefix, then a $group whose keys and accumulators resolve through the join
     resolver (so ``a.region`` / ``SUM(b.amt)`` map to the post-unwind paths)."""
     base, _amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
+    # A correlated / EXISTS WHERE wasn't pushed into a ``$match`` (see
+    # ``_build_join_pipeline``); it's filtered per joined row after the join prefix
+    # and before the ``$group`` below. ``residual_split`` marks that boundary.
+    where_node = stmt.args.get("where")
+    residual = where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
+    residual_split = len(pipeline)
 
     group_node = stmt.args.get("group")
     group_keys: dict[str, str] = {}  # _id key name -> resolved "$path"
@@ -2571,7 +2581,16 @@ def _plan_join_group_select(
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
     _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
-    return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
+    return PipelineSelectPlan(
+        base.collection,
+        {},
+        pipeline,
+        out_columns,
+        derived=derived,
+        residual_where=residual,
+        residual_resolve=resolve if residual is not None else None,
+        residual_split=residual_split,
+    )
 
 
 def _plan_join_group_window_select(
@@ -2581,6 +2600,13 @@ def _plan_join_group_window_select(
     ``_plan_group_window_select``. The $lookup/$unwind/$match/$group/$project
     pipeline produces the grouped rows (aggregates resolved through the join
     resolver), then the evaluated executor runs the windows over them."""
+    if where_needs_per_row(stmt):
+        # A correlated / EXISTS WHERE would need per-joined-row filtering before the
+        # $group, which the window phase (post-group) can't express here.
+        raise errors.feature_not_supported(
+            "a correlated / EXISTS WHERE combined with JOIN, GROUP BY, and a window "
+            "function in one SELECT is not supported"
+        )
     stmt = stmt.copy()  # we mutate the tree, replacing aggregates with columns
     base, _amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
 
