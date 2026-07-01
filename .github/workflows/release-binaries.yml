@@ -62,7 +62,7 @@ jobs:
             runner: macos-14
             os: macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           # The vendored WiredTiger lives in a submodule — without it the wheel
           # build (and thus the static lib) can't be produced.
@@ -100,12 +100,12 @@ jobs:
         run: brew install swig ninja
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -164,7 +164,7 @@ jobs:
       # Keep the artifacts on the run too, so a workflow_dispatch dry-run can be
       # inspected without (or before) touching a Release.
       - name: Upload run artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: secantusdb-${{ matrix.target }}
           path: |
@@ -173,7 +173,7 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to the GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           tag_name: ${{ env.TAG }}
           # A SemVer pre-release (the `-beta.N` suffix has a hyphen) ⇒ mark the

@@ -17,10 +17,10 @@ jobs:
   verify_tag:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
 
       - name: Verify tag matches project version
         # `--no-project` is critical: without it, `uv run` tries to install
@@ -62,7 +62,7 @@ jobs:
             platform: windows-x86_64
             cibw_archs: AMD64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           submodules: recursive
 
@@ -81,7 +81,7 @@ jobs:
 
       - name: Restore ccache
         if: matrix.platform != 'windows-x86_64'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           path: ~/.cache/ccache
           key: ccache-${{ matrix.platform }}-wt-${{ steps.wt-sha.outputs.sha }}
@@ -89,7 +89,7 @@ jobs:
             ccache-${{ matrix.platform }}-
 
       - name: Build wheels with cibuildwheel
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@7940a4c0e76eb2030e473a5f864f291f63ee879b  # v2.21
         env:
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
           # Linux: install ccache once in the manylinux/musllinux
@@ -139,7 +139,7 @@ jobs:
           # the publish-workflow bottleneck, switch to sccache.
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: wheels-${{ matrix.platform }}
           path: wheelhouse/*.whl
@@ -148,17 +148,17 @@ jobs:
     needs: verify_tag
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           submodules: recursive
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
 
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -176,12 +176,12 @@ jobs:
       id-token: write
     steps:
       - name: Download all wheel and sdist artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7
         with:
           path: dist/
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
         with:
           packages-dir: dist/

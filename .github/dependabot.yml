@@ -1,0 +1,18 @@
+# Keep the SHA-pinned GitHub Actions current. Actions are pinned to commit
+# SHAs (defence against tag-mutation supply-chain attacks — see the nightly
+# security review, issue #117); Dependabot bumps each SHA (and its `# vN`
+# comment) when the upstream action publishes a new release, so pinning
+# doesn't mean going stale.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
