@@ -169,6 +169,34 @@ def test_window_over_group_by_via_driver(server):
     conn.close()
 
 
+def test_window_over_join_group_via_driver(server):
+    # A window ranking GROUP BY aggregates that span a JOIN, through the driver.
+    server.storage.insert(
+        "db",
+        "orders",
+        [
+            {"_id": bson.Int64(i), "cid": bson.Int64(c), "amt": bson.Int64(a)}
+            for i, (c, a) in enumerate([(1, 10), (1, 20), (2, 30), (2, 5), (3, 40)], 1)
+        ],
+    )
+    server.storage.insert(
+        "db",
+        "customers",
+        [{"_id": bson.Int64(i), "region": r} for i, r in [(1, "e"), (2, "e"), (3, "w")]],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT c.region, SUM(o.amt) AS s, "
+        "RANK() OVER (ORDER BY SUM(o.amt) DESC) AS rk, "
+        "SUM(SUM(o.amt)) OVER () AS total "
+        "FROM orders o JOIN customers c ON o.cid = c._id GROUP BY c.region ORDER BY c.region"
+    )
+    # region e total = 65, w = 40 → ranked desc e=1, w=2; grand total 105.
+    assert cur.fetchall() == (["e", 65, 1, 105], ["w", 40, 2, 105])
+    conn.close()
+
+
 def test_join_where_subquery_via_driver(server):
     # A scalar WHERE-subquery inside a JOIN query, through the real driver.
     server.storage.insert(

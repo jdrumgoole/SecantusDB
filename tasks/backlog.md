@@ -1430,9 +1430,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   AST by a reference to its computed field (so `RANK() OVER (ORDER BY SUM(sal))`, `SUM(SUM(sal)) OVER ()`,
   and `PARTITION BY <group col>` all resolve), `HAVING` prunes groups before the window, and `ORDER BY
   <window alias>` is resolved in this planner (a bare alias term is substituted with its output expression).
-  **Still `0A000`/unsupported:** numeric `RANGE` offset (needs interval arithmetic on the order key),
-  window + `GROUP BY` combined with a `JOIN` in one SELECT (the join+group path doesn't yet run the
-  window phase), and the general `ORDER BY <alias>` gap in the plain evaluated (non-group-window) path.
+  **Window + `GROUP BY` + `JOIN` landed** (b73): `_plan_join_group_window_select` is the join analogue —
+  it builds the `$lookup`/`$unwind`/`$match`/`$group`/`$project` pipeline (group keys + aggregates
+  resolved through the join resolver), then the same window phase runs over the grouped rows. The shared
+  tail (`_finish_group_window`) is factored out of both planners. **Still `0A000`/unsupported:** numeric
+  `RANGE` offset (needs interval arithmetic on the order key), and the general `ORDER BY <alias>` gap in
+  the plain evaluated (non-group-window) path.
 - [ ] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
   [WHERE …]` via `planner._plan_on_conflict` (an `OnConflict` on `InsertPlan`) + `executor.
   _execute_insert_on_conflict`: each proposed row probes the conflict target with `find_matching`; a
