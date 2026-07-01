@@ -27,10 +27,9 @@
 use std::cmp::Ordering;
 
 use bson::{Bson, Document};
-use regex::RegexBuilder;
 
 use crate::collation::{self, Collation};
-use crate::{expressions, numeric};
+use crate::{expressions, numeric, regexutil};
 
 /// Signal that the pure-Python matcher must handle this query/value.
 #[derive(Debug)]
@@ -273,38 +272,13 @@ fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>
     }
 }
 
-/// Hard cap on user-supplied regex pattern length, mirroring
-/// `secantus.query._MAX_REGEX_PATTERN_LEN`. Over the cap, defer to Python
-/// (which raises a `QueryError`).
-const MAX_REGEX_PATTERN_LEN: usize = 1000;
-
-/// A compiled `$regex`, from whichever engine could build it: the linear
-/// `regex` crate (the fast path for almost every pattern) or, when that can't
-/// compile a pattern (lookaround / backreferences), the backtracking
-/// `fancy-regex`. Both run `re.search` semantics (unanchored).
-enum CompiledRegex {
-    Linear(regex::Regex),
-    Fancy(fancy_regex::Regex),
-}
-
-impl CompiledRegex {
-    fn is_match(&self, s: &str) -> bool {
-        match self {
-            CompiledRegex::Linear(re) => re.is_match(s),
-            // fancy-regex's is_match is fallible (e.g. backtrack-limit hit); a
-            // failure is treated as no-match to stay sound (never over-match).
-            CompiledRegex::Fancy(re) => re.is_match(s).unwrap_or(false),
-        }
-    }
-}
-
 /// `$regex` / bare-regex matching, mirroring `secantus.query._op_regex`:
 /// `re.search` over each string value (and over string elements of array
 /// values). `pattern` is a `String` or a BSON `RegularExpression`; `options`
 /// is the optional sibling `$options` string. A non-string pattern/options, or
 /// a pattern neither regex engine can compile, signals `Fallback`.
 fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) -> R {
-    let re = build_regex(pattern, options)?;
+    let re = regexutil::compile(pattern, options).map_err(|_| Fallback)?;
     for v in values {
         match v {
             Some(Bson::String(s)) if re.is_match(s) => return Ok(true),
@@ -321,60 +295,6 @@ fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) ->
         }
     }
     Ok(false)
-}
-
-fn build_regex(pattern: &Bson, options: Option<&Bson>) -> Result<CompiledRegex, Fallback> {
-    let (pat, embedded_flags): (&str, &str) = match pattern {
-        Bson::String(s) => (s.as_str(), ""),
-        Bson::RegularExpression(r) => (r.pattern.as_str(), r.options.as_str()),
-        _ => return Err(Fallback),
-    };
-    let opt_flags: &str = match options {
-        None => "",
-        Some(Bson::String(s)) => s.as_str(),
-        Some(_) => return Err(Fallback),
-    };
-    if pat.len() > MAX_REGEX_PATTERN_LEN {
-        return Err(Fallback);
-    }
-    // i/m/s/x map to builder flags; any other flag char is ignored, mirroring
-    // Python's `_MONGO_FLAG_MAP.get(c, 0)`.
-    let (mut ci, mut ml, mut dotall, mut ext) = (false, false, false, false);
-    for c in embedded_flags.chars().chain(opt_flags.chars()) {
-        match c {
-            'i' => ci = true,
-            'm' => ml = true,
-            's' => dotall = true,
-            'x' => ext = true,
-            _ => {}
-        }
-    }
-    // Fast path: the linear engine handles almost every pattern.
-    if let Ok(re) = RegexBuilder::new(pat)
-        .case_insensitive(ci)
-        .multi_line(ml)
-        .dot_matches_new_line(dotall)
-        .ignore_whitespace(ext)
-        .build()
-    {
-        return Ok(CompiledRegex::Linear(re));
-    }
-    // Fallback: lookaround / backreferences via the backtracking engine. Flags
-    // ride an inline group prefix since fancy-regex has no builder-flag API.
-    let mut flagstr = String::new();
-    for (on, ch) in [(ci, 'i'), (ml, 'm'), (dotall, 's'), (ext, 'x')] {
-        if on {
-            flagstr.push(ch);
-        }
-    }
-    let full = if flagstr.is_empty() {
-        pat.to_string()
-    } else {
-        format!("(?{flagstr}){pat}")
-    };
-    fancy_regex::Regex::new(&full)
-        .map(CompiledRegex::Fancy)
-        .map_err(|_| Fallback)
 }
 
 fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Collation>) -> R {

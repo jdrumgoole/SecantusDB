@@ -249,6 +249,26 @@ CURATED = [
     ({"$convert": {"input": "notanumber", "to": "int"}}, {}),  # str->int defer
     ({"$convert": {"input": "$d", "to": "int"}}, {"d": Decimal128("3.5")}),  # dec->int defer
     ({"$convert": {"input": 5}}, {}),  # missing `to` -> defer
+    # $regexMatch / $regexFind / $regexFindAll — ASCII patterns (byte offset ==
+    # code-point idx), simple captures. The linear `regex` crate's leftmost-first
+    # semantics align with Python `re` here.
+    ({"$regexMatch": {"input": "hello world", "regex": "wor"}}, {}),
+    ({"$regexMatch": {"input": "hello", "regex": "^h"}}, {}),
+    ({"$regexMatch": {"input": "Hello", "regex": "hello", "options": "i"}}, {}),
+    ({"$regexMatch": {"input": "hello", "regex": "xyz"}}, {}),  # no match -> False
+    ({"$regexMatch": {"input": 123, "regex": "1"}}, {}),  # non-string input -> False
+    ({"$regexMatch": {"input": "$s", "regex": "b"}}, {"s": "abc"}),  # field-path input
+    ({"$regexMatch": {"input": "aa", "regex": r"(a)\1"}}, {}),  # backref -> fancy is_match
+    ({"$regexFind": {"input": "hello world", "regex": "o"}}, {}),
+    ({"$regexFind": {"input": "2024-01", "regex": r"(\d+)-(\d+)"}}, {}),  # captures
+    ({"$regexFind": {"input": "a", "regex": "(a)(b)?"}}, {}),  # non-participating -> null
+    ({"$regexFind": {"input": "abc", "regex": "x"}}, {}),  # no match -> null
+    ({"$regexFind": {"input": 5, "regex": "5"}}, {}),  # non-string input -> null
+    ({"$regexFind": {"input": "aa", "regex": r"(a)\1"}}, {}),  # backref find -> defer
+    ({"$regexFindAll": {"input": "a1b2c3", "regex": r"\d"}}, {}),
+    ({"$regexFindAll": {"input": "a1b2", "regex": r"([a-z])(\d)"}}, {}),  # captures
+    ({"$regexFindAll": {"input": "xyz", "regex": r"\d"}}, {}),  # none -> []
+    ({"$regexFindAll": {"input": 5, "regex": "."}}, {}),  # non-string -> []
     # Math (deterministic subset).
     ({"$abs": -5}, {}),
     ({"$abs": "$n"}, {"n": -5.5}),
