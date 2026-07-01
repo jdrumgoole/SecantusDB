@@ -223,6 +223,8 @@ def _write_target_collection(
         table_node = target.find(exp.Table) if target is not None else None
     elif isinstance(stmt, (exp.Update, exp.Delete)):
         table_node = stmt.find(exp.Table)
+    elif isinstance(stmt, exp.Merge):
+        table_node = stmt.this if isinstance(stmt.this, exp.Table) else None
     else:
         return None
     if table_node is None:
@@ -397,6 +399,160 @@ def _close_non_hold_cursors(session: Session) -> None:
     session.cursors = {n: c for n, c in session.cursors.items() if c.hold}
 
 
+# --------------------------------------------------------------------------- #
+# MERGE INTO target USING source ON cond WHEN [NOT] MATCHED THEN <action>.
+# For each source row: find the target rows the ON condition matches, then apply
+# the first WHEN clause of the right kind (matched / not-matched) whose optional
+# AND-condition holds — UPDATE / DELETE / DO NOTHING for a match, INSERT /
+# DO NOTHING for a non-match. Matches are taken against the target snapshot at
+# MERGE start, and each target row is affected at most once.
+# --------------------------------------------------------------------------- #
+
+
+def _run_merge(
+    stmt: exp.Merge, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    from secantus.paths import get_path
+
+    if not isinstance(stmt.this, exp.Table):
+        raise errors.feature_not_supported("MERGE target must be a table")
+    target = _require_table(catalog, db, stmt.this.name, storage)
+    target_alias = (stmt.this.alias or stmt.this.name).lower()
+    src_alias, source_rows, source_cols = _merge_source(
+        stmt.args["using"], db, catalog, session, storage
+    )
+    on = stmt.args["on"]
+    whens = stmt.args["whens"].expressions
+    sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    target_docs = storage.find_matching(db, target.collection, {})
+    affected = 0
+    done: set[int] = set()
+
+    def scope_for(tdoc: dict[str, Any] | None, srow: dict[str, Any]):
+        def scope(node: Any) -> Any:
+            alias = (node.table or "").lower() or None
+            name = node.name
+            if alias == target_alias or (alias is None and target.column(name) is not None):
+                return None if tdoc is None else get_path(tdoc, target.field_for(name))
+            if alias == src_alias or alias is None or name in source_cols:
+                return srow.get(name)
+            raise errors.undefined_column(name)
+
+        return scope
+
+    for srow in source_rows:
+        matched = [
+            td
+            for td in target_docs
+            if id(td) not in done and scalar._truthy(scalar.evaluate(on, scope_for(td, srow), sctx))
+        ]
+        if matched:
+            when = _merge_pick_when(whens, True, scope_for(matched[0], srow), sctx)
+            if when is None:
+                continue
+            for td in matched:
+                affected += _merge_apply_matched(
+                    when, target, td, storage, db, scope_for(td, srow), sctx
+                )
+                done.add(id(td))
+        else:
+            when = _merge_pick_when(whens, False, scope_for(None, srow), sctx)
+            if when is not None:
+                affected += _merge_apply_not_matched(
+                    when, target, storage, db, scope_for(None, srow), sctx
+                )
+    return SQLResult(command_tag=f"MERGE {affected}", rowcount=affected)
+
+
+def _merge_source(
+    using: exp.Expression, db: str, catalog: Catalog, session: Session, storage: Any
+) -> tuple[str, list[dict[str, Any]], set[str]]:
+    """Materialize the MERGE source into (alias, rows-by-column-name, column set).
+    The source is a table / reflected collection or a ``(SELECT …) alias``."""
+    from secantus.paths import get_path
+
+    if isinstance(using, exp.Subquery):
+        res = _run_query(using.this, storage, db, catalog, session)
+        cols = [c.name for c in res.columns]
+        rows = [dict(zip(cols, r, strict=True)) for r in res.rows]
+        return (using.alias or "").lower(), rows, set(cols)
+    if not isinstance(using, exp.Table):
+        raise errors.feature_not_supported(f"unsupported MERGE source: {using.sql()}")
+    tdef = catalog.get(db, using.name) or reflect.reflect(storage, db, using.name)
+    if tdef is None:
+        raise errors.undefined_table(using.name)
+    docs = storage.find_matching(db, tdef.collection, {})
+    rows = [{c.name: get_path(d, c.field) for c in tdef.columns} for d in docs]
+    return (using.alias or using.name).lower(), rows, {c.name for c in tdef.columns}
+
+
+def _merge_pick_when(
+    whens: list[exp.Expression], matched: bool, scope: Any, sctx: Any
+) -> exp.Expression | None:
+    """The first WHEN clause of the right kind whose optional AND-condition holds."""
+    for w in whens:
+        if bool(w.args.get("matched")) != matched:
+            continue
+        if w.args.get("source"):
+            raise errors.feature_not_supported("MERGE ... BY SOURCE is not supported")
+        cond = w.args.get("condition")
+        if cond is None or scalar._truthy(scalar.evaluate(cond, scope, sctx)):
+            return w
+    return None
+
+
+def _merge_apply_matched(
+    when: exp.Expression, target: TableDef, td: dict[str, Any], storage: Any, db: str, scope, sctx
+) -> int:
+    then = when.args["then"]
+    if isinstance(then, exp.Update):
+        set_doc: dict[str, Any] = {}
+        for eq in then.expressions:
+            col = eq.this.name
+            set_doc[target.field_for(col)] = typemap.coerce(
+                scalar.evaluate(eq.expression, scope, sctx), target.type_for(col)
+            )
+        if set_doc:
+            storage.update_matching(db, target.collection, {"_id": td["_id"]}, {"$set": set_doc})
+        return 1
+    action = then.sql().strip().upper()
+    if action == "DELETE":
+        storage.delete_matching(db, target.collection, {"_id": td["_id"]})
+        return 1
+    if action == "DO NOTHING":
+        return 0
+    raise errors.feature_not_supported(f"unsupported MERGE matched action: {then.sql()}")
+
+
+def _merge_apply_not_matched(
+    when: exp.Expression, target: TableDef, storage: Any, db: str, scope, sctx
+) -> int:
+    import bson
+
+    then = when.args["then"]
+    if not isinstance(then, exp.Insert):
+        if then.sql().strip().upper() == "DO NOTHING":
+            return 0
+        raise errors.feature_not_supported(f"unsupported MERGE not-matched action: {then.sql()}")
+    col_node = then.this
+    cols = (
+        [c.name for c in col_node.expressions]
+        if col_node is not None
+        else [c.name for c in target.columns]
+    )
+    values = then.expression.expressions if then.expression is not None else []
+    if len(values) != len(cols):
+        raise errors.SQLError("42601", "MERGE INSERT has mismatched column and value counts")
+    doc: dict[str, Any] = {}
+    for col, vexpr in zip(cols, values, strict=True):
+        doc[target.field_for(col)] = typemap.coerce(
+            scalar.evaluate(vexpr, scope, sctx), target.type_for(col)
+        )
+    doc.setdefault("_id", bson.ObjectId())
+    storage.insert(db, target.collection, [doc])
+    return 1
+
+
 def run_statement(
     storage: Any,
     db: str,
@@ -529,6 +685,9 @@ def _run_statement(
     if isinstance(stmt, exp.Delete):
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
         return executor.execute_delete(planner.plan_delete(stmt, table), storage, db)
+
+    if isinstance(stmt, exp.Merge):
+        return _run_merge(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Set):
         return _run_set(stmt, session)

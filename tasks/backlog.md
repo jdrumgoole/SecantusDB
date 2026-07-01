@@ -1449,7 +1449,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   an optional `WHERE` gates the update. A bare `ON CONFLICT DO NOTHING` (no target) inserts and swallows
   any `11000` duplicate. Command tag counts rows inserted *or* updated (skipped don't count); `RETURNING`
   projects the inserted + updated rows. **Still unsupported:** `ON CONFLICT ON CONSTRAINT <name>` (→
-  `0A000`; no named-constraint registry), `DO UPDATE` with no conflict target (→ `42601`), `MERGE`.
+  `0A000`; no named-constraint registry), `DO UPDATE` with no conflict target (→ `42601`).
+- [ ] **`MERGE` landed** (b74). `MERGE INTO target [alias] USING source [alias] ON <cond> WHEN [NOT]
+  MATCHED [AND <cond>] THEN UPDATE SET … | DELETE | INSERT [(cols)] VALUES (…) | DO NOTHING` via
+  `engine._run_merge`. Per source row it scans the target snapshot (loaded once at MERGE start) for rows
+  the `ON` condition matches, then applies the first `WHEN` of the right kind whose optional `AND`
+  condition holds; `_merge_source` materializes a table / reflected-collection / `(SELECT …) alias` source
+  into name-keyed rows; conditions + `UPDATE` RHS + `INSERT` VALUES evaluate through `scalar.evaluate` with
+  a scope that resolves target vs source columns by alias (`_merge_pick_when` / `_merge_apply_matched` /
+  `_merge_apply_not_matched`). Command tag `MERGE n` counts inserts + updates + deletes; each target row is
+  affected at most once (`done` id-set), and MERGE targets are captured for savepoint snapshots
+  (`_write_target_collection` recognises `exp.Merge`). **Limitations:** no `WHEN [NOT] MATCHED BY SOURCE`
+  (→ `0A000`), no `RETURNING`, no multi-target-match cardinality error (Postgres raises 21000 when a source
+  row matches >1 target; SecantusDB applies to all matched, once each), and an unqualified column ambiguous
+  between target and source resolves to the target.
 - [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
   (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`
