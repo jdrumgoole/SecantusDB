@@ -496,9 +496,10 @@ SELECT jsonb_array_elements((data->'tags')) FROM docs;   -- one row per element
 SELECT jsonb_object_keys(data) FROM docs;                -- one row per key
 ```
 
-Two caveats. `<@` (contained-by) is **not supported** — "this field is a subset
-of a constant" can't be pushed down as a filter; rewrite it as `'<const>' @>
-field` where possible. And because sqlglot reads a bare `->` inside a function
+Two caveats. `<@` (contained-by) is supported only as `'<const>' <@ field`
+(equivalently `field @> '<const>'`) — the `field <@ '<const>'` direction ("this
+field is a subset of a constant") is a constraint on the stored shape and can't
+be pushed down as a filter. And because sqlglot reads a bare `->` inside a function
 call as a lambda arrow, a *navigated function argument* must be parenthesised
 (`jsonb_array_length((data->'tags'))`) or use the `#>` form
 (`jsonb_array_length(data #> '{tags}')`); bare `->` in `WHERE`/projection is
@@ -686,6 +687,15 @@ SHOW search_path;
 SET search_path TO myschema;
 ```
 
+A FROM-less `SELECT` also evaluates constant expressions (arithmetic, `||`,
+function calls) and honours a constant `WHERE` (a false predicate returns zero
+rows with the right column shape):
+
+```sql
+SELECT 1 + 1 AS two, upper('ab') AS shout;
+SELECT 1 WHERE current_setting('server_version') IS NOT NULL;
+```
+
 Programmatic schema discovery works through `information_schema` and `pg_catalog`,
 including joins across the catalogs (so SQLAlchemy's `get_table_names()` /
 `has_table()` and `psql \dt` work):
@@ -757,7 +767,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`), `UPDATE`, `DELETE`, `RETURNING` | `MERGE`, `ON CONFLICT ON CONSTRAINT` |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries | `WITH` on `INSERT`/`UPDATE`/`DELETE` |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, jsonb `<@` |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |

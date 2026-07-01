@@ -53,6 +53,17 @@ def test_connect_and_select_one(server):
     conn.close()
 
 
+def test_fromless_expression_and_where_via_driver(server):
+    # FROM-less constant expression + a constant WHERE, through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT 2 * 3 AS six")
+    assert cur.fetchall() == ([6],)
+    cur.execute("SELECT 1 AS x WHERE 1 = 0")
+    assert cur.fetchall() == ()
+    conn.close()
+
+
 def test_crud_with_bound_parameters(server):
     conn = connect(server)
     cur = conn.cursor()
