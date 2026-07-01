@@ -264,11 +264,17 @@ CURATED = [
     ({"$regexFind": {"input": "a", "regex": "(a)(b)?"}}, {}),  # non-participating -> null
     ({"$regexFind": {"input": "abc", "regex": "x"}}, {}),  # no match -> null
     ({"$regexFind": {"input": 5, "regex": "5"}}, {}),  # non-string input -> null
-    ({"$regexFind": {"input": "aa", "regex": r"(a)\1"}}, {}),  # backref find -> defer
     ({"$regexFindAll": {"input": "a1b2c3", "regex": r"\d"}}, {}),
     ({"$regexFindAll": {"input": "a1b2", "regex": r"([a-z])(\d)"}}, {}),  # captures
     ({"$regexFindAll": {"input": "xyz", "regex": r"\d"}}, {}),  # none -> []
     ({"$regexFindAll": {"input": 5, "regex": "."}}, {}),  # non-string -> []
+    # Fancy-regex finds: backreferences / lookaround now compute (the backtracking
+    # engine is Python-`re`-compatible), no longer deferring.
+    ({"$regexFind": {"input": "hello", "regex": r"(l)\1"}}, {}),  # backref -> "ll" @2
+    ({"$regexFind": {"input": "foobar", "regex": r"foo(?=bar)"}}, {}),  # lookahead, no capture
+    ({"$regexFind": {"input": "xfoobar", "regex": r"(?<=x)foo"}}, {}),  # lookbehind @1
+    ({"$regexFindAll": {"input": "aabbcc", "regex": r"(.)\1"}}, {}),  # backref, all pairs
+    ({"$regexMatch": {"input": "foobar", "regex": r"foo(?=bar)"}}, {}),  # lookahead match
     # Math (deterministic subset).
     ({"$abs": -5}, {}),
     ({"$abs": "$n"}, {"n": -5.5}),

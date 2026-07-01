@@ -1716,8 +1716,10 @@ fn op_to_string(arg: &Bson, ctx: &Ctx) -> R {
 // (false / null / []) *before* touching the regex — matching Python's
 // short-circuit. `regex` + optional `options` are compiled via the shared
 // `regexutil` (linear engine, else backtracking). $regexMatch uses `is_match`
-// (both engines, same guarantee as query `$regex`); the positional finds use the
-// linear engine only (fancy-regex capture semantics are a parity risk → defer).
+// and the positional finds use `captures` — both served by whichever engine
+// compiled the pattern (the backtracking `fancy-regex` is Python-`re`-compatible,
+// so lookaround / backreference captures parity-match too); only a pattern
+// neither engine compiles, or a backtrack-limit error, defers.
 
 /// Compile `{regex, options?}` from an already-validated (input-is-string) spec.
 fn compile_regex(spec: &Document, ctx: &Ctx) -> Result<regexutil::CompiledRegex, Fallback> {

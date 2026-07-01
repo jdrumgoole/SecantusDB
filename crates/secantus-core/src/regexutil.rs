@@ -47,23 +47,30 @@ impl CompiledRegex {
     }
 
     /// First match (Python `re.search`), or `None`. `Err(())` → defer (a
-    /// fancy-only pattern, whose capture semantics we don't reproduce here).
+    /// backtrack-limit error from the fancy engine).
     pub(crate) fn find_first(&self, s: &str) -> Result<Option<RegexMatch>, ()> {
-        let re = self.linear_or_defer()?;
-        Ok(re.captures(s).map(|c| to_match(s, &c)))
+        match self {
+            CompiledRegex::Linear(re) => Ok(re.captures(s).map(|c| to_match(s, &c))),
+            CompiledRegex::Fancy(re) => match re.captures(s) {
+                Ok(Some(c)) => Ok(Some(to_match_fancy(s, &c))),
+                Ok(None) => Ok(None),
+                Err(_) => Err(()), // backtrack limit / engine error -> defer
+            },
+        }
     }
 
     /// All non-overlapping matches left-to-right (Python `re.finditer`). `Err(())`
-    /// → defer (fancy-only pattern).
+    /// → defer (a backtrack-limit error from the fancy engine).
     pub(crate) fn find_all(&self, s: &str) -> Result<Vec<RegexMatch>, ()> {
-        let re = self.linear_or_defer()?;
-        Ok(re.captures_iter(s).map(|c| to_match(s, &c)).collect())
-    }
-
-    fn linear_or_defer(&self) -> Result<&LinearRegex, ()> {
         match self {
-            CompiledRegex::Linear(re) => Ok(re),
-            CompiledRegex::Fancy(_) => Err(()),
+            CompiledRegex::Linear(re) => Ok(re.captures_iter(s).map(|c| to_match(s, &c)).collect()),
+            CompiledRegex::Fancy(re) => {
+                let mut out = Vec::new();
+                for caps in re.captures_iter(s) {
+                    out.push(to_match_fancy(s, &caps.map_err(|_| ())?));
+                }
+                Ok(out)
+            }
         }
     }
 }
@@ -71,6 +78,22 @@ impl CompiledRegex {
 /// Build one `RegexMatch` from a linear-engine capture set. Group 0 is the whole
 /// match; groups `1..` are `Some(text)` / `None` exactly like Python `m.groups()`.
 fn to_match(s: &str, caps: &regex::Captures) -> RegexMatch {
+    let whole = caps.get(0).unwrap();
+    let captures = (1..caps.len())
+        .map(|i| caps.get(i).map(|m| m.as_str().to_string()))
+        .collect();
+    RegexMatch {
+        text: whole.as_str().to_string(),
+        codepoint_idx: s[..whole.start()].chars().count(),
+        captures,
+    }
+}
+
+/// Same as [`to_match`] for a fancy-engine capture set. The backtracking engine
+/// is Perl/Python-`re`-compatible, so its leftmost-first match and per-group
+/// participation line up with Python's for the lookaround / backreference
+/// patterns that reach this path.
+fn to_match_fancy(s: &str, caps: &fancy_regex::Captures) -> RegexMatch {
     let whole = caps.get(0).unwrap();
     let captures = (1..caps.len())
         .map(|i| caps.get(i).map(|m| m.as_str().to_string()))
