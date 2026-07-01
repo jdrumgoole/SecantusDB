@@ -190,6 +190,26 @@ def test_outer_join_via_driver(server):
     conn.close()
 
 
+def test_cross_join_via_driver(server):
+    # CROSS JOIN / comma-join cartesian product over the real driver.
+    server.storage.insert(
+        "db",
+        "a",
+        [
+            {"_id": bson.Int64(1), "av": bson.Int64(10)},
+            {"_id": bson.Int64(2), "av": bson.Int64(20)},
+        ],
+    )
+    server.storage.insert("db", "b", [{"_id": bson.Int64(1), "bv": bson.Int64(100)}])
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT a.av, b.bv FROM a CROSS JOIN b ORDER BY a.av")
+    assert cur.fetchall() == ([10, 100], [20, 100])
+    cur.execute("SELECT a.av, b.bv FROM a, b WHERE a._id = 1")
+    assert cur.fetchall() == ([10, 100],)
+    conn.close()
+
+
 def test_nulls_ordering_via_driver(server):
     # ORDER BY NULL placement (Postgres default + explicit NULLS FIRST/LAST).
     server.storage.insert(

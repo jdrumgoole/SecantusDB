@@ -2013,7 +2013,20 @@ def _build_join_pipeline(
         side = str(jn.args.get("side") or "").upper()
         on = jn.args.get("on")
         if on is None:
-            raise errors.feature_not_supported("JOIN without ON is not supported")
+            # No ON: a CROSS JOIN or an implicit comma-join — the cartesian
+            # product (an empty `$lookup` pipeline returns every foreign doc, then
+            # `$unwind` pairs each with the outer row). An outer join without ON is
+            # not valid SQL.
+            if side in ("LEFT", "RIGHT", "FULL"):
+                raise errors.syntax_error(f"{side} JOIN requires an ON clause")
+            pipeline.append(
+                {"$lookup": {"from": join_table.collection, "pipeline": [], "as": join_alias}}
+            )
+            pipeline.append(
+                {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": False}}
+            )
+            amap[join_alias] = ("join", join_table)
+            continue
         pipeline.append(_lookup_stage(on, join_alias, join_table, amap))
         pipeline.append(
             {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": side == "LEFT"}}

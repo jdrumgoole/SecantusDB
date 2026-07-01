@@ -271,9 +271,12 @@ FROM sales GROUP BY region;
 
 ## Joins
 
-An `INNER` or `LEFT JOIN` with an equality `ON` compiles to a `$lookup`.
-Multiple joins chain — each table joins the base or an already-joined table.
-`RIGHT` and `FULL OUTER` joins are supported between **two** tables:
+An `INNER` or `LEFT JOIN` compiles to a `$lookup`. The `ON` may be an equality
+(index-accelerated), a multi-condition `AND`, or a non-equi / `OR` predicate
+(evaluated per candidate pair). `CROSS JOIN` and the implicit comma form
+(`FROM a, b`) produce a cartesian product. Multiple joins chain — each table
+joins the base or an already-joined table. `RIGHT` and `FULL OUTER` joins are
+supported between **two** tables:
 
 ```sql
 SELECT o.id, o.total, c.name
@@ -286,6 +289,12 @@ ORDER BY o.id;
 SELECT o.id, c.name
 FROM orders o
 LEFT JOIN customers c ON o.cust_id = c.id;
+
+-- CROSS JOIN (and the comma form) is the cartesian product; a non-equi or OR
+-- ON condition is evaluated per candidate pair:
+SELECT a.x, b.y FROM a CROSS JOIN b;
+SELECT a.x, b.y FROM a, b WHERE a.k = b.k;
+SELECT o.id, t.bracket FROM orders o JOIN tax t ON o.total BETWEEN t.lo AND t.hi;
 
 -- RIGHT keeps unmatched right rows; FULL OUTER keeps unmatched rows from both
 -- sides (two-table only — a chain mixing in a RIGHT/FULL is rejected):
@@ -752,7 +761,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
-| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, equality `ON`, JOIN + GROUP BY / aggregates / HAVING | `CROSS`, `RIGHT`/`FULL` in a 3+ table chain, non-equi / `OR` `ON` |
+| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain |
 | DDL | `CREATE TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER TABLE`, views, constraints (enforced) |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
