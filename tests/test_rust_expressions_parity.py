@@ -24,7 +24,7 @@ import types
 
 import bson
 import pytest
-from bson import Int64, ObjectId
+from bson import Decimal128, Int64, ObjectId
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -214,6 +214,41 @@ CURATED = [
     ({"$toString": "$s"}, {"s": "hi"}),
     ({"$toInt": "12"}, {}),  # string parse -> defer
     ({"$toString": 3.14}, {}),  # float str() -> defer
+    # $toDecimal: int / bool / finite double (shortest round-trip text) / numeric
+    # string / Decimal128 passthrough. Floats use exactly-representable values so
+    # `{:?}` text matches Python's `repr` and the Decimal128 bytes agree.
+    ({"$toDecimal": 5}, {}),
+    ({"$toDecimal": "$n"}, {"n": Int64(7)}),
+    ({"$toDecimal": True}, {}),
+    ({"$toDecimal": 4.125}, {}),
+    ({"$toDecimal": "1234.5678"}, {}),
+    ({"$toDecimal": "$d"}, {"d": Decimal128("3.14")}),  # passthrough
+    ({"$toDecimal": "$x"}, {}),  # missing -> null
+    ({"$toDecimal": "notanumber"}, {}),  # unparseable -> defer
+    # $convert: bounded port (numeric / bool / decimal targets + null/onNull/
+    # onError). String / objectId targets and string/Decimal128 numeric sources
+    # defer to Python. Targets given as both alias strings and numeric codes.
+    ({"$convert": {"input": 5, "to": "double"}}, {}),
+    ({"$convert": {"input": True, "to": 1}}, {}),  # numeric target code
+    ({"$convert": {"input": 5, "to": "bool"}}, {}),
+    ({"$convert": {"input": 0, "to": "bool"}}, {}),
+    ({"$convert": {"input": "", "to": "bool"}}, {}),
+    ({"$convert": {"input": "hi", "to": "bool"}}, {}),
+    ({"$convert": {"input": True, "to": "int"}}, {}),
+    ({"$convert": {"input": 7.9, "to": "int"}}, {}),  # truncates
+    ({"$convert": {"input": 5, "to": "long"}}, {}),  # -> Int64
+    ({"$convert": {"input": "1234.5678", "to": "decimal"}}, {}),
+    ({"$convert": {"input": 5, "to": "decimal"}}, {}),
+    ({"$convert": {"input": 4.125, "to": "decimal"}}, {}),
+    ({"$convert": {"input": "$dt", "to": "date"}}, {"dt": datetime.datetime(2021, 1, 2)}),
+    ({"$convert": {"input": "$x", "to": "int", "onNull": -1}}, {}),  # null -> onNull
+    ({"$convert": {"input": "$x", "to": "int"}}, {}),  # null -> null
+    ({"$convert": {"input": "nope", "to": "decimal", "onError": -7}}, {}),  # fail -> onError
+    # $convert defers (Rust None; Python not invoked since rust is None first).
+    ({"$convert": {"input": 5, "to": "string"}}, {}),  # string target -> defer
+    ({"$convert": {"input": "notanumber", "to": "int"}}, {}),  # str->int defer
+    ({"$convert": {"input": "$d", "to": "int"}}, {"d": Decimal128("3.5")}),  # dec->int defer
+    ({"$convert": {"input": 5}}, {}),  # missing `to` -> defer
     # Math (deterministic subset).
     ({"$abs": -5}, {}),
     ({"$abs": "$n"}, {"n": -5.5}),

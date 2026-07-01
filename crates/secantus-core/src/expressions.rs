@@ -228,6 +228,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // str() defer to Python)
         "$toInt" => op_to_int(arg, ctx),
         "$toDouble" => op_to_double(arg, ctx),
+        "$toDecimal" => op_to_decimal(arg, ctx),
+        "$convert" => op_convert(arg, ctx),
         "$toBool" => op_to_bool(arg, ctx),
         "$toString" => op_to_string(arg, ctx),
         // math (exactly-deterministic only; $round/$pow/$trunc and the
@@ -1432,6 +1434,164 @@ fn op_to_double(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Int64(n) => Ok(Bson::Double(n as f64)),
         v @ Bson::Double(_) => Ok(v),
         _ => Err(Fallback), // Decimal128 / string parsing -> Python
+    }
+}
+
+fn op_to_decimal(arg: &Bson, ctx: &Ctx) -> R {
+    let v = eval(arg, ctx)?;
+    match v {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Decimal128(_) => Ok(v),
+        Bson::Int32(n) => decimal_from_str(&n.to_string()),
+        Bson::Int64(n) => decimal_from_str(&n.to_string()),
+        Bson::Boolean(b) => decimal_from_str(if b { "1" } else { "0" }),
+        // Shortest round-trip text matches Python's `repr(float)` so the
+        // Decimal128 payload agrees bit-for-bit.
+        Bson::Double(d) if d.is_finite() => decimal_from_str(&format!("{d:?}")),
+        Bson::String(ref s) => decimal_from_str(s),
+        _ => Err(Fallback),
+    }
+}
+
+fn decimal_from_str(s: &str) -> R {
+    s.parse::<bson::Decimal128>()
+        .map(Bson::Decimal128)
+        .map_err(|_| Fallback)
+}
+
+/// `$convert` outcome for one (value, target): a successful conversion, a
+/// supported conversion that *failed* (Python would raise → `onError` applies),
+/// or a target/source combination this bounded port doesn't implement (defer the
+/// whole `$convert` to Python).
+enum Conv {
+    Ok(Bson),
+    Failed,
+    Unsupported,
+}
+
+/// `$convert` (`{input, to, onNull?, onError?}`) — bounded port of
+/// `expressions._op_convert`. Numeric / bool / decimal conversions are handled
+/// here; string / objectId targets and string/Decimal128 numeric sources defer
+/// to Python. `null` input → `onNull` (or null); a failed *supported* conversion
+/// → `onError` (or defer so Python raises the same error).
+fn op_convert(arg: &Bson, ctx: &Ctx) -> R {
+    let spec = arg.as_document().ok_or(Fallback)?;
+    let (Some(input), Some(to)) = (spec.get("input"), spec.get("to")) else {
+        return Err(Fallback); // Python raises: requires {input, to}
+    };
+    let value = eval(input, ctx)?;
+    let target = eval(to, ctx)?;
+    if matches!(value, Bson::Null) {
+        return match spec.get("onNull") {
+            Some(on) => eval(on, ctx),
+            None => Ok(Bson::Null),
+        };
+    }
+    let code = convert_target_code(&target).ok_or(Fallback)?;
+    match convert_value(&value, code) {
+        Conv::Ok(v) => Ok(v),
+        Conv::Failed => match spec.get("onError") {
+            Some(on) => eval(on, ctx),
+            None => Err(Fallback), // Python raises "$convert failed"
+        },
+        Conv::Unsupported => Err(Fallback),
+    }
+}
+
+/// mongod's `$convert` target codes (`expressions._CONVERT_TARGETS`): the string
+/// alias or the numeric code. A double / unknown target -> `None` (Python raises).
+fn convert_target_code(target: &Bson) -> Option<i32> {
+    let code = match target {
+        Bson::String(s) => match s.as_str() {
+            "double" => 1,
+            "string" => 2,
+            "objectId" => 7,
+            "bool" => 8,
+            "date" => 9,
+            "int" => 16,
+            "long" => 18,
+            "decimal" => 19,
+            _ => return None,
+        },
+        Bson::Int32(n) => *n,
+        Bson::Int64(n) => *n as i32,
+        _ => return None,
+    };
+    matches!(code, 1 | 2 | 7 | 8 | 9 | 16 | 18 | 19).then_some(code)
+}
+
+fn convert_value(value: &Bson, code: i32) -> Conv {
+    match code {
+        // double
+        1 => match value {
+            Bson::Boolean(b) => Conv::Ok(Bson::Double(if *b { 1.0 } else { 0.0 })),
+            Bson::Int32(n) => Conv::Ok(Bson::Double(*n as f64)),
+            Bson::Int64(n) => Conv::Ok(Bson::Double(*n as f64)),
+            Bson::Double(_) => Conv::Ok(value.clone()),
+            _ => Conv::Unsupported, // Decimal128 / string / date -> Python
+        },
+        // bool — non-(bool/int/double/string/Decimal128) is truthy (Python's else).
+        8 => match value {
+            Bson::Boolean(_) => Conv::Ok(value.clone()),
+            Bson::Int32(n) => Conv::Ok(Bson::Boolean(*n != 0)),
+            Bson::Int64(n) => Conv::Ok(Bson::Boolean(*n != 0)),
+            Bson::Double(d) => Conv::Ok(Bson::Boolean(*d != 0.0)),
+            Bson::String(s) => Conv::Ok(Bson::Boolean(!s.is_empty())),
+            Bson::Decimal128(_) => Conv::Unsupported, // decimal compare -> Python
+            _ => Conv::Ok(Bson::Boolean(true)),
+        },
+        // int (16) / long (18)
+        16 | 18 => match value {
+            Bson::Boolean(b) => wrap_int(i128::from(*b), code),
+            Bson::Int32(n) => wrap_int(*n as i128, code),
+            Bson::Int64(n) => wrap_int(*n as i128, code),
+            Bson::Double(d) if d.is_finite() && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 => {
+                wrap_int(d.trunc() as i128, code)
+            }
+            Bson::Double(_) => Conv::Failed, // int(inf/overflow) raises -> onError
+            _ => Conv::Unsupported,          // Decimal128 / string -> Python
+        },
+        // decimal (the full $toDecimal set, incl. parseable strings)
+        19 => match value {
+            Bson::Decimal128(_) => Conv::Ok(value.clone()),
+            Bson::Boolean(b) => decimal_conv(if *b { "1" } else { "0" }),
+            Bson::Int32(n) => decimal_conv(&n.to_string()),
+            Bson::Int64(n) => decimal_conv(&n.to_string()),
+            Bson::Double(d) if d.is_finite() => decimal_conv(&format!("{d:?}")),
+            Bson::String(s) => decimal_conv(s),
+            _ => Conv::Unsupported,
+        },
+        // date — passthrough only. int/float/string -> Python: the oracle
+        // builds a *tz-aware* datetime for the numeric path, which wouldn't
+        // compare equal to a bson-decoded naive datetime, so we defer it.
+        9 => match value {
+            Bson::DateTime(_) => Conv::Ok(value.clone()),
+            _ => Conv::Unsupported,
+        },
+        // string (2) / objectId (7): str()/isoformat/hex parsing -> Python.
+        _ => Conv::Unsupported,
+    }
+}
+
+fn wrap_int(n: i128, code: i32) -> Conv {
+    if code == 18 {
+        if (i64::MIN as i128..=i64::MAX as i128).contains(&n) {
+            Conv::Ok(Bson::Int64(n as i64))
+        } else {
+            Conv::Failed
+        }
+    } else {
+        match int_to_bson(n) {
+            Some(v) => Conv::Ok(v),
+            None => Conv::Failed,
+        }
+    }
+}
+
+fn decimal_conv(s: &str) -> Conv {
+    match s.parse::<bson::Decimal128>() {
+        Ok(d) => Conv::Ok(Bson::Decimal128(d)),
+        Err(_) => Conv::Failed,
     }
 }
 
