@@ -89,7 +89,9 @@ pub fn gkey(v: &Bson) -> R<GKey> {
 /// integral variant also tracks whether any operand was int64, so the result
 /// promotes to int64 (MongoDB's numeric widening — `numerics.bson_add`).
 #[derive(Clone, Copy)]
-enum Num {
+// `pub(crate)` only because it is reachable through the `pub(crate) Acc` the
+// `windowfields` module reuses; not part of any real cross-module API.
+pub(crate) enum Num {
     Int { v: i128, wide: bool },
     Float(f64),
 }
@@ -126,7 +128,10 @@ impl Num {
 }
 
 /// One accumulator's running state.
-enum Acc {
+// Shared with `windowfields` (`$setWindowFields`), which reuses the same
+// per-op accumulator state / step / finalize logic over sliding document
+// windows rather than whole groups — hence `pub(crate)`.
+pub(crate) enum Acc {
     Sum(Num),
     Count(i64),
     Avg(Option<(Num, i64)>), // None until the first non-null value (field stays absent)
@@ -144,7 +149,7 @@ struct Compiled<'a> {
     arg: &'a Bson,
 }
 
-fn new_acc(op: &str) -> R<Acc> {
+pub(crate) fn new_acc(op: &str) -> R<Acc> {
     Ok(match op {
         "$sum" => Acc::Sum(Num::Int { v: 0, wide: false }),
         "$count" => Acc::Count(0),
@@ -169,7 +174,7 @@ fn arg_is_one(arg: &Bson) -> bool {
         || matches!(arg, Bson::Double(d) if *d == 1.0)
 }
 
-fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
+pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
     match acc {
         Acc::Sum(running) => {
             // `1 if arg == 1 else evaluate(arg)`, then None -> 0.
@@ -281,6 +286,39 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
         }
     }
     Ok(out)
+}
+
+/// Finalize a single accumulator to its scalar value, for `$setWindowFields`
+/// (one value per output field per row, not a whole group doc). Differs from
+/// `finalize` only in that `$avg` over no non-null value yields `Null` rather
+/// than an absent field — mongod's `$setWindowFields` writes the window's
+/// empty/degenerate value (`_empty_window_value`) into every row. Because a
+/// fresh accumulator applied over zero window docs already lands on those
+/// defaults (`$sum`/`$count` -> 0, `$push`/`$addToSet` -> [], everything else
+/// -> Null), the empty-window case needs no special path.
+pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
+    Ok(match acc {
+        Acc::Sum(n) => n.to_bson()?,
+        Acc::Count(n) => int_to_bson(n as i128).ok_or(())?,
+        Acc::Avg(state) => match state {
+            Some((total, count)) => {
+                let tf = match total {
+                    Num::Int { v: a, .. } => {
+                        if a.unsigned_abs() > (1u128 << 53) {
+                            return Err(()); // precision: defer to Python int/int divide
+                        }
+                        a as f64
+                    }
+                    Num::Float(f) => f,
+                };
+                Bson::Double(tf / count as f64)
+            }
+            None => Bson::Null,
+        },
+        Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),
+        Acc::First(v) | Acc::Last(v) => v.unwrap_or(Bson::Null),
+        Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list),
+    })
 }
 
 /// Compile the accumulator specs (each must be a single-op doc) and run the

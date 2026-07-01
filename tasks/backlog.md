@@ -1235,15 +1235,18 @@ From the `Fallback`-site audit (#2): constructs the Python server supports but t
 Rust core defers (so they error on the Rust server). None are *correctness* bugs —
 the actionable gauge tail is closed; these are feature completeness. **Shipped since
 the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#76),
-`$unionWith` (#77). **Remaining:**
+`$unionWith` (#77), `$fill` (#123), `$toDecimal` + `$convert` (#132),
+`$setWindowFields` (bounded: rank funcs + `$group` accumulators over document-based
+windows; range windows / time-series ops defer). **Remaining:**
 
-- [ ] **Expression operators:** `$convert` (general type conversion), `$dateFromString`
-  (date parsing), `$toDecimal` (Decimal128 construction — the deferred edge type), and
-  the regex family `$regexFind` / `$regexFindAll` / `$regexMatch` (could reuse the query
-  `$regex` `fancy-regex` path; regex parity vs Python `re` is the documented hard-defer
-  class).
-- [ ] **Aggregate stages:** `$setWindowFields` (partitioning + window functions —
-  large) and `$fill` (locf / linear gap-filling — a command-layer stage like `$unionWith`).
+- [ ] **Expression operators:** `$dateFromString` (date parsing — tz-aware/naive and
+  format-string parity vs Python is the hazard) and the regex family `$regexFind` /
+  `$regexFindAll` / `$regexMatch` (could reuse the query `$regex` `fancy-regex` path;
+  regex parity vs Python `re` is the documented hard-defer class).
+- [ ] **Aggregate stages:** `$setWindowFields` range-based windows + time-series window
+  operators (`$shift` / `$integral` / `$derivative` / `$expMovingAvg` / ...) — the
+  bounded port ships the common document-window + rank/accumulator subset and defers
+  these to Python.
 - [ ] **Query operator:** `$jsonSchema` (document-level; complex JSON-Schema subset).
 
 ## SQL / PostgreSQL interface — P0 spike limitations

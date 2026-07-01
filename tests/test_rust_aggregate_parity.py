@@ -311,6 +311,128 @@ def test_fill_parity(docs, pipeline):
     assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
 
 
+@pytest.mark.parametrize(
+    "docs,pipeline",
+    [
+        # Rank trio with a tie (sorted 10, 10, 20). $documentNumber 1/2/3;
+        # $rank 1/1/3 (gap on tie); $denseRank 1/1/2 (no gap). Output stays in
+        # input order.
+        (
+            [{"_id": 1, "s": 10}, {"_id": 2, "s": 20}, {"_id": 3, "s": 10}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"s": 1},
+                        "output": {
+                            "dn": {"$documentNumber": {}},
+                            "rk": {"$rank": {}},
+                            "dr": {"$denseRank": {}},
+                        },
+                    }
+                }
+            ],
+        ),
+        # Running sum over ["unbounded", "current"] → 1, 3, 6.
+        (
+            [{"_id": 1, "t": 1, "v": 1}, {"_id": 2, "t": 2, "v": 2}, {"_id": 3, "t": 3, "v": 3}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "run": {"$sum": "$v", "window": {"documents": ["unbounded", "current"]}}
+                        },
+                    }
+                }
+            ],
+        ),
+        # Sliding avg over [-1, 0] → 1.0, 1.5, 2.5 (clean doubles).
+        (
+            [{"_id": 1, "t": 1, "v": 1}, {"_id": 2, "t": 2, "v": 2}, {"_id": 3, "t": 3, "v": 3}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"m": {"$avg": "$v", "window": {"documents": [-1, 0]}}},
+                    }
+                }
+            ],
+        ),
+        # partitionBy expression + whole-partition (default) window sum: each row
+        # gets its partition total (a:3, b:10). No sortBy.
+        (
+            [
+                {"_id": 1, "g": "a", "v": 1},
+                {"_id": 2, "g": "b", "v": 10},
+                {"_id": 3, "g": "a", "v": 2},
+            ],
+            [{"$setWindowFields": {"partitionBy": "$g", "output": {"tot": {"$sum": "$v"}}}}],
+        ),
+        # $push over ["unbounded", "current"] within a partition.
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": "x"},
+                {"_id": 2, "g": "a", "t": 2, "v": "y"},
+                {"_id": 3, "g": "b", "t": 1, "v": "z"},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "hist": {
+                                "$push": "$v",
+                                "window": {"documents": ["unbounded", "current"]},
+                            }
+                        },
+                    }
+                }
+            ],
+        ),
+        # $min/$max/$first/$last over the whole (sorted) partition.
+        (
+            [{"_id": 1, "t": 2, "v": 5}, {"_id": 2, "t": 1, "v": 3}, {"_id": 3, "t": 3, "v": 9}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "mn": {"$min": "$v"},
+                            "mx": {"$max": "$v"},
+                            "f": {"$first": "$v"},
+                            "l": {"$last": "$v"},
+                        },
+                    }
+                }
+            ],
+        ),
+    ],
+)
+def test_set_window_fields_parity(docs, pipeline):
+    docs = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, f"expected Rust $setWindowFields to handle {pipeline}"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+
+
+def test_set_window_fields_range_window_defers():
+    # range-based windows are not ported (mongod-valid but unimplemented) → the
+    # Rust stage defers rather than guessing.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "t": 1, "v": 1}]}))["d"]
+    pipeline = [
+        {
+            "$setWindowFields": {
+                "sortBy": {"t": 1},
+                "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+            }
+        }
+    ]
+    assert _rust_pipeline(docs, pipeline) is None
+
+
 @pytest.mark.parametrize("direction", [1, -1])
 def test_sort_mixed_types(direction):
     docs = bson.decode(bson.encode({"d": SORT_DOCS}))["d"]

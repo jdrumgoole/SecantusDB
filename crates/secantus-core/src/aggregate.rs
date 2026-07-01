@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 
 use crate::collation::Collation;
 use crate::numeric::{as_int_like, int_to_bson};
-use crate::{densify, expressions, fill, group, order, paths, query};
+use crate::{densify, expressions, fill, group, order, paths, query, windowfields};
 
 #[derive(Debug)]
 pub struct Fallback;
@@ -129,6 +129,9 @@ fn apply_stage(
         "$facet" => facet_stage(spec, docs, vars, coll),
         "$densify" => densify::densify_stage(spec, &docs).map_err(|_| Fallback),
         "$fill" => fill::fill_stage(spec, docs, vars).map_err(|_| Fallback),
+        "$setWindowFields" => {
+            windowfields::set_window_fields_stage(spec, docs, vars).map_err(|_| Fallback)
+        }
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
         _ => Err(Fallback),
     }

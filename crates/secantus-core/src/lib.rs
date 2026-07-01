@@ -39,6 +39,7 @@ mod group;
 mod numeric;
 mod order;
 mod paths;
+mod windowfields;
 
 // Re-export the read-only dotted-path helpers (only) so the Rust storage layer's
 // index-key builders can resolve `key_spec` fields against documents, mirroring
