@@ -13,6 +13,7 @@ Only the P0 subset is handled; anything outside it raises a
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -399,6 +400,16 @@ class SubqueryCtx:
     session: Any
 
 
+# The single-table pushdown path threads a SubqueryCtx explicitly. The pipeline
+# planners (join / GROUP BY / evaluated / DISTINCT) call `_where_filter` from many
+# places, so `plan_pipeline_select` publishes the context here for the duration of
+# planning and every `_where_filter` picks it up — one set-point, no signature
+# churn. Planning-scoped and reset in a finally.
+_pipeline_subctx: contextvars.ContextVar[SubqueryCtx | None] = contextvars.ContextVar(
+    "pipeline_subctx", default=None
+)
+
+
 def _subquery_select(node: exp.Expression) -> exp.Expression:
     return node.this if isinstance(node, exp.Subquery) else node
 
@@ -685,7 +696,12 @@ def _where_filter(
     stmt: exp.Expression, table: TableDef, subctx: SubqueryCtx | None = None
 ) -> dict[str, Any]:
     where = stmt.args.get("where")
-    return _expr_to_filter(where.this, table_resolver(table), subctx) if where is not None else {}
+    if where is None:
+        return {}
+    # The pipeline planners don't thread `subctx`; fall back to the one published
+    # by `plan_pipeline_select` so WHERE subqueries work there too.
+    ctx = subctx or _pipeline_subctx.get()
+    return _expr_to_filter(where.this, table_resolver(table), ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1427,6 +1443,18 @@ def _lookup_table_def(
 def plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
+    # Publish the subquery context so any WHERE `$match` in the pipeline planners
+    # can evaluate a scalar / IN subquery (the same as the single-table pushdown).
+    token = _pipeline_subctx.set(SubqueryCtx(storage=storage, db=db, catalog=catalog, session=None))
+    try:
+        return _plan_pipeline_select(stmt, db, catalog, storage)
+    finally:
+        _pipeline_subctx.reset(token)
+
+
+def _plan_pipeline_select(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+) -> PipelineSelectPlan | EvaluatedSelectPlan:
     if stmt.args.get("joins"):
         has_agg = any(
             _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
@@ -2055,7 +2083,7 @@ def _build_join_pipeline(
     resolve = _join_resolver(amap)
     where = stmt.args.get("where")
     if where is not None:
-        pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
+        pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
     return base, amap, resolve, pipeline, derived
 
 
@@ -2109,7 +2137,7 @@ def _build_outer_join_pipeline(
     resolve = _join_resolver(amap)
     where = stmt.args.get("where")
     if where is not None:
-        pipeline.append({"$match": _expr_to_filter(where.this, resolve)})
+        pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
     return base, amap, resolve, pipeline, derived
 
 

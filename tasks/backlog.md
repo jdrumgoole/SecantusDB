@@ -1424,7 +1424,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   is honoured — a false predicate yields zero rows (`ConstantSelectPlan.emit`), so a recursive-CTE
   anchor like `SELECT 1 WHERE 1=0` works; a column reference with no FROM → `42703`. (3) The jsonb `<@`
   (contained-by) operator lands in its pushable `const <@ field` form (== `field @> const`,
-  `_jsonb_contains_filter`); `field <@ const` (subset-of-a-constant) stays `0A000`. Postgres orders NULL as the largest value (ASC →
+  `_jsonb_contains_filter`); `field <@ const` (subset-of-a-constant) stays `0A000`.
+- [ ] **WHERE subqueries in the pipeline paths landed** (b59). The single-table pushdown always threaded
+  a `SubqueryCtx`, but the pipeline planners (JOIN / GROUP BY / evaluated / DISTINCT) called
+  `_where_filter` from many places without one, so a WHERE scalar/`IN` subquery there was `0A000`.
+  `plan_pipeline_select` now publishes the context via a planning-scoped `contextvars.ContextVar`
+  (`_pipeline_subctx`, reset in a finally) that `_where_filter` / the join `$match` pick up — one
+  set-point, no signature churn. So `WHERE x OP (SELECT …)` / `x IN (SELECT …)` work in JOIN / GROUP BY /
+  scalar-expr queries and in a recursive-CTE term's WHERE (session is None on that path — data
+  subqueries don't need it). Correlated subqueries in a pipeline are still `0A000` (single-table only).
+- [ ] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
   NULLs last, DESC → NULLs first) with `NULLS FIRST`/`NULLS LAST` overriding; Mongo sort treats
   NULL/missing as the *smallest*, so the SQL layer no longer delegates NULL placement to storage.
   `planner._nulls_first` reads sqlglot's per-term flag (already PG-defaulted); the single-table,

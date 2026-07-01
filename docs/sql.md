@@ -220,9 +220,13 @@ ORDER BY price * qty DESC;
 SELECT coalesce(nickname, name) || ' (' || length(name) || ')' AS label FROM users;
 
 -- Non-correlated subqueries in WHERE: IN / NOT IN over a single column, and a
--- scalar `= (SELECT ...)`. The inner query runs first (it may aggregate/filter).
+-- scalar `OP (SELECT ...)`. The inner query runs first (it may aggregate/filter).
+-- These work in every query shape — a plain SELECT, or one that also JOINs /
+-- GROUP BYs / has computed columns.
 SELECT name FROM customers WHERE id IN (SELECT cust_id FROM orders WHERE total > 100);
 SELECT name FROM customers WHERE id = (SELECT max(cust_id) FROM orders);
+SELECT c.region, sum(o.total) FROM orders o JOIN customers c ON o.cust_id = c.id
+WHERE o.total > (SELECT avg(total) FROM orders) GROUP BY c.region;
 
 -- EXISTS / NOT EXISTS and correlated subqueries (the inner query references the
 -- outer row) are evaluated per row: each candidate row is tested against the
