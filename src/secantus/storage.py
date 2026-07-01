@@ -870,7 +870,25 @@ class Storage:
             #
             # ``file_max=10MB`` bounds journal segment size; smaller
             # files churn the log more, larger files delay reclamation.
-            # 10 MB matches mongod's WT default.
+            # 10 MB matches mongod's WT default. (Kept at 10 MB, not
+            # smaller: a single log record must fit in one segment, and a
+            # write of a near-``maxBsonObjectSize`` (16 MB) document needs
+            # headroom.)
+            #
+            # ``prealloc=false`` disables WT's log-file pre-allocation.
+            # By default WT's log server keeps two ``file_max``-sized
+            # ``WiredTigerPreplog`` files ready ahead of the active log, so
+            # every on-disk instance costs ~3x ``file_max`` (~30 MB here)
+            # of log space even for a database holding a few KB. That
+            # pre-allocation is a write-latency optimisation for
+            # sustained-throughput servers; SecantusDB is an ephemeral
+            # in-process test database whose instances are small and
+            # short-lived, so the latency win is irrelevant and the disk
+            # cost is not — a full test run spins up thousands of
+            # instances. Disabling prealloc drops each instance's log
+            # footprint from ~30 MB to ~10 MB with no durability change
+            # (recovery still replays the same log records); WT just
+            # allocates each segment on demand instead of ahead of time.
             sync_part = (
                 "transaction_sync=(enabled=true,method=fsync)"
                 if sync_on_commit
@@ -878,7 +896,7 @@ class Storage:
             )
             config = (
                 f"create,session_max={session_max},cache_size={cache_size},"
-                f"log=(enabled=true,file_max=10MB),"
+                f"log=(enabled=true,file_max=10MB,prealloc=false),"
                 f"{sync_part}"
             )
         # The on-disk WT home is stashed so ``create_archive`` can tar
