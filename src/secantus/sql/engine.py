@@ -399,19 +399,21 @@ class _CTECatalog(Catalog):
 def _run_with(
     stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
-    """Run a ``WITH name AS (...) [, ...] <query>`` statement (non-recursive CTEs).
+    """Run a ``WITH name AS (...) [, ...] <query>`` statement.
 
     Each CTE is materialized to rows and registered as an ephemeral collection on
     a ``CatalogBackend``; a catalog overlay maps the CTE names to TableDefs built
     from each inner query's result shape. The WITH is then stripped and the main
-    query runs against that backend + overlay, so CTE names resolve like tables
-    in every path (single-table, pipeline/join, set operations). CTEs are
-    materialized in order, so a later CTE may reference an earlier one."""
+    statement runs against that backend + overlay, so CTE names resolve like
+    tables in every path (single-table, pipeline/join, set operations, and the
+    ``INSERT``/``UPDATE``/``DELETE`` write bodies). CTEs are materialized in
+    order, so a later CTE may reference an earlier one."""
     with_node = _own_with(stmt)
     recursive = bool(with_node.args.get("recursive"))
-    if not isinstance(stmt, (exp.Select, exp.SetOperation)):
+    is_write = isinstance(stmt, (exp.Insert, exp.Update, exp.Delete))
+    if not isinstance(stmt, (exp.Select, exp.SetOperation)) and not is_write:
         raise errors.feature_not_supported(
-            "WITH is supported only with SELECT / set-operation queries"
+            "WITH is supported only with SELECT / set-operation / INSERT / UPDATE / DELETE"
         )
 
     backend = virtual.CatalogBackend(storage, catalog, session, db)
@@ -430,7 +432,19 @@ def _run_with(
             result = _run_query(cte.this, backend, db, cte_catalog, session)
         _register_cte(backend, cte_defs, name, result.columns, result.rows, col_aliases)
 
-    with_node.pop()  # detach the WITH so the main query plans as a plain statement
+    with_node.pop()  # detach the WITH so the body plans as a plain statement
+    if is_write:
+        # A write body reads CTEs through the backend (INSERT … SELECT FROM cte)
+        # or a WHERE subquery over one. Publish the CTE-aware context so an UPDATE
+        # / DELETE WHERE subquery resolves the CTE, and dispatch the write against
+        # the backend (its writes forward to real storage) + overlay catalog.
+        token = planner._pipeline_subctx.set(
+            planner.SubqueryCtx(storage=backend, db=db, catalog=cte_catalog, session=session)
+        )
+        try:
+            return _run_statement(stmt, backend, db, cte_catalog, session)
+        finally:
+            planner._pipeline_subctx.reset(token)
     return _run_query(stmt, backend, db, cte_catalog, session)
 
 

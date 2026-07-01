@@ -182,6 +182,26 @@ def test_insert_select_via_driver(server):
     conn.close()
 
 
+def test_with_insert_via_driver(server):
+    # WITH ... INSERT ... SELECT FROM cte over the real driver.
+    server.storage.insert(
+        "db",
+        "src",
+        [{"_id": bson.Int64(i), "n": bson.Int64(v)} for i, v in [(1, 10), (2, 40)]],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE dst (id bigint primary key, n int)")
+    cur.execute(
+        "WITH big AS (SELECT _id, n FROM src WHERE n >= 20) "
+        "INSERT INTO dst (id, n) SELECT _id, n FROM big"
+    )
+    assert cur.rowcount == 1
+    cur.execute("SELECT id, n FROM dst ORDER BY id")
+    assert cur.fetchall() == ([2, 40],)
+    conn.close()
+
+
 def test_on_conflict_via_driver(server):
     # INSERT ... ON CONFLICT DO UPDATE upsert through the real driver.
     conn = connect(server)

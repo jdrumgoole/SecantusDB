@@ -402,8 +402,16 @@ WITH RECURSIVE chain(id, name, lvl) AS (
 SELECT id, name, lvl FROM chain ORDER BY id;
 ```
 
-A `WITH` prefix is accepted only on a `SELECT` / set-operation query (not on
-`INSERT` / `UPDATE` / `DELETE`).
+A `WITH` prefix also works on a write: `WITH cte AS (…) INSERT INTO t SELECT …
+FROM cte`, and an `UPDATE` / `DELETE` whose `WHERE` has a subquery over a CTE.
+
+```sql
+WITH recent AS (SELECT id FROM events WHERE ts > '2024-01-01')
+DELETE FROM events WHERE id IN (SELECT id FROM recent);
+
+WITH totals AS (SELECT cust_id, sum(total) AS spent FROM orders GROUP BY cust_id)
+INSERT INTO summary (cust_id, spent) SELECT cust_id, spent FROM totals;
+```
 
 ## Window functions
 
@@ -771,7 +779,7 @@ constraints. Column comments aren't stored, so they reflect as `None`.
 |---|---|---|
 | DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | `MERGE`, `ON CONFLICT ON CONSTRAINT` |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
-| CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries | `WITH` on `INSERT`/`UPDATE`/`DELETE` |
+| CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` | `WITH RECURSIVE` on a write body |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
