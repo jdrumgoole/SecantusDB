@@ -1418,7 +1418,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   any `11000` duplicate. Command tag counts rows inserted *or* updated (skipped don't count); `RETURNING`
   projects the inserted + updated rows. **Still unsupported:** `ON CONFLICT ON CONSTRAINT <name>` (→
   `0A000`; no named-constraint registry), `DO UPDATE` with no conflict target (→ `42601`), `MERGE`.
-- [ ] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
+- [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
+  (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
+  (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`
+  is honoured — a false predicate yields zero rows (`ConstantSelectPlan.emit`), so a recursive-CTE
+  anchor like `SELECT 1 WHERE 1=0` works; a column reference with no FROM → `42703`. (3) The jsonb `<@`
+  (contained-by) operator lands in its pushable `const <@ field` form (== `field @> const`,
+  `_jsonb_contains_filter`); `field <@ const` (subset-of-a-constant) stays `0A000`. Postgres orders NULL as the largest value (ASC →
   NULLs last, DESC → NULLs first) with `NULLS FIRST`/`NULLS LAST` overriding; Mongo sort treats
   NULL/missing as the *smallest*, so the SQL layer no longer delegates NULL placement to storage.
   `planner._nulls_first` reads sqlglot's per-term flag (already PG-defaulted); the single-table,

@@ -246,8 +246,10 @@ def _apply_conflict_update(
 
 def execute_constant_select(plan: planner.ConstantSelectPlan) -> SQLResult:
     columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag, _ in plan.columns]
-    row = tuple(value for _, _, value in plan.columns)
-    return SQLResult(command_tag="SELECT 1", columns=columns, rows=[row], rowcount=1)
+    rows = [tuple(value for _, _, value in plan.columns)] if plan.emit else []
+    return SQLResult(
+        command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
+    )
 
 
 def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult:

@@ -93,9 +93,12 @@ class InsertPlan:
 
 @dataclass
 class ConstantSelectPlan:
-    # A FROM-less ``SELECT <literals>`` — one row, no storage access. The
-    # headline P1 case (``SELECT 1``) and the seed for ``SELECT version()`` etc.
+    # A FROM-less ``SELECT <expr>, ...`` — no storage access. The headline P1 case
+    # (``SELECT 1``), ``SELECT version()``, and constant expressions (``SELECT
+    # 1 + 1``). ``emit`` is False when a constant ``WHERE`` evaluates false, so the
+    # result has the column shape but zero rows.
     columns: list[tuple[str, str, Any]]  # (out_name, type_tag, python_value)
+    emit: bool = True
 
 
 @dataclass
@@ -594,12 +597,16 @@ def _expr_to_filter(
         return _jsonb_contains_filter(field, _json_value(node.expression))
 
     if isinstance(node, exp.ArrayContainedBy):  # jsonb <@ (contained by)
-        # "field is a subset of <constant>" is a constraint on the stored value's
-        # whole shape, not a value lookup, so it can't be pushed down as a Mongo
-        # filter. Faithful not-supported beats a silent divergence.
+        # ``const <@ field`` is exactly ``field @> const`` (the field contains the
+        # constant), which pushes down. ``field <@ const`` is a subset constraint
+        # on the stored value's whole shape — not a value lookup — so it can't
+        # lower to a Mongo filter; faithful not-supported beats a silent divergence.
+        if _is_field_node(node.expression) and _is_literalish(node.this):
+            field, _ = _field(node.expression, resolve)
+            return _jsonb_contains_filter(field, _json_value(node.this))
         raise errors.feature_not_supported(
-            "the jsonb <@ (contained by) operator is not supported; "
-            "rewrite as <constant> @> field where possible"
+            "the jsonb <@ (contained by) operator is only supported as "
+            "<constant> <@ field (equivalently field @> <constant>)"
         )
 
     if isinstance(node, exp.JSONBContains):  # jsonb ? (top-level key / element exists)
@@ -967,17 +974,28 @@ def _infer_value_tag(value: Any) -> str:
 _LITERAL_NODES = (exp.Literal, exp.Boolean, exp.Null, exp.Neg, exp.Paren)
 
 
+def _const_scope(node: exp.Expression) -> Any:
+    """The scope for a FROM-less SELECT: any column reference is undefined."""
+    name = node.name if isinstance(node, exp.Column) else node.sql()
+    raise errors.undefined_column(name)
+
+
 def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
-    """Plan a FROM-less ``SELECT <literal | function>, ...`` into one row.
+    """Plan a FROM-less ``SELECT <expr>, ... [WHERE <const>]``.
 
     Literals are read directly; session/info functions (``version()``,
     ``current_database()``, ``current_setting(...)``, ...) resolve against the
-    connection ``session``.
+    connection ``session``; any other constant expression (arithmetic, ``||``,
+    function calls, ``CASE`` …) is evaluated by the scalar evaluator against an
+    empty scope. A constant ``WHERE`` that evaluates false yields zero rows.
     """
-    from secantus.sql import functions
+    from secantus.sql import functions, scalar
 
-    if stmt.args.get("where") or stmt.args.get("group") or stmt.args.get("joins"):
+    if stmt.args.get("group") or stmt.args.get("joins"):
         raise errors.feature_not_supported("FROM-less SELECT supports only constant projections")
+    ctx = scalar.ScalarContext(storage=None, catalog=None, db=None, session=session)
+    where = stmt.args.get("where")
+    emit = where is None or scalar._truthy(scalar.evaluate(where.this, _const_scope, ctx))
     columns: list[tuple[str, str, Any]] = []
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -989,8 +1007,9 @@ def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
             fname, value, tag = functions.evaluate_scalar(target, session)
             columns.append((alias or fname, tag, value))
         else:
-            raise errors.feature_not_supported(f"unsupported FROM-less projection: {target.sql()}")
-    return ConstantSelectPlan(columns=columns)
+            value = scalar.evaluate(target, _const_scope, ctx)
+            columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
+    return ConstantSelectPlan(columns=columns, emit=emit)
 
 
 def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = None) -> SelectPlan:
