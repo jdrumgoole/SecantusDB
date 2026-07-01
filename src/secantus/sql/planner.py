@@ -88,7 +88,7 @@ class OnConflict:
 class InsertPlan:
     table: TableDef
     docs: list[dict[str, Any]]
-    returning: list[tuple[str, Column]] | None = None
+    returning: list[tuple[str, Column, Any]] | None = None
     on_conflict: OnConflict | None = None
 
 
@@ -138,14 +138,14 @@ class UpdatePlan:
     table: TableDef
     filter: dict[str, Any]
     update: dict[str, Any]
-    returning: list[tuple[str, Column]] | None = None
+    returning: list[tuple[str, Column, Any]] | None = None
 
 
 @dataclass
 class DeletePlan:
     table: TableDef
     filter: dict[str, Any]
-    returning: list[tuple[str, Column]] | None = None
+    returning: list[tuple[str, Column, Any]] | None = None
 
 
 Plan = CreateTablePlan | DropTablePlan | InsertPlan | SelectPlan | UpdatePlan | DeletePlan
@@ -1110,14 +1110,46 @@ def _select_out_columns(stmt: exp.Select, table: TableDef) -> list[tuple[str, Co
     return _out_columns(stmt.expressions, table)
 
 
-def _returning_columns(stmt: exp.Expression, table: TableDef) -> list[tuple[str, Column]] | None:
-    """The projected columns for a write statement's ``RETURNING`` clause, or
-    None when there is no ``RETURNING``. Supports ``*``, column references (with
-    aliases), and jsonb navigation — the same projection vocabulary as SELECT."""
+def _returning_columns(
+    stmt: exp.Expression, table: TableDef
+) -> list[tuple[str, Column, Any]] | None:
+    """The projected items for a write statement's ``RETURNING`` clause, or None
+    when there's no ``RETURNING``. Each item is ``(name, Column, expr)``: ``expr``
+    is None for a plain column / ``*`` / jsonb path (read straight from the doc);
+    for a computed expression (arithmetic, ``||``, function calls, ``CASE`` …) it
+    is the raw node, evaluated per returned row by the executor."""
     returning = stmt.args.get("returning")
     if returning is None:
         return None
-    return _out_columns(returning.expressions, table)
+    items: list[tuple[str, Column, Any]] = []
+    resolve = table_resolver(table)
+    for e in returning.expressions:
+        if isinstance(e, exp.Star):
+            items.extend((col.name, col, None) for col in table.columns)
+            continue
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, exp.Column):
+            cname = _column_name(target)
+            col = table.column(cname)
+            if col is None:
+                if table.reflected:
+                    col = Column(cname, "any", cname, pk=False, nullable=True)
+                else:
+                    raise errors.undefined_column(cname)
+            items.append((alias or cname, col, None))
+        elif isinstance(target, _JSONB_CLASSES):
+            path, tag = _field(target, resolve)
+            out_name = alias or "?column?"
+            items.append((out_name, Column(out_name, tag, path, pk=False, nullable=True), None))
+        else:
+            # A computed expression — evaluated per returned row (field unused).
+            out_name = alias or "?column?"
+            tag = _infer_scalar_tag(target, resolve)
+            items.append(
+                (out_name, Column(out_name, tag, out_name, pk=False, nullable=True), target)
+            )
+    return items
 
 
 def where_needs_per_row(stmt: exp.Select) -> bool:

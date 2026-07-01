@@ -95,6 +95,11 @@ def test_returning_via_driver(server):
     assert cur.fetchall() == ([1, "a", 99],)
     cur.execute("SELECT id FROM t ORDER BY id")
     assert cur.fetchall() == ([2],)
+    # A computed RETURNING expression, evaluated per returned row.
+    cur.execute(
+        "INSERT INTO t (id, name, n) VALUES (3, 'c', 4) RETURNING n * 2 AS dbl, upper(name)"
+    )
+    assert cur.fetchall() == ([8, "C"],)
     conn.close()
 
 
