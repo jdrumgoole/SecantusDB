@@ -47,7 +47,7 @@ jobs:
           # (extra toolchain steps below).
           - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
@@ -63,10 +63,10 @@ jobs:
 
       - name: Install Rust toolchain
         if: matrix.driver.name == 'pymongo-rust-server'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
         with:
           enable-cache: true
 
@@ -95,7 +95,7 @@ jobs:
 
       - name: Cache test-libmongoc build
         if: matrix.driver.name == 'c'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           # The from-source build (~several min cold) is the dominant cost.
           # Pin the cache to the vendored driver SHA so a submodule bump
@@ -114,7 +114,7 @@ jobs:
 
       - name: Cache libmongoc install + mongocxx build
         if: matrix.driver.name == 'cxx'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           # The libmongoc install + mongocxx build (~10-15 min cold) dominate.
           # Pin to both vendored driver versions so either bump rebuilds.
@@ -132,13 +132,13 @@ jobs:
       # targets net10.0.
       - name: Set up .NET SDK
         if: matrix.driver.name == 'dotnet'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4
         with:
           dotnet-version: "10.0.x"
 
       - name: Cache NuGet packages
         if: matrix.driver.name == 'dotnet'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           path: ~/.nuget/packages
           key: ${{ runner.os }}-nuget-${{ hashFiles('vendor/mongo-csharp-driver/**/*.csproj', 'vendor/mongo-csharp-driver/**/Directory.Packages.props') }}
@@ -147,13 +147,13 @@ jobs:
 
       - name: Set up Go
         if: matrix.driver.name == 'go'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6
         with:
           go-version: "1.25"
 
       - name: Cache Go modules + build
         if: matrix.driver.name == 'go'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           path: |
             ~/go/pkg/mod
@@ -170,13 +170,13 @@ jobs:
 
       - name: Set up Node.js
         if: matrix.driver.name == 'node'
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: "22"
 
       - name: Cache node_modules
         if: matrix.driver.name == 'node'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           path: vendor/node-mongodb-native/node_modules
           key: ${{ runner.os }}-node-modules-${{ hashFiles('vendor/node-mongodb-native/package-lock.json') }}
@@ -185,14 +185,14 @@ jobs:
 
       - name: Set up JDK
         if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin'
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520  # v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
         if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           path: |
             ~/.gradle/caches
@@ -208,14 +208,14 @@ jobs:
 
       - name: Set up Ruby
         if: matrix.driver.name == 'ruby'
-        uses: ruby/setup-ruby@v1
+        uses: ruby/setup-ruby@0dafeac902942906541bc140009cdbf32665b601  # v1
         with:
           ruby-version: "3.3"
           bundler-cache: false  # gems installed via runner's bundle install
 
       - name: Cache Ruby bundle
         if: matrix.driver.name == 'ruby'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           path: vendor/mongo-ruby-driver/.bundle
           key: ${{ runner.os }}-ruby-bundle-${{ hashFiles('vendor/mongo-ruby-driver/Gemfile.lock') }}
@@ -224,7 +224,7 @@ jobs:
 
       - name: Set up Rust
         if: matrix.driver.name == 'rust'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
           # mongo-rust-driver's MSRV is 1.88; stable on Actions is
           # ahead of that as of writing.
@@ -232,7 +232,7 @@ jobs:
 
       - name: Cache cargo registry + target
         if: matrix.driver.name == 'rust'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
         with:
           path: |
             ~/.cargo/registry
@@ -249,7 +249,7 @@ jobs:
       # so the .phpt tests stay version-aligned.
       - name: Set up PHP
         if: startsWith(matrix.driver.name, 'php-')
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240  # v2
         with:
           php-version: "8.3"
           extensions: mongodb-2.3.1
@@ -262,7 +262,7 @@ jobs:
         run: head -50 ${{ matrix.driver.report }}
 
       - name: Upload report artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: report-${{ matrix.driver.name }}
           path: ${{ matrix.driver.report }}
@@ -280,10 +280,10 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
 
       - name: Download all report artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7
         with:
           path: artifacts
 
