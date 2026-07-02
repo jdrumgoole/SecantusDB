@@ -1240,6 +1240,24 @@ def test_column_default_and_alter_type_via_driver(server):
     conn.close()
 
 
+def test_comment_reflection_via_driver(server):
+    # COMMENT ON TABLE / COLUMN reflected through SQLAlchemy's inspector.
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE t (id bigint primary key, n int)"))
+            conn.execute(sa.text("COMMENT ON TABLE t IS 'my table'"))
+            conn.execute(sa.text("COMMENT ON COLUMN t.n IS 'the n col'"))
+        insp = sa.inspect(engine)
+        assert insp.get_table_comment("t") == {"text": "my table"}
+        cols = {c["name"]: c.get("comment") for c in insp.get_columns("t")}
+        assert cols["n"] == "the n col"
+    finally:
+        engine.dispose()
+
+
 def test_alter_add_foreign_key_via_driver(server):
     # ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY, reflected via SQLAlchemy.
     sa = pytest.importorskip("sqlalchemy")

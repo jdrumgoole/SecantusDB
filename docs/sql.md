@@ -273,6 +273,18 @@ insp.get_foreign_keys("orders")
 also be added after the fact with `ALTER TABLE … ADD [CONSTRAINT name] FOREIGN
 KEY (…) REFERENCES …`.
 
+### Comments (`COMMENT ON`)
+
+`COMMENT ON TABLE` / `COMMENT ON COLUMN` attach a description that reflects
+through `pg_description` — SQLAlchemy's `get_table_comment()` and the `comment`
+field of `get_columns()`:
+
+```sql
+COMMENT ON TABLE users IS 'application users';
+COMMENT ON COLUMN users.email IS 'primary contact address';
+COMMENT ON COLUMN users.email IS NULL;   -- remove the comment
+```
+
 ## Querying
 
 `WHERE` supports the common operators; they lower to the same match engine the
@@ -1090,11 +1102,11 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` declared-not-enforced, literal column `DEFAULT`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] FOREIGN KEY`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | multi-action `ALTER`, `ADD` CHECK/UNIQUE constraint, non-literal / expression DEFAULT, enforced constraints, views |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` declared-not-enforced, literal column `DEFAULT`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] FOREIGN KEY`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`), `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, `ADD` CHECK/UNIQUE constraint, non-literal / expression DEFAULT, enforced constraints, views |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
-| Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`) | column comments, FK reflection (no FKs modeled) |
+| Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`, `get_foreign_keys`, `get_table_comment` + column comments) | `get_check_constraints`, `get_unique_constraints` |
 
 Anything outside the supported set returns a faithful SQLSTATE error rather than
 a wrong answer — the same "honest *not supported* over a half-feature" discipline

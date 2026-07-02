@@ -205,6 +205,28 @@ def _to_regtype(name: Any) -> int | None:
     return None
 
 
+# Catalog-relation OIDs for ``'pg_catalog.pg_class'::regclass``-style casts (used
+# by SQLAlchemy's get_table_comment join on ``pg_description.classoid``).
+_REGCLASS_OIDS = {
+    "pg_class": 1259,
+    "pg_type": 1247,
+    "pg_attribute": 1249,
+    "pg_constraint": 2606,
+    "pg_namespace": 2615,
+    "pg_index": 2610,
+    "pg_description": 2609,
+    "pg_proc": 1255,
+}
+
+
+def _regclass_oid(value: Any) -> Any:
+    """``<name>::regclass`` → the catalog relation's OID (unchanged if unknown)."""
+    if not isinstance(value, str):
+        return value
+    name = value.rsplit(".", 1)[-1].strip('"')
+    return _REGCLASS_OIDS.get(name, value)
+
+
 def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
     """Coerce a value to a Python number when a CAST targets a numeric type.
 
@@ -213,6 +235,8 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
     """
     if value is None or datatype is None:
         return value
+    if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGCLASS":
+        return _regclass_oid(value)
     tag = typemap.type_tag_for_sql(datatype) if isinstance(datatype, exp.DataType) else None
     try:
         if tag in ("int4", "int8"):
@@ -3449,6 +3473,12 @@ _RELEASE_SAVEPOINT_RE = re.compile(r"(?i)\brelease\s+savepoint\b")
 # sqlglot's Postgres dialect can't parse ``MOVE`` (cursor positioning) at all, so
 # a lone MOVE statement is hand-built into the same ``Command`` shape FETCH gets.
 _MOVE_RE = re.compile(r"^\s*MOVE\b\s*(?P<tail>.*?)\s*;?\s*$", re.IGNORECASE | re.DOTALL)
+#: Placeholder substituted for a ``COMMENT ON … IS NULL`` (comment removal);
+#: ``executor.execute_comment`` reads it back as "remove the comment".
+UNCOMMENT_SENTINEL = "\x00__secantus_uncomment__"
+# Only a whole ``COMMENT ON … IS NULL`` statement — anchored so a query's
+# ``WHERE x IS NULL`` is never touched.
+_COMMENT_NULL_RE = re.compile(r"(?is)^(\s*COMMENT\s+ON\b.*\bIS\s+)NULL(\s*;?\s*)$")
 
 
 def parse(sql: str) -> list[exp.Expression]:
@@ -3460,6 +3490,10 @@ def parse(sql: str) -> list[exp.Expression]:
     # (the standard form SQLAlchemy / psycopg emit) — drop the redundant keyword.
     # Savepoint commands are standalone, so this can't touch a string literal.
     sql = _RELEASE_SAVEPOINT_RE.sub("RELEASE", sql)
+    # sqlglot can't parse ``COMMENT ON … IS NULL`` (it requires a string
+    # expression), so a NULL comment (comment removal) is rewritten to a sentinel
+    # the executor reads back as "remove". COMMENT statements are standalone.
+    sql = _COMMENT_NULL_RE.sub(lambda m: f"{m.group(1)}'{UNCOMMENT_SENTINEL}'{m.group(2)}", sql)
     try:
         return [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
     except sqlglot.errors.ParseError as exc:

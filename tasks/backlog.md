@@ -1547,7 +1547,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `information_schema.table_constraints`, `key_column_usage`, and `constraint_column_usage` (built from
   `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
   reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
-  resolves; `sequences` is present-but-empty (no sequences). Remaining: column comments.
+  resolves; `sequences` is present-but-empty (no sequences).
+- [ ] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
+  `Column.comment` (persisted in the catalog doc) by `executor.execute_comment` (dispatched on
+  `exp.Comment`), surfaced through `virtual._pg_description` (table comment → `objsubid 0`, column
+  comment → the column's attnum, `classoid` = pg_class 1259). SQLAlchemy's `get_table_comment()` and
+  the `comment` field of `get_columns()` reflect them. `COMMENT ON … IS NULL` removes the comment
+  (sqlglot can't parse a NULL comment expression, so `planner.parse` rewrites a whole `COMMENT ON … IS
+  NULL` statement — anchored so a query's `WHERE x IS NULL` is untouched — to an `UNCOMMENT_SENTINEL`
+  the executor reads as removal). `get_table_comment`'s join needs `'pg_catalog.pg_class'::regclass`, so
+  `_coerce_cast` now maps a `regclass` cast of a catalog relation name to its OID (`_REGCLASS_OIDS`).
 - [ ] **Foreign keys — declared, reflected, NOT enforced** (b81): column-level `col type REFERENCES
   t(c)` and table-level `FOREIGN KEY (c) REFERENCES t(c)` (incl. `ON DELETE` / `ON UPDATE` actions and
   the columnless `REFERENCES t` → target-PK form) are parsed by `planner._extract_foreign_keys`, stored

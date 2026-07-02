@@ -424,9 +424,37 @@ def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> li
     return []
 
 
+_PG_CLASS_OID = 1259  # the OID of the pg_class catalog itself (classoid for relations)
+
+
 def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    # No object comments — empty, but present so catalog joins resolve.
-    return []
+    # Object comments from COMMENT ON TABLE / COLUMN. A table comment has
+    # objsubid 0; a column comment's objsubid is the column's attnum. classoid is
+    # pg_class so SQLAlchemy's get_columns / get_table_comment joins line up.
+    oids = _table_oids(db, catalog)
+    rows: list[dict] = []
+    for t in _user_tables(db, catalog):
+        relid = oids[t.name]
+        if t.comment is not None:
+            rows.append(
+                {
+                    "objoid": relid,
+                    "classoid": _PG_CLASS_OID,
+                    "objsubid": 0,
+                    "description": t.comment,
+                }
+            )
+        for attnum, col in enumerate(t.columns, start=1):
+            if col.comment is not None:
+                rows.append(
+                    {
+                        "objoid": relid,
+                        "classoid": _PG_CLASS_OID,
+                        "objsubid": attnum,
+                        "description": col.comment,
+                    }
+                )
+    return rows
 
 
 def _pg_sequence(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
