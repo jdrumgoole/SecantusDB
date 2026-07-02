@@ -35,7 +35,19 @@ source_suffix = {
 }
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    # Nightly security-review output (docs/security-reports/**) is an
+    # internal artifact, not part of the published manual: the dated
+    # reports enumerate findings (some not yet fixed) that don't belong
+    # on the public RTD site, and they're intentionally not in any
+    # toctree. Excluding the whole directory keeps them browsable on
+    # GitHub while stopping each new report from tripping the -W build
+    # with a "document isn't included in any toctree" warning.
+    "security-reports/**",
+]
 
 html_theme = "furo"
 html_static_path = ["_static"]
