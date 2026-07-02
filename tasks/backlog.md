@@ -1589,9 +1589,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   leftover collection reflects as a phantom table), and `ALTER COLUMN … SET/DROP NOT NULL`.
   `ALTER TABLE IF EXISTS` on a missing table is a no-op; dropping the PK column is rejected
   (`0A000`). `execute_alter_table` / `_apply_alter_action` in `executor.py`; catalog rewrite via
-  `Catalog.replace`. **Limitations:** `ALTER COLUMN … TYPE`/`SET DEFAULT` and **multiple actions in
-  one statement** are unsupported — sqlglot parses a comma-separated action list (`ADD …, DROP …`)
-  as an opaque `Command`, so each action must be its own statement.
+  `Catalog.replace`. `ALTER COLUMN … TYPE t` (retype in catalog) and `SET`/`DROP DEFAULT` landed in
+  b84 (see below). **Limitation:** **multiple actions in one statement** are unsupported — sqlglot
+  parses a comma-separated action list (`ADD …, DROP …`) as an opaque `Command`, so each action must
+  be its own statement.
+- [ ] **Literal column DEFAULTs + `ALTER COLUMN TYPE` / `SET`/`DROP DEFAULT` landed** (b84). `Column`
+  gained `has_default` / `default`; a literal DEFAULT (number / string / bool / NULL) from `CREATE
+  TABLE` (`planner._column_default`) or `ALTER COLUMN SET DEFAULT` is filled in for an omitted column
+  in `_insert_doc`. `ALTER COLUMN … TYPE t` updates the catalog `type_tag` (new inserts/reads use it;
+  already-stored BSON values are **not** rewritten). Fixed a latent bug: `DROP DEFAULT` and `DROP NOT
+  NULL` both parse with `drop=True`, and the old AlterColumn handler conflated them, wrongly setting
+  the column NOT NULL on `DROP DEFAULT`. **Limitations:** only *literal* defaults are stored — an
+  expression/function default (`now()`) is accepted but never applied (reads NULL when omitted); a
+  `TYPE` change doesn't recast existing rows.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
