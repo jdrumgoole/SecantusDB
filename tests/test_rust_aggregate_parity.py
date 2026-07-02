@@ -513,6 +513,42 @@ def test_fill_parity(docs, pipeline):
                 }
             ],
         ),
+        # $locf (carry forward; leading null stays null) + $linearFill (interpolate
+        # on the t x-axis; trailing null stays null).
+        (
+            [
+                {"_id": 1, "t": 0, "v": None},
+                {"_id": 2, "t": 1, "v": 10},
+                {"_id": 3, "t": 2, "v": None},
+                {"_id": 4, "t": 4, "v": 40},
+                {"_id": 5, "t": 5, "v": None},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"lo": {"$locf": "$v"}, "li": {"$linearFill": "$v"}},
+                    }
+                }
+            ],
+        ),
+        # $locf per-partition; carries a non-numeric value too.
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": "x"},
+                {"_id": 2, "g": "a", "t": 2, "v": None},
+                {"_id": 3, "g": "b", "t": 1, "v": None},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"lo": {"$locf": "$v"}},
+                    }
+                }
+            ],
+        ),
     ],
 )
 def test_set_window_fields_parity(docs, pipeline):

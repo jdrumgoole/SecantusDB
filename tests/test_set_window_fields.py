@@ -11,14 +11,13 @@ First-cut subset that matches the common driver-test surface:
 * Bound forms: integer offsets, ``"current"``, ``"unbounded"``.
 * Default window (when not specified) covers the whole partition.
 
-Also supported: the position-based ``$shift`` and the prefix-accumulated
-``$expMovingAvg`` time-series operators, and the rank functions (``$rank`` /
-``$denseRank`` / ``$documentNumber`` — see ``tests/test_window_rank_functions.py``).
+Also supported: the time-series operators ``$shift`` / ``$expMovingAvg`` /
+``$locf`` / ``$linearFill``, and the rank functions (``$rank`` / ``$denseRank`` /
+``$documentNumber`` — see ``tests/test_window_rank_functions.py``).
 
 Deferred (raises ``AggregateError`` with a clear message): range windows with a
 time ``unit`` or a non-ascending / multi-field / non-numeric sortBy, and the
-remaining time-series functions (``$derivative`` / ``$integral`` /
-``$linearFill`` / ``$locf``).
+remaining time-series functions (``$derivative`` / ``$integral``).
 """
 
 from __future__ import annotations
@@ -408,9 +407,41 @@ def test_exp_moving_avg_requires_one_of_n_alpha(client) -> None:
             )
 
 
+def test_locf_and_linear_fill(client) -> None:
+    """`$locf` carries the last non-null forward; `$linearFill` interpolates on
+    the sortBy x-axis. Leading nulls (locf) / trailing nulls (both) stay null."""
+    coll = client["swf_db"]["fill"]
+    coll.insert_many(
+        [
+            {"_id": 1, "t": 0, "v": None},
+            {"_id": 2, "t": 1, "v": 10},
+            {"_id": 3, "t": 2, "v": None},
+            {"_id": 4, "t": 4, "v": 40},
+            {"_id": 5, "t": 5, "v": None},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"lo": {"$locf": "$v"}, "li": {"$linearFill": "$v"}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["lo"] for d in out] == [None, 10, 10, 40, 40]
+    # t=1..4 line from (1,10) to (4,40): at t=2 -> 20, at t=3 -> 30 (not present),
+    # but here t goes 0,1,2,4,5: interp at t=2 -> 10+(40-10)*(2-1)/(4-1) = 20.
+    assert [d["li"] for d in out] == [None, 10, 20.0, 40, None]
+
+
 def test_unsupported_time_series_function_raises(client) -> None:
-    """The remaining time-series functions ($derivative / $integral /
-    $linearFill / ...) are still deferred — raise so the gap is visible."""
+    """The remaining time-series functions ($derivative / $integral) are still
+    deferred — raise so the gap is visible."""
     coll = client["swf_db"]["timeseries"]
     coll.insert_one({"_id": 1, "v": 1, "ts": 1})
 
