@@ -296,13 +296,29 @@ CREATE TABLE t (
 );
 ```
 
-`CHECK`, `NOT NULL`, and `UNIQUE` are **enforced** on write: an `INSERT` or
-`UPDATE` that would leave a row violating a declared `CHECK` predicate (`23514`),
-a `NOT NULL` column (`23502`), or a `UNIQUE` constraint (`23505`) is rejected,
-and the table is left unchanged. A `CHECK` whose predicate evaluates to NULL
-(unknown) passes, and NULLs are distinct in a `UNIQUE` constraint (multiple NULLs
-are allowed) — both matching Postgres. `FOREIGN KEY` remains declaration-only for
-now.
+`CHECK`, `NOT NULL`, `UNIQUE`, and `FOREIGN KEY` are **enforced** on write. An
+`INSERT` or `UPDATE` that would leave a row violating a declared `CHECK`
+predicate (`23514`), a `NOT NULL` column (`23502`), a `UNIQUE` constraint
+(`23505`), or a `FOREIGN KEY` (`23503`) is rejected and the table is left
+unchanged. A `CHECK` whose predicate evaluates to NULL (unknown) passes, and
+NULLs are distinct in a `UNIQUE` constraint (multiple NULLs allowed) — both
+matching Postgres.
+
+`FOREIGN KEY` enforcement covers both sides: a child `INSERT`/`UPDATE` whose FK
+columns are all non-NULL requires a matching parent row (MATCH SIMPLE — a NULL in
+any FK column exempts the row), and `DELETE`/`UPDATE` of a referenced parent row
+applies the declared referential action — `NO ACTION` / `RESTRICT` reject,
+`ON DELETE CASCADE` deletes the children (recursively), `SET NULL` / `SET DEFAULT`
+clear the child columns:
+
+```sql
+CREATE TABLE users  (id bigint PRIMARY KEY, name text);
+CREATE TABLE orders (id bigint PRIMARY KEY,
+                     uid bigint REFERENCES users(id) ON DELETE CASCADE);
+
+INSERT INTO orders (id, uid) VALUES (1, 999);  -- 23503: no such user
+DELETE FROM users WHERE id = 1;                -- also deletes user 1's orders
+```
 
 Unnamed constraints get Postgres' default names (`<table>_<col>_key`,
 `<table>_<col>_check`). They reflect through `pg_catalog.pg_constraint`

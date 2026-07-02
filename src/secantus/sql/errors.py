@@ -54,5 +54,9 @@ def unique_violation(message: str) -> SQLError:
     return SQLError("23505", message)
 
 
+def foreign_key_violation(message: str) -> SQLError:
+    return SQLError("23503", message)
+
+
 def datatype_mismatch(message: str) -> SQLError:
     return SQLError("42804", message)

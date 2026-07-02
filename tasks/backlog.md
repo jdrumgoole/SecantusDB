@@ -1553,6 +1553,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
   reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
   resolves; `sequences` is present-but-empty (no sequences).
+- [ ] **FOREIGN KEY enforcement on write landed** (b96): referential integrity is now enforced both
+  ways (`23503`, `errors.foreign_key_violation`). **Child side** (`executor._validate_fk_child_rows`,
+  wired into `execute_insert` + the UPDATE post-image path): an INSERT/UPDATE row whose FK columns are
+  all non-NULL must have a matching parent row — MATCH SIMPLE, so a NULL in any FK column exempts the
+  row; empty ref-column lists (`REFERENCES t`) resolve to the parent PK (`_fk_ref_columns`). **Parent
+  side** (`_enforce_fk_on_parent_delete` from `execute_delete`, `_enforce_fk_on_parent_update` from the
+  UPDATE path): deleting/updating a referenced row applies the declared action — NO ACTION / RESTRICT
+  reject, `ON DELETE CASCADE` deletes children recursively (depth-guarded at 20), SET NULL / SET DEFAULT
+  clear the child FK columns (`_fk_clear_value` uses the column default for SET DEFAULT). Reverse-FK
+  lookup (`_referencing_fks`) scans the catalog. `execute_delete` / `execute_update` now take
+  `catalog` + `session`; reflected tables have no FKs → ungated. **Limitations:** deferred constraints
+  aren't modeled (checks are immediate); `MERGE` writes bypass enforcement (`_run_merge`); parent-side
+  UPDATE only fires when a referenced column actually changes (references usually target the immutable
+  PK/`_id`); no cross-database FKs.
 - [ ] **UNIQUE enforcement on write landed** (b95): `INSERT` / `UPDATE` on a **declared** table now
   reject a write that would create two rows sharing a value for a declared UNIQUE constraint (`23505`,
   `executor._validate_unique_rows`). NULLs are distinct — a row with any NULL in a constraint's columns
