@@ -10,8 +10,9 @@
 //! to Python. `$jsonSchema` is handled for the bounded keyword subset the pure
 //! server validates (`bsonType`/`type`/`enum`/numeric bounds/string length +
 //! `pattern`/array + object counts + `items`/`required`/`properties`/
-//! `additionalProperties`/`allOf`/`anyOf`/`oneOf`/`not`), deferring any shape it
-//! can't reproduce. `$expr` is handled via the Rust expression
+//! `additionalProperties`/`patternProperties`/`dependencies`/`allOf`/`anyOf`/
+//! `oneOf`/`not`), deferring any shape it can't reproduce. `$expr` is handled via
+//! the Rust expression
 //! evaluator; `$all` via its Python-`==`. A `collation` is threaded through
 //! string comparisons and handled for the ASCII-safe cases (see
 //! `crate::collation`), deferring non-ASCII / `numericOrdering` to Python.
@@ -805,14 +806,35 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
                 return Ok(false);
             }
         }
+        // patternProperties: each key matching a pattern-regex validates against
+        // its sub-schema. Compile once; also used to exclude matches from
+        // "additional".
+        let mut pattern_res: Vec<regexutil::CompiledRegex> = Vec::new();
+        if let Some(pp) = sch.get("patternProperties") {
+            let Bson::Document(pd) = pp else {
+                return Err(Fallback);
+            };
+            for (pat, sub) in pd {
+                let rx =
+                    regexutil::compile(&Bson::String(pat.clone()), None).map_err(|_| Fallback)?;
+                for (k, v) in obj {
+                    if rx.is_match(k) && !validate_json_schema(v, sub)? {
+                        return Ok(false);
+                    }
+                }
+                pattern_res.push(rx);
+            }
+        }
         if let Some(ap) = sch.get("additionalProperties") {
-            // "Additional" = a key not named in `properties` (patternProperties
-            // not modelled). `false` forbids extras; a sub-schema validates them.
-            let allowed: Vec<&str> = match sch.get("properties") {
+            // "Additional" = a key not named in `properties` and not matching any
+            // patternProperties regex. `false` forbids extras; a sub-schema
+            // validates them.
+            let named: Vec<&str> = match sch.get("properties") {
                 Some(Bson::Document(pd)) => pd.keys().map(String::as_str).collect(),
                 _ => Vec::new(),
             };
-            let is_extra = |k: &str| !allowed.contains(&k);
+            let is_extra =
+                |k: &str| !named.contains(&k) && !pattern_res.iter().any(|rx| rx.is_match(k));
             match ap {
                 Bson::Boolean(true) => {}
                 Bson::Boolean(false) => {
@@ -828,6 +850,36 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
                     }
                 }
                 _ => return Err(Fallback), // non-bool/doc -> defer
+            }
+        }
+        // dependencies: if a trigger key is present, its listed properties must all
+        // be present (array form) or the whole doc must validate (schema form).
+        if let Some(deps) = sch.get("dependencies") {
+            let Bson::Document(dd) = deps else {
+                return Err(Fallback);
+            };
+            for (prop, dep) in dd {
+                if !obj.contains_key(prop) {
+                    continue;
+                }
+                match dep {
+                    Bson::Array(reqs) => {
+                        for r in reqs {
+                            let Bson::String(name) = r else {
+                                return Err(Fallback);
+                            };
+                            if !obj.contains_key(name) {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Bson::Document(_) => {
+                        if !validate_json_schema(value, dep)? {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Err(Fallback),
+                }
             }
         }
     }

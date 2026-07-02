@@ -474,6 +474,50 @@ CURATED = [
     ),
     # top-level combinator over the whole document.
     ({"t": "x"}, {"$jsonSchema": {"anyOf": [{"required": ["t"]}, {"required": ["u"]}]}}),
+    # patternProperties — keys matching the regex validate against the sub-schema.
+    ({"s_a": "x", "n": 5}, {"$jsonSchema": {"patternProperties": {"^s_": {"bsonType": "string"}}}}),
+    ({"s_a": 5}, {"$jsonSchema": {"patternProperties": {"^s_": {"bsonType": "string"}}}}),
+    # additionalProperties: false with patternProperties allowing s_* keys.
+    (
+        {"id": 1, "s_x": 2},
+        {
+            "$jsonSchema": {
+                "properties": {"id": {}},
+                "patternProperties": {"^s_": {}},
+                "additionalProperties": False,
+            }
+        },
+    ),
+    (
+        {"id": 1, "other": 2},
+        {
+            "$jsonSchema": {
+                "properties": {"id": {}},
+                "patternProperties": {"^s_": {}},
+                "additionalProperties": False,
+            }
+        },
+    ),
+    # dependencies — property (list) form and schema form.
+    ({"card": 1, "billing": 2}, {"$jsonSchema": {"dependencies": {"card": ["billing"]}}}),
+    ({"card": 1}, {"$jsonSchema": {"dependencies": {"card": ["billing"]}}}),
+    ({"x": 1}, {"$jsonSchema": {"dependencies": {"card": ["billing"]}}}),  # trigger absent -> ok
+    (
+        {"a": 1, "b": 2},
+        {
+            "$jsonSchema": {
+                "dependencies": {"a": {"required": ["b"], "properties": {"b": {"bsonType": "int"}}}}
+            }
+        },
+    ),
+    (
+        {"a": 1, "b": "x"},
+        {
+            "$jsonSchema": {
+                "dependencies": {"a": {"required": ["b"], "properties": {"b": {"bsonType": "int"}}}}
+            }
+        },
+    ),
 ]
 
 
