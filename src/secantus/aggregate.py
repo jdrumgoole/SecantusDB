@@ -1819,6 +1819,19 @@ def _stage_set_window_fields(
                 raise AggregateError(f"$setWindowFields {op} requires sortBy")
             compiled.append((field, op, arg, window))
             continue
+        if op == "$shift":
+            # Position-based (like the rank funcs): value from `by` slots away in
+            # the sorted partition. No window; requires a sortBy.
+            if window is not None:
+                raise AggregateError("$setWindowFields $shift does not accept a window")
+            if not sort_by:
+                raise AggregateError("$setWindowFields $shift requires sortBy")
+            if not isinstance(arg, Mapping) or "output" not in arg or "by" not in arg:
+                raise AggregateError("$shift requires {output, by, default?}")
+            if not isinstance(arg["by"], int) or isinstance(arg["by"], bool):
+                raise AggregateError("$shift 'by' must be an integer")
+            compiled.append((field, op, arg, window))
+            continue
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
@@ -1864,6 +1877,9 @@ def _stage_set_window_fields(
             for field, op, arg, window in compiled:
                 if op in _RANK_FUNCS:
                     target[field] = rank_state[op][slot]
+                    continue
+                if op == "$shift":
+                    target[field] = _shift_value(arg, slot, partition_docs, ctx)
                     continue
                 low, high = _resolve_window(slot, n, window, range_vals)
                 if high < low:
@@ -2010,6 +2026,23 @@ def _range_window_bounds(
 
 def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _shift_value(
+    spec: Mapping[str, Any],
+    slot: int,
+    partition_docs: list[dict[str, Any]],
+    ctx: PipelineContext,
+) -> Any:
+    """`$shift` — the `output` expression evaluated on the row ``by`` positions
+    away in the sorted partition, or ``default`` (evaluated as a constant, or
+    ``null``) when that position is outside the partition."""
+    idx = slot + spec["by"]
+    if 0 <= idx < len(partition_docs):
+        return evaluate(spec["output"], partition_docs[idx], ctx.vars)
+    if "default" in spec:
+        return evaluate(spec["default"], partition_docs[slot], ctx.vars)
+    return None
 
 
 def _window_bounds(slot: int, n: int, window: Mapping[str, Any] | None) -> tuple[int, int]:

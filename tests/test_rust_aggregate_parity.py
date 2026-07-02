@@ -463,6 +463,24 @@ def test_fill_parity(docs, pipeline):
                 }
             ],
         ),
+        # $shift — value `by` positions away in sorted order: prev (default), next
+        # (null out of range), self (by 0), and an expression output.
+        (
+            [{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "prev": {"$shift": {"output": "$v", "by": -1, "default": 0}},
+                            "next": {"$shift": {"output": "$v", "by": 1}},
+                            "self": {"$shift": {"output": "$v", "by": 0}},
+                            "prev2": {"$shift": {"output": {"$add": ["$v", 1]}, "by": -2}},
+                        },
+                    }
+                }
+            ],
+        ),
     ],
 )
 def test_set_window_fields_parity(docs, pipeline):
