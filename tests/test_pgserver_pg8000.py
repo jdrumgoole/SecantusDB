@@ -1219,6 +1219,28 @@ def test_alter_table_via_driver(server):
     conn.close()
 
 
+def test_grouping_sets_via_driver(server):
+    # ROLLUP over Mongo-written data, through the real driver: per-region
+    # subtotals + a grand-total row (region NULL).
+    server.storage.insert(
+        "db",
+        "sales",
+        [
+            {"_id": bson.Int64(i), "region": r, "amount": bson.Int64(a)}
+            for i, (r, a) in enumerate([("e", 10), ("e", 30), ("w", 20), ("w", 50)], 1)
+        ],
+    )
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("SELECT region, SUM(amount) AS s FROM sales GROUP BY ROLLUP(region)")
+    got = cur.fetchall()
+    assert ["e", 40] in [list(r) for r in got]
+    assert ["w", 70] in [list(r) for r in got]
+    assert [None, 110] in [list(r) for r in got]
+    assert len(got) == 3
+    conn.close()
+
+
 def test_distinct_on_via_driver(server):
     # DISTINCT ON keeps the first row per key in ORDER BY order, through the driver.
     server.storage.insert(

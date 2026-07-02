@@ -1573,6 +1573,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `feature_not_supported`); `JOIN LATERAL` with a non-`TRUE` ON is rejected (correlate in the subquery
   WHERE); `DISTINCT ON` doesn't enforce Postgres' "ORDER BY must start with the DISTINCT ON exprs" rule
   (lenient — keeps whatever the sort order gives).
+- [ ] **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` landed** (b83, single-table). Enumerated grouping
+  sets (`planner._grouping_sets`: ROLLUP → prefixes, CUBE → all subsets, explicit GROUPING SETS as
+  written, a leading plain `GROUP BY a, …` as a prefix in every set) are each compiled to a
+  `$group`+`$project` branch (`_grouping_set_branch`; group columns absent from a set project as
+  `{$literal: None}` so every branch shares one output shape) and combined with `$unionWith`
+  (`_plan_grouping_sets_select`, routed in `_plan_pipeline_select`). **Limitations:** single-table only
+  (GROUPING SETS over a JOIN → `feature_not_supported`); no `HAVING`, correlated WHERE, or DISTINCT
+  aggregate with GROUPING SETS; no window over GROUPING SETS; the `GROUPING()` helper function isn't
+  modeled.
 - [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the

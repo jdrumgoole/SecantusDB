@@ -1584,6 +1584,8 @@ def _plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
     if stmt.args.get("joins"):
+        if _has_grouping_sets(stmt):
+            raise errors.feature_not_supported("GROUPING SETS over a JOIN is not supported")
         has_agg = any(
             _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
         )
@@ -1606,10 +1608,16 @@ def _plan_pipeline_select(
         _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
     )
     grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_aggregate)
-    if _select_has_window(stmt) and (grouped or _group_agg_nodes(stmt)):
+    if _has_grouping_sets(stmt):
+        if _select_has_window(stmt):
+            raise errors.feature_not_supported(
+                "window functions over GROUPING SETS are not supported"
+            )
+        plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_grouping_sets_select(stmt, table)
+    elif _select_has_window(stmt) and (grouped or _group_agg_nodes(stmt)):
         # Window functions computed over GROUP BY aggregates (or an implicit
         # whole-table aggregation) — a two-phase group-then-window plan.
-        plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_group_window_select(stmt, table)
+        plan = _plan_group_window_select(stmt, table)
     elif grouped:
         plan = _plan_group_select(stmt, table)
     elif _stmt_needs_evaluation(stmt) or _distinct_on(stmt):
@@ -1825,6 +1833,124 @@ class _NameAllocator:
             name = f"{base}_{i}"
         self._used.add(name)
         return name
+
+
+def _has_grouping_sets(stmt: exp.Select) -> bool:
+    g = stmt.args.get("group")
+    return bool(g and (g.args.get("rollup") or g.args.get("cube") or g.args.get("grouping_sets")))
+
+
+def _grouping_set_cols(node: exp.Expression) -> list[str]:
+    """Column names in one grouping-set element — a ``(a, b)`` Tuple, a ``(a)``
+    Paren, a bare column, or the empty set ``()`` (→ ``[]``)."""
+    if isinstance(node, exp.Tuple):
+        cols: list[str] = []
+        for x in node.expressions:
+            cols.extend(_grouping_set_cols(x))
+        return cols
+    if isinstance(node, exp.Paren):
+        return _grouping_set_cols(node.this)
+    if isinstance(node, exp.Column):
+        return [_column_name(node)]
+    return []  # empty () or a stray literal → no columns
+
+
+def _grouping_sets(group_node: exp.Group) -> list[list[str]]:
+    """Enumerate the grouping sets (each a list of column names) for a GROUP BY
+    that uses ROLLUP / CUBE / GROUPING SETS. A plain leading ``GROUP BY a, …`` is
+    a prefix present in every set; ROLLUP / CUBE / explicit GROUPING SETS each
+    contribute a list of alternatives, cross-producted together (Postgres
+    semantics)."""
+    base = [_column_name(c) for c in group_node.expressions]
+    factors: list[list[list[str]]] = []
+    for r in group_node.args.get("rollup") or []:
+        cols = [_column_name(c) for c in r.expressions]
+        factors.append([cols[:i] for i in range(len(cols), -1, -1)])
+    for cnode in group_node.args.get("cube") or []:
+        cols = [_column_name(x) for x in cnode.expressions]
+        subsets = [
+            [cols[i] for i in range(len(cols)) if mask & (1 << i)] for mask in range(2 ** len(cols))
+        ]
+        factors.append(subsets)
+    for gs in group_node.args.get("grouping_sets") or []:
+        factors.append([_grouping_set_cols(n) for n in gs.expressions])
+    result: list[list[str]] = [list(base)]
+    for factor in factors:
+        result = [r + s for r in result for s in factor]
+    seen: set[tuple[str, ...]] = set()
+    deduped: list[list[str]] = []
+    for s in result:
+        key = tuple(s)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(s)
+    return deduped
+
+
+def _grouping_set_branch(
+    stmt: exp.Select, table: TableDef, gset: list[str]
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """One grouping set's ``[$group, $project]`` sub-pipeline. Group columns not in
+    this set project as literal NULL (Postgres' grouping-set semantics), so every
+    branch has the same output shape (required for the ``$unionWith``)."""
+    in_set = set(gset)
+    group_id = {c: f"${table.field_for(c)}" for c in gset} or None
+    accumulators: dict[str, Any] = {}
+    project: dict[str, Any] = {"_id": 0}
+    out_columns: list[tuple[str, str]] = []
+    names = _NameAllocator()
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        arr_arg = _array_agg_arg(e)
+        agg = _aggregate_of(e)
+        if arr_arg is not None:
+            fname = names.fresh(alias or "array_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
+            project[fname] = f"${fname}"
+            out_columns.append((fname, "json"))
+        elif agg is not None:
+            func, col, _distinct = agg
+            acc, tag = _accumulator(func, col, table)
+            fname = names.fresh(alias or func)
+            accumulators[fname] = acc
+            project[fname] = f"${fname}"
+            out_columns.append((fname, tag))
+        else:
+            inner = e.this if isinstance(e, exp.Alias) else e
+            if isinstance(inner, exp.Star):
+                raise errors.feature_not_supported("SELECT * with GROUP BY is not supported")
+            col = _column_name(inner)
+            out_name = names.fresh(alias or col)
+            if col in in_set:
+                project[out_name] = f"$_id.{col}"
+            else:
+                # A group column absent from this set (or an ungrouped column) reads
+                # NULL for these rows.
+                table.field_for(col)  # validate it's a real column
+                project[out_name] = {"$literal": None}
+            out_columns.append((out_name, table.type_for(col)))
+    return [{"$group": {"_id": group_id, **accumulators}}, {"$project": project}], out_columns
+
+
+def _plan_grouping_sets_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
+    """GROUP BY ROLLUP / CUBE / GROUPING SETS → the UNION (via ``$unionWith``) of a
+    plain GROUP BY per enumerated grouping set."""
+    if stmt.args.get("having") is not None:
+        raise errors.feature_not_supported("HAVING with GROUPING SETS is not supported")
+    if _residual_where(stmt, table) is not None:
+        raise errors.feature_not_supported("a correlated WHERE with GROUPING SETS is not supported")
+    if any(a[2] for e in stmt.expressions if (a := _aggregate_of(e)) is not None):
+        raise errors.feature_not_supported("DISTINCT aggregate with GROUPING SETS is not supported")
+    base_filter = _where_filter(stmt, table)
+    sets = _grouping_sets(stmt.args["group"])
+    branches = [_grouping_set_branch(stmt, table, gs) for gs in sets]
+    pipeline = list(branches[0][0])
+    out_columns = branches[0][1]
+    prefix = [{"$match": base_filter}] if base_filter else []
+    for sub, _cols in branches[1:]:
+        pipeline.append({"$unionWith": {"coll": table.collection, "pipeline": prefix + sub}})
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
 def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
