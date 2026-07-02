@@ -236,6 +236,24 @@ def _column_name(node: exp.Expression) -> str:
     raise errors.feature_not_supported(f"expected a column, got: {node.sql()}")
 
 
+def _literal_default(node: exp.Expression, tag: str) -> tuple[bool, Any]:
+    """A column DEFAULT expression → ``(has_default, coerced_value)``. Only literal
+    defaults (number / string / bool / NULL) are stored; a function / expression
+    default (e.g. ``now()``) is not modeled — it reads as "no static default"."""
+    if isinstance(node, exp.Null):
+        return True, None
+    if isinstance(node, (exp.Literal, exp.Boolean, exp.Neg)):
+        return True, typemap.coerce(_literal(node), tag)
+    return False, None
+
+
+def _column_default(coldef: exp.ColumnDef, tag: str) -> tuple[bool, Any]:
+    for c in coldef.args.get("constraints") or []:
+        if type(c.kind).__name__ == "DefaultColumnConstraint":
+            return _literal_default(c.kind.this, tag)
+    return False, None
+
+
 # ---------------------------------------------------------------------------
 # WHERE -> Mongo filter
 # ---------------------------------------------------------------------------
@@ -747,6 +765,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         nullable = not is_pk and "NotNullColumnConstraint" not in constraints
         if is_pk:
             pk_seen = True
+        has_default, default = _column_default(coldef, tag)
         columns.append(
             Column(
                 name=coldef.name,
@@ -754,6 +773,8 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 field="_id" if is_pk else coldef.name,
                 pk=is_pk,
                 nullable=nullable,
+                has_default=has_default,
+                default=default,
             )
         )
     if not pk_seen:
@@ -906,9 +927,14 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             raise errors.not_null_violation(name)
         doc[col.field] = typemap.coerce(raw, col.type_tag)
         provided.add(name)
-    # NOT NULL columns omitted entirely are a violation (no DEFAULT support).
+    # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
+    # omission is a violation.
     for col in table.columns:
-        if col.name not in provided and not col.nullable:
+        if col.name in provided:
+            continue
+        if col.has_default:
+            doc[col.field] = typemap.coerce(col.default, col.type_tag)
+        elif not col.nullable:
             raise errors.not_null_violation(col.name)
     return doc
 

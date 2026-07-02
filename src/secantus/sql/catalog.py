@@ -43,6 +43,10 @@ class Column:
     field: str  # "_id" for the PK column, else == name
     pk: bool
     nullable: bool
+    # A literal column DEFAULT (applied when an INSERT omits the column).
+    # ``has_default`` disambiguates "DEFAULT NULL" from "no default".
+    has_default: bool = False
+    default: Any = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,8 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "field": c.field,
                 "pk": c.pk,
                 "nullable": c.nullable,
+                "has_default": c.has_default,
+                "default": c.default,
             }
             for c in table.columns
         ],
@@ -142,6 +148,8 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 field=c["field"],
                 pk=bool(c["pk"]),
                 nullable=bool(c["nullable"]),
+                has_default=bool(c.get("has_default", False)),
+                default=c.get("default"),
             )
             for c in doc["columns"]
         ],

@@ -1219,6 +1219,27 @@ def test_alter_table_via_driver(server):
     conn.close()
 
 
+def test_column_default_and_alter_type_via_driver(server):
+    # Literal DEFAULT filled on omit + ALTER COLUMN TYPE/SET DEFAULT, via the driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, n int DEFAULT 5, s text)")
+    cur.execute("INSERT INTO t (id) VALUES (1)")
+    cur.execute("SELECT id, n FROM t WHERE id = 1")
+    assert cur.fetchall() == ([1, 5],)
+    cur.execute("ALTER TABLE t ALTER COLUMN n SET DEFAULT 42")
+    cur.execute("INSERT INTO t (id) VALUES (2)")
+    cur.execute("SELECT n FROM t WHERE id = 2")
+    assert cur.fetchall() == ([42],)
+    cur.execute("ALTER TABLE t ALTER COLUMN n TYPE bigint")
+    cur.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 't' AND column_name = 'n'"
+    )
+    assert cur.fetchall() == (["bigint"],)
+    conn.close()
+
+
 def test_grouping_sets_via_driver(server):
     # ROLLUP over Mongo-written data, through the real driver: per-region
     # subtotals + a grand-total row (region NULL).

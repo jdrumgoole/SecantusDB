@@ -200,16 +200,34 @@ ALTER TABLE users ADD COLUMN score int NOT NULL;    -- marks the column non-null
 ALTER TABLE users DROP COLUMN age;                  -- $unsets the field on every doc
 ALTER TABLE users RENAME COLUMN name TO full_name;  -- $renames the field
 ALTER TABLE users ALTER COLUMN email SET NOT NULL;  -- / DROP NOT NULL
+ALTER TABLE users ALTER COLUMN score TYPE bigint;   -- retype in the catalog
+ALTER TABLE users ALTER COLUMN score SET DEFAULT 0; -- / DROP DEFAULT
 ALTER TABLE users RENAME TO members;                -- renames the table + collection
 ```
 
 Supported actions: `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`,
-`RENAME COLUMN`, `RENAME TO`, and `ALTER COLUMN … SET/DROP NOT NULL`.
-`ALTER TABLE IF EXISTS` on a missing table is a no-op. Dropping the `PRIMARY
-KEY` column is rejected (it maps to `_id`); renaming it changes only the SQL
-name — the field stays `_id`. Column *type* changes and multiple actions in one
-statement are not supported (sqlglot parses a comma-separated action list as an
-opaque command); issue one action per statement.
+`RENAME COLUMN`, `RENAME TO`, `ALTER COLUMN … SET/DROP NOT NULL`, `ALTER COLUMN
+… TYPE t`, and `ALTER COLUMN … SET/DROP DEFAULT`. `ALTER TABLE IF EXISTS` on a
+missing table is a no-op. Dropping the `PRIMARY KEY` column is rejected (it maps
+to `_id`); renaming it changes only the SQL name — the field stays `_id`. A
+`TYPE` change retypes the column in the catalog (new inserts/reads use it;
+already-stored values keep their BSON type — no rewrite). Multiple actions in
+one statement are not supported (sqlglot parses a comma-separated action list as
+an opaque command); issue one action per statement.
+
+### Column DEFAULTs
+
+A literal column `DEFAULT` (a number, string, boolean, or `NULL`) — declared in
+`CREATE TABLE` or via `ALTER COLUMN … SET DEFAULT` — is filled in when an
+`INSERT` omits the column:
+
+```sql
+CREATE TABLE t (id bigint PRIMARY KEY, n int DEFAULT 5, s text DEFAULT 'hi');
+INSERT INTO t (id) VALUES (1);        -- n -> 5, s -> 'hi'
+```
+
+A non-literal default (e.g. `DEFAULT now()`) is accepted but not applied — the
+column reads `NULL` when omitted.
 
 ### Foreign keys (declared, not enforced)
 
@@ -1069,7 +1087,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY`, declared not enforced), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER COLUMN … TYPE`, multi-action `ALTER`, `ALTER TABLE … ADD FOREIGN KEY`, enforced constraints, views |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` declared-not-enforced, literal column `DEFAULT`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | multi-action `ALTER`, `ALTER TABLE … ADD FOREIGN KEY`, non-literal / expression DEFAULT, enforced constraints, views |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |

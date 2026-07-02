@@ -164,19 +164,37 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
             table.collection = new_name
         table.name = new_name
         return
-    if isinstance(action, exp.AlterColumn):  # ALTER COLUMN c SET/DROP NOT NULL
+    if isinstance(action, exp.AlterColumn):
+        # ALTER COLUMN c { TYPE t | SET/DROP DEFAULT | SET/DROP NOT NULL }.
+        import dataclasses
+
+        from secantus.sql import planner
+
         name = action.this.name
         col = table.column(name)
         if col is None:
             raise errors.undefined_column(name)
-        if action.args.get("allow_null") is None and not action.args.get("drop"):
-            # Neither SET NOT NULL nor DROP NOT NULL — a TYPE / DEFAULT change.
+        if action.args.get("dtype") is not None:  # TYPE t — retype in the catalog
+            tag = typemap.type_tag_for_sql(action.args["dtype"])
+            if tag is None:
+                raise errors.feature_not_supported(
+                    f"unsupported column type: {action.args['dtype'].sql()}"
+                )
+            new_col = dataclasses.replace(col, type_tag=tag)
+        elif action.args.get("default") is not None:  # SET DEFAULT <literal>
+            has_def, value = planner._literal_default(action.args["default"], col.type_tag)
+            if not has_def:
+                raise errors.feature_not_supported(
+                    f"only a literal DEFAULT is supported: {action.args['default'].sql()}"
+                )
+            new_col = dataclasses.replace(col, has_default=True, default=value)
+        elif action.args.get("allow_null") is not None:  # SET/DROP NOT NULL
+            new_col = dataclasses.replace(col, nullable=bool(action.args["allow_null"]))
+        elif action.args.get("drop"):  # DROP DEFAULT
+            new_col = dataclasses.replace(col, has_default=False, default=None)
+        else:
             raise errors.feature_not_supported(f"unsupported ALTER COLUMN action: {action.sql()}")
-        nullable = bool(action.args.get("allow_null"))
-        table.columns = [
-            Column(c.name, c.type_tag, c.field, c.pk, nullable) if c.name == name else c
-            for c in table.columns
-        ]
+        table.columns = [new_col if c.name == name else c for c in table.columns]
         return
     raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
 
