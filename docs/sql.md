@@ -285,6 +285,30 @@ COMMENT ON COLUMN users.email IS 'primary contact address';
 COMMENT ON COLUMN users.email IS NULL;   -- remove the comment
 ```
 
+## Views (`CREATE VIEW`)
+
+A view is a stored `SELECT` that reads like the table it stands for. `CREATE
+VIEW` records the query text; any reference to the view in a `FROM` / `JOIN`
+expands inline as a subquery, so single-table reads, aggregates, joins against
+real tables, and views built on other views all work:
+
+```sql
+CREATE VIEW active_users AS SELECT id, name FROM users WHERE age >= 18;
+CREATE OR REPLACE VIEW active_users AS SELECT id, name, email FROM users WHERE age >= 21;
+
+SELECT count(*) FROM active_users;                 -- reads through to `users`
+SELECT a.name FROM active_users a JOIN orders o ON o.user_id = a.id;
+
+DROP VIEW active_users;
+DROP VIEW IF EXISTS active_users;                  -- no error if absent
+```
+
+Views reflect through `pg_class` (`relkind = 'v'`), `pg_get_viewdef()`, and
+`information_schema.views`, so SQLAlchemy's `get_view_names()` and
+`get_view_definition()` see them. Views are read-only (no `INSERT`/`UPDATE`
+through a view) and are not materialized — each query re-reads the underlying
+tables.
+
 ## Querying
 
 `WHERE` supports the common operators; they lower to the same match engine the

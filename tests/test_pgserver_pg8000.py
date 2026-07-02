@@ -1347,6 +1347,25 @@ def test_lateral_join_via_driver(server):
     conn.close()
 
 
+def test_view_via_driver(server):
+    # CREATE VIEW / query a view / DROP VIEW through the real driver — the view
+    # expands to its stored SELECT so it reads like the table it stands for.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, n int, grp text)")
+    cur.execute("INSERT INTO t (id, n, grp) VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 5, 'b')")
+    cur.execute("CREATE VIEW hi AS SELECT id, grp FROM t WHERE n > 8")
+    cur.execute("SELECT id, grp FROM hi ORDER BY id")
+    assert cur.fetchall() == ([1, "a"], [2, "a"])
+    # An aggregate over the view, and a join against a real table.
+    cur.execute("SELECT count(*) FROM hi")
+    assert cur.fetchall() == ([2],)
+    cur.execute("DROP VIEW hi")
+    cur.execute("SELECT relname FROM pg_catalog.pg_class WHERE relkind = 'v'")
+    assert cur.fetchall() == ()
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

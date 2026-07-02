@@ -20,6 +20,7 @@ from typing import Any, Protocol
 from secantus.sql import errors
 
 CATALOG_COLLECTION = "__sql_catalog__"
+VIEW_COLLECTION = "__sql_views__"
 
 
 class _StorageLike(Protocol):
@@ -201,3 +202,24 @@ class Catalog:
     def list_tables(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, CATALOG_COLLECTION, {})
         return sorted(d["table"] for d in docs)
+
+    # -- views ------------------------------------------------------------- #
+    # A view is just a stored SELECT definition; querying one expands it as a
+    # subquery. Kept in a separate collection so it never shadows a real table.
+
+    def put_view(self, db: str, name: str, definition: str) -> None:
+        self._storage.delete_matching(db, VIEW_COLLECTION, {"_id": name})
+        self._storage.insert(
+            db, VIEW_COLLECTION, [{"_id": name, "view": name, "definition": definition}]
+        )
+
+    def get_view(self, db: str, name: str) -> str | None:
+        docs = self._storage.find_matching(db, VIEW_COLLECTION, {"_id": name}, limit=1)
+        return docs[0]["definition"] if docs else None
+
+    def drop_view(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, VIEW_COLLECTION, {"_id": name}) > 0
+
+    def list_views(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, VIEW_COLLECTION, {})
+        return sorted(d["view"] for d in docs)

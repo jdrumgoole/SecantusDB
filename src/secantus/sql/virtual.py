@@ -65,6 +65,20 @@ def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return {t.name: 16384 + i for i, t in enumerate(_user_tables(db, catalog))}
 
 
+_VIEW_OID_BASE = 50000
+
+
+def _view_names(db: str, catalog: Catalog) -> list[str]:
+    lister = getattr(catalog, "list_views", None)
+    return lister(db) if lister is not None else []
+
+
+def _view_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    """Stable pg_class OIDs per view — a distinct range from tables/indexes/FKs so
+    ``pg_get_viewdef(oid)`` and relkind='v' rows never collide with a real table."""
+    return {name: _VIEW_OID_BASE + i for i, name in enumerate(_view_names(db, catalog))}
+
+
 # Access-method / opclass OIDs (the real Postgres values for btree).
 _BTREE_AM_OID = 403
 _HEAP_AM_OID = 2
@@ -118,7 +132,7 @@ def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, 
 
 
 def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    return [
+    rows = [
         {
             "table_catalog": db,
             "table_schema": "public",
@@ -127,6 +141,35 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
         }
         for t in _user_tables(db, catalog)
     ]
+    # Views appear in information_schema.tables with table_type 'VIEW'.
+    rows.extend(
+        {
+            "table_catalog": db,
+            "table_schema": "public",
+            "table_name": name,
+            "table_type": "VIEW",
+        }
+        for name in _view_names(db, catalog)
+    )
+    return rows
+
+
+def _info_views(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    getter = getattr(catalog, "get_view", None)
+    rows: list[dict] = []
+    for name in _view_names(db, catalog):
+        rows.append(
+            {
+                "table_catalog": db,
+                "table_schema": "public",
+                "table_name": name,
+                "view_definition": getter(db, name) if getter is not None else None,
+                "check_option": "NONE",
+                "is_updatable": "NO",
+                "is_insertable_into": "NO",
+            }
+        )
+    return rows
 
 
 def _info_columns(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -389,7 +432,30 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "reloptions": None,
             }
         )
+    # Views are pg_class rows too (relkind 'v') — SQLAlchemy's get_view_names
+    # filters pg_class on relkind IN ('v','m').
+    for name, oid in _view_oids(db, catalog).items():
+        rows.append(
+            {
+                "oid": oid,
+                "relname": name,
+                "relnamespace": _NS_OIDS["public"],
+                "relkind": "v",
+                "relpersistence": "p",
+                "relam": 0,
+                "reloptions": None,
+            }
+        )
     return rows
+
+
+def viewdef_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
+    """``pg_get_viewdef(oid)`` — the stored SELECT text for a view's pg_class OID."""
+    for name, vourid in _view_oids(db, catalog).items():
+        if vourid == oid:
+            getter = getattr(catalog, "get_view", None)
+            return getter(db, name) if getter is not None else None
+    return None
 
 
 def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -601,6 +667,20 @@ _register(
         ("is_nullable", "text"),
     ],
     _info_columns,
+)
+_register(
+    "information_schema",
+    "views",
+    [
+        ("table_catalog", "text"),
+        ("table_schema", "text"),
+        ("table_name", "text"),
+        ("view_definition", "text"),
+        ("check_option", "text"),
+        ("is_updatable", "text"),
+        ("is_insertable_into", "text"),
+    ],
+    _info_views,
 )
 _register(
     "information_schema",

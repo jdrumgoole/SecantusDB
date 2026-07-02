@@ -1550,6 +1550,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
   reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
   resolves; `sequences` is present-but-empty (no sequences).
+- [ ] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
+  text in a per-db `__sql_views__` collection (`catalog.put_view` / `get_view` / `drop_view` /
+  `list_views`). `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` dispatch on `exp.Create` /
+  `exp.Drop` kind `'VIEW'` (`executor.execute_create_view` / `execute_drop_view`). Querying a view
+  works by inline expansion: `engine._expand_views` rewrites every `FROM` / `JOIN` reference to a
+  declared view into a `(<view def>) AS name` subquery before dispatch, so single-table reads,
+  aggregates, joins against real tables, and nested views (a view over a view, expanded recursively
+  with a depth guard) all ride the existing derived-table (`_resolve_source`) machinery.
+  `select_needs_pipeline` now routes a from-subquery to the pipeline path so a bare `SELECT * FROM
+  view` materializes. CTE names defined in the same statement shadow views. Reflection: `pg_class`
+  gains `relkind='v'` rows (`virtual._view_oids`, base 50000), `pg_get_viewdef(oid)`
+  (`scalar._call_func` → `virtual.viewdef_for_oid`), `information_schema.views`, and a `table_type='VIEW'`
+  row in `information_schema.tables` — SQLAlchemy's `get_view_names()` / `get_view_definition()` reflect
+  end to end. **Limitations:** views are read-only (no INSERT/UPDATE through a view) and not
+  materialized (each query re-reads the base tables); no `CASCADE`/`RESTRICT` on `DROP`; no column-list
+  aliasing (`CREATE VIEW v (a, b) AS …`); `WITH CHECK OPTION` not modeled.
 - [ ] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
   `Column.comment` (persisted in the catalog doc) by `executor.execute_comment` (dispatched on
   `exp.Comment`), surfaced through `virtual._pg_description` (table comment → `objsubid 0`, column

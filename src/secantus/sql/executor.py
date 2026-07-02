@@ -126,6 +126,26 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
     raise errors.feature_not_supported(f"COMMENT ON {kind} is not supported")
 
 
+def execute_create_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
+    """``CREATE [OR REPLACE] VIEW v AS SELECT …`` — store the SELECT definition.
+    Querying the view expands it as a subquery (see ``engine._expand_views``)."""
+    name = stmt.this.name
+    replace = bool(stmt.args.get("replace"))
+    if catalog.exists(db, name):
+        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+    if not replace and catalog.get_view(db, name) is not None:
+        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+    catalog.put_view(db, name, stmt.expression.sql(dialect="postgres"))
+    return SQLResult(command_tag="CREATE VIEW")
+
+
+def execute_drop_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
+    name = stmt.this.name
+    if not catalog.drop_view(db, name) and not stmt.args.get("exists"):
+        raise errors.SQLError("42P01", f'view "{name}" does not exist')
+    return SQLResult(command_tag="DROP VIEW")
+
+
 def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
     from sqlglot import exp
 
