@@ -712,8 +712,14 @@ def _run_statement(
         return executor.execute_comment(stmt, catalog, storage, db)
 
     # Expand any referenced views (FROM/JOIN) into inline subqueries before the
-    # query dispatch below, so a view reads like the SELECT it stands for.
-    if isinstance(stmt, (exp.Select, exp.SetOperation, exp.Insert)) or _own_with(stmt) is not None:
+    # query dispatch below, so a view reads like the SELECT it stands for. Skip on
+    # the re-entrant CTE path (``_run_with`` strips the WITH and re-dispatches with
+    # a ``_CTECatalog``): the outer pass already walked the whole tree, and a
+    # second pass — now with no CTE names in scope — would let a stored view shadow
+    # a same-named CTE.
+    if not isinstance(catalog, _CTECatalog) and (
+        isinstance(stmt, (exp.Select, exp.SetOperation, exp.Insert)) or _own_with(stmt) is not None
+    ):
         _expand_views(stmt, catalog, db)
 
     if _own_with(stmt) is not None:
@@ -939,6 +945,12 @@ class _CTECatalog(Catalog):
 
     def list_tables(self, db: str) -> list[str]:
         return self._base.list_tables(db)
+
+    def get_view(self, db: str, name: str) -> str | None:
+        return self._base.get_view(db, name)
+
+    def list_views(self, db: str) -> list[str]:
+        return self._base.list_views(db)
 
 
 def _run_with(

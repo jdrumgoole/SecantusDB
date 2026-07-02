@@ -157,6 +157,31 @@ def test_information_schema_tables_lists_view(storage, session):
     ) == [("v",)]
 
 
+def test_cte_shadows_same_named_view(storage, session):
+    # A CTE named the same as a stored view must win — the view is not expanded
+    # in place of the CTE (the CTE-catalog re-dispatch must not re-run expansion).
+    run_sql(storage, DB, "CREATE VIEW big AS SELECT id FROM t WHERE n < 0", session=session)
+    assert rows(
+        storage,
+        session,
+        "WITH big AS (SELECT id FROM t WHERE n >= 8) SELECT id FROM big ORDER BY id",
+    ) == [(1,), (2,)]
+
+
+def test_with_insert_select_from_cte_not_broken_by_views(storage, session):
+    # Regression: `WITH cte AS (...) INSERT INTO dst SELECT ... FROM cte` re-enters
+    # dispatch with a _CTECatalog; view expansion must not crash on it.
+    run_sql(storage, DB, "CREATE TABLE dst (id bigint primary key, n int)", session=session)
+    run_sql(
+        storage,
+        DB,
+        "WITH big AS (SELECT id, n FROM t WHERE n >= 8) "
+        "INSERT INTO dst (id, n) SELECT id, n FROM big",
+        session=session,
+    )
+    assert rows(storage, session, "SELECT id FROM dst ORDER BY id") == [(1,), (2,)]
+
+
 def test_views_persist_in_catalog(storage, session):
     from secantus.sql.catalog import Catalog
 
