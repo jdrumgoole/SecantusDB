@@ -1552,6 +1552,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
   reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
   resolves; `sequences` is present-but-empty (no sequences).
+- [ ] **CHECK / UNIQUE constraints — declared, reflected, NOT enforced** (b91): column-level (`col int
+  CHECK (col > 0)` / `col text UNIQUE`), table-level named (`CONSTRAINT c CHECK (...)` / `... UNIQUE (a,
+  b)`), and table-level unnamed CHECK/UNIQUE are parsed by `planner._extract_constraints`, stored on
+  `TableDef.check_constraints` (`catalog.CheckConstraint`) / `TableDef.unique_constraints`
+  (`catalog.UniqueConstraint`), and persisted in the catalog doc. Unnamed constraints get Postgres'
+  default names (`<table>_<col>_key`, `<table>_<col>_check`). Reflection: `pg_catalog.pg_constraint`
+  gains `contype='u'`/`'c'` rows (`virtual._unique_constraints` / `_check_constraints`, oid bases
+  45000/47000); each UNIQUE is backed by an implicit unique index (`_unique_constraint_index_relations`,
+  idx oid base 46000) whose `indexrelid == conindid`, because SQLAlchemy's `get_unique_constraints`
+  joins `pg_constraint.conindid = pg_index.indexrelid` and reads columns from `unnest(indkey)`.
+  `information_schema.table_constraints` / `.check_constraints` (new) / `.key_column_usage` /
+  `.constraint_column_usage` gain rows; `pg_get_constraintdef(oid)` renders `UNIQUE (…)` and `CHECK
+  ((…))`. SQLAlchemy's `get_unique_constraints()` / `get_check_constraints()` resolve end to end. **Not
+  enforced:** no CHECK-predicate validation, no UNIQUE-duplicate rejection on write — schema-shape
+  record only. **Limitations:** no `ALTER TABLE … ADD CONSTRAINT CHECK/UNIQUE` yet (still
+  `feature_not_supported`; only ADD FOREIGN KEY is wired); CHECK columns aren't listed in
+  `constraint_column_usage` (the predicate isn't parsed for referenced columns).
 - [ ] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
   text in a per-db `__sql_views__` collection (`catalog.put_view` / `get_view` / `drop_view` /
   `list_views`). `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` dispatch on `exp.Create` /

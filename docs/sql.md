@@ -273,6 +273,42 @@ insp.get_foreign_keys("orders")
 also be added after the fact with `ALTER TABLE … ADD [CONSTRAINT name] FOREIGN
 KEY (…) REFERENCES …`.
 
+### CHECK and UNIQUE constraints (declared, not enforced)
+
+`CHECK` and `UNIQUE` constraints — column-level, table-level, named or unnamed —
+are recorded in the catalog and reflected, but (like foreign keys) **not
+enforced**: SecantusDB does not validate a `CHECK` predicate or reject a
+duplicate `UNIQUE` value on write.
+
+```sql
+CREATE TABLE t (
+    id     bigint PRIMARY KEY,
+    email  text UNIQUE,                       -- column-level UNIQUE
+    age    int CHECK (age >= 0),              -- column-level CHECK
+    status text,
+    CONSTRAINT uq_es UNIQUE (email, status),  -- named table-level UNIQUE
+    CONSTRAINT ck_age CHECK (age < 200),      -- named table-level CHECK
+    UNIQUE (status)                           -- unnamed table-level UNIQUE
+);
+```
+
+Unnamed constraints get Postgres' default names (`<table>_<col>_key`,
+`<table>_<col>_check`). They reflect through `pg_catalog.pg_constraint`
+(`contype = 'u'` / `'c'`, each `UNIQUE` backed by an implicit unique index),
+`information_schema.table_constraints` / `.check_constraints` /
+`.key_column_usage`, and `pg_get_constraintdef()`. SQLAlchemy's inspector
+reflects them end to end:
+
+```python
+insp = sqlalchemy.inspect(engine)
+insp.get_unique_constraints("t")
+# [{'name': 't_email_key', 'column_names': ['email'], ...},
+#  {'name': 'uq_es', 'column_names': ['email', 'status'], ...}, ...]
+insp.get_check_constraints("t")
+# [{'name': 'ck_age', 'sqltext': 'age < 200', ...},
+#  {'name': 't_age_check', 'sqltext': 'age >= 0', ...}]
+```
+
 ### Comments (`COMMENT ON`)
 
 `COMMENT ON TABLE` / `COMMENT ON COLUMN` attach a description that reflects

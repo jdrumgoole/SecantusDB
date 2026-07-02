@@ -128,6 +128,8 @@ def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, 
                 }
             )
             oid += 1
+    # The implicit unique index backing each declared UNIQUE constraint.
+    out.extend(_unique_constraint_index_relations(db, catalog))
     return out
 
 
@@ -261,45 +263,144 @@ def _foreign_keys(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     return out
 
 
+_UNIQUE_CON_OID_BASE = 45000
+_UNIQUE_IDX_OID_BASE = 46000
+_CHECK_CON_OID_BASE = 47000
+
+
+def _unique_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
+    """Declared UNIQUE constraints with the fields ``pg_constraint`` /
+    ``information_schema`` / ``pg_get_constraintdef`` need: a stable ``oid``, the
+    owner table OID, ``conkey`` attnums, columns, the rendered ``condef``, and the
+    OID of its backing unique index (``conindid``) — SQLAlchemy reflects a UNIQUE
+    constraint by joining ``pg_constraint.conindid = pg_index.indexrelid``."""
+    table_oids = _table_oids(db, catalog)
+    out: list[dict[str, Any]] = []
+    oid = _UNIQUE_CON_OID_BASE
+    idx_oid = _UNIQUE_IDX_OID_BASE
+    for t in _user_tables(db, catalog):
+        attnum = {c.name: i for i, c in enumerate(t.columns, start=1)}
+        for uq in t.unique_constraints:
+            out.append(
+                {
+                    "oid": oid,
+                    "conindid": idx_oid,
+                    "conname": uq.name,
+                    "table": t,
+                    "conrelid": table_oids.get(t.name, 0),
+                    "conkey": [attnum.get(c, 0) for c in uq.columns],
+                    "columns": list(uq.columns),
+                    "condef": f"UNIQUE ({', '.join(uq.columns)})",
+                }
+            )
+            oid += 1
+            idx_oid += 1
+    return out
+
+
+def _unique_constraint_index_relations(db: str, catalog: Catalog) -> list[dict[str, Any]]:
+    """The implicit unique index backing each UNIQUE constraint — a pg_index /
+    pg_class relation whose ``indexrelid`` matches the constraint's ``conindid``."""
+    return [
+        {
+            "indexrelid": uq["conindid"],
+            "indrelid": uq["conrelid"],
+            "relname": uq["conname"],
+            "indkey": uq["conkey"],
+            "unique": True,
+            "primary": False,
+            "conname": uq["conname"],
+        }
+        for uq in _unique_constraints(db, catalog)
+    ]
+
+
+def _check_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
+    """Declared CHECK constraints with the fields reflection needs. ``condef`` is
+    rendered the way Postgres does — ``CHECK ((<expr>))`` — so SQLAlchemy's
+    ``get_check_constraints`` regex can peel it back to the predicate text."""
+    table_oids = _table_oids(db, catalog)
+    out: list[dict[str, Any]] = []
+    oid = _CHECK_CON_OID_BASE
+    for t in _user_tables(db, catalog):
+        for ck in t.check_constraints:
+            out.append(
+                {
+                    "oid": oid,
+                    "conname": ck.name,
+                    "table": t,
+                    "conrelid": table_oids.get(t.name, 0),
+                    "expression": ck.expression,
+                    "condef": f"CHECK (({ck.expression}))",
+                }
+            )
+            oid += 1
+    return out
+
+
 def constraint_def_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
     """``pg_get_constraintdef(oid)`` — the rendered constraint definition for a
-    foreign-key constraint OID, or ``None`` when the OID isn't an FK we know."""
+    foreign-key, UNIQUE, or CHECK constraint OID, or ``None`` when unknown."""
     for fk in _foreign_keys(db, catalog):
         if fk["oid"] == oid:
             return fk["condef"]
+    for uq in _unique_constraints(db, catalog):
+        if uq["oid"] == oid:
+            return uq["condef"]
+    for ck in _check_constraints(db, catalog):
+        if ck["oid"] == oid:
+            return ck["condef"]
     return None
 
 
 def _info_table_constraints(
     db: str, session: Session, storage: Any, catalog: Catalog
 ) -> list[dict]:
-    return [
-        {
-            "constraint_catalog": db,
-            "constraint_schema": "public",
-            "constraint_name": conname,
-            "table_catalog": db,
-            "table_schema": "public",
-            "table_name": t.name,
-            "constraint_type": "PRIMARY KEY",
-            "is_deferrable": "NO",
-            "initially_deferred": "NO",
-        }
-        for t, conname, _cols in _pk_constraints(db, catalog)
-    ] + [
-        {
-            "constraint_catalog": db,
-            "constraint_schema": "public",
-            "constraint_name": fk["conname"],
-            "table_catalog": db,
-            "table_schema": "public",
-            "table_name": fk["table"].name,
-            "constraint_type": "FOREIGN KEY",
-            "is_deferrable": "NO",
-            "initially_deferred": "NO",
-        }
-        for fk in _foreign_keys(db, catalog)
-    ]
+    return (
+        [
+            {
+                "constraint_catalog": db,
+                "constraint_schema": "public",
+                "constraint_name": conname,
+                "table_catalog": db,
+                "table_schema": "public",
+                "table_name": t.name,
+                "constraint_type": "PRIMARY KEY",
+                "is_deferrable": "NO",
+                "initially_deferred": "NO",
+            }
+            for t, conname, _cols in _pk_constraints(db, catalog)
+        ]
+        + [
+            {
+                "constraint_catalog": db,
+                "constraint_schema": "public",
+                "constraint_name": fk["conname"],
+                "table_catalog": db,
+                "table_schema": "public",
+                "table_name": fk["table"].name,
+                "constraint_type": "FOREIGN KEY",
+                "is_deferrable": "NO",
+                "initially_deferred": "NO",
+            }
+            for fk in _foreign_keys(db, catalog)
+        ]
+        + [
+            {
+                "constraint_catalog": db,
+                "constraint_schema": "public",
+                "constraint_name": con["conname"],
+                "table_catalog": db,
+                "table_schema": "public",
+                "table_name": con["table"].name,
+                "constraint_type": ctype,
+                "is_deferrable": "NO",
+                "initially_deferred": "NO",
+            }
+            for ctype, builder in (("UNIQUE", _unique_constraints), ("CHECK", _check_constraints))
+            for con in builder(db, catalog)
+        ]
+    )
 
 
 def _info_key_column_usage(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -336,6 +437,22 @@ def _info_key_column_usage(db: str, session: Session, storage: Any, catalog: Cat
                     "position_in_unique_constraint": pos,
                 }
             )
+    # UNIQUE constraint columns (CHECK constraints have no key_column_usage rows).
+    for uq in _unique_constraints(db, catalog):
+        for pos, col in enumerate(uq["columns"], start=1):
+            rows.append(
+                {
+                    "constraint_catalog": db,
+                    "constraint_schema": "public",
+                    "constraint_name": uq["conname"],
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": uq["table"].name,
+                    "column_name": col,
+                    "ordinal_position": pos,
+                    "position_in_unique_constraint": None,
+                }
+            )
     return rows
 
 
@@ -370,7 +487,36 @@ def _info_constraint_column_usage(
                     "constraint_name": fk["conname"],
                 }
             )
+    for uq in _unique_constraints(db, catalog):
+        for col in uq["columns"]:
+            rows.append(
+                {
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": uq["table"].name,
+                    "column_name": col,
+                    "constraint_catalog": db,
+                    "constraint_schema": "public",
+                    "constraint_name": uq["conname"],
+                }
+            )
     return rows
+
+
+def _info_check_constraints(
+    db: str, session: Session, storage: Any, catalog: Catalog
+) -> list[dict]:
+    """``information_schema.check_constraints`` — one row per declared CHECK, with
+    the predicate under ``check_clause``."""
+    return [
+        {
+            "constraint_catalog": db,
+            "constraint_schema": "public",
+            "constraint_name": ck["conname"],
+            "check_clause": f"({ck['expression']})",
+        }
+        for ck in _check_constraints(db, catalog)
+    ]
 
 
 def _info_referential_constraints(
@@ -589,6 +735,34 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "confkey": fk["confkey"],
             }
         )
+    for uq in _unique_constraints(db, catalog):
+        rows.append(
+            {
+                "oid": uq["oid"],
+                "conname": uq["conname"],
+                "conrelid": uq["conrelid"],
+                "confrelid": 0,
+                "conindid": uq["conindid"],
+                "contype": "u",
+                "contypid": 0,
+                "conkey": uq["conkey"],
+                "confkey": None,
+            }
+        )
+    for ck in _check_constraints(db, catalog):
+        rows.append(
+            {
+                "oid": ck["oid"],
+                "conname": ck["conname"],
+                "conrelid": ck["conrelid"],
+                "confrelid": 0,
+                "conindid": 0,
+                "contype": "c",
+                "contypid": 0,
+                "conkey": None,
+                "confkey": None,
+            }
+        )
     return rows
 
 
@@ -733,6 +907,17 @@ _register(
         ("constraint_name", "text"),
     ],
     _info_constraint_column_usage,
+)
+_register(
+    "information_schema",
+    "check_constraints",
+    [
+        ("constraint_catalog", "text"),
+        ("constraint_schema", "text"),
+        ("constraint_name", "text"),
+        ("check_clause", "text"),
+    ],
+    _info_check_constraints,
 )
 _register(
     "information_schema",
