@@ -414,6 +414,29 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     }
 }
 
+/// Reject a namespace component (database / collection / index name) that
+/// carries an embedded NUL byte.
+///
+/// BSON strings are length-prefixed and may legally contain a NUL, so a
+/// client can send `{find: "c\0evil"}` or a `$db` with an interior NUL. Such
+/// a value would reach secantus-wt's `cstr` key encoder
+/// (`CString::new(..).expect(..)`) and **panic** — and because the storage
+/// serialises WT ops under a `std::sync::Mutex`, that panic unwinds while the
+/// lock is held and poisons it for *every* connection, turning a per-request
+/// fault into a whole-server DoS. Reject it here, before it reaches storage,
+/// with the same `InvalidNamespace` error mongod returns. (#139)
+pub(crate) fn nul_in_namespace(kind: &str, value: &str) -> Option<CommandError> {
+    if value.contains('\0') {
+        Some(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Invalid {kind}: names cannot contain a NUL ('\\0') byte."),
+        ))
+    } else {
+        None
+    }
+}
+
 fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     let name = command_name(doc);
 
@@ -431,6 +454,20 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             ),
         )
         .into_reply();
+    }
+
+    // Embedded-NUL guard for the database + collection name. The collection is
+    // the command's first-value string for every collection-scoped command
+    // (`{find: "coll", ...}`, `{insert: "coll", ...}`, ...); a non-string first
+    // value (e.g. `{ping: 1}`) simply isn't checked. Index names are guarded
+    // separately inside the index handlers. (#139)
+    if let Some(e) = nul_in_namespace("database name", &ctx.db_name) {
+        return e.into_reply();
+    }
+    if let Ok(coll) = doc.get_str(name) {
+        if let Some(e) = nul_in_namespace("collection name", coll) {
+            return e.into_reply();
+        }
     }
 
     if let Err(e) = validate_read_concern(doc, name, ctx) {
@@ -1265,6 +1302,36 @@ mod tests {
     fn command_name_is_first_key() {
         assert_eq!(command_name(&doc! {"ping": 1, "$db": "admin"}), "ping");
         assert_eq!(command_name(&Document::new()), "");
+    }
+
+    #[test]
+    fn nul_in_namespace_rejects_interior_nul() {
+        assert!(nul_in_namespace("collection name", "fine").is_none());
+        let e = nul_in_namespace("collection name", "c\0x").expect("should reject");
+        assert_eq!(
+            e.into_reply().get_str("codeName").unwrap(),
+            "InvalidNamespace"
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_nul_collection_name() {
+        // A well-formed BSON command whose collection name carries an interior
+        // NUL must return InvalidNamespace, not panic — a panic here would
+        // unwind while the storage lock is held and poison it (#139).
+        let reply = dispatch(&doc! {"find": "c\0evil"}, &mut ctx());
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 73);
+        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidNamespace");
+    }
+
+    #[test]
+    fn dispatch_rejects_nul_database_name() {
+        let mut c = ctx();
+        c.db_name = "te\0st".to_string();
+        let reply = dispatch(&doc! {"find": "coll"}, &mut c);
+        assert_eq!(reply.get_i32("code").unwrap(), 73);
+        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidNamespace");
     }
 
     #[test]

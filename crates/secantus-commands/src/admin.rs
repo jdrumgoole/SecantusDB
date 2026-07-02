@@ -908,6 +908,11 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .and_then(Bson::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| default_index_name(&key));
+        // Guard the index name against an embedded NUL before it reaches the
+        // WT key encoder (see crate::nul_in_namespace / #139).
+        if let Some(e) = crate::nul_in_namespace("index name", &name) {
+            return Ok(e.into_reply());
+        }
         // `partialFilterExpression` must be a document and a parseable filter —
         // mongod rejects a non-document, unknown operators (`{x: {$asdasd: 3}}`),
         // and malformed logical operators (`{$and: 5}`). (pymongo's
@@ -1013,6 +1018,9 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 .map_err(command_error)?;
         }
         Some(Bson::String(name)) => {
+            if let Some(e) = crate::nul_in_namespace("index name", name) {
+                return Ok(e.into_reply());
+            }
             let existed = storage
                 .drop_index(&ctx.db_name, &coll, name)
                 .map_err(command_error)?;
