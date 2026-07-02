@@ -250,6 +250,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$round" => op_round(arg, ctx),
         "$trunc" => op_trunc(arg, ctx),
         "$dateFromString" => op_date_from_string(arg, ctx),
+        "$dateToString" => op_date_to_string(arg, ctx),
         // misc structural / deterministic
         "$dateToParts" => op_date_to_parts(arg, ctx),
         "$range" => op_range(arg, ctx),
@@ -1249,6 +1250,71 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
         Some(millis) => bounded_datetime(millis),
         None => Err(Fallback), // non-canonical / invalid -> Python (onError or raise)
     }
+}
+
+/// `$dateToString` — bounded port of `expressions._op_date_to_string`. Formats a
+/// date (UTC) per a strftime-style `format`, defaulting to
+/// `"%Y-%m-%dT%H:%M:%S.%LZ"`. A non-datetime `date` (incl. null) → null.
+///
+/// Renders the unambiguous directives — `%Y` (4-digit year), `%m`/`%d`/`%H`/`%M`/
+/// `%S` (2-digit), `%L` (3-digit millis), `%j` (3-digit day-of-year), `%w`
+/// (mongod Sunday=1..7), `%u` (ISO Monday=1..7), `%%` — and defers (`Fallback`)
+/// on a `timezone`, any other directive (`%z`/`%Z`/`%G`/`%V`/`%U`/locale names —
+/// Python `strftime` handles those), a non-4-digit year (glibc `%Y` padding
+/// differs), or a non-string `format`.
+fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
+    let spec = arg.as_document().ok_or(Fallback)?;
+    if spec.contains_key("timezone") {
+        return Err(Fallback); // tz conversion -> Python
+    }
+    let millis = match eval(spec.get("date").ok_or(Fallback)?, ctx)? {
+        Bson::DateTime(dt) => dt.timestamp_millis(),
+        _ => return Ok(Bson::Null), // `_ensure_datetime(non-datetime)` -> None -> null
+    };
+    let fmt = match spec.get("format") {
+        None => "%Y-%m-%dT%H:%M:%S.%LZ",
+        Some(Bson::String(s)) => s.as_str(),
+        Some(_) => return Err(Fallback), // Python raises "format must be a string"
+    };
+    Ok(Bson::String(render_date(millis, fmt)?))
+}
+
+fn render_date(millis: i64, fmt: &str) -> Result<String, Fallback> {
+    let days = millis.div_euclid(86_400_000);
+    let ms_of_day = millis.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    if !(1000..=9999).contains(&y) {
+        return Err(Fallback); // glibc `%Y` zero-pads only in this range
+    }
+    let hh = ms_of_day / 3_600_000;
+    let mi = (ms_of_day / 60_000) % 60;
+    let ss = (ms_of_day / 1000) % 60;
+    let frac_ms = ms_of_day % 1000;
+    let py_weekday = (days + 3).rem_euclid(7); // 1970-01-01 = Thursday(3); Mon=0..Sun=6
+    let day_of_year = days - days_from_civil(y, 1, 1) + 1;
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{y:04}")),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('H') => out.push_str(&format!("{hh:02}")),
+            Some('M') => out.push_str(&format!("{mi:02}")),
+            Some('S') => out.push_str(&format!("{ss:02}")),
+            Some('L') => out.push_str(&format!("{frac_ms:03}")),
+            Some('j') => out.push_str(&format!("{day_of_year:03}")),
+            Some('w') => out.push_str(&(((py_weekday + 1) % 7) + 1).to_string()),
+            Some('u') => out.push_str(&(py_weekday + 1).to_string()),
+            Some('%') => out.push('%'),
+            _ => return Err(Fallback), // unknown directive -> Python strftime
+        }
+    }
+    Ok(out)
 }
 
 /// Parse ISO-8601 into epoch milliseconds (UTC). Accepts the naive canonical
@@ -2536,10 +2602,11 @@ mod tests {
 
     #[test]
     fn unsupported_falls_back() {
-        // Still-unported op, non-ASCII $toUpper, and string $add all defer.
+        // A deferring shape ($dateToString with a timezone), non-ASCII $toUpper,
+        // and string $add all defer.
         assert!(evaluate(
             &doc! {},
-            &bson::bson!({"$dateToString": {"date": "$d"}}),
+            &bson::bson!({"$dateToString": {"date": "$d", "timezone": "UTC"}}),
             &Document::new()
         )
         .is_err());

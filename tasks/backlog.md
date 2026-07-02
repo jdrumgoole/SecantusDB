@@ -1253,12 +1253,18 @@ ignored, unreproducible shapes defer), `$dateFromString`
 fixed `±HH:MM` offset → UTC instant — plus `null`→`onNull`; the parity harness now
 compares the *bson-normalised* stored form so tz-aware results compare cleanly.
 `format` / separate `timezone` field / fractional seconds / non-canonical strings
-defer). **Remaining:**
+defer), and `$dateToString` (strftime-style formatting: `%Y`/`%m`/`%d`/`%H`/`%M`/
+`%S`/`%L`/`%j`/`%w`/`%u`/`%%` + literals; a `timezone`, any other directive
+(`%z`/`%Z`/`%G`/`%V`/`%U`/locale names), or a non-4-digit year defer to Python
+`strftime`). **With `$dateToString`, the pure expression-operator surface is
+complete on both servers** (only date *formatting/parsing* edges below remain).
+**Remaining:**
 
 - [ ] **Expression operators:** `$dateFromString` `format` (strptime) and the
-  separate `timezone` field (named IANA zones need a tz database — `chrono-tz` or
-  similar). Fractional seconds stay deferred (BSON is millisecond-only). The
-  `Z` / `±HH:MM` offset tz slice now ships.
+  separate `timezone` field on both `$dateFromString` / `$dateToString` (named
+  IANA zones need a tz database — `chrono-tz` or similar); `$dateToString` locale
+  / `%z`/`%Z`/ISO-week directives (Python `strftime` handles those). Fractional
+  seconds stay deferred (BSON is millisecond-only).
 - [ ] **Aggregate stages:** `$setWindowFields` date-`unit` x-axes — the time
   `unit` scaling on `$derivative` / `$integral` and range windows over a date
   sortBy — absent from *both* servers, so each needs a Python oracle first, then
