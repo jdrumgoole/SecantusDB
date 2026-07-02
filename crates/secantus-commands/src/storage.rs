@@ -559,6 +559,26 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Drop oplog rows past the retention window, returning the number pruned.
+    /// Backs `secantusAdmin.pruneOplog` — an operator-driven immediate sweep
+    /// (the WT backend also prunes opportunistically on every emit). Default:
+    /// unsupported; the WT adapter forwards to `Storage::prune_oplog`.
+    fn prune_oplog(&self) -> Result<usize, StorageError> {
+        Err(StorageError::Internal(
+            "pruneOplog: this storage backend has no oplog to prune".into(),
+        ))
+    }
+
+    /// Run TTL pruning across every collection, returning the number of docs
+    /// deleted. Backs `secantusAdmin.pruneTtl` — an immediate pass (the WT
+    /// backend also sweeps on a background cadence). Default: unsupported; the
+    /// WT adapter forwards to `Storage::prune_ttl_all_collections`.
+    fn prune_ttl_all(&self) -> Result<usize, StorageError> {
+        Err(StorageError::Internal(
+            "pruneTtl: this storage backend has no TTL indexes to prune".into(),
+        ))
+    }
+
     /// Rename a collection. Returns `(succeeded, error_message)`; `succeeded ==
     /// false` carries a reason (source missing / target exists).
     fn rename_collection(

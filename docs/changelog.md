@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: `secantusAdmin.pruneOplog` and `pruneTtl` maintenance commands
+
+The Rust server now implements two of the proprietary `secantusAdmin.*`
+maintenance commands the Python server already had: `pruneOplog` (force an
+immediate oplog-retention sweep) and `pruneTtl` (run TTL pruning across every
+collection now). Both return `{pruned: <count>, ok: 1}`, mirroring the Python
+handlers. The underlying storage already prunes on its own cadence; these
+wire commands let an operator — or the admin console's Maintenance page —
+drive a deterministic pass on demand. This closes the first slice of the Rust
+admin-command parity gap (issue #163); the admin UI's capability probe will now
+enable the "Prune oplog / TTL" buttons against a Rust target.
+
+Remaining #163 gaps (tracked, not in this slice): `secantusAdmin.restoreArchive`
+and the standard admin commands `grantRolesToUser` / `revokeRolesFromUser` /
+`killOp`, plus fleshing out the `getLog` / `profile` stubs.
+
+#### Added
+
+- **Rust server:** `secantusAdmin.pruneOplog` / `secantusAdmin.pruneTtl` wire
+  commands (`Storage::prune_oplog` / `prune_ttl_all` on the command `Storage`
+  trait, forwarded by the WT adapter to the real storage engine). Regression:
+  `tests/test_rust_server_smoke.py::test_secantus_admin_prune_commands`.
+
 ### `$jsonSchema` gains `patternProperties` and `dependencies`
 
 The `$jsonSchema` query operator now understands `patternProperties` and

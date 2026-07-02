@@ -583,6 +583,16 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn prune_oplog(&self) -> Result<usize, StorageError> {
+        self.inner.prune_oplog(None).map_err(map_err)
+    }
+
+    fn prune_ttl_all(&self) -> Result<usize, StorageError> {
+        self.inner
+            .prune_ttl_all_collections(bson::DateTime::now())
+            .map_err(map_err)
+    }
+
     fn rename_collection(
         &self,
         src_db: &str,

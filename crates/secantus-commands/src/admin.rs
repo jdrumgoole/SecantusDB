@@ -524,6 +524,26 @@ pub fn backup_archive(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
 }
 
+/// `secantusAdmin.pruneOplog` — drop oplog rows past the retention window now,
+/// returning `{pruned, ok}`. An operator-driven immediate sweep (the storage
+/// engine also prunes opportunistically on every emit). Mirrors the Python
+/// `secantusAdmin.pruneOplog` command.
+pub fn prune_oplog(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    let pruned = storage.prune_oplog().map_err(command_error)?;
+    Ok(doc! { "pruned": pruned as i64, "ok": 1.0 })
+}
+
+/// `secantusAdmin.pruneTtl` — run TTL pruning across every collection now,
+/// returning `{pruned, ok}` (the docs deleted). Lets callers force a
+/// deterministic pass instead of waiting for the background cadence. Mirrors
+/// the Python `secantusAdmin.pruneTtl` command.
+pub fn prune_ttl(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    let pruned = storage.prune_ttl_all().map_err(command_error)?;
+    Ok(doc! { "pruned": pruned as i64, "ok": 1.0 })
+}
+
 /// `secantusAdmin.archiveBaseSnapshot` — take a PITR v2 base snapshot into
 /// `archiveDir` (`base-<head>.tar.gz`). Pair with a server started with
 /// `--oplog-archive-dir <archiveDir>` so pruned oplog rows are archived as
