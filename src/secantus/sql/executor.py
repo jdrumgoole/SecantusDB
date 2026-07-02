@@ -389,6 +389,7 @@ def execute_insert(
         # insert, so we can't rely on it back-filling ``_id`` into plan.docs).
         for doc in plan.docs:
             doc.setdefault("_id", bson.ObjectId())
+    _validate_rows(plan.docs, plan.table, storage, db, session, catalog)
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
         _raise_write_error(write_errors[0], plan.table)
@@ -413,6 +414,67 @@ def _raise_write_error(err: dict[str, Any], table: planner.TableDef) -> None:
     raise errors.SQLError("XX000", err.get("errmsg", "insert failed"))
 
 
+@functools.lru_cache(maxsize=256)
+def _parse_check_expr(text: str) -> Any:
+    import sqlglot
+
+    return sqlglot.parse_one(text, read="postgres")
+
+
+def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
+    """Enforce a declared table's NOT NULL and CHECK constraints against a row
+    (the post-image for an UPDATE). Raises on violation; no-op for reflected
+    (schema-on-read) tables, which carry no declared constraints.
+
+    NOT NULL — a non-nullable, non-PK column that is null / missing violates
+    ``23502`` (the PK is skipped: storage auto-assigns ``_id``). CHECK — a
+    predicate that evaluates to FALSE violates ``23514``; NULL passes (Postgres
+    treats an unknown CHECK result as satisfied)."""
+    from secantus.sql import scalar
+
+    if getattr(table, "reflected", False):
+        return
+    for col in table.columns:
+        if col.pk or col.nullable:
+            continue
+        if get_path(doc, col.field) is None:
+            raise errors.SQLError(
+                "23502",
+                f'null value in column "{col.name}" of relation "{table.name}" '
+                "violates not-null constraint",
+            )
+    if not table.check_constraints:
+        return
+
+    def scope(node: Any) -> Any:
+        col = table.column(node.name)
+        return get_path(doc, col.field if col is not None else node.name)
+
+    for ck in table.check_constraints:
+        value = scalar.evaluate(_parse_check_expr(ck.expression), scope, ctx)
+        if value is not None and not scalar._truthy(value):
+            raise errors.SQLError(
+                "23514",
+                f'new row for relation "{table.name}" violates check constraint "{ck.name}"',
+            )
+
+
+def _validate_rows(
+    docs: list[dict[str, Any]], table: Any, storage: Any, db: str, session: Any, catalog: Any = None
+) -> None:
+    from secantus.sql import scalar
+
+    if getattr(table, "reflected", False) or not (table.check_constraints or _has_not_null(table)):
+        return
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    for doc in docs:
+        _validate_write_row(doc, table, ctx)
+
+
+def _has_not_null(table: Any) -> bool:
+    return any(not c.pk and not c.nullable for c in table.columns)
+
+
 def _execute_insert_on_conflict(
     plan: planner.InsertPlan, storage: Any, db: str, catalog: Catalog | None, session: Any
 ) -> SQLResult:
@@ -433,6 +495,7 @@ def _execute_insert_on_conflict(
             doc.setdefault("_id", bson.ObjectId())
         existing = _find_conflict(storage, db, coll, oc, doc)
         if existing is None:
+            _validate_write_row(doc, plan.table, sctx)
             inserted, write_errors = storage.insert(db, coll, [doc])
             if write_errors:
                 # A bare ``DO NOTHING`` (no conflict target) absorbs any unique
@@ -499,9 +562,10 @@ def _apply_conflict_update(
     set_doc: dict[str, Any] = {}
     for field, type_tag, expr in oc.set_exprs:
         set_doc[field] = typemap.coerce(scalar.evaluate(expr, scope, sctx), type_tag)
-    storage.update_matching(db, table.collection, {"_id": existing["_id"]}, {"$set": set_doc})
     updated = copy.deepcopy(existing)
     updated.update(set_doc)
+    _validate_write_row(updated, table, sctx)  # DO UPDATE post-image
+    storage.update_matching(db, table.collection, {"_id": existing["_id"]}, {"$set": set_doc})
     return updated
 
 
@@ -859,8 +923,11 @@ def execute_evaluated_select(
     )
 
 
-def execute_update(plan: planner.UpdatePlan, storage: Any, db: str) -> SQLResult:
+def execute_update(
+    plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
+) -> SQLResult:
     coll = plan.table.collection
+    _validate_update_post_images(plan, storage, db, session, catalog)
     if plan.returning is not None:
         # RETURNING yields the post-image, so capture the matched ``_id``s first,
         # apply the update, then re-read those rows.
@@ -873,6 +940,23 @@ def execute_update(plan: planner.UpdatePlan, storage: Any, db: str) -> SQLResult
             post, plan.returning, f"UPDATE {matched}", matched, plan.table, storage, db
         )
     return SQLResult(command_tag=f"UPDATE {matched}", rowcount=matched)
+
+
+def _validate_update_post_images(
+    plan: planner.UpdatePlan, storage: Any, db: str, session: Any, catalog: Any
+) -> None:
+    """Enforce NOT NULL / CHECK on an UPDATE's post-image: apply the update in
+    memory to each matched row and validate the result before touching storage,
+    so a violating UPDATE leaves the table unchanged (Postgres statement-atomic)."""
+    from secantus.sql import scalar
+    from secantus.update import apply_update
+
+    table = plan.table
+    if getattr(table, "reflected", False) or not (table.check_constraints or _has_not_null(table)):
+        return
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    for doc in storage.find_matching(db, table.collection, plan.filter):
+        _validate_write_row(apply_update(doc, plan.update), table, ctx)
 
 
 def execute_delete(plan: planner.DeletePlan, storage: Any, db: str) -> SQLResult:

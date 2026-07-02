@@ -1553,6 +1553,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
   reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
   resolves; `sequences` is present-but-empty (no sequences).
+- [ ] **CHECK + NOT NULL enforcement on write landed** (b94): `INSERT` / `UPDATE` on a **declared**
+  table now enforce NOT NULL (`23502`) and CHECK (`23514`) against the post-image — a violating write is
+  rejected and the table left unchanged (`executor._validate_write_row` / `_validate_rows` /
+  `_validate_update_post_images`). NOT NULL skips the PK column (storage auto-assigns `_id`). CHECK
+  predicates are parsed from their stored text (`_parse_check_expr`, lru-cached) and evaluated per row
+  via `scalar.evaluate` with a column→field scope; a predicate that returns NULL passes (Postgres
+  three-valued semantics — comparisons with NULL yield None in `scalar._eval_compare`). Wired into
+  `execute_insert`, both `INSERT … ON CONFLICT` branches (insert + DO UPDATE post-image), INSERT…SELECT
+  (rows flow through `execute_insert`), and `execute_update` (post-image computed with
+  `secantus.update.apply_update` before the storage write). Reflected (schema-on-read) tables carry no
+  declared constraints, so their writes are never gated. **Limitations:** UNIQUE / FOREIGN KEY still
+  aren't enforced (separate slices); `MERGE` writes go through `_run_merge`, not `execute_update`, so
+  they bypass enforcement (TODO); a multi-statement failure isn't rolled back unless inside an explicit
+  transaction block (per-statement atomicity only for the failing statement).
 - [ ] **CHECK / UNIQUE constraints — declared, reflected, NOT enforced** (b91): column-level (`col int
   CHECK (col > 0)` / `col text UNIQUE`), table-level named (`CONSTRAINT c CHECK (...)` / `... UNIQUE (a,
   b)`), and table-level unnamed CHECK/UNIQUE are parsed by `planner._extract_constraints`, stored on

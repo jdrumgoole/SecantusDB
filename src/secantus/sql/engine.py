@@ -736,7 +736,9 @@ def _run_statement(
 
     if isinstance(stmt, exp.Update):
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
-        return executor.execute_update(planner.plan_update(stmt, table), storage, db)
+        return executor.execute_update(
+            planner.plan_update(stmt, table), storage, db, catalog, session
+        )
 
     if isinstance(stmt, exp.Delete):
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
