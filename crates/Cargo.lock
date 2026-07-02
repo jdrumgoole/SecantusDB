@@ -984,7 +984,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.108"
+version = "0.5.3-beta.109"
 dependencies = [
  "base64",
  "hmac",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.108"
+version = "0.5.3-beta.109"
 dependencies = [
  "base64",
  "bson",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.108"
+version = "0.5.3-beta.109"
 dependencies = [
  "bson",
  "fancy-regex",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core-py"
-version = "0.5.3-beta.108"
+version = "0.5.3-beta.109"
 dependencies = [
  "bson",
  "pyo3",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.108"
+version = "0.5.3-beta.109"
 dependencies = [
  "bson",
  "rcgen",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.108"
+version = "0.5.3-beta.109"
 dependencies = [
  "bson",
 ]

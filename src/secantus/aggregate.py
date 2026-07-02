@@ -1855,6 +1855,19 @@ def _stage_set_window_fields(
                 raise AggregateError(f"$setWindowFields {op} requires sortBy")
             compiled.append((field, op, arg, window))
             continue
+        if op in ("$derivative", "$integral"):
+            # Window operators over the sortBy value (x) and input (y). Require a
+            # sortBy; a time `unit` (date x-axis) is not yet modelled.
+            if not sort_by:
+                raise AggregateError(f"$setWindowFields {op} requires sortBy")
+            if not isinstance(arg, Mapping) or "input" not in arg:
+                raise AggregateError(f"{op} requires {{input, unit?}}")
+            if "unit" in arg:
+                raise AggregateError(
+                    f"$setWindowFields {op} with a time 'unit' is not yet implemented"
+                )
+            compiled.append((field, op, arg, window))
+            continue
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
@@ -1915,6 +1928,11 @@ def _stage_set_window_fields(
                     target[field] = fill_state[field][slot]
                     continue
                 low, high = _resolve_window(slot, n, window, range_vals)
+                if op in ("$derivative", "$integral"):
+                    target[field] = _ts_window_value(
+                        op, arg["input"], low, high, partition_docs, range_vals, ctx
+                    )
+                    continue
                 if high < low:
                     target[field] = _empty_window_value(op)
                     continue
@@ -2140,6 +2158,39 @@ def _compute_linear_fill(
                 raise AggregateError("$linearFill requires numeric sortBy values")
             out[i] = y0 + (y1 - y0) * ((x - x0) / (x1 - x0))
     return out
+
+
+def _ts_window_value(
+    op: str,
+    input_expr: Any,
+    low: int,
+    high: int,
+    partition_docs: list[dict[str, Any]],
+    range_vals: list[Any] | None,
+    ctx: PipelineContext,
+) -> Any:
+    """`$derivative` / `$integral` over the window `[low, high]`, using the sortBy
+    value as x and ``input`` as y. `$derivative` is the slope between the first
+    and last window points (null if fewer than two, or the x's coincide);
+    `$integral` is the trapezoidal area. Requires a single ascending numeric
+    sortBy (`range_vals`) and numeric inputs; math in IEEE double."""
+    if range_vals is None:
+        raise AggregateError(f"$setWindowFields {op} requires a single ascending numeric sortBy")
+    pts: list[tuple[float, float]] = []
+    for i in range(low, high + 1):
+        x, y = range_vals[i], evaluate(input_expr, partition_docs[i], ctx.vars)
+        if not (_is_number(x) and _is_number(y)):
+            raise AggregateError(f"$setWindowFields {op} requires numeric sortBy values and inputs")
+        pts.append((x, y))
+    if op == "$derivative":
+        if len(pts) < 2:
+            return None
+        (x0, y0), (x1, y1) = pts[0], pts[-1]
+        return None if x1 == x0 else (y1 - y0) / (x1 - x0)
+    total = 0.0  # $integral — trapezoidal sum
+    for (xa, ya), (xb, yb) in zip(pts, pts[1:], strict=False):
+        total += (xb - xa) * (ya + yb) / 2
+    return total
 
 
 def _compute_ema(

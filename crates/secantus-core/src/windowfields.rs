@@ -7,8 +7,9 @@
 //! window?: {...}}}`. The three rank functions (`$rank` / `$denseRank` /
 //! `$documentNumber`), the position-based `$shift` (`{output, by, default?}`),
 //! the prefix-accumulated `$expMovingAvg` (`{input, N|alpha}`), the gap-fill
-//! `$locf` / `$linearFill` (`<expr>`), plus every `$group` accumulator the shared
-//! `group` module knows
+//! `$locf` / `$linearFill` (`<expr>`), the window `$derivative` / `$integral`
+//! (`{input}` — slope / trapezoidal area over the sortBy x-axis), plus every
+//! `$group` accumulator the shared `group` module knows
 //! (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`/`$addToSet`/
 //! `$count`) evaluate over document-based windows (`documents: [lo, hi]`, with
 //! `"unbounded"` / `"current"` / integer bounds; a missing/empty window → the
@@ -17,8 +18,8 @@
 //! is in `[cur+lo, cur+hi]`, with `"unbounded"` / `"current"` / numeric bounds).
 //!
 //! Defers (`Err(())` → Python) on: range windows with a time `unit` or a
-//! non-ascending / multi-field / non-numeric sortBy, the remaining time-series
-//! operators (`$integral` / `$derivative`), any unsupported accumulator,
+//! non-ascending / multi-field / non-numeric sortBy, `$derivative` / `$integral`
+//! with a time `unit` (date x-axis), any unsupported accumulator,
 //! a non-document/empty `output`, an unsortable `sortBy` value, and a
 //! `partitionBy` expression the evaluator can't reproduce. Output preserves the
 //! *original* input order (only per-partition ordering drives the windows).
@@ -124,6 +125,13 @@ pub fn set_window_fields_stage(
             if window.is_some() || sort_by.is_none() {
                 return Err(());
             }
+        } else if op == "$derivative" || op == "$integral" {
+            // Window operators over the sortBy value (x) and input (y). Requires a
+            // sortBy; a time `unit` (date x-axis) is not modelled.
+            let spec = arg.as_document().ok_or(())?;
+            if sort_by.is_none() || !spec.contains_key("input") || spec.contains_key("unit") {
+                return Err(());
+            }
         } else {
             group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
         }
@@ -136,11 +144,12 @@ pub fn set_window_fields_stage(
     }
 
     let needs_rank = compiled.iter().any(|c| RANK_FUNCS.contains(&c.op));
-    // Range windows and `$linearFill` both need the single-ascending-numeric
-    // sortBy values (as window bounds / interpolation x-axis).
-    let needs_range = compiled
-        .iter()
-        .any(|c| c.window.is_some_and(|w| w.contains_key("range")) || c.op == "$linearFill");
+    // Range windows, `$linearFill`, and `$derivative`/`$integral` all need the
+    // single-ascending-numeric sortBy values (window bounds / interp / rate x-axis).
+    let needs_range = compiled.iter().any(|c| {
+        c.window.is_some_and(|w| w.contains_key("range"))
+            || matches!(c.op, "$linearFill" | "$derivative" | "$integral")
+    });
 
     // Partition, preserving partition-discovery order; each partition holds the
     // *original* indices of its members (in input order).
@@ -209,6 +218,22 @@ pub fn set_window_fields_stage(
                     prefix_vecs[ci].as_ref().unwrap()[pos].clone()
                 } else if c.op == "$shift" {
                     shift_value(c.arg.as_document().ok_or(())?, pos, &slots, &docs, vars)?
+                } else if c.op == "$derivative" || c.op == "$integral" {
+                    let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
+                        range_window_bounds(pos, n, c.window.unwrap(), range_vals.as_deref())?
+                    } else {
+                        window_bounds(pos, n, c.window)?
+                    };
+                    ts_window_value(
+                        c.op,
+                        c.arg.as_document().ok_or(())?,
+                        low,
+                        high,
+                        &slots,
+                        &docs,
+                        range_vals.as_deref(),
+                        vars,
+                    )?
                 } else {
                     let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
                         range_window_bounds(pos, n, c.window.unwrap(), range_vals.as_deref())?
@@ -366,6 +391,51 @@ fn shift_value(
         expressions::evaluate(&docs[slots[pos]], default, vars).map_err(|_| ())
     } else {
         Ok(Bson::Null)
+    }
+}
+
+/// `$derivative` / `$integral` over the window `[low, high]`, using the sortBy
+/// value (`range_vals`, x) and `input` (y). `$derivative` is the slope between
+/// the first and last window points (null if fewer than two, or the x's
+/// coincide); `$integral` is the trapezoidal area. Mirrors `_ts_window_value`.
+#[allow(clippy::too_many_arguments)]
+fn ts_window_value(
+    op: &str,
+    spec: &Document,
+    low: i64,
+    high: i64,
+    slots: &[usize],
+    docs: &[Document],
+    range_vals: Option<&[f64]>,
+    vars: &Document,
+) -> R<Bson> {
+    let xs = range_vals.ok_or(())?;
+    let input = spec.get("input").ok_or(())?;
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for s in low..=high {
+        let s = s as usize;
+        let y = as_number(&expressions::evaluate(&docs[slots[s]], input, vars).map_err(|_| ())?)
+            .ok_or(())?;
+        pts.push((xs[s], y));
+    }
+    if op == "$derivative" {
+        if pts.len() < 2 {
+            return Ok(Bson::Null);
+        }
+        let (x0, y0) = pts[0];
+        let (x1, y1) = pts[pts.len() - 1];
+        Ok(if x1 == x0 {
+            Bson::Null
+        } else {
+            Bson::Double((y1 - y0) / (x1 - x0))
+        })
+    } else {
+        let mut total = 0.0; // $integral — trapezoidal sum
+        for w in pts.windows(2) {
+            let ((xa, ya), (xb, yb)) = (w[0], w[1]);
+            total += (xb - xa) * (ya + yb) / 2.0;
+        }
+        Ok(Bson::Double(total))
     }
 }
 

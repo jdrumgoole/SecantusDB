@@ -549,6 +549,29 @@ def test_fill_parity(docs, pipeline):
                 }
             ],
         ),
+        # $derivative / $integral — whole-partition (default window) slope & area,
+        # plus a rolling 2-doc derivative. window is a sibling of the operator.
+        (
+            [
+                {"_id": i, "t": t, "v": v}
+                for i, (t, v) in enumerate([(0, 0), (1, 10), (2, 20), (4, 60)])
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "d": {"$derivative": {"input": "$v"}},
+                            "i": {"$integral": {"input": "$v"}},
+                            "rd": {
+                                "$derivative": {"input": "$v"},
+                                "window": {"documents": [-1, 0]},
+                            },
+                        },
+                    }
+                }
+            ],
+        ),
     ],
 )
 def test_set_window_fields_parity(docs, pipeline):
