@@ -49,6 +49,25 @@ review (issue #167).
   low-privilege reader can no longer harvest credential material.
   `usersInfo` (gated by `A_VIEW_USER` + `showCredentials`) is unchanged.
   Regressions in `tests/test_system_users_view.py`.
+### `$setWindowFields` gains `$expMovingAvg`
+
+`$setWindowFields` now supports `$expMovingAvg`, the exponential moving average —
+the second time-series window operator (after `$shift`).
+`{$expMovingAvg: {input: <expr>, N: <n>}}` smooths a series over the sorted
+partition, weighting recent rows more heavily: each output is
+`input·α + previous·(1−α)`, with `α = 2/(N+1)`. An explicit
+`{alpha: <0…1>}` may be given instead of `N`. It's the standard smoothing for
+noisy time-series — a trend line that reacts faster than a flat rolling average.
+
+The recurrence runs in IEEE double on both the Python and Rust servers, so the
+two agree bit-for-bit (pinned by the aggregation parity suite). The remaining
+time-series operators (`$derivative`, `$integral`, `$linearFill`, `$locf`) still
+raise a clear error.
+
+#### Added
+
+- `$setWindowFields` `$expMovingAvg` window operator (`{input, N | alpha}`) —
+  prefix-accumulated per partition, requires a `sortBy`.
 
 ### `$jsonSchema` gains logical combinators and `additionalProperties`
 
