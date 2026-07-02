@@ -67,6 +67,24 @@ class ForeignKey:
     on_update: str | None = None
 
 
+@dataclass(frozen=True)
+class CheckConstraint:
+    """A declared (never enforced) CHECK constraint. Recorded for reflection only
+    — ``expression`` is the rendered SQL of the predicate (e.g. ``age >= 0``)."""
+
+    name: str
+    expression: str
+
+
+@dataclass(frozen=True)
+class UniqueConstraint:
+    """A declared (never enforced) UNIQUE constraint over one or more columns.
+    Recorded for reflection only — uniqueness is not checked on write."""
+
+    name: str
+    columns: tuple[str, ...]
+
+
 @dataclass
 class TableDef:
     name: str
@@ -77,6 +95,8 @@ class TableDef:
     # the permissive ``any`` type rather than erroring.
     reflected: bool = False
     foreign_keys: list[ForeignKey] = field(default_factory=list)
+    check_constraints: list[CheckConstraint] = field(default_factory=list)
+    unique_constraints: list[UniqueConstraint] = field(default_factory=list)
     comment: str | None = None  # COMMENT ON TABLE (reflected via pg_description)
 
     def column(self, name: str) -> Column | None:
@@ -139,6 +159,12 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
             }
             for fk in table.foreign_keys
         ],
+        "check_constraints": [
+            {"name": ck.name, "expression": ck.expression} for ck in table.check_constraints
+        ],
+        "unique_constraints": [
+            {"name": uq.name, "columns": list(uq.columns)} for uq in table.unique_constraints
+        ],
     }
 
 
@@ -170,6 +196,14 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 on_update=fk.get("on_update"),
             )
             for fk in doc.get("foreign_keys", [])
+        ],
+        check_constraints=[
+            CheckConstraint(name=ck["name"], expression=ck["expression"])
+            for ck in doc.get("check_constraints", [])
+        ],
+        unique_constraints=[
+            UniqueConstraint(name=uq["name"], columns=tuple(uq["columns"]))
+            for uq in doc.get("unique_constraints", [])
         ],
     )
 

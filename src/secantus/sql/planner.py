@@ -25,7 +25,13 @@ import sqlglot
 from sqlglot import exp
 
 from secantus.sql import errors, typemap
-from secantus.sql.catalog import Column, ForeignKey, TableDef
+from secantus.sql.catalog import (
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    TableDef,
+    UniqueConstraint,
+)
 
 # sqlglot logs a WARNING when it falls back to parsing ``SHOW`` / ``RESET`` as a
 # generic ``Command`` node — which is exactly how we consume them. Quiet it so
@@ -777,6 +783,11 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         if isinstance(coldef, exp.ForeignKey):
             # Table-level FOREIGN KEY — collected by _extract_foreign_keys below.
             continue
+        if isinstance(
+            coldef, (exp.Constraint, exp.CheckColumnConstraint, exp.UniqueColumnConstraint)
+        ):
+            # Table-level CHECK / UNIQUE — collected by _extract_constraints below.
+            continue
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")
         tag = typemap.type_tag_for_sql(coldef.args["kind"])
@@ -806,7 +817,15 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         # column. Fine for the spike.
         pass
     fks = _extract_foreign_keys(schema, table_name)
-    table = TableDef(name=table_name, collection=table_name, columns=columns, foreign_keys=fks)
+    checks, uniques = _extract_constraints(schema, table_name)
+    table = TableDef(
+        name=table_name,
+        collection=table_name,
+        columns=columns,
+        foreign_keys=fks,
+        check_constraints=checks,
+        unique_constraints=uniques,
+    )
     return CreateTablePlan(table=table, if_not_exists=bool(stmt.args.get("exists")))
 
 
@@ -870,6 +889,59 @@ def _extract_foreign_keys(schema: exp.Schema, table_name: str) -> list[ForeignKe
                 if isinstance(con.kind, exp.Reference):
                     fks.append(_make_fk(table_name, (coldef.name,), con.kind))
     return fks
+
+
+def _unique_cols(node: exp.Expression | None, fallback: str | None) -> tuple[str, ...]:
+    """Column names a UNIQUE constraint covers. A table-level UNIQUE holds its
+    columns in a ``Schema`` (paren list) or a bare column node; a column-level
+    UNIQUE has no columns of its own, so it falls back to the owning column."""
+    if node is None:
+        return (fallback,) if fallback is not None else ()
+    if isinstance(node, exp.Schema):
+        return tuple(_column_name(c) for c in node.expressions)
+    return (_column_name(node),)
+
+
+def _extract_constraints(
+    schema: exp.Schema, table_name: str
+) -> tuple[list[CheckConstraint], list[UniqueConstraint]]:
+    """Collect declared CHECK / UNIQUE constraints from a ``CREATE TABLE`` column
+    list — column-level (``col int CHECK (col > 0)`` / ``col text UNIQUE``),
+    table-level named (``CONSTRAINT c CHECK (...)`` / ``... UNIQUE (a, b)``), and
+    table-level unnamed. Neither is enforced — recorded for reflection only."""
+    checks: list[CheckConstraint] = []
+    uniques: list[UniqueConstraint] = []
+
+    def add_check(inner: exp.CheckColumnConstraint, name: str | None, col: str | None) -> None:
+        expr = inner.this.sql(dialect="postgres")
+        cname = name or (f"{table_name}_{col}_check" if col else f"{table_name}_check")
+        checks.append(CheckConstraint(name=cname, expression=expr))
+
+    def add_unique(inner: exp.UniqueColumnConstraint, name: str | None, col: str | None) -> None:
+        cols = _unique_cols(inner.this, col)
+        cname = name or f"{table_name}_{'_'.join(cols)}_key"
+        uniques.append(UniqueConstraint(name=cname, columns=cols))
+
+    for coldef in schema.expressions:
+        if isinstance(coldef, exp.ColumnDef):  # column-level
+            for con in coldef.args.get("constraints") or []:
+                kind = con.kind
+                if isinstance(kind, exp.CheckColumnConstraint):
+                    add_check(kind, None, coldef.name)
+                elif isinstance(kind, exp.UniqueColumnConstraint):
+                    add_unique(kind, None, coldef.name)
+        elif isinstance(coldef, exp.Constraint):  # CONSTRAINT <name> CHECK/UNIQUE (...)
+            name = coldef.this.name if coldef.this else None
+            for inner in coldef.args.get("expressions") or []:
+                if isinstance(inner, exp.CheckColumnConstraint):
+                    add_check(inner, name, None)
+                elif isinstance(inner, exp.UniqueColumnConstraint):
+                    add_unique(inner, name, None)
+        elif isinstance(coldef, exp.CheckColumnConstraint):  # table-level unnamed CHECK (...)
+            add_check(coldef, None, None)
+        elif isinstance(coldef, exp.UniqueColumnConstraint):  # table-level unnamed UNIQUE (...)
+            add_unique(coldef, None, None)
+    return checks, uniques
 
 
 def _with_pk(col: Column, pk_name: str) -> Column:
