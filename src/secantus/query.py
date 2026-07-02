@@ -153,7 +153,26 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
             return False
         if "maxProperties" in schema and len(value) > schema["maxProperties"]:
             return False
-    return True
+        if "additionalProperties" in schema:
+            # Properties not named in ``properties`` are "additional". (Pattern-
+            # based allowances via ``patternProperties`` are not modelled.)
+            ap = schema["additionalProperties"]
+            allowed = set(schema.get("properties", {}))
+            extras = [k for k in value if k not in allowed]
+            if ap is False and extras:
+                return False
+            if isinstance(ap, Mapping):
+                for k in extras:
+                    if not _validate_json_schema(value[k], ap):
+                        return False
+    # Logical combinators apply to the value regardless of its type.
+    if "allOf" in schema and not all(_validate_json_schema(value, s) for s in schema["allOf"]):
+        return False
+    if "anyOf" in schema and not any(_validate_json_schema(value, s) for s in schema["anyOf"]):
+        return False
+    if "oneOf" in schema and sum(_validate_json_schema(value, s) for s in schema["oneOf"]) != 1:
+        return False
+    return not ("not" in schema and _validate_json_schema(value, schema["not"]))
 
 
 def _matches_json_type(value: Any, json_type: str) -> bool:

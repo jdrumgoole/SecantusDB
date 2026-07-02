@@ -1243,10 +1243,11 @@ family `$regexMatch` /
 `$regexFind` / `$regexFindAll` (shared `regexutil`; all three served by both the
 linear and backtracking `fancy-regex` engines — lookaround / backreference finds
 compute, matching Python `re`),
-`$jsonSchema` (bounded: the keyword subset the pure server validates — `bsonType` /
-`type` / `enum` / numeric bounds / string length + `pattern` / array + object counts
-+ `items` / `required` / `properties`; other JSON-Schema keywords are ignored exactly
-as the pure impl ignores them, and unreproducible shapes defer), `$dateFromString`
+`$jsonSchema` (`bsonType` / `type` / `enum` / numeric bounds / string length +
+`pattern` / array + object counts + `items` / `required` / `properties` /
+`additionalProperties` + the `allOf` / `anyOf` / `oneOf` / `not` combinators —
+both servers; `patternProperties` and other keywords still ignored, unreproducible
+shapes defer), `$dateFromString`
 (canonical ISO — `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS`, optional trailing `Z` or
 fixed `±HH:MM` offset → UTC instant — plus `null`→`onNull`; the parity harness now
 compares the *bson-normalised* stored form so tz-aware results compare cleanly.
@@ -1262,9 +1263,10 @@ defer). **Remaining:**
   `$locf` / ...) and range windows with a time `unit` — absent from *both* servers,
   so each needs a Python oracle first, then the Rust port. (`$shift`, document +
   value-`range` windows, and rank/accumulators already ship on both.)
-- [ ] **Query operator:** `$jsonSchema` extended keywords the pure server doesn't yet
-  validate either (`additionalProperties` / `patternProperties` / `allOf` / `anyOf` /
-  `oneOf` / `not` / `dependencies` / ...) — would need porting on **both** servers.
+- [ ] **Query operator:** `$jsonSchema` remaining keywords absent from both servers
+  (`patternProperties` / `dependencies` / `minProperties`-per-pattern / ...) — would
+  need porting on **both** servers. (`additionalProperties` + `allOf` / `anyOf` /
+  `oneOf` / `not` now ship on both.)
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 

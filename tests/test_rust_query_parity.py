@@ -422,6 +422,58 @@ CURATED = [
             }
         },
     ),
+    # allOf — all sub-schemas must hold.
+    (
+        {"n": 5},
+        {"$jsonSchema": {"properties": {"n": {"allOf": [{"bsonType": "int"}, {"minimum": 0}]}}}},
+    ),
+    (
+        {"n": -1},
+        {"$jsonSchema": {"properties": {"n": {"allOf": [{"bsonType": "int"}, {"minimum": 0}]}}}},
+    ),
+    # anyOf — at least one.
+    (
+        {"x": "s"},
+        {
+            "$jsonSchema": {
+                "properties": {"x": {"anyOf": [{"bsonType": "string"}, {"bsonType": "int"}]}}
+            }
+        },
+    ),
+    (
+        {"x": 1.5},
+        {
+            "$jsonSchema": {
+                "properties": {"x": {"anyOf": [{"bsonType": "string"}, {"bsonType": "int"}]}}
+            }
+        },
+    ),
+    # oneOf — exactly one (both bounds match -> fail).
+    (
+        {"n": 5},
+        {"$jsonSchema": {"properties": {"n": {"oneOf": [{"minimum": 0}, {"bsonType": "string"}]}}}},
+    ),
+    (
+        {"n": 5},
+        {"$jsonSchema": {"properties": {"n": {"oneOf": [{"minimum": 0}, {"maximum": 10}]}}}},
+    ),
+    # not — must NOT match.
+    ({"x": "s"}, {"$jsonSchema": {"properties": {"x": {"not": {"bsonType": "int"}}}}}),
+    ({"x": 5}, {"$jsonSchema": {"properties": {"x": {"not": {"bsonType": "int"}}}}}),
+    # additionalProperties: false forbids extras; true / schema allow.
+    ({"a": 1}, {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": False}}),
+    ({"a": 1, "b": 2}, {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": False}}),
+    ({"a": 1, "b": 2}, {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": True}}),
+    (
+        {"a": 1, "b": "x"},
+        {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": {"bsonType": "string"}}},
+    ),
+    (
+        {"a": 1, "b": 2},
+        {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": {"bsonType": "string"}}},
+    ),
+    # top-level combinator over the whole document.
+    ({"t": "x"}, {"$jsonSchema": {"anyOf": [{"required": ["t"]}, {"required": ["u"]}]}}),
 ]
 
 
