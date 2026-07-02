@@ -6,8 +6,9 @@
 //! optional `sortBy`, and an `output` map of `{field: {<accumulator>: arg,
 //! window?: {...}}}`. The three rank functions (`$rank` / `$denseRank` /
 //! `$documentNumber`), the position-based `$shift` (`{output, by, default?}`),
-//! the prefix-accumulated `$expMovingAvg` (`{input, N|alpha}`), plus every
-//! `$group` accumulator the shared `group` module knows
+//! the prefix-accumulated `$expMovingAvg` (`{input, N|alpha}`), the gap-fill
+//! `$locf` / `$linearFill` (`<expr>`), plus every `$group` accumulator the shared
+//! `group` module knows
 //! (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`/`$addToSet`/
 //! `$count`) evaluate over document-based windows (`documents: [lo, hi]`, with
 //! `"unbounded"` / `"current"` / integer bounds; a missing/empty window → the
@@ -17,8 +18,7 @@
 //!
 //! Defers (`Err(())` → Python) on: range windows with a time `unit` or a
 //! non-ascending / multi-field / non-numeric sortBy, the remaining time-series
-//! operators (`$integral` / `$derivative` / `$linearFill` / ...), any
-//! unsupported accumulator,
+//! operators (`$integral` / `$derivative`), any unsupported accumulator,
 //! a non-document/empty `output`, an unsortable `sortBy` value, and a
 //! `partitionBy` expression the evaluator can't reproduce. Output preserves the
 //! *original* input order (only per-partition ordering drives the windows).
@@ -33,6 +33,9 @@ use crate::{expressions, group, order, paths};
 type R<T> = Result<T, ()>;
 
 const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
+/// Ops whose output is a per-slot vector precomputed once over the sorted
+/// partition (prefix accumulation / gap-fill), rather than a window accumulator.
+const PREFIX_OPS: [&str; 3] = ["$expMovingAvg", "$locf", "$linearFill"];
 
 fn field_value(doc: &Document, field: &str) -> Bson {
     paths::get_path(doc, field).cloned().unwrap_or(Bson::Null)
@@ -114,6 +117,13 @@ pub fn set_window_fields_stage(
                 return Err(());
             }
             ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
+        } else if op == "$locf" || op == "$linearFill" {
+            // Gap-fill over the sorted partition; `arg` is the input expression.
+            // No window; requires a sortBy ($linearFill also a numeric x-axis,
+            // checked when the vector is built).
+            if window.is_some() || sort_by.is_none() {
+                return Err(());
+            }
         } else {
             group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
         }
@@ -126,9 +136,11 @@ pub fn set_window_fields_stage(
     }
 
     let needs_rank = compiled.iter().any(|c| RANK_FUNCS.contains(&c.op));
+    // Range windows and `$linearFill` both need the single-ascending-numeric
+    // sortBy values (as window bounds / interpolation x-axis).
     let needs_range = compiled
         .iter()
-        .any(|c| c.window.is_some_and(|w| w.contains_key("range")));
+        .any(|c| c.window.is_some_and(|w| w.contains_key("range")) || c.op == "$linearFill");
 
     // Partition, preserving partition-discovery order; each partition holds the
     // *original* indices of its members (in input order).
@@ -167,15 +179,17 @@ pub fn set_window_fields_stage(
         } else {
             None
         };
-        // $expMovingAvg is a prefix accumulation — precompute its per-slot vector
-        // once per partition per output field (parallel to `compiled`).
-        let mut ema_vecs: Vec<Option<Vec<f64>>> = Vec::with_capacity(compiled.len());
+        // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
+        // precompute once per partition per output field (parallel to `compiled`).
+        let mut prefix_vecs: Vec<Option<Vec<Bson>>> = Vec::with_capacity(compiled.len());
         for c in &compiled {
-            ema_vecs.push(if c.op == "$expMovingAvg" {
-                Some(ema_values(
+            prefix_vecs.push(if PREFIX_OPS.contains(&c.op) {
+                Some(window_vector(
+                    c.op,
                     &slots,
                     &docs,
-                    c.arg.as_document().ok_or(())?,
+                    c.arg,
+                    range_vals.as_deref(),
                     vars,
                 )?)
             } else {
@@ -191,8 +205,8 @@ pub fn set_window_fields_stage(
                         "$rank" => r.rank[pos],
                         _ => r.dense[pos], // "$denseRank"
                     })
-                } else if c.op == "$expMovingAvg" {
-                    Bson::Double(ema_vecs[ci].as_ref().unwrap()[pos])
+                } else if PREFIX_OPS.contains(&c.op) {
+                    prefix_vecs[ci].as_ref().unwrap()[pos].clone()
                 } else if c.op == "$shift" {
                     shift_value(c.arg.as_document().ok_or(())?, pos, &slots, &docs, vars)?
                 } else {
@@ -395,6 +409,83 @@ fn ema_values(slots: &[usize], docs: &[Document], spec: &Document, vars: &Docume
         };
         out.push(ema);
         prev = Some(ema);
+    }
+    Ok(out)
+}
+
+/// Per-slot output vector for the prefix/gap-fill window operators, mirroring
+/// `_compute_window_vector`. `$expMovingAvg` needs `arg` as a `{input, N|alpha}`
+/// doc; `$locf` / `$linearFill` take `arg` as the input expression directly.
+fn window_vector(
+    op: &str,
+    slots: &[usize],
+    docs: &[Document],
+    arg: &Bson,
+    range_vals: Option<&[f64]>,
+    vars: &Document,
+) -> R<Vec<Bson>> {
+    match op {
+        "$expMovingAvg" => Ok(ema_values(slots, docs, arg.as_document().ok_or(())?, vars)?
+            .into_iter()
+            .map(Bson::Double)
+            .collect()),
+        "$locf" => locf_values(slots, docs, arg, vars),
+        "$linearFill" => linear_fill_values(slots, docs, arg, range_vals, vars),
+        _ => Err(()),
+    }
+}
+
+/// `$locf` — last observation of `expr` carried forward over the sorted
+/// partition; leading nulls (before the first non-null) stay null.
+fn locf_values(slots: &[usize], docs: &[Document], expr: &Bson, vars: &Document) -> R<Vec<Bson>> {
+    let mut out = Vec::with_capacity(slots.len());
+    let mut last: Option<Bson> = None;
+    for &i in slots {
+        let v = expressions::evaluate(&docs[i], expr, vars).map_err(|_| ())?;
+        if matches!(v, Bson::Null) {
+            out.push(last.clone().unwrap_or(Bson::Null));
+        } else {
+            last = Some(v.clone());
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// `$linearFill` — interpolate `expr`'s nulls between non-null anchors along the
+/// (single ascending numeric) sortBy x-axis. Leading / trailing nulls stay null.
+/// Same IEEE-double math as `_compute_linear_fill`. Non-numeric sort / anchor,
+/// coincident x, or a missing x-axis (`range_vals` is `None`) → defer.
+fn linear_fill_values(
+    slots: &[usize],
+    docs: &[Document],
+    expr: &Bson,
+    range_vals: Option<&[f64]>,
+    vars: &Document,
+) -> R<Vec<Bson>> {
+    let xs = range_vals.ok_or(())?;
+    let vals: Vec<Bson> = slots
+        .iter()
+        .map(|&i| expressions::evaluate(&docs[i], expr, vars).map_err(|_| ()))
+        .collect::<R<Vec<_>>>()?;
+    let mut out = vals.clone();
+    let anchors: Vec<usize> = vals
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !matches!(v, Bson::Null))
+        .map(|(i, _)| i)
+        .collect();
+    for w in anchors.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (x0, x1) = (xs[a], xs[b]);
+        let y0 = as_number(&vals[a]).ok_or(())?;
+        let y1 = as_number(&vals[b]).ok_or(())?;
+        if x1 == x0 {
+            return Err(());
+        }
+        for i in (a + 1)..b {
+            out[i] = Bson::Double(y0 + (y1 - y0) * ((xs[i] - x0) / (x1 - x0)));
+        }
     }
     Ok(out)
 }

@@ -1259,9 +1259,9 @@ defer). **Remaining:**
   similar). Fractional seconds stay deferred (BSON is millisecond-only). The
   `Z` / `±HH:MM` offset tz slice now ships.
 - [ ] **Aggregate stages:** the remaining `$setWindowFields` time-series window
-  operators (`$integral` / `$derivative` / `$linearFill` / `$locf`) and range
-  windows with a time `unit` — absent from *both* servers, so each needs a Python
-  oracle first, then the Rust port. (`$shift`, `$expMovingAvg`, document +
+  operators (`$integral` / `$derivative`) and range windows with a time `unit` —
+  absent from *both* servers, so each needs a Python oracle first, then the Rust
+  port. (`$shift`, `$expMovingAvg`, `$locf`, `$linearFill`, document +
   value-`range` windows, and rank/accumulators already ship on both.)
 - [ ] **Query operator:** `$jsonSchema` remaining keywords absent from both servers
   (`patternProperties` / `dependencies` / `minProperties`-per-pattern / ...) — would

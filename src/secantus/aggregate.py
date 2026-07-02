@@ -1845,6 +1845,16 @@ def _stage_set_window_fields(
             _ema_alpha(arg)  # validates exactly-one-of N/alpha and their ranges
             compiled.append((field, op, arg, window))
             continue
+        if op in ("$locf", "$linearFill"):
+            # Gap-filling over the sorted partition (arg is the input expression).
+            # No window; requires a sortBy. $linearFill additionally needs a single
+            # ascending numeric sort field as the interpolation x-axis.
+            if window is not None:
+                raise AggregateError(f"$setWindowFields {op} does not accept a window")
+            if not sort_by:
+                raise AggregateError(f"$setWindowFields {op} requires sortBy")
+            compiled.append((field, op, arg, window))
+            continue
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
@@ -1885,12 +1895,12 @@ def _stage_set_window_fields(
             sort_field, sort_dir = next(iter(sort_by.items()))
             if sort_dir == 1:
                 range_vals = [get_path(doc, sort_field) for doc in partition_docs]
-        # $expMovingAvg is a prefix accumulation — precompute its per-slot vector
-        # once per partition per output field.
-        ema_state = {
-            field: _compute_ema(partition_docs, arg, ctx)
+        # $expMovingAvg / $locf / $linearFill are per-slot vectors computed once
+        # per partition per output field.
+        fill_state = {
+            field: _compute_window_vector(op, partition_docs, arg, range_vals, ctx)
             for field, op, arg, _w in compiled
-            if op == "$expMovingAvg"
+            if op in ("$expMovingAvg", "$locf", "$linearFill")
         }
         for slot, (orig_i, _) in enumerate(members):
             target = out_docs[orig_i]
@@ -1901,8 +1911,8 @@ def _stage_set_window_fields(
                 if op == "$shift":
                     target[field] = _shift_value(arg, slot, partition_docs, ctx)
                     continue
-                if op == "$expMovingAvg":
-                    target[field] = ema_state[field][slot]
+                if op in ("$expMovingAvg", "$locf", "$linearFill"):
+                    target[field] = fill_state[field][slot]
                     continue
                 low, high = _resolve_window(slot, n, window, range_vals)
                 if high < low:
@@ -2066,6 +2076,70 @@ def _ema_alpha(spec: Mapping[str, Any]) -> float:
     if not _is_number(a) or not (0 < a < 1):
         raise AggregateError("$expMovingAvg alpha must be a number in (0, 1)")
     return float(a)
+
+
+def _compute_window_vector(
+    op: str,
+    partition_docs: list[dict[str, Any]],
+    arg: Any,
+    range_vals: list[Any] | None,
+    ctx: PipelineContext,
+) -> list[Any]:
+    """Per-slot output for the prefix/partition window operators."""
+    if op == "$expMovingAvg":
+        return _compute_ema(partition_docs, arg, ctx)
+    if op == "$locf":
+        return _compute_locf(partition_docs, arg, ctx)
+    return _compute_linear_fill(partition_docs, arg, range_vals, ctx)  # $linearFill
+
+
+def _compute_locf(
+    partition_docs: list[dict[str, Any]],
+    expr: Any,
+    ctx: PipelineContext,
+) -> list[Any]:
+    """Last-observation-carried-forward of ``expr`` over the sorted partition:
+    a null / missing value takes the last non-null seen; leading nulls stay null."""
+    out: list[Any] = []
+    last: Any = None
+    seen = False
+    for doc in partition_docs:
+        v = evaluate(expr, doc, ctx.vars)
+        if v is not None:
+            last, seen = v, True
+            out.append(v)
+        else:
+            out.append(last if seen else None)
+    return out
+
+
+def _compute_linear_fill(
+    partition_docs: list[dict[str, Any]],
+    expr: Any,
+    range_vals: list[Any] | None,
+    ctx: PipelineContext,
+) -> list[Any]:
+    """Linear interpolation of ``expr``'s nulls between surrounding non-null
+    anchors, using the (single ascending numeric) sortBy value as the x-axis.
+    Leading / trailing nulls stay null. Values in IEEE double so the Rust port
+    matches bit-for-bit."""
+    if range_vals is None:
+        raise AggregateError("$linearFill requires a single ascending sortBy field")
+    vals = [evaluate(expr, doc, ctx.vars) for doc in partition_docs]
+    out = list(vals)
+    anchors = [i for i, v in enumerate(vals) if v is not None]
+    for a, b in zip(anchors, anchors[1:], strict=False):
+        x0, x1, y0, y1 = range_vals[a], range_vals[b], vals[a], vals[b]
+        if not all(_is_number(x) for x in (x0, x1, y0, y1)):
+            raise AggregateError("$linearFill requires numeric sortBy values and inputs")
+        if x1 == x0:
+            raise AggregateError("$linearFill: coincident sortBy values")
+        for i in range(a + 1, b):
+            x = range_vals[i]
+            if not _is_number(x):
+                raise AggregateError("$linearFill requires numeric sortBy values")
+            out[i] = y0 + (y1 - y0) * ((x - x0) / (x1 - x0))
+    return out
 
 
 def _compute_ema(

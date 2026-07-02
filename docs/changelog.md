@@ -19,6 +19,28 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$setWindowFields` gains `$locf` and `$linearFill`
+
+`$setWindowFields` now supports the two gap-filling window operators, `$locf` and
+`$linearFill`. `{$locf: <expr>}` ("last observation carried forward") replaces a
+null with the most recent non-null value seen in sort order — the standard way to
+hold a reading steady until the next sample. `{$linearFill: <expr>}` instead draws
+a straight line between the surrounding non-null anchors and reads off the missing
+values along it, using the `sortBy` value as the x-axis. Leading nulls (for
+`$locf`) and leading/trailing nulls (for `$linearFill`, which has nothing to
+interpolate between) stay null.
+
+Both run on the Python and Rust servers alike, pinned by the aggregation parity
+suite (the interpolation is IEEE-double, so the two agree bit-for-bit). With these
+plus `$shift` and `$expMovingAvg`, only `$derivative` and `$integral` remain of
+the time-series window operators.
+
+#### Added
+
+- `$setWindowFields` `$locf` and `$linearFill` gap-fill window operators
+  (`<expr>`) — prefix/partition-based, require a `sortBy` (`$linearFill` a single
+  ascending numeric one).
+
 ### `admin.system.users` no longer leaks SCRAM credentials via find/count/aggregate
 
 A query against `admin.system.users` — reachable through ordinary
