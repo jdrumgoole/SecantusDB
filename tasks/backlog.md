@@ -1553,6 +1553,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
   reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
   resolves; `sequences` is present-but-empty (no sequences).
+- [ ] **UNIQUE enforcement on write landed** (b95): `INSERT` / `UPDATE` on a **declared** table now
+  reject a write that would create two rows sharing a value for a declared UNIQUE constraint (`23505`,
+  `executor._validate_unique_rows`). NULLs are distinct — a row with any NULL in a constraint's columns
+  is exempt (matches Postgres default, no `NULLS NOT DISTINCT`). Duplicates *within* an INSERT/UPDATE
+  batch collide, and each row is probed against stored rows; an UPDATE excludes every row it is
+  rewriting (`exclude_ids` = matched `_id`s) so unchanged rows and value-swaps across the matched set
+  don't self-conflict. Wired into `execute_insert` and `execute_update` (via
+  `_validate_update_post_images`, which now also does UNIQUE). The PK is still enforced separately by
+  storage's `_id` index (code 11000 → 23505 in `_raise_write_error`). **Limitations:** `INSERT … ON
+  CONFLICT` only handles its arbiter target — a secondary UNIQUE violated by the insert / DO UPDATE
+  isn't caught (TODO); `MERGE` writes bypass enforcement (go through `_run_merge`, not
+  `execute_update`); no `NULLS NOT DISTINCT`.
 - [ ] **CHECK + NOT NULL enforcement on write landed** (b94): `INSERT` / `UPDATE` on a **declared**
   table now enforce NOT NULL (`23502`) and CHECK (`23514`) against the post-image — a violating write is
   rejected and the table left unchanged (`executor._validate_write_row` / `_validate_rows` /
