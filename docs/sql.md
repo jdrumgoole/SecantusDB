@@ -207,7 +207,9 @@ ALTER TABLE users RENAME TO members;                -- renames the table + colle
 
 Supported actions: `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`,
 `RENAME COLUMN`, `RENAME TO`, `ALTER COLUMN … SET/DROP NOT NULL`, `ALTER COLUMN
-… TYPE t`, and `ALTER COLUMN … SET/DROP DEFAULT`. `ALTER TABLE IF EXISTS` on a
+… TYPE t`, `ALTER COLUMN … SET/DROP DEFAULT`, and `ADD [CONSTRAINT name] FOREIGN
+KEY (…) REFERENCES …` (declared, not enforced — like a CREATE TABLE FK).
+`ALTER TABLE IF EXISTS` on a
 missing table is a no-op. Dropping the `PRIMARY KEY` column is rejected (it maps
 to `_id`); renaming it changes only the SQL name — the field stays `_id`. A
 `TYPE` change retypes the column in the catalog (new inserts/reads use it;
@@ -267,8 +269,9 @@ insp.get_foreign_keys("orders")
 ```
 
 `ON DELETE` / `ON UPDATE` actions are recorded and reflected but never acted on.
-`REFERENCES t` with no column list targets `t`'s primary key. Composite foreign
-keys parse, but adding a foreign key via `ALTER TABLE` is not yet supported.
+`REFERENCES t` with no column list targets `t`'s primary key. A foreign key can
+also be added after the fact with `ALTER TABLE … ADD [CONSTRAINT name] FOREIGN
+KEY (…) REFERENCES …`.
 
 ## Querying
 
@@ -1087,7 +1090,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` declared-not-enforced, literal column `DEFAULT`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | multi-action `ALTER`, `ALTER TABLE … ADD FOREIGN KEY`, non-literal / expression DEFAULT, enforced constraints, views |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` declared-not-enforced, literal column `DEFAULT`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] FOREIGN KEY`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | multi-action `ALTER`, `ADD` CHECK/UNIQUE constraint, non-literal / expression DEFAULT, enforced constraints, views |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
