@@ -6,7 +6,8 @@
 //! optional `sortBy`, and an `output` map of `{field: {<accumulator>: arg,
 //! window?: {...}}}`. The three rank functions (`$rank` / `$denseRank` /
 //! `$documentNumber`), the position-based `$shift` (`{output, by, default?}`),
-//! plus every `$group` accumulator the shared `group` module knows
+//! the prefix-accumulated `$expMovingAvg` (`{input, N|alpha}`), plus every
+//! `$group` accumulator the shared `group` module knows
 //! (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`/`$addToSet`/
 //! `$count`) evaluate over document-based windows (`documents: [lo, hi]`, with
 //! `"unbounded"` / `"current"` / integer bounds; a missing/empty window → the
@@ -16,7 +17,7 @@
 //!
 //! Defers (`Err(())` → Python) on: range windows with a time `unit` or a
 //! non-ascending / multi-field / non-numeric sortBy, the remaining time-series
-//! operators (`$integral` / `$derivative` / `$expMovingAvg` / ...), any
+//! operators (`$integral` / `$derivative` / `$linearFill` / ...), any
 //! unsupported accumulator,
 //! a non-document/empty `output`, an unsortable `sortBy` value, and a
 //! `partitionBy` expression the evaluator can't reproduce. Output preserves the
@@ -106,6 +107,13 @@ pub fn set_window_fields_stage(
             if !matches!(spec.get("by"), Some(Bson::Int32(_)) | Some(Bson::Int64(_))) {
                 return Err(());
             }
+        } else if op == "$expMovingAvg" {
+            // Prefix accumulation: requires a sortBy, no window, `{input, N|alpha}`.
+            let spec = arg.as_document().ok_or(())?;
+            if window.is_some() || sort_by.is_none() || !spec.contains_key("input") {
+                return Err(());
+            }
+            ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
         } else {
             group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
         }
@@ -159,8 +167,23 @@ pub fn set_window_fields_stage(
         } else {
             None
         };
+        // $expMovingAvg is a prefix accumulation — precompute its per-slot vector
+        // once per partition per output field (parallel to `compiled`).
+        let mut ema_vecs: Vec<Option<Vec<f64>>> = Vec::with_capacity(compiled.len());
+        for c in &compiled {
+            ema_vecs.push(if c.op == "$expMovingAvg" {
+                Some(ema_values(
+                    &slots,
+                    &docs,
+                    c.arg.as_document().ok_or(())?,
+                    vars,
+                )?)
+            } else {
+                None
+            });
+        }
         for (pos, &orig_i) in slots.iter().enumerate() {
-            for c in &compiled {
+            for (ci, c) in compiled.iter().enumerate() {
                 let value = if RANK_FUNCS.contains(&c.op) {
                     let r = ranks.as_ref().unwrap();
                     Bson::Int32(match c.op {
@@ -168,6 +191,8 @@ pub fn set_window_fields_stage(
                         "$rank" => r.rank[pos],
                         _ => r.dense[pos], // "$denseRank"
                     })
+                } else if c.op == "$expMovingAvg" {
+                    Bson::Double(ema_vecs[ci].as_ref().unwrap()[pos])
                 } else if c.op == "$shift" {
                     shift_value(c.arg.as_document().ok_or(())?, pos, &slots, &docs, vars)?
                 } else {
@@ -328,6 +353,50 @@ fn shift_value(
     } else {
         Ok(Bson::Null)
     }
+}
+
+/// `$expMovingAvg` smoothing factor: `2/(N+1)` from a positive-int `N`, or a
+/// given `alpha` in (0, 1). Exactly one must be present, else `Err(())` (defer).
+fn ema_alpha(spec: &Document) -> R<f64> {
+    let has_n = spec.contains_key("N");
+    let has_alpha = spec.contains_key("alpha");
+    if has_n == has_alpha {
+        return Err(());
+    }
+    if has_n {
+        let n = match spec.get("N") {
+            Some(Bson::Int32(n)) if *n >= 1 => *n as f64,
+            Some(Bson::Int64(n)) if *n >= 1 => *n as f64,
+            _ => return Err(()),
+        };
+        Ok(2.0 / (n + 1.0))
+    } else {
+        match spec.get("alpha") {
+            Some(Bson::Double(a)) if *a > 0.0 && *a < 1.0 => Ok(*a),
+            _ => Err(()), // int alpha can't be in (0,1); non-number defers
+        }
+    }
+}
+
+/// Per-slot exponential moving average over the sorted partition, mirroring
+/// `_compute_ema`: `ema[0] = input[0]`; `ema[i] = input[i]*alpha +
+/// ema[i-1]*(1-alpha)`. Same IEEE-double ops as the oracle → bit-for-bit match.
+fn ema_values(slots: &[usize], docs: &[Document], spec: &Document, vars: &Document) -> R<Vec<f64>> {
+    let alpha = ema_alpha(spec)?;
+    let input = spec.get("input").ok_or(())?;
+    let mut out = Vec::with_capacity(slots.len());
+    let mut prev: Option<f64> = None;
+    for &i in slots {
+        let v = expressions::evaluate(&docs[i], input, vars).map_err(|_| ())?;
+        let x = as_number(&v).ok_or(())?; // non-numeric input -> defer
+        let ema = match prev {
+            None => x,
+            Some(p) => x * alpha + p * (1.0 - alpha),
+        };
+        out.push(ema);
+        prev = Some(ema);
+    }
+    Ok(out)
 }
 
 /// A numeric BSON value as `f64` (int / long / double, never bool / Decimal128 —

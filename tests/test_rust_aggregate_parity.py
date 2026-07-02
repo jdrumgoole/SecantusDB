@@ -481,6 +481,38 @@ def test_fill_parity(docs, pipeline):
                 }
             ],
         ),
+        # $expMovingAvg — N form (alpha = 2/(N+1)) and explicit alpha; IEEE-double
+        # recurrence matches the oracle bit-for-bit. Also a per-partition case.
+        (
+            [{"_id": i, "t": i, "v": v} for i, v in enumerate([10, 20, 30, 40])],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "eN": {"$expMovingAvg": {"input": "$v", "N": 3}},
+                            "eA": {"$expMovingAvg": {"input": "$v", "alpha": 0.4}},
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": 2},
+                {"_id": 2, "g": "a", "t": 2, "v": 4},
+                {"_id": 3, "g": "b", "t": 1, "v": 100},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"e": {"$expMovingAvg": {"input": "$v", "N": 2}}},
+                    }
+                }
+            ],
+        ),
     ],
 )
 def test_set_window_fields_parity(docs, pipeline):

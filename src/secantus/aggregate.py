@@ -1832,6 +1832,19 @@ def _stage_set_window_fields(
                 raise AggregateError("$shift 'by' must be an integer")
             compiled.append((field, op, arg, window))
             continue
+        if op == "$expMovingAvg":
+            # Prefix-accumulated over the sorted partition. No window; requires a
+            # sortBy. Validating the {input, N|alpha} shape up front (raises on a
+            # bad spec, exactly one of N/alpha).
+            if window is not None:
+                raise AggregateError("$setWindowFields $expMovingAvg does not accept a window")
+            if not sort_by:
+                raise AggregateError("$setWindowFields $expMovingAvg requires sortBy")
+            if not isinstance(arg, Mapping) or "input" not in arg:
+                raise AggregateError("$expMovingAvg requires {input, N|alpha}")
+            _ema_alpha(arg)  # validates exactly-one-of N/alpha and their ranges
+            compiled.append((field, op, arg, window))
+            continue
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
@@ -1872,6 +1885,13 @@ def _stage_set_window_fields(
             sort_field, sort_dir = next(iter(sort_by.items()))
             if sort_dir == 1:
                 range_vals = [get_path(doc, sort_field) for doc in partition_docs]
+        # $expMovingAvg is a prefix accumulation — precompute its per-slot vector
+        # once per partition per output field.
+        ema_state = {
+            field: _compute_ema(partition_docs, arg, ctx)
+            for field, op, arg, _w in compiled
+            if op == "$expMovingAvg"
+        }
         for slot, (orig_i, _) in enumerate(members):
             target = out_docs[orig_i]
             for field, op, arg, window in compiled:
@@ -1880,6 +1900,9 @@ def _stage_set_window_fields(
                     continue
                 if op == "$shift":
                     target[field] = _shift_value(arg, slot, partition_docs, ctx)
+                    continue
+                if op == "$expMovingAvg":
+                    target[field] = ema_state[field][slot]
                     continue
                 low, high = _resolve_window(slot, n, window, range_vals)
                 if high < low:
@@ -2026,6 +2049,45 @@ def _range_window_bounds(
 
 def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _ema_alpha(spec: Mapping[str, Any]) -> float:
+    """The smoothing factor for `$expMovingAvg`: `2/(N+1)` from a positive-int
+    `N`, or a given `alpha` in (0, 1). Exactly one must be present."""
+    has_n, has_alpha = "N" in spec, "alpha" in spec
+    if has_n == has_alpha:
+        raise AggregateError("$expMovingAvg requires exactly one of N / alpha")
+    if has_n:
+        n = spec["N"]
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise AggregateError("$expMovingAvg N must be a positive integer")
+        return 2 / (n + 1)
+    a = spec["alpha"]
+    if not _is_number(a) or not (0 < a < 1):
+        raise AggregateError("$expMovingAvg alpha must be a number in (0, 1)")
+    return float(a)
+
+
+def _compute_ema(
+    partition_docs: list[dict[str, Any]],
+    spec: Mapping[str, Any],
+    ctx: PipelineContext,
+) -> list[float]:
+    """Per-slot exponential moving average over the sorted partition:
+    ``ema[0] = input[0]``; ``ema[i] = input[i]*alpha + ema[i-1]*(1-alpha)``. All
+    in IEEE double so the Rust port matches bit-for-bit."""
+    alpha = _ema_alpha(spec)
+    out: list[float] = []
+    prev: float | None = None
+    for doc in partition_docs:
+        val = evaluate(spec["input"], doc, ctx.vars)
+        if not _is_number(val):
+            raise AggregateError("$expMovingAvg input must be numeric")
+        val = float(val)
+        ema = val if prev is None else val * alpha + prev * (1 - alpha)
+        out.append(ema)
+        prev = ema
+    return out
 
 
 def _shift_value(

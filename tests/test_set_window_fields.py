@@ -11,11 +11,14 @@ First-cut subset that matches the common driver-test surface:
 * Bound forms: integer offsets, ``"current"``, ``"unbounded"``.
 * Default window (when not specified) covers the whole partition.
 
+Also supported: the position-based ``$shift`` and the prefix-accumulated
+``$expMovingAvg`` time-series operators, and the rank functions (``$rank`` /
+``$denseRank`` / ``$documentNumber`` — see ``tests/test_window_rank_functions.py``).
+
 Deferred (raises ``AggregateError`` with a clear message): range windows with a
-time ``unit`` or a non-ascending / multi-field / non-numeric sortBy, time-series
-functions (``$derivative`` / ``$integral`` / ``$linearFill`` / ``$locf`` /
-``$shift`` / ``$expMovingAvg``), and rank functions (``$rank`` / ``$denseRank`` /
-``$documentNumber`` — see ``tests/test_window_rank_functions.py``).
+time ``unit`` or a non-ascending / multi-field / non-numeric sortBy, and the
+remaining time-series functions (``$derivative`` / ``$integral`` /
+``$linearFill`` / ``$locf``).
 """
 
 from __future__ import annotations
@@ -360,9 +363,54 @@ def test_shift_partitioned(client) -> None:
     assert [d["nxt"] for d in out] == [2, -1, -1]
 
 
+def test_exp_moving_avg_n_and_alpha(client) -> None:
+    """`$expMovingAvg` — `ema[i] = v[i]*a + ema[i-1]*(1-a)`, with `a = 2/(N+1)`
+    for the N form (N=3 -> a=0.5) or an explicit `alpha`."""
+    coll = client["swf_db"]["ema"]
+    coll.insert_many([{"_id": i, "t": i, "v": v} for i, v in enumerate([10, 20, 30, 40])])
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "eN": {"$expMovingAvg": {"input": "$v", "N": 3}},
+                            "eA": {"$expMovingAvg": {"input": "$v", "alpha": 0.5}},
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["eN"] for d in out] == [10.0, 15.0, 22.5, 31.25]
+    assert [d["eA"] for d in out] == [10.0, 15.0, 22.5, 31.25]
+
+
+def test_exp_moving_avg_requires_one_of_n_alpha(client) -> None:
+    """Exactly one of N / alpha — neither or both raises."""
+    coll = client["swf_db"]["ema_bad"]
+    coll.insert_one({"_id": 1, "t": 1, "v": 1})
+    for spec in ({"input": "$v"}, {"input": "$v", "N": 3, "alpha": 0.5}):
+        with pytest.raises(OperationFailure):
+            list(
+                coll.aggregate(
+                    [
+                        {
+                            "$setWindowFields": {
+                                "sortBy": {"t": 1},
+                                "output": {"e": {"$expMovingAvg": spec}},
+                            }
+                        }
+                    ]
+                )
+            )
+
+
 def test_unsupported_time_series_function_raises(client) -> None:
     """The remaining time-series functions ($derivative / $integral /
-    $expMovingAvg / ...) are still deferred — raise so the gap is visible."""
+    $linearFill / ...) are still deferred — raise so the gap is visible."""
     coll = client["swf_db"]["timeseries"]
     coll.insert_one({"_id": 1, "v": 1, "ts": 1})
 
