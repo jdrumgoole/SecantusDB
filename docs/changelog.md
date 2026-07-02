@@ -19,6 +19,26 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$jsonSchema` gains logical combinators and `additionalProperties`
+
+The `$jsonSchema` query operator now understands the JSON-Schema logical
+combinators — `allOf`, `anyOf`, `oneOf`, and `not` — plus `additionalProperties`.
+`allOf`/`anyOf`/`oneOf` compose sub-schemas (all / at-least-one / exactly-one
+must hold), `not` inverts one, and `additionalProperties` controls fields not
+named in `properties`: `false` forbids them outright, while a sub-schema
+validates each one. Together they cover the structural side of collection
+validators that go beyond flat field constraints — "exactly one of these shapes",
+"none of that", "no unexpected fields".
+
+These keywords were previously absent from *both* servers; they now ship on the
+Python and Rust servers alike, pinned by the query parity suite.
+(`patternProperties` is still not modelled.)
+
+#### Added
+
+- `$jsonSchema` `allOf` / `anyOf` / `oneOf` / `not` combinators and
+  `additionalProperties` (`true` / `false` / sub-schema).
+
 ### `$setWindowFields` gains the `$shift` window operator
 
 `$setWindowFields` now supports `$shift` — the first of MongoDB's time-series

@@ -274,6 +274,47 @@ def test_json_schema_enum() -> None:
     assert not matches({"status": "pending"}, {"$jsonSchema": schema})
 
 
+def test_json_schema_all_of() -> None:
+    schema = {"properties": {"n": {"allOf": [{"bsonType": "int"}, {"minimum": 0}]}}}
+    assert matches({"n": 5}, {"$jsonSchema": schema})
+    assert not matches({"n": -1}, {"$jsonSchema": schema})  # fails minimum
+    assert not matches({"n": 1.5}, {"$jsonSchema": schema})  # fails bsonType
+
+
+def test_json_schema_any_of() -> None:
+    schema = {"properties": {"x": {"anyOf": [{"bsonType": "string"}, {"bsonType": "int"}]}}}
+    assert matches({"x": "s"}, {"$jsonSchema": schema})
+    assert matches({"x": 3}, {"$jsonSchema": schema})
+    assert not matches({"x": 1.5}, {"$jsonSchema": schema})
+
+
+def test_json_schema_one_of() -> None:
+    schema = {"properties": {"n": {"oneOf": [{"bsonType": "int"}, {"bsonType": "string"}]}}}
+    assert matches({"n": 5}, {"$jsonSchema": schema})  # exactly one (int)
+    assert matches({"n": "s"}, {"$jsonSchema": schema})  # exactly one (string)
+    assert not matches({"n": 1.5}, {"$jsonSchema": schema})  # neither -> zero matches
+    # A value satisfying BOTH sub-schemas -> more than one -> fails. (5 is >= 0
+    # and <= 10; a bound-only schema doesn't constrain the other direction.)
+    two = {"properties": {"n": {"oneOf": [{"minimum": 0}, {"maximum": 10}]}}}
+    assert not matches({"n": 5}, {"$jsonSchema": two})
+
+
+def test_json_schema_not() -> None:
+    schema = {"properties": {"x": {"not": {"bsonType": "int"}}}}
+    assert matches({"x": "s"}, {"$jsonSchema": schema})
+    assert not matches({"x": 5}, {"$jsonSchema": schema})
+
+
+def test_json_schema_additional_properties() -> None:
+    false_schema = {"properties": {"a": {}}, "additionalProperties": False}
+    assert matches({"a": 1}, {"$jsonSchema": false_schema})
+    assert not matches({"a": 1, "b": 2}, {"$jsonSchema": false_schema})  # extra `b`
+    # a sub-schema validates each additional property
+    typed = {"properties": {"a": {}}, "additionalProperties": {"bsonType": "string"}}
+    assert matches({"a": 1, "b": "x"}, {"$jsonSchema": typed})
+    assert not matches({"a": 1, "b": 2}, {"$jsonSchema": typed})
+
+
 def test_json_schema_array_items() -> None:
     schema = {"properties": {"tags": {"bsonType": "array", "items": {"bsonType": "string"}}}}
     assert matches({"tags": ["a", "b"]}, {"$jsonSchema": schema})

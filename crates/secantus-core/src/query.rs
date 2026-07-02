@@ -9,8 +9,9 @@
 //! everything else (geo, structural/compound equality, exotic BSON types) defers
 //! to Python. `$jsonSchema` is handled for the bounded keyword subset the pure
 //! server validates (`bsonType`/`type`/`enum`/numeric bounds/string length +
-//! `pattern`/array + object counts + `items`/`required`/`properties`), deferring
-//! any shape it can't reproduce. `$expr` is handled via the Rust expression
+//! `pattern`/array + object counts + `items`/`required`/`properties`/
+//! `additionalProperties`/`allOf`/`anyOf`/`oneOf`/`not`), deferring any shape it
+//! can't reproduce. `$expr` is handled via the Rust expression
 //! evaluator; `$all` via its Python-`==`. A `collation` is threaded through
 //! string comparisons and handled for the ASCII-safe cases (see
 //! `crate::collation`), deferring non-ASCII / `numericOrdering` to Python.
@@ -803,6 +804,73 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
             if n > as_schema_int(max)? {
                 return Ok(false);
             }
+        }
+        if let Some(ap) = sch.get("additionalProperties") {
+            // "Additional" = a key not named in `properties` (patternProperties
+            // not modelled). `false` forbids extras; a sub-schema validates them.
+            let allowed: Vec<&str> = match sch.get("properties") {
+                Some(Bson::Document(pd)) => pd.keys().map(String::as_str).collect(),
+                _ => Vec::new(),
+            };
+            let is_extra = |k: &str| !allowed.contains(&k);
+            match ap {
+                Bson::Boolean(true) => {}
+                Bson::Boolean(false) => {
+                    if obj.keys().any(|k| is_extra(k.as_str())) {
+                        return Ok(false);
+                    }
+                }
+                Bson::Document(_) => {
+                    for (k, pv) in obj {
+                        if is_extra(k.as_str()) && !validate_json_schema(pv, ap)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => return Err(Fallback), // non-bool/doc -> defer
+            }
+        }
+    }
+    // Logical combinators apply to the value regardless of its BSON type.
+    if let Some(Bson::Array(subs)) = sch.get("allOf") {
+        for s in subs {
+            if !validate_json_schema(value, s)? {
+                return Ok(false);
+            }
+        }
+    } else if sch.contains_key("allOf") {
+        return Err(Fallback);
+    }
+    if let Some(Bson::Array(subs)) = sch.get("anyOf") {
+        let mut any = false;
+        for s in subs {
+            if validate_json_schema(value, s)? {
+                any = true;
+                break;
+            }
+        }
+        if !any {
+            return Ok(false);
+        }
+    } else if sch.contains_key("anyOf") {
+        return Err(Fallback);
+    }
+    if let Some(Bson::Array(subs)) = sch.get("oneOf") {
+        let mut count = 0;
+        for s in subs {
+            if validate_json_schema(value, s)? {
+                count += 1;
+            }
+        }
+        if count != 1 {
+            return Ok(false);
+        }
+    } else if sch.contains_key("oneOf") {
+        return Err(Fallback);
+    }
+    if let Some(not_schema) = sch.get("not") {
+        if validate_json_schema(value, not_schema)? {
+            return Ok(false);
         }
     }
     Ok(true)
