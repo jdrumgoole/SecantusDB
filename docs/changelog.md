@@ -63,6 +63,36 @@ the time-series window operators.
   (`<expr>`) — prefix/partition-based, require a `sortBy` (`$linearFill` a single
   ascending numeric one).
 
+### Rust server: an interior-NUL db/collection/index name no longer panics the connection
+
+A well-formed BSON command whose database, collection, or index name carried
+an embedded NUL byte (BSON strings are length-prefixed and may legally contain
+one) reached the Rust server's WiredTiger key encoder (`secantus-wt`'s `cstr`,
+`CString::new(..).expect(..)`) and **panicked**. Because the storage layer
+serialises WiredTiger operations under a `std::sync::Mutex`, that panic unwound
+while the lock was held and **poisoned it for every connection** — turning a
+single crafted command into a whole-server denial of service, and dropping the
+offending socket with no `{ok: 0, ...}` reply (unlike the Python server, which
+catches every error in `dispatch`).
+
+The Rust server now rejects an interior-NUL database / collection / index name
+during command validation — before it reaches storage — with the same
+`InvalidNamespace` error mongod returns, so the connection survives with a
+clean wire reply. As defense-in-depth, the per-connection dispatch call is now
+wrapped in `catch_unwind`: any future unguarded panic in a handler produces a
+wire-level `InternalError` reply instead of a silent disconnect. This is the
+Rust-side analogue of the earlier Python-server OP_QUERY hardening. Found by
+the nightly security review (issue #139).
+
+#### Security
+
+- **Rust server:** interior-NUL `db` / `coll` / `index` names are rejected with
+  `InvalidNamespace` before reaching the WiredTiger key encoder (which would
+  otherwise panic and poison the shared storage mutex — a whole-server DoS).
+  Per-connection dispatch is wrapped in `catch_unwind` so any residual panic
+  surfaces as an `InternalError` wire reply rather than a dropped socket.
+  Regressions in `crates/secantus-commands` unit tests.
+
 ### `admin.system.users` no longer leaks SCRAM credentials via find/count/aggregate
 
 A query against `admin.system.users` — reachable through ordinary

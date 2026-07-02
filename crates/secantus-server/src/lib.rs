@@ -647,7 +647,22 @@ fn run_dispatch(
     if let Ok(db) = request.get_str("$db") {
         ctx.db_name = db.to_string();
     }
-    let reply = dispatch(request, &mut ctx);
+    // Defense-in-depth: every handler is contracted to return a `CommandError`
+    // rather than panic, and the known interior-NUL vector is rejected earlier
+    // in `dispatch_inner` (#139). But if any handler ever panics, catch it here
+    // and reply with a wire-level `InternalError` instead of letting the panic
+    // unwind the connection thread and drop the socket with no reply — matching
+    // the Python server's dispatch-level catch-all.
+    let reply =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(request, &mut ctx)))
+            .unwrap_or_else(|_| {
+                let mut d = Document::new();
+                d.insert("ok", 0.0_f64);
+                d.insert("errmsg", "internal server error");
+                d.insert("code", 1_i32);
+                d.insert("codeName", "InternalError");
+                d
+            });
     (reply, ctx.close_connection)
 }
 
