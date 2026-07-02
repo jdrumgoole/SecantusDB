@@ -7,20 +7,26 @@ First-cut subset that matches the common driver-test surface:
   ``$count``).
 * Position-based windows via ``window: {documents: [<lower>, <upper>]}``.
 * Value-based windows via ``window: {range: [<lower>, <upper>]}`` over a single
-  ascending numeric sortBy field (bounds ``[cur+lo, cur+hi]``).
+  ascending numeric sortBy field (bounds ``[cur+lo, cur+hi]``), or over a date
+  sortBy with a fixed-duration ``unit`` (``week`` / ``day`` / ``hour`` /
+  ``minute`` / ``second`` / ``millisecond``) that scales the offsets.
 * Bound forms: integer offsets, ``"current"``, ``"unbounded"``.
 * Default window (when not specified) covers the whole partition.
 
 Also supported: the time-series operators ``$shift`` / ``$expMovingAvg`` /
-``$locf`` / ``$linearFill``, and the rank functions (``$rank`` / ``$denseRank`` /
-``$documentNumber`` — see ``tests/test_window_rank_functions.py``).
+``$locf`` / ``$linearFill`` / ``$derivative`` / ``$integral``, and the rank
+functions (``$rank`` / ``$denseRank`` / ``$documentNumber`` — see
+``tests/test_window_rank_functions.py``).
 
 Deferred (raises ``AggregateError`` with a clear message): range windows with a
-time ``unit`` or a non-ascending / multi-field / non-numeric sortBy, and the
-remaining time-series functions (``$derivative`` / ``$integral``).
+variable-length ``unit`` (``month`` / ``quarter`` / ``year``) or a non-ascending
+/ multi-field / non-numeric sortBy, and ``$derivative`` / ``$integral`` with a
+time ``unit``.
 """
 
 from __future__ import annotations
+
+import datetime as _dt
 
 import pytest
 from pymongo import MongoClient
@@ -544,8 +550,8 @@ def test_range_window_unbounded_to_current_running_total(client) -> None:
     assert [d["r"] for d in out] == [10, 30, 60, 100]
 
 
-def test_range_window_with_time_unit_raises(client) -> None:
-    """A range window with a time ``unit`` is still deferred."""
+def test_range_window_time_unit_on_numeric_sort_raises(client) -> None:
+    """A range window ``unit`` requires a date sortBy — a numeric sortBy raises."""
     coll = client["swf_db"]["range_unit"]
     coll.insert_one({"_id": 1, "t": 1, "v": 1})
     with pytest.raises(OperationFailure):
@@ -557,6 +563,78 @@ def test_range_window_with_time_unit_raises(client) -> None:
                             "sortBy": {"t": 1},
                             "output": {
                                 "x": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "day"}}
+                            },
+                        }
+                    }
+                ]
+            )
+        )
+
+
+def test_range_window_date_unit_day_rolling_sum(client) -> None:
+    """A ``unit: "day"`` range window over a date sortBy sums the trailing
+    2-day span for each row (x-axis is the date's epoch millis)."""
+    coll = client["swf_db"]["range_day"]
+    coll.insert_many(
+        [
+            {
+                "_id": i,
+                "t": _dt.datetime(2020, 1, 1 + i, tzinfo=_dt.timezone.utc),
+                "v": (i + 1) * 10,
+            }
+            for i in range(5)
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "s": {"$sum": "$v", "window": {"range": [-2, 0], "unit": "day"}}
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["s"] for d in out] == [10, 30, 60, 90, 120]
+
+
+def test_range_window_date_without_unit_raises(client) -> None:
+    """A range window over a date sortBy requires a ``unit``."""
+    coll = client["swf_db"]["range_nounit"]
+    coll.insert_one({"_id": 1, "t": _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc), "v": 1})
+    with pytest.raises(OperationFailure):
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$setWindowFields": {
+                            "sortBy": {"t": 1},
+                            "output": {"x": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                        }
+                    }
+                ]
+            )
+        )
+
+
+def test_range_window_variable_length_unit_raises(client) -> None:
+    """A variable-length ``unit`` (month/quarter/year) is still deferred."""
+    coll = client["swf_db"]["range_month"]
+    coll.insert_one({"_id": 1, "t": _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc), "v": 1})
+    with pytest.raises(OperationFailure):
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$setWindowFields": {
+                            "sortBy": {"t": 1},
+                            "output": {
+                                "x": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "month"}}
                             },
                         }
                     }

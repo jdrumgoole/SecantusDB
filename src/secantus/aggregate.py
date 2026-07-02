@@ -1904,10 +1904,16 @@ def _stage_set_window_fields(
         # else (multi-field / descending / no sortBy) leaves this None, and a range
         # window then raises in ``_range_window_bounds``.
         range_vals = None
+        range_date_ms = None
         if sort_by and len(sort_by) == 1:
             sort_field, sort_dir = next(iter(sort_by.items()))
             if sort_dir == 1:
                 range_vals = [get_path(doc, sort_field) for doc in partition_docs]
+                # A date-valued x-axis is offered to range windows (with a time
+                # `unit`) as epoch millis; the raw dates stay in ``range_vals`` so
+                # the other window ops keep deferring on a non-numeric sortBy.
+                if range_vals and all(isinstance(v, _dt.datetime) for v in range_vals):
+                    range_date_ms = [_date_ms(v) for v in range_vals]
         # $expMovingAvg / $locf / $linearFill are per-slot vectors computed once
         # per partition per output field.
         fill_state = {
@@ -1927,7 +1933,7 @@ def _stage_set_window_fields(
                 if op in ("$expMovingAvg", "$locf", "$linearFill"):
                     target[field] = fill_state[field][slot]
                     continue
-                low, high = _resolve_window(slot, n, window, range_vals)
+                low, high = _resolve_window(slot, n, window, range_vals, range_date_ms)
                 if op in ("$derivative", "$integral"):
                     target[field] = _ts_window_value(
                         op, arg["input"], low, high, partition_docs, range_vals, ctx
@@ -2013,10 +2019,11 @@ def _resolve_window(
     n: int,
     window: Mapping[str, Any] | None,
     range_vals: list[Any] | None,
+    range_date_ms: list[int] | None = None,
 ) -> tuple[int, int]:
     """Dispatch a window spec to the document-based or range-based resolver."""
     if window is not None and "range" in window:
-        return _range_window_bounds(slot, n, window, range_vals)
+        return _range_window_bounds(slot, n, window, range_vals, range_date_ms)
     return _window_bounds(slot, n, window)
 
 
@@ -2025,19 +2032,39 @@ def _range_window_bounds(
     n: int,
     window: Mapping[str, Any],
     range_vals: list[Any] | None,
+    range_date_ms: list[int] | None = None,
 ) -> tuple[int, int]:
     """Resolve a ``range``-based window: include rows whose sortBy value falls in
     ``[cur + lower, cur + upper]`` (``cur`` = this row's value). Bounds may be
     ``"unbounded"`` (open), ``"current"`` (this row's value), or a number offset.
 
-    Supported only for a single ascending numeric sortBy field (``range_vals``);
-    a time ``unit``, a missing/descending/multi-field sort, or a non-numeric value
-    raises (mongod-valid shapes we don't yet reproduce).
+    A time ``unit`` scales each offset by that unit's millisecond span and pins
+    the x-axis to the date sortBy's epoch millis (``range_date_ms``). mongod's
+    rule is enforced both ways: ``unit`` **requires** a date sortBy, and a date
+    sortBy **requires** ``unit`` — the numeric x-axis (``range_vals``) and the
+    date x-axis are mutually exclusive. A missing/descending/multi-field sort, a
+    variable-length unit (month/quarter/year), or a non-numeric value raises.
     """
-    if "unit" in window:
-        raise AggregateError(
-            "$setWindowFields range windows with a time 'unit' are not yet implemented"
-        )
+    has_unit = "unit" in window
+    if has_unit:
+        if range_date_ms is None:
+            raise AggregateError(
+                "$setWindowFields range window 'unit' requires a date sortBy field"
+            )
+        unit_ms = _WINDOW_UNIT_MS.get(window["unit"])
+        if unit_ms is None:
+            raise AggregateError(
+                f"$setWindowFields range window unit {window['unit']!r} is not supported "
+                "(variable-length month/quarter/year)"
+            )
+        # Offset in the date's own units — the x-axis is epoch millis.
+        range_vals = range_date_ms
+    else:
+        if range_date_ms is not None:
+            raise AggregateError(
+                "$setWindowFields range window over a date sortBy requires a 'unit'"
+            )
+        unit_ms = 1
     if range_vals is None:
         raise AggregateError(
             "$setWindowFields range windows require a single ascending sortBy field"
@@ -2059,7 +2086,7 @@ def _range_window_bounds(
                 f"$setWindowFields window.range bound {b!r} must be a number "
                 "or 'unbounded' / 'current'"
             )
-        return cur + b
+        return cur + b * unit_ms
 
     lo, hi = edge(bounds[0]), edge(bounds[1])
     # range_vals is ascending; walk in from both ends. A non-numeric value in the
@@ -2077,6 +2104,28 @@ def _range_window_bounds(
 
 def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+# Fixed-duration window units → milliseconds (variable-length month/quarter/year
+# defer). Used to offset a date-valued range window in the sortBy's own units.
+_WINDOW_UNIT_MS: dict[str, int] = {
+    "week": 604_800_000,
+    "day": 86_400_000,
+    "hour": 3_600_000,
+    "minute": 60_000,
+    "second": 1_000,
+    "millisecond": 1,
+}
+
+_EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+
+
+def _date_ms(dt: _dt.datetime) -> int:
+    """Epoch milliseconds for a datetime, matching a BSON Date (naive → UTC). Exact
+    integer arithmetic so the Rust port (`bson DateTime::timestamp_millis`) agrees."""
+    aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=_dt.timezone.utc)
+    delta = aware - _EPOCH_UTC
+    return delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
 
 
 def _ema_alpha(spec: Mapping[str, Any]) -> float:

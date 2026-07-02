@@ -16,9 +16,12 @@
 //! whole partition, matching mongod's default) and value-based windows
 //! (`range: [lo, hi]` over a single ascending numeric sortBy — rows whose value
 //! is in `[cur+lo, cur+hi]`, with `"unbounded"` / `"current"` / numeric bounds).
+//! A range window with a fixed-duration time `unit` (`week`/`day`/`hour`/
+//! `minute`/`second`/`millisecond`) offsets against a date sortBy's epoch millis.
 //!
-//! Defers (`Err(())` → Python) on: range windows with a time `unit` or a
-//! non-ascending / multi-field / non-numeric sortBy, `$derivative` / `$integral`
+//! Defers (`Err(())` → Python) on: range windows with a variable-length `unit`
+//! (`month`/`quarter`/`year`) or a non-ascending / multi-field / non-numeric
+//! sortBy, `$derivative` / `$integral`
 //! with a time `unit` (date x-axis), any unsupported accumulator,
 //! a non-document/empty `output`, an unsortable `sortBy` value, and a
 //! `partitionBy` expression the evaluator can't reproduce. Output preserves the
@@ -188,6 +191,13 @@ pub fn set_window_fields_stage(
         } else {
             None
         };
+        // Epoch-millis of a date sortBy — the x-axis for a time-`unit` range
+        // window (mutually exclusive with the numeric `range_vals`).
+        let range_dates = if needs_range {
+            range_dates(&slots, &docs, sort_by)
+        } else {
+            None
+        };
         // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
         // precompute once per partition per output field (parallel to `compiled`).
         let mut prefix_vecs: Vec<Option<Vec<Bson>>> = Vec::with_capacity(compiled.len());
@@ -220,7 +230,13 @@ pub fn set_window_fields_stage(
                     shift_value(c.arg.as_document().ok_or(())?, pos, &slots, &docs, vars)?
                 } else if c.op == "$derivative" || c.op == "$integral" {
                     let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
-                        range_window_bounds(pos, n, c.window.unwrap(), range_vals.as_deref())?
+                        range_window_bounds(
+                            pos,
+                            n,
+                            c.window.unwrap(),
+                            range_vals.as_deref(),
+                            range_dates.as_deref(),
+                        )?
                     } else {
                         window_bounds(pos, n, c.window)?
                     };
@@ -236,7 +252,13 @@ pub fn set_window_fields_stage(
                     )?
                 } else {
                     let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
-                        range_window_bounds(pos, n, c.window.unwrap(), range_vals.as_deref())?
+                        range_window_bounds(
+                            pos,
+                            n,
+                            c.window.unwrap(),
+                            range_vals.as_deref(),
+                            range_dates.as_deref(),
+                        )?
                     } else {
                         window_bounds(pos, n, c.window)?
                     };
@@ -571,6 +593,21 @@ fn as_number(v: &Bson) -> Option<f64> {
     }
 }
 
+/// Fixed-duration `unit` → milliseconds, for `range` windows with a time `unit`.
+/// Variable-length `month` / `quarter` / `year` (and any unknown unit) → `None`,
+/// which makes the range window defer to Python. Mirrors `_WINDOW_UNIT_MS`.
+fn window_unit_ms(unit: &str) -> Option<i64> {
+    match unit {
+        "week" => Some(604_800_000),
+        "day" => Some(86_400_000),
+        "hour" => Some(3_600_000),
+        "minute" => Some(60_000),
+        "second" => Some(1_000),
+        "millisecond" => Some(1),
+        _ => None,
+    }
+}
+
 /// The per-slot sortBy values for a range window: `Some` only for a single
 /// **ascending** sort field whose values are all numeric (the shape range
 /// windows support); anything else → `None`, which makes a range window defer.
@@ -593,21 +630,64 @@ fn range_values(
         .collect()
 }
 
+/// The per-slot epoch-millis of a single **ascending** `DateTime` sortBy field —
+/// the x-axis a time-`unit` range window offsets against. `None` unless the sort
+/// is a single ascending field whose values are *all* dates. Mirrors the Python
+/// `range_date_ms` branch; kept separate from `range_values` (raw dates) so the
+/// non-range window ops keep deferring on a non-numeric sortBy.
+fn range_dates(slots: &[usize], docs: &[Document], sort_by: Option<&Document>) -> Option<Vec<f64>> {
+    let sb = sort_by?;
+    if sb.len() != 1 {
+        return None;
+    }
+    let (field, dir) = sb.iter().next().unwrap();
+    if !matches!(dir, Bson::Int32(1) | Bson::Int64(1)) {
+        return None; // ascending only
+    }
+    let raw: Vec<Bson> = slots
+        .iter()
+        .map(|&i| field_value(&docs[i], field))
+        .collect();
+    if raw.is_empty() || !raw.iter().all(|v| matches!(v, Bson::DateTime(_))) {
+        return None;
+    }
+    raw.iter()
+        .map(|v| match v {
+            Bson::DateTime(dt) => Some(dt.timestamp_millis() as f64),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Inclusive `(low, high)` value-window indices: rows whose (ascending) sortBy
 /// value falls in `[cur + lo, cur + hi]`. Bounds: `"unbounded"` → open,
-/// `"current"` → `cur`, numeric offset → `cur + b`. A time `unit`, a missing
-/// single-ascending-numeric sort (`range_vals` is `None`), or a non-numeric
-/// bound → defer.
+/// `"current"` → `cur`, numeric offset → `cur + b * unit_ms`. A fixed-duration
+/// time `unit` scales the offset and pins the x-axis to the date sortBy's epoch
+/// millis (`range_dates`). mongod's rule holds both ways: `unit` requires a date
+/// sortBy, a date sortBy requires `unit`. A variable-length `unit`
+/// (month/quarter/year), a missing single-ascending sort, or a non-numeric bound
+/// → defer.
 fn range_window_bounds(
     slot: usize,
     n: usize,
     window: &Document,
     range_vals: Option<&[f64]>,
+    range_dates: Option<&[f64]>,
 ) -> R<(i64, i64)> {
-    if window.contains_key("unit") {
-        return Err(()); // time-unit ranges defer to Python
-    }
-    let vals = range_vals.ok_or(())?;
+    let (unit_ms, vals): (f64, &[f64]) = match window.get("unit") {
+        Some(Bson::String(u)) => {
+            // `unit` requires a date sortBy.
+            (window_unit_ms(u).ok_or(())? as f64, range_dates.ok_or(())?)
+        }
+        Some(_) => return Err(()), // non-string unit → defer
+        None => {
+            // A date sortBy requires a `unit`.
+            if range_dates.is_some() {
+                return Err(());
+            }
+            (1.0, range_vals.ok_or(())?)
+        }
+    };
     let bounds = match window.get("range") {
         Some(Bson::Array(b)) if b.len() == 2 => b,
         _ => return Err(()),
@@ -617,7 +697,7 @@ fn range_window_bounds(
         match b {
             Bson::String(s) if s == "unbounded" => Ok(None),
             Bson::String(s) if s == "current" => Ok(Some(cur)),
-            _ => as_number(b).map(|x| Some(cur + x)).ok_or(()),
+            _ => as_number(b).map(|x| Some(cur + x * unit_ms)).ok_or(()),
         }
     };
     let lo = edge(&bounds[0])?;

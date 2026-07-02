@@ -42,6 +42,31 @@ and the standard admin commands `grantRolesToUser` / `revokeRolesFromUser` /
   trait, forwarded by the WT adapter to the real storage engine). Regression:
   `tests/test_rust_server_smoke.py::test_secantus_admin_prune_commands`.
 
+### `$setWindowFields` range windows over a date sortBy
+
+A `$setWindowFields` value-`range` window can now span a *time* interval. Give the
+window a `unit` — `week`, `day`, `hour`, `minute`, `second`, or `millisecond` —
+and the numeric `range: [lower, upper]` bounds are measured in that unit against a
+date-valued `sortBy` field. A `range: [-2, 0], unit: "day"` window is the trailing
+three-day span ending at each row, so `{$sum: "$v"}` over it is a rolling 3-day
+total regardless of how the dates are spaced.
+
+The rule mongod enforces holds both ways: a `unit` requires a date `sortBy` (a
+numeric sort with a `unit` is rejected), and a date `sortBy` in a range window
+requires a `unit` (there is no implicit millisecond arithmetic on dates).
+Variable-length units — `month`, `quarter`, `year` — are still rejected, since
+their span depends on the calendar position. The feature ships on both the Python
+and Rust servers, pinned by the `$setWindowFields` parity suite; the date x-axis
+is carried as epoch milliseconds so both engines compute identical window bounds.
+
+#### Added
+
+- `$setWindowFields` `range` windows accept a fixed-duration time `unit`
+  (`week`/`day`/`hour`/`minute`/`second`/`millisecond`) over a date `sortBy`,
+  offsetting the bounds in that unit against the date's epoch millis. `unit` and a
+  date sortBy are mutually required; variable-length `month`/`quarter`/`year`
+  defer with an error.
+
 ### `$jsonSchema` gains `patternProperties` and `dependencies`
 
 The `$jsonSchema` query operator now understands `patternProperties` and

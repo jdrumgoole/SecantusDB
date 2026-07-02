@@ -13,6 +13,7 @@ ported stages so the pure path never needs `secantus.storage`.
 
 from __future__ import annotations
 
+import datetime as _dt
 import importlib.util
 import pathlib
 import random
@@ -463,6 +464,66 @@ def test_fill_parity(docs, pipeline):
                 }
             ],
         ),
+        # Date-unit range windows: a `unit` scales the offset and the x-axis is
+        # the epoch-millis of a date sortBy. 2-day trailing sum, a `week` unit,
+        # and a symmetric `hour` window all compute; a variable-length `month`
+        # unit defers to Python.
+        (
+            [
+                {
+                    "_id": i,
+                    "t": _dt.datetime(2020, 1, 1 + i, tzinfo=_dt.timezone.utc),
+                    "v": (i + 1) * 10,
+                }
+                for i in range(5)
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "s": {"$sum": "$v", "window": {"range": [-2, 0], "unit": "day"}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [
+                {"_id": i, "t": _dt.datetime(2020, 1, 1 + 7 * i, tzinfo=_dt.timezone.utc), "v": i}
+                for i in range(4)
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "r": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "week"}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [
+                {
+                    "_id": i,
+                    "t": _dt.datetime(2020, 1, 1, i, tzinfo=_dt.timezone.utc),
+                    "v": (i + 1) * 5,
+                }
+                for i in range(5)
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "a": {"$avg": "$v", "window": {"range": [-1, 1], "unit": "hour"}}
+                        },
+                    }
+                }
+            ],
+        ),
         # $shift — value `by` positions away in sorted order: prev (default), next
         # (null out of range), self (by 0), and an expression output.
         (
@@ -586,7 +647,8 @@ def test_set_window_fields_parity(docs, pipeline):
 @pytest.mark.parametrize(
     "pipeline",
     [
-        # Range window with a time unit — not ported (Python raises).
+        # Time `unit` on a *numeric* sortBy — mongod requires a date sortBy, so
+        # both sides reject it (Rust defers, Python raises).
         [
             {
                 "$setWindowFields": {
