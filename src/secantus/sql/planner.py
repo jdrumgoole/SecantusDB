@@ -902,6 +902,27 @@ def _unique_cols(node: exp.Expression | None, fallback: str | None) -> tuple[str
     return (_column_name(node),)
 
 
+def make_check_constraint(
+    inner: exp.CheckColumnConstraint, table_name: str, name: str | None, col: str | None = None
+) -> CheckConstraint:
+    """Build a ``CheckConstraint`` from a parsed ``CHECK (...)`` node. Unnamed
+    constraints get Postgres' default name (``<table>_<col>_check`` for a
+    column-level check, ``<table>_check`` otherwise)."""
+    expr = inner.this.sql(dialect="postgres")
+    cname = name or (f"{table_name}_{col}_check" if col else f"{table_name}_check")
+    return CheckConstraint(name=cname, expression=expr)
+
+
+def make_unique_constraint(
+    inner: exp.UniqueColumnConstraint, table_name: str, name: str | None, col: str | None = None
+) -> UniqueConstraint:
+    """Build a ``UniqueConstraint`` from a parsed ``UNIQUE (...)`` node. Unnamed
+    constraints get Postgres' default name (``<table>_<col1>_<col2>_key``)."""
+    cols = _unique_cols(inner.this, col)
+    cname = name or f"{table_name}_{'_'.join(cols)}_key"
+    return UniqueConstraint(name=cname, columns=cols)
+
+
 def _extract_constraints(
     schema: exp.Schema, table_name: str
 ) -> tuple[list[CheckConstraint], list[UniqueConstraint]]:
@@ -912,35 +933,25 @@ def _extract_constraints(
     checks: list[CheckConstraint] = []
     uniques: list[UniqueConstraint] = []
 
-    def add_check(inner: exp.CheckColumnConstraint, name: str | None, col: str | None) -> None:
-        expr = inner.this.sql(dialect="postgres")
-        cname = name or (f"{table_name}_{col}_check" if col else f"{table_name}_check")
-        checks.append(CheckConstraint(name=cname, expression=expr))
-
-    def add_unique(inner: exp.UniqueColumnConstraint, name: str | None, col: str | None) -> None:
-        cols = _unique_cols(inner.this, col)
-        cname = name or f"{table_name}_{'_'.join(cols)}_key"
-        uniques.append(UniqueConstraint(name=cname, columns=cols))
-
     for coldef in schema.expressions:
         if isinstance(coldef, exp.ColumnDef):  # column-level
             for con in coldef.args.get("constraints") or []:
                 kind = con.kind
                 if isinstance(kind, exp.CheckColumnConstraint):
-                    add_check(kind, None, coldef.name)
+                    checks.append(make_check_constraint(kind, table_name, None, coldef.name))
                 elif isinstance(kind, exp.UniqueColumnConstraint):
-                    add_unique(kind, None, coldef.name)
+                    uniques.append(make_unique_constraint(kind, table_name, None, coldef.name))
         elif isinstance(coldef, exp.Constraint):  # CONSTRAINT <name> CHECK/UNIQUE (...)
             name = coldef.this.name if coldef.this else None
             for inner in coldef.args.get("expressions") or []:
                 if isinstance(inner, exp.CheckColumnConstraint):
-                    add_check(inner, name, None)
+                    checks.append(make_check_constraint(inner, table_name, name))
                 elif isinstance(inner, exp.UniqueColumnConstraint):
-                    add_unique(inner, name, None)
+                    uniques.append(make_unique_constraint(inner, table_name, name))
         elif isinstance(coldef, exp.CheckColumnConstraint):  # table-level unnamed CHECK (...)
-            add_check(coldef, None, None)
+            checks.append(make_check_constraint(coldef, table_name, None))
         elif isinstance(coldef, exp.UniqueColumnConstraint):  # table-level unnamed UNIQUE (...)
-            add_unique(coldef, None, None)
+            uniques.append(make_unique_constraint(coldef, table_name, None))
     return checks, uniques
 
 

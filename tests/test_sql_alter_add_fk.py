@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import errors, run_sql
+from secantus.sql import run_sql
 from secantus.sql.session import Session
 from sqlfake import FakeStorage
 
@@ -82,14 +82,20 @@ def test_added_fk_in_pg_constraint(storage, session):
     ) == [("fk_ou", "f")]
 
 
-def test_add_check_constraint_rejected(storage, session):
-    with pytest.raises(errors.SQLError):
-        run_sql(
-            storage,
-            DB,
-            "ALTER TABLE orders ADD CONSTRAINT ck CHECK (total > 0)",
-            session=session,
-        )
+def test_add_check_constraint_now_supported(storage, session):
+    # ADD CONSTRAINT ... CHECK is now modeled (declared, reflected, not enforced).
+    run_sql(
+        storage,
+        DB,
+        "ALTER TABLE orders ADD CONSTRAINT ck CHECK (total > 0)",
+        session=session,
+    )
+    assert run_sql(
+        storage,
+        DB,
+        "SELECT conname, contype FROM pg_catalog.pg_constraint WHERE contype = 'c'",
+        session=session,
+    )[-1].rows == [("ck", "c")]
 
 
 def test_added_fk_persists_in_catalog(storage, session):
