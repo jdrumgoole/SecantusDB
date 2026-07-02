@@ -296,6 +296,12 @@ CREATE TABLE t (
 );
 ```
 
+`CHECK` and `NOT NULL` are **enforced** on write: an `INSERT` or `UPDATE` that
+would leave a row violating a declared `CHECK` predicate (`23514`) or a `NOT
+NULL` column (`23502`) is rejected, and the table is left unchanged. A `CHECK`
+whose predicate evaluates to NULL (unknown) passes, matching Postgres. `UNIQUE`
+and `FOREIGN KEY` remain declaration-only for now.
+
 Unnamed constraints get Postgres' default names (`<table>_<col>_key`,
 `<table>_<col>_check`). They reflect through `pg_catalog.pg_constraint`
 (`contype = 'u'` / `'c'`, each `UNIQUE` backed by an implicit unique index),
