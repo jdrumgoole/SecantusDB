@@ -1236,10 +1236,11 @@ Rust core defers (so they error on the Rust server). None are *correctness* bugs
 the actionable gauge tail is closed; these are feature completeness. **Shipped since
 the audit:** `$exp`/`$ln`/`$log`/`$pow`/`$round`/`$trunc` (#74), `$sortArray` (#76),
 `$unionWith` (#77), `$fill` (#123), `$toDecimal` + `$convert` (#132),
-`$setWindowFields` (rank funcs + `$shift` + `$group` accumulators over
-document-based **and value-based `range`** windows — both servers, single
-ascending numeric sortBy; remaining time-series ops still defer), the regex
-family `$regexMatch` /
+`$setWindowFields` (rank funcs + the **full time-series operator set** `$shift` /
+`$expMovingAvg` / `$locf` / `$linearFill` / `$derivative` / `$integral` + `$group`
+accumulators over document-based **and value-based `range`** windows — both
+servers, single ascending numeric sortBy; only date-`unit` x-axes defer), the
+regex family `$regexMatch` /
 `$regexFind` / `$regexFindAll` (shared `regexutil`; all three served by both the
 linear and backtracking `fancy-regex` engines — lookaround / backreference finds
 compute, matching Python `re`),
@@ -1258,11 +1259,12 @@ defer). **Remaining:**
   separate `timezone` field (named IANA zones need a tz database — `chrono-tz` or
   similar). Fractional seconds stay deferred (BSON is millisecond-only). The
   `Z` / `±HH:MM` offset tz slice now ships.
-- [ ] **Aggregate stages:** the remaining `$setWindowFields` time-series window
-  operators (`$integral` / `$derivative`) and range windows with a time `unit` —
-  absent from *both* servers, so each needs a Python oracle first, then the Rust
-  port. (`$shift`, `$expMovingAvg`, `$locf`, `$linearFill`, document +
-  value-`range` windows, and rank/accumulators already ship on both.)
+- [ ] **Aggregate stages:** `$setWindowFields` date-`unit` x-axes — the time
+  `unit` scaling on `$derivative` / `$integral` and range windows over a date
+  sortBy — absent from *both* servers, so each needs a Python oracle first, then
+  the Rust port. (The full time-series operator set — `$shift` / `$expMovingAvg` /
+  `$locf` / `$linearFill` / `$derivative` / `$integral` — plus document +
+  value-`range` windows and rank/accumulators, all ship on both for numeric sorts.)
 - [ ] **Query operator:** `$jsonSchema` remaining keywords absent from both servers
   (`patternProperties` / `dependencies` / `minProperties`-per-pattern / ...) — would
   need porting on **both** servers. (`additionalProperties` + `allOf` / `anyOf` /

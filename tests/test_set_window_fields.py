@@ -440,7 +440,7 @@ def test_locf_and_linear_fill(client) -> None:
 
 
 def test_unsupported_time_series_function_raises(client) -> None:
-    """The remaining time-series functions ($derivative / $integral) are still
+    """A `$derivative` / `$integral` with a time `unit` (date x-axis) is still
     deferred — raise so the gap is visible."""
     coll = client["swf_db"]["timeseries"]
     coll.insert_one({"_id": 1, "v": 1, "ts": 1})
@@ -452,12 +452,45 @@ def test_unsupported_time_series_function_raises(client) -> None:
                     {
                         "$setWindowFields": {
                             "sortBy": {"ts": 1},
-                            "output": {"d": {"$derivative": {"input": "$v"}}},
+                            "output": {"d": {"$derivative": {"input": "$v", "unit": "second"}}},
                         }
                     }
                 ]
             )
         )
+
+
+def test_derivative_and_integral(client) -> None:
+    """`$derivative` is the slope over the window (null for <2 points);
+    `$integral` is the trapezoidal area, both against the sortBy x-axis."""
+    coll = client["swf_db"]["deriv"]
+    coll.insert_many(
+        [{"_id": i, "t": t, "v": v} for i, (t, v) in enumerate([(0, 0), (1, 10), (2, 20), (4, 60)])]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "d": {"$derivative": {"input": "$v"}},  # (60-0)/(4-0) = 15
+                            "i": {"$integral": {"input": "$v"}},  # 5 + 15 + 80 = 100
+                            "rd": {
+                                "$derivative": {"input": "$v"},
+                                "window": {"documents": [-1, 0]},
+                            },
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["d"] for d in out] == [15.0, 15.0, 15.0, 15.0]
+    assert [d["i"] for d in out] == [100.0, 100.0, 100.0, 100.0]
+    # rolling 2-doc slope: first row has a single-point window -> null.
+    assert [d["rd"] for d in out] == [None, 10.0, 10.0, 20.0]
 
 
 def test_range_window_rolling_sum(client) -> None:

@@ -19,6 +19,28 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$setWindowFields` completes its time-series window operators with `$derivative` and `$integral`
+
+`$setWindowFields` now supports `$derivative` and `$integral`, the last two of
+MongoDB's time-series window operators. Over the window, `$derivative` reports the
+rate of change — the slope between the first and last points, `(yₙ − y₀) / (xₙ −
+x₀)`, with the `sortBy` value as x and `input` as y — and `$integral` reports the
+area under the curve by the trapezoidal rule. Together with `$shift`,
+`$expMovingAvg`, `$locf`, and `$linearFill`, that rounds out the full set of
+time-series window functions: rates, running smoothing, lag/lead, and gap-filling
+all now run in-process.
+
+Both operate over any window (`documents` or `range`), require a single ascending
+numeric `sortBy` as the x-axis, and run the same IEEE-double arithmetic on the
+Python and Rust servers (pinned bit-for-bit by the aggregation parity suite). A
+`$derivative` window with fewer than two points is `null`. A time `unit` (for a
+date x-axis) is not yet modelled and raises a clear error.
+
+#### Added
+
+- `$setWindowFields` `$derivative` and `$integral` window operators (`{input}`) —
+  slope / trapezoidal area over the sortBy x-axis, over any window.
+
 ### `$setWindowFields` gains `$locf` and `$linearFill`
 
 `$setWindowFields` now supports the two gap-filling window operators, `$locf` and
