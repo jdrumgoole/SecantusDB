@@ -13,6 +13,7 @@ import copy
 import re
 from typing import Any
 
+import sqlglot
 from sqlglot import exp
 
 from secantus.sql import errors, executor, planner, reflect, scalar, typemap, virtual
@@ -690,6 +691,8 @@ def _run_statement(
             return executor.execute_create_index(
                 planner.plan_create_index(stmt, table), catalog, storage, db
             )
+        if kind == "VIEW":
+            return executor.execute_create_view(stmt, catalog, storage, db)
         raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
     if isinstance(stmt, exp.Drop):
@@ -698,6 +701,8 @@ def _run_statement(
             return executor.execute_drop_table(planner.plan_drop_table(stmt), catalog, storage, db)
         if kind == "INDEX":
             return executor.execute_drop_index(planner.plan_drop_index(stmt), catalog, storage, db)
+        if kind == "VIEW":
+            return executor.execute_drop_view(stmt, catalog, storage, db)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
     if isinstance(stmt, exp.Alter):
@@ -705,6 +710,17 @@ def _run_statement(
 
     if isinstance(stmt, exp.Comment):
         return executor.execute_comment(stmt, catalog, storage, db)
+
+    # Expand any referenced views (FROM/JOIN) into inline subqueries before the
+    # query dispatch below, so a view reads like the SELECT it stands for. Skip on
+    # the re-entrant CTE path (``_run_with`` strips the WITH and re-dispatches with
+    # a ``_CTECatalog``): the outer pass already walked the whole tree, and a
+    # second pass — now with no CTE names in scope — would let a stored view shadow
+    # a same-named CTE.
+    if not isinstance(catalog, _CTECatalog) and (
+        isinstance(stmt, (exp.Select, exp.SetOperation, exp.Insert)) or _own_with(stmt) is not None
+    ):
+        _expand_views(stmt, catalog, db)
 
     if _own_with(stmt) is not None:
         return _run_with(stmt, storage, db, catalog, session)
@@ -860,6 +876,40 @@ def _run_query(
     raise errors.feature_not_supported(f"unsupported set-operation arm: {type(node).__name__}")
 
 
+_MAX_VIEW_DEPTH = 32
+
+
+def _expand_views(
+    stmt: exp.Expression, catalog: Catalog, db: str, _depth: int = 0
+) -> exp.Expression:
+    """Rewrite FROM/JOIN references to declared views into inline subqueries.
+
+    A view is a stored SELECT: ``SELECT ... FROM v`` becomes
+    ``SELECT ... FROM (<view def>) AS v``. A view whose definition references
+    another view expands recursively. CTE names defined in the same statement
+    shadow views and are left alone."""
+    if _depth > _MAX_VIEW_DEPTH:
+        raise errors.feature_not_supported("view nesting too deep (possible cycle)")
+    cte_names = {cte.alias for w in stmt.find_all(exp.With) for cte in w.expressions}
+    for holder in list(stmt.find_all(exp.From, exp.Join)):
+        src = holder.this
+        if not isinstance(src, exp.Table) or src.args.get("db"):
+            continue
+        if src.name in cte_names:
+            continue
+        vdef = catalog.get_view(db, src.name)
+        if vdef is None:
+            continue
+        inner = sqlglot.parse_one(vdef, read="postgres")
+        _expand_views(inner, catalog, db, _depth + 1)
+        alias = src.alias or src.name
+        holder.set(
+            "this",
+            exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias))),
+        )
+    return stmt
+
+
 def _own_with(stmt: exp.Expression) -> exp.With | None:
     """The ``WITH`` clause attached directly to ``stmt`` (not one nested inside a
     subquery), or None. Found by identity among the statement's own args so it's
@@ -895,6 +945,12 @@ class _CTECatalog(Catalog):
 
     def list_tables(self, db: str) -> list[str]:
         return self._base.list_tables(db)
+
+    def get_view(self, db: str, name: str) -> str | None:
+        return self._base.get_view(db, name)
+
+    def list_views(self, db: str) -> list[str]:
+        return self._base.list_views(db)
 
 
 def _run_with(

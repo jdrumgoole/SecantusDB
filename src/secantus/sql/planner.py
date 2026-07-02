@@ -1576,6 +1576,11 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
         or stmt.args.get("distinct")
     ):
         return True
+    # A ``(SELECT ...) AS alias`` derived table in FROM — e.g. an expanded view —
+    # is materialized by the pipeline path's ``_resolve_source``.
+    from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
+    if from_node is not None and isinstance(from_node.this, exp.Subquery):
+        return True
     # A SELECT list / ORDER BY with set-returning or scalar functions, CASE, or
     # subqueries needs per-row evaluation (the pipeline path), not a plain find.
     if _stmt_needs_evaluation(stmt):

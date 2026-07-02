@@ -329,6 +329,14 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
             return virtual.constraint_def_for_oid(ctx.db, ctx.catalog, args[0])
         return None
+    if name == "pg_get_viewdef":
+        # Render a view's stored SELECT text (by pg_class oid) so SQLAlchemy's
+        # get_view_definition can reflect it; unknown oid / no ctx → NULL.
+        if ctx is not None and args and isinstance(args[0], int):
+            from secantus.sql import virtual
+
+            return virtual.viewdef_for_oid(ctx.db, ctx.catalog, args[0])
+        return None
     if name in (
         "pg_get_expr",
         "pg_get_serial_sequence",
