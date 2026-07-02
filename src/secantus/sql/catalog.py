@@ -47,6 +47,7 @@ class Column:
     # ``has_default`` disambiguates "DEFAULT NULL" from "no default".
     has_default: bool = False
     default: Any = None
+    comment: str | None = None  # COMMENT ON COLUMN (reflected via pg_description)
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class TableDef:
     # the permissive ``any`` type rather than erroring.
     reflected: bool = False
     foreign_keys: list[ForeignKey] = field(default_factory=list)
+    comment: str | None = None  # COMMENT ON TABLE (reflected via pg_description)
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:
@@ -120,9 +122,11 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "nullable": c.nullable,
                 "has_default": c.has_default,
                 "default": c.default,
+                "comment": c.comment,
             }
             for c in table.columns
         ],
+        "comment": table.comment,
         "foreign_keys": [
             {
                 "name": fk.name,
@@ -150,9 +154,11 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 nullable=bool(c["nullable"]),
                 has_default=bool(c.get("has_default", False)),
                 default=c.get("default"),
+                comment=c.get("comment"),
             )
             for c in doc["columns"]
         ],
+        comment=doc.get("comment"),
         foreign_keys=[
             ForeignKey(
                 name=fk["name"],

@@ -90,6 +90,42 @@ def execute_alter_table(
     return SQLResult(command_tag="ALTER TABLE")
 
 
+def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
+    """``COMMENT ON TABLE t IS '…'`` / ``COMMENT ON COLUMN t.c IS '…'`` — store the
+    comment in the catalog so it reflects via ``pg_description`` (SQLAlchemy's
+    ``get_columns`` / ``get_table_comment``). ``IS NULL`` removes it."""
+    import dataclasses
+
+    from sqlglot import exp
+
+    kind = str(stmt.args.get("kind") or "").upper()
+    expr = stmt.args.get("expression")
+    text = expr.this if isinstance(expr, exp.Literal) else None
+    if text == planner.UNCOMMENT_SENTINEL:
+        text = None
+    if kind == "TABLE":
+        table = catalog.get(db, stmt.this.name)
+        if table is None:
+            raise errors.undefined_table(stmt.this.name)
+        table.comment = text
+        catalog.replace(db, table)
+        return SQLResult(command_tag="COMMENT")
+    if kind == "COLUMN":
+        col_node = stmt.this  # exp.Column: table.col
+        tname, cname = col_node.table, col_node.name
+        table = catalog.get(db, tname)
+        if table is None:
+            raise errors.undefined_table(tname)
+        if table.column(cname) is None:
+            raise errors.undefined_column(cname)
+        table.columns = [
+            dataclasses.replace(c, comment=text) if c.name == cname else c for c in table.columns
+        ]
+        catalog.replace(db, table)
+        return SQLResult(command_tag="COMMENT")
+    raise errors.feature_not_supported(f"COMMENT ON {kind} is not supported")
+
+
 def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
     from sqlglot import exp
 

@@ -703,6 +703,9 @@ def _run_statement(
     if isinstance(stmt, exp.Alter):
         return executor.execute_alter_table(planner.plan_alter_table(stmt), catalog, storage, db)
 
+    if isinstance(stmt, exp.Comment):
+        return executor.execute_comment(stmt, catalog, storage, db)
+
     if _own_with(stmt) is not None:
         return _run_with(stmt, storage, db, catalog, session)
 
