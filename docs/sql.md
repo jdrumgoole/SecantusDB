@@ -202,14 +202,18 @@ ALTER TABLE users RENAME COLUMN name TO full_name;  -- $renames the field
 ALTER TABLE users ALTER COLUMN email SET NOT NULL;  -- / DROP NOT NULL
 ALTER TABLE users ALTER COLUMN score TYPE bigint;   -- retype in the catalog
 ALTER TABLE users ALTER COLUMN score SET DEFAULT 0; -- / DROP DEFAULT
+ALTER TABLE users ADD CONSTRAINT uq_email UNIQUE (email);   -- declared, not enforced
+ALTER TABLE users ADD CONSTRAINT ck_score CHECK (score >= 0);
+ALTER TABLE users DROP CONSTRAINT ck_score;         -- drops any FK / CHECK / UNIQUE by name
 ALTER TABLE users RENAME TO members;                -- renames the table + collection
 ```
 
 Supported actions: `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`,
 `RENAME COLUMN`, `RENAME TO`, `ALTER COLUMN … SET/DROP NOT NULL`, `ALTER COLUMN
-… TYPE t`, `ALTER COLUMN … SET/DROP DEFAULT`, and `ADD [CONSTRAINT name] FOREIGN
-KEY (…) REFERENCES …` (declared, not enforced — like a CREATE TABLE FK).
-`ALTER TABLE IF EXISTS` on a
+… TYPE t`, `ALTER COLUMN … SET/DROP DEFAULT`, `ADD [CONSTRAINT name] { FOREIGN
+KEY (…) REFERENCES … | CHECK (…) | UNIQUE (…) }` (declared, not enforced — like a
+CREATE TABLE constraint), and `DROP CONSTRAINT [IF EXISTS] name` (removes a
+declared FK / CHECK / UNIQUE). `ALTER TABLE IF EXISTS` on a
 missing table is a no-op. Dropping the `PRIMARY KEY` column is rejected (it maps
 to `_id`); renaming it changes only the SQL name — the field stays `_id`. A
 `TYPE` change retypes the column in the catalog (new inserts/reads use it;

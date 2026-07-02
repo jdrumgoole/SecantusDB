@@ -176,6 +176,23 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
             )
         )
         return
+    if (
+        isinstance(action, exp.Drop)
+        and (action.args.get("kind") or "COLUMN").upper() == "CONSTRAINT"
+    ):
+        # DROP CONSTRAINT [IF EXISTS] name — remove a declared FK / CHECK / UNIQUE.
+        name = action.this.name
+        buckets = (table.foreign_keys, table.check_constraints, table.unique_constraints)
+        if not any(any(c.name == name for c in b) for b in buckets):
+            if action.args.get("exists"):
+                return
+            raise errors.SQLError(
+                "42704", f'constraint "{name}" of relation "{table.name}" does not exist'
+            )
+        table.foreign_keys = [c for c in table.foreign_keys if c.name != name]
+        table.check_constraints = [c for c in table.check_constraints if c.name != name]
+        table.unique_constraints = [c for c in table.unique_constraints if c.name != name]
+        return
     if isinstance(action, exp.Drop):  # DROP COLUMN [IF EXISTS] name
         name = action.this.name
         col = table.column(name)
@@ -253,9 +270,10 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
         table.columns = [new_col if c.name == name else c for c in table.columns]
         return
     if isinstance(action, exp.AddConstraint):
-        # ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES t(cols) — declared,
-        # reflected, never enforced (same as a CREATE TABLE FK). Other constraint
-        # kinds (CHECK / UNIQUE) aren't modeled.
+        # ADD [CONSTRAINT name] { FOREIGN KEY (…) REFERENCES … | CHECK (…) |
+        # UNIQUE (…) } — declared, reflected, never enforced (same as a CREATE
+        # TABLE constraint). Unnamed ``ADD UNIQUE (…)`` is accepted; unnamed ``ADD
+        # CHECK (…)`` isn't parseable by sqlglot, so a CHECK needs CONSTRAINT name.
         from secantus.sql import planner
 
         for con in action.args.get("expressions") or []:
@@ -273,10 +291,16 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
                         f"unsupported ADD FOREIGN KEY: {action.sql()}"
                     )
                 table.foreign_keys.append(planner._make_fk(table.name, cols, ref, con_name))
-            else:
-                raise errors.feature_not_supported(
-                    f"only ADD FOREIGN KEY is supported: {action.sql()}"
+            elif isinstance(node, exp.CheckColumnConstraint):
+                table.check_constraints.append(
+                    planner.make_check_constraint(node, table.name, con_name)
                 )
+            elif isinstance(node, exp.UniqueColumnConstraint):
+                table.unique_constraints.append(
+                    planner.make_unique_constraint(node, table.name, con_name)
+                )
+            else:
+                raise errors.feature_not_supported(f"unsupported ADD CONSTRAINT: {action.sql()}")
         return
     raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
 

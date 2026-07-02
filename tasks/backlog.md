@@ -1567,9 +1567,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `.constraint_column_usage` gain rows; `pg_get_constraintdef(oid)` renders `UNIQUE (…)` and `CHECK
   ((…))`. SQLAlchemy's `get_unique_constraints()` / `get_check_constraints()` resolve end to end. **Not
   enforced:** no CHECK-predicate validation, no UNIQUE-duplicate rejection on write — schema-shape
-  record only. **Limitations:** no `ALTER TABLE … ADD CONSTRAINT CHECK/UNIQUE` yet (still
-  `feature_not_supported`; only ADD FOREIGN KEY is wired); CHECK columns aren't listed in
-  `constraint_column_usage` (the predicate isn't parsed for referenced columns).
+  record only. **Limitations:** CHECK columns aren't listed in `constraint_column_usage` (the
+  predicate isn't parsed for referenced columns).
+- [ ] **`ALTER TABLE … ADD CONSTRAINT CHECK/UNIQUE` + `DROP CONSTRAINT` landed** (b93): `ADD
+  [CONSTRAINT name] CHECK (…)` / `UNIQUE (…)` and unnamed `ADD UNIQUE (…)` append to
+  `TableDef.check_constraints` / `unique_constraints` via `executor._apply_alter_action` (reusing
+  `planner.make_check_constraint` / `make_unique_constraint`, factored out of `_extract_constraints`);
+  they reflect exactly like a CREATE TABLE CHECK/UNIQUE (b91). `DROP CONSTRAINT [IF EXISTS] name`
+  removes a declared FK / CHECK / UNIQUE by name (dispatched on `exp.Drop` kind='CONSTRAINT'; unknown
+  name → `42704` unless IF EXISTS). Still not enforced. **Limitations:** unnamed `ADD CHECK (…)` isn't
+  accepted (sqlglot can't parse it — a CHECK needs an explicit `CONSTRAINT name`); no `ALTER CONSTRAINT`
+  / `VALIDATE CONSTRAINT`.
 - [ ] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
   text in a per-db `__sql_views__` collection (`catalog.put_view` / `get_view` / `drop_view` /
   `list_views`). `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` dispatch on `exp.Create` /
