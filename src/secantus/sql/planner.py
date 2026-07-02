@@ -811,13 +811,16 @@ def _ref_actions(ref: exp.Reference) -> tuple[str | None, str | None]:
     return on_delete, on_update
 
 
-def _make_fk(table_name: str, cols: tuple[str, ...], ref: exp.Reference) -> ForeignKey:
+def _make_fk(
+    table_name: str, cols: tuple[str, ...], ref: exp.Reference, name: str | None = None
+) -> ForeignKey:
     ref_table, ref_cols = _ref_target(ref)
     on_delete, on_update = _ref_actions(ref)
-    # Postgres' default constraint name: <table>_<firstcol>_fkey.
-    name = f"{table_name}_{cols[0]}_fkey" if cols else f"{table_name}_fkey"
+    # Postgres' default constraint name: <table>_<firstcol>_fkey (an explicit
+    # ``CONSTRAINT <name>`` wins when supplied, e.g. from ALTER TABLE ADD).
+    con_name = name or (f"{table_name}_{cols[0]}_fkey" if cols else f"{table_name}_fkey")
     return ForeignKey(
-        name=name,
+        name=con_name,
         columns=cols,
         ref_table=ref_table,
         ref_columns=ref_cols,

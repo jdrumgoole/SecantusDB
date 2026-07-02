@@ -196,6 +196,32 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
             raise errors.feature_not_supported(f"unsupported ALTER COLUMN action: {action.sql()}")
         table.columns = [new_col if c.name == name else c for c in table.columns]
         return
+    if isinstance(action, exp.AddConstraint):
+        # ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES t(cols) — declared,
+        # reflected, never enforced (same as a CREATE TABLE FK). Other constraint
+        # kinds (CHECK / UNIQUE) aren't modeled.
+        from secantus.sql import planner
+
+        for con in action.args.get("expressions") or []:
+            con_name = None
+            node = con
+            if isinstance(con, exp.Constraint):
+                con_name = con.this.name if con.this else None
+                inner = con.args.get("expressions") or []
+                node = inner[0] if inner else None
+            if isinstance(node, exp.ForeignKey):
+                cols = tuple(c.name for c in node.args.get("expressions") or [])
+                ref = node.args.get("reference")
+                if ref is None:
+                    raise errors.feature_not_supported(
+                        f"unsupported ADD FOREIGN KEY: {action.sql()}"
+                    )
+                table.foreign_keys.append(planner._make_fk(table.name, cols, ref, con_name))
+            else:
+                raise errors.feature_not_supported(
+                    f"only ADD FOREIGN KEY is supported: {action.sql()}"
+                )
+        return
     raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
 
 

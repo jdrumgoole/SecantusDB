@@ -1240,6 +1240,31 @@ def test_column_default_and_alter_type_via_driver(server):
     conn.close()
 
 
+def test_alter_add_foreign_key_via_driver(server):
+    # ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY, reflected via SQLAlchemy.
+    sa = pytest.importorskip("sqlalchemy")
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE users (id bigint primary key, name text)"))
+            conn.execute(sa.text("CREATE TABLE orders (id bigint primary key, user_id bigint)"))
+            conn.execute(
+                sa.text(
+                    "ALTER TABLE orders ADD CONSTRAINT ofk FOREIGN KEY (user_id) "
+                    "REFERENCES users(id) ON DELETE CASCADE"
+                )
+            )
+        fks = sa.inspect(engine).get_foreign_keys("orders")
+        assert len(fks) == 1
+        assert fks[0]["name"] == "ofk"
+        assert fks[0]["constrained_columns"] == ["user_id"]
+        assert fks[0]["referred_table"] == "users"
+        assert fks[0]["options"] == {"ondelete": "CASCADE"}
+    finally:
+        engine.dispose()
+
+
 def test_grouping_sets_via_driver(server):
     # ROLLUP over Mongo-written data, through the real driver: per-region
     # subtotals + a grand-total row (region NULL).
