@@ -19,6 +19,26 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$jsonSchema` gains `patternProperties` and `dependencies`
+
+The `$jsonSchema` query operator now understands `patternProperties` and
+`dependencies`. `patternProperties` applies a sub-schema to every field whose
+*name* matches a regular expression — the way to say "every `s_*` field must be a
+string" without listing them — and it also tells `additionalProperties: false`
+which keys are legitimately covered, so pattern-matched fields are no longer
+flagged as unexpected. `dependencies` expresses conditional structure: when a
+trigger field is present, either a list of other fields must also be present
+(property dependency) or the whole document must satisfy a sub-schema (schema
+dependency) — e.g. "if `card` is set, `billing` is required."
+
+Both ship on the Python and Rust servers, pinned by the query parity suite;
+`patternProperties` reuses the shared regex engine.
+
+#### Added
+
+- `$jsonSchema` `patternProperties` (regex-keyed sub-schemas, also honoured by
+  `additionalProperties`) and `dependencies` (property-list and schema forms).
+
 ### `$setWindowFields` completes its time-series window operators with `$derivative` and `$integral`
 
 `$setWindowFields` now supports `$derivative` and `$integral`, the last two of

@@ -153,18 +153,39 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
             return False
         if "maxProperties" in schema and len(value) > schema["maxProperties"]:
             return False
+        pattern_props = schema.get("patternProperties")
+        pattern_res = []
+        if isinstance(pattern_props, Mapping):
+            for pat, sub_schema in pattern_props.items():
+                rx = _compile_regex(pat, 0)  # search semantics; length cap fires
+                pattern_res.append(rx)
+                for k, v in value.items():
+                    if rx.search(k) and not _validate_json_schema(v, sub_schema):
+                        return False
         if "additionalProperties" in schema:
-            # Properties not named in ``properties`` are "additional". (Pattern-
-            # based allowances via ``patternProperties`` are not modelled.)
+            # "Additional" = a key not named in ``properties`` and not matching any
+            # ``patternProperties`` regex.
             ap = schema["additionalProperties"]
-            allowed = set(schema.get("properties", {}))
-            extras = [k for k in value if k not in allowed]
+            named = set(schema.get("properties", {}))
+            extras = [
+                k for k in value if k not in named and not any(rx.search(k) for rx in pattern_res)
+            ]
             if ap is False and extras:
                 return False
             if isinstance(ap, Mapping):
                 for k in extras:
                     if not _validate_json_schema(value[k], ap):
                         return False
+        deps = schema.get("dependencies")
+        if isinstance(deps, Mapping):
+            for prop, dep in deps.items():
+                if prop not in value:
+                    continue
+                if isinstance(dep, list):
+                    if any(req not in value for req in dep):  # property dependency
+                        return False
+                elif isinstance(dep, Mapping) and not _validate_json_schema(value, dep):
+                    return False  # schema dependency
     # Logical combinators apply to the value regardless of its type.
     if "allOf" in schema and not all(_validate_json_schema(value, s) for s in schema["allOf"]):
         return False

@@ -1246,9 +1246,9 @@ linear and backtracking `fancy-regex` engines — lookaround / backreference fin
 compute, matching Python `re`),
 `$jsonSchema` (`bsonType` / `type` / `enum` / numeric bounds / string length +
 `pattern` / array + object counts + `items` / `required` / `properties` /
-`additionalProperties` + the `allOf` / `anyOf` / `oneOf` / `not` combinators —
-both servers; `patternProperties` and other keywords still ignored, unreproducible
-shapes defer), `$dateFromString`
+`additionalProperties` / `patternProperties` / `dependencies` + the `allOf` /
+`anyOf` / `oneOf` / `not` combinators — both servers; only exotic keywords still
+ignored, unreproducible shapes defer), `$dateFromString`
 (canonical ISO — `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS`, optional trailing `Z` or
 fixed `±HH:MM` offset → UTC instant — plus `null`→`onNull`; the parity harness now
 compares the *bson-normalised* stored form so tz-aware results compare cleanly.
@@ -1265,10 +1265,11 @@ defer). **Remaining:**
   the Rust port. (The full time-series operator set — `$shift` / `$expMovingAvg` /
   `$locf` / `$linearFill` / `$derivative` / `$integral` — plus document +
   value-`range` windows and rank/accumulators, all ship on both for numeric sorts.)
-- [ ] **Query operator:** `$jsonSchema` remaining keywords absent from both servers
-  (`patternProperties` / `dependencies` / `minProperties`-per-pattern / ...) — would
-  need porting on **both** servers. (`additionalProperties` + `allOf` / `anyOf` /
-  `oneOf` / `not` now ship on both.)
+- [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
+  (`uniqueItems` / `$ref`-style refs / `title`/`description` metadata / ...) —
+  would need porting on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/
+  `pattern`/counts/`items`/`required`/`properties`/`additionalProperties`/
+  `patternProperties`/`dependencies`/`allOf`/`anyOf`/`oneOf`/`not` all ship on both.)
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 

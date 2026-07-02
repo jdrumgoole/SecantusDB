@@ -315,6 +315,32 @@ def test_json_schema_additional_properties() -> None:
     assert not matches({"a": 1, "b": 2}, {"$jsonSchema": typed})
 
 
+def test_json_schema_pattern_properties() -> None:
+    schema = {"patternProperties": {"^s_": {"bsonType": "string"}}}
+    assert matches({"s_name": "x", "n": 5}, {"$jsonSchema": schema})  # s_name str, n ignored
+    assert not matches({"s_name": 5}, {"$jsonSchema": schema})  # s_name not a string
+    # a pattern-matched key is not "additional"
+    strict = {
+        "properties": {"id": {}},
+        "patternProperties": {"^s_": {}},
+        "additionalProperties": False,
+    }
+    assert matches({"id": 1, "s_x": 2}, {"$jsonSchema": strict})
+    assert not matches({"id": 1, "other": 2}, {"$jsonSchema": strict})  # `other` is additional
+
+
+def test_json_schema_dependencies() -> None:
+    # property (list) form: if `card` present, `billing` must be too.
+    lst = {"dependencies": {"card": ["billing"]}}
+    assert matches({"card": 1, "billing": 2}, {"$jsonSchema": lst})
+    assert not matches({"card": 1}, {"$jsonSchema": lst})
+    assert matches({"x": 1}, {"$jsonSchema": lst})  # trigger absent -> ok
+    # schema form: if `a` present, the doc must validate against the sub-schema.
+    sch = {"dependencies": {"a": {"required": ["b"], "properties": {"b": {"bsonType": "int"}}}}}
+    assert matches({"a": 1, "b": 2}, {"$jsonSchema": sch})
+    assert not matches({"a": 1, "b": "x"}, {"$jsonSchema": sch})
+
+
 def test_json_schema_array_items() -> None:
     schema = {"properties": {"tags": {"bsonType": "array", "items": {"bsonType": "string"}}}}
     assert matches({"tags": ["a", "b"]}, {"$jsonSchema": schema})
