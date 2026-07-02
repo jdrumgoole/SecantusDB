@@ -353,6 +353,18 @@ CURATED = [
         {},
     ),  # format -> defer
     ({"$dateFromString": {"dateString": "2024-01-15", "timezone": "America/New_York"}}, {}),  # tz
+    # $dateToString — default format + unambiguous directives. `_DT` is a modern
+    # date; a separate date carries non-zero milliseconds for %L.
+    ({"$dateToString": {"date": "$d"}}, {"d": _DT}),  # default %Y-%m-%dT%H:%M:%S.%LZ
+    ({"$dateToString": {"date": "$d", "format": "%Y-%m-%d"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$d", "format": "%H:%M:%S"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$d", "format": "doy=%j dow=%w iso=%u"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$d", "format": "literal %% pct"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$m"}}, {"m": _mkdate(1_749_000_000_234)}),  # %L = 234
+    ({"$dateToString": {"date": 5}}, {}),  # non-datetime -> null
+    ({"$dateToString": {"date": "$x"}}, {}),  # missing -> null
+    ({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),  # tz -> defer
+    ({"$dateToString": {"date": "$d", "format": "%z"}}, {"d": _DT}),  # unknown directive -> defer
     # $range.
     ({"$range": [0, 5]}, {}),
     ({"$range": [0, 10, 2]}, {}),
