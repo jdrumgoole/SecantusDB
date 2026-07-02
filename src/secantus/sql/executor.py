@@ -390,6 +390,7 @@ def execute_insert(
         for doc in plan.docs:
             doc.setdefault("_id", bson.ObjectId())
     _validate_rows(plan.docs, plan.table, storage, db, session, catalog)
+    _validate_unique_rows(plan.docs, plan.table, storage, db)
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
         _raise_write_error(write_errors[0], plan.table)
@@ -473,6 +474,41 @@ def _validate_rows(
 
 def _has_not_null(table: Any) -> bool:
     return any(not c.pk and not c.nullable for c in table.columns)
+
+
+def _uq_violation(uq: Any) -> errors.SQLError:
+    return errors.unique_violation(f'duplicate key value violates unique constraint "{uq.name}"')
+
+
+def _validate_unique_rows(
+    docs: list[dict[str, Any]],
+    table: Any,
+    storage: Any,
+    db: str,
+    *,
+    exclude_ids: frozenset = frozenset(),
+) -> None:
+    """Enforce declared UNIQUE constraints against a batch of rows (23505). A row
+    with any NULL in a constraint's columns is exempt (NULLs are distinct in a
+    UNIQUE constraint). Duplicates *within* the batch collide, and each row is
+    probed against stored rows (``exclude_ids`` skips the rows an UPDATE is
+    rewriting, so a row keeping its own value doesn't conflict with itself)."""
+    if getattr(table, "reflected", False) or not table.unique_constraints:
+        return
+    seen: dict[str, set] = {uq.name: set() for uq in table.unique_constraints}
+    for doc in docs:
+        for uq in table.unique_constraints:
+            fields = [table.field_for(c) for c in uq.columns]
+            key = tuple(get_path(doc, f) for f in fields)
+            if any(v is None for v in key):
+                continue
+            if key in seen[uq.name]:
+                raise _uq_violation(uq)
+            probe = dict(zip(fields, key, strict=True))
+            for existing in storage.find_matching(db, table.collection, probe):
+                if existing.get("_id") not in exclude_ids:
+                    raise _uq_violation(uq)
+            seen[uq.name].add(key)
 
 
 def _execute_insert_on_conflict(
@@ -945,18 +981,26 @@ def execute_update(
 def _validate_update_post_images(
     plan: planner.UpdatePlan, storage: Any, db: str, session: Any, catalog: Any
 ) -> None:
-    """Enforce NOT NULL / CHECK on an UPDATE's post-image: apply the update in
-    memory to each matched row and validate the result before touching storage,
-    so a violating UPDATE leaves the table unchanged (Postgres statement-atomic)."""
+    """Enforce NOT NULL / CHECK / UNIQUE on an UPDATE's post-image: apply the
+    update in memory to each matched row and validate the result before touching
+    storage, so a violating UPDATE leaves the table unchanged (Postgres
+    statement-atomic). UNIQUE probes exclude every row the statement is rewriting
+    (so unchanged rows and value swaps across the matched set don't self-conflict)."""
     from secantus.sql import scalar
     from secantus.update import apply_update
 
     table = plan.table
-    if getattr(table, "reflected", False) or not (table.check_constraints or _has_not_null(table)):
+    needs = table.check_constraints or table.unique_constraints or _has_not_null(table)
+    if getattr(table, "reflected", False) or not needs:
         return
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
-    for doc in storage.find_matching(db, table.collection, plan.filter):
-        _validate_write_row(apply_update(doc, plan.update), table, ctx)
+    matched = storage.find_matching(db, table.collection, plan.filter)
+    post_images = [apply_update(doc, plan.update) for doc in matched]
+    for post in post_images:
+        _validate_write_row(post, table, ctx)
+    _validate_unique_rows(
+        post_images, table, storage, db, exclude_ids=frozenset(d["_id"] for d in matched)
+    )
 
 
 def execute_delete(plan: planner.DeletePlan, storage: Any, db: str) -> SQLResult:
