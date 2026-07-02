@@ -1439,6 +1439,25 @@ class Storage:
                     session.close()
         return rows
 
+    @staticmethod
+    def _without_credentials(record: dict[str, Any]) -> dict[str, Any]:
+        """Return ``record`` minus its SCRAM ``credentials`` blob.
+
+        The generic CRUD read path onto ``admin.system.users`` is
+        reachable with only the ordinary collection-read action
+        (``A_FIND``), but the SCRAM ``storedKey`` / ``serverKey`` / salt /
+        iteration-count is the sensitive artifact — the ``/etc/shadow``
+        equivalent that enables offline cracking and server
+        impersonation. ``usersInfo`` gates it behind ``A_VIEW_USER`` +
+        ``showCredentials``; the generic ``find`` / ``count`` /
+        ``aggregate`` view must never surface it. See issue #167.
+        """
+        if "credentials" not in record:
+            return record
+        stripped = dict(record)
+        stripped.pop("credentials", None)
+        return stripped
+
     def _find_system_users(
         self,
         filter: dict[str, Any] | None,
@@ -1451,14 +1470,16 @@ class Storage:
         collation: Any,
     ) -> list[dict[str, Any]]:
         """Read path for ``admin.system.users``. The user records
-        themselves already carry the mongod-shaped fields (``_id`` =
-        ``<db>.<user>``, ``user``, ``db``, ``credentials``, ``roles``,
-        ``mechanisms``), so the view is the row set unchanged plus the
-        usual filter / sort / skip / limit / projection pipeline."""
+        carry the mongod-shaped fields (``_id`` = ``<db>.<user>``,
+        ``user``, ``db``, ``roles``, ``mechanisms``), so the view is the
+        row set plus the usual filter / sort / skip / limit / projection
+        pipeline — but with the SCRAM ``credentials`` blob stripped
+        first (see :meth:`_without_credentials`), so it is never returned
+        and can't be used as a filter match-oracle."""
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
-        rows = self._scan_user_records()
+        rows = [self._without_credentials(r) for r in self._scan_user_records()]
         if filter:
             rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
         if sort:
@@ -1481,7 +1502,9 @@ class Storage:
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
-        rows = self._scan_user_records()
+        # Strip credentials before counting too, so a filter on
+        # ``credentials.*`` can't be used as a match-oracle (see #167).
+        rows = [self._without_credentials(r) for r in self._scan_user_records()]
         if not filter:
             return len(rows)
         return sum(1 for r in rows if matches(r, filter, vars=let, collation=collation_obj))

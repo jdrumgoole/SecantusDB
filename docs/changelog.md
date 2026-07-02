@@ -19,6 +19,37 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `admin.system.users` no longer leaks SCRAM credentials via find/count/aggregate
+
+A query against `admin.system.users` — reachable through ordinary
+`find` / `count` / `aggregate` / `explain` / `distinct` / `mapReduce`,
+which need only the standard collection-read action — used to return each
+user record *including* its SCRAM `credentials` blob (`storedKey`,
+`serverKey`, `salt`, iteration count). That's the sensitive artifact:
+even without the plaintext password it enables offline dictionary/brute
+attacks (salt + iterations are the `/etc/shadow` equivalent) and, via
+`serverKey`, lets an attacker stand up a rogue server that completes the
+SASL server side. A principal holding only `read` / `readAnyDatabase` on
+`admin` — a routine monitoring/backup grant — could read every user's
+credential material, which is exactly what `usersInfo` intentionally
+gates behind `A_VIEW_USER` + `showCredentials`.
+
+The generic read path now strips `credentials` unconditionally, *before*
+the filter runs, so it is never returned and can't be used as a
+match-oracle either. Credentials remain reachable only through
+`usersInfo` with `showCredentials` and the `A_VIEW_USER` privilege — the
+one intentionally-gated path, unchanged. Found by the nightly security
+review (issue #167).
+
+#### Security
+
+- `Storage._find_system_users` / `_count_system_users`: the SCRAM
+  `credentials` blob is stripped from the generic `admin.system.users`
+  read path (`find` / `count` / `aggregate` / …) before filtering, so a
+  low-privilege reader can no longer harvest credential material.
+  `usersInfo` (gated by `A_VIEW_USER` + `showCredentials`) is unchanged.
+  Regressions in `tests/test_system_users_view.py`.
+
 ### `$jsonSchema` gains logical combinators and `additionalProperties`
 
 The `$jsonSchema` query operator now understands the JSON-Schema logical
