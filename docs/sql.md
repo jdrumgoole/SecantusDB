@@ -346,6 +346,30 @@ FROM sales GROUP BY region;
 
 (`DISTINCT` inside an aggregate is not yet supported in a `HAVING` clause.)
 
+### GROUPING SETS / ROLLUP / CUBE
+
+Multi-grouping aggregation produces the union of several groupings in one query;
+a column absent from a given grouping reads `NULL` in those rows:
+
+```sql
+-- per-region subtotals + a grand total (region NULL)
+SELECT region, SUM(amount) FROM sales GROUP BY ROLLUP(region);
+
+-- (region, city), (region), () — a subtotal hierarchy
+SELECT region, city, SUM(amount) FROM sales GROUP BY ROLLUP(region, city);
+
+-- every combination: (r,c), (r), (c), ()
+SELECT region, city, SUM(amount) FROM sales GROUP BY CUBE(region, city);
+
+-- exactly the listed groupings
+SELECT region, city, SUM(amount)
+FROM sales GROUP BY GROUPING SETS ((region), (city), ());
+```
+
+A leading plain `GROUP BY a, ROLLUP(b)` keeps `a` in every grouping set. These
+are single-table only (a `JOIN`, `HAVING`, `DISTINCT` aggregate, or window over
+GROUPING SETS is rejected); the `GROUPING()` helper function isn't modeled.
+
 ## Joins
 
 An `INNER` or `LEFT JOIN` compiles to a `$lookup`. The `ON` may be an equality
@@ -1042,7 +1066,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` | `WITH RECURSIVE` on a write body |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
-| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING` | `GROUPING SETS`, `DISTINCT` aggregate in `HAVING` |
+| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY`, declared not enforced), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`) | `ALTER COLUMN … TYPE`, multi-action `ALTER`, `ALTER TABLE … ADD FOREIGN KEY`, enforced constraints, views |
