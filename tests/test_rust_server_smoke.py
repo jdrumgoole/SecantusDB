@@ -431,3 +431,24 @@ def test_change_stream_against_rust_server(tmp_path) -> None:
             cs.close()
     finally:
         srv.stop()
+
+
+def test_secantus_admin_prune_commands(tmp_path) -> None:
+    """secantusAdmin.pruneOplog / pruneTtl return {pruned, ok} against the Rust
+    server (issue #163 — the native maintenance commands the admin UI drives).
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        client = _client(srv)
+        # Seed a little data so the oplog + a collection exist.
+        client["t"]["c"].insert_many([{"_id": i} for i in range(3)])
+
+        r1 = client.admin.command({"secantusAdmin.pruneOplog": 1})
+        assert r1["ok"] == 1.0
+        assert isinstance(r1["pruned"], int) and r1["pruned"] >= 0
+
+        r2 = client.admin.command({"secantusAdmin.pruneTtl": 1})
+        assert r2["ok"] == 1.0
+        assert isinstance(r2["pruned"], int) and r2["pruned"] >= 0
+    finally:
+        srv.stop()
