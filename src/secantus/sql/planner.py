@@ -1409,6 +1409,9 @@ class EvaluatedSelectPlan:
     # A correlated / EXISTS WHERE that couldn't lower to a ``$match`` — evaluated
     # per joined row (via ``resolve`` as the outer scope) after the pipeline.
     where: exp.Expression | None = None
+    # ``DISTINCT ON (exprs)`` — keep the first row (in ORDER BY order) per distinct
+    # value of these expressions. Mutually exclusive with plain ``distinct``.
+    distinct_on: list[exp.Expression] = field(default_factory=list)
 
 
 _AGG_CLASSES: dict[type, str] = {
@@ -1609,7 +1612,8 @@ def _plan_pipeline_select(
         plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_group_window_select(stmt, table)
     elif grouped:
         plan = _plan_group_select(stmt, table)
-    elif _stmt_needs_evaluation(stmt):
+    elif _stmt_needs_evaluation(stmt) or _distinct_on(stmt):
+        # DISTINCT ON needs the evaluated path's sort-then-keep-first-per-key.
         plan = _build_evaluated_single(stmt, table)
     elif stmt.args.get("distinct"):
         plan = _plan_distinct_select(stmt, table)
@@ -1671,6 +1675,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         for o in order_node.expressions:
             order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
+    don = _distinct_on(stmt)
     return EvaluatedSelectPlan(
         base_collection=table.collection,
         base_filter=base_filter,
@@ -1679,10 +1684,22 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         out_exprs=out_exprs,
         resolve=resolve,
         order=order,
-        distinct=bool(stmt.args.get("distinct")),
+        distinct=bool(stmt.args.get("distinct")) and not don,
         limit=limit,
         skip=skip,
+        distinct_on=don,
     )
+
+
+def _distinct_on(stmt: exp.Select) -> list[exp.Expression]:
+    """The expressions of a ``SELECT DISTINCT ON (…)``, or ``[]`` for plain / no
+    DISTINCT. Postgres keeps the first row per distinct value of these, in the
+    query's ORDER BY order."""
+    d = stmt.args.get("distinct")
+    if isinstance(d, exp.Distinct) and d.args.get("on") is not None:
+        on = d.args["on"]
+        return list(on.expressions) if isinstance(on, exp.Tuple) else [on]
+    return []
 
 
 def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
@@ -2339,6 +2356,111 @@ def _lookup_stage(
     }
 
 
+def _lateral_stage(
+    lateral: exp.Lateral,
+    side: str,
+    amap: dict[str, tuple[str, TableDef]],
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> tuple[str, TableDef, list[dict[str, Any]]]:
+    """Lower a ``LATERAL (SELECT … FROM inner [WHERE …] [ORDER BY …] [LIMIT n])``
+    to a correlated ``$lookup`` + ``$unwind``.
+
+    The subquery may reference columns from the preceding FROM items (that's what
+    makes it lateral); those become ``let``-bound ``$$vars`` in the lookup's
+    sub-pipeline via ``_OnTranslator`` (the same inner-``$field`` / outer-``$$var``
+    split a compound JOIN ON uses). Scope is a single-table subquery with an
+    optional WHERE / ORDER BY / LIMIT — a join / GROUP BY / scalar-fn subquery is
+    rejected rather than mis-lowered."""
+    alias = lateral.alias
+    if not alias:
+        raise errors.feature_not_supported("a LATERAL subquery requires an alias")
+    sub = lateral.this
+    if isinstance(sub, exp.Subquery):
+        sub = sub.this
+    if not isinstance(sub, exp.Select):
+        raise errors.feature_not_supported(f"unsupported LATERAL source: {lateral.sql()}")
+    has_agg = any(
+        _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in sub.expressions
+    )
+    if (
+        sub.args.get("joins")
+        or sub.args.get("group")
+        or sub.args.get("having")
+        or sub.args.get("distinct")
+        or has_agg
+        or _stmt_needs_evaluation(sub)
+    ):
+        raise errors.feature_not_supported(
+            "only a single-table LATERAL subquery (projection + WHERE + ORDER BY / LIMIT) "
+            "is supported"
+        )
+    from_node = sub.find(exp.From)
+    if from_node is None:
+        raise errors.feature_not_supported("a LATERAL subquery requires a FROM clause")
+    inner_alias, inner = _resolve_source(from_node.this, db, catalog, storage, derived)
+    inner_resolve = table_resolver(inner)
+
+    sub_pipeline: list[dict[str, Any]] = []
+    lets: dict[str, str] = {}
+    where = sub.args.get("where")
+    if where is not None:
+        tr = _OnTranslator(inner_alias, inner, amap)
+        cond = tr.expr(where.this)
+        lets = tr.lets
+        sub_pipeline.append({"$match": {"$expr": cond}})
+    order = sub.args.get("order")
+    if order is not None:
+        sort_spec: dict[str, int] = {}
+        for o in order.expressions:
+            path, _ = inner_resolve(o.this)
+            sort_spec[path] = -1 if o.args.get("desc") else 1
+        sub_pipeline.append({"$sort": sort_spec})
+    limit, skip = _limit_skip(sub)
+    if skip:
+        sub_pipeline.append({"$skip": skip})
+    if limit:
+        sub_pipeline.append({"$limit": limit})
+
+    project: dict[str, Any] = {"_id": 0}
+    out_columns: list[tuple[str, str]] = []
+    names = _NameAllocator()
+    for e in sub.expressions:
+        col_alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, exp.Star):
+            for c in inner.columns:
+                nm = names.fresh(c.name)
+                project[nm] = f"${c.field}"
+                out_columns.append((nm, c.type_tag))
+            continue
+        path, tag = _field(target, inner_resolve)
+        nm = names.fresh(col_alias or _column_name(target))
+        project[nm] = f"${path}"
+        out_columns.append((nm, tag))
+    sub_pipeline.append({"$project": project})
+
+    tdef = TableDef(
+        name=alias,
+        collection=alias,
+        columns=[Column(n, t, n, pk=False, nullable=True) for n, t in out_columns],
+    )
+    stages: list[dict[str, Any]] = [
+        {
+            "$lookup": {
+                "from": inner.collection,
+                "let": {var: f"${path}" for path, var in lets.items()},
+                "pipeline": sub_pipeline,
+                "as": alias,
+            }
+        },
+        {"$unwind": {"path": f"${alias}", "preserveNullAndEmptyArrays": side == "LEFT"}},
+    ]
+    return alias, tdef, stages
+
+
 def _resolve_source(
     node: exp.Expression, db: str, catalog: Any, storage: Any, derived: list[DerivedTable]
 ) -> tuple[str, TableDef]:
@@ -2348,6 +2470,8 @@ def _resolve_source(
     ``(SELECT ...) AS alias`` derived table is planned as a sub-plan and recorded
     in ``derived`` (the executor materializes it into an ephemeral collection
     named by the alias before running the main pipeline)."""
+    if isinstance(node, exp.Lateral):
+        raise errors.feature_not_supported("LATERAL cannot be the first FROM item")
     if isinstance(node, exp.Subquery):
         alias = node.alias
         if not alias:
@@ -2403,9 +2527,23 @@ def _build_join_pipeline(
     # Mongo's dotted localField handles since b was unwound into the doc.
     for jn in joins:
         jt = jn.this
-        join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
         side = str(jn.args.get("side") or "").upper()
         on = jn.args.get("on")
+        if isinstance(jt, exp.Lateral):
+            # A LATERAL subquery correlates *inside* itself (its WHERE references
+            # outer columns), so the join ON is only ever TRUE (or absent for the
+            # comma / CROSS form). A real ON predicate here isn't supported.
+            if on is not None and not (isinstance(on, exp.Boolean) and bool(on.this)):
+                raise errors.feature_not_supported(
+                    "LATERAL join ON must be TRUE — correlate inside the subquery's WHERE"
+                )
+            lat_alias, lat_table, stages = _lateral_stage(
+                jt, side, amap, db, catalog, storage, derived
+            )
+            pipeline.extend(stages)
+            amap[lat_alias] = ("join", lat_table)
+            continue
+        join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
         if on is None:
             # No ON: a CROSS JOIN or an implicit comma-join — the cartesian
             # product (an empty `$lookup` pipeline returns every foreign doc, then
@@ -2510,9 +2648,10 @@ def _plan_join_select(
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
     base, amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
 
-    # A scalar SELECT list / ORDER BY, or a correlated / EXISTS WHERE (which the
-    # pipeline builder deliberately left un-pushed), needs the per-row evaluator.
-    if _stmt_needs_evaluation(stmt) or where_needs_per_row(stmt):
+    # A scalar SELECT list / ORDER BY, a correlated / EXISTS WHERE (which the
+    # pipeline builder deliberately left un-pushed), or DISTINCT ON (keep-first
+    # per key) all need the per-row evaluator.
+    if _stmt_needs_evaluation(stmt) or where_needs_per_row(stmt) or _distinct_on(stmt):
         return _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
 
     project: dict[str, Any] = {"_id": 0}
@@ -3010,6 +3149,7 @@ def _build_evaluated_join(
     # ``_build_join_pipeline``); carry it for per-joined-row evaluation.
     where_node = stmt.args.get("where")
     residual = where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
+    don = _distinct_on(stmt)
     return EvaluatedSelectPlan(
         base_collection=base.collection,
         base_filter={},
@@ -3018,11 +3158,12 @@ def _build_evaluated_join(
         out_exprs=out_exprs,
         resolve=resolve,
         order=order,
-        distinct=bool(stmt.args.get("distinct")),
+        distinct=bool(stmt.args.get("distinct")) and not don,
         limit=limit,
         skip=skip,
         derived=derived,
         where=residual,
+        distinct_on=don,
     )
 
 
