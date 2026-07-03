@@ -54,6 +54,10 @@ def execute_create_table(
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE TABLE")
         raise errors.duplicate_table(plan.table.name)
+    # An enum-typed column must reference a declared enum type (else 42704).
+    for col in plan.table.columns:
+        if col.enum_type is not None and not catalog.enum_exists(db, col.enum_type):
+            raise errors.SQLError("42704", f'type "{col.enum_type}" does not exist')
     catalog.put(db, plan.table)
     storage.create_collection(db, plan.table.collection)
     # Auto-create the sequence behind each SERIAL column (owned by the table).
@@ -518,11 +522,37 @@ def _assign_sequences(
                 session.record_sequence_value(col.sequence, value)
 
 
+def _validate_enum_columns(docs: list[dict[str, Any]], table: Any, catalog: Any, db: str) -> None:
+    """Every enum-typed column value must be one of the enum's labels (22P02). A
+    NULL value is exempt (the NOT NULL check handles required columns)."""
+    if catalog is None or getattr(table, "reflected", False):
+        return
+    enum_cols = [c for c in table.columns if c.enum_type is not None]
+    if not enum_cols:
+        return
+    label_cache: dict[str, set] = {}
+    for col in enum_cols:
+        if col.enum_type not in label_cache:
+            enum = catalog.get_enum(db, col.enum_type)
+            label_cache[col.enum_type] = set(enum["labels"]) if enum else set()
+    for doc in docs:
+        for col in enum_cols:
+            value = get_path(doc, col.field)
+            if value is None:
+                continue
+            if value not in label_cache[col.enum_type]:
+                raise errors.SQLError(
+                    "22P02",
+                    f'invalid input value for enum {col.enum_type}: "{value}"',
+                )
+
+
 def enforce_insert_rows(
     docs: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any, session: Any
 ) -> None:
     """Enforce every declared constraint against rows about to be inserted."""
     _validate_rows(docs, table, storage, db, session, catalog)
+    _validate_enum_columns(docs, table, catalog, db)
     _validate_unique_rows(docs, table, storage, db, session=session)
     _validate_fk_child_rows(docs, table, storage, db, catalog, session)
 
@@ -545,6 +575,7 @@ def enforce_update_images(
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     for post in post_images:
         _validate_write_row(post, table, ctx)
+    _validate_enum_columns(post_images, table, catalog, db)
     _validate_unique_rows(
         post_images, table, storage, db, exclude_ids=frozenset(matched_ids), session=session
     )
@@ -1111,6 +1142,7 @@ def _validate_update_post_images(
         or table.unique_constraints
         or table.foreign_keys
         or _has_not_null(table)
+        or any(c.enum_type for c in table.columns)
         or (catalog is not None and _referencing_fks(catalog, db, table.name))
     )
     if getattr(table, "reflected", False) or not needs:
@@ -1120,6 +1152,7 @@ def _validate_update_post_images(
     post_images = [apply_update(doc, plan.update) for doc in matched]
     for post in post_images:
         _validate_write_row(post, table, ctx)
+    _validate_enum_columns(post_images, table, catalog, db)
     _validate_unique_rows(
         post_images,
         table,

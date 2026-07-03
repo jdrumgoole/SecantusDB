@@ -717,6 +717,8 @@ def _run_statement(
             return executor.execute_create_view(stmt, catalog, storage, db)
         if kind == "SEQUENCE":
             return _create_sequence(stmt, db, catalog)
+        if kind == "TYPE":
+            return _create_type(stmt, db, catalog)
         raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
     if isinstance(stmt, exp.Drop):
@@ -731,6 +733,8 @@ def _run_statement(
             return executor.execute_drop_view(stmt, catalog, storage, db)
         if kind == "SEQUENCE":
             return _drop_sequence(stmt, db, catalog)
+        if kind == "TYPE":
+            return _drop_type(stmt, db, catalog)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
     if isinstance(stmt, exp.Alter):
@@ -1256,6 +1260,29 @@ def _drop_sequence(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     if not catalog.drop_sequence(db, name) and not stmt.args.get("exists"):
         raise errors.SQLError("42P01", f'sequence "{name}" does not exist')
     return SQLResult(command_tag="DROP SEQUENCE")
+
+
+def _create_type(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
+    """``CREATE TYPE name AS ENUM ('a', 'b', …)`` — record the enum's label list.
+    Only the ENUM form is supported (composite / range / base types are not)."""
+    name = stmt.this.name
+    dt = stmt.args.get("expression")
+    if not (isinstance(dt, exp.DataType) and dt.this and dt.this.name == "ENUM"):
+        raise errors.feature_not_supported(
+            "only CREATE TYPE … AS ENUM is supported (composite/range types are not)"
+        )
+    if catalog.enum_exists(db, name):
+        raise errors.SQLError("42710", f'type "{name}" already exists')
+    labels = [e.this if isinstance(e, exp.Literal) else str(e) for e in dt.expressions]
+    catalog.create_enum(db, name, labels)
+    return SQLResult(command_tag="CREATE TYPE")
+
+
+def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
+    name = stmt.this.name
+    if not catalog.drop_enum(db, name) and not stmt.args.get("exists"):
+        raise errors.SQLError("42704", f'type "{name}" does not exist')
+    return SQLResult(command_tag="DROP TYPE")
 
 
 _ALTER_SEQUENCE_RE = re.compile(
