@@ -1837,9 +1837,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   codec is `secantus.sql.copyfmt` (pure string↔rows; text `\N` NULL + backslash escapes; CSV NULL =
   unquoted-empty vs `""` = empty string, `HEADER` skip/emit). A no-column-list `COPY FROM` excludes
   generated / identity-always columns. Tests: `tests/test_pgserver_copy.py` (wire) + `tests/test_sql_copyfmt.py`
-  (codec). **Limitations:** text + CSV only (no binary `COPY`); `STDIN` / `STDOUT` only (no server-side
-  file paths — the client streams, like `\copy`); the embedded `run_sql` API can't do COPY (no stream) —
-  it's wire-only; whole-table `COPY TO` (no query form `COPY (SELECT …) TO`).
+  (codec). `COPY (SELECT …) TO STDOUT` (query-form, b113) runs an arbitrary query via `engine._run_query`
+  (joins / aggregates / `WITH` / set operations) and renders its `SQLResult` to copy cells in
+  `engine._copy_query_rows` (CSV `HEADER` uses the query's output column names); it is dump-only —
+  `COPY (query) FROM` → `42601`. **Limitations:** text + CSV only (no binary `COPY`); `STDIN` / `STDOUT`
+  only (no server-side file paths — the client streams, like `\copy`); the embedded `run_sql` API can't
+  drive the streaming COPY sub-protocol (no stream) — it's wire-only.
 - [ ] **Partial indexes landed** (b110): `CREATE INDEX … WHERE <predicate>` lowers the predicate to a
   Mongo filter (`planner.plan_create_index` calls `_expr_to_filter` on the index's `params.where`) and
   passes it to storage as `partialFilterExpression` (`executor.execute_create_index`), so the query

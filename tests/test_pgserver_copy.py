@@ -187,3 +187,54 @@ def test_copy_from_missing_table_errors(client):
     err = pgwire.parse_error_response(m.payload)
     assert err["C"] == "42P01"
     client.read_until_ready()
+
+
+def _copy_out(client: PGClient, sql: str) -> bytes:
+    """Drive a COPY … TO STDOUT and return the concatenated CopyData payloads."""
+    client.send(pgwire.build_query(sql))
+    assert client.read_message().type == "H"  # CopyOutResponse
+    data = bytearray()
+    while True:
+        m = client.read_message()
+        if m.type == "d":
+            data += m.payload
+        elif m.type == "c":  # CopyDone
+            break
+    client.read_until_ready()
+    return bytes(data)
+
+
+def test_copy_query_to_stdout_text(client):
+    client.query("INSERT INTO t (id, name, active) VALUES (1, 'alice', true), (2, 'bob', false)")
+    data = _copy_out(client, "COPY (SELECT id, name FROM t WHERE active ORDER BY id) TO STDOUT")
+    assert data.decode() == "1\talice\n"
+
+
+def test_copy_query_to_stdout_csv_header(client):
+    client.query("INSERT INTO t (id, name, active) VALUES (1, 'alice', true), (2, 'bob', false)")
+    data = _copy_out(
+        client,
+        "COPY (SELECT id, name FROM t ORDER BY id) TO STDOUT WITH CSV HEADER",
+    )
+    # The header uses the query's output column names.
+    assert data.decode() == "id,name\n1,alice\n2,bob\n"
+
+
+def test_copy_query_aggregate_to_stdout(client):
+    client.query(
+        "INSERT INTO t (id, name, active) VALUES (1, 'a', true), (2, 'a', true), (3, 'b', false)"
+    )
+    data = _copy_out(
+        client,
+        "COPY (SELECT name, count(*) AS c FROM t GROUP BY name ORDER BY name) TO STDOUT",
+    )
+    assert data.decode() == "a\t2\nb\t1\n"
+
+
+def test_copy_query_from_stdin_rejected(client):
+    # COPY (query) FROM is a syntax error — you can't load into a query.
+    client.send(pgwire.build_query("COPY (SELECT 1) FROM STDIN"))
+    m = client.read_message()
+    assert m.type == "E"
+    assert pgwire.parse_error_response(m.payload)["C"] == "42601"
+    client.read_until_ready()

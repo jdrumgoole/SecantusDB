@@ -1172,6 +1172,10 @@ COPY users (id, name, active) FROM STDIN;      -- then stream tab-separated rows
 COPY users FROM STDIN WITH CSV HEADER;         -- CSV, first line is column names
 COPY users TO STDOUT;                          -- stream every row back, text format
 COPY users (id, name) TO STDOUT WITH CSV;      -- selected columns, CSV format
+
+-- Dump an arbitrary query's result (query-form COPY, TO only):
+COPY (SELECT id, name FROM users WHERE active ORDER BY id) TO STDOUT;
+COPY (SELECT grp, count(*) FROM users GROUP BY grp) TO STDOUT WITH CSV HEADER;
 ```
 
 From `psql`:
@@ -1190,6 +1194,11 @@ line. `DELIMITER` and `NULL` options are honoured. Only `STDIN` / `STDOUT` are
 supported (no server-side file paths — the client streams the data, exactly as
 `\copy` does). A generated or `GENERATED ALWAYS AS IDENTITY` column is excluded
 from a no-column-list `COPY FROM`.
+
+`COPY (query) TO STDOUT` runs an arbitrary `SELECT` (including joins, aggregates,
+`WITH`, and set operations) and dumps its result; the CSV `HEADER` uses the
+query's output column names. It is dump-only — `COPY (query) FROM STDIN` is a
+syntax error (`42601`).
 
 ## Indexes
 
