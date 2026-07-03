@@ -73,6 +73,11 @@ def _view_names(db: str, catalog: Catalog) -> list[str]:
     return lister(db) if lister is not None else []
 
 
+def _matview_names(db: str, catalog: Catalog) -> set[str]:
+    lister = getattr(catalog, "list_matviews", None)
+    return set(lister(db)) if lister is not None else set()
+
+
 def _view_oids(db: str, catalog: Catalog) -> dict[str, int]:
     """Stable pg_class OIDs per view — a distinct range from tables/indexes/FKs so
     ``pg_get_viewdef(oid)`` and relkind='v' rows never collide with a real table."""
@@ -134,6 +139,9 @@ def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, 
 
 
 def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # Materialized views are pg_catalog relations only — Postgres does not list
+    # them in information_schema.tables, so neither do we.
+    matviews = _matview_names(db, catalog)
     rows = [
         {
             "table_catalog": db,
@@ -142,6 +150,7 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
             "table_type": "BASE TABLE",
         }
         for t in _user_tables(db, catalog)
+        if t.name not in matviews
     ]
     # Views appear in information_schema.tables with table_type 'VIEW'.
     rows.extend(
@@ -552,12 +561,15 @@ def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> 
 
 def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     oids = _table_oids(db, catalog)
+    matviews = _matview_names(db, catalog)
     rows = [
         {
             "oid": oids[t.name],
             "relname": t.name,
             "relnamespace": _NS_OIDS["public"],
-            "relkind": "r",
+            # A materialized view is a real relation with columns, tracked in the
+            # catalog like a table — but it reports relkind 'm', not 'r'.
+            "relkind": "m" if t.name in matviews else "r",
             "relpersistence": "p",  # permanent (never temp/unlogged)
             "relam": _HEAP_AM_OID,
             "reloptions": None,
@@ -596,11 +608,18 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
 
 
 def viewdef_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
-    """``pg_get_viewdef(oid)`` — the stored SELECT text for a view's pg_class OID."""
+    """``pg_get_viewdef(oid)`` — the stored SELECT text for a view's or
+    materialized view's pg_class OID."""
     for name, vourid in _view_oids(db, catalog).items():
         if vourid == oid:
             getter = getattr(catalog, "get_view", None)
             return getter(db, name) if getter is not None else None
+    # Materialized views are catalog tables (their OID comes from _table_oids).
+    getter = getattr(catalog, "get_matview", None)
+    if getter is not None:
+        for name, toid in _table_oids(db, catalog).items():
+            if toid == oid and (definition := getter(db, name)) is not None:
+                return definition
     return None
 
 

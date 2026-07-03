@@ -373,6 +373,26 @@ Views reflect through `pg_class` (`relkind = 'v'`), `pg_get_viewdef()`, and
 through a view) and are not materialized — each query re-reads the underlying
 tables.
 
+### Materialized views
+
+A materialized view stores a **snapshot** of its `SELECT`'s rows, queried like a
+table. Unlike a plain view it does not track the base tables — `REFRESH
+MATERIALIZED VIEW` recomputes the snapshot:
+
+```sql
+CREATE MATERIALIZED VIEW active AS SELECT id, name FROM users WHERE age >= 18;
+SELECT count(*) FROM active;              -- reads the snapshot, not `users`
+REFRESH MATERIALIZED VIEW active;         -- recompute after base data changes
+DROP MATERIALIZED VIEW active;
+DROP MATERIALIZED VIEW IF EXISTS active;
+```
+
+Materialized views reflect through `pg_class` (`relkind = 'm'`) and
+`pg_get_viewdef()` — SQLAlchemy's `get_materialized_view_names()` sees them, and
+they are excluded from `get_table_names()` / `information_schema.tables` (matching
+Postgres). Refreshing is a full recompute (no incremental / `CONCURRENTLY`
+refresh, no indexes on the snapshot).
+
 ## Querying
 
 `WHERE` supports the common operators; they lower to the same match engine the

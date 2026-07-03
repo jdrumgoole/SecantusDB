@@ -692,6 +692,8 @@ def _run_statement(
                 planner.plan_create_index(stmt, table), catalog, storage, db
             )
         if kind == "VIEW":
+            if _is_materialized(stmt):
+                return _create_matview(stmt, storage, db, catalog, session)
             return executor.execute_create_view(stmt, catalog, storage, db)
         raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
@@ -702,6 +704,8 @@ def _run_statement(
         if kind == "INDEX":
             return executor.execute_drop_index(planner.plan_drop_index(stmt), catalog, storage, db)
         if kind == "VIEW":
+            if stmt.args.get("materialized"):
+                return _drop_matview(stmt, storage, db, catalog)
             return executor.execute_drop_view(stmt, catalog, storage, db)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
@@ -758,6 +762,8 @@ def _run_statement(
             return _declare_cursor(stmt, storage, db, catalog, session)
         if verb in ("FETCH", "MOVE"):
             return _fetch_cursor(stmt, session, move=verb == "MOVE")
+        if verb == "REFRESH":
+            return _refresh_matview(stmt, storage, db, catalog, session)
         return _run_command(stmt, session)
 
     # CLOSE cursor / CLOSE ALL parses as a bare Alias (``CLOSE AS name``).
@@ -878,6 +884,86 @@ def _run_query(
     if isinstance(node, exp.Select):
         return _run_select(node, storage, db, catalog, session)
     raise errors.feature_not_supported(f"unsupported set-operation arm: {type(node).__name__}")
+
+
+_MATVIEW_NAME_RE = re.compile(r"(?is)^\s*MATERIALIZED\s+VIEW\s+(?:CONCURRENTLY\s+)?(.+?)\s*;?\s*$")
+
+
+def _is_materialized(stmt: exp.Create) -> bool:
+    props = stmt.args.get("properties")
+    return bool(props) and any(isinstance(p, exp.MaterializedProperty) for p in props.expressions)
+
+
+def _matview_docs(result: SQLResult) -> list[dict[str, Any]]:
+    """Turn a query result into snapshot docs keyed by output column name. Storage
+    assigns each an ``_id``; the matview's own columns are the SELECT outputs."""
+    names = [c.name for c in result.columns]
+    return [{n: v for n, v in zip(names, row, strict=False)} for row in result.rows]
+
+
+def _matview_table_def(name: str, result: SQLResult) -> TableDef:
+    return TableDef(
+        name=name,
+        collection=name,
+        columns=[
+            Column(name=c.name, type_tag=c.type_tag, field=c.name, pk=False, nullable=True)
+            for c in result.columns
+        ],
+    )
+
+
+def _materialize(name: str, definition: str, storage: Any, db: str, catalog, session) -> SQLResult:
+    """(Re)compute a materialized view's snapshot: run its SELECT and replace the
+    rows in the backing collection (named after the matview). Returns the result."""
+    inner = sqlglot.parse_one(definition, read="postgres")
+    result = _run_query(inner, storage, db, catalog, session)
+    storage.delete_matching(db, name, {})
+    docs = _matview_docs(result)
+    if docs:
+        storage.insert(db, name, docs)
+    return result
+
+
+def _create_matview(stmt: exp.Create, storage: Any, db: str, catalog, session) -> SQLResult:
+    name = stmt.this.name
+    if catalog.exists(db, name) or catalog.get_matview(db, name) is not None:
+        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+    definition = stmt.expression.sql(dialect="postgres")
+    storage.create_collection(db, name)
+    result = _materialize(name, definition, storage, db, catalog, session)
+    # Register the snapshot's shape as a catalog table so ``SELECT *`` projects the
+    # SELECT's output columns (not the storage-assigned _id), and flag it a matview
+    # so pg_class reports relkind 'm'.
+    catalog.put(db, _matview_table_def(name, result))
+    catalog.put_matview(db, name, definition)
+    return SQLResult(command_tag=f"SELECT {len(result.rows)}", rowcount=len(result.rows))
+
+
+def _refresh_matview(stmt: exp.Command, storage: Any, db: str, catalog, session) -> SQLResult:
+    # The Command's argument is the raw tail text (e.g. "MATERIALIZED VIEW mv");
+    # a Literal carries it verbatim under ``this``.
+    arg = stmt.expression
+    text = arg.this if isinstance(arg, exp.Literal) else str(arg)
+    m = _MATVIEW_NAME_RE.match(str(text))
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported REFRESH: {stmt.sql()}")
+    name = m.group(1).strip().strip('"')
+    definition = catalog.get_matview(db, name)
+    if definition is None:
+        raise errors.SQLError("42P01", f'materialized view "{name}" does not exist')
+    _materialize(name, definition, storage, db, catalog, session)
+    return SQLResult(command_tag="REFRESH MATERIALIZED VIEW")
+
+
+def _drop_matview(stmt: exp.Drop, storage: Any, db: str, catalog) -> SQLResult:
+    name = stmt.this.name
+    if not catalog.drop_matview(db, name):
+        if stmt.args.get("exists"):
+            return SQLResult(command_tag="DROP MATERIALIZED VIEW")
+        raise errors.SQLError("42P01", f'materialized view "{name}" does not exist')
+    catalog.drop(db, name)
+    storage.drop_collection(db, name)
+    return SQLResult(command_tag="DROP MATERIALIZED VIEW")
 
 
 _MAX_VIEW_DEPTH = 32
