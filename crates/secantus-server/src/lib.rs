@@ -30,6 +30,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
+use secantus_commands::logbuf::LogBuffer;
 use secantus_commands::{
     dispatch, CommandContext, ConnectionAuth, ConnectionKiller, CursorRegistry, Storage,
 };
@@ -182,6 +183,9 @@ struct Shared {
     /// The `ConnectionKiller` handed to each request's `CommandContext` so the
     /// `killOp` handler can reach `conns` without depending on server internals.
     conn_killer: Arc<dyn ConnectionKiller>,
+    /// In-memory log ring buffer surfaced by `getLog`; the server appends
+    /// connection-lifecycle lines and hands it to each request's context.
+    logs: Arc<LogBuffer>,
 }
 
 /// Closes a connection by `conn_id` on behalf of `killOp`, by shutting down the
@@ -358,6 +362,12 @@ pub fn bind(
     let conn_killer: Arc<dyn ConnectionKiller> = Arc::new(ConnRegistry {
         conns: conns.clone(),
     });
+    let logs = Arc::new(LogBuffer::new());
+    logs.append(
+        "I",
+        "CONTROL",
+        format!("SecantusDB (rust) {VERSION} started"),
+    );
     let shared = Arc::new(Shared {
         config,
         storage,
@@ -373,6 +383,7 @@ pub fn bind(
         alloc_budget: AllocBudget::new(MAX_INFLIGHT_BYTES),
         conns,
         conn_killer,
+        logs,
     });
 
     let accept_shared = shared.clone();
@@ -441,6 +452,17 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
         conns: shared.conns.clone(),
         conn_id,
     };
+    // Record the accept in the getLog ring buffer (mirrors the Python server's
+    // "connection accepted" NETWORK line).
+    let peer = tcp
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    shared.logs.append(
+        "I",
+        "NETWORK",
+        format!("connection accepted from {peer} #{conn_id}"),
+    );
     // Per-connection auth state, shared across every request on this socket so a
     // SCRAM conversation (saslStart → saslContinue) and the authenticated
     // principals persist for the connection's lifetime.
@@ -748,7 +770,8 @@ fn make_context(
         .with_transactions(shared.transactions.clone())
         .with_failpoints(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
-        .with_conn_killer(shared.conn_killer.clone());
+        .with_conn_killer(shared.conn_killer.clone())
+        .with_logs(shared.logs.clone());
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
     ctx.require_auth = shared.config.require_auth;

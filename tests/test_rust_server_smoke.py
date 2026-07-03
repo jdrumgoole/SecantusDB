@@ -550,3 +550,18 @@ def test_kill_op_closes_a_connection(tmp_path) -> None:
         c2.close()
     finally:
         srv.stop()
+
+
+def test_get_log_returns_connection_lines(tmp_path) -> None:
+    """getLog surfaces the server's in-memory log ring buffer, including the
+    connection-accept line (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        client = _client(srv)
+        client.admin.command("ping")  # ensure a connection is established
+        res = client.admin.command({"getLog": "global"})
+        assert res["ok"] == 1.0
+        assert res["totalLinesWritten"] >= 1
+        assert any("connection accepted" in line for line in res["log"])
+    finally:
+        srv.stop()
