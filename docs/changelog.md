@@ -43,6 +43,33 @@ second, or any input Python would reject still defer to the Python oracle.
   field matching. Combined with the fixed-offset `timezone` support, a naive
   strptime result is interpreted in the given offset zone.
 
+### Rust server: `killOp`
+
+The Rust server now implements `killOp`. Real mongod signals a per-op interrupt
+flag; SecantusDB's faithful analogue (in both servers) is "close the socket" —
+since we model one in-flight op per connection, the `op` a caller passes is the
+connection's `conn_id` (readable off `hello`'s `connectionId`). The server gained
+a live-connection registry (`conn_id → socket clone`, populated on accept and
+cleared on disconnect); `killOp` shuts down the target socket, so the connection
+thread's next read returns 0 and the connection ends. The opid is accepted as
+Int32 / Int64 / integral Double / numeric string, and the reply mirrors the
+Python handler: `{info: "operation killed" | "no operation with that opid" |
+"no connection registry", ok: 1}`, or `TypeMismatch` for a non-integer `op`.
+The admin console's Connections → Kill button now works against a Rust target.
+Slice 4 of the Rust admin-command parity work (issue #163).
+
+Remaining #163 gaps: fleshing out the `getLog` / `profile` stubs (both need
+real capture infrastructure — a log ring buffer and slow-op timing).
+
+#### Added
+
+- **Rust server:** `killOp` (gated by `A_KILLOP` under `--auth`), backed by a new
+  server-side connection registry + a `ConnectionKiller` handle on
+  `CommandContext`. Regressions: `crates/secantus-commands` unit tests
+  (registry-present/absent, found/not-found, numeric-string opid, non-integer →
+  `TypeMismatch`) and
+  `tests/test_rust_server_smoke.py::test_kill_op_closes_a_connection`.
+
 ### Rust server: fixed-offset `timezone` on `$dateToString` / `$dateFromString`
 
 The Rust server now handles a fixed-offset `timezone` on the `$dateToString` and

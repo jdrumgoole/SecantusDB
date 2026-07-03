@@ -60,6 +60,36 @@ pub fn fsync(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "numFiles": 1i32, "ok": 1.0 })
 }
 
+/// `killOp` — close a client connection by its `op` (our per-connection
+/// `conn_id`; we model one in-flight op per connection, so the opid a caller
+/// reads off `hello`'s `connectionId` / `currentOp` is directly killable). Real
+/// mongod signals a per-op interrupt flag long-running paths poll; SecantusDB's
+/// faithful analogue is "close the socket" — the connection thread's next read
+/// returns 0, the loop exits, and the connection unregisters. The opid is
+/// accepted as Int32 / Int64 / an integral Double / a numeric string (drivers
+/// serialise it differently). Mirrors `commands.py::_kill_op`.
+pub fn kill_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let op_id: i64 = match doc.get("op") {
+        Some(Bson::Int32(n)) => i64::from(*n),
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Double(d)) if d.fract() == 0.0 => *d as i64,
+        Some(Bson::String(s)) if s.parse::<i64>().is_ok() => s.parse::<i64>().unwrap(),
+        other => {
+            return Err(crate::CommandError::new(
+                14,
+                "TypeMismatch",
+                format!("killOp requires an integer `op` field, got {other:?}"),
+            ));
+        }
+    };
+    let info = match &ctx.conn_killer {
+        None => "no connection registry",
+        Some(killer) if killer.kill(op_id) => "operation killed",
+        Some(_) => "no operation with that opid",
+    };
+    Ok(doc! { "info": info, "ok": 1.0 })
+}
+
 /// `connectionStatus` — auth info for the connection (empty until R5 auth).
 pub fn connection_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! {
@@ -171,6 +201,72 @@ mod tests {
             }
             other => panic!("expected UUID binary, got {other:?}"),
         }
+    }
+
+    /// A `ConnectionKiller` that records the ids it was asked to kill and reports
+    /// a fixed found/not-found result.
+    struct FakeKiller {
+        found: bool,
+        killed: std::sync::Mutex<Vec<i64>>,
+    }
+    impl crate::ConnectionKiller for FakeKiller {
+        fn kill(&self, conn_id: i64) -> bool {
+            self.killed.lock().unwrap().push(conn_id);
+            self.found
+        }
+    }
+
+    #[test]
+    fn kill_op_without_registry_reports_no_registry() {
+        let reply = dispatch(&doc! {"killOp": 1, "op": 7_i32}, &mut ctx());
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(reply.get_str("info").unwrap(), "no connection registry");
+    }
+
+    #[test]
+    fn kill_op_kills_a_known_connection() {
+        let killer = std::sync::Arc::new(FakeKiller {
+            found: true,
+            killed: Default::default(),
+        });
+        let mut c = ctx().with_conn_killer(killer.clone());
+        let reply = dispatch(&doc! {"killOp": 1, "op": 42_i64}, &mut c);
+        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
+        assert_eq!(*killer.killed.lock().unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn kill_op_unknown_opid_reports_no_operation() {
+        let killer = std::sync::Arc::new(FakeKiller {
+            found: false,
+            killed: Default::default(),
+        });
+        let mut c = ctx().with_conn_killer(killer);
+        let reply = dispatch(&doc! {"killOp": 1, "op": 99_i32}, &mut c);
+        assert_eq!(
+            reply.get_str("info").unwrap(),
+            "no operation with that opid"
+        );
+    }
+
+    #[test]
+    fn kill_op_accepts_a_numeric_string_op() {
+        let killer = std::sync::Arc::new(FakeKiller {
+            found: true,
+            killed: Default::default(),
+        });
+        let mut c = ctx().with_conn_killer(killer.clone());
+        let reply = dispatch(&doc! {"killOp": 1, "op": "7"}, &mut c);
+        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
+        assert_eq!(*killer.killed.lock().unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn kill_op_non_integer_op_is_type_mismatch() {
+        let reply = dispatch(&doc! {"killOp": 1, "op": "not-an-int"}, &mut ctx());
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 14);
+        assert_eq!(reply.get_str("codeName").unwrap(), "TypeMismatch");
     }
 
     #[test]

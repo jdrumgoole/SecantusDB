@@ -21,15 +21,18 @@
 
 pub mod args;
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
-use secantus_commands::{dispatch, CommandContext, ConnectionAuth, CursorRegistry, Storage};
+use secantus_commands::{
+    dispatch, CommandContext, ConnectionAuth, ConnectionKiller, CursorRegistry, Storage,
+};
 use secantus_wire::{
     build_op_msg_reply, build_op_reply, Header, Op, OpMsg, WireError, HEADER_SIZE,
     OP_MSG_FLAG_EXHAUST_ALLOWED, OP_MSG_FLAG_MORE_TO_COME,
@@ -172,6 +175,50 @@ struct Shared {
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Global cap on concurrent in-flight message-body allocations.
     alloc_budget: AllocBudget,
+    /// Live-connection registry: `conn_id → a clone of the connection's socket`,
+    /// so `killOp` can close a connection by its id. Each connection registers
+    /// on accept and unregisters on exit (`ConnEntryGuard`). Poison-tolerant.
+    conns: Arc<Mutex<HashMap<i64, TcpStream>>>,
+    /// The `ConnectionKiller` handed to each request's `CommandContext` so the
+    /// `killOp` handler can reach `conns` without depending on server internals.
+    conn_killer: Arc<dyn ConnectionKiller>,
+}
+
+/// Closes a connection by `conn_id` on behalf of `killOp`, by shutting down the
+/// registered socket clone. Backs [`ConnectionKiller`].
+struct ConnRegistry {
+    conns: Arc<Mutex<HashMap<i64, TcpStream>>>,
+}
+
+impl ConnectionKiller for ConnRegistry {
+    fn kill(&self, conn_id: i64) -> bool {
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        match conns.get(&conn_id) {
+            Some(sock) => {
+                // Best-effort: `shutdown` makes the peer's read return 0 and the
+                // connection thread exit (which unregisters the entry). An
+                // already-closed socket erroring here is harmless.
+                let _ = sock.shutdown(Shutdown::Both);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// RAII: removes a connection's entry from the registry when its thread exits.
+struct ConnEntryGuard {
+    conns: Arc<Mutex<HashMap<i64, TcpStream>>>,
+    conn_id: i64,
+}
+
+impl Drop for ConnEntryGuard {
+    fn drop(&mut self) {
+        self.conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.conn_id);
+    }
 }
 
 /// The Rust server's own version, embedded at compile time from the crate
@@ -307,6 +354,10 @@ pub fn bind(
         ))
     };
 
+    let conns: Arc<Mutex<HashMap<i64, TcpStream>>> = Arc::new(Mutex::new(HashMap::new()));
+    let conn_killer: Arc<dyn ConnectionKiller> = Arc::new(ConnRegistry {
+        conns: conns.clone(),
+    });
     let shared = Arc::new(Shared {
         config,
         storage,
@@ -320,6 +371,8 @@ pub fn bind(
         active: Arc::new(AtomicUsize::new(0)),
         tls,
         alloc_budget: AllocBudget::new(MAX_INFLIGHT_BYTES),
+        conns,
+        conn_killer,
     });
 
     let accept_shared = shared.clone();
@@ -371,6 +424,23 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     tcp.set_nonblocking(false)?;
     tcp.set_read_timeout(Some(READ_POLL))?;
     let conn_id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    // Register a killable handle (a clone of this socket) under `conn_id` so a
+    // `killOp` from another connection can `shutdown` it; the guard unregisters
+    // when this thread exits. Cloning failure is non-fatal — the connection just
+    // isn't killable (better than refusing it). The clone shares the OS socket,
+    // so a `shutdown` on it tears down this connection (TLS included, since the
+    // underlying TCP is what closes).
+    if let Ok(kill_handle) = tcp.try_clone() {
+        shared
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conn_id, kill_handle);
+    }
+    let _conn_entry = ConnEntryGuard {
+        conns: shared.conns.clone(),
+        conn_id,
+    };
     // Per-connection auth state, shared across every request on this socket so a
     // SCRAM conversation (saslStart → saslContinue) and the authenticated
     // principals persist for the connection's lifetime.
@@ -677,7 +747,8 @@ fn make_context(
         .with_cursors(shared.cursors.clone())
         .with_transactions(shared.transactions.clone())
         .with_failpoints(shared.failpoints.clone())
-        .with_conn_auth(conn_auth.clone());
+        .with_conn_auth(conn_auth.clone())
+        .with_conn_killer(shared.conn_killer.clone());
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
     ctx.require_auth = shared.config.require_auth;

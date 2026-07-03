@@ -71,6 +71,16 @@ pub const DEFAULT_BATCH_SIZE: i32 = 101;
 const VALID_READ_CONCERN_LEVELS: [&str; 5] =
     ["local", "available", "majority", "linearizable", "snapshot"];
 
+/// Lets `killOp` reach the server's live-connection registry to close a
+/// connection by its `conn_id` (our per-connection opid — one in-flight op per
+/// connection). Implemented by the server over its connection map; `None` in
+/// unit-test / storage-less contexts (where `killOp` reports "no connection
+/// registry", matching the Python server).
+pub trait ConnectionKiller: Send + Sync {
+    /// Close the connection with `conn_id`, returning whether one was found.
+    fn kill(&self, conn_id: i64) -> bool;
+}
+
 /// The per-request state a handler reads. Handshake- and CRUD-scoped for this
 /// slice; it grows (auth, sessions, cursors, metrics, …) as command families
 /// land. The fields mirror the subset of `commands.py::CommandContext` the
@@ -117,6 +127,10 @@ pub struct CommandContext {
     /// server drops the socket after dispatch instead of replying, so the driver
     /// sees a network error (the drivers' retryability / socket-error tests).
     pub close_connection: bool,
+    /// The server's live-connection registry, so `killOp` can close a connection
+    /// by its `conn_id`. `None` until the server wires one in (and in unit-test
+    /// contexts).
+    pub conn_killer: Option<Arc<dyn ConnectionKiller>>,
 }
 
 impl CommandContext {
@@ -140,6 +154,7 @@ impl CommandContext {
             peer_cert_dn: None,
             failpoints: None,
             close_connection: false,
+            conn_killer: None,
         }
     }
 
@@ -169,6 +184,13 @@ impl CommandContext {
     /// tests). The auth family (`saslStart` / `saslContinue` / …) reads it.
     pub fn with_conn_auth(mut self, conn_auth: Arc<Mutex<ConnectionAuth>>) -> Self {
         self.conn_auth = Some(conn_auth);
+        self
+    }
+
+    /// Attach the server's live-connection registry (builder-style). `killOp`
+    /// uses it to close a connection by its `conn_id`.
+    pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
+        self.conn_killer = Some(conn_killer);
         self
     }
 
@@ -312,6 +334,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "dbStats" | "dbstats" => admin::db_stats,
         "serverStatus" => admin::server_status,
         "currentOp" => admin::current_op,
+        "killOp" => diagnostics::kill_op,
         "validate" => admin::validate,
         "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
@@ -1114,6 +1137,7 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "rolesInfo" => (A_VIEW_ROLE, SCOPE_DATABASE),
         "serverStatus" => (A_SERVER_STATUS, SCOPE_CLUSTER),
         "currentOp" => (A_INPROG, SCOPE_CLUSTER),
+        "killOp" => (A_KILLOP, SCOPE_CLUSTER),
         "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
         "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),

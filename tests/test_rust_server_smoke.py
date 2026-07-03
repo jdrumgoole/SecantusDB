@@ -528,3 +528,25 @@ def test_secantus_grant_revoke_roles_to_user(tmp_path) -> None:
         assert roles2 == {("readWrite", "admin")}
     finally:
         srv.stop()
+
+
+def test_kill_op_closes_a_connection(tmp_path) -> None:
+    """killOp closes another connection by its conn_id (from hello.connectionId)
+    and reports {info, ok}; a bogus opid is reported not-found (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        c1 = _client(srv)
+        cid1 = c1.admin.command("hello")["connectionId"]
+        c2 = _client(srv)
+
+        killed = c2.admin.command({"killOp": 1, "op": cid1})
+        assert killed["ok"] == 1.0
+        assert killed["info"] == "operation killed"
+
+        bogus = c2.admin.command({"killOp": 1, "op": 2_000_000_000})
+        assert bogus["info"] == "no operation with that opid"
+
+        c1.close()
+        c2.close()
+    finally:
+        srv.stop()
