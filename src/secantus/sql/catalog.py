@@ -21,6 +21,7 @@ from secantus.sql import errors
 
 CATALOG_COLLECTION = "__sql_catalog__"
 VIEW_COLLECTION = "__sql_views__"
+MATVIEW_COLLECTION = "__sql_matviews__"
 
 
 class _StorageLike(Protocol):
@@ -257,3 +258,25 @@ class Catalog:
     def list_views(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, VIEW_COLLECTION, {})
         return sorted(d["view"] for d in docs)
+
+    # -- materialized views ------------------------------------------------- #
+    # A materialized view stores its SELECT text here and a snapshot of rows in a
+    # backing collection of the same name (queried through schema-on-read
+    # reflection); REFRESH recomputes the snapshot.
+
+    def put_matview(self, db: str, name: str, definition: str) -> None:
+        self._storage.delete_matching(db, MATVIEW_COLLECTION, {"_id": name})
+        self._storage.insert(
+            db, MATVIEW_COLLECTION, [{"_id": name, "matview": name, "definition": definition}]
+        )
+
+    def get_matview(self, db: str, name: str) -> str | None:
+        docs = self._storage.find_matching(db, MATVIEW_COLLECTION, {"_id": name}, limit=1)
+        return docs[0]["definition"] if docs else None
+
+    def drop_matview(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, MATVIEW_COLLECTION, {"_id": name}) > 0
+
+    def list_matviews(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, MATVIEW_COLLECTION, {})
+        return sorted(d["matview"] for d in docs)

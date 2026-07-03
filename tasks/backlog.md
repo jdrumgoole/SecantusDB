@@ -1624,6 +1624,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   name → `42704` unless IF EXISTS). Still not enforced. **Limitations:** unnamed `ADD CHECK (…)` isn't
   accepted (sqlglot can't parse it — a CHECK needs an explicit `CONSTRAINT name`); no `ALTER CONSTRAINT`
   / `VALIDATE CONSTRAINT`.
+- [ ] **Materialized views landed** (b97): `CREATE MATERIALIZED VIEW name AS SELECT …` runs the SELECT
+  and stores a **snapshot** of its rows in a backing collection (named after the matview) plus the
+  definition text in a per-db `__sql_matviews__` registry (`catalog.put_matview` / `get_matview` /
+  `drop_matview` / `list_matviews`). The snapshot's shape is registered as a catalog `TableDef` (columns
+  = the SELECT outputs) so `SELECT * FROM mv` projects the view's columns, not the storage-assigned
+  `_id`. `REFRESH MATERIALIZED VIEW name` (parses as an `exp.Command` — sqlglot can't parse it as DDL —
+  handled in `engine._refresh_matview`) re-runs the SELECT and replaces the snapshot rows; `DROP
+  MATERIALIZED VIEW [IF EXISTS]` (`exp.Drop` kind='VIEW' `materialized=True`) drops the registry entry,
+  catalog `TableDef`, and backing collection. CREATE detection uses the `MaterializedProperty` in
+  `exp.Create.properties` (`_is_materialized`). Reflection: `pg_class` reports `relkind='m'` for matview
+  names (`virtual._matview_names`), `pg_get_viewdef(oid)` returns the definition (`viewdef_for_oid`
+  extended), and matviews are **excluded** from `information_schema.tables` (matching Postgres).
+  SQLAlchemy's `get_materialized_view_names()` reflects them; they don't appear in `get_table_names()`.
+  **Limitations:** full recompute only (no `REFRESH … CONCURRENTLY`, no incremental refresh); no indexes
+  on the snapshot; `WITH NO DATA` / `WITH DATA` not modeled (always populated); `ALTER MATERIALIZED
+  VIEW` unsupported.
 - [ ] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
   text in a per-db `__sql_views__` collection (`catalog.put_view` / `get_view` / `drop_view` /
   `list_views`). `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` dispatch on `exp.Create` /
