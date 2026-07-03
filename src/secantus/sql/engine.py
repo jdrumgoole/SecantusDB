@@ -770,6 +770,10 @@ def _run_statement(
             return _fetch_cursor(stmt, session, move=verb == "MOVE")
         if verb == "REFRESH":
             return _refresh_matview(stmt, storage, db, catalog, session)
+        if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
+            return _create_matview_command(stmt, storage, db, catalog, session)
+        if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
+            return _alter_matview_command(stmt, storage, db, catalog, session)
         return _run_command(stmt, session)
 
     # CLOSE cursor / CLOSE ALL parses as a bare Alias (``CLOSE AS name``).
@@ -807,6 +811,17 @@ def _run_select(
     table_node = stmt.find(exp.Table)
     if table_node is None:
         return executor.execute_constant_select(planner.plan_constant_select(stmt, session))
+
+    # A WITH NO DATA materialized view is not scannable until its first REFRESH.
+    if (
+        not table_node.args.get("db")
+        and catalog.get_matview(db, table_node.name) is not None
+        and not catalog.matview_populated(db, table_node.name)
+    ):
+        raise errors.SQLError(
+            "55000",
+            f'materialized view "{table_node.name}" has not been populated',
+        )
 
     # JOIN / GROUP BY / aggregates compile to an aggregation pipeline. Route it
     # through a CatalogBackend so the pipeline can read pg_catalog /
@@ -930,24 +945,36 @@ def _materialize(name: str, definition: str, storage: Any, db: str, catalog, ses
     return result
 
 
-def _create_matview(stmt: exp.Create, storage: Any, db: str, catalog, session) -> SQLResult:
+def _create_matview(
+    stmt: exp.Create, storage: Any, db: str, catalog, session, populate: bool = True
+) -> SQLResult:
     name = stmt.this.name
     if catalog.exists(db, name) or catalog.get_matview(db, name) is not None:
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
     definition = stmt.expression.sql(dialect="postgres")
     storage.create_collection(db, name)
-    result = _materialize(name, definition, storage, db, catalog, session)
+    # Run the SELECT for its column shape either way; only write rows for WITH
+    # DATA (the default). A WITH NO DATA matview is registered but unpopulated —
+    # querying it errors until the first REFRESH.
+    inner = sqlglot.parse_one(definition, read="postgres")
+    result = _run_query(inner, storage, db, catalog, session)
     # Register the snapshot's shape as a catalog table so ``SELECT *`` projects the
     # SELECT's output columns (not the storage-assigned _id), and flag it a matview
     # so pg_class reports relkind 'm'.
     catalog.put(db, _matview_table_def(name, result))
-    catalog.put_matview(db, name, definition)
-    return SQLResult(command_tag=f"SELECT {len(result.rows)}", rowcount=len(result.rows))
+    if populate:
+        docs = _matview_docs(result)
+        if docs:
+            storage.insert(db, name, docs)
+    catalog.put_matview(db, name, definition, populated=populate)
+    if populate:
+        return SQLResult(command_tag=f"SELECT {len(result.rows)}", rowcount=len(result.rows))
+    return SQLResult(command_tag="CREATE MATERIALIZED VIEW")
 
 
 def _refresh_matview(stmt: exp.Command, storage: Any, db: str, catalog, session) -> SQLResult:
-    # The Command's argument is the raw tail text (e.g. "MATERIALIZED VIEW mv");
-    # a Literal carries it verbatim under ``this``.
+    # The Command's argument is the raw tail text (e.g. "MATERIALIZED VIEW mv" or
+    # "MATERIALIZED VIEW CONCURRENTLY mv"); a Literal carries it verbatim.
     arg = stmt.expression
     text = arg.this if isinstance(arg, exp.Literal) else str(arg)
     m = _MATVIEW_NAME_RE.match(str(text))
@@ -958,7 +985,61 @@ def _refresh_matview(stmt: exp.Command, storage: Any, db: str, catalog, session)
     if definition is None:
         raise errors.SQLError("42P01", f'materialized view "{name}" does not exist')
     _materialize(name, definition, storage, db, catalog, session)
+    catalog.set_matview_populated(db, name, True)  # a WITH NO DATA matview is now scannable
     return SQLResult(command_tag="REFRESH MATERIALIZED VIEW")
+
+
+_MATVIEW_CREATE_RE = re.compile(
+    r"(?is)^\s*MATERIALIZED\s+VIEW\s+(.*?)\s+WITH\s+(NO\s+)?DATA\s*;?\s*$"
+)
+_MATVIEW_ALTER_RE = re.compile(
+    r"(?is)^\s*MATERIALIZED\s+VIEW\s+(?:IF\s+EXISTS\s+)?(.+?)\s+RENAME\s+TO\s+(.+?)\s*;?\s*$"
+)
+
+
+def _command_text(stmt: exp.Command) -> str:
+    arg = stmt.expression
+    return arg.this if isinstance(arg, exp.Literal) else str(arg or "")
+
+
+def _create_matview_command(
+    stmt: exp.Command, storage: Any, db: str, catalog, session
+) -> SQLResult:
+    """``CREATE MATERIALIZED VIEW … WITH [NO] DATA`` — sqlglot can't parse the WITH
+    clause, so it arrives as a Command. Strip the suffix, re-parse the bare CREATE,
+    and delegate with the populate flag."""
+    text = _command_text(stmt)
+    m = _MATVIEW_CREATE_RE.match(text)
+    if m is None:
+        return _run_command(stmt, session)
+    populate = m.group(2) is None  # "WITH NO DATA" → don't populate
+    inner = sqlglot.parse_one(f"CREATE MATERIALIZED VIEW {m.group(1)}", read="postgres")
+    return _create_matview(inner, storage, db, catalog, session, populate=populate)
+
+
+def _alter_matview_command(stmt: exp.Command, storage: Any, db: str, catalog, session) -> SQLResult:
+    """``ALTER MATERIALIZED VIEW name RENAME TO newname`` (arrives as a Command)."""
+    m = _MATVIEW_ALTER_RE.match(_command_text(stmt))
+    if m is None:
+        return _run_command(stmt, session)
+    old = m.group(1).strip().strip('"')
+    new = m.group(2).strip().strip('"')
+    definition = catalog.get_matview(db, old)
+    if definition is None:
+        raise errors.SQLError("42P01", f'materialized view "{old}" does not exist')
+    if catalog.exists(db, new) or catalog.get_matview(db, new) is not None:
+        raise errors.SQLError("42P07", f'relation "{new}" already exists')
+    ok, err = storage.rename_collection(db, old, db, new)
+    if not ok:
+        raise errors.SQLError("42P07", err or f'relation "{new}" already exists')
+    populated = catalog.matview_populated(db, old)
+    table = catalog.get(db, old)
+    if table is not None:
+        table.name, table.collection = new, new
+        catalog.replace(db, table, old_name=old)
+    catalog.drop_matview(db, old)
+    catalog.put_matview(db, new, definition, populated=populated)
+    return SQLResult(command_tag="ALTER MATERIALIZED VIEW")
 
 
 def _drop_matview(stmt: exp.Drop, storage: Any, db: str, catalog) -> SQLResult:
@@ -1047,6 +1128,12 @@ class _CTECatalog(Catalog):
 
     def list_views(self, db: str) -> list[str]:
         return self._base.list_views(db)
+
+    def get_matview(self, db: str, name: str) -> str | None:
+        return self._base.get_matview(db, name)
+
+    def matview_populated(self, db: str, name: str) -> bool:
+        return self._base.matview_populated(db, name)
 
 
 def _run_with(

@@ -1633,6 +1633,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   name → `42704` unless IF EXISTS). Still not enforced. **Limitations:** unnamed `ADD CHECK (…)` isn't
   accepted (sqlglot can't parse it — a CHECK needs an explicit `CONSTRAINT name`); no `ALTER CONSTRAINT`
   / `VALIDATE CONSTRAINT`.
+- [ ] **Materialized-view polish landed** (b99): `WITH NO DATA` registers a matview unpopulated (a
+  `populated` flag in the `__sql_matviews__` registry doc — `catalog.matview_populated` /
+  `set_matview_populated`); querying an unpopulated matview errors `55000`
+  (`object_not_in_prerequisite_state`, checked in `engine._run_select`), and its first `REFRESH` marks
+  it populated. `WITH DATA` is the default (returns `SELECT N`; `WITH NO DATA` returns `CREATE
+  MATERIALIZED VIEW`). `REFRESH … CONCURRENTLY` is accepted (the existing `_MATVIEW_NAME_RE` already
+  skips the keyword; no unique index required since refresh is a full recompute). `ALTER MATERIALIZED
+  VIEW name RENAME TO new` moves the registry entry, the catalog `TableDef`, and the backing collection
+  (`storage.rename_collection`), preserving the populated flag. All three (`CREATE … WITH [NO] DATA`,
+  `REFRESH … CONCURRENTLY`, `ALTER … RENAME`) parse as `exp.Command` — sqlglot can't parse them as DDL —
+  and are handled in the Command dispatch (`_create_matview_command` / `_alter_matview_command`).
+  `_CTECatalog` gained `get_matview` / `matview_populated` delegation so the scannability check works
+  inside a WITH. **Limitations:** the unpopulated check only fires for a matview in the query's primary
+  FROM (not a secondary JOIN position); no real `CONCURRENTLY` snapshot isolation; still no indexes on
+  the snapshot.
 - [ ] **Materialized views landed** (b97): `CREATE MATERIALIZED VIEW name AS SELECT …` runs the SELECT
   and stores a **snapshot** of its rows in a backing collection (named after the matview) plus the
   definition text in a per-db `__sql_matviews__` registry (`catalog.put_matview` / `get_matview` /

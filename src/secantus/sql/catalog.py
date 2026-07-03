@@ -264,15 +264,28 @@ class Catalog:
     # backing collection of the same name (queried through schema-on-read
     # reflection); REFRESH recomputes the snapshot.
 
-    def put_matview(self, db: str, name: str, definition: str) -> None:
+    def put_matview(self, db: str, name: str, definition: str, populated: bool = True) -> None:
         self._storage.delete_matching(db, MATVIEW_COLLECTION, {"_id": name})
         self._storage.insert(
-            db, MATVIEW_COLLECTION, [{"_id": name, "matview": name, "definition": definition}]
+            db,
+            MATVIEW_COLLECTION,
+            [{"_id": name, "matview": name, "definition": definition, "populated": populated}],
         )
 
     def get_matview(self, db: str, name: str) -> str | None:
         docs = self._storage.find_matching(db, MATVIEW_COLLECTION, {"_id": name}, limit=1)
         return docs[0]["definition"] if docs else None
+
+    def matview_populated(self, db: str, name: str) -> bool:
+        """Whether a materialized view holds data. A ``WITH NO DATA`` matview is
+        unpopulated (not scannable) until its first ``REFRESH``."""
+        docs = self._storage.find_matching(db, MATVIEW_COLLECTION, {"_id": name}, limit=1)
+        return bool(docs[0].get("populated", True)) if docs else False
+
+    def set_matview_populated(self, db: str, name: str, populated: bool) -> None:
+        definition = self.get_matview(db, name)
+        if definition is not None:
+            self.put_matview(db, name, definition, populated=populated)
 
     def drop_matview(self, db: str, name: str) -> bool:
         return self._storage.delete_matching(db, MATVIEW_COLLECTION, {"_id": name}) > 0
