@@ -1750,6 +1750,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   different connections (acceptable for the dev/test surface; the storage RLock keeps each write
   atomic); no `ALTER SEQUENCE`, no `CACHE`, no `OWNED BY`, and an explicit value into a SERIAL column
   doesn't bump the sequence (matches Postgres).
+- [ ] **SQL-level roles landed** (b103): `CREATE ROLE` / `CREATE USER` / `ALTER ROLE` / `DROP ROLE`
+  (all arrive as `exp.Command`; parsed by `engine._run_role_command` / `_parse_role_attrs` — `LOGIN` /
+  `SUPERUSER` / `CREATEDB` / `CREATEROLE` / `INHERIT` / `REPLICATION` + `NO…` negations, `PASSWORD`,
+  `CONNECTION LIMIT`; `USER` implies LOGIN). Stored in a per-db `__sql_roles__` collection
+  (`Catalog.put_role` / `get_role` / `drop_role` / `list_roles`), reflected via `pg_catalog.pg_roles`
+  (`_pg_roles`), which also surfaces the connecting `session.user` as a superuser login role (Postgres
+  bootstrap-superuser analogue). `GRANT` / `REVOKE` (privileges via `exp.Grant` / `exp.Revoke`, role
+  membership via `Command`) are accepted as no-ops. Tests: `tests/test_sql_roles.py`. **Limitations:**
+  roles are a reflection / DDL-acceptance record only — **distinct from the wire server's SCRAM auth
+  users** (constructor `users={}`), no privilege enforcement, no `pg_authid` / `pg_auth_members` /
+  role-membership graph, password not stored (only a `password_set` flag), and roles live in the
+  connection's db rather than being cluster-wide.
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);

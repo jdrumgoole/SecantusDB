@@ -794,7 +794,21 @@ def _run_statement(
             return _alter_matview_command(stmt, storage, db, catalog, session)
         if verb == "SET" and _command_text(stmt).lstrip().upper().startswith("CONSTRAINTS"):
             return _set_constraints_command(stmt, storage, db, catalog, session)
+        if verb in ("CREATE", "DROP", "ALTER") and _command_text(stmt).lstrip().upper().startswith(
+            ("ROLE ", "USER ", "GROUP ")
+        ):
+            return _run_role_command(verb, stmt, db, catalog)
+        if verb in ("GRANT", "REVOKE"):
+            # Role-membership / privilege grants aren't enforced — accept no-op.
+            return SQLResult(command_tag=verb)
         return _run_command(stmt, session)
+
+    if isinstance(stmt, exp.Grant):
+        # Privileges aren't enforced (single-node dev surface) — accept as a no-op.
+        return SQLResult(command_tag="GRANT")
+
+    if isinstance(stmt, exp.Revoke):
+        return SQLResult(command_tag="REVOKE")
 
     # CLOSE cursor / CLOSE ALL parses as a bare Alias (``CLOSE AS name``).
     close = _close_cursor_target(stmt)
@@ -1022,6 +1036,90 @@ _MATVIEW_ALTER_RE = re.compile(
 def _command_text(stmt: exp.Command) -> str:
     arg = stmt.expression
     return arg.this if isinstance(arg, exp.Literal) else str(arg or "")
+
+
+# CREATE/DROP/ALTER ROLE | USER | GROUP arrive as a Command; the tail carries the
+# name + attribute keywords. ``USER`` implies LOGIN (Postgres).
+_ROLE_HEAD_RE = re.compile(
+    r"(?is)^\s*(ROLE|USER|GROUP)\s+(?:IF\s+(NOT\s+)?EXISTS\s+)?"
+    r'("[^"]+"|\w+)\s*(.*?)\s*;?\s*$'
+)
+# Boolean role attributes: keyword -> (field, value). NO<attr> negates.
+_ROLE_FLAGS = {
+    "LOGIN": ("login", True),
+    "NOLOGIN": ("login", False),
+    "SUPERUSER": ("superuser", True),
+    "NOSUPERUSER": ("superuser", False),
+    "CREATEDB": ("createdb", True),
+    "NOCREATEDB": ("createdb", False),
+    "CREATEROLE": ("createrole", True),
+    "NOCREATEROLE": ("createrole", False),
+    "INHERIT": ("inherit", True),
+    "NOINHERIT": ("inherit", False),
+    "REPLICATION": ("replication", True),
+    "NOREPLICATION": ("replication", False),
+}
+
+
+def _parse_role_attrs(rest: str) -> dict[str, Any]:
+    """Parse the attribute keywords after a role name (``LOGIN SUPERUSER PASSWORD
+    'x' CONNECTION LIMIT 5``) into catalog fields. Unknown keywords are ignored
+    (Postgres accepts a broad grammar; we record the ones that reflect)."""
+    attrs: dict[str, Any] = {}
+    tokens = rest.replace("WITH", " ").split()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].upper()
+        if tok in _ROLE_FLAGS:
+            field, value = _ROLE_FLAGS[tok]
+            attrs[field] = value
+        elif tok == "PASSWORD":
+            attrs["password_set"] = True
+            i += 1  # skip the password literal
+        elif tok in ("CONNECTION", "LIMIT"):
+            # CONNECTION LIMIT n
+            if tok == "LIMIT" and i + 1 < len(tokens):
+                try:
+                    attrs["connlimit"] = int(tokens[i + 1])
+                    i += 1
+                except ValueError:
+                    pass
+        i += 1
+    return attrs
+
+
+def _run_role_command(verb: str, stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    """``CREATE`` / ``DROP`` / ``ALTER`` ``ROLE`` | ``USER`` | ``GROUP``. Roles are
+    recorded in the catalog for reflection (``pg_roles``); ``USER`` implies LOGIN."""
+    text = _command_text(stmt)
+    m = _ROLE_HEAD_RE.match(text)
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported role command: {stmt.sql()}")
+    kind, not_exists, name, rest = m.group(1).upper(), m.group(2), m.group(3).strip('"'), m.group(4)
+    tag = f"{verb} {kind}"
+    if verb == "DROP":
+        if (
+            not catalog.drop_role(db, name)
+            and not_exists is None
+            and "IF EXISTS" not in text.upper()
+        ):
+            raise errors.SQLError("42704", f'role "{name}" does not exist')
+        return SQLResult(command_tag=tag)
+    attrs = _parse_role_attrs(rest)
+    if kind == "USER":
+        attrs.setdefault("login", True)  # CREATE USER == CREATE ROLE ... LOGIN
+    if verb == "ALTER":
+        existing = catalog.get_role(db, name)
+        if existing is None:
+            raise errors.SQLError("42704", f'role "{name}" does not exist')
+        merged = {k: existing[k] for k in catalog.ROLE_DEFAULTS if k in existing}
+        merged.update(attrs)
+        catalog.put_role(db, name, merged)
+        return SQLResult(command_tag=tag)
+    if catalog.role_exists(db, name):
+        raise errors.SQLError("42710", f'role "{name}" already exists')
+    catalog.put_role(db, name, attrs)
+    return SQLResult(command_tag=tag)
 
 
 _SET_CONSTRAINTS_RE = re.compile(r"(?is)^\s*CONSTRAINTS\s+(.+?)\s+(DEFERRED|IMMEDIATE)\s*;?\s*$")

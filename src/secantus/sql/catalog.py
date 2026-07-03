@@ -23,6 +23,7 @@ CATALOG_COLLECTION = "__sql_catalog__"
 VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
+ROLE_COLLECTION = "__sql_roles__"
 
 
 class _StorageLike(Protocol):
@@ -401,6 +402,43 @@ class Catalog:
             {"$set": {"last_value": value, "is_called": True}},
         )
         return value
+
+    # -- roles -------------------------------------------------------------- #
+    # SQL-level roles (``CREATE ROLE`` / ``CREATE USER``). Recorded for reflection
+    # (``pg_roles`` / ``\du``) and DDL acceptance; these are distinct from the
+    # wire server's SCRAM auth users (which remain constructor config) — a SQL
+    # role does not by itself grant a login credential.
+
+    # Default role attributes, overlaid by the CREATE/ALTER option list.
+    ROLE_DEFAULTS = {
+        "login": False,
+        "superuser": False,
+        "createdb": False,
+        "createrole": False,
+        "inherit": True,
+        "replication": False,
+        "connlimit": -1,
+        "password_set": False,
+    }
+
+    def put_role(self, db: str, name: str, attrs: dict[str, Any]) -> None:
+        merged = {**self.ROLE_DEFAULTS, **attrs}
+        self._storage.delete_matching(db, ROLE_COLLECTION, {"_id": name})
+        self._storage.insert(db, ROLE_COLLECTION, [{"_id": name, "role": name, **merged}])
+
+    def get_role(self, db: str, name: str) -> dict[str, Any] | None:
+        docs = self._storage.find_matching(db, ROLE_COLLECTION, {"_id": name}, limit=1)
+        return docs[0] if docs else None
+
+    def role_exists(self, db: str, name: str) -> bool:
+        return self.get_role(db, name) is not None
+
+    def drop_role(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, ROLE_COLLECTION, {"_id": name}) > 0
+
+    def list_roles(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, ROLE_COLLECTION, {})
+        return sorted(d["role"] for d in docs)
 
     def sequence_setval(self, db: str, name: str, value: int, is_called: bool = True) -> int:
         """Set ``name``'s current value. With ``is_called`` (default) the next

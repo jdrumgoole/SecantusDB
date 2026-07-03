@@ -67,6 +67,7 @@ def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
 
 _VIEW_OID_BASE = 50000
 _SEQUENCE_OID_BASE = 55000
+_ROLE_OID_BASE = 60000
 
 
 def _view_names(db: str, catalog: Catalog) -> list[str]:
@@ -761,6 +762,44 @@ def _pg_sequence(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     return rows
 
 
+def _pg_roles(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_roles`` — SQL-declared roles plus the connection's own user
+    (a superuser login, like Postgres' bootstrap role) when it isn't one already."""
+    lister = getattr(catalog, "list_roles", None)
+    names = lister(db) if lister is not None else []
+    rows = []
+    seen = set()
+    for i, name in enumerate(names):
+        role = catalog.get_role(db, name) or {}
+        seen.add(name)
+        rows.append(_role_row(_ROLE_OID_BASE + i, name, role))
+    # The connecting user is always a role (superuser login).
+    if session.user and session.user not in seen:
+        rows.append(
+            _role_row(
+                _ROLE_OID_BASE - 1,
+                session.user,
+                {"login": True, "superuser": True, "createdb": True, "createrole": True},
+            )
+        )
+    return rows
+
+
+def _role_row(oid: int, name: str, role: dict) -> dict:
+    return {
+        "oid": oid,
+        "rolname": name,
+        "rolsuper": bool(role.get("superuser", False)),
+        "rolinherit": bool(role.get("inherit", True)),
+        "rolcreaterole": bool(role.get("createrole", False)),
+        "rolcreatedb": bool(role.get("createdb", False)),
+        "rolcanlogin": bool(role.get("login", False)),
+        "rolreplication": bool(role.get("replication", False)),
+        "rolconnlimit": int(role.get("connlimit", -1)),
+        "rolbypassrls": False,
+    }
+
+
 def _pg_collation(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     # No non-default collations — present-but-empty.
     return []
@@ -1117,6 +1156,23 @@ _register(
     "pg_collation",
     [("oid", "int4"), ("collname", "text"), ("collnamespace", "int4")],
     _pg_collation,
+)
+_register(
+    "pg_catalog",
+    "pg_roles",
+    [
+        ("oid", "int4"),
+        ("rolname", "text"),
+        ("rolsuper", "bool"),
+        ("rolinherit", "bool"),
+        ("rolcreaterole", "bool"),
+        ("rolcreatedb", "bool"),
+        ("rolcanlogin", "bool"),
+        ("rolreplication", "bool"),
+        ("rolconnlimit", "int4"),
+        ("rolbypassrls", "bool"),
+    ],
+    _pg_roles,
 )
 _register(
     "pg_catalog",

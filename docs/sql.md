@@ -1178,6 +1178,30 @@ ctx = ssl.create_default_context(cafile="ca.pem")
 pg8000.dbapi.connect(user="alice", host="127.0.0.1", port=5432, database="db", ssl_context=ctx)
 ```
 
+### Roles (`CREATE ROLE` / `CREATE USER`)
+
+SQL-level roles are recorded in the catalog and surfaced through `pg_catalog.pg_roles`,
+so `psql`'s `\du` and role-aware tooling see them:
+
+```sql
+CREATE ROLE analyst;
+CREATE USER app WITH PASSWORD 'secret' CREATEDB;   -- USER implies LOGIN
+ALTER ROLE analyst WITH LOGIN;
+GRANT SELECT ON orders TO analyst;                 -- accepted, not enforced
+DROP ROLE analyst;
+```
+
+`CREATE ROLE` / `CREATE USER` (with `LOGIN` / `SUPERUSER` / `CREATEDB` / `CREATEROLE` /
+`INHERIT` / `REPLICATION` and their `NO…` negations, `PASSWORD`, `CONNECTION LIMIT`),
+`ALTER ROLE`, and `DROP ROLE` are stored and reflected. `GRANT` / `REVOKE` (privileges
+and role membership) are **accepted but not enforced** — SecantusDB does no
+privilege checking. The connecting user always appears in `pg_roles` as a superuser
+login role, like Postgres' bootstrap superuser.
+
+These SQL roles are a schema-shape / reflection record, **distinct from the wire
+server's SCRAM auth users** (the `users={...}` constructor argument above): creating
+a SQL role does not by itself add a login credential, and vice versa.
+
 ## Session and catalog introspection
 
 Common session functions and settings resolve against the connection:
@@ -1297,7 +1321,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`), `CREATE`/`DROP SEQUENCE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), `ALTER SEQUENCE` |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
-| Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |
+| Auth | trust, SCRAM-SHA-256, TLS, SQL `CREATE`/`ALTER`/`DROP ROLE`/`USER` (reflected via `pg_roles`), `GRANT`/`REVOKE` (accepted) | channel binding, mTLS, enforced privileges, SQL roles wired to SCRAM login |
 | Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`, `get_foreign_keys`, `get_table_comment` + column comments) | `get_check_constraints`, `get_unique_constraints` |
 
 Anything outside the supported set returns a faithful SQLSTATE error rather than
