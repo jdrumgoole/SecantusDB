@@ -677,14 +677,20 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
     """One row per column of every declared table — the pg_catalog column surface
     tools (and ``\\d``-style queries) read. attrelid lines up with pg_class.oid."""
     oids = _table_oids(db, catalog)
+    enum_oids = _enum_oids(db, catalog)
     rows: list[dict] = []
     for t in _user_tables(db, catalog):
         for i, col in enumerate(t.columns, start=1):
+            typoid = (
+                enum_oids.get(col.enum_type, 25)
+                if col.enum_type is not None
+                else typemap.PG_OID.get(col.type_tag, 25)
+            )
             rows.append(
                 {
                     "attrelid": oids[t.name],
                     "attname": col.name,
-                    "atttypid": typemap.PG_OID.get(col.type_tag, 25),
+                    "atttypid": typoid,
                     "atttypmod": -1,
                     "attnum": i,
                     "attnotnull": not col.nullable,
@@ -805,8 +811,17 @@ def _pg_collation(db: str, session: Session, storage: Any, catalog: Catalog) -> 
     return []
 
 
+_ENUM_OID_BASE = 65000
+
+
+def _enum_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    lister = getattr(catalog, "list_enums", None)
+    names = lister(db) if lister is not None else []
+    return {name: _ENUM_OID_BASE + i for i, name in enumerate(names)}
+
+
 def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    return [
+    rows = [
         {
             "oid": typemap.PG_OID[tag],
             "typname": typname,
@@ -820,6 +835,22 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         }
         for tag, typname in typemap.PG_TYPENAME.items()
     ]
+    # User-declared enum types (typtype 'e') live in the public namespace.
+    for name, oid in _enum_oids(db, catalog).items():
+        rows.append(
+            {
+                "oid": oid,
+                "typname": name,
+                "typcollation": 0,
+                "typnamespace": _NS_OIDS["public"],
+                "typbasetype": 0,
+                "typtypmod": -1,
+                "typnotnull": False,
+                "typdefault": None,
+                "typtype": "e",
+            }
+        )
+    return rows
 
 
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -931,8 +962,25 @@ def _pg_opclass(db: str, session: Session, storage: Any, catalog: Catalog) -> li
 
 
 def _pg_enum(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    # No enum types — present-but-empty so SQLAlchemy's enum-label subquery resolves.
-    return []
+    """One row per enum label — ``enumtypid`` points at the pg_type enum oid,
+    ``enumsortorder`` is the 1-based label position (SQLAlchemy reads these)."""
+    oids = _enum_oids(db, catalog)
+    lister = getattr(catalog, "list_enums", None)
+    rows: list[dict] = []
+    oid = _ENUM_OID_BASE + 10000
+    for name in lister(db) if lister is not None else []:
+        enum = catalog.get_enum(db, name)
+        for order, label in enumerate(enum["labels"] if enum else [], start=1):
+            rows.append(
+                {
+                    "oid": oid,
+                    "enumtypid": oids[name],
+                    "enumsortorder": float(order),
+                    "enumlabel": label,
+                }
+            )
+            oid += 1
+    return rows
 
 
 def _pg_database(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:

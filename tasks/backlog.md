@@ -1769,6 +1769,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   columns. Tests: `tests/test_sql_identity.py`. **Limitations:** no `OVERRIDING SYSTEM VALUE` (so an
   ALWAYS column can't be force-overridden), no `ALTER TABLE … ADD/DROP/SET GENERATED`, no
   `ALTER SEQUENCE … OWNED BY` / `RESTART` distinction from `is_called` edge cases beyond the basic reset.
+- [ ] **Enum types landed** (b107): `CREATE TYPE name AS ENUM ('a', …)` / `DROP TYPE [IF EXISTS]` store
+  the label list in a per-db `__sql_enums__` collection (`Catalog.create_enum` / `get_enum` / `drop_enum`
+  / `list_enums`); dispatched from `engine._create_type` / `_drop_type`. An enum-typed column
+  (`Column.enum_type`, stored as `text`) is detected in `plan_create_table` via `_enum_type_name` (a
+  USERDEFINED DataType); `execute_create_table` verifies the enum exists (else `42704`), and
+  `executor._validate_enum_columns` rejects a value outside the labels with `22P02` on every write path
+  (INSERT / UPDATE / ON CONFLICT / MERGE). Reflection: `pg_type` (`typtype='e'`, oid base 65000),
+  `pg_enum` (label rows with `enumsortorder`), and enum columns' `pg_attribute.atttypid` → the enum oid.
+  Tests: `tests/test_sql_enum.py`. **Limitations:** only the ENUM form of `CREATE TYPE` (composite /
+  range / base types → `0A000`); no `ALTER TYPE … ADD VALUE` / `RENAME VALUE`; enum ordering in
+  `ORDER BY` is lexical on the label text, not the declared enum order (would need an enum-aware sort
+  key); enums live in the connection's db, not schema-scoped.
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);

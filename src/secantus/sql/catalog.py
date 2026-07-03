@@ -24,6 +24,7 @@ VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
 ROLE_COLLECTION = "__sql_roles__"
+ENUM_COLLECTION = "__sql_enums__"
 
 
 class _StorageLike(Protocol):
@@ -60,6 +61,10 @@ class Column:
     # user-supplied value is rejected) or ``"by_default"`` (like SERIAL). None for
     # a plain SERIAL or non-identity column.
     identity: str | None = None
+    # The enum type name for a column declared with a ``CREATE TYPE … AS ENUM``
+    # type. Stored as ``text`` (``type_tag``) but validated against the enum's
+    # labels on write and reflected with the enum's type oid.
+    enum_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +165,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "comment": c.comment,
                 "sequence": c.sequence,
                 "identity": c.identity,
+                "enum_type": c.enum_type,
             }
             for c in table.columns
         ],
@@ -208,6 +214,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 comment=c.get("comment"),
                 sequence=c.get("sequence"),
                 identity=c.get("identity"),
+                enum_type=c.get("enum_type"),
             )
             for c in doc["columns"]
         ],
@@ -459,6 +466,30 @@ class Catalog:
             {"$set": {"last_value": value, "is_called": is_called}},
         )
         return value
+
+    # -- enum types --------------------------------------------------------- #
+    # ``CREATE TYPE name AS ENUM (...)`` — the label list is stored here; an
+    # enum-typed column validates its value against it and reflects via pg_enum.
+
+    def create_enum(self, db: str, name: str, labels: list[str]) -> None:
+        self._storage.delete_matching(db, ENUM_COLLECTION, {"_id": name})
+        self._storage.insert(
+            db, ENUM_COLLECTION, [{"_id": name, "enum": name, "labels": list(labels)}]
+        )
+
+    def get_enum(self, db: str, name: str) -> dict[str, Any] | None:
+        docs = self._storage.find_matching(db, ENUM_COLLECTION, {"_id": name}, limit=1)
+        return docs[0] if docs else None
+
+    def enum_exists(self, db: str, name: str) -> bool:
+        return self.get_enum(db, name) is not None
+
+    def drop_enum(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, ENUM_COLLECTION, {"_id": name}) > 0
+
+    def list_enums(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, ENUM_COLLECTION, {})
+        return sorted(d["enum"] for d in docs)
 
     def alter_sequence(self, db: str, name: str, changes: dict[str, Any]) -> None:
         """Apply ``ALTER SEQUENCE`` changes. ``changes`` may set ``increment`` /

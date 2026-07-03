@@ -300,6 +300,15 @@ def _serial_tag(datatype: exp.Expression) -> str | None:
     return None
 
 
+def _enum_type_name(datatype: exp.Expression) -> str | None:
+    """The user-defined type name of a column declared with a non-builtin type
+    (a candidate ``CREATE TYPE … AS ENUM``), or None. Existence is verified at
+    execution time (the planner is storage-free)."""
+    if isinstance(datatype, exp.DataType) and datatype.this and datatype.this.name == "USERDEFINED":
+        return datatype.sql(dialect="postgres").strip('"')
+    return None
+
+
 def _identity_spec(coldef: exp.ColumnDef) -> dict[str, Any] | None:
     """Parse a ``GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(START WITH n
     INCREMENT BY n)]`` column constraint into ``{mode, start, increment}``, or
@@ -848,6 +857,14 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")
         serial_tag = _serial_tag(coldef.args["kind"])
         tag = serial_tag or typemap.type_tag_for_sql(coldef.args["kind"])
+        enum_name = None
+        if tag is None:
+            # An unknown type name is a candidate enum type (stored as text,
+            # validated against the enum's labels at write time). If it isn't a
+            # declared enum, execute_create_table raises 42704.
+            enum_name = _enum_type_name(coldef.args["kind"])
+            if enum_name is not None:
+                tag = "text"
         if tag is None:
             raise errors.feature_not_supported(
                 f"unsupported column type for {coldef.name}: {coldef.args['kind'].sql()}"
@@ -880,6 +897,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 default=default,
                 sequence=sequence,
                 identity=(identity["mode"] if identity else None),
+                enum_type=enum_name,
             )
         )
     if not pk_seen:
