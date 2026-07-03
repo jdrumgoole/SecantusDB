@@ -1260,11 +1260,15 @@ defer), and `$dateToString` (strftime-style formatting: `%Y`/`%m`/`%d`/`%H`/`%M`
 complete on both servers** (only date *formatting/parsing* edges below remain).
 **Remaining:**
 
-- [ ] **Expression operators:** `$dateFromString` `format` (strptime) and the
-  separate `timezone` field on both `$dateFromString` / `$dateToString` (named
-  IANA zones need a tz database — `chrono-tz` or similar); `$dateToString` locale
-  / `%z`/`%Z`/ISO-week directives (Python `strftime` handles those). Fractional
-  seconds stay deferred (BSON is millisecond-only).
+- [ ] **Expression operators (Rust server):** `$dateFromString` `format`
+  (strptime) and *named IANA* `timezone` zones on `$dateFromString` /
+  `$dateToString` still defer to the Python oracle — the Rust server errors on
+  them (named zones need a bundled tz database — `chrono-tz` or similar; strptime
+  needs a format-string parser). **Fixed-offset / `UTC` / `GMT` timezones now
+  compute natively on both ops** (0.5.3-beta.116). Also deferred: `$dateToString`
+  locale / `%z`/`%Z`/ISO-week directives (Python `strftime` handles those).
+  Fractional seconds stay deferred (BSON is millisecond-only). The Python server
+  already supports all of these.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/

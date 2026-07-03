@@ -19,6 +19,28 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: fixed-offset `timezone` on `$dateToString` / `$dateFromString`
+
+The Rust server now handles a fixed-offset `timezone` on the `$dateToString` and
+`$dateFromString` aggregation-expression operators natively, instead of the whole
+expression being unsupported. `$dateToString` with `timezone: "+05:30"` shifts the
+wall clock before formatting; `$dateFromString` with a `timezone` interprets a
+naive date string as being in that zone (and ignores it when the string already
+carries its own offset), matching the Python server exactly. The `UTC` / `GMT`
+aliases and both the `±HHMM` and `±HH:MM` offset spellings are accepted.
+
+Named IANA zones (`America/New_York`) still defer — they need a bundled tz
+database — as does a `$dateFromString` `format` (strptime). This narrows the gap
+between the two servers on the date operators; the behaviour is pinned against the
+Python oracle by the expression parity suite.
+
+#### Added
+
+- **Rust server:** fixed-offset / `UTC` / `GMT` `timezone` support on
+  `$dateToString` and `$dateFromString` (offset arithmetic in the shared
+  `secantus-core` expression engine). Named IANA zones and `format` strptime still
+  defer.
+
 ### `$jsonSchema` gains `uniqueItems`
 
 The `$jsonSchema` query operator now understands `uniqueItems`. With

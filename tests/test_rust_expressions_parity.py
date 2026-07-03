@@ -353,6 +353,14 @@ CURATED = [
         {},
     ),  # format -> defer
     ({"$dateFromString": {"dateString": "2024-01-15", "timezone": "America/New_York"}}, {}),  # tz
+    # Fixed-offset timezone: a naive string is interpreted in that zone
+    # (utc = wall - offset); UTC/GMT aliases and ±HHMM / ±HH:MM forms compute.
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "+05:00"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15", "timezone": "-08:00"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "+0530"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "UTC"}}, {}),
+    # A string that already carries an offset ignores the timezone field.
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z", "timezone": "+05:00"}}, {}),
     # $dateToString — default format + unambiguous directives. `_DT` is a modern
     # date; a separate date carries non-zero milliseconds for %L.
     ({"$dateToString": {"date": "$d"}}, {"d": _DT}),  # default %Y-%m-%dT%H:%M:%S.%LZ
@@ -364,6 +372,13 @@ CURATED = [
     ({"$dateToString": {"date": 5}}, {}),  # non-datetime -> null
     ({"$dateToString": {"date": "$x"}}, {}),  # missing -> null
     ({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),  # tz -> defer
+    # Fixed-offset timezone shifts the wall clock before rendering.
+    ({"$dateToString": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
+    (
+        {"$dateToString": {"date": "$d", "timezone": "-0800", "format": "%Y-%m-%d %H:%M"}},
+        {"d": _DT},
+    ),
+    ({"$dateToString": {"date": "$d", "timezone": "UTC"}}, {"d": _DT}),
     ({"$dateToString": {"date": "$d", "format": "%z"}}, {"d": _DT}),  # unknown directive -> defer
     # $range.
     ({"$range": [0, 5]}, {}),
