@@ -274,6 +274,21 @@ def test_json_schema_enum() -> None:
     assert not matches({"status": "pending"}, {"$jsonSchema": schema})
 
 
+def test_json_schema_unique_items() -> None:
+    schema = {"properties": {"tags": {"bsonType": "array", "uniqueItems": True}}}
+    assert matches({"tags": ["a", "b", "c"]}, {"$jsonSchema": schema})
+    assert matches({"tags": []}, {"$jsonSchema": schema})
+    assert not matches({"tags": ["a", "b", "a"]}, {"$jsonSchema": schema})
+    # cross-type-equal numerics collide (1 == 1.0) at the top level
+    assert not matches({"tags": [1, 1.0]}, {"$jsonSchema": schema})
+    # distinct vs duplicate documents
+    assert matches({"tags": [{"x": 1}, {"x": 2}]}, {"$jsonSchema": schema})
+    assert not matches({"tags": [{"x": 1}, {"x": 1}]}, {"$jsonSchema": schema})
+    # uniqueItems: false is a no-op
+    off = {"properties": {"tags": {"uniqueItems": False}}}
+    assert matches({"tags": [1, 1]}, {"$jsonSchema": off})
+
+
 def test_json_schema_all_of() -> None:
     schema = {"properties": {"n": {"allOf": [{"bsonType": "int"}, {"minimum": 0}]}}}
     assert matches({"n": 5}, {"$jsonSchema": schema})

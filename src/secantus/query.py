@@ -12,6 +12,7 @@ from bson import Binary, Decimal128, Int64, ObjectId, Regex
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
 from secantus.collation import equal as _coll_equal
+from secantus.sortkey import encode_value as _encode_sortkey
 
 
 class _Missing:
@@ -140,6 +141,18 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
             for item in value:
                 if not _validate_json_schema(item, schema["items"]):
                     return False
+        if schema.get("uniqueItems") is True:
+            # Every element must be distinct. The shared sort-key encoding is the
+            # equality key: it collides equal-value numerics (1 == 1.0 at top
+            # level) and is order-sensitive for documents, matching real mongod
+            # for scalar arrays. (Nested cross-type-equal numerics are a known
+            # gap — see tasks/backlog.md.)
+            seen: set[bytes] = set()
+            for item in value:
+                key = _encode_sortkey(item)
+                if key in seen:
+                    return False
+                seen.add(key)
     if isinstance(value, Mapping):
         if "required" in schema:
             for required_key in schema["required"]:

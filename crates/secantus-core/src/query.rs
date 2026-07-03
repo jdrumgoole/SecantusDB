@@ -767,6 +767,19 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
                 }
             }
         }
+        // `uniqueItems: true` — every element must be distinct. Uses the shared
+        // sort-key encoding as the equality key (collides equal-value numerics,
+        // order-sensitive for documents), matching the Python oracle. An element
+        // the encoder can't represent defers the whole match to Python.
+        if matches!(sch.get("uniqueItems"), Some(Bson::Boolean(true))) {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            for item in arr {
+                let key = crate::sortkey::encode_value(item, None).map_err(|_| Fallback)?;
+                if !seen.insert(key) {
+                    return Ok(false);
+                }
+            }
+        }
     }
     // Object constraints.
     if let Bson::Document(obj) = value {

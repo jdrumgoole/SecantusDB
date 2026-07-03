@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$jsonSchema` gains `uniqueItems`
+
+The `$jsonSchema` query operator now understands `uniqueItems`. With
+`uniqueItems: true` on an array schema, a document matches only when every element
+of the array is distinct — the way to say "this list has no repeats" in a
+validator or a `$jsonSchema` query. Elements are compared by value: cross-type
+numerics that are numerically equal (`1` and `1.0`) count as duplicates, and
+documents compare field-by-field in order, matching how mongod compares them.
+
+The check ships on both the Python and Rust servers, pinned by the query parity
+suite; it reuses the shared byte-sortable value encoding as the equality key, so
+both engines agree bit-for-bit. (One documented gap: cross-type-equal numerics
+*nested inside* a document element — `[{a: 1}, {a: 1.0}]` — are treated as
+distinct on both servers; top-level scalar arrays are fully faithful.)
+
+#### Added
+
+- `$jsonSchema` `uniqueItems: true` — rejects arrays with duplicate elements
+  (value equality, cross-type-numeric aware for top-level scalars). `false` is a
+  no-op.
+
 ### Rust server: `secantusAdmin.restoreArchive`
 
 The Rust server now implements `secantusAdmin.restoreArchive`, completing the
