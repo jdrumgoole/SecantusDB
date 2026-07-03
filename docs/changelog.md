@@ -43,7 +43,31 @@ optimized output equals the scan output across many queries.
 - `$geoNear` with a `maxDistance` and a matching `2dsphere` / `2d` index now
   fetches candidates through the geo index (`aggregate._geo_near_index_filter`,
   lifted into the aggregate command's initial fetch) instead of a full collection
-  scan. Output is unchanged. (Rust-server mirror tracked in the backlog.)
+  scan. Output is unchanged. (Rust-server mirror below.)
+
+### Rust server: `$geoNear` rides the geo index for a bounded search
+
+The Rust server now mirrors the Python server's `$geoNear` index optimization. A
+leading `$geoNear` with a `maxDistance` and a matching `2d` / `2dsphere` index no
+longer scans the whole collection: the search is lifted into a conservative
+`$geoWithin` candidate fetch in the aggregate command's initial fetch (next to the
+existing leading-`$match` lift), and the `$geoNear` stage then re-applies the exact
+distance filter over just the candidates.
+
+The candidate radius is inflated by a negligible epsilon so the fetched set is a
+strict superset of the exact within-`maxDistance` set, keeping the output — docs,
+order, and attached `distanceField` — byte-for-byte identical to the brute-force
+path. An unbounded `$geoNear` still scans, and a mismatched index type falls back
+to the full scan. A regression test drives the Rust server directly, asserting the
+optimized output equals the scan output across many random queries.
+
+#### Changed
+
+- **Rust server:** `$geoNear` with a `maxDistance` and a matching geo index fetches
+  candidates through the index (`aggregate::geo_near_index_filter` in
+  `secantus-commands`) instead of a full collection scan. Output is unchanged.
+  Regression: `tests/test_rust_server_smoke.py::
+  test_geo_near_index_optimization_against_rust_server`.
 
 ### Rust server: bool-as-int range comparison in the query matcher
 

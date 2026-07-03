@@ -1,6 +1,6 @@
 [package]
 name = "secantus-commands"
-version = "0.5.3-beta.120"
+version = "0.5.3-beta.121"
 edition = "2021"
 description = "Pure-Rust command dispatch for the SecantusDB Rust server: the dispatch table, the error contract, and command handlers (handshake family in this slice)."
 license = "GPL-2.0-only"

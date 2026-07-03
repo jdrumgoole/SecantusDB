@@ -24,10 +24,14 @@
 //! synchronously and keeps no per-op registry. They're what makes a
 //! database-level `aggregate: 1` pipeline (which has no source collection) work.
 //!
-//! `$geoNear` runs here too (brute-force COLLSCAN: distance from each doc's `key`
-//! to `near` via `secantus_core::geo::point_distance`, min/max filter, ascending
-//! sort, `distanceField`/`includeLocs` attach) — `key` must be explicit
-//! (geo-index inference deferred).
+//! `$geoNear` runs here too (distance from each doc's `key` to `near` via
+//! `secantus_core::geo::point_distance`, min/max filter, ascending sort,
+//! `distanceField`/`includeLocs` attach; `key` is explicit or inferred from the
+//! lone geo index). A leading **bounded** `$geoNear` (with a `maxDistance` and a
+//! matching `2d`/`2dsphere` index) rides that index via a conservative
+//! `$geoWithin` candidate fetch (`geo_near_index_filter`) instead of a full
+//! COLLSCAN — the stage is kept and re-applies the exact distance filter, so the
+//! output is identical; only the fetched set shrinks. Mirrors the Python lift.
 //!
 //! **Deferred (documented so parity is honest):**
 //! * **`$graphLookup`** — recursive BFS traversal of a foreign collection
@@ -156,9 +160,21 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if first_stage_has_any(&pipeline, &["$collStats", "$indexStats", "$documents"]) {
                 (ns, Vec::new(), pipeline)
             } else {
-                // Lift a leading $match into the fetch filter; drop it from the
-                // pipeline so we don't apply it twice.
-                let (filter, rest) = lift_leading_match(&pipeline);
+                // Lift a leading $match into the fetch filter (dropping it from
+                // the pipeline). A leading bounded $geoNear instead rides its geo
+                // index via a conservative $geoWithin candidate fetch — the stage
+                // is kept (it re-applies the exact distance filter, so the output
+                // is identical; only the fetched set shrinks). Mirrors the Python
+                // `_geo_near_index_filter` lift.
+                let geonear_candidate = pipeline
+                    .first()
+                    .and_then(Bson::as_document)
+                    .and_then(|d| d.get("$geoNear"))
+                    .and_then(|spec| geo_near_index_filter(spec, &ctx.db_name, Some(c), storage));
+                let (filter, rest) = match geonear_candidate {
+                    Some(cand) => (cand, pipeline),
+                    None => lift_leading_match(&pipeline),
+                };
                 let bytes = storage
                     .find_collated(
                         &ctx.db_name,
@@ -835,16 +851,97 @@ fn bson_f64(b: &Bson) -> Option<f64> {
     }
 }
 
+/// Conservative `$geoWithin` candidate filter for a leading bounded `$geoNear`
+/// (Rust mirror of `aggregate._geo_near_index_filter`): `Some(filter)` when the
+/// stage has a numeric `maxDistance` and a matching `2d`/`2dsphere` index on
+/// `key`, else `None` (fall back to the full scan). The radius is inflated by a
+/// tiny epsilon so the candidate set is a strict superset of the exact
+/// within-`maxDistance` set — the `$geoNear` stage then re-applies the exact
+/// filter, so the output is byte-for-byte identical, only the fetched set shrinks.
+/// The candidate shape (`$centerSphere`/`$center`) must match the index type.
+fn geo_near_index_filter(
+    spec: &Bson,
+    db: &str,
+    coll: Option<&str>,
+    storage: &dyn crate::storage::Storage,
+) -> Option<Document> {
+    const EARTH_RADIUS_METERS: f64 = 6_378_100.0; // matches secantus_core::geo
+    let spec = spec.as_document()?;
+    let max_distance = match spec.get("maxDistance") {
+        Some(Bson::Int32(n)) => *n as f64,
+        Some(Bson::Int64(n)) => *n as f64,
+        Some(Bson::Double(d)) => *d,
+        _ => return None, // no numeric maxDistance -> no optimization
+    };
+    let coll = coll?;
+    let indexes = storage.list_indexes(db, coll).ok()?;
+    // Geo-indexed fields (field -> "2dsphere"/"2d"), in list_indexes order.
+    let mut geo_fields: Vec<(String, String)> = Vec::new();
+    for idx in &indexes {
+        if let Ok(key) = idx.get_document("key") {
+            for (field, v) in key {
+                if let Bson::String(t) = v {
+                    if (t == "2dsphere" || t == "2d") && !geo_fields.iter().any(|(f, _)| f == field)
+                    {
+                        geo_fields.push((field.clone(), t.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if geo_fields.is_empty() {
+        return None;
+    }
+    let key: String = match spec.get_str("key") {
+        Ok(k) if !k.is_empty() => k.to_string(),
+        _ => geo_fields[0].0.clone(), // infer: first geo index (mongod's behaviour)
+    };
+    let idx_type = geo_fields
+        .iter()
+        .find(|(f, _)| *f == key)
+        .map(|(_, t)| t.as_str())?;
+    // Parse `near` -> (spherical, cx, cy).
+    let (spherical, cx, cy) = match spec.get("near") {
+        Some(Bson::Document(d)) if d.get_str("type").ok() == Some("Point") => {
+            let coords = d.get_array("coordinates").ok()?;
+            if coords.len() != 2 {
+                return None;
+            }
+            (true, bson_f64(&coords[0])?, bson_f64(&coords[1])?)
+        }
+        Some(Bson::Array(a)) if a.len() == 2 => {
+            let sph = spec.get_bool("spherical").unwrap_or(false);
+            (sph, bson_f64(&a[0])?, bson_f64(&a[1])?)
+        }
+        _ => return None,
+    };
+    // The candidate shape must match the index type.
+    if spherical && idx_type != "2dsphere" {
+        return None;
+    }
+    if !spherical && idx_type != "2d" {
+        return None;
+    }
+    let radius = max_distance * (1.0 + 1e-9); // inflate -> guaranteed superset
+    let center = Bson::Array(vec![Bson::Double(cx), Bson::Double(cy)]);
+    let inner = if spherical {
+        doc! { "$centerSphere": Bson::Array(vec![center, Bson::Double(radius / EARTH_RADIUS_METERS)]) }
+    } else {
+        doc! { "$center": Bson::Array(vec![center, Bson::Double(radius)]) }
+    };
+    let mut filter = Document::new();
+    filter.insert(key, doc! { "$geoWithin": inner });
+    Some(filter)
+}
+
 /// `$geoNear` — proximity search with attached distances. Mirrors
 /// `aggregate._stage_geo_near`: optional `query` pre-filter, distance from each
 /// doc's `key` field to `near` (`secantus_core::geo::point_distance`), drop docs
 /// outside `[minDistance, maxDistance]`, attach the distance (× `distanceMultiplier`)
 /// under `distanceField`, optionally echo the raw geometry under `includeLocs`,
 /// and return ascending by distance. A GeoJSON Point `near` is spherical; a
-/// legacy `[x, y]` is planar unless `spherical: true`.
-///
-/// **Deferred:** `key`-inference from a geo index (we require an explicit `key`,
-/// erroring otherwise — real mongod infers it from the sole geo index).
+/// legacy `[x, y]` is planar unless `spherical: true`. `key` is explicit or
+/// inferred from the collection's lone geo index (`infer_geo_near_key`).
 fn apply_geo_near(
     spec: Option<&Bson>,
     docs: Vec<Document>,
