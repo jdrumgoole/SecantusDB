@@ -77,6 +77,42 @@ def test_no_foreign_keys():
     assert _fks("CREATE TABLE o (id bigint primary key, n int)") == []
 
 
+def test_column_level_named_constraint_keeps_name():
+    (fk,) = _fks(
+        "CREATE TABLE o (id bigint primary key, "
+        "uid bigint CONSTRAINT o_uid_ref REFERENCES users(id) ON DELETE CASCADE)"
+    )
+    assert fk.name == "o_uid_ref"  # explicit CONSTRAINT name, not the auto o_uid_fkey
+    assert fk.columns == ("uid",)
+    assert fk.ref_table == "users"
+    assert fk.on_delete == "CASCADE"
+
+
+def test_table_level_named_foreign_key_parsed():
+    (fk,) = _fks(
+        "CREATE TABLE o (id bigint primary key, uid bigint, "
+        "CONSTRAINT o_uid_ref FOREIGN KEY (uid) REFERENCES users(id) "
+        "ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)"
+    )
+    assert fk.name == "o_uid_ref"
+    assert fk.columns == ("uid",)
+    assert fk.ref_table == "users"
+    assert fk.ref_columns == ("id",)
+    assert fk.on_delete == "SET NULL"
+    assert fk.deferrable is True
+    assert fk.initially_deferred is True
+
+
+def test_table_level_named_composite_foreign_key_parsed():
+    (fk,) = _fks(
+        "CREATE TABLE o (a bigint, b bigint, "
+        "CONSTRAINT o_ab_fk FOREIGN KEY (a, b) REFERENCES users(x, y))"
+    )
+    assert fk.name == "o_ab_fk"
+    assert fk.columns == ("a", "b")
+    assert fk.ref_columns == ("x", "y")
+
+
 # -- catalog round-trip ----------------------------------------------------- #
 
 
@@ -89,6 +125,35 @@ def test_foreign_key_persists_in_catalog(storage, session):
     assert fk.name == "orders_user_id_fkey"
     assert fk.ref_table == "users"
     assert fk.on_delete == "CASCADE"
+
+
+def test_table_level_named_fk_enforces_and_reflects(session):
+    """A table-level ``CONSTRAINT n FOREIGN KEY`` enforces on write under its
+    explicit name and reflects through ``pg_constraint``."""
+    s = FakeStorage()
+    run_sql(s, DB, "CREATE TABLE users (id bigint primary key, name text)", session=session)
+    run_sql(s, DB, "INSERT INTO users (id, name) VALUES (1, 'a')", session=session)
+    run_sql(
+        s,
+        DB,
+        "CREATE TABLE orders (id bigint primary key, uid bigint, "
+        "CONSTRAINT orders_uid_ref FOREIGN KEY (uid) REFERENCES users(id))",
+        session=session,
+    )
+    # Enforced: a child pointing at a missing parent is rejected (23503).
+    from secantus.sql import errors
+
+    with pytest.raises(errors.SQLError) as ei:
+        run_sql(s, DB, "INSERT INTO orders (id, uid) VALUES (10, 99)", session=session)
+    assert ei.value.sqlstate == "23503"
+    run_sql(s, DB, "INSERT INTO orders (id, uid) VALUES (10, 1)", session=session)  # OK
+    # Reflected under the explicit name.
+    rows = q(
+        s,
+        session,
+        "SELECT conname FROM pg_catalog.pg_constraint WHERE contype = 'f'",
+    ).rows
+    assert ("orders_uid_ref",) in rows
 
 
 # -- information_schema reflection ------------------------------------------ #
