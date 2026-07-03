@@ -1260,15 +1260,18 @@ defer), and `$dateToString` (strftime-style formatting: `%Y`/`%m`/`%d`/`%H`/`%M`
 complete on both servers** (only date *formatting/parsing* edges below remain).
 **Remaining:**
 
-- [ ] **Expression operators (Rust server):** `$dateFromString` `format`
-  (strptime) and *named IANA* `timezone` zones on `$dateFromString` /
-  `$dateToString` still defer to the Python oracle — the Rust server errors on
-  them (named zones need a bundled tz database — `chrono-tz` or similar; strptime
-  needs a format-string parser). **Fixed-offset / `UTC` / `GMT` timezones now
-  compute natively on both ops** (0.5.3-beta.116). Also deferred: `$dateToString`
-  locale / `%z`/`%Z`/ISO-week directives (Python `strftime` handles those).
-  Fractional seconds stay deferred (BSON is millisecond-only). The Python server
-  already supports all of these.
+- [ ] **Expression operators (Rust server):** the remaining date-op defers to the
+  Python oracle (the Rust server errors on them): *named IANA* `timezone` zones on
+  `$dateFromString` / `$dateToString` (need a bundled tz database — `chrono-tz` or
+  similar); `$dateFromString` `format` directives *outside* the numeric subset
+  (`%z`/`%Z`/`%a`/`%b`/`%p`/… — need locale/text/offset handling), a `%j` combined
+  with `%m`/`%d`, and any input Python would reject; `$dateToString` `%z`/`%Z`/
+  ISO-week/locale directives. **Now native on the Rust server:** fixed-offset /
+  `UTC` / `GMT` timezones on both ops (0.5.3-beta.116), and `$dateFromString`
+  `format` (strptime) for the numeric-directive subset `%Y`/`%y`/`%m`/`%d`/`%H`/
+  `%M`/`%S`/`%j`/`%%` + literals + whitespace (0.5.3-beta.117, regex built from
+  CPython `_strptime` fragments). Fractional seconds stay deferred (BSON is
+  millisecond-only). The Python server already supports all of these.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
