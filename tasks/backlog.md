@@ -1802,9 +1802,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (INSERT / UPDATE / ON CONFLICT / MERGE). Reflection: `pg_type` (`typtype='e'`, oid base 65000),
   `pg_enum` (label rows with `enumsortorder`), and enum columns' `pg_attribute.atttypid` → the enum oid.
   Tests: `tests/test_sql_enum.py`. **Limitations:** only the ENUM form of `CREATE TYPE` (composite /
-  range / base types → `0A000`); no `ALTER TYPE … ADD VALUE` / `RENAME VALUE`; enum ordering in
-  `ORDER BY` is lexical on the label text, not the declared enum order (would need an enum-aware sort
-  key); enums live in the connection's db, not schema-scoped.
+  range / base types → `0A000`); enums live in the connection's db, not schema-scoped.
+- [ ] **`ALTER TYPE … ADD VALUE` + enum-aware ORDER BY landed** (b112): `ALTER TYPE name ADD VALUE
+  [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']` (arrives as a `Command`, parsed by
+  `engine._ALTER_TYPE_ADD_RE` → `Catalog.alter_enum_add_value`) inserts a new label into the enum's
+  ordered label list at the end or relative to a neighbour; duplicate → `42710` (unless `IF NOT EXISTS`),
+  missing type / neighbour → `42704`. A single-table `ORDER BY` on an enum column now sorts by the
+  **declared** label order: `planner._enum_order_map` records the label list on `SelectPlan.enum_orders`
+  (via the catalog on the pushdown `SubqueryCtx`), and `executor._order_key_fn` maps each value to its
+  ordinal. Tests: `tests/test_sql_alter_type.py` + a pg8000 wire round-trip. **Limitations:** `ALTER TYPE
+  RENAME VALUE` / composite-type alters → `0A000`; enum-aware ordering covers the single-table pushdown
+  path only — an enum sorted inside a JOIN / GROUP BY / evaluated pipeline (or a correlated SELECT) still
+  sorts lexically (the pipeline `$sort` and `plan_correlated_select` don't thread `enum_orders`).
 - [ ] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
   (`planner._generated_expr` stores the rendered SQL on `Column.generated`). Computed from the row's
   other columns on every write by `executor._apply_generated_columns` (evaluates the expr via

@@ -316,6 +316,26 @@ an enum column's `pg_attribute.atttypid` points at its enum type's oid — so
 SQLAlchemy and `psql`'s `\dT` reflect them. Only the `ENUM` form of `CREATE TYPE`
 is supported (composite / range / base types raise `0A000`).
 
+An enum can be extended with `ALTER TYPE … ADD VALUE`, optionally positioning the
+new label relative to an existing one. **`ORDER BY` on an enum column follows the
+enum's declared label order, not lexical text order** — so a label added in the
+middle sorts in its declared position:
+
+```sql
+ALTER TYPE mood ADD VALUE 'ecstatic';              -- appended
+ALTER TYPE mood ADD VALUE 'meh' AFTER 'ok';        -- positioned
+ALTER TYPE mood ADD VALUE IF NOT EXISTS 'ok';      -- no-op if present
+
+SELECT feeling FROM survey ORDER BY feeling;
+-- sad, ok, meh, happy, ecstatic  (declared order, not alphabetical)
+```
+
+Adding a label that already exists raises `42710` (unless `IF NOT EXISTS`); a
+missing type or `BEFORE`/`AFTER` neighbour raises `42704`. Other `ALTER TYPE`
+forms (e.g. `RENAME VALUE`) raise `0A000`. Enum-aware ordering applies to a
+single-table `ORDER BY`; an enum ordered inside a JOIN / GROUP BY pipeline still
+sorts lexically (see `tasks/backlog.md`).
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

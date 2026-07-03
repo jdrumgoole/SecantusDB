@@ -493,6 +493,42 @@ class Catalog:
     def drop_enum(self, db: str, name: str) -> bool:
         return self._storage.delete_matching(db, ENUM_COLLECTION, {"_id": name}) > 0
 
+    def alter_enum_add_value(
+        self,
+        db: str,
+        name: str,
+        label: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        if_not_exists: bool = False,
+    ) -> None:
+        """``ALTER TYPE name ADD VALUE 'label' [BEFORE/AFTER 'other']`` — insert a
+        new label into the enum's ordered label list. Position defaults to the end;
+        ``BEFORE`` / ``AFTER`` place it relative to an existing label. Raises
+        ``42704`` if the enum (or a referenced neighbour) doesn't exist, and
+        ``42710`` if the label already exists (unless ``if_not_exists``)."""
+        doc = self.get_enum(db, name)
+        if doc is None:
+            raise errors.SQLError("42704", f'type "{name}" does not exist')
+        labels = list(doc["labels"])
+        if label in labels:
+            if if_not_exists:
+                return
+            raise errors.SQLError("42710", f'enum label "{label}" already exists in type "{name}"')
+        if before is not None or after is not None:
+            neighbour = before if before is not None else after
+            if neighbour not in labels:
+                raise errors.SQLError(
+                    "42704", f'"{neighbour}" is not an existing enum label of type "{name}"'
+                )
+            idx = labels.index(neighbour)
+            labels.insert(idx if before is not None else idx + 1, label)
+        else:
+            labels.append(label)
+        self._storage.delete_matching(db, ENUM_COLLECTION, {"_id": name})
+        self._storage.insert(db, ENUM_COLLECTION, [{"_id": name, "enum": name, "labels": labels}])
+
     def list_enums(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ENUM_COLLECTION, {})
         return sorted(d["enum"] for d in docs)

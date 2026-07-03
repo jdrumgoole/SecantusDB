@@ -47,6 +47,32 @@ def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> No
     items.sort(key=functools.cmp_to_key(cmp))
 
 
+def _order_key_fn(
+    order: list[tuple[str, int, bool]], enum_orders: dict[str, list[str]] | None = None
+) -> Any:
+    """Build the ``key_of(doc)`` used by ``_pg_sort`` for a list of ORDER BY field
+    paths. An enum-typed order field maps its label value to the label's ordinal in
+    the enum's declared order (``enum_orders[field]``) so sorting follows the
+    declared order, not lexical text order — a NULL stays NULL for placement."""
+    ordinals: dict[str, dict[str, int]] = {}
+    if enum_orders:
+        ordinals = {
+            f: {lbl: i for i, lbl in enumerate(labels)} for f, labels in enum_orders.items()
+        }
+
+    def key_of(doc: Any) -> tuple:
+        out = []
+        for field_path, _, _ in order:
+            value = get_path(doc, field_path)
+            omap = ordinals.get(field_path)
+            if omap is not None and value is not None:
+                value = omap.get(value, len(omap))  # unknown label sorts last
+            out.append(value)
+        return tuple(out)
+
+    return key_of
+
+
 def execute_create_table(
     plan: planner.CreateTablePlan, catalog: Catalog, storage: Any, db: str
 ) -> SQLResult:
@@ -807,11 +833,8 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         # NULL placement follows Postgres, not Mongo sort order, so order in
         # Python; that also pulls OFFSET/LIMIT off the storage fetch.
         docs = storage.find_matching(db, plan.table.collection, plan.filter)
-        _pg_sort(
-            docs,
-            lambda d: tuple(get_path(d, f) for f, _, _ in plan.order),
-            [(direction, nf) for _, direction, nf in plan.order],
-        )
+        key_of = _order_key_fn(plan.order, plan.enum_orders)
+        _pg_sort(docs, key_of, [(direction, nf) for _, direction, nf in plan.order])
         if plan.skip:
             docs = docs[plan.skip :]
         if plan.limit:
