@@ -1734,6 +1734,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   the name through `_make_fk`; composite columns, `ON DELETE`/`ON UPDATE`, and `DEFERRABLE` all carry
   through. Enforcement + reflection + named `SET CONSTRAINTS` all light up under the real name. Tests:
   `tests/test_sql_foreign_keys.py`.
+- [ ] **SERIAL columns + sequences landed** (b102): `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` columns
+  (int + implicit NOT NULL + owned sequence `<table>_<col>_seq`), `CREATE SEQUENCE` / `DROP SEQUENCE`
+  (`START WITH` / `INCREMENT BY` / `MINVALUE` / `MAXVALUE` / `CYCLE`), `DEFAULT nextval('seq')`, and the
+  `nextval` / `currval` / `setval` / `lastval` functions. Sequence state persists in a per-db
+  `__sql_sequences__` collection (`Catalog.create_sequence` / `sequence_nextval` / `sequence_setval`);
+  `Column.sequence` marks a sequence-backed column, filled by `executor._assign_sequences` at INSERT
+  (planner leaves it unset — planning is storage-free). currval/lastval are per-session
+  (`Session.seq_values` / `record_sequence_value`, error 55000 before first nextval); the FROM-less
+  `SELECT nextval(...)` path routes through the scalar evaluator (`plan_constant_select` now takes
+  storage/catalog/db). Reflection: `pg_class` relkind='S', `information_schema.sequences`,
+  `pg_catalog.pg_sequence`. Overflow past MAXVALUE → 2200H (CYCLE wraps). Tests:
+  `tests/test_sql_sequences.py`. **Limitations:** `nextval` is a read-modify-write (not a single atomic
+  op) — a small duplicate-value window exists under truly concurrent `nextval` on the same sequence from
+  different connections (acceptable for the dev/test surface; the storage RLock keeps each write
+  atomic); no `ALTER SEQUENCE`, no `CACHE`, no `OWNED BY`, and an explicit value into a SERIAL column
+  doesn't bump the sequence (matches Postgres).
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);

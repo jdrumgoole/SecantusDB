@@ -233,7 +233,42 @@ INSERT INTO t (id) VALUES (1);        -- n -> 5, s -> 'hi'
 ```
 
 A non-literal default (e.g. `DEFAULT now()`) is accepted but not applied — the
-column reads `NULL` when omitted.
+column reads `NULL` when omitted. The exception is `DEFAULT nextval('seq')`,
+which draws from a sequence (see below).
+
+### Sequences and SERIAL
+
+`SERIAL` / `BIGSERIAL` / `SMALLSERIAL` columns are auto-incrementing integers. A
+SERIAL column is an integer column (`int4` / `int8` / `int2`), implicitly
+`NOT NULL`, backed by an owned sequence named `<table>_<column>_seq`; an `INSERT`
+that omits it fills in the sequence's next value:
+
+```sql
+CREATE TABLE users (id serial PRIMARY KEY, name text);
+INSERT INTO users (name) VALUES ('a'), ('b');    -- id -> 1, 2
+INSERT INTO users (id, name) VALUES (100, 'c');  -- explicit id; sequence untouched
+SELECT currval('users_id_seq');                  -- 2 (last value drawn this session)
+```
+
+Standalone sequences work too, with `START WITH` / `INCREMENT BY` / `MINVALUE` /
+`MAXVALUE` / `CYCLE`, and the `nextval` / `currval` / `setval` / `lastval`
+functions:
+
+```sql
+CREATE SEQUENCE order_seq START WITH 1000 INCREMENT BY 10;
+SELECT nextval('order_seq');            -- 1000
+SELECT nextval('order_seq');            -- 1010
+SELECT setval('order_seq', 5000);       -- next nextval -> 5010
+CREATE TABLE orders (id bigint DEFAULT nextval('order_seq') PRIMARY KEY, total int);
+```
+
+`nextval` advances and returns; `currval` / `lastval` read the last value drawn
+**in the current session** (error `55000` before the first `nextval`); `setval`
+sets the current value (`setval(seq, v, false)` makes the next `nextval` return
+`v` itself). A non-cycling sequence raises `2200H` when it passes `MAXVALUE`;
+`CYCLE` wraps to the other bound. Sequences reflect through
+`information_schema.sequences`, `pg_catalog.pg_sequence`, and `pg_class`
+(`relkind = 'S'`). A SERIAL column's owned sequence is dropped with the table.
 
 ### Foreign keys
 
@@ -1259,7 +1294,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` declared-not-enforced, literal column `DEFAULT`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] FOREIGN KEY`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`), `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, `ADD` CHECK/UNIQUE constraint, non-literal / expression DEFAULT, enforced constraints, views |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`), `CREATE`/`DROP SEQUENCE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), `ALTER SEQUENCE` |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
 | Auth | trust, SCRAM-SHA-256, TLS | channel binding, mTLS, SQL `CREATE ROLE` |

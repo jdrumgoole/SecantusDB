@@ -22,6 +22,7 @@ from secantus.sql import errors
 CATALOG_COLLECTION = "__sql_catalog__"
 VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
+SEQUENCE_COLLECTION = "__sql_sequences__"
 
 
 class _StorageLike(Protocol):
@@ -50,6 +51,10 @@ class Column:
     has_default: bool = False
     default: Any = None
     comment: str | None = None  # COMMENT ON COLUMN (reflected via pg_description)
+    # The sequence this column draws its default from (SERIAL columns and
+    # ``DEFAULT nextval('seq')``). When set and the column is omitted at INSERT,
+    # the executor assigns the sequence's next value.
+    sequence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +153,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "has_default": c.has_default,
                 "default": c.default,
                 "comment": c.comment,
+                "sequence": c.sequence,
             }
             for c in table.columns
         ],
@@ -194,6 +200,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 has_default=bool(c.get("has_default", False)),
                 default=c.get("default"),
                 comment=c.get("comment"),
+                sequence=c.get("sequence"),
             )
             for c in doc["columns"]
         ],
@@ -311,3 +318,100 @@ class Catalog:
     def list_matviews(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, MATVIEW_COLLECTION, {})
         return sorted(d["matview"] for d in docs)
+
+    # -- sequences ---------------------------------------------------------- #
+    # A sequence is a persisted monotonic counter (``CREATE SEQUENCE`` and the
+    # implicit sequence behind a SERIAL column). State lives in a per-db
+    # ``__sql_sequences__`` collection, one doc per sequence.
+
+    def create_sequence(
+        self,
+        db: str,
+        name: str,
+        *,
+        start: int = 1,
+        increment: int = 1,
+        minvalue: int | None = None,
+        maxvalue: int | None = None,
+        cycle: bool = False,
+        owned_by: str | None = None,
+    ) -> None:
+        """Create (or overwrite) a sequence's persisted state. ``owned_by`` is the
+        ``table.column`` a SERIAL/identity sequence belongs to (dropped with it)."""
+        self._storage.delete_matching(db, SEQUENCE_COLLECTION, {"_id": name})
+        self._storage.insert(
+            db,
+            SEQUENCE_COLLECTION,
+            [
+                {
+                    "_id": name,
+                    "sequence": name,
+                    "last_value": start,
+                    "start": start,
+                    "increment": increment,
+                    "min_value": minvalue,
+                    "max_value": maxvalue,
+                    "cycle": cycle,
+                    "is_called": False,
+                    "owned_by": owned_by,
+                }
+            ],
+        )
+
+    def get_sequence(self, db: str, name: str) -> dict[str, Any] | None:
+        docs = self._storage.find_matching(db, SEQUENCE_COLLECTION, {"_id": name}, limit=1)
+        return docs[0] if docs else None
+
+    def sequence_exists(self, db: str, name: str) -> bool:
+        return self.get_sequence(db, name) is not None
+
+    def drop_sequence(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, SEQUENCE_COLLECTION, {"_id": name}) > 0
+
+    def list_sequences(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, SEQUENCE_COLLECTION, {})
+        return sorted(d["sequence"] for d in docs)
+
+    def sequence_nextval(self, db: str, name: str) -> int:
+        """Advance ``name`` and return its new value. The first ``nextval`` returns
+        the sequence's ``start``; subsequent calls add ``increment`` (raising on
+        overflow past ``max_value`` unless ``cycle``, when it wraps to the bound)."""
+        doc = self.get_sequence(db, name)
+        if doc is None:
+            raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+        inc = int(doc.get("increment", 1))
+        if not doc.get("is_called", False):
+            # First draw returns the current value as-is — ``start`` for a fresh
+            # sequence, or the value a ``setval(…, false)`` planted.
+            value = int(doc["last_value"])
+        else:
+            value = int(doc["last_value"]) + inc
+            bound = doc.get("max_value") if inc > 0 else doc.get("min_value")
+            if bound is not None and (value > bound if inc > 0 else value < bound):
+                if not doc.get("cycle", False):
+                    raise errors.SQLError(
+                        "2200H", f'nextval: reached maximum value of sequence "{name}"'
+                    )
+                other = doc.get("min_value") if inc > 0 else doc.get("max_value")
+                value = other if other is not None else int(doc.get("start", 1))
+        self._storage.update_matching(
+            db,
+            SEQUENCE_COLLECTION,
+            {"_id": name},
+            {"$set": {"last_value": value, "is_called": True}},
+        )
+        return value
+
+    def sequence_setval(self, db: str, name: str, value: int, is_called: bool = True) -> int:
+        """Set ``name``'s current value. With ``is_called`` (default) the next
+        ``nextval`` returns ``value + increment``; without it, ``nextval`` returns
+        ``value`` itself (Postgres ``setval(seq, v, false)`` semantics)."""
+        if not self.sequence_exists(db, name):
+            raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+        self._storage.update_matching(
+            db,
+            SEQUENCE_COLLECTION,
+            {"_id": name},
+            {"$set": {"last_value": value, "is_called": is_called}},
+        )
+        return value

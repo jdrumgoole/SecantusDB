@@ -97,6 +97,34 @@ class Session:
     pending_deferred: list[Any] = field(default_factory=list)
     deferred_all: bool | None = None
     deferred_names: dict[str, bool] = field(default_factory=dict)
+    # Per-session sequence values for currval / lastval. ``seq_values`` maps a
+    # sequence name to the last value ``nextval`` returned *in this session*;
+    # ``last_seq_value`` is the most recent one (``lastval()``, sequence-agnostic).
+    seq_values: dict[str, int] = field(default_factory=dict)
+    last_seq_value: int | None = None
+
+    def record_sequence_value(self, name: str, value: int) -> None:
+        """Remember a ``nextval`` result for later ``currval(name)`` / ``lastval()``."""
+        self.seq_values[name] = value
+        self.last_seq_value = value
+
+    def currval(self, name: str) -> int:
+        """The last value ``nextval(name)`` returned in this session (error 55000 if
+        ``nextval`` hasn't been called for ``name`` yet)."""
+        if name not in self.seq_values:
+            from secantus.sql import errors
+
+            raise errors.SQLError(
+                "55000", f'currval of sequence "{name}" is not yet defined in this session'
+            )
+        return self.seq_values[name]
+
+    def lastval(self) -> int:
+        if self.last_seq_value is None:
+            from secantus.sql import errors
+
+            raise errors.SQLError("55000", "lastval is not yet defined in this session")
+        return self.last_seq_value
 
     def constraint_is_deferred(self, name: str, initially_deferred: bool) -> bool:
         """Whether constraint ``name`` is currently deferred, honouring SET
