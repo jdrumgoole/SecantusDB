@@ -72,6 +72,9 @@ class CreateIndexPlan:
     key_spec: dict[str, int]
     unique: bool
     if_not_exists: bool
+    # A partial-index predicate (``CREATE INDEX … WHERE …``) lowered to a Mongo
+    # filter, passed to storage as ``partialFilterExpression``. None = full index.
+    partial_filter: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1119,17 +1122,30 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
     for col in params.args["columns"]:
         ordered = col if isinstance(col, exp.Ordered) else None
         col_node = ordered.this if ordered is not None else col
+        if not isinstance(col_node, (exp.Column, exp.Identifier)):
+            # An expression index (``CREATE INDEX … ((a + b))``) can't map to a
+            # storage index over a stored field — faithful not-supported.
+            raise errors.feature_not_supported(
+                "expression indexes are not supported (index a stored column, or "
+                "add a GENERATED column and index that)"
+            )
         name = _column_name(col_node)
         direction = -1 if (ordered is not None and ordered.args.get("desc")) else 1
         key_spec[table.field_for(name)] = direction
     name_ident = index.this
     index_name = name_ident.name if name_ident is not None else _default_index_name(key_spec)
+    # A partial-index predicate (``WHERE …``) lowers to a Mongo filter.
+    where = params.args.get("where")
+    partial_filter = (
+        _expr_to_filter(where.this, table_resolver(table), None) if where is not None else None
+    )
     return CreateIndexPlan(
         collection=table.collection,
         name=index_name,
         key_spec=key_spec,
         unique=bool(stmt.args.get("unique")),
         if_not_exists=bool(stmt.args.get("exists")),
+        partial_filter=partial_filter,
     )
 
 

@@ -332,8 +332,12 @@ def execute_create_index(
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE INDEX")
         raise errors.SQLError("42P07", f'relation "{plan.name}" already exists')
-    options = {"unique": True} if plan.unique else None
-    storage.create_index(db, plan.collection, plan.name, plan.key_spec, options)
+    options: dict[str, Any] = {}
+    if plan.unique:
+        options["unique"] = True
+    if plan.partial_filter:
+        options["partialFilterExpression"] = plan.partial_filter
+    storage.create_index(db, plan.collection, plan.name, plan.key_spec, options or None)
     return SQLResult(command_tag="CREATE INDEX")
 
 
