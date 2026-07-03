@@ -391,6 +391,7 @@ def execute_insert(
             doc.setdefault("_id", bson.ObjectId())
     _validate_rows(plan.docs, plan.table, storage, db, session, catalog)
     _validate_unique_rows(plan.docs, plan.table, storage, db)
+    _validate_fk_child_rows(plan.docs, plan.table, storage, db, catalog)
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
         _raise_write_error(write_errors[0], plan.table)
@@ -990,7 +991,13 @@ def _validate_update_post_images(
     from secantus.update import apply_update
 
     table = plan.table
-    needs = table.check_constraints or table.unique_constraints or _has_not_null(table)
+    needs = (
+        table.check_constraints
+        or table.unique_constraints
+        or table.foreign_keys
+        or _has_not_null(table)
+        or (catalog is not None and _referencing_fks(catalog, db, table.name))
+    )
     if getattr(table, "reflected", False) or not needs:
         return
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
@@ -1001,12 +1008,177 @@ def _validate_update_post_images(
     _validate_unique_rows(
         post_images, table, storage, db, exclude_ids=frozenset(d["_id"] for d in matched)
     )
+    _validate_fk_child_rows(post_images, table, storage, db, catalog)
+    _enforce_fk_on_parent_update(matched, post_images, table, storage, db, catalog)
 
 
-def execute_delete(plan: planner.DeletePlan, storage: Any, db: str) -> SQLResult:
+# --------------------------------------------------------------------------- #
+# Foreign-key enforcement
+# --------------------------------------------------------------------------- #
+
+
+def _fk_ref_columns(fk: Any, parent: Any) -> list[str]:
+    """The parent columns a FK targets — its explicit ``ref_columns`` or, when the
+    reference had no column list (``REFERENCES t``), the parent's PRIMARY KEY."""
+    if fk.ref_columns:
+        return list(fk.ref_columns)
+    return [parent.pk_column.name] if parent is not None and parent.pk_column else []
+
+
+def _parent_probe(fk: Any, parent: Any, values: list[Any]) -> dict[str, Any]:
+    ref_cols = _fk_ref_columns(fk, parent)
+    return {parent.field_for(rc): v for rc, v in zip(ref_cols, values, strict=False)}
+
+
+def _validate_fk_child_rows(
+    docs: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any
+) -> None:
+    """Referential integrity on the child side: every INSERT/UPDATE row whose FK
+    columns are all non-NULL must have a matching parent row (23503). MATCH SIMPLE
+    — a NULL in any FK column exempts the row."""
+    if catalog is None or getattr(table, "reflected", False) or not table.foreign_keys:
+        return
+    for doc in docs:
+        for fk in table.foreign_keys:
+            fields = [table.field_for(c) for c in fk.columns]
+            values = [get_path(doc, f) for f in fields]
+            if any(v is None for v in values):
+                continue
+            parent = catalog.get(db, fk.ref_table)
+            if parent is None:
+                continue  # parent table not declared — can't check
+            probe = _parent_probe(fk, parent, values)
+            if not storage.find_matching(db, parent.collection, probe, limit=1):
+                raise errors.foreign_key_violation(
+                    f'insert or update on table "{table.name}" violates foreign key '
+                    f'constraint "{fk.name}"'
+                )
+
+
+def _referencing_fks(catalog: Any, db: str, parent_name: str) -> list[tuple[Any, Any]]:
+    """Every ``(child_table, fk)`` whose FK targets ``parent_name`` — the reverse
+    of a table's declared foreign keys, scanned across the catalog."""
+    out: list[tuple[Any, Any]] = []
+    for tname in catalog.list_tables(db):
+        child = catalog.get(db, tname)
+        if child is None:
+            continue
+        for fk in child.foreign_keys:
+            if fk.ref_table == parent_name:
+                out.append((child, fk))
+    return out
+
+
+def _child_match_filter(child: Any, fk: Any, parent: Any, parent_row: dict[str, Any]) -> Any:
+    """A storage filter selecting the child rows that reference ``parent_row``, or
+    None when the parent's referenced columns are NULL (nothing references NULL)."""
+    ref_cols = _fk_ref_columns(fk, parent)
+    filt: dict[str, Any] = {}
+    for child_col, ref_col in zip(fk.columns, ref_cols, strict=False):
+        val = get_path(parent_row, parent.field_for(ref_col))
+        if val is None:
+            return None
+        filt[child.field_for(child_col)] = val
+    return filt
+
+
+def _enforce_fk_on_parent_delete(
+    victims: list[dict[str, Any]], parent: Any, storage: Any, db: str, catalog: Any, _depth: int = 0
+) -> None:
+    """Apply referential actions when parent rows are deleted: RESTRICT / NO ACTION
+    reject if any child references them (23503); CASCADE deletes the children
+    (recursively); SET NULL / SET DEFAULT clears the child FK columns."""
+    if catalog is None or _depth > 20:
+        return
+    for child, fk in _referencing_fks(catalog, db, parent.name):
+        for parent_row in victims:
+            filt = _child_match_filter(child, fk, parent, parent_row)
+            if filt is None:
+                continue
+            children = storage.find_matching(db, child.collection, filt)
+            if not children:
+                continue
+            action = (fk.on_delete or "NO ACTION").upper()
+            if action in ("NO ACTION", "RESTRICT"):
+                raise errors.foreign_key_violation(
+                    f'update or delete on table "{parent.name}" violates foreign key '
+                    f'constraint "{fk.name}" on table "{child.name}"'
+                )
+            if action == "CASCADE":
+                _enforce_fk_on_parent_delete(children, child, storage, db, catalog, _depth + 1)
+                storage.delete_matching(db, child.collection, filt)
+            else:  # SET NULL / SET DEFAULT — clear the child's FK columns
+                clear = {child.field_for(c): _fk_clear_value(child, c, action) for c in fk.columns}
+                storage.update_matching(db, child.collection, filt, {"$set": clear}, multi=True)
+
+
+def _fk_clear_value(child: Any, col_name: str, action: str) -> Any:
+    if action == "SET DEFAULT":
+        col = child.column(col_name)
+        if col is not None and col.has_default:
+            return col.default
+    return None
+
+
+def _enforce_fk_on_parent_update(
+    matched: list[dict[str, Any]],
+    post_images: list[dict[str, Any]],
+    parent: Any,
+    storage: Any,
+    db: str,
+    catalog: Any,
+) -> None:
+    """Apply referential actions when an UPDATE changes a parent's referenced
+    columns: RESTRICT / NO ACTION reject (23503); CASCADE rewrites the children's
+    FK to the new value; SET NULL / SET DEFAULT clears them. Usually a no-op —
+    references target the PK (``_id``), which isn't updatable."""
+    if catalog is None:
+        return
+    refs = _referencing_fks(catalog, db, parent.name)
+    if not refs:
+        return
+    for child, fk in refs:
+        ref_cols = _fk_ref_columns(fk, parent)
+        for pre, post in zip(matched, post_images, strict=False):
+            old = [get_path(pre, parent.field_for(rc)) for rc in ref_cols]
+            new = [get_path(post, parent.field_for(rc)) for rc in ref_cols]
+            if old == new or any(v is None for v in old):
+                continue
+            filt = {child.field_for(c): v for c, v in zip(fk.columns, old, strict=False)}
+            if not storage.find_matching(db, child.collection, filt, limit=1):
+                continue
+            action = (fk.on_update or "NO ACTION").upper()
+            if action in ("NO ACTION", "RESTRICT"):
+                raise errors.foreign_key_violation(
+                    f'update or delete on table "{parent.name}" violates foreign key '
+                    f'constraint "{fk.name}" on table "{child.name}"'
+                )
+            if action == "CASCADE":
+                new_set = {child.field_for(c): v for c, v in zip(fk.columns, new, strict=False)}
+                storage.update_matching(db, child.collection, filt, {"$set": new_set}, multi=True)
+            else:
+                clear = {child.field_for(c): _fk_clear_value(child, c, action) for c in fk.columns}
+                storage.update_matching(db, child.collection, filt, {"$set": clear}, multi=True)
+
+
+def execute_delete(
+    plan: planner.DeletePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
+) -> SQLResult:
     coll = plan.table.collection
-    # RETURNING yields the deleted rows, so snapshot them before the delete.
-    victims = storage.find_matching(db, coll, plan.filter) if plan.returning is not None else []
+    # RETURNING yields the deleted rows, so snapshot them before the delete. FK
+    # enforcement also needs the victims, so read them whenever either applies.
+    enforce_fk = (
+        catalog is not None
+        and not getattr(plan.table, "reflected", False)
+        and bool(_referencing_fks(catalog, db, plan.table.name))
+    )
+    victims = (
+        storage.find_matching(db, coll, plan.filter)
+        if (plan.returning is not None or enforce_fk)
+        else []
+    )
+    if enforce_fk:
+        _enforce_fk_on_parent_delete(victims, plan.table, storage, db, catalog)
     n = storage.delete_matching(db, coll, plan.filter)
     if plan.returning is not None:
         return _returning_result(victims, plan.returning, f"DELETE {n}", n, plan.table, storage, db)

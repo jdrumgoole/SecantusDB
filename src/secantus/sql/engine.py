@@ -742,7 +742,9 @@ def _run_statement(
 
     if isinstance(stmt, exp.Delete):
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
-        return executor.execute_delete(planner.plan_delete(stmt, table), storage, db)
+        return executor.execute_delete(
+            planner.plan_delete(stmt, table), storage, db, catalog, session
+        )
 
     if isinstance(stmt, exp.Merge):
         return _run_merge(stmt, storage, db, catalog, session)
