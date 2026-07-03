@@ -40,6 +40,31 @@ includes booleans — 0 divergences).
   `secantus-core` query matcher (numeric compare vs int / long / double; no match
   vs any other type), matching the Python oracle's `<` semantics.
 
+### Rust server: `getLog` returns a real in-memory log
+
+The Rust server's `getLog` was a stub returning an empty array; it now surfaces a
+real bounded in-memory log ring buffer (`secantus_commands::logbuf::LogBuffer`,
+5000-entry cap, the Rust port of `logbuf.py`). The server records a startup line
+and a `"connection accepted"` NETWORK line per connection, and `getLog: "global"`
+returns them as mongod-shaped pre-formatted strings
+(`"<ts> <level> <component> <msg>"`) with `totalLinesWritten`. The admin
+console's Logs page now shows activity against a Rust target instead of an empty
+table. Slice 5 of the Rust admin-command parity work (issue #163).
+
+This resolves the last genuine gap in #163: with `getLog` real, `killOp` and the
+role grant/revoke + native backup/restore/prune commands all landed, and the
+`profile` command was already at parity with the Python server (both persist the
+level / slowms / sampleRate config; neither captures slow ops — out of scope for
+the surrogate). `currentOp` / `serverStatus` remain intentionally minimal.
+
+#### Added
+
+- **Rust server:** `secantus_commands::logbuf::LogBuffer` + a `getLog`-backed log
+  ring buffer wired through the server (connection-accept + startup lines) and a
+  `logs` handle on `CommandContext`. Regressions: `crates/secantus-commands` unit
+  tests (buffer append/tail/capacity; `getLog` formatting; empty without a
+  buffer) and `tests/test_rust_server_smoke.py::test_get_log_returns_connection_lines`.
+
 ### Rust server: `$min` / `$max` / `$addToSet` / `$pull` update operators
 
 The Rust server now applies four more update operators natively instead of

@@ -43,6 +43,7 @@ pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
 pub mod handshake;
+pub mod logbuf;
 pub mod rbac;
 pub mod roles;
 pub mod storage;
@@ -131,6 +132,10 @@ pub struct CommandContext {
     /// by its `conn_id`. `None` until the server wires one in (and in unit-test
     /// contexts).
     pub conn_killer: Option<Arc<dyn ConnectionKiller>>,
+    /// The server's in-memory log ring buffer, read by `getLog`. `None` until the
+    /// server wires one in (and in unit-test contexts) — `getLog` then reports an
+    /// empty log.
+    pub logs: Option<Arc<logbuf::LogBuffer>>,
 }
 
 impl CommandContext {
@@ -155,6 +160,7 @@ impl CommandContext {
             failpoints: None,
             close_connection: false,
             conn_killer: None,
+            logs: None,
         }
     }
 
@@ -191,6 +197,13 @@ impl CommandContext {
     /// uses it to close a connection by its `conn_id`.
     pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
         self.conn_killer = Some(conn_killer);
+        self
+    }
+
+    /// Attach the server's in-memory log ring buffer (builder-style). `getLog`
+    /// reads it.
+    pub fn with_logs(mut self, logs: Arc<logbuf::LogBuffer>) -> Self {
+        self.logs = Some(logs);
         self
     }
 
