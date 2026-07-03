@@ -235,12 +235,12 @@ INSERT INTO t (id) VALUES (1);        -- n -> 5, s -> 'hi'
 A non-literal default (e.g. `DEFAULT now()`) is accepted but not applied — the
 column reads `NULL` when omitted.
 
-### Foreign keys (declared, not enforced)
+### Foreign keys
 
-Column-level `REFERENCES` and table-level `FOREIGN KEY` are recorded in the
-catalog and surfaced through reflection, so ORMs and migration tools see the
-relationships. SecantusDB does **not** enforce referential integrity on write —
-a foreign key here is a schema-shape record, not a runtime guard.
+Column-level `REFERENCES` and table-level `FOREIGN KEY` — named or unnamed — are
+recorded in the catalog, enforced on write (see "Constraint enforcement" above),
+and surfaced through reflection so ORMs and migration tools see the
+relationships.
 
 ```sql
 CREATE TABLE users (id bigint PRIMARY KEY, name text);
@@ -254,9 +254,14 @@ CREATE TABLE orders (
 CREATE TABLE items (
     id       bigint PRIMARY KEY,
     order_id bigint,
-    FOREIGN KEY (order_id) REFERENCES orders(id)             -- table-level
+    CONSTRAINT items_order_fk FOREIGN KEY (order_id)          -- table-level, named
+        REFERENCES orders(id)
 );
 ```
+
+A `CONSTRAINT name` before a column-level `REFERENCES` or a table-level
+`FOREIGN KEY` sets the constraint's name (used for reflection and
+`SET CONSTRAINTS`); without one it defaults to `<table>_<col>_fkey`.
 
 Foreign keys reflect through the standard catalogs:
 `information_schema.referential_constraints` / `.table_constraints` /
@@ -272,8 +277,10 @@ insp.get_foreign_keys("orders")
 #   'options': {'ondelete': 'CASCADE'}, ...}]
 ```
 
-`ON DELETE` / `ON UPDATE` actions are recorded and reflected but never acted on.
-`REFERENCES t` with no column list targets `t`'s primary key. A foreign key can
+`ON DELETE` / `ON UPDATE` actions (`NO ACTION` / `RESTRICT` / `CASCADE` /
+`SET NULL` / `SET DEFAULT`) fire on a parent `DELETE` / `UPDATE` (see "Constraint
+enforcement" above). `REFERENCES t` with no column list targets `t`'s primary
+key. A foreign key can
 also be added after the fact with `ALTER TABLE … ADD [CONSTRAINT name] FOREIGN
 KEY (…) REFERENCES …`.
 

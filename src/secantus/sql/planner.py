@@ -885,22 +885,40 @@ def _make_fk(
     )
 
 
+def _fk_from_node(node: exp.ForeignKey, table_name: str, name: str | None) -> ForeignKey | None:
+    """Build a ``ForeignKey`` from an ``exp.ForeignKey`` node (its ``expressions``
+    are the local columns, ``reference`` the target), or None if it carries no
+    reference (a bare ``FOREIGN KEY`` with no ``REFERENCES`` is malformed)."""
+    ref = node.args.get("reference")
+    if ref is None:
+        return None
+    cols = tuple(_column_name(c) for c in node.args.get("expressions") or [])
+    return _make_fk(table_name, cols, ref, name)
+
+
 def _extract_foreign_keys(schema: exp.Schema, table_name: str) -> list[ForeignKey]:
-    """Collect declared foreign keys from a ``CREATE TABLE`` column list — both
-    column-level ``col type REFERENCES t(c)`` and table-level ``FOREIGN KEY (c)
-    REFERENCES t(c)``."""
+    """Collect declared foreign keys from a ``CREATE TABLE`` column list — column-
+    level ``col type [CONSTRAINT n] REFERENCES t(c)``, table-level unnamed
+    ``FOREIGN KEY (c) REFERENCES t(c)``, and table-level named
+    ``CONSTRAINT n FOREIGN KEY (c) REFERENCES t(c)``."""
     fks: list[ForeignKey] = []
     for coldef in schema.expressions:
-        if isinstance(coldef, exp.ForeignKey):  # table-level
-            cols = tuple(_column_name(c) for c in coldef.args.get("expressions") or [])
-            ref = coldef.args.get("reference")
-            if ref is not None:
-                fks.append(_make_fk(table_name, cols, ref))
-            continue
-        if isinstance(coldef, exp.ColumnDef):  # column-level REFERENCES
+        if isinstance(coldef, exp.ForeignKey):  # table-level unnamed
+            fk = _fk_from_node(coldef, table_name, None)
+            if fk is not None:
+                fks.append(fk)
+        elif isinstance(coldef, exp.Constraint):  # CONSTRAINT n FOREIGN KEY (...) ...
+            name = coldef.this.name if coldef.this else None
+            for inner in coldef.args.get("expressions") or []:
+                if isinstance(inner, exp.ForeignKey):
+                    fk = _fk_from_node(inner, table_name, name)
+                    if fk is not None:
+                        fks.append(fk)
+        elif isinstance(coldef, exp.ColumnDef):  # column-level [CONSTRAINT n] REFERENCES
             for con in coldef.args.get("constraints") or []:
                 if isinstance(con.kind, exp.Reference):
-                    fks.append(_make_fk(table_name, (coldef.name,), con.kind))
+                    cname = con.this.name if con.args.get("this") else None
+                    fks.append(_make_fk(table_name, (coldef.name,), con.kind, cname))
     return fks
 
 

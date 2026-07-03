@@ -1720,10 +1720,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   aborts + re-raises `23505` / `23503` on a surviving violation) or at `SET CONSTRAINTS … IMMEDIATE`
   (`engine._set_constraints_command`; supports `ALL` and named forms, `DEFERRED` / `IMMEDIATE`). Session
   deferral state (`deferred_all` / `deferred_names` / `pending_deferred`) resets at end of transaction.
-  **Limitations:** re-check is a whole-constraint rescan (not per-row); a table-level `CONSTRAINT name
-  FOREIGN KEY (…)` still isn't parsed into a FK at all, and a column-level `CONSTRAINT name REFERENCES`
-  drops the explicit name (auto-named `<table>_<col>_fkey`) — a pre-existing planner gap, so named
-  `SET CONSTRAINTS` must use the generated name for those.
+  **Limitations:** re-check is a whole-constraint rescan (not per-row). (The named-FK parsing gap this
+  note used to describe was fixed in b101 — see "Named FK constraint parsing" below.)
+- [ ] **Named FK constraint parsing landed** (b101): `planner._extract_foreign_keys` now handles a
+  table-level `CONSTRAINT n FOREIGN KEY (cols) REFERENCES …` (sqlglot wraps it in an `exp.Constraint`
+  whose `expressions` hold the `exp.ForeignKey`) — previously not parsed into a FK **at all** — and a
+  column-level `col … CONSTRAINT n REFERENCES …` now keeps the explicit name (read from the
+  `ColumnConstraint`'s `this`) instead of falling back to the auto `<table>_<col>_fkey`. Shared
+  `_fk_from_node` builds the `ForeignKey` from an `exp.ForeignKey` node (columns + reference), threading
+  the name through `_make_fk`; composite columns, `ON DELETE`/`ON UPDATE`, and `DEFERRABLE` all carry
+  through. Enforcement + reflection + named `SET CONSTRAINTS` all light up under the real name. Tests:
+  `tests/test_sql_foreign_keys.py`.
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
