@@ -1700,8 +1700,9 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `scalar._call_func`). SQLAlchemy's `Inspector.get_foreign_keys()` + full `MetaData.reflect()` resolve
   the relationship end to end. **Not enforced:** no referential-integrity check on insert/update/delete
   — this is a schema-shape record only. Adding a FK after the fact via `ALTER TABLE … ADD [CONSTRAINT
-  name] FOREIGN KEY` landed in b85 (see below). **Limitations:** FK actions never fire;
-  `MATCH`/`DEFERRABLE` render as the defaults.
+  name] FOREIGN KEY` landed in b85 (see below). **Limitations:** `MATCH` renders as the default.
+  (FK enforcement + referential actions landed in later slices; `DEFERRABLE` is captured and
+  honoured — see "Constraint enforcement" and "Deferred constraints" below.)
 - [ ] **`ALTER TABLE … ADD [CONSTRAINT name] FOREIGN KEY` landed** (b85): parsed as `exp.AddConstraint`
   (a bare `ForeignKey` or a named `Constraint` wrapping one) in `executor._apply_alter_action`, which
   appends a `catalog.ForeignKey` (via `planner._make_fk`, now taking an optional constraint name) to
@@ -1709,6 +1710,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`information_schema.referential_constraints`, `pg_constraint` contype='f', SQLAlchemy
   `get_foreign_keys()`). Non-FK `ADD CONSTRAINT` (CHECK / UNIQUE) → `feature_not_supported`. Still not
   enforced.
+- [ ] **Deferred constraints landed** (b100): `UNIQUE` / `FOREIGN KEY` declared `DEFERRABLE` /
+  `INITIALLY DEFERRED` are parsed (`planner._deferrable_flags`), stored on `catalog.UniqueConstraint` /
+  `ForeignKey` (`deferrable` / `initially_deferred`), and reflected via `pg_constraint.condeferrable` /
+  `condeferred` and `information_schema.table_constraints.is_deferrable` / `initially_deferred`. When a
+  deferrable constraint is currently deferred inside a transaction, `executor._maybe_defer` records a
+  pending `(kind, table, name)` re-check on the `Session` instead of raising; `executor.flush_deferred`
+  re-validates the whole constraint against the in-txn state at `COMMIT` (`engine._commit_txn`, which
+  aborts + re-raises `23505` / `23503` on a surviving violation) or at `SET CONSTRAINTS … IMMEDIATE`
+  (`engine._set_constraints_command`; supports `ALL` and named forms, `DEFERRED` / `IMMEDIATE`). Session
+  deferral state (`deferred_all` / `deferred_names` / `pending_deferred`) resets at end of transaction.
+  **Limitations:** re-check is a whole-constraint rescan (not per-row); a table-level `CONSTRAINT name
+  FOREIGN KEY (…)` still isn't parsed into a FK at all, and a column-level `CONSTRAINT name REFERENCES`
+  drops the explicit name (auto-named `<table>_<col>_fkey`) — a pre-existing planner gap, so named
+  `SET CONSTRAINTS` must use the generated name for those.
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);

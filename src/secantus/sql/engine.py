@@ -51,7 +51,7 @@ def _dispatch(
     if isinstance(stmt, exp.Transaction):
         return _begin_txn(storage, session)
     if isinstance(stmt, exp.Commit):
-        return _commit_txn(storage, session)
+        return _commit_txn(storage, db, catalog, session)
     if isinstance(stmt, exp.Rollback):
         if stmt.args.get("savepoint") is not None:
             # ROLLBACK TO SAVEPOINT recovers the block from an error, so it runs
@@ -89,15 +89,23 @@ def _begin_txn(storage: Any, session: Session) -> SQLResult:
         session.txn_handle = storage.begin_user_transaction()
         session.txn_failed = False
         session.savepoints = []
+        session.reset_deferred()
     return SQLResult(command_tag="BEGIN")
 
 
-def _commit_txn(storage: Any, session: Session) -> SQLResult:
+def _commit_txn(storage: Any, db: str, catalog: Catalog, session: Session) -> SQLResult:
     handle, failed = session.txn_handle, session.txn_failed
-    session.txn_handle = None
-    session.txn_failed = False
-    session.savepoints = []
-    _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
+    # Deferred constraints re-check against the in-transaction state before the
+    # commit lands; a surviving violation aborts the block (and re-raises).
+    if handle is not None and not failed and session.pending_deferred:
+        try:
+            with storage.use_user_transaction(handle):
+                executor.flush_deferred(session, storage, db, catalog)
+        except Exception:
+            storage.abort_user_transaction(handle)
+            _end_txn_state(session)
+            raise
+    _end_txn_state(session)
     if handle is None:
         return SQLResult(command_tag="COMMIT")  # no open block — Postgres warns, returns COMMIT
     if failed:
@@ -108,12 +116,18 @@ def _commit_txn(storage: Any, session: Session) -> SQLResult:
     return SQLResult(command_tag="COMMIT")
 
 
-def _rollback_txn(storage: Any, session: Session) -> SQLResult:
-    handle = session.txn_handle
+def _end_txn_state(session: Session) -> None:
+    """Clear all per-transaction session state at the end of a block."""
     session.txn_handle = None
     session.txn_failed = False
     session.savepoints = []
+    session.reset_deferred()
     _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
+
+
+def _rollback_txn(storage: Any, session: Session) -> SQLResult:
+    handle = session.txn_handle
+    _end_txn_state(session)
     if handle is not None:
         storage.abort_user_transaction(handle)
     return SQLResult(command_tag="ROLLBACK")
@@ -774,6 +788,8 @@ def _run_statement(
             return _create_matview_command(stmt, storage, db, catalog, session)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
             return _alter_matview_command(stmt, storage, db, catalog, session)
+        if verb == "SET" and _command_text(stmt).lstrip().upper().startswith("CONSTRAINTS"):
+            return _set_constraints_command(stmt, storage, db, catalog, session)
         return _run_command(stmt, session)
 
     # CLOSE cursor / CLOSE ALL parses as a bare Alias (``CLOSE AS name``).
@@ -1000,6 +1016,34 @@ _MATVIEW_ALTER_RE = re.compile(
 def _command_text(stmt: exp.Command) -> str:
     arg = stmt.expression
     return arg.this if isinstance(arg, exp.Literal) else str(arg or "")
+
+
+_SET_CONSTRAINTS_RE = re.compile(r"(?is)^\s*CONSTRAINTS\s+(.+?)\s+(DEFERRED|IMMEDIATE)\s*;?\s*$")
+
+
+def _set_constraints_command(
+    stmt: exp.Command, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }`` — set the
+    per-session deferral mode. Switching to IMMEDIATE re-checks the affected
+    deferred constraints right away (a surviving violation raises, poisoning the
+    block, as Postgres does)."""
+    m = _SET_CONSTRAINTS_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported SET CONSTRAINTS: {stmt.sql()}")
+    targets, mode = m.group(1).strip(), m.group(2).upper()
+    deferred = mode == "DEFERRED"
+    if targets.upper() == "ALL":
+        session.deferred_all = deferred
+        if not deferred and session.pending_deferred:
+            executor.flush_deferred(session, storage, db, catalog)
+    else:
+        names = {t.strip().strip('"') for t in targets.split(",") if t.strip()}
+        for name in names:
+            session.deferred_names[name] = deferred
+        if not deferred and session.pending_deferred:
+            executor.flush_deferred(session, storage, db, catalog, names=names)
+    return SQLResult(command_tag="SET CONSTRAINTS")
 
 
 def _create_matview_command(
