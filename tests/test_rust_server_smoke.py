@@ -452,3 +452,58 @@ def test_secantus_admin_prune_commands(tmp_path) -> None:
         assert isinstance(r2["pruned"], int) and r2["pruned"] >= 0
     finally:
         srv.stop()
+
+
+def test_secantus_admin_restore_archive_roundtrips(tmp_path) -> None:
+    """backupArchive -> restoreArchive round-trips data through a fresh dir, and
+    the restored directory is a startable WT home (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    archive = str(tmp_path / "backup.tar.gz")
+    target = str(tmp_path / "restored")
+    try:
+        client = _client(srv)
+        client["t"]["c"].insert_many([{"_id": i, "x": i * 2} for i in range(5)])
+        r = client.admin.command({"secantusAdmin.backupArchive": 1, "outputPath": archive})
+        assert r["ok"] == 1.0
+
+        rr = client.admin.command(
+            {"secantusAdmin.restoreArchive": 1, "archivePath": archive, "targetDir": target}
+        )
+        assert rr["ok"] == 1.0
+        assert rr["fileCount"] > 0
+        assert rr["targetDir"] and rr["archive"]
+    finally:
+        srv.stop()
+
+    # The restored directory is a startable WT home carrying the data.
+    srv2 = _server.RustServer(target, 0)
+    try:
+        c2 = _client(srv2)["t"]["c"]
+        assert sorted(d["_id"] for d in c2.find({})) == [0, 1, 2, 3, 4]
+        assert c2.find_one({"_id": 3})["x"] == 6
+    finally:
+        srv2.stop()
+
+
+def test_restore_archive_rejects_nonempty_target(tmp_path) -> None:
+    """A non-empty target without allowExisting is IllegalOperation(20)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    archive = str(tmp_path / "b.tar.gz")
+    target = tmp_path / "restored"
+    target.mkdir()
+    (target / "sentinel").write_text("x")
+    try:
+        client = _client(srv)
+        client["t"]["c"].insert_one({"_id": 1})
+        client.admin.command({"secantusAdmin.backupArchive": 1, "outputPath": archive})
+        with pytest.raises(pymongo.errors.OperationFailure) as ei:
+            client.admin.command(
+                {
+                    "secantusAdmin.restoreArchive": 1,
+                    "archivePath": archive,
+                    "targetDir": str(target),
+                }
+            )
+        assert ei.value.code == 20
+    finally:
+        srv.stop()
