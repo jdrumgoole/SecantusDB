@@ -210,6 +210,19 @@ def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
     return text[begin:]
 
 
+def _eval_array_size(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    # array_length(arr, dim) / cardinality(arr). Arrays are stored as native BSON
+    # lists (one level deep here), so only dimension 1 has a length; any other
+    # dimension is NULL, matching Postgres for a 1-D array.
+    v = evaluate(node.this, scope, ctx)
+    if not isinstance(v, (list, tuple)):
+        return None
+    dim_node = node.args.get("expression")
+    if dim_node is not None and int(evaluate(dim_node, scope, ctx)) != 1:
+        return None
+    return len(v)
+
+
 def _eval_nullif(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     a, b = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
     return None if a == b else a
@@ -257,6 +270,7 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.Concat: _eval_concat,
     exp.Greatest: _extremum(max),
     exp.Least: _extremum(min),
+    exp.ArraySize: _eval_array_size,
 }
 
 
@@ -390,6 +404,13 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         v = args[0] if args else None
         if not isinstance(v, list):
             raise errors.SQLError("22023", "cannot get array length of a non-array")
+        return len(v)
+    if name in ("array_length", "cardinality"):
+        v = args[0] if args else None
+        if not isinstance(v, (list, tuple)):
+            return None
+        if name == "array_length" and len(args) > 1 and args[1] != 1:
+            return None
         return len(v)
     if name in ("jsonb_typeof", "json_typeof"):
         return _json_typeof(args[0] if args else None)

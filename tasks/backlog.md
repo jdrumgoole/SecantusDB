@@ -1537,6 +1537,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`planner._emit_pipeline_sort`), then `$unset`. **Note:** index-accelerated ORDER BY+LIMIT pushdown
   no longer applies to a single-table ordered SELECT (correctness over the storage-side sort
   optimisation — the SQL layer is a dev/test surface).
+- [ ] **Array columns landed** (b111). A `<type>[]` column stores a native BSON array; `ARRAY[…]` and
+  `'{…}'` literals coerce in (`typemap._parse_pg_array_literal` / `coerce`), results render as Postgres
+  array text (`_render_pg_array`) with the array type OID in `PG_OID` so a driver decodes back to a list.
+  `<value> = ANY(col)` → array membership, `col @> ARRAY[…]` → containment (reuses the jsonb `$all` path),
+  `array_length(col, 1)` / `cardinality(col)` → element count. Reflection: `information_schema.columns.
+  data_type = 'ARRAY'` + `pg_attribute.atttypid` = array OID. **Limitations:** one level deep only (no
+  multi-dimensional arrays — `array_length(col, 2)` is NULL), no array subscripting (`col[1]`), no slicing,
+  no `unnest(col)` / `array_agg` into a declared array column, and no element-type coercion beyond the
+  scalar tags.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the

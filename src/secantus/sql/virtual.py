@@ -207,7 +207,11 @@ def _info_columns(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                     "table_name": t.name,
                     "column_name": col.name,
                     "ordinal_position": i,
-                    "data_type": typemap.SQL_TYPE_NAME.get(col.type_tag, "text"),
+                    "data_type": (
+                        "ARRAY"
+                        if typemap.is_array_tag(col.type_tag)
+                        else typemap.SQL_TYPE_NAME.get(col.type_tag, "text")
+                    ),
                     "is_nullable": "NO" if not col.nullable else "YES",
                 }
             )

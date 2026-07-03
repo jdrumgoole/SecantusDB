@@ -192,6 +192,8 @@ def _literal(node: exp.Expression) -> Any:
         return None
     if isinstance(node, exp.Boolean):
         return bool(node.this)
+    if isinstance(node, exp.Array):  # ARRAY[1, 2, 3] -> [1, 2, 3]
+        return [_literal(e) for e in node.expressions]
     if isinstance(node, exp.Literal):
         if node.is_string:
             return node.this
@@ -676,11 +678,20 @@ def _expr_to_filter(
     if isinstance(node, exp.EQ):
         left, right = node.this, node.expression
         if isinstance(left, exp.Any) or isinstance(right, exp.Any):
+            anynode, other = (left, right) if isinstance(left, exp.Any) else (right, left)
+            inner = anynode.this
+            while isinstance(inner, exp.Paren):  # ANY(col) wraps the operand in a Paren
+                inner = inner.this
+            if _is_field_node(inner):
+                # ``<value> = ANY(array_col)`` — array membership. Mongo's
+                # array-aware equality matches a doc whose array contains the value.
+                field, tag = _field(inner, resolve)
+                elem = typemap.array_element_tag(tag) if typemap.is_array_tag(tag) else tag
+                return {field: typemap.coerce(_literal(other), elem)}
             # ``col = ANY(ARRAY[...])`` is Postgres' IN — SQLAlchemy's reflection
             # emits ``relkind = ANY(ARRAY['r','p',...])``.
-            anynode, fld = (left, right) if isinstance(left, exp.Any) else (right, left)
-            field, tag = _field(fld, resolve)
-            values = [typemap.coerce(_literal(e), tag) for e in _array_elements(anynode.this)]
+            field, tag = _field(other, resolve)
+            values = [typemap.coerce(_literal(e), tag) for e in _array_elements(inner)]
             return {field: {"$in": values}}
         pair = _field_literal_pair(left, right)
         if pair is not None:
@@ -3561,7 +3572,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "numeric"
     if isinstance(node, (exp.DPipe, exp.Upper, exp.Lower, exp.Trim, exp.Substring, exp.Concat)):
         return "text"
-    if isinstance(node, exp.Length):
+    if isinstance(node, (exp.Length, exp.ArraySize)):
         return "int4"
     if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
         # Type from the first operand (its own tag, recursively).
@@ -3592,7 +3603,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "jsonb_build_array",
         ):
             return "json"
-        if fname in ("jsonb_array_length", "json_array_length"):
+        if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):
             return "int4"
     return "text"
 

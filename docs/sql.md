@@ -181,6 +181,7 @@ cur.execute("SELECT name FROM users WHERE age > %s", (21,))
 | `timestamptz` / `timestamp` | UTC datetime | `datetime` |
 | `json` / `jsonb` | embedded document / array | `dict` / `list` |
 | `bytea` | binary | `bytes` |
+| `<type>[]` (e.g. `text[]`, `int[]`) | BSON array of the element type | `list` |
 
 ```sql
 CREATE TABLE m (id bigint PRIMARY KEY, price numeric, at timestamptz);
@@ -339,6 +340,31 @@ The expression is evaluated with the aggregation/scalar engine (arithmetic,
 expression yields NULL (e.g. a NULL input), the column is NULL. Generated columns
 reflect as `pg_attribute.attgenerated = 's'`. Only `STORED` is supported (which is
 all Postgres itself offers).
+
+### Array columns (`text[]`, `int[]`, …)
+
+An array column (`<type>[]`) is stored as a native BSON array — the same
+representation a MongoDB array field uses — so both protocols see one list.
+Insert with either an `ARRAY[…]` constructor or a `'{…}'` string literal; results
+render as Postgres array text (`{a,"b,c",NULL}`, quoting only elements that need
+it) and a real driver decodes them back into a list via the array type OID:
+
+```sql
+CREATE TABLE post (id int PRIMARY KEY, tags text[], scores int[]);
+INSERT INTO post VALUES (1, ARRAY['py', 'db'], ARRAY[10, 20]);
+INSERT INTO post VALUES (2, '{go}', '{5}');
+
+SELECT id FROM post WHERE 'py' = ANY(tags);   -- membership -> 1
+SELECT id FROM post WHERE scores @> ARRAY[5]; -- containment -> 2
+SELECT id, array_length(tags, 1) FROM post;   -- 1 -> 2, 2 -> 1
+```
+
+`= ANY(col)` is array membership (the value is contained in the array),
+`col @> ARRAY[…]` is containment (every listed element is present), and
+`array_length(col, 1)` / `cardinality(col)` give the element count (only
+dimension 1 exists — arrays are one level deep, so any other dimension is NULL).
+Array columns reflect as `information_schema.columns.data_type = 'ARRAY'` with the
+Postgres array type OID in `pg_attribute`.
 
 ### Foreign keys
 
