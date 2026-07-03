@@ -8,7 +8,9 @@
 //! `$documentNumber`), the position-based `$shift` (`{output, by, default?}`),
 //! the prefix-accumulated `$expMovingAvg` (`{input, N|alpha}`), the gap-fill
 //! `$locf` / `$linearFill` (`<expr>`), the window `$derivative` / `$integral`
-//! (`{input}` — slope / trapezoidal area over the sortBy x-axis), plus every
+//! (`{input, unit?}` — slope / trapezoidal area over the sortBy x-axis; a
+//! fixed-duration `unit` scales the x-axis against a date sortBy so the rate is
+//! *per unit*), plus every
 //! `$group` accumulator the shared `group` module knows
 //! (`$sum`/`$avg`/`$min`/`$max`/`$first`/`$last`/`$push`/`$addToSet`/
 //! `$count`) evaluate over document-based windows (`documents: [lo, hi]`, with
@@ -19,13 +21,13 @@
 //! A range window with a fixed-duration time `unit` (`week`/`day`/`hour`/
 //! `minute`/`second`/`millisecond`) offsets against a date sortBy's epoch millis.
 //!
-//! Defers (`Err(())` → Python) on: range windows with a variable-length `unit`
-//! (`month`/`quarter`/`year`) or a non-ascending / multi-field / non-numeric
-//! sortBy, `$derivative` / `$integral`
-//! with a time `unit` (date x-axis), any unsupported accumulator,
-//! a non-document/empty `output`, an unsortable `sortBy` value, and a
-//! `partitionBy` expression the evaluator can't reproduce. Output preserves the
-//! *original* input order (only per-partition ordering drives the windows).
+//! Defers (`Err(())` → Python) on: range windows or `$derivative` / `$integral`
+//! with a variable-length `unit` (`month`/`quarter`/`year`), a non-ascending /
+//! multi-field / non-numeric sortBy, a `unit` without a date sortBy, any
+//! unsupported accumulator, a non-document/empty `output`, an unsortable
+//! `sortBy` value, and a `partitionBy` expression the evaluator can't reproduce.
+//! Output preserves the *original* input order (only per-partition ordering
+//! drives the windows).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -130,9 +132,10 @@ pub fn set_window_fields_stage(
             }
         } else if op == "$derivative" || op == "$integral" {
             // Window operators over the sortBy value (x) and input (y). Requires a
-            // sortBy; a time `unit` (date x-axis) is not modelled.
+            // sortBy; a time `unit` scales the x-axis against a date sortBy
+            // (validated in `ts_window_value` where the partition values are known).
             let spec = arg.as_document().ok_or(())?;
-            if sort_by.is_none() || !spec.contains_key("input") || spec.contains_key("unit") {
+            if sort_by.is_none() || !spec.contains_key("input") {
                 return Err(());
             }
         } else {
@@ -248,6 +251,7 @@ pub fn set_window_fields_stage(
                         &slots,
                         &docs,
                         range_vals.as_deref(),
+                        range_dates.as_deref(),
                         vars,
                     )?
                 } else {
@@ -417,9 +421,13 @@ fn shift_value(
 }
 
 /// `$derivative` / `$integral` over the window `[low, high]`, using the sortBy
-/// value (`range_vals`, x) and `input` (y). `$derivative` is the slope between
-/// the first and last window points (null if fewer than two, or the x's
-/// coincide); `$integral` is the trapezoidal area. Mirrors `_ts_window_value`.
+/// value (x) and `input` (y). `$derivative` is the slope between the first and
+/// last window points (null if fewer than two, or the x's coincide); `$integral`
+/// is the trapezoidal area. Without a `unit` the x-axis is the numeric
+/// `range_vals`; with a fixed-duration `unit` it is the date sortBy's epoch
+/// millis (`range_dates`) divided by the unit span, so the rate is *per unit*.
+/// `unit` requires a date sortBy; a variable-length unit defers. Mirrors
+/// `_ts_window_value`.
 #[allow(clippy::too_many_arguments)]
 fn ts_window_value(
     op: &str,
@@ -429,9 +437,21 @@ fn ts_window_value(
     slots: &[usize],
     docs: &[Document],
     range_vals: Option<&[f64]>,
+    range_dates: Option<&[f64]>,
     vars: &Document,
 ) -> R<Bson> {
-    let xs = range_vals.ok_or(())?;
+    let scaled: Vec<f64>;
+    let xs: &[f64] = match spec.get("unit") {
+        Some(Bson::String(u)) => {
+            // `unit` requires a date sortBy; scale its millis into the unit.
+            let unit_ms = window_unit_ms(u).ok_or(())? as f64;
+            let dates = range_dates.ok_or(())?;
+            scaled = dates.iter().map(|ms| ms / unit_ms).collect();
+            &scaled
+        }
+        Some(_) => return Err(()), // non-string unit → defer
+        None => range_vals.ok_or(())?,
+    };
     let input = spec.get("input").ok_or(())?;
     let mut pts: Vec<(f64, f64)> = Vec::new();
     for s in low..=high {

@@ -1857,15 +1857,12 @@ def _stage_set_window_fields(
             continue
         if op in ("$derivative", "$integral"):
             # Window operators over the sortBy value (x) and input (y). Require a
-            # sortBy; a time `unit` (date x-axis) is not yet modelled.
+            # sortBy; a time `unit` scales the x-axis against a date sortBy
+            # (validated at evaluation, when the partition's values are known).
             if not sort_by:
                 raise AggregateError(f"$setWindowFields {op} requires sortBy")
             if not isinstance(arg, Mapping) or "input" not in arg:
                 raise AggregateError(f"{op} requires {{input, unit?}}")
-            if "unit" in arg:
-                raise AggregateError(
-                    f"$setWindowFields {op} with a time 'unit' is not yet implemented"
-                )
             compiled.append((field, op, arg, window))
             continue
         if op not in _ACC_DISPATCH:
@@ -1936,7 +1933,7 @@ def _stage_set_window_fields(
                 low, high = _resolve_window(slot, n, window, range_vals, range_date_ms)
                 if op in ("$derivative", "$integral"):
                     target[field] = _ts_window_value(
-                        op, arg["input"], low, high, partition_docs, range_vals, ctx
+                        op, arg, low, high, partition_docs, range_vals, range_date_ms, ctx
                     )
                     continue
                 if high < low:
@@ -2211,23 +2208,46 @@ def _compute_linear_fill(
 
 def _ts_window_value(
     op: str,
-    input_expr: Any,
+    arg: Mapping[str, Any],
     low: int,
     high: int,
     partition_docs: list[dict[str, Any]],
     range_vals: list[Any] | None,
+    range_date_ms: list[int] | None,
     ctx: PipelineContext,
 ) -> Any:
     """`$derivative` / `$integral` over the window `[low, high]`, using the sortBy
     value as x and ``input`` as y. `$derivative` is the slope between the first
     and last window points (null if fewer than two, or the x's coincide);
-    `$integral` is the trapezoidal area. Requires a single ascending numeric
-    sortBy (`range_vals`) and numeric inputs; math in IEEE double."""
-    if range_vals is None:
-        raise AggregateError(f"$setWindowFields {op} requires a single ascending numeric sortBy")
+    `$integral` is the trapezoidal area.
+
+    Without a ``unit``: a single ascending numeric sortBy (`range_vals`) is the
+    x-axis. With a fixed-duration ``unit``: the x-axis is a date sortBy's epoch
+    millis (`range_date_ms`) divided by the unit's millisecond span, so the rate
+    is *per unit* (e.g. per hour). `unit` requires a date sortBy; a variable-
+    length unit (month/quarter/year) raises. Math in IEEE double."""
+    input_expr = arg["input"]
+    unit = arg.get("unit")
+    if unit is not None:
+        if range_date_ms is None:
+            raise AggregateError(f"$setWindowFields {op} 'unit' requires a date sortBy field")
+        unit_ms = _WINDOW_UNIT_MS.get(unit)
+        if unit_ms is None:
+            raise AggregateError(
+                f"$setWindowFields {op} unit {unit!r} is not supported "
+                "(variable-length month/quarter/year)"
+            )
+        # x-axis is the date's epoch millis scaled into the requested unit.
+        xs: list[Any] = [ms / unit_ms for ms in range_date_ms]
+    else:
+        if range_vals is None:
+            raise AggregateError(
+                f"$setWindowFields {op} requires a single ascending numeric sortBy"
+            )
+        xs = range_vals
     pts: list[tuple[float, float]] = []
     for i in range(low, high + 1):
-        x, y = range_vals[i], evaluate(input_expr, partition_docs[i], ctx.vars)
+        x, y = xs[i], evaluate(input_expr, partition_docs[i], ctx.vars)
         if not (_is_number(x) and _is_number(y)):
             raise AggregateError(f"$setWindowFields {op} requires numeric sortBy values and inputs")
         pts.append((x, y))

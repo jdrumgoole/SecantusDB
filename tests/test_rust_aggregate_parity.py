@@ -633,6 +633,30 @@ def test_fill_parity(docs, pipeline):
                 }
             ],
         ),
+        # $derivative / $integral with a time `unit` over a date sortBy: the
+        # x-axis is the date's epoch millis scaled into the unit, so the rate is
+        # per hour. Both engines scale identically (millis / unit_ms in f64).
+        (
+            [
+                {
+                    "_id": i,
+                    "t": _dt.datetime(2020, 1, 1, i, tzinfo=_dt.timezone.utc),
+                    "v": v,
+                }
+                for i, v in enumerate([0, 10, 30, 45])
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "d": {"$derivative": {"input": "$v", "unit": "hour"}},
+                            "i": {"$integral": {"input": "$v", "unit": "hour"}},
+                        },
+                    }
+                }
+            ],
+        ),
     ],
 )
 def test_set_window_fields_parity(docs, pipeline):
