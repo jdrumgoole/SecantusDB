@@ -106,9 +106,79 @@ _DATATYPE_TAGS: dict[Any, str] = {
 }
 
 
+# Element tag -> Postgres array type OID (pg_type of the ``_elem`` array type).
+_ARRAY_PG_OID: dict[str, int] = {
+    "bool": 1000,
+    "int8": 1016,
+    "int4": 1007,
+    "text": 1009,
+    "float8": 1022,
+    "numeric": 1231,
+    "timestamptz": 1185,
+    "bytea": 1001,
+}
+
+# Register the array tags (``text[]`` -> 1009, ...) in PG_OID so the wire layer's
+# RowDescription reports the array type OID for an array column, not the element's.
+PG_OID.update({f"{elem}[]": oid for elem, oid in _ARRAY_PG_OID.items()})
+
+
 def type_tag_for_sql(datatype: exp.DataType) -> str | None:
-    """Map a parsed SQL ``DataType`` to an internal tag, or None if unknown."""
+    """Map a parsed SQL ``DataType`` to an internal tag, or None if unknown. An
+    ``ARRAY`` type becomes ``<elem>[]`` (e.g. ``int4[]``)."""
+    if datatype.this == exp.DataType.Type.ARRAY:
+        inner = datatype.args.get("expressions") or []
+        elem = type_tag_for_sql(inner[0]) if inner else None
+        return f"{elem}[]" if elem is not None else None
     return _DATATYPE_TAGS.get(datatype.this)
+
+
+def is_array_tag(tag: str | None) -> bool:
+    return isinstance(tag, str) and tag.endswith("[]")
+
+
+def array_element_tag(tag: str) -> str:
+    """The element tag of an array tag (``int4[]`` -> ``int4``)."""
+    return tag[:-2]
+
+
+def _parse_pg_array_literal(text: str) -> list:
+    """Parse a Postgres array *string* literal (``{1,2,3}`` / ``{a,"b,c",NULL}``)
+    into a Python list (a bare ``NULL`` element is None). One level deep."""
+    s = text.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        raise ValueError(f"malformed array literal: {text!r}")
+    body = s[1:-1]
+    if body.strip() == "":
+        return []
+    out: list = []
+    i, n = 0, len(body)
+    while i < n:
+        while i < n and body[i] in " \t":
+            i += 1
+        if i < n and body[i] == '"':  # quoted element (keeps commas / literal NULL)
+            i += 1
+            buf: list[str] = []
+            while i < n and body[i] != '"':
+                if body[i] == "\\" and i + 1 < n:
+                    buf.append(body[i + 1])
+                    i += 2
+                else:
+                    buf.append(body[i])
+                    i += 1
+            i += 1  # closing quote
+            out.append("".join(buf))
+            while i < n and body[i] != ",":  # skip to the separator
+                i += 1
+            i += 1  # consume the comma
+        else:  # unquoted element up to the next comma
+            j = body.find(",", i)
+            if j == -1:
+                j = n
+            token = body[i:j].strip()
+            out.append(None if token.upper() == "NULL" else token)
+            i = j + 1
+    return out
 
 
 def coerce(value: Any, tag: str) -> Any:
@@ -119,6 +189,10 @@ def coerce(value: Any, tag: str) -> Any:
     """
     if value is None:
         return None
+    if is_array_tag(tag):
+        elem = array_element_tag(tag)
+        items = value if isinstance(value, (list, tuple)) else _parse_pg_array_literal(str(value))
+        return [coerce(v, elem) for v in items]
     if tag == "any":
         # Schema-on-read (reflected tables): keep the literal's natural Python
         # type so it compares against the stored BSON value as-is.
@@ -163,6 +237,9 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         # int2vector / oidvector render as space-separated ints ("1 2"), the
         # form libpq clients parse for pg_index.indkey/indoption/indclass.
         return " ".join(str(int(v)) for v in value).encode("ascii")
+    if is_array_tag(tag) and isinstance(value, (list, tuple)):
+        elem = array_element_tag(tag)
+        return _render_pg_array(value, elem).encode("utf-8")
     if isinstance(value, bool):
         return b"t" if value else b"f"
     if isinstance(value, (bytes, bytearray)):
@@ -184,6 +261,9 @@ def to_py(value: Any, tag: str) -> Any:
     """
     if value is None:
         return None
+    if is_array_tag(tag) and isinstance(value, (list, tuple)):
+        elem = array_element_tag(tag)
+        return [to_py(v, elem) for v in value]
     if isinstance(value, bson.Int64):
         return int(value)
     if isinstance(value, bson.Decimal128):
@@ -193,3 +273,22 @@ def to_py(value: Any, tag: str) -> Any:
     if isinstance(value, bson.Binary):
         return bytes(value)
     return value
+
+
+def _render_pg_array(items: Any, elem_tag: str) -> str:
+    """Render a Python list as a Postgres array text literal ``{a,b,c}``, quoting
+    an element only when it needs it (empty, NULL-looking, or containing a comma /
+    brace / quote / whitespace)."""
+    parts: list[str] = []
+    for v in items:
+        if v is None:
+            parts.append("NULL")
+            continue
+        rendered = to_pg_text(v, elem_tag)
+        text = rendered.decode("utf-8") if rendered is not None else ""
+        if text == "" or text.upper() == "NULL" or any(c in text for c in ',{}"\\ \t'):
+            escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'"{escaped}"')
+        else:
+            parts.append(text)
+    return "{" + ",".join(parts) + "}"

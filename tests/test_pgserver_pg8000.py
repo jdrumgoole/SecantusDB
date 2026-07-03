@@ -1366,6 +1366,26 @@ def test_view_via_driver(server):
     conn.close()
 
 
+def test_array_columns_via_driver(server):
+    # Array columns round-trip through the real driver: pg8000 reads the array
+    # type OID from RowDescription and decodes the ``{...}`` text into a list.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, tags text[], nums int[])")
+    cur.execute("INSERT INTO t (id, tags, nums) VALUES (1, ARRAY['a','b'], ARRAY[1,2,3])")
+    cur.execute("INSERT INTO t (id, tags, nums) VALUES (2, '{x,y}', '{7,8}')")
+    cur.execute("SELECT id, tags, nums FROM t ORDER BY id")
+    assert cur.fetchall() == ([1, ["a", "b"], [1, 2, 3]], [2, ["x", "y"], [7, 8]])
+    # = ANY(col) membership, @> containment, array_length.
+    cur.execute("SELECT id FROM t WHERE 'a' = ANY(tags)")
+    assert cur.fetchall() == ([1],)
+    cur.execute("SELECT id FROM t WHERE nums @> ARRAY[7]")
+    assert cur.fetchall() == ([2],)
+    cur.execute("SELECT id, array_length(tags, 1) FROM t ORDER BY id")
+    assert cur.fetchall() == ([1, 2], [2, 2])
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address
