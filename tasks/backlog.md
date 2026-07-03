@@ -887,12 +887,15 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).
 - [ ] **Widen the Rust query matcher (Rust server)** — the matcher backs the
   Rust server directly; there is no Python fallback in that path, so an unported
-  construct surfaces as `BadValue`. `$all` is handled (element equality via
-  `expressions::py_eq`; regex elements still defer). Remaining gaps to widen
-  where faithful: bool-as-int `$gt`/`$lt` comparison and structural array/doc
-  equality. (The retired in-process "flip `query.matches` default to Rust" item
-  is gone — the two-server model has no per-call engine selection; `_secantus_core`
-  is only the parity-test vehicle now.)
+  construct surfaces as `BadValue`. **Done:** `$all` (element equality via
+  `expressions::py_eq`; regex elements still defer); structural array/doc
+  *equality* (`array_eq` / `doc_eq`); bool-as-int `$gt`/`$lt`/`$gte`/`$lte`
+  comparison (0.5.3-beta.119 — numeric vs int/long/double, no-match vs any other
+  type, matching Python's `<`). **Still deferred where faithful:** regex array
+  elements in `$all`, structural array/doc *ordering* under `$gt`/`$lt`, and the
+  exotic BSON types. (The retired in-process "flip `query.matches` default to
+  Rust" item is gone — the two-server model has no per-call engine selection;
+  `_secantus_core` is only the parity-test vehicle now.)
 - [x] **Phase 1, leaf engine #3: `update.apply_update`** — the common
   deterministic operators ported to Rust (`crates/secantus-core/src/update.rs`,
   with the `secantus.paths` dotted-path helpers): replacement-style, `$set`,
