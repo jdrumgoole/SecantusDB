@@ -792,6 +792,8 @@ def _run_statement(
             return _create_matview_command(stmt, storage, db, catalog, session)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
             return _alter_matview_command(stmt, storage, db, catalog, session)
+        if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("SEQUENCE"):
+            return _alter_sequence_command(stmt, db, catalog)
         if verb == "SET" and _command_text(stmt).lstrip().upper().startswith("CONSTRAINTS"):
             return _set_constraints_command(stmt, storage, db, catalog, session)
         if verb in ("CREATE", "DROP", "ALTER") and _command_text(stmt).lstrip().upper().startswith(
@@ -1254,6 +1256,81 @@ def _drop_sequence(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     if not catalog.drop_sequence(db, name) and not stmt.args.get("exists"):
         raise errors.SQLError("42P01", f'sequence "{name}" does not exist')
     return SQLResult(command_tag="DROP SEQUENCE")
+
+
+_ALTER_SEQUENCE_RE = re.compile(
+    r"(?is)^\s*SEQUENCE\s+(?:IF\s+EXISTS\s+)?(\"[^\"]+\"|\w+)\s+(.*?)\s*;?\s*$"
+)
+
+
+def _alter_sequence_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    """``ALTER SEQUENCE [IF EXISTS] name { RESTART [WITH n] | INCREMENT BY n |
+    MINVALUE n | MAXVALUE n | START WITH n | [NO] CYCLE }…``. Arrives as a
+    Command (sqlglot doesn't model the grammar)."""
+    m = _ALTER_SEQUENCE_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported ALTER SEQUENCE: {stmt.sql()}")
+    name = m.group(1).strip('"')
+    if not catalog.sequence_exists(db, name):
+        if "IF EXISTS" in _command_text(stmt).upper():
+            return SQLResult(command_tag="ALTER SEQUENCE")
+        raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+    changes = _parse_alter_sequence_opts(m.group(2))
+    catalog.alter_sequence(db, name, changes)
+    return SQLResult(command_tag="ALTER SEQUENCE")
+
+
+def _parse_alter_sequence_opts(rest: str) -> dict[str, Any]:
+    """Parse the option keywords after ``ALTER SEQUENCE name`` into catalog
+    changes (``restart`` / ``increment`` / ``min_value`` / ``max_value`` /
+    ``start`` / ``cycle``)."""
+    tokens = rest.split()
+    changes: dict[str, Any] = {}
+    i = 0
+
+    def _int_after(j: int) -> tuple[int | None, int]:
+        # value at tokens[j], optionally preceded by BY/WITH — return (value, new_j).
+        if j < len(tokens) and tokens[j].upper() in ("BY", "WITH"):
+            j += 1
+        if j < len(tokens):
+            try:
+                return int(tokens[j].rstrip(";")), j
+            except ValueError:
+                return None, j
+        return None, j
+
+    while i < len(tokens):
+        tok = tokens[i].upper()
+        if tok == "RESTART":
+            # RESTART [WITH n] — n optional (None → restart at the sequence's start).
+            if i + 1 < len(tokens) and (
+                tokens[i + 1].upper() == "WITH" or tokens[i + 1].lstrip("-").isdigit()
+            ):
+                val, i = _int_after(i + 1)
+                changes["restart"] = val
+            else:
+                changes["restart"] = None
+        elif tok == "INCREMENT":
+            val, i = _int_after(i + 1)
+            if val is not None:
+                changes["increment"] = val
+        elif tok == "MINVALUE":
+            val, i = _int_after(i + 1)
+            changes["min_value"] = val
+        elif tok == "MAXVALUE":
+            val, i = _int_after(i + 1)
+            changes["max_value"] = val
+        elif tok == "START":
+            val, i = _int_after(i + 1)
+            if val is not None:
+                changes["start"] = val
+        elif tok == "CYCLE":
+            changes["cycle"] = True
+        elif tok == "NO" and i + 1 < len(tokens) and tokens[i + 1].upper() == "CYCLE":
+            changes["cycle"] = False
+            i += 1
+        i += 1
+    return changes
 
 
 _MAX_VIEW_DEPTH = 32

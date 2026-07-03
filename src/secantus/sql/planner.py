@@ -300,6 +300,26 @@ def _serial_tag(datatype: exp.Expression) -> str | None:
     return None
 
 
+def _identity_spec(coldef: exp.ColumnDef) -> dict[str, Any] | None:
+    """Parse a ``GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(START WITH n
+    INCREMENT BY n)]`` column constraint into ``{mode, start, increment}``, or
+    None. ``mode`` is ``"always"`` (a user value is rejected) or ``"by_default"``
+    (like SERIAL)."""
+    for c in coldef.args.get("constraints") or []:
+        kind = c.kind
+        if type(kind).__name__ != "GeneratedAsIdentityColumnConstraint":
+            continue
+        always = bool(kind.args.get("this"))  # this=True → ALWAYS, False → BY DEFAULT
+        start = kind.args.get("start")
+        increment = kind.args.get("increment")
+        return {
+            "mode": "always" if always else "by_default",
+            "start": int(_literal(start)) if start is not None else 1,
+            "increment": int(_literal(increment)) if increment is not None else 1,
+        }
+    return None
+
+
 def _default_sequence(coldef: exp.ColumnDef) -> str | None:
     """The sequence name a column's ``DEFAULT nextval('seq')`` draws from, or None.
     Only the ``nextval('literal')`` form is recognised (regclass cast included)."""
@@ -834,15 +854,21 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
             )
         constraints = [type(c.kind).__name__ for c in (coldef.args.get("constraints") or [])]
         is_pk = "PrimaryKeyColumnConstraint" in constraints
-        # A SERIAL column is implicitly NOT NULL with an owned sequence default.
-        nullable = not is_pk and serial_tag is None and "NotNullColumnConstraint" not in constraints
+        identity = _identity_spec(coldef)
+        # A SERIAL / IDENTITY column is implicitly NOT NULL with an owned sequence.
+        auto = serial_tag is not None or identity is not None
+        nullable = not is_pk and not auto and "NotNullColumnConstraint" not in constraints
         if is_pk:
             pk_seen = True
         has_default, default = _column_default(coldef, tag)
         sequence = _default_sequence(coldef)
-        if serial_tag is not None:
+        if auto:
             sequence = f"{table_name}_{coldef.name}_seq"
-            seq_plans.append({"name": sequence, "column": coldef.name, "increment": 1, "start": 1})
+            start = identity["start"] if identity else 1
+            increment = identity["increment"] if identity else 1
+            seq_plans.append(
+                {"name": sequence, "column": coldef.name, "increment": increment, "start": start}
+            )
         columns.append(
             Column(
                 name=coldef.name,
@@ -853,6 +879,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 has_default=has_default,
                 default=default,
                 sequence=sequence,
+                identity=(identity["mode"] if identity else None),
             )
         )
     if not pk_seen:
@@ -1096,6 +1123,12 @@ def insert_target_columns(stmt: exp.Insert, table: TableDef) -> list[str]:
     return [c.name for c in table.columns]
 
 
+def _is_default_cell(cell: exp.Expression) -> bool:
+    """A ``DEFAULT`` keyword in a VALUES tuple (sqlglot parses it as
+    ``Var('DEFAULT')``)."""
+    return isinstance(cell, exp.Var) and cell.name.upper() == "DEFAULT"
+
+
 def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) -> dict[str, Any]:
     """Build one insert doc from raw Python values mapped positionally onto
     ``col_names`` — shared by the VALUES and INSERT…SELECT paths. Coerces per the
@@ -1112,6 +1145,12 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
                 col = Column(name, "any", name, pk=(name == "_id"), nullable=(name != "_id"))
             else:
                 raise errors.undefined_column(name)
+        if col.identity == "always":
+            raise errors.SQLError(
+                "428C9",
+                f'cannot insert a non-DEFAULT value into column "{name}" — it is an '
+                f"identity column defined as GENERATED ALWAYS",
+            )
         if raw is None and not col.nullable:
             raise errors.not_null_violation(name)
         doc[col.field] = typemap.coerce(raw, col.type_tag)
@@ -1143,7 +1182,16 @@ def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
             raise errors.syntax_error(
                 f"INSERT has {len(cells)} values but {len(col_names)} columns"
             )
-        docs.append(_insert_doc(col_names, [_literal(c) for c in cells], table))
+        # A ``DEFAULT`` keyword cell is treated as an omitted column, so the
+        # column's DEFAULT / sequence applies (and an identity ALWAYS column
+        # accepts DEFAULT while rejecting a real value).
+        row_cols, row_vals = [], []
+        for name, cell in zip(col_names, cells, strict=True):
+            if _is_default_cell(cell):
+                continue
+            row_cols.append(name)
+            row_vals.append(_literal(cell))
+        docs.append(_insert_doc(row_cols, row_vals, table))
     return InsertPlan(
         table=table,
         docs=docs,
