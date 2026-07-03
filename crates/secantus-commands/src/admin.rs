@@ -544,6 +544,47 @@ pub fn prune_ttl(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "pruned": pruned as i64, "ok": 1.0 })
 }
 
+/// `secantusAdmin.restoreArchive` — extract a backup archive (from
+/// `backupArchive`) into `targetDir`, a fresh directory the operator then points
+/// a *new* server at (the running server's storage is untouched — same
+/// side-channel model as the Python command and real mongod's "stop, swap
+/// dbpath, start"). Required: `archivePath`, `targetDir`. Optional
+/// `allowExisting` (bool, default false) overlays into a non-empty target.
+/// Returns `{targetDir, fileCount, archive, ok}`. Mirrors the Python
+/// `secantusAdmin.restoreArchive` command.
+pub fn restore_archive(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let archive_path = doc.get_str("archivePath").unwrap_or("");
+    if archive_path.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.restoreArchive requires archivePath: <string>",
+        ));
+    }
+    let target_dir = doc.get_str("targetDir").unwrap_or("");
+    if target_dir.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.restoreArchive requires targetDir: <string>",
+        ));
+    }
+    let allow_existing = doc.get_bool("allowExisting").unwrap_or(false);
+    let storage = ctx.storage()?;
+    let (abs_target, abs_archive, file_count) = storage
+        .restore_archive(archive_path, target_dir, allow_existing)
+        // A failed restore (missing/invalid archive, non-empty target) is a
+        // caller error, not an internal fault — mirror the Python handler's
+        // IllegalOperation(20) rather than InternalError.
+        .map_err(|e| CommandError::new(20, "IllegalOperation", command_error(e).errmsg))?;
+    Ok(doc! {
+        "targetDir": abs_target,
+        "fileCount": file_count as i64,
+        "archive": abs_archive,
+        "ok": 1.0,
+    })
+}
+
 /// `secantusAdmin.archiveBaseSnapshot` — take a PITR v2 base snapshot into
 /// `archiveDir` (`base-<head>.tar.gz`). Pair with a server started with
 /// `--oplog-archive-dir <archiveDir>` so pruned oplog rows are archived as

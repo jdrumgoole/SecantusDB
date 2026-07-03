@@ -593,6 +593,18 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn restore_archive(
+        &self,
+        archive_path: &str,
+        target_dir: &str,
+        allow_existing: bool,
+    ) -> Result<(String, String, u64), StorageError> {
+        // Free function on the storage crate — no live handle needed; it rebuilds
+        // a fresh on-disk directory the operator points a new server at.
+        secantus_storage::extract_backup_archive_ex(archive_path, target_dir, allow_existing)
+            .map_err(map_err)
+    }
+
     fn rename_collection(
         &self,
         src_db: &str,

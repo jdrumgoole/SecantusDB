@@ -579,6 +579,25 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Extract a backup archive (from `create_archive`) into `target_dir`,
+    /// returning `(abs_target, abs_archive, file_count)`. Backs
+    /// `secantusAdmin.restoreArchive` — a side-channel restore into a fresh
+    /// directory the operator then points a new server at; the running server's
+    /// storage is untouched. Rejects a non-empty target unless `allow_existing`,
+    /// and rejects an archive with no `WiredTiger` metadata. Default:
+    /// unsupported; the WT adapter forwards to
+    /// `secantus_storage::extract_backup_archive_ex`.
+    fn restore_archive(
+        &self,
+        _archive_path: &str,
+        _target_dir: &str,
+        _allow_existing: bool,
+    ) -> Result<(String, String, u64), StorageError> {
+        Err(StorageError::Internal(
+            "restoreArchive: this storage backend has no on-disk archive support".into(),
+        ))
+    }
+
     /// Rename a collection. Returns `(succeeded, error_message)`; `succeeded ==
     /// false` carries a reason (source missing / target exists).
     fn rename_collection(

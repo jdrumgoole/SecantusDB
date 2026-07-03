@@ -298,6 +298,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "secantusAdmin.archiveBaseSnapshot" => admin::archive_base_snapshot,
         "secantusAdmin.pruneOplog" => admin::prune_oplog,
         "secantusAdmin.pruneTtl" => admin::prune_ttl,
+        "secantusAdmin.restoreArchive" => admin::restore_archive,
         "listCollections" => admin::list_collections,
         "listDatabases" => admin::list_databases,
         "listIndexes" => admin::list_indexes,

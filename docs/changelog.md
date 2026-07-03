@@ -19,6 +19,34 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: `secantusAdmin.restoreArchive`
+
+The Rust server now implements `secantusAdmin.restoreArchive`, completing the
+proprietary backup/restore + prune command family (`backupArchive` and the
+prune commands already shipped). It extracts a backup `.tar.gz` (produced by
+`backupArchive`) into a fresh `targetDir` the operator then points a new server
+at — the running server's storage is untouched, the same side-channel restore
+model as the Python command and real mongod's "stop, swap dbpath, start". It
+rejects a non-empty target unless `allowExisting: true`, verifies the archive is
+a genuine SecantusDB / WiredTiger backup *before* extracting (so a malformed
+archive can't pollute the target), and returns `{targetDir, fileCount, archive,
+ok}`, mirroring the Python handler. This is slice 2 of the Rust admin-command
+parity work (issue #163); the admin console's Backup page can now drive native
+archive restore against a Rust target.
+
+Remaining #163 gaps: the standard admin commands `grantRolesToUser` /
+`revokeRolesFromUser` / `killOp`, plus fleshing out the `getLog` / `profile`
+stubs.
+
+#### Added
+
+- **Rust server:** `secantusAdmin.restoreArchive` wire command
+  (`Storage::restore_archive` on the command trait →
+  `secantus_storage::extract_backup_archive_ex`, with the target-emptiness /
+  WiredTiger-metadata guards and abs-path + file-count reply). Regressions:
+  `tests/test_rust_server_smoke.py::test_secantus_admin_restore_archive_roundtrips`
+  and `::test_restore_archive_rejects_nonempty_target`.
+
 ### Rust server: `secantusAdmin.pruneOplog` and `pruneTtl` maintenance commands
 
 The Rust server now implements two of the proprietary `secantusAdmin.*`

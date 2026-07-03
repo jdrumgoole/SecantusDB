@@ -1361,6 +1361,95 @@ pub fn extract_backup_archive(archive_path: &str, target_dir: &str) -> Result<()
     Ok(())
 }
 
+/// Extract a backup `.tar.gz` into `target_dir` with the same guardrails as the
+/// Python `extract_backup_archive`, returning `(abs_target, abs_archive,
+/// file_count)`. Backs `secantusAdmin.restoreArchive`:
+///
+/// * rejects a `target_dir` that already exists, is non-empty, and
+///   `allow_existing` is false;
+/// * verifies the archive is a SecantusDB / WiredTiger backup (contains a
+///   `WiredTiger` metadata entry) **before** extracting, so a malformed archive
+///   can't pollute `target_dir`.
+pub fn extract_backup_archive_ex(
+    archive_path: &str,
+    target_dir: &str,
+    allow_existing: bool,
+) -> Result<(String, String, u64)> {
+    let abs_archive = std::fs::canonicalize(archive_path)
+        .map_err(|_| {
+            archive_err(
+                "restoreArchive",
+                format!("archive not found: {archive_path}"),
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    let target = std::path::Path::new(target_dir);
+    if target.exists() {
+        if !target.is_dir() {
+            return Err(archive_err(
+                "restoreArchive",
+                format!("target exists and is not a directory: {target_dir}"),
+            ));
+        }
+        let non_empty = std::fs::read_dir(target)
+            .map_err(|e| archive_err("restoreArchive", e))?
+            .next()
+            .is_some();
+        if non_empty && !allow_existing {
+            return Err(archive_err(
+                "restoreArchive",
+                format!(
+                    "target directory is not empty (pass allowExisting=true to overlay): {target_dir}"
+                ),
+            ));
+        }
+    } else {
+        std::fs::create_dir_all(target).map_err(|e| archive_err("restoreArchive", e))?;
+    }
+
+    // Pass 1: verify it's a SecantusDB backup + count entries, without touching
+    // the target (mirrors Python's "check the WiredTiger metadata is present
+    // before extraction so a malformed archive can't pollute target_dir").
+    let mut count: u64 = 0;
+    let mut has_wt = false;
+    {
+        let file =
+            std::fs::File::open(&abs_archive).map_err(|e| archive_err("restoreArchive", e))?;
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        for entry in ar.entries().map_err(|e| archive_err("restoreArchive", e))? {
+            let entry = entry.map_err(|e| archive_err("restoreArchive", e))?;
+            let path = entry.path().map_err(|e| archive_err("restoreArchive", e))?;
+            if path.as_os_str() == "WiredTiger" {
+                has_wt = true;
+            }
+            count += 1;
+        }
+    }
+    if !has_wt {
+        return Err(archive_err(
+            "restoreArchive",
+            format!(
+                "archive {abs_archive:?} is not a SecantusDB backup \
+                 (no WiredTiger metadata file inside)"
+            ),
+        ));
+    }
+
+    // Pass 2: extract.
+    let file = std::fs::File::open(&abs_archive).map_err(|e| archive_err("restoreArchive", e))?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    ar.unpack(target)
+        .map_err(|e| archive_err("restoreArchive", e))?;
+
+    let abs_target = std::fs::canonicalize(target)
+        .map_err(|e| archive_err("restoreArchive", e))?
+        .to_string_lossy()
+        .into_owned();
+    Ok((abs_target, abs_archive, count))
+}
+
 impl Storage {
     /// Open (creating if needed) an on-disk database at `home` with the default
     /// SecantusDB WiredTiger config, bootstrapping the table schema.
