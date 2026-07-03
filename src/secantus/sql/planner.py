@@ -329,6 +329,15 @@ def _identity_spec(coldef: exp.ColumnDef) -> dict[str, Any] | None:
     return None
 
 
+def _generated_expr(coldef: exp.ColumnDef) -> str | None:
+    """The rendered SQL of a ``GENERATED ALWAYS AS (expr) STORED`` column's
+    expression, or None. (Postgres only supports STORED; VIRTUAL is not a thing.)"""
+    for c in coldef.args.get("constraints") or []:
+        if type(c.kind).__name__ == "ComputedColumnConstraint" and c.kind.this is not None:
+            return c.kind.this.sql(dialect="postgres")
+    return None
+
+
 def _default_sequence(coldef: exp.ColumnDef) -> str | None:
     """The sequence name a column's ``DEFAULT nextval('seq')`` draws from, or None.
     Only the ``nextval('literal')`` form is recognised (regclass cast included)."""
@@ -898,6 +907,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 sequence=sequence,
                 identity=(identity["mode"] if identity else None),
                 enum_type=enum_name,
+                generated=_generated_expr(coldef),
             )
         )
     if not pk_seen:
@@ -1169,6 +1179,12 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
                 f'cannot insert a non-DEFAULT value into column "{name}" — it is an '
                 f"identity column defined as GENERATED ALWAYS",
             )
+        if col.generated is not None:
+            raise errors.SQLError(
+                "428C9",
+                f'cannot insert a non-DEFAULT value into column "{name}" — it is a '
+                f"generated column",
+            )
         if raw is None and not col.nullable:
             raise errors.not_null_violation(name)
         doc[col.field] = typemap.coerce(raw, col.type_tag)
@@ -1179,8 +1195,8 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
     for col in table.columns:
         if col.name in provided:
             continue
-        if col.sequence is not None:
-            continue
+        if col.sequence is not None or col.generated is not None:
+            continue  # filled by the executor (sequence draw / computed expr)
         if col.has_default:
             doc[col.field] = typemap.coerce(col.default, col.type_tag)
         elif not col.nullable:
@@ -1598,6 +1614,14 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
                 raise errors.undefined_column(col_name)
         if col.pk:
             raise errors.feature_not_supported("updating the primary key is not supported")
+        if col.generated is not None:
+            # A generated column can only be set to DEFAULT (which recomputes it);
+            # any other value is rejected. The executor recomputes it either way.
+            if not _is_default_cell(assign.expression):
+                raise errors.SQLError(
+                    "428C9", f'column "{col_name}" can only be updated to DEFAULT'
+                )
+            continue
         raw = _literal(assign.expression)
         if raw is None and not col.nullable:
             raise errors.not_null_violation(col_name)

@@ -547,10 +547,37 @@ def _validate_enum_columns(docs: list[dict[str, Any]], table: Any, catalog: Any,
                 )
 
 
+def _apply_generated_columns(docs: list[dict[str, Any]], table: Any, ctx: Any) -> None:
+    """Compute each ``GENERATED ALWAYS AS (expr) STORED`` column from the row's
+    other columns and store the result (runs before validation so NOT NULL / CHECK
+    / UNIQUE see the computed value). No-op for reflected tables."""
+    from secantus.sql import scalar
+
+    if getattr(table, "reflected", False):
+        return
+    gen_cols = [c for c in table.columns if c.generated is not None]
+    if not gen_cols:
+        return
+    for doc in docs:
+
+        def scope(node: Any, _doc: Any = doc) -> Any:
+            col = table.column(node.name)
+            return get_path(_doc, col.field if col is not None else node.name)
+
+        for col in gen_cols:
+            value = scalar.evaluate(_parse_check_expr(col.generated), scope, ctx)
+            doc[col.field] = typemap.coerce(value, col.type_tag)
+
+
 def enforce_insert_rows(
     docs: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any, session: Any
 ) -> None:
     """Enforce every declared constraint against rows about to be inserted."""
+    from secantus.sql import scalar
+
+    _apply_generated_columns(
+        docs, table, scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    )
     _validate_rows(docs, table, storage, db, session, catalog)
     _validate_enum_columns(docs, table, catalog, db)
     _validate_unique_rows(docs, table, storage, db, session=session)
@@ -573,6 +600,7 @@ def enforce_update_images(
     if getattr(table, "reflected", False):
         return
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    _apply_generated_columns(post_images, table, ctx)
     for post in post_images:
         _validate_write_row(post, table, ctx)
     _validate_enum_columns(post_images, table, catalog, db)
@@ -1111,12 +1139,26 @@ def execute_update(
 ) -> SQLResult:
     coll = plan.table.collection
     _validate_update_post_images(plan, storage, db, session, catalog)
-    if plan.returning is not None:
-        # RETURNING yields the post-image, so capture the matched ``_id``s first,
-        # apply the update, then re-read those rows.
+    gen_cols = (
+        [c for c in plan.table.columns if c.generated is not None]
+        if not getattr(plan.table, "reflected", False)
+        else []
+    )
+    # A generated column's value depends on each row's post-image, so the bulk
+    # ``$set`` can't carry it; capture the target ids first, then recompute and
+    # persist per row after the update lands.
+    if plan.returning is not None or gen_cols:
         ids = [d["_id"] for d in storage.find_matching(db, coll, plan.filter)]
     res = storage.update_matching(db, coll, plan.filter, plan.update, multi=True)
     matched = int(res["matched"])
+    if gen_cols and ids:
+        from secantus.sql import scalar
+
+        ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+        for doc in storage.find_matching(db, coll, {"_id": {"$in": ids}}):
+            _apply_generated_columns([doc], plan.table, ctx)
+            gset = {c.field: doc[c.field] for c in gen_cols}
+            storage.update_matching(db, coll, {"_id": doc["_id"]}, {"$set": gset}, multi=False)
     if plan.returning is not None:
         post = storage.find_matching(db, coll, {"_id": {"$in": ids}}) if ids else []
         return _returning_result(
@@ -1143,6 +1185,7 @@ def _validate_update_post_images(
         or table.foreign_keys
         or _has_not_null(table)
         or any(c.enum_type for c in table.columns)
+        or any(c.generated for c in table.columns)
         or (catalog is not None and _referencing_fks(catalog, db, table.name))
     )
     if getattr(table, "reflected", False) or not needs:
@@ -1150,6 +1193,7 @@ def _validate_update_post_images(
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     matched = storage.find_matching(db, table.collection, plan.filter)
     post_images = [apply_update(doc, plan.update) for doc in matched]
+    _apply_generated_columns(post_images, table, ctx)
     for post in post_images:
         _validate_write_row(post, table, ctx)
     _validate_enum_columns(post_images, table, catalog, db)

@@ -65,6 +65,10 @@ class Column:
     # type. Stored as ``text`` (``type_tag``) but validated against the enum's
     # labels on write and reflected with the enum's type oid.
     enum_type: str | None = None
+    # The rendered SQL expression of a ``GENERATED ALWAYS AS (expr) STORED``
+    # column. Computed from the row's other columns on every write; a user value
+    # can't be supplied. Reflected as ``attgenerated = 's'``.
+    generated: str | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +170,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "sequence": c.sequence,
                 "identity": c.identity,
                 "enum_type": c.enum_type,
+                "generated": c.generated,
             }
             for c in table.columns
         ],
@@ -215,6 +220,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 sequence=c.get("sequence"),
                 identity=c.get("identity"),
                 enum_type=c.get("enum_type"),
+                generated=c.get("generated"),
             )
             for c in doc["columns"]
         ],

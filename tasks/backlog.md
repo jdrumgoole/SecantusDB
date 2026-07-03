@@ -1781,6 +1781,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   range / base types → `0A000`); no `ALTER TYPE … ADD VALUE` / `RENAME VALUE`; enum ordering in
   `ORDER BY` is lexical on the label text, not the declared enum order (would need an enum-aware sort
   key); enums live in the connection's db, not schema-scoped.
+- [ ] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
+  (`planner._generated_expr` stores the rendered SQL on `Column.generated`). Computed from the row's
+  other columns on every write by `executor._apply_generated_columns` (evaluates the expr via
+  `scalar.evaluate` with a column→field scope, reusing the CHECK-constraint machinery) — runs before
+  NOT NULL / CHECK / UNIQUE so they see the value. A user value is rejected with `428C9` on INSERT
+  (`_insert_doc`) and UPDATE (`plan_update` — only `= DEFAULT` is allowed, which recomputes). `execute_update`
+  does a per-row second pass to persist the recomputed value (the bulk `$set` can't carry a per-row
+  expression). Reflection: `pg_attribute.attgenerated = 's'`. Tests: `tests/test_sql_generated.py`.
+  **Limitations:** only `STORED` (all Postgres offers); the expression may reference only columns of the
+  same row (no subqueries / volatile functions guard); no `ALTER TABLE … ADD COLUMN … GENERATED` (the
+  ALTER ADD path doesn't parse the constraint yet); a generated column isn't re-derived if the underlying
+  data was written directly via the Mongo API (SQL writes only).
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
