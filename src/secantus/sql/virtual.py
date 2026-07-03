@@ -697,7 +697,7 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                     "atthasdef": col.has_default or col.sequence is not None,
                     "attisdropped": False,
                     "attidentity": {"always": "a", "by_default": "d"}.get(col.identity or "", ""),
-                    "attgenerated": "",
+                    "attgenerated": "s" if col.generated is not None else "",
                     "attcollation": 0,
                     "attlen": -1,
                 }

@@ -315,6 +315,31 @@ an enum column's `pg_attribute.atttypid` points at its enum type's oid — so
 SQLAlchemy and `psql`'s `\dT` reflect them. Only the `ENUM` form of `CREATE TYPE`
 is supported (composite / range / base types raise `0A000`).
 
+### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
+
+A generated column's value is computed from the row's other columns on every
+write; you can't insert or update one directly (`428C9`), only recompute it via
+`DEFAULT`:
+
+```sql
+CREATE TABLE box (
+    id   int PRIMARY KEY,
+    w    int,
+    h    int,
+    area int GENERATED ALWAYS AS (w * h) STORED
+);
+INSERT INTO box (id, w, h) VALUES (1, 3, 4);   -- area -> 12
+UPDATE box SET w = 10 WHERE id = 1;            -- area recomputed to 40
+INSERT INTO box (id, w, h, area) VALUES (2, 1, 1, 9);  -- error 428C9
+```
+
+The expression is evaluated with the aggregation/scalar engine (arithmetic,
+`||`, functions), so a string column like
+`full text GENERATED ALWAYS AS (first || ' ' || last) STORED` works too. If the
+expression yields NULL (e.g. a NULL input), the column is NULL. Generated columns
+reflect as `pg_attribute.attgenerated = 's'`. Only `STORED` is supported (which is
+all Postgres itself offers).
+
 ### Foreign keys
 
 Column-level `REFERENCES` and table-level `FOREIGN KEY` — named or unnamed — are
@@ -1363,7 +1388,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE` |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE` |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
 | Auth | trust, SCRAM-SHA-256, TLS, SQL `CREATE`/`ALTER`/`DROP ROLE`/`USER` (reflected via `pg_roles`), `GRANT`/`REVOKE` (accepted) | channel binding, mTLS, enforced privileges, SQL roles wired to SCRAM login |
