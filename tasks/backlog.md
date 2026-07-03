@@ -1757,6 +1757,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   users** (constructor `users={}`), no privilege enforcement, no `pg_authid` / `pg_auth_members` /
   role-membership graph, password not stored (only a `password_set` flag), and roles live in the
   connection's db rather than being cluster-wide.
+- [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
+  IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
+  machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is
+  `"always"` / `"by_default"`; ALWAYS rejects a user-supplied value with `428C9` but accepts the
+  `DEFAULT` keyword (a VALUES `DEFAULT` cell is now filtered to "omitted" in `plan_insert` via
+  `_is_default_cell` — this also fixed general `VALUES (DEFAULT)` handling). `ALTER SEQUENCE [IF EXISTS]
+  name { RESTART [WITH n] | INCREMENT BY n | MINVALUE | MAXVALUE | START WITH | [NO] CYCLE }…` arrives as
+  a Command (`engine._alter_sequence_command` / `_parse_alter_sequence_opts` → `Catalog.alter_sequence`).
+  Reflection: `pg_attribute.attidentity` (`'a'` / `'d'`), `atthasdef` now true for sequence/default
+  columns. Tests: `tests/test_sql_identity.py`. **Limitations:** no `OVERRIDING SYSTEM VALUE` (so an
+  ALWAYS column can't be force-overridden), no `ALTER TABLE … ADD/DROP/SET GENERATED`, no
+  `ALTER SEQUENCE … OWNED BY` / `RESTART` distinction from `is_called` edge cases beyond the basic reset.
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);

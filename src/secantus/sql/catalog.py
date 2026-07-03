@@ -56,6 +56,10 @@ class Column:
     # ``DEFAULT nextval('seq')``). When set and the column is omitted at INSERT,
     # the executor assigns the sequence's next value.
     sequence: str | None = None
+    # Identity mode for a ``GENERATED … AS IDENTITY`` column: ``"always"`` (a
+    # user-supplied value is rejected) or ``"by_default"`` (like SERIAL). None for
+    # a plain SERIAL or non-identity column.
+    identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +159,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "default": c.default,
                 "comment": c.comment,
                 "sequence": c.sequence,
+                "identity": c.identity,
             }
             for c in table.columns
         ],
@@ -202,6 +207,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 default=c.get("default"),
                 comment=c.get("comment"),
                 sequence=c.get("sequence"),
+                identity=c.get("identity"),
             )
             for c in doc["columns"]
         ],
@@ -453,3 +459,27 @@ class Catalog:
             {"$set": {"last_value": value, "is_called": is_called}},
         )
         return value
+
+    def alter_sequence(self, db: str, name: str, changes: dict[str, Any]) -> None:
+        """Apply ``ALTER SEQUENCE`` changes. ``changes`` may set ``increment`` /
+        ``min_value`` / ``max_value`` / ``cycle`` / ``start``, and a ``restart``
+        key (the value to restart at, or None → the sequence's ``start``) resets
+        ``last_value`` with ``is_called`` cleared so the next ``nextval`` returns
+        it. Raises ``42P01`` if the sequence doesn't exist."""
+        doc = self.get_sequence(db, name)
+        if doc is None:
+            raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+        update: dict[str, Any] = {}
+        for key in ("increment", "min_value", "max_value", "cycle", "start"):
+            if key in changes:
+                update[key] = changes[key]
+        if "restart" in changes:
+            restart = changes["restart"]
+            update["last_value"] = (
+                int(restart)
+                if restart is not None
+                else int(changes.get("start", doc.get("start", 1)))
+            )
+            update["is_called"] = False
+        if update:
+            self._storage.update_matching(db, SEQUENCE_COLLECTION, {"_id": name}, {"$set": update})
