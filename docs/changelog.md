@@ -69,6 +69,28 @@ optimized output equals the scan output across many random queries.
   Regression: `tests/test_rust_server_smoke.py::
   test_geo_near_index_optimization_against_rust_server`.
 
+### Constant-time secret comparison in the PostgreSQL SCRAM + admin-token checks
+
+Two authentication comparisons used a plain `!=` / `==` on secret material,
+which CPython does not guarantee to run in constant time — a timing side-channel
+that can narrow a secret a byte at a time. The PostgreSQL/SQL server's SCRAM
+proof check (`sql/pgauth.py`) compared the recomputed stored-key digest with
+`!=`, and the admin console's token middleware (`admin/middleware.py`) compared
+the presented token with `!=` / `==` on both the HTTP and WebSocket paths. All
+three now use `hmac.compare_digest` (bytes-encoded, so a non-ASCII presented
+value is rejected rather than raising), matching the Mongo-side SCRAM check in
+`secantus.auth` which was already constant-time. Behaviour is otherwise
+unchanged — valid credentials/tokens are accepted, wrong or missing ones
+rejected. Found by the nightly security review (issue #195).
+
+#### Security
+
+- `sql/pgauth.py`: SCRAM stored-key comparison uses `hmac.compare_digest`.
+- `admin/middleware.py`: HTTP `TokenAuthMiddleware` and `verify_websocket_token`
+  compare the admin token with `hmac.compare_digest` (and reject a
+  missing/non-ASCII token without raising). Regression:
+  `tests/test_admin_skeleton.py::test_verify_websocket_token_is_constant_time_and_robust`.
+
 ### Rust server: bool-as-int range comparison in the query matcher
 
 The Rust server's query matcher now compares a boolean field against a numeric
