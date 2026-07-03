@@ -5,20 +5,24 @@
 //! pure-Python `apply_update` instead (which also raises the right errors).
 //!
 //! Handled: replacement-style updates, `$set`, `$setOnInsert`, `$unset`,
-//! `$inc`, `$mul`, `$push`, `$pop`, `$rename`, plus `_id` immutability.
+//! `$inc`, `$mul`, `$push`, `$pop`, `$rename`, `$bit`, `$min`/`$max` (Python `<`
+//! for numeric / string / date pairs — cross-type defers), `$addToSet` /
+//! `$pull` (Python `==` element semantics, incl. bool-as-int and structural
+//! equality via `expressions::py_eq`), plus `_id` immutability.
 //! Deferred to Python: pipeline (array) updates, positional operators
 //! (`$`/`$[]`/`$[id]`) and array filters, `$currentDate` (non-deterministic),
-//! `$min`/`$max`/`$pull`/`$addToSet`/`$bit` (Python comparison/`==` semantics),
-//! Decimal128 / non-numeric arithmetic, and every error condition (so Python
-//! raises the exact `UpdateError`).
+//! a `$min`/`$max` comparison Python's `<` would raise (cross-type / Decimal128 /
+//! ObjectId / arrays), Decimal128 / non-numeric arithmetic, and every error
+//! condition (so Python raises the exact `UpdateError`).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use bson::{Bson, Document};
 
 use crate::numeric::{as_float_like, as_int_like, int_promoted_to_bson, is_int64};
 use crate::paths::{self, get_path, has_path};
-use crate::query;
+use crate::{expressions, query};
 
 #[derive(Debug)]
 pub struct Fallback;
@@ -232,6 +236,60 @@ fn payload_doc(payload: &Bson) -> R<&Document> {
     }
 }
 
+/// Compare two BSON values the way Python's `<` / `>` would for `$min` / `$max`:
+/// `Some(Ordering)` only for the operand pairs Python compares *without raising*
+/// — both numeric (int / long / double / bool; exact when integral, else `f64`
+/// with a 2^53 safety bound so a large int can't lose precision), both strings
+/// (UTF-8 byte order == code-point order), or both dates. Any other pair
+/// (cross-type, Decimal128, ObjectId, arrays, NaN, …) returns `None`, which
+/// defers `$min`/`$max` to the Python oracle, whose `<` would raise or use an
+/// ordering not reproduced here.
+fn py_cmp(a: &Bson, b: &Bson) -> Option<Ordering> {
+    fn as_int(v: &Bson) -> Option<i64> {
+        match v {
+            Bson::Int32(n) => Some(*n as i64),
+            Bson::Int64(n) => Some(*n),
+            Bson::Boolean(x) => Some(*x as i64),
+            _ => None,
+        }
+    }
+    fn as_f(v: &Bson) -> Option<f64> {
+        match v {
+            Bson::Double(d) => Some(*d),
+            _ => as_int(v).map(|i| i as f64),
+        }
+    }
+    // Both integral (incl. bool) -> exact i64 comparison.
+    if let (Some(x), Some(y)) = (as_int(a), as_int(b)) {
+        return Some(x.cmp(&y));
+    }
+    let numeric = |v: &Bson| {
+        matches!(
+            v,
+            Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_)
+        )
+    };
+    if numeric(a) && numeric(b) {
+        // One side is a double; refuse if an integer side can't be represented
+        // exactly as f64 (else the compare could diverge from Python's exact one).
+        for v in [a, b] {
+            if let Some(i) = as_int(v) {
+                if i.unsigned_abs() >= (1u64 << 53) {
+                    return None;
+                }
+            }
+        }
+        return as_f(a)?.partial_cmp(&as_f(b)?); // NaN -> None (defer)
+    }
+    match (a, b) {
+        (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
+        (Bson::DateTime(x), Bson::DateTime(y)) => {
+            Some(x.timestamp_millis().cmp(&y.timestamp_millis()))
+        }
+        _ => None,
+    }
+}
+
 fn apply_op(
     result: &mut Document,
     op: &str,
@@ -368,8 +426,75 @@ fn apply_op(
                 }
             }
         }
-        // $currentDate (non-deterministic), $min/$max/$pull/$addToSet (Python
-        // comparison/== semantics), and unknown ops -> Python.
+        "$min" | "$max" => {
+            let want_less = op == "$min"; // $min sets when value < current
+            for (path, value) in payload {
+                for cpath in expand_path(result, path, filters, pos)? {
+                    // Python treats an absent *or null* field as "no current" and
+                    // always sets (`current is None`); else it compares.
+                    let should_set = match get_path(result, &cpath) {
+                        None | Some(Bson::Null) => true,
+                        Some(current) => {
+                            let ord = py_cmp(value, current).ok_or(Fallback)?;
+                            if want_less {
+                                ord == Ordering::Less
+                            } else {
+                                ord == Ordering::Greater
+                            }
+                        }
+                    };
+                    if should_set {
+                        set_path(result, &cpath, value.clone())?;
+                    }
+                }
+            }
+        }
+        "$addToSet" => {
+            for (path, value) in payload {
+                for cpath in expand_path(result, path, filters, pos)? {
+                    // No `$each` unwrapping — the pure oracle appends the value
+                    // (including a `$each` doc) as a single element; match it.
+                    match get_path(result, &cpath).cloned() {
+                        None | Some(Bson::Null) => {
+                            set_path(result, &cpath, Bson::Array(vec![value.clone()]))?;
+                        }
+                        Some(Bson::Array(mut a)) => {
+                            let mut present = false;
+                            for e in &a {
+                                if expressions::py_eq(e, value).map_err(|_| Fallback)? {
+                                    present = true;
+                                    break;
+                                }
+                            }
+                            if !present {
+                                a.push(value.clone());
+                            }
+                            set_path(result, &cpath, Bson::Array(a))?;
+                        }
+                        Some(_) => return Err(Fallback), // non-array -> Python raises
+                    }
+                }
+            }
+        }
+        "$pull" => {
+            for (path, criterion) in payload {
+                for cpath in expand_path(result, path, filters, pos)? {
+                    // The pure oracle removes elements that are `==` the criterion
+                    // (a literal value comparison, *not* query matching); a
+                    // non-array field is a no-op.
+                    if let Some(Bson::Array(a)) = get_path(result, &cpath).cloned() {
+                        let mut kept = Vec::with_capacity(a.len());
+                        for e in a {
+                            if !expressions::py_eq(&e, criterion).map_err(|_| Fallback)? {
+                                kept.push(e);
+                            }
+                        }
+                        set_path(result, &cpath, Bson::Array(kept))?;
+                    }
+                }
+            }
+        }
+        // $currentDate (non-deterministic) and unknown ops -> Python.
         _ => return Err(Fallback),
     }
     Ok(())
@@ -513,10 +638,11 @@ mod tests {
 
     #[test]
     fn fallbacks() {
-        // _id change, mixing, $min, pipeline-only ops -> Fallback.
+        // _id change, mixing, cross-type $min, pipeline-only ops -> Fallback.
         assert!(apply_update(&doc! {"_id": 1}, &doc! {"$set": {"_id": 2}}, false).is_err());
         assert!(apply_update(&doc! {"a": 1}, &doc! {"$set": {"a": 1}, "b": 2}, false).is_err());
-        assert!(apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": 0}}, false).is_err());
+        // Numeric $min now computes; a cross-type compare (Python `<` raises) defers.
+        assert!(apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": "x"}}, false).is_err());
         // Bare `apply_update` (no positional_matches) can't resolve `$` -> defer.
         assert!(apply_update(&doc! {"a": [1]}, &doc! {"$set": {"a.$": 9}}, false).is_err());
     }
