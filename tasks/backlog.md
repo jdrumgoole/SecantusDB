@@ -1265,15 +1265,6 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   IANA zones need a tz database — `chrono-tz` or similar); `$dateToString` locale
   / `%z`/`%Z`/ISO-week directives (Python `strftime` handles those). Fractional
   seconds stay deferred (BSON is millisecond-only).
-- [ ] **Aggregate stages:** `$setWindowFields` date-`unit` x-axis on
-  `$derivative` / `$integral` — the time `unit` scaling on the *rate* operators
-  over a date sortBy is absent from both servers (a Python oracle first, then the
-  Rust port). (Range windows with a fixed-duration date `unit` —
-  `week`/`day`/`hour`/`minute`/`second`/`millisecond` — now ship on both;
-  variable-length `month`/`quarter`/`year` still defer. The full time-series
-  operator set — `$shift` / `$expMovingAvg` / `$locf` / `$linearFill` /
-  `$derivative` / `$integral` — plus document + value-`range` windows and
-  rank/accumulators all ship on both for numeric sorts.)
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`uniqueItems` / `$ref`-style refs / `title`/`description` metadata / ...) —
   would need porting on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/

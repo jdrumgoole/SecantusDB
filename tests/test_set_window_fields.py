@@ -445,9 +445,9 @@ def test_locf_and_linear_fill(client) -> None:
     assert [d["li"] for d in out] == [None, 10, 20.0, 40, None]
 
 
-def test_unsupported_time_series_function_raises(client) -> None:
-    """A `$derivative` / `$integral` with a time `unit` (date x-axis) is still
-    deferred — raise so the gap is visible."""
+def test_derivative_unit_on_numeric_sort_raises(client) -> None:
+    """A `$derivative` / `$integral` `unit` requires a date sortBy — a numeric
+    sortBy raises."""
     coll = client["swf_db"]["timeseries"]
     coll.insert_one({"_id": 1, "v": 1, "ts": 1})
 
@@ -459,6 +459,62 @@ def test_unsupported_time_series_function_raises(client) -> None:
                         "$setWindowFields": {
                             "sortBy": {"ts": 1},
                             "output": {"d": {"$derivative": {"input": "$v", "unit": "second"}}},
+                        }
+                    }
+                ]
+            )
+        )
+
+
+def test_derivative_and_integral_with_time_unit(client) -> None:
+    """`$derivative` / `$integral` with a time `unit` over a date sortBy: the
+    x-axis is the date scaled into the unit, so the rate is *per hour*."""
+    coll = client["swf_db"]["ts_unit"]
+    coll.insert_many(
+        [
+            {"_id": i, "t": _dt.datetime(2020, 1, 1, i, tzinfo=_dt.timezone.utc), "v": v}
+            for i, v in enumerate([0, 10, 30])
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            # slope over the whole partition: (30-0)/2h = 15/hour
+                            "d": {"$derivative": {"input": "$v", "unit": "hour"}},
+                            # trapezoidal area: 5 + 20 = 25 (x in hours)
+                            "i": {"$integral": {"input": "$v", "unit": "hour"}},
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["d"] for d in out] == [15.0, 15.0, 15.0]
+    assert [d["i"] for d in out] == [25.0, 25.0, 25.0]
+
+
+def test_derivative_variable_length_unit_raises(client) -> None:
+    """A variable-length `unit` (month/quarter/year) on `$derivative` defers."""
+    coll = client["swf_db"]["ts_month"]
+    coll.insert_many(
+        [
+            {"_id": i, "t": _dt.datetime(2020, 1 + i, 1, tzinfo=_dt.timezone.utc), "v": i}
+            for i in range(3)
+        ]
+    )
+    with pytest.raises(OperationFailure):
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$setWindowFields": {
+                            "sortBy": {"t": 1},
+                            "output": {"d": {"$derivative": {"input": "$v", "unit": "month"}}},
                         }
                     }
                 ]

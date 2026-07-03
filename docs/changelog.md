@@ -42,6 +42,31 @@ and the standard admin commands `grantRolesToUser` / `revokeRolesFromUser` /
   trait, forwarded by the WT adapter to the real storage engine). Regression:
   `tests/test_rust_server_smoke.py::test_secantus_admin_prune_commands`.
 
+### `$derivative` and `$integral` gain a time `unit`
+
+The `$setWindowFields` rate operators `$derivative` and `$integral` now accept a
+time `unit`. Over a date-valued `sortBy`, `$derivative: {input: "$v", unit:
+"hour"}` reports the change in `v` *per hour* — the x-axis is the date's epoch
+milliseconds scaled into the requested unit — and `$integral` computes the
+trapezoidal area with the same unit-scaled x-axis. This is how you express a rate
+of change in meaningful units (per second, per hour, per day) instead of the raw
+millisecond spacing between timestamps.
+
+As with time-`unit` range windows, the `unit` requires a date `sortBy` (a numeric
+sort with a `unit` is rejected) and the fixed-duration units
+`week`/`day`/`hour`/`minute`/`second`/`millisecond` are supported; variable-length
+`month`/`quarter`/`year` defer. The feature ships on both servers, pinned by the
+`$setWindowFields` parity suite — the millisecond-to-unit scaling runs in IEEE
+double on both sides so the results match bit-for-bit. This completes the
+`$setWindowFields` time-`unit` surface.
+
+#### Added
+
+- `$setWindowFields` `$derivative` / `$integral` accept a fixed-duration time
+  `unit` over a date `sortBy`, scaling the x-axis into that unit so the rate /
+  area is expressed per unit. `unit` requires a date sortBy; variable-length
+  units defer.
+
 ### `$setWindowFields` range windows over a date sortBy
 
 A `$setWindowFields` value-`range` window can now span a *time* interval. Give the
