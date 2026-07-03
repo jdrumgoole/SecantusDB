@@ -548,10 +548,15 @@ def _merge_apply_matched(
                 scalar.evaluate(eq.expression, scope, sctx), target.type_for(col)
             )
         if set_doc:
+            post = {**td, **set_doc}
+            executor.enforce_update_images(
+                [post], [td["_id"]], target, storage, db, sctx.catalog, sctx.session
+            )
             storage.update_matching(db, target.collection, {"_id": td["_id"]}, {"$set": set_doc})
         return 1, {**td, **set_doc}
     action = then.sql().strip().upper()
     if action == "DELETE":
+        executor.enforce_parent_delete([td], target, storage, db, sctx.catalog)
         storage.delete_matching(db, target.collection, {"_id": td["_id"]})
         return 1, td
     if action == "DO NOTHING":
@@ -584,6 +589,7 @@ def _merge_apply_not_matched(
             scalar.evaluate(vexpr, scope, sctx), target.type_for(col)
         )
     doc.setdefault("_id", bson.ObjectId())
+    executor.enforce_insert_rows([doc], target, storage, db, sctx.catalog, sctx.session)
     storage.insert(db, target.collection, [doc])
     return 1, doc
 

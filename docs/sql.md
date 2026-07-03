@@ -304,6 +304,10 @@ unchanged. A `CHECK` whose predicate evaluates to NULL (unknown) passes, and
 NULLs are distinct in a `UNIQUE` constraint (multiple NULLs allowed) — both
 matching Postgres.
 
+Enforcement applies to **every** write path: plain `INSERT` / `UPDATE` /
+`DELETE`, `INSERT … SELECT`, `INSERT … ON CONFLICT` (including a constraint other
+than its arbiter target), and `MERGE`'s `INSERT` / `UPDATE` / `DELETE` actions.
+
 `FOREIGN KEY` enforcement covers both sides: a child `INSERT`/`UPDATE` whose FK
 columns are all non-NULL requires a matching parent row (MATCH SIMPLE — a NULL in
 any FK column exempts the row), and `DELETE`/`UPDATE` of a referenced parent row
