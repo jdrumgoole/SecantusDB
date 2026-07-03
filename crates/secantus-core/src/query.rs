@@ -526,17 +526,32 @@ fn cmp_op(
 
 /// Ordering between two values, or `None` when not comparable (Python's
 /// comparison raises `TypeError`, which the matcher treats as no-match).
-/// `Err(Fallback)` for cases whose Python semantics we don't reproduce (bool
-/// participating as int, structural array/doc ordering, exotic types).
+/// `Err(Fallback)` for cases whose Python semantics we don't reproduce
+/// (structural array/doc ordering, exotic types).
 fn compare_values(
     a: &Bson,
     b: &Bson,
     coll: Option<&Collation>,
 ) -> Result<Option<Ordering>, Fallback> {
-    // Python compares bool as int (bool is an int subclass) for $gt/$lt; rather
-    // than reproduce that quirk, defer any bool operand to Python.
+    // Python compares bool as its int value (bool is an int subclass): bool vs
+    // int / long / double compares numerically; bool vs any other type — incl.
+    // Decimal128 — makes `op(bool, other)` raise `TypeError`, i.e. no match. (A
+    // bool operand is 0 or 1, so an `f64` compare is exact even against a large
+    // int, whose magnitude is unambiguously != 0/1.)
     if matches!(a, Bson::Boolean(_)) || matches!(b, Bson::Boolean(_)) {
-        return Err(Fallback);
+        fn num_f(v: &Bson) -> Option<f64> {
+            match v {
+                Bson::Boolean(x) => Some(*x as i64 as f64),
+                Bson::Int32(n) => Some(*n as f64),
+                Bson::Int64(n) => Some(*n as f64),
+                Bson::Double(d) => Some(*d),
+                _ => None,
+            }
+        }
+        return Ok(match (num_f(a), num_f(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y), // NaN -> None (Python nan compares False)
+            _ => None,                               // bool vs non-numeric -> no match
+        });
     }
     if let (Some(na), Some(nb)) = (numeric::classify(a), numeric::classify(b)) {
         return Ok(numeric::cmp(&na, &nb));

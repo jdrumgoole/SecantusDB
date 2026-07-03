@@ -227,6 +227,19 @@ CURATED = [
     ({"x": True}, {"x": 1}),
     ({"x": 1}, {"x": True}),
     ({"x": False}, {"x": 0}),
+    # bool-as-int comparison ($gt/$lt/$gte/$lte): bool compares numerically with
+    # int / long / double (True == 1), but bool vs a non-numeric (incl.
+    # Decimal128) is TypeError -> no match.
+    ({"x": True}, {"x": {"$gt": 0}}),
+    ({"x": True}, {"x": {"$lt": 1}}),
+    ({"x": True}, {"x": {"$gte": 1}}),
+    ({"x": False}, {"x": {"$lt": 1}}),
+    ({"x": 5}, {"x": {"$gt": True}}),
+    ({"x": True}, {"x": {"$gt": False}}),
+    ({"x": True}, {"x": {"$gt": Int64(0)}}),
+    ({"x": True}, {"x": {"$gt": "a"}}),  # bool vs string -> no match
+    ({"x": True}, {"x": {"$gt": Decimal128("0.5")}}),  # bool vs decimal -> no match
+    ({"x": [True, False]}, {"x": {"$gt": 0}}),  # multikey array with bool elements
     ({"x": Decimal128("3.5")}, {"x": {"$gt": 2}}),
     ({"x": 3.5}, {"x": {"$gt": Decimal128("2")}}),
     ({"x": Decimal128("1.5")}, {"x": {"$gt": 2}}),

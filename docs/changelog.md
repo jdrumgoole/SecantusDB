@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: bool-as-int range comparison in the query matcher
+
+The Rust server's query matcher now compares a boolean field against a numeric
+`$gt` / `$lt` / `$gte` / `$lte` bound (and vice versa) natively, instead of
+deferring the whole match to a `BadValue`. Following the Python oracle — which
+compares with Python's `<`, where `bool` is an `int` subclass — `True` counts as
+`1` and `False` as `0`: `{x: {$gt: 0}}` now matches `x: true` on the Rust server,
+matching the Python one. A bool compared against a non-numeric type (string,
+Decimal128, date, …) is `TypeError` in Python, i.e. no match, and is reproduced
+as such. Boolean *equality* is unaffected (a bool stays distinct from `1`).
+
+Pinned by the query parity suite (curated bool-vs-number / bool-vs-non-numeric /
+multikey cases, plus the existing randomized fuzz whose scalar corpus already
+includes booleans — 0 divergences).
+
+#### Added
+
+- **Rust server:** bool-as-int `$gt` / `$lt` / `$gte` / `$lte` comparison in the
+  `secantus-core` query matcher (numeric compare vs int / long / double; no match
+  vs any other type), matching the Python oracle's `<` semantics.
+
 ### Rust server: `$min` / `$max` / `$addToSet` / `$pull` update operators
 
 The Rust server now applies four more update operators natively instead of
