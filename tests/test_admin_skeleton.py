@@ -1901,3 +1901,31 @@ async def test_json_pretty_static_file_served(http: AsyncClient) -> None:
     # documents — a doc with "<script>" in a string field must not turn
     # into a real script tag in the rendered page.
     assert "escapeHtml" in body
+
+
+def test_verify_websocket_token_is_constant_time_and_robust() -> None:
+    """verify_websocket_token uses hmac.compare_digest and tolerates a missing /
+    non-ASCII presented value without raising (issue #195)."""
+    from secantus.admin.middleware import QUERY_NAME, verify_websocket_token
+
+    ok = verify_websocket_token(
+        expected="s3cret", query_params={QUERY_NAME: "s3cret"}, cookies={}
+    )
+    assert ok is True
+
+    wrong = verify_websocket_token(
+        expected="s3cret", query_params={QUERY_NAME: "nope"}, cookies={}
+    )
+    assert wrong is False
+
+    # Absent token → rejected, not an exception.
+    assert verify_websocket_token(expected="s3cret", query_params={}, cookies={}) is False
+
+    # A non-ASCII presented value must be rejected, not raise (the bytes-encode
+    # guard around compare_digest).
+    assert (
+        verify_websocket_token(
+            expected="s3cret", query_params={QUERY_NAME: "s3crét"}, cookies={}
+        )
+        is False
+    )

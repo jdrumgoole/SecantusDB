@@ -113,7 +113,10 @@ class ScramExchange:
         client_signature = hmac.new(self._creds.stored_key, auth_bytes, hashlib.sha256).digest()
         client_proof = base64.b64decode(proof_b64)
         client_key = bytes(a ^ b for a, b in zip(client_proof, client_signature, strict=True))
-        if hashlib.sha256(client_key).digest() != self._creds.stored_key:
+        # Constant-time compare — a plain ``!=`` on the digests would leak
+        # timing that narrows a brute force. Mirrors the Mongo-side SCRAM check
+        # in ``secantus.auth`` (which uses ``hmac.compare_digest``). (#195)
+        if not hmac.compare_digest(hashlib.sha256(client_key).digest(), self._creds.stored_key):
             raise PGAuthError("password authentication failed")
 
         server_signature = hmac.new(self._creds.server_key, auth_bytes, hashlib.sha256).digest()
