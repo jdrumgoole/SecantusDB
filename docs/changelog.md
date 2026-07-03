@@ -19,6 +19,30 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: `$dateFromString` `format` (strptime)
+
+The Rust server now parses a `$dateFromString` `format` string natively for the
+numeric-directive subset (`%Y` `%y` `%m` `%d` `%H` `%M` `%S` `%j` `%%`, literals,
+and whitespace), instead of the whole expression being unsupported. So
+`$dateFromString: {dateString: "15/01/2024", format: "%d/%m/%Y"}` now evaluates on
+the Rust server, matching the Python one.
+
+Fidelity is structural: the format is translated into a regex built from
+CPython's own `_strptime` per-directive sub-patterns, so field matching — the
+2-digit-year pivot (`00`–`68` → 2000s, `69`–`99` → 1900s), the value-range digit
+rules, single-digit leniency, day-of-year, and full-input consumption — is
+identical to Python's by construction. It's pinned by the expression parity suite
+with a 6000-case fuzz corpus (0 divergences). Directives outside the subset
+(`%z` / `%Z` / `%a` / `%b` / `%p` / …), a `%j` combined with `%m`/`%d`, a leap
+second, or any input Python would reject still defer to the Python oracle.
+
+#### Added
+
+- **Rust server:** `$dateFromString` `format` (strptime) for the numeric-directive
+  subset, built from CPython `_strptime`'s exact regex fragments for byte-faithful
+  field matching. Combined with the fixed-offset `timezone` support, a naive
+  strptime result is interpreted in the given offset zone.
+
 ### Rust server: fixed-offset `timezone` on `$dateToString` / `$dateFromString`
 
 The Rust server now handles a fixed-offset `timezone` on the `$dateToString` and

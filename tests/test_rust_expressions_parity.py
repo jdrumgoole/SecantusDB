@@ -361,6 +361,38 @@ CURATED = [
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "UTC"}}, {}),
     # A string that already carries an offset ignores the timezone field.
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z", "timezone": "+05:00"}}, {}),
+    # $dateFromString `format` (strptime) — numeric-directive subset, built from
+    # CPython _strptime's exact per-directive regexes so field matching agrees.
+    ({"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:45", "format": "%Y-%m-%dT%H:%M:%S"}}, {}),
+    ({"$dateFromString": {"dateString": "20240115", "format": "%Y%m%d"}}, {}),  # adjacent
+    ({"$dateFromString": {"dateString": "2024-1-5", "format": "%Y-%m-%d"}}, {}),  # single-digit
+    ({"$dateFromString": {"dateString": "68-06-15", "format": "%y-%m-%d"}}, {}),  # 2000s pivot
+    ({"$dateFromString": {"dateString": "69-06-15", "format": "%y-%m-%d"}}, {}),  # 1900s pivot
+    ({"$dateFromString": {"dateString": "2024-100", "format": "%Y-%j"}}, {}),  # day-of-year
+    ({"$dateFromString": {"dateString": "100", "format": "%j"}}, {}),  # default year 1900
+    ({"$dateFromString": {"dateString": "date: 2024-01-15", "format": "date: %Y-%m-%d"}}, {}),
+    (
+        {
+            "$dateFromString": {
+                "dateString": "2024-01-15",
+                "format": "%Y-%m-%d",
+                "timezone": "+05:00",
+            }
+        },
+        {},
+    ),
+    # defers: bad field / leap second / unsupported directive / literal mismatch.
+    ({"$dateFromString": {"dateString": "2023-02-29", "format": "%Y-%m-%d"}}, {}),  # -> defer
+    (
+        {"$dateFromString": {"dateString": "10:30:60", "format": "%H:%M:%S"}},
+        {},
+    ),  # leap sec -> defer
+    ({"$dateFromString": {"dateString": "2024-01-15", "format": "%Y-%m-%d%z"}}, {}),  # %z -> defer
+    (
+        {"$dateFromString": {"dateString": "2024/01/15", "format": "%Y-%m-%d"}},
+        {},
+    ),  # mismatch -> defer
     # $dateToString — default format + unambiguous directives. `_DT` is a modern
     # date; a separate date carries non-zero milliseconds for %L.
     ({"$dateToString": {"date": "$d"}}, {"d": _DT}),  # default %Y-%m-%dT%H:%M:%S.%LZ
@@ -614,6 +646,48 @@ def test_date_extractor_fuzz():
                 continue
             py = _pure.evaluate(expr, doc)
             assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+
+
+def test_date_from_string_strptime_fuzz():
+    """$dateFromString `format` (strptime): the Rust regex-built parser must match
+    Python's datetime.strptime exactly wherever Rust computes (else it defers).
+    Mixes valid strftime-rendered inputs with random junk so both the compute and
+    the defer/raise paths are exercised."""
+    rng = random.Random(0x57717D)
+    fmts = [
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y%m%d",
+        "%m-%d-%Y",
+        "%Y-%j",
+        "%y-%m-%d",
+        "at %Y-%m-%d %H:%M",
+        "%H:%M:%S",
+    ]
+    for _ in range(6000):
+        fmt = rng.choice(fmts)
+        if rng.random() < 0.8:
+            try:
+                dt = datetime.datetime(
+                    rng.randint(1, 9999),
+                    rng.randint(1, 12),
+                    rng.randint(1, 28),
+                    rng.randint(0, 23),
+                    rng.randint(0, 59),
+                    rng.randint(0, 59),
+                )
+                inp = dt.strftime(fmt)
+            except ValueError:
+                continue
+        else:
+            inp = "".join(rng.choice("0123456789-/T: ") for _ in range(rng.randint(3, 12)))
+        expr = {"$dateFromString": {"dateString": inp, "format": fmt}}
+        rust = _rust_eval(expr, {})
+        if rust is None:
+            continue  # Rust deferred -> Python (compute or raise) handles it
+        py = _bson_norm(_pure.evaluate(expr, {}))
+        assert rust == py, f"rust={rust!r} pure={py!r} inp={inp!r} fmt={fmt!r}"
 
 
 def test_date_arithmetic_fuzz():

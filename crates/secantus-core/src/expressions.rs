@@ -26,7 +26,8 @@
 //!
 //! The remaining operators are *principled* defers — they can't be reproduced
 //! without a fidelity risk: regex (`$regexMatch`/…) needs Python's `re`;
-//! `$dateToString`/`$dateFromString` need `strftime`/`strptime` + timezones;
+//! `$dateToString`/`$dateFromString` handle a numeric-directive `strftime`/
+//! `strptime` subset + fixed-offset timezones, deferring named IANA zones;
 //! `$convert`/`$toDecimal` + float-`str()` / string-parse / Decimal128
 //! conversions; `$round`/`$pow`/`$trunc` (rounding mode) and transcendentals
 //! (`$exp`/`$ln`/`$log`/`$log10` — last-ULP) risk float divergence; `$sortArray`
@@ -1226,16 +1227,23 @@ fn bounded_datetime(millis: i128) -> R {
 /// a *naive* dateString as being in that zone (`utc = wall - offset`); a string
 /// that already carries a `Z` / offset ignores it, mirroring the pure oracle.
 ///
-/// Defers (`Fallback` → Python) on: a `format` (strptime) or a *named* IANA
-/// `timezone` (needs a tz database), **fractional seconds** (BSON is
-/// millisecond-only but `fromisoformat` keeps microseconds), a space separator or
-/// other non-canonical/offset shape, an out-of-range/invalid field, or a
-/// non-string `dateString`. A null `dateString` returns `onNull` (or null).
+/// A string `format` is parsed by `strptime_millis` (the numeric-directive
+/// subset); a null/absent format uses the ISO parser above.
+///
+/// Defers (`Fallback` → Python) on: a *named* IANA `timezone` (needs a tz
+/// database), a `format` directive/shape `strptime_millis` doesn't reproduce,
+/// **fractional seconds** (BSON is millisecond-only but `fromisoformat` keeps
+/// microseconds), a space separator or other non-canonical/offset shape, an
+/// out-of-range/invalid field, or a non-string `dateString`. A null `dateString`
+/// returns `onNull` (or null).
 fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback)?;
-    if spec.contains_key("format") {
-        return Err(Fallback); // strptime -> Python
-    }
+    // A string `format` selects strptime; a null/absent format uses ISO parsing.
+    let format = match spec.get("format") {
+        None | Some(Bson::Null) => None,
+        Some(Bson::String(f)) => Some(f.as_str()),
+        Some(_) => return Err(Fallback), // non-string format -> Python
+    };
     // A fixed-offset `timezone` field interprets a *naive* dateString as being in
     // that zone (`utc = wall - offset`); a named zone / malformed offset defers.
     let tz_offset = match spec.get("timezone") {
@@ -1256,20 +1264,22 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = raw else {
         return Err(Fallback); // Python raises "dateString must be a string"
     };
-    // The tz applies only when the string carries no offset of its own, mirroring
-    // the pure oracle's `parsed.tzinfo is None` guard.
-    let has_embedded_offset =
-        s.ends_with('Z') || (s.len() == 25 && matches!(s.as_bytes()[19], b'+' | b'-'));
-    match parse_iso(&s) {
-        Some(millis) => {
-            let millis = match tz_offset {
-                Some(off) if !has_embedded_offset => millis - off as i128 * 60_000,
-                _ => millis,
-            };
-            bounded_datetime(millis)
+    // strptime always yields a naive instant, so the tz always applies; the ISO
+    // path applies it only when the string carries no offset of its own (the pure
+    // oracle's `parsed.tzinfo is None` guard).
+    let (millis, apply_tz) = match format {
+        Some(fmt) => (strptime_millis(&s, fmt).ok_or(Fallback)?, true),
+        None => {
+            let has_embedded_offset =
+                s.ends_with('Z') || (s.len() == 25 && matches!(s.as_bytes()[19], b'+' | b'-'));
+            (parse_iso(&s).ok_or(Fallback)?, !has_embedded_offset)
         }
-        None => Err(Fallback), // non-canonical / invalid -> Python (onError or raise)
-    }
+    };
+    let millis = match tz_offset {
+        Some(off) if apply_tz => millis - off as i128 * 60_000,
+        _ => millis,
+    };
+    bounded_datetime(millis)
 }
 
 /// `$dateToString` — bounded port of `expressions._op_date_to_string`. Formats a
@@ -1365,6 +1375,89 @@ fn parse_iso(s: &str) -> Option<i128> {
         return parse_naive(base).map(|ms| ms - off_min as i128 * 60_000);
     }
     parse_naive(s)
+}
+
+/// `$dateFromString` `format` (strptime) for the bounded numeric-directive subset
+/// — epoch millis (UTC / naive), or `None` (defer to the pure oracle) for an
+/// unsupported directive, a non-matching input, or an out-of-range field.
+///
+/// The format is translated into a regex built from CPython `_strptime`'s *exact*
+/// per-directive sub-patterns, so field matching is identical by construction;
+/// `\A…\z` requires the whole input to be consumed (Python's "unconverted data
+/// remains" check). Supported directives: `%Y` `%y` `%m` `%d` `%H` `%M` `%S` `%j`
+/// `%%`; whitespace runs match `\s+` and literals match themselves
+/// (case-insensitively, like `TimeRE`). Any other directive, `%j` combined with
+/// `%m`/`%d`, a second of 60/61 (leap second — `datetime` rejects it), or an
+/// invalid day-of-month defers to Python.
+fn strptime_millis(data: &str, format: &str) -> Option<i128> {
+    let mut pat = String::from(r"(?i)\A");
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let frag = match chars.next()? {
+                'Y' => r"(?P<Y>\d\d\d\d)",
+                'y' => r"(?P<y>\d\d)",
+                'm' => r"(?P<m>1[0-2]|0[1-9]|[1-9])",
+                'd' => r"(?P<d>3[0-1]|[1-2]\d|0[1-9]|[1-9]| [1-9])",
+                'H' => r"(?P<H>2[0-3]|[0-1]\d|\d)",
+                'M' => r"(?P<M>[0-5]\d|\d)",
+                'S' => r"(?P<S>6[0-1]|[0-5]\d|\d)",
+                'j' => r"(?P<j>36[0-6]|3[0-5]\d|[1-2]\d\d|0[1-9]\d|00[1-9]|[1-9]\d|0[1-9]|[1-9])",
+                '%' => {
+                    pat.push('%');
+                    continue;
+                }
+                _ => return None, // unsupported directive -> defer
+            };
+            pat.push_str(frag);
+        } else if c.is_whitespace() {
+            pat.push_str(r"\s+");
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+        } else {
+            pat.push_str(&regex::escape(&c.to_string()));
+        }
+    }
+    pat.push_str(r"\z");
+    let re = regex::Regex::new(&pat).ok()?;
+    let caps = re.captures(data)?;
+    let num = |name: &str| -> Option<i64> { caps.name(name)?.as_str().trim().parse().ok() };
+    // Year: %Y (4-digit) or %y (2-digit, Python's 00-68→2000s / 69-99→1900s
+    // pivot), else the strptime default of 1900.
+    let year = match num("Y") {
+        Some(y) => y,
+        None => match num("y") {
+            Some(y) if y <= 68 => 2000 + y,
+            Some(y) => 1900 + y,
+            None => 1900,
+        },
+    };
+    let (month, day) = match num("j") {
+        Some(j) => {
+            if caps.name("m").is_some() || caps.name("d").is_some() {
+                return None; // %j combined with %m/%d -> defer
+            }
+            let (yy, mm, dd) = civil_from_days(days_from_civil(year, 1, 1) + (j - 1));
+            if yy != year {
+                return None; // day-of-year overflowed the year -> defer
+            }
+            (mm, dd)
+        }
+        None => (num("m").unwrap_or(1), num("d").unwrap_or(1)),
+    };
+    let (hh, mi, ss) = (
+        num("H").unwrap_or(0),
+        num("M").unwrap_or(0),
+        num("S").unwrap_or(0),
+    );
+    // The regexes already bound most fields; still reject an invalid day-of-month
+    // and a 60/61 leap second (which `datetime` raises on) -> defer.
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) || ss > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days as i128 * 86_400_000 + (hh * 3_600_000 + mi * 60_000 + ss * 1000) as i128)
 }
 
 /// Resolve a MongoDB `timezone` field to a fixed UTC offset in signed minutes,
