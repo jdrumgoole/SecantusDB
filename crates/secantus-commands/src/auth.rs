@@ -638,6 +638,116 @@ pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }
 
+/// Load and decode a user record, or return `UserNotFound`.
+fn load_user_record(
+    ctx: &mut CommandContext,
+    db_name: &str,
+    username: &str,
+) -> Result<Document, CommandError> {
+    let Some(bytes) = ctx
+        .storage()?
+        .get_user(db_name, username)
+        .map_err(crate::util::command_error)?
+    else {
+        return Err(CommandError::new(
+            USER_NOT_FOUND,
+            "UserNotFound",
+            format!("User '{username}@{db_name}' not found"),
+        ));
+    };
+    Document::from_reader(&mut bytes.as_slice())
+        .map_err(|e| CommandError::new(1, "InternalError", format!("decode user record: {e}")))
+}
+
+/// Re-encode a user record and persist it (overwriting the existing one).
+fn save_user_record(
+    ctx: &mut CommandContext,
+    db_name: &str,
+    username: &str,
+    record: &Document,
+) -> Result<(), CommandError> {
+    let mut bytes = Vec::new();
+    record
+        .to_writer(&mut bytes)
+        .map_err(|e| CommandError::new(1, "InternalError", format!("encode user record: {e}")))?;
+    ctx.storage()?
+        .add_user(db_name, username, &bytes, true)
+        .map_err(crate::util::command_error)?;
+    Ok(())
+}
+
+/// `(role, db)` identity of a role-assignment entry, for dedup / set membership.
+fn role_pair(b: &Bson) -> Option<(String, String)> {
+    let d = b.as_document()?;
+    Some((
+        d.get_str("role").ok()?.to_string(),
+        d.get_str("db").ok()?.to_string(),
+    ))
+}
+
+/// `grantRolesToUser` — add roles to a user's assignment list (deduped by
+/// `(role, db)`), taking effect immediately on the calling connection. Mirrors
+/// the Python `grantRolesToUser` command.
+pub fn grant_roles_to_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let username = match doc.get_str("grantRolesToUser") {
+        Ok(u) if !u.is_empty() => u.to_string(),
+        _ => return Err(bad_value("grantRolesToUser: username (string) required")),
+    };
+    let db_name = if ctx.db_name.is_empty() {
+        "admin".to_string()
+    } else {
+        ctx.db_name.clone()
+    };
+    // Validate the requested roles (RoleNotFound) before touching the user.
+    let additions = normalise_roles(doc.get("roles"), &db_name, ctx)?;
+    let mut record = load_user_record(ctx, &db_name, &username)?;
+
+    let mut roles: Vec<Bson> = record.get_array("roles").cloned().unwrap_or_default();
+    let mut seen: Vec<(String, String)> = roles.iter().filter_map(role_pair).collect();
+    for add in additions {
+        if let Some(pair) = role_pair(&add) {
+            if !seen.contains(&pair) {
+                seen.push(pair);
+                roles.push(add);
+            }
+        }
+    }
+    record.insert("roles", roles);
+    save_user_record(ctx, &db_name, &username, &record)?;
+    refresh_effective_roles(ctx);
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `revokeRolesFromUser` — remove roles from a user's assignment list (matched
+/// by `(role, db)`), taking effect immediately on the calling connection.
+/// Mirrors the Python `revokeRolesFromUser` command.
+pub fn revoke_roles_from_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let username = match doc.get_str("revokeRolesFromUser") {
+        Ok(u) if !u.is_empty() => u.to_string(),
+        _ => return Err(bad_value("revokeRolesFromUser: username (string) required")),
+    };
+    let db_name = if ctx.db_name.is_empty() {
+        "admin".to_string()
+    } else {
+        ctx.db_name.clone()
+    };
+    let revocations = normalise_roles(doc.get("roles"), &db_name, ctx)?;
+    let mut record = load_user_record(ctx, &db_name, &username)?;
+
+    let drop_set: Vec<(String, String)> = revocations.iter().filter_map(role_pair).collect();
+    let kept: Vec<Bson> = record
+        .get_array("roles")
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| role_pair(r).map(|p| !drop_set.contains(&p)).unwrap_or(true))
+        .collect();
+    record.insert("roles", kept);
+    save_user_record(ctx, &db_name, &username, &record)?;
+    refresh_effective_roles(ctx);
+    Ok(doc! { "ok": 1.0 })
+}
+
 /// `dropAllUsersFromDatabase` — drop every user bound to the calling db; returns
 /// `n` = removed count.
 pub fn drop_all_users_from_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
@@ -903,6 +1013,90 @@ mod tests {
             ctx,
         );
         assert_eq!(cont.get_f64("ok").unwrap(), 1.0, "auth failed: {cont:?}");
+    }
+
+    /// A user's current `(role, db)` assignments, sorted, for assertions.
+    fn user_role_pairs(ctx: &CommandContext, user: &str) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = lookup_roles(ctx, "admin", user)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(role_pair)
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn grant_and_revoke_roles_to_user() {
+        let (mut ctx, _auth) = ctx_with_store();
+        let r = dispatch(
+            &doc! {"createUser": "alice", "pwd": "pw",
+            "roles": [{"role": "read", "db": "admin"}], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0, "{r:?}");
+
+        // Grant readWrite — now has both.
+        let g = dispatch(
+            &doc! {"grantRolesToUser": "alice",
+            "roles": [{"role": "readWrite", "db": "admin"}], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(g.get_f64("ok").unwrap(), 1.0, "{g:?}");
+        assert_eq!(
+            user_role_pairs(&ctx, "alice"),
+            vec![
+                ("read".to_string(), "admin".to_string()),
+                ("readWrite".to_string(), "admin".to_string()),
+            ]
+        );
+
+        // Granting an already-held role is idempotent (no duplicate).
+        dispatch(
+            &doc! {"grantRolesToUser": "alice",
+            "roles": [{"role": "read", "db": "admin"}], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(user_role_pairs(&ctx, "alice").len(), 2);
+
+        // Revoke read — only readWrite remains.
+        let rv = dispatch(
+            &doc! {"revokeRolesFromUser": "alice",
+            "roles": [{"role": "read", "db": "admin"}], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(rv.get_f64("ok").unwrap(), 1.0, "{rv:?}");
+        assert_eq!(
+            user_role_pairs(&ctx, "alice"),
+            vec![("readWrite".to_string(), "admin".to_string())]
+        );
+    }
+
+    #[test]
+    fn grant_roles_to_missing_user_is_user_not_found() {
+        let (mut ctx, _auth) = ctx_with_store();
+        let r = dispatch(
+            &doc! {"grantRolesToUser": "ghost",
+            "roles": [{"role": "read", "db": "admin"}], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(r.get_i32("code").unwrap(), USER_NOT_FOUND);
+        assert_eq!(r.get_str("codeName").unwrap(), "UserNotFound");
+    }
+
+    #[test]
+    fn grant_unknown_role_is_role_not_found() {
+        let (mut ctx, _auth) = ctx_with_store();
+        dispatch(
+            &doc! {"createUser": "bob", "pwd": "pw", "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        let r = dispatch(
+            &doc! {"grantRolesToUser": "bob",
+            "roles": [{"role": "nonexistentRole", "db": "admin"}], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(r.get_str("codeName").unwrap(), "RoleNotFound");
     }
 
     #[test]

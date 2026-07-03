@@ -40,6 +40,29 @@ distinct on both servers; top-level scalar arrays are fully faithful.)
   (value equality, cross-type-numeric aware for top-level scalars). `false` is a
   no-op.
 
+### Rust server: `grantRolesToUser` / `revokeRolesFromUser`
+
+The Rust server now implements the two user-role management commands it was
+missing: `grantRolesToUser` adds roles to a user's assignment list (deduped by
+`(role, db)`), and `revokeRolesFromUser` removes them. Both validate the
+requested roles against the built-in + custom role catalogue (`RoleNotFound`),
+require the user to exist (`UserNotFound`), and refresh the calling connection's
+effective roles so a privilege change takes effect immediately — matching the
+Python handlers. Previously the Rust server could only set a user's roles at
+`createUser` / `updateUser` time; the admin console's Users → Roles editor can
+now grant/revoke against a Rust target. Slice 3 of the Rust admin-command parity
+work (issue #163).
+
+Remaining #163 gaps: `killOp`, and fleshing out the `getLog` / `profile` stubs.
+
+#### Added
+
+- **Rust server:** `grantRolesToUser` / `revokeRolesFromUser` commands (gated by
+  `A_GRANT_ROLE` / `A_REVOKE_ROLE` under `--auth`). Regressions:
+  `crates/secantus-commands` unit tests (grant/revoke, dedup, `UserNotFound`,
+  `RoleNotFound`) and
+  `tests/test_rust_server_smoke.py::test_secantus_grant_revoke_roles_to_user`.
+
 ### Rust server: `secantusAdmin.restoreArchive`
 
 The Rust server now implements `secantusAdmin.restoreArchive`, completing the

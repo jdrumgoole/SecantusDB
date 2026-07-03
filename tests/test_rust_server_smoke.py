@@ -507,3 +507,24 @@ def test_restore_archive_rejects_nonempty_target(tmp_path) -> None:
         assert ei.value.code == 20
     finally:
         srv.stop()
+
+
+def test_secantus_grant_revoke_roles_to_user(tmp_path) -> None:
+    """grantRolesToUser / revokeRolesFromUser modify a user's roles on the Rust
+    server, reflected by usersInfo (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        admin = _client(srv)["admin"]
+        admin.command("createUser", "carol", pwd="pw", roles=[{"role": "read", "db": "admin"}])
+
+        admin.command("grantRolesToUser", "carol", roles=[{"role": "readWrite", "db": "admin"}])
+        info = admin.command("usersInfo", "carol")
+        roles = {(r["role"], r["db"]) for r in info["users"][0]["roles"]}
+        assert roles == {("read", "admin"), ("readWrite", "admin")}
+
+        admin.command("revokeRolesFromUser", "carol", roles=[{"role": "read", "db": "admin"}])
+        info2 = admin.command("usersInfo", "carol")
+        roles2 = {(r["role"], r["db"]) for r in info2["users"][0]["roles"]}
+        assert roles2 == {("readWrite", "admin")}
+    finally:
+        srv.stop()
