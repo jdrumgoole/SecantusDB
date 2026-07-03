@@ -448,3 +448,48 @@ def test_compound_geo_scalar_input_validation_still_strict(
     with pytest.raises(OperationFailure) as exc:
         coll.insert_one({"_id": 1, "loc": _pt(200.0, 0.0), "cat": "park"})
     assert exc.value.code == 16572
+
+
+def test_geo_near_index_optimization_matches_scan(client: MongoClient) -> None:
+    """A leading ``$geoNear`` with a ``maxDistance`` rides the geo index (via a
+    conservative ``$geoWithin`` candidate fetch) instead of scanning the whole
+    collection — and the output must be byte-for-byte identical to the
+    brute-force path. Compare an indexed collection (optimized) against an
+    unindexed one (full scan) over many random queries."""
+    import random
+
+    rng = random.Random(2024)
+    docs = [
+        {
+            "_id": i,
+            "loc": _pt(rng.uniform(-20, 20), rng.uniform(-20, 20)),
+            "v": rng.randint(0, 5),
+        }
+        for i in range(400)
+    ]
+    indexed = client["geo_idx"]["gn_indexed"]
+    scanned = client["geo_idx"]["gn_scanned"]
+    indexed.insert_many(docs)
+    scanned.insert_many(docs)
+    indexed.create_index([("loc", "2dsphere")])  # only this one gets optimized
+
+    for _ in range(40):
+        cx, cy = rng.uniform(-20, 20), rng.uniform(-20, 20)
+        max_d = rng.uniform(50_000, 2_000_000)  # metres
+        stage = {
+            "$geoNear": {
+                "near": _pt(cx, cy),
+                "distanceField": "d",
+                "maxDistance": max_d,
+                "key": "loc",
+                "spherical": True,
+            }
+        }
+        pipeline: list[dict] = [stage]
+        if rng.random() < 0.4:
+            pipeline.append({"$match": {"v": {"$gte": 2}}})
+        if rng.random() < 0.3:
+            stage["$geoNear"]["query"] = {"v": {"$lte": 4}}
+        opt = [(d["_id"], round(d["d"], 6)) for d in indexed.aggregate(pipeline)]
+        brute = [(d["_id"], round(d["d"], 6)) for d in scanned.aggregate(pipeline)]
+        assert opt == brute, f"center={(cx, cy)} maxDistance={max_d}"

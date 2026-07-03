@@ -18,7 +18,21 @@ These work end-to-end but cut corners.
 
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
 - [ ] **`top` counters are always zero** — the command returns the mongod shape (one `totals` entry per namespace, `total`/`readLock`/`writeLock`/per-op sections) and mongotop renders it like an idle server, but SecantusDB doesn't instrument per-namespace operation timing, so every `{time, count}` is `0`. Real counters would need per-ns accounting in `Metrics` threaded through dispatch.
-- [ ] **`$geoNear` is a brute-force COLLSCAN on both servers** — `aggregate._stage_geo_near` (Python) and `secantus-commands::aggregate::apply_geo_near` (Rust) both walk *every* doc and compute the distance, even when a `2d` / `2dsphere` index exists and a `maxDistance` bound is set. Results are correct and the two servers match; this is purely a missing perf optimization. **Fix the Python server first** (it's the oracle): when `$geoNear` is the leading stage with a `maxDistance` (and a usable geo index for `key`), lift the `near` + `maxDistance` into a `$geoWithin: {$centerSphere|$center: [...]}` candidate query and serve it through `Storage.find_matching` (the same geo-index path `$near`/`$geoWithin` already use — `_pick_geo_index_for_filter` / `_try_geo_index_id_keys`), then compute exact distances + sort over just the candidates. Without `maxDistance`, `$geoNear` must return all docs in distance order, so a full scan is unavoidable — the optimization only applies to the bounded case. Once Python ships it, mirror in the Rust aggregate's leading-stage initial-fetch (the same place a leading `$match` is lifted into the index filter). Output (docs + order + attached `distanceField`) must stay identical to the brute-force path — only the candidate set shrinks.
+- [ ] **`$geoNear` index optimization — Rust-server mirror remaining.** The
+  **Python server ships it** (0.5.4b111): a leading `$geoNear` with a `maxDistance`
+  and a matching `2d`/`2dsphere` index lifts `near` + `maxDistance` into a
+  conservative `$geoWithin: {$centerSphere|$center: [...]}` candidate query
+  (`aggregate._geo_near_index_filter`, radius inflated by ~1e-9 so the candidate
+  set is a strict superset), served through `Storage.find_matching`; the
+  `$geoNear` stage then re-applies the exact distance filter, so output stays
+  identical to the brute-force path (regression: `tests/test_geo_index.py::
+  test_geo_near_index_optimization_matches_scan`). An unbounded `$geoNear` (no
+  `maxDistance`) still scans (unavoidable — must return all docs in distance
+  order); a mismatched index type falls back to the full scan. **Remaining:**
+  mirror in the Rust aggregate command's leading-stage initial-fetch
+  (`secantus-commands`), the same place a leading `$match` is lifted into the
+  index filter. Output (docs + order + attached `distanceField`) must stay
+  identical — only the candidate set shrinks.
 - ~~**`renameCollection` cross-process safety**~~ structurally guaranteed by WiredTiger (b34). Within-process atomicity is the storage `RLock`. Cross-process exclusion is `WiredTiger.lock` — a second `wiredtiger_open` on the same path fails with ``WT_ERROR Resource busy`` before any state is touched, so concurrent writers across processes / worktrees can't exist in the first place. See `tests/test_storage_exclusion.py`.
 - ~~**`createIndexes` collation**~~ shipped (single-field b25 + compound b27). `sortkey.encode_value_directed` takes a `collation` kwarg; index entries are written under the index's stored collation; single-field equality / range / `$in` (`_find_leading_field_index`), compound bare-equality (`_pick_compound_eq_index`), and compound prefix + trailing-operator (`_pick_compound_range_index`) all thread collation through and gate by exact match. Unique-probe path reads each index's stored collation too. Strength 1/2/3 + `caseLevel` work uniformly across single- and compound-field indexes; `numericOrdering` still falls back to COLLSCAN at every level (would need a length-prefixed digit-run encoding to stay byte-sortable). See `docs/indexes.md` "Per-index collation".
 

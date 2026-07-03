@@ -2581,6 +2581,63 @@ def _parse_geo_near_origin(near: Any, spherical_opt: Any) -> tuple[bool, tuple[f
     raise AggregateError("$geoNear `near` must be a GeoJSON Point or a [x, y] pair")
 
 
+def _geo_near_index_filter(
+    spec: Any, storage: Any, db_name: str | None, coll_name: str | None
+) -> dict[str, Any] | None:
+    """Conservative ``$geoWithin`` candidate filter for a leading ``$geoNear`` with
+    a ``maxDistance``, so the initial fetch can ride a geo index instead of
+    scanning the whole collection — or ``None`` when the optimization doesn't
+    apply (no ``maxDistance``, unparseable ``near``, or no matching geo index on
+    ``key``).
+
+    The candidate radius is inflated by a tiny epsilon so the fetched set is a
+    strict **superset** of the exact within-``maxDistance`` set; the ``$geoNear``
+    stage then re-applies the exact distance filter, so its output is byte-for-byte
+    identical to the brute-force path — only the number of docs fetched shrinks.
+    The candidate shape (``$centerSphere`` vs ``$center``) must match the index
+    type (``2dsphere`` vs ``2d``); a mismatch falls back to the full scan.
+    """
+    if not isinstance(spec, Mapping):
+        return None
+    max_distance = spec.get("maxDistance")
+    if not isinstance(max_distance, (int, float)) or isinstance(max_distance, bool):
+        return None
+    if storage is None or not db_name or not coll_name:
+        return None
+    # Geo-indexed fields (field -> "2dsphere"/"2d"), in list_indexes order.
+    geo_fields: dict[str, str] = {}
+    for index in storage.list_indexes(db_name, coll_name):
+        key_spec = index.get("key", {})
+        if not isinstance(key_spec, Mapping):
+            continue
+        for field, value in key_spec.items():
+            if isinstance(value, str) and value in ("2dsphere", "2d"):
+                geo_fields.setdefault(field, value)
+    if not geo_fields:
+        return None
+    key = spec.get("key")
+    if not (isinstance(key, str) and key):
+        key = next(iter(geo_fields))  # infer: first geo index (mongod's behaviour)
+    if key not in geo_fields:
+        return None
+    try:
+        spherical, center = _parse_geo_near_origin(spec.get("near"), spec.get("spherical"))
+    except AggregateError:
+        return None
+    idx_type = geo_fields[key]
+    if spherical and idx_type != "2dsphere":
+        return None
+    if not spherical and idx_type != "2d":
+        return None
+    from secantus.geo import EARTH_RADIUS_METERS
+
+    radius = float(max_distance) * (1.0 + 1e-9)  # inflate -> guaranteed superset
+    cx, cy = center
+    if spherical:
+        return {key: {"$geoWithin": {"$centerSphere": [[cx, cy], radius / EARTH_RADIUS_METERS]}}}
+    return {key: {"$geoWithin": {"$center": [[cx, cy], radius]}}}
+
+
 _STAGES = {
     "$match": _stage_match,
     "$count": _stage_count,
