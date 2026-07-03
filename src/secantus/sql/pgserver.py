@@ -25,7 +25,9 @@ import threading
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
-from secantus.sql import errors, pgwire, typemap
+from secantus.sql import copyfmt, errors, pgwire, planner, typemap
+from secantus.sql import engine as sql_engine
+from secantus.sql.catalog import Catalog
 from secantus.sql.engine import run_sql
 from secantus.sql.pgauth import (
     SCRAM_SHA_256,
@@ -287,6 +289,14 @@ class SecantusPGServer:
                 conn.sendall(reply)
 
     def _handle_query(self, conn: socket.socket, session: Session, sql: str) -> None:
+        # A COPY … FROM/TO STDIN/STDOUT statement drives its own sub-protocol
+        # (CopyIn/CopyOut) mid-query, so it can't go through run_sql.
+        from sqlglot import exp
+
+        stmts = planner.parse(sql)
+        if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
+            self._handle_copy(conn, session, stmts[0])
+            return
         out = bytearray()
         try:
             results = run_sql(self.storage, session.database, sql, session=session)
@@ -303,6 +313,70 @@ class SecantusPGServer:
         # The ReadyForQuery status reflects the transaction block (I/T/E).
         out += pgwire.ready_for_query(session.txn_status())
         conn.sendall(bytes(out))
+
+    def _handle_copy(self, conn: socket.socket, session: Session, stmt: Any) -> None:
+        """Run the ``COPY`` sub-protocol: CopyInResponse → CopyData* → CopyDone for
+        ``FROM STDIN``, or CopyOutResponse → CopyData* → CopyDone for ``TO STDOUT``."""
+        catalog = Catalog(self.storage)
+        try:
+            plan = sql_engine.copy_plan(stmt, self.storage, session.database, catalog)
+            if plan.to_stdout:
+                self._copy_out(conn, session, catalog, plan)
+            else:
+                self._copy_in(conn, session, catalog, plan)
+        except errors.SQLError as exc:
+            conn.sendall(pgwire.error_response(exc.sqlstate, exc.message))
+            conn.sendall(pgwire.ready_for_query(session.txn_status()))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("error executing COPY")
+            conn.sendall(pgwire.error_response("XX000", f"internal error: {exc}"))
+            conn.sendall(pgwire.ready_for_query(session.txn_status()))
+
+    def _copy_in(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
+        conn.sendall(pgwire.copy_in_response(len(plan.columns)))
+        chunks: list[bytes] = []
+        while True:
+            msg = pgwire.read_message(conn)
+            if msg.type == "d":  # CopyData
+                chunks.append(msg.payload)
+            elif msg.type == "c":  # CopyDone
+                break
+            elif msg.type == "f":  # CopyFail
+                reason = msg.payload.split(b"\x00", 1)[0].decode("utf-8", "replace")
+                conn.sendall(pgwire.error_response("57014", f"COPY from stdin failed: {reason}"))
+                conn.sendall(pgwire.ready_for_query(session.txn_status()))
+                return
+            else:  # pragma: no cover - client desync
+                break
+        data = b"".join(chunks).decode("utf-8")
+        if plan.fmt == "csv":
+            rows = copyfmt.parse_csv(
+                data, delimiter=plan.delimiter, null=plan.null, header=plan.header
+            )
+        else:
+            rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)
+        try:
+            n = sql_engine.copy_insert(self.storage, session.database, catalog, session, plan, rows)
+        except errors.SQLError as exc:
+            conn.sendall(pgwire.error_response(exc.sqlstate, exc.message))
+            conn.sendall(pgwire.ready_for_query(session.txn_status()))
+            return
+        conn.sendall(pgwire.command_complete(f"COPY {n}"))
+        conn.sendall(pgwire.ready_for_query(session.txn_status()))
+
+    def _copy_out(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
+        rows = sql_engine.copy_extract(self.storage, session.database, catalog, session, plan)
+        if plan.fmt == "csv":
+            header = plan.columns if plan.header else None
+            text = copyfmt.format_csv(rows, delimiter=plan.delimiter, null=plan.null, header=header)
+        else:
+            text = copyfmt.format_text(rows, delimiter=plan.delimiter, null=plan.null)
+        conn.sendall(pgwire.copy_out_response(len(plan.columns)))
+        if text:
+            conn.sendall(pgwire.copy_data(text.encode("utf-8")))
+        conn.sendall(pgwire.copy_done())
+        conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
+        conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
     # -- context manager ---------------------------------------------------- #
 
