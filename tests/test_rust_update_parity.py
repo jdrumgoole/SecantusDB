@@ -91,10 +91,30 @@ CURATED = [
     ({"n": 5}, {"$set": {"n": 5}, "$inc": {"m": 1}}, False),
     ({}, {}, False),  # empty update
     ({"a": 1}, {"b": 2, "c": [1, 2, {"d": 3}]}, False),  # replacement, no _id
-    # Cases the Rust path should defer (rust returns None -> skipped):
-    ({"a": 5}, {"$min": {"a": 3}}, False),
+    # $min / $max — numeric compare, absent/null treated as no-current, bool-as-int.
+    ({"a": 5}, {"$min": {"a": 3}}, False),  # 3 < 5 -> 3
+    ({"a": 5}, {"$min": {"a": 7}}, False),  # no change
+    ({}, {"$min": {"a": 4}}, False),  # absent -> set
+    ({"a": None}, {"$max": {"a": 9}}, False),  # null -> set
+    ({"a": 5}, {"$max": {"a": 9}}, False),
+    ({"a": True}, {"$max": {"a": 2}}, False),  # bool-as-int max(1,2)=2
+    ({"a": "m"}, {"$min": {"a": "a"}}, False),  # string compare
+    ({"a": 2}, {"$min": {"a": 1.5}}, False),  # int/float cross-numeric
+    ({"a": 5}, {"$min": {"a": "x"}}, False),  # cross-type -> defer (Python raises)
+    # $addToSet — dedup by value (bool-as-int, structural), absent -> create.
+    ({"a": [1, 2]}, {"$addToSet": {"a": 3}}, False),  # append
+    ({"a": [1, 2, 3]}, {"$addToSet": {"a": 2}}, False),  # present -> no change
+    ({"a": [1, 2]}, {"$addToSet": {"a": True}}, False),  # True==1 present
+    ({"a": [{"x": 1}]}, {"$addToSet": {"a": {"x": 1}}}, False),  # structural dup
+    ({}, {"$addToSet": {"a": 7}}, False),  # absent -> [7]
+    ({"a": 5}, {"$addToSet": {"a": 1}}, False),  # non-array -> defer (Python raises)
+    # $pull — remove elements `==` the criterion (value compare, not query).
     ({"a": [1, 2, 3, 2]}, {"$pull": {"a": 2}}, False),
-    ({"a": [1, 2]}, {"$addToSet": {"a": 3}}, False),
+    ({"a": [{"x": 1}, {"x": 2}]}, {"$pull": {"a": {"x": 1}}}, False),  # structural
+    ({"a": [1, True, 2]}, {"$pull": {"a": 1}}, False),  # 1==True removes both
+    ({"a": 5}, {"$pull": {"a": 1}}, False),  # non-array -> no-op
+    # $bit already handled above.
+    # Cases the Rust path should defer (rust returns None -> skipped):
     ({"_id": 1}, {"_id": 2, "x": 9}, False),  # _id change -> error path
     ({}, {"$set": {"a": 1}, "b": 2}, False),  # mixing -> error path
     ({"a": [1]}, {"$set": {"a.$": 9}}, False),  # positional -> defer
@@ -201,7 +221,22 @@ def _rand_doc(rng):
 
 
 def _rand_update(rng):
-    op = rng.choice(["$set", "$unset", "$inc", "$mul", "$push", "$pop", "$rename", "replace"])
+    op = rng.choice(
+        [
+            "$set",
+            "$unset",
+            "$inc",
+            "$mul",
+            "$push",
+            "$pop",
+            "$rename",
+            "$min",
+            "$max",
+            "$addToSet",
+            "$pull",
+            "replace",
+        ]
+    )
     field = rng.choice(["a", "b", "n", "a.x", "b.0"])
     if op == "replace":
         return {k: _rand_scalar(rng) for k in rng.sample(["p", "q", "r"], rng.randint(0, 3))}
@@ -211,7 +246,7 @@ def _rand_update(rng):
         return {op: {field: ""}}
     if op in ("$inc", "$mul"):
         return {op: {field: rng.choice([rng.randint(-5, 5), round(rng.uniform(-3, 3), 2)])}}
-    if op == "$push":
+    if op in ("$push", "$min", "$max", "$addToSet", "$pull"):
         return {op: {field: _rand_scalar(rng)}}
     if op == "$pop":
         return {op: {field: rng.choice([1, -1])}}

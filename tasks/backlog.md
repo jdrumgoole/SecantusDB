@@ -904,11 +904,16 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   and every error condition (so the exact `UpdateError`/`PathError` is raised by
   Python). Parity pinned by `tests/test_rust_update_parity.py` (curated +
   6000-case fuzz).
-- [ ] **Widen the Rust update operators (Rust server)** to cover current defers
-  where faithful: `$min`/`$max` (Python `<` cross-type / raise semantics),
-  `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and structural),
-  `$bit`. In the Rust server a defer surfaces as `BadValue`, so these are real
-  capability gaps (not silent fallbacks). Field-order on `$set` of an existing
+- [ ] **Widen the Rust update operators (Rust server)** — remaining defers where
+  faithful. **Done (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
+  string / date pairs, bool-as-int; a cross-type comparison Python would raise on
+  defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and
+  structural equality via `expressions::py_eq`); `$bit` was already native.
+  **Still deferred:** a `$min`/`$max` comparison Python's `<` raises on
+  (cross-type / Decimal128 / ObjectId / array operands), pipeline (array) updates,
+  positional operators / array filters, and Decimal128 / non-numeric arithmetic.
+  In the Rust server a defer surfaces as `BadValue`, so these are real capability
+  gaps (not silent fallbacks). Field-order on `$set` of an existing
   key is **verified correct** (0.5.3-beta.22+): `bson::Document::insert` preserves
   an existing field's position and appends new keys — matching mongod. (The
   retired "flip `update` default to Rust" framing is dropped — no in-process

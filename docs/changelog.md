@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: `$min` / `$max` / `$addToSet` / `$pull` update operators
+
+The Rust server now applies four more update operators natively instead of
+rejecting them: `$min` and `$max` (keep the smaller / larger of the current and
+given value), `$addToSet` (append to an array only if not already present), and
+`$pull` (remove the array elements equal to a value). Previously each surfaced as
+a `BadValue` error on the Rust server; they now match the Python server.
+
+Fidelity follows the Python oracle exactly. `$min`/`$max` compare with Python's
+`<` semantics for numeric / string / date pairs (bool counts as its integer
+value; a cross-type comparison Python would raise on defers to Python), and an
+absent-or-null field is treated as "no current value". `$addToSet` and `$pull`
+use Python `==` element equality — cross-type-equal numerics (`1` == `True`) and
+structural document/array equality included — via the shared value-equality
+helper. It's pinned by the update parity suite with curated edge cases and a fuzz
+corpus (0 divergences). `$bit` was already native.
+
+#### Added
+
+- **Rust server:** `$min` / `$max` / `$addToSet` / `$pull` update operators in the
+  `secantus-core` update engine, matching the Python oracle's comparison / `==`
+  element semantics.
+
 ### Rust server: `$dateFromString` `format` (strptime)
 
 The Rust server now parses a `$dateFromString` `format` string natively for the
