@@ -277,12 +277,10 @@ insp.get_foreign_keys("orders")
 also be added after the fact with `ALTER TABLE … ADD [CONSTRAINT name] FOREIGN
 KEY (…) REFERENCES …`.
 
-### CHECK and UNIQUE constraints (declared, not enforced)
+### CHECK and UNIQUE constraints
 
 `CHECK` and `UNIQUE` constraints — column-level, table-level, named or unnamed —
-are recorded in the catalog and reflected, but (like foreign keys) **not
-enforced**: SecantusDB does not validate a `CHECK` predicate or reject a
-duplicate `UNIQUE` value on write.
+are recorded in the catalog, reflected, and **enforced** on write (see below).
 
 ```sql
 CREATE TABLE t (
@@ -323,6 +321,33 @@ CREATE TABLE orders (id bigint PRIMARY KEY,
 INSERT INTO orders (id, uid) VALUES (1, 999);  -- 23503: no such user
 DELETE FROM users WHERE id = 1;                -- also deletes user 1's orders
 ```
+
+#### Deferred constraints (`DEFERRABLE` / `INITIALLY DEFERRED`)
+
+A `UNIQUE` or `FOREIGN KEY` constraint declared `DEFERRABLE` can have its check
+postponed to the end of the transaction, so a block may hold a
+transiently-inconsistent state and still commit — as long as the constraint holds
+by the time it's checked. `INITIALLY DEFERRED` defers by default; `INITIALLY
+IMMEDIATE` (the default) checks on each statement unless `SET CONSTRAINTS` defers
+it. A deferred violation is re-checked at `COMMIT`; a violation that survives
+raises (`23505` / `23503`) and rolls the transaction back.
+
+```sql
+CREATE TABLE orders (id bigint PRIMARY KEY,
+                     uid bigint REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED);
+
+BEGIN;
+INSERT INTO orders (id, uid) VALUES (1, 5);   -- user 5 doesn't exist yet — OK, deferred
+INSERT INTO users  (id, name) VALUES (5, 'e'); -- now it does
+COMMIT;                                        -- FK re-checked here: passes
+```
+
+`SET CONSTRAINTS { ALL | name [, …] } { DEFERRED | IMMEDIATE }` overrides the
+deferral mode for the current transaction. Switching a pending constraint to
+`IMMEDIATE` re-checks it right away (a surviving violation raises there, not at
+`COMMIT`). Deferrability reflects through `pg_catalog.pg_constraint`
+(`condeferrable` / `condeferred`) and
+`information_schema.table_constraints` (`is_deferrable` / `initially_deferred`).
 
 Unnamed constraints get Postgres' default names (`<table>_<col>_key`,
 `<table>_<col>_check`). They reflect through `pg_catalog.pg_constraint`

@@ -66,12 +66,14 @@ class ForeignKey:
     ref_columns: tuple[str, ...]
     on_delete: str | None = None  # "CASCADE" / "SET NULL" / ... (informational)
     on_update: str | None = None
+    deferrable: bool = False  # DEFERRABLE — the check can be postponed to COMMIT
+    initially_deferred: bool = False  # INITIALLY DEFERRED — deferred by default
 
 
 @dataclass(frozen=True)
 class CheckConstraint:
-    """A declared (never enforced) CHECK constraint. Recorded for reflection only
-    — ``expression`` is the rendered SQL of the predicate (e.g. ``age >= 0``)."""
+    """A declared CHECK constraint. ``expression`` is the rendered SQL of the
+    predicate (e.g. ``age >= 0``); it is enforced on write."""
 
     name: str
     expression: str
@@ -79,11 +81,12 @@ class CheckConstraint:
 
 @dataclass(frozen=True)
 class UniqueConstraint:
-    """A declared (never enforced) UNIQUE constraint over one or more columns.
-    Recorded for reflection only — uniqueness is not checked on write."""
+    """A declared UNIQUE constraint over one or more columns, enforced on write."""
 
     name: str
     columns: tuple[str, ...]
+    deferrable: bool = False
+    initially_deferred: bool = False
 
 
 @dataclass
@@ -157,6 +160,8 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "ref_columns": list(fk.ref_columns),
                 "on_delete": fk.on_delete,
                 "on_update": fk.on_update,
+                "deferrable": fk.deferrable,
+                "initially_deferred": fk.initially_deferred,
             }
             for fk in table.foreign_keys
         ],
@@ -164,7 +169,13 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
             {"name": ck.name, "expression": ck.expression} for ck in table.check_constraints
         ],
         "unique_constraints": [
-            {"name": uq.name, "columns": list(uq.columns)} for uq in table.unique_constraints
+            {
+                "name": uq.name,
+                "columns": list(uq.columns),
+                "deferrable": uq.deferrable,
+                "initially_deferred": uq.initially_deferred,
+            }
+            for uq in table.unique_constraints
         ],
     }
 
@@ -195,6 +206,8 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 ref_columns=tuple(fk["ref_columns"]),
                 on_delete=fk.get("on_delete"),
                 on_update=fk.get("on_update"),
+                deferrable=bool(fk.get("deferrable", False)),
+                initially_deferred=bool(fk.get("initially_deferred", False)),
             )
             for fk in doc.get("foreign_keys", [])
         ],
@@ -203,7 +216,12 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
             for ck in doc.get("check_constraints", [])
         ],
         unique_constraints=[
-            UniqueConstraint(name=uq["name"], columns=tuple(uq["columns"]))
+            UniqueConstraint(
+                name=uq["name"],
+                columns=tuple(uq["columns"]),
+                deferrable=bool(uq.get("deferrable", False)),
+                initially_deferred=bool(uq.get("initially_deferred", False)),
+            )
             for uq in doc.get("unique_constraints", [])
         ],
     )

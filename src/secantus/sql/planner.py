@@ -854,11 +854,22 @@ def _ref_actions(ref: exp.Reference) -> tuple[str | None, str | None]:
     return on_delete, on_update
 
 
+def _deferrable_flags(options: Any) -> tuple[bool, bool]:
+    """``(deferrable, initially_deferred)`` parsed from a constraint's option
+    strings (``DEFERRABLE`` / ``NOT DEFERRABLE`` / ``INITIALLY DEFERRED`` /
+    ``INITIALLY IMMEDIATE``)."""
+    texts = [str(o).upper() for o in (options or [])]
+    deferrable = "DEFERRABLE" in texts and "NOT DEFERRABLE" not in texts
+    initially_deferred = deferrable and "INITIALLY DEFERRED" in texts
+    return deferrable, initially_deferred
+
+
 def _make_fk(
     table_name: str, cols: tuple[str, ...], ref: exp.Reference, name: str | None = None
 ) -> ForeignKey:
     ref_table, ref_cols = _ref_target(ref)
     on_delete, on_update = _ref_actions(ref)
+    deferrable, initially_deferred = _deferrable_flags(ref.args.get("options"))
     # Postgres' default constraint name: <table>_<firstcol>_fkey (an explicit
     # ``CONSTRAINT <name>`` wins when supplied, e.g. from ALTER TABLE ADD).
     con_name = name or (f"{table_name}_{cols[0]}_fkey" if cols else f"{table_name}_fkey")
@@ -869,6 +880,8 @@ def _make_fk(
         ref_columns=ref_cols,
         on_delete=on_delete,
         on_update=on_update,
+        deferrable=deferrable,
+        initially_deferred=initially_deferred,
     )
 
 
@@ -920,7 +933,10 @@ def make_unique_constraint(
     constraints get Postgres' default name (``<table>_<col1>_<col2>_key``)."""
     cols = _unique_cols(inner.this, col)
     cname = name or f"{table_name}_{'_'.join(cols)}_key"
-    return UniqueConstraint(name=cname, columns=cols)
+    deferrable, initially_deferred = _deferrable_flags(inner.args.get("options"))
+    return UniqueConstraint(
+        name=cname, columns=cols, deferrable=deferrable, initially_deferred=initially_deferred
+    )
 
 
 def _extract_constraints(

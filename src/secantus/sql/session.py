@@ -89,6 +89,29 @@ class Session:
     savepoints: list[Any] = field(default_factory=list)
     # Open server-side cursors by name (``DECLARE … CURSOR`` / ``FETCH`` / ``CLOSE``).
     cursors: dict[str, Any] = field(default_factory=dict)
+    # Deferred-constraint state (DEFERRABLE FK / UNIQUE). ``pending_deferred`` holds
+    # re-check records collected while a deferred constraint would be violated
+    # inside a transaction; they run at COMMIT (or SET CONSTRAINTS … IMMEDIATE).
+    # ``deferred_all`` is the SET CONSTRAINTS ALL override (None = per-constraint
+    # default); ``deferred_names`` overrides individual constraints by name.
+    pending_deferred: list[Any] = field(default_factory=list)
+    deferred_all: bool | None = None
+    deferred_names: dict[str, bool] = field(default_factory=dict)
+
+    def constraint_is_deferred(self, name: str, initially_deferred: bool) -> bool:
+        """Whether constraint ``name`` is currently deferred, honouring SET
+        CONSTRAINTS overrides over the constraint's INITIALLY DEFERRED default."""
+        if name in self.deferred_names:
+            return self.deferred_names[name]
+        if self.deferred_all is not None:
+            return self.deferred_all
+        return initially_deferred
+
+    def reset_deferred(self) -> None:
+        """Clear all deferred-constraint state (at end of transaction)."""
+        self.pending_deferred = []
+        self.deferred_all = None
+        self.deferred_names = {}
 
     def get_setting(self, name: str) -> str:
         return self.settings.get(name, GUC_DEFAULTS.get(name, ""))

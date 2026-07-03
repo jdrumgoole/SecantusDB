@@ -300,6 +300,8 @@ def _unique_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
                     "conkey": [attnum.get(c, 0) for c in uq.columns],
                     "columns": list(uq.columns),
                     "condef": f"UNIQUE ({', '.join(uq.columns)})",
+                    "deferrable": uq.deferrable,
+                    "initially_deferred": uq.initially_deferred,
                 }
             )
             oid += 1
@@ -389,8 +391,8 @@ def _info_table_constraints(
                 "table_schema": "public",
                 "table_name": fk["table"].name,
                 "constraint_type": "FOREIGN KEY",
-                "is_deferrable": "NO",
-                "initially_deferred": "NO",
+                "is_deferrable": "YES" if fk["fk"].deferrable else "NO",
+                "initially_deferred": "YES" if fk["fk"].initially_deferred else "NO",
             }
             for fk in _foreign_keys(db, catalog)
         ]
@@ -403,8 +405,8 @@ def _info_table_constraints(
                 "table_schema": "public",
                 "table_name": con["table"].name,
                 "constraint_type": ctype,
-                "is_deferrable": "NO",
-                "initially_deferred": "NO",
+                "is_deferrable": "YES" if con.get("deferrable") else "NO",
+                "initially_deferred": "YES" if con.get("initially_deferred") else "NO",
             }
             for ctype, builder in (("UNIQUE", _unique_constraints), ("CHECK", _check_constraints))
             for con in builder(db, catalog)
@@ -735,6 +737,8 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "conindid": ix["indexrelid"],
                 "contype": "p",
                 "contypid": 0,  # not a domain constraint
+                "condeferrable": False,
+                "condeferred": False,
                 "conkey": list(ix["indkey"]),
                 "confkey": None,
             }
@@ -750,6 +754,8 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "conindid": 0,
                 "contype": "f",
                 "contypid": 0,
+                "condeferrable": fk["fk"].deferrable,
+                "condeferred": fk["fk"].initially_deferred,
                 "conkey": fk["conkey"],
                 "confkey": fk["confkey"],
             }
@@ -764,6 +770,8 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "conindid": uq["conindid"],
                 "contype": "u",
                 "contypid": 0,
+                "condeferrable": uq["deferrable"],
+                "condeferred": uq["initially_deferred"],
                 "conkey": uq["conkey"],
                 "confkey": None,
             }
@@ -778,6 +786,8 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "conindid": 0,
                 "contype": "c",
                 "contypid": 0,
+                "condeferrable": False,
+                "condeferred": False,
                 "conkey": None,
                 "confkey": None,
             }
@@ -1070,6 +1080,8 @@ _register(
         ("confrelid", "int4"),
         ("conindid", "int4"),
         ("contype", "text"),
+        ("condeferrable", "bool"),
+        ("condeferred", "bool"),
         ("conkey", "json"),
         ("confkey", "json"),
     ],

@@ -484,8 +484,8 @@ def enforce_insert_rows(
 ) -> None:
     """Enforce every declared constraint against rows about to be inserted."""
     _validate_rows(docs, table, storage, db, session, catalog)
-    _validate_unique_rows(docs, table, storage, db)
-    _validate_fk_child_rows(docs, table, storage, db, catalog)
+    _validate_unique_rows(docs, table, storage, db, session=session)
+    _validate_fk_child_rows(docs, table, storage, db, catalog, session)
 
 
 def enforce_update_images(
@@ -506,8 +506,10 @@ def enforce_update_images(
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     for post in post_images:
         _validate_write_row(post, table, ctx)
-    _validate_unique_rows(post_images, table, storage, db, exclude_ids=frozenset(matched_ids))
-    _validate_fk_child_rows(post_images, table, storage, db, catalog)
+    _validate_unique_rows(
+        post_images, table, storage, db, exclude_ids=frozenset(matched_ids), session=session
+    )
+    _validate_fk_child_rows(post_images, table, storage, db, catalog, session)
 
 
 def enforce_parent_delete(
@@ -524,6 +526,23 @@ def _uq_violation(uq: Any) -> errors.SQLError:
     return errors.unique_violation(f'duplicate key value violates unique constraint "{uq.name}"')
 
 
+def _maybe_defer(session: Any, kind: str, table_name: str, constraint: Any) -> bool:
+    """If ``constraint`` is DEFERRABLE and currently deferred inside an open
+    transaction, record a pending re-check on the session and return True (the
+    caller skips the immediate raise — the constraint is re-validated at COMMIT or
+    ``SET CONSTRAINTS … IMMEDIATE``). Returns False otherwise (raise now)."""
+    if session is None or getattr(session, "txn_handle", None) is None:
+        return False
+    if not getattr(constraint, "deferrable", False):
+        return False
+    if not session.constraint_is_deferred(constraint.name, constraint.initially_deferred):
+        return False
+    record = (kind, table_name, constraint.name)
+    if record not in session.pending_deferred:
+        session.pending_deferred.append(record)
+    return True
+
+
 def _validate_unique_rows(
     docs: list[dict[str, Any]],
     table: Any,
@@ -531,12 +550,14 @@ def _validate_unique_rows(
     db: str,
     *,
     exclude_ids: frozenset = frozenset(),
+    session: Any = None,
 ) -> None:
     """Enforce declared UNIQUE constraints against a batch of rows (23505). A row
     with any NULL in a constraint's columns is exempt (NULLs are distinct in a
     UNIQUE constraint). Duplicates *within* the batch collide, and each row is
     probed against stored rows (``exclude_ids`` skips the rows an UPDATE is
-    rewriting, so a row keeping its own value doesn't conflict with itself)."""
+    rewriting, so a row keeping its own value doesn't conflict with itself). A
+    deferred constraint records a pending re-check instead of raising."""
     if getattr(table, "reflected", False) or not table.unique_constraints:
         return
     seen: dict[str, set] = {uq.name: set() for uq in table.unique_constraints}
@@ -546,12 +567,17 @@ def _validate_unique_rows(
             key = tuple(get_path(doc, f) for f in fields)
             if any(v is None for v in key):
                 continue
-            if key in seen[uq.name]:
+            violated = key in seen[uq.name]
+            if not violated:
+                probe = dict(zip(fields, key, strict=True))
+                for existing in storage.find_matching(db, table.collection, probe):
+                    if existing.get("_id") not in exclude_ids:
+                        violated = True
+                        break
+            if violated:
+                if _maybe_defer(session, "unique", table.name, uq):
+                    continue
                 raise _uq_violation(uq)
-            probe = dict(zip(fields, key, strict=True))
-            for existing in storage.find_matching(db, table.collection, probe):
-                if existing.get("_id") not in exclude_ids:
-                    raise _uq_violation(uq)
             seen[uq.name].add(key)
 
 
@@ -1055,9 +1081,14 @@ def _validate_update_post_images(
     for post in post_images:
         _validate_write_row(post, table, ctx)
     _validate_unique_rows(
-        post_images, table, storage, db, exclude_ids=frozenset(d["_id"] for d in matched)
+        post_images,
+        table,
+        storage,
+        db,
+        exclude_ids=frozenset(d["_id"] for d in matched),
+        session=session,
     )
-    _validate_fk_child_rows(post_images, table, storage, db, catalog)
+    _validate_fk_child_rows(post_images, table, storage, db, catalog, session)
     _enforce_fk_on_parent_update(matched, post_images, table, storage, db, catalog)
 
 
@@ -1080,11 +1111,12 @@ def _parent_probe(fk: Any, parent: Any, values: list[Any]) -> dict[str, Any]:
 
 
 def _validate_fk_child_rows(
-    docs: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any
+    docs: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any, session: Any = None
 ) -> None:
     """Referential integrity on the child side: every INSERT/UPDATE row whose FK
     columns are all non-NULL must have a matching parent row (23503). MATCH SIMPLE
-    — a NULL in any FK column exempts the row."""
+    — a NULL in any FK column exempts the row. A deferred FK records a pending
+    re-check instead of raising."""
     if catalog is None or getattr(table, "reflected", False) or not table.foreign_keys:
         return
     for doc in docs:
@@ -1098,10 +1130,71 @@ def _validate_fk_child_rows(
                 continue  # parent table not declared — can't check
             probe = _parent_probe(fk, parent, values)
             if not storage.find_matching(db, parent.collection, probe, limit=1):
+                if _maybe_defer(session, "fk", table.name, fk):
+                    continue
                 raise errors.foreign_key_violation(
                     f'insert or update on table "{table.name}" violates foreign key '
                     f'constraint "{fk.name}"'
                 )
+
+
+def flush_deferred(
+    session: Any, storage: Any, db: str, catalog: Any, names: set | None = None
+) -> None:
+    """Re-validate every constraint whose deferred violation was recorded during
+    the transaction, against the current (uncommitted) state. Raises on the first
+    that still fails — the caller aborts the transaction. Clears the flushed
+    records; ``names`` (when given) restricts the flush to those constraint names,
+    leaving the rest pending (for ``SET CONSTRAINTS <name> IMMEDIATE``)."""
+    if names is None:
+        pending = session.pending_deferred
+        session.pending_deferred = []
+    else:
+        pending = [r for r in session.pending_deferred if r[2] in names]
+        session.pending_deferred = [r for r in session.pending_deferred if r[2] not in names]
+    for kind, table_name, cname in pending:
+        table = catalog.get(db, table_name) if catalog is not None else None
+        if table is None:
+            continue  # table dropped inside the txn — nothing to re-check
+        if kind == "unique":
+            _recheck_unique(table, cname, storage, db)
+        elif kind == "fk":
+            _recheck_fk(table, cname, storage, db, catalog)
+
+
+def _recheck_unique(table: Any, cname: str, storage: Any, db: str) -> None:
+    uq = next((u for u in table.unique_constraints if u.name == cname), None)
+    if uq is None:
+        return
+    fields = [table.field_for(c) for c in uq.columns]
+    seen: set = set()
+    for doc in storage.find_matching(db, table.collection, {}):
+        key = tuple(get_path(doc, f) for f in fields)
+        if any(v is None for v in key):
+            continue
+        if key in seen:
+            raise _uq_violation(uq)
+        seen.add(key)
+
+
+def _recheck_fk(table: Any, cname: str, storage: Any, db: str, catalog: Any) -> None:
+    fk = next((f for f in table.foreign_keys if f.name == cname), None)
+    if fk is None:
+        return
+    parent = catalog.get(db, fk.ref_table)
+    if parent is None:
+        return
+    fields = [table.field_for(c) for c in fk.columns]
+    for doc in storage.find_matching(db, table.collection, {}):
+        values = [get_path(doc, f) for f in fields]
+        if any(v is None for v in values):
+            continue
+        probe = _parent_probe(fk, parent, values)
+        if not storage.find_matching(db, parent.collection, probe, limit=1):
+            raise errors.foreign_key_violation(
+                f'insert or update on table "{table.name}" violates foreign key '
+                f'constraint "{fk.name}"'
+            )
 
 
 def _referencing_fks(catalog: Any, db: str, parent_name: str) -> list[tuple[Any, Any]]:
