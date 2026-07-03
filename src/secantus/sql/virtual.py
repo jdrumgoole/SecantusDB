@@ -66,11 +66,23 @@ def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
 
 
 _VIEW_OID_BASE = 50000
+_SEQUENCE_OID_BASE = 55000
 
 
 def _view_names(db: str, catalog: Catalog) -> list[str]:
     lister = getattr(catalog, "list_views", None)
     return lister(db) if lister is not None else []
+
+
+def _sequence_names(db: str, catalog: Catalog) -> list[str]:
+    lister = getattr(catalog, "list_sequences", None)
+    return lister(db) if lister is not None else []
+
+
+def _sequence_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    """Stable pg_class OIDs per sequence — a distinct range so relkind='S' rows
+    never collide with tables / indexes / views."""
+    return {name: _SEQUENCE_OID_BASE + i for i, name in enumerate(_sequence_names(db, catalog))}
 
 
 def _matview_names(db: str, catalog: Catalog) -> set[str]:
@@ -553,8 +565,30 @@ def _info_referential_constraints(
 
 
 def _info_sequences(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    # No sequences / identity columns — present-but-empty for the same reason.
-    return []
+    rows = []
+    for name in _sequence_names(db, catalog):
+        seq = catalog.get_sequence(db, name)
+        if seq is None:
+            continue
+        inc = int(seq.get("increment", 1))
+        maxv = seq.get("max_value")
+        minv = seq.get("min_value")
+        rows.append(
+            {
+                "sequence_catalog": db,
+                "sequence_schema": "public",
+                "sequence_name": name,
+                "data_type": "bigint",
+                "numeric_precision": 64,
+                "numeric_scale": 0,
+                "start_value": str(seq.get("start", 1)),
+                "minimum_value": str(minv if minv is not None else (1 if inc > 0 else -(2**63))),
+                "maximum_value": str(maxv if maxv is not None else (2**63 - 1 if inc > 0 else -1)),
+                "increment": str(inc),
+                "cycle_option": "YES" if seq.get("cycle") else "NO",
+            }
+        )
+    return rows
 
 
 def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -601,6 +635,19 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "relname": name,
                 "relnamespace": _NS_OIDS["public"],
                 "relkind": "v",
+                "relpersistence": "p",
+                "relam": 0,
+                "reloptions": None,
+            }
+        )
+    # Sequences are pg_class rows too (relkind 'S').
+    for name, oid in _sequence_oids(db, catalog).items():
+        rows.append(
+            {
+                "oid": oid,
+                "relname": name,
+                "relnamespace": _NS_OIDS["public"],
+                "relkind": "S",
                 "relpersistence": "p",
                 "relam": 0,
                 "reloptions": None,
@@ -691,9 +738,27 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
 
 
 def _pg_sequence(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    # No sequences / identity columns in our model — present-but-empty so the
-    # identity-options subquery in SQLAlchemy's get_columns resolves to NULL.
-    return []
+    oids = _sequence_oids(db, catalog)
+    rows = []
+    for name in _sequence_names(db, catalog):
+        seq = catalog.get_sequence(db, name)
+        if seq is None:
+            continue
+        inc = int(seq.get("increment", 1))
+        maxv = seq.get("max_value")
+        minv = seq.get("min_value")
+        rows.append(
+            {
+                "seqrelid": oids[name],
+                "seqstart": int(seq.get("start", 1)),
+                "seqincrement": inc,
+                "seqmax": int(maxv) if maxv is not None else (2**63 - 1 if inc > 0 else -1),
+                "seqmin": int(minv) if minv is not None else (1 if inc > 0 else -(2**63)),
+                "seqcache": 1,
+                "seqcycle": bool(seq.get("cycle", False)),
+            }
+        )
+    return rows
 
 
 def _pg_collation(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:

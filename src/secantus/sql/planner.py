@@ -47,6 +47,9 @@ logging.getLogger("sqlglot").setLevel(logging.ERROR)
 class CreateTablePlan:
     table: TableDef
     if_not_exists: bool
+    # Sequences to auto-create alongside the table (SERIAL columns). Each is
+    # ``{"name", "column", "increment", "start"}`` — the executor creates them.
+    sequences: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -282,6 +285,38 @@ def _column_default(coldef: exp.ColumnDef, tag: str) -> tuple[bool, Any]:
         if type(c.kind).__name__ == "DefaultColumnConstraint":
             return _literal_default(c.kind.this, tag)
     return False, None
+
+
+# SERIAL pseudo-types → the integer tag they store as, plus the sequence increment
+# implied. (SERIAL is not a real type — it's an int column with an owned sequence.)
+_SERIAL_TAGS = {"SERIAL": "int4", "BIGSERIAL": "int8", "SMALLSERIAL": "int2"}
+
+
+def _serial_tag(datatype: exp.Expression) -> str | None:
+    """The integer type tag a SERIAL/BIGSERIAL/SMALLSERIAL column stores as, or
+    None when ``datatype`` isn't a serial pseudo-type."""
+    if isinstance(datatype, exp.DataType):
+        return _SERIAL_TAGS.get(datatype.this.name if datatype.this else "")
+    return None
+
+
+def _default_sequence(coldef: exp.ColumnDef) -> str | None:
+    """The sequence name a column's ``DEFAULT nextval('seq')`` draws from, or None.
+    Only the ``nextval('literal')`` form is recognised (regclass cast included)."""
+    for c in coldef.args.get("constraints") or []:
+        if type(c.kind).__name__ != "DefaultColumnConstraint":
+            continue
+        expr = c.kind.this
+        if isinstance(expr, exp.Cast):  # nextval('s'::regclass)
+            expr = expr.this
+        if isinstance(expr, exp.Anonymous) and str(expr.this).lower() == "nextval":
+            args = expr.expressions
+            if args:
+                target = args[0]
+                if isinstance(target, exp.Cast):
+                    target = target.this
+                return str(_literal(target))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +805,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         raise errors.feature_not_supported("CREATE TABLE requires a column list")
     table_name = schema.this.name
     columns: list[Column] = []
+    seq_plans: list[dict[str, Any]] = []
     pk_seen = False
     for coldef in schema.expressions:
         if isinstance(coldef, exp.PrimaryKey):
@@ -790,17 +826,23 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
             continue
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")
-        tag = typemap.type_tag_for_sql(coldef.args["kind"])
+        serial_tag = _serial_tag(coldef.args["kind"])
+        tag = serial_tag or typemap.type_tag_for_sql(coldef.args["kind"])
         if tag is None:
             raise errors.feature_not_supported(
                 f"unsupported column type for {coldef.name}: {coldef.args['kind'].sql()}"
             )
         constraints = [type(c.kind).__name__ for c in (coldef.args.get("constraints") or [])]
         is_pk = "PrimaryKeyColumnConstraint" in constraints
-        nullable = not is_pk and "NotNullColumnConstraint" not in constraints
+        # A SERIAL column is implicitly NOT NULL with an owned sequence default.
+        nullable = not is_pk and serial_tag is None and "NotNullColumnConstraint" not in constraints
         if is_pk:
             pk_seen = True
         has_default, default = _column_default(coldef, tag)
+        sequence = _default_sequence(coldef)
+        if serial_tag is not None:
+            sequence = f"{table_name}_{coldef.name}_seq"
+            seq_plans.append({"name": sequence, "column": coldef.name, "increment": 1, "start": 1})
         columns.append(
             Column(
                 name=coldef.name,
@@ -810,6 +852,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 nullable=nullable,
                 has_default=has_default,
                 default=default,
+                sequence=sequence,
             )
         )
     if not pk_seen:
@@ -826,7 +869,9 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         check_constraints=checks,
         unique_constraints=uniques,
     )
-    return CreateTablePlan(table=table, if_not_exists=bool(stmt.args.get("exists")))
+    return CreateTablePlan(
+        table=table, if_not_exists=bool(stmt.args.get("exists")), sequences=seq_plans
+    )
 
 
 def _ref_target(ref: exp.Reference) -> tuple[str, tuple[str, ...]]:
@@ -1072,9 +1117,12 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
         doc[col.field] = typemap.coerce(raw, col.type_tag)
         provided.add(name)
     # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
-    # omission is a violation.
+    # omission is a violation. A sequence-backed column (SERIAL / DEFAULT
+    # nextval) is left unset for the executor to fill (planning is storage-free).
     for col in table.columns:
         if col.name in provided:
+            continue
+        if col.sequence is not None:
             continue
         if col.has_default:
             doc[col.field] = typemap.coerce(col.default, col.type_tag)
@@ -1247,7 +1295,23 @@ def _const_scope(node: exp.Expression) -> Any:
     raise errors.undefined_column(name)
 
 
-def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
+_SEQUENCE_FUNCS = frozenset({"nextval", "currval", "setval", "lastval"})
+
+
+def _is_sequence_func(node: exp.Expression) -> bool:
+    return (
+        isinstance(node, (exp.Anonymous, exp.Func))
+        and str(getattr(node, "this", node.sql_name())).lower() in _SEQUENCE_FUNCS
+    )
+
+
+def plan_constant_select(
+    stmt: exp.Select,
+    session: Any,
+    storage: Any = None,
+    catalog: Any = None,
+    db: str | None = None,
+) -> ConstantSelectPlan:
     """Plan a FROM-less ``SELECT <expr>, ... [WHERE <const>]``.
 
     Literals are read directly; session/info functions (``version()``,
@@ -1260,7 +1324,7 @@ def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
 
     if stmt.args.get("group") or stmt.args.get("joins"):
         raise errors.feature_not_supported("FROM-less SELECT supports only constant projections")
-    ctx = scalar.ScalarContext(storage=None, catalog=None, db=None, session=session)
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     where = stmt.args.get("where")
     emit = where is None or scalar._truthy(scalar.evaluate(where.this, _const_scope, ctx))
     columns: list[tuple[str, str, Any]] = []
@@ -1270,6 +1334,13 @@ def plan_constant_select(stmt: exp.Select, session: Any) -> ConstantSelectPlan:
         if isinstance(target, _LITERAL_NODES):
             value = _literal(target)
             columns.append((alias or "?column?", _infer_value_tag(value), value))
+        elif _is_sequence_func(target):
+            # nextval / currval / setval / lastval need storage + session state,
+            # so they go through the scalar evaluator (not the storage-free
+            # session-function path).
+            fname = str(getattr(target, "this", target.sql_name())).lower()
+            value = scalar.evaluate(target, _const_scope, ctx)
+            columns.append((alias or fname, "int8", value))
         elif functions.is_scalar_function(target):
             fname, value, tag = functions.evaluate_scalar(target, session)
             columns.append((alias or fname, tag, value))

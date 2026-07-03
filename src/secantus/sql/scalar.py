@@ -317,6 +317,39 @@ def _eval_typed_func(node: exp.Func, scope: Scope, ctx: ScalarContext) -> Any:
     return _call_func(name, args, ctx)
 
 
+def _seq_name(arg: Any) -> str:
+    """The bare sequence name from a ``nextval`` / ``currval`` / ``setval`` arg —
+    a string (possibly schema-qualified ``public.s``, or quoted), stripped down."""
+    text = str(arg).strip().strip('"')
+    return text.split(".")[-1].strip('"')
+
+
+def _sequence_func(name: str, args: list[Any], ctx: ScalarContext | None) -> Any:
+    """``nextval`` / ``currval`` / ``setval`` / ``lastval`` — sequence value ops.
+    ``nextval`` / ``setval`` advance persisted state via the catalog; ``currval`` /
+    ``lastval`` read per-session state; all record the session's currval."""
+    if ctx is None:
+        raise errors.feature_not_supported(f"{name}() requires an execution context")
+    if name == "lastval":
+        return ctx.session.lastval()
+    if not args:
+        raise errors.SQLError("42883", f"{name}() requires an argument")
+    seq = _seq_name(args[0])
+    if name == "nextval":
+        value = ctx.catalog.sequence_nextval(ctx.db, seq)
+        ctx.session.record_sequence_value(seq, value)
+        return value
+    if name == "currval":
+        return ctx.session.currval(seq)
+    # setval(seq, value [, is_called])
+    value = int(args[1])
+    is_called = bool(args[2]) if len(args) > 2 else True
+    ctx.catalog.sequence_setval(ctx.db, seq, value, is_called)
+    if is_called:
+        ctx.session.record_sequence_value(seq, value)
+    return value
+
+
 def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
     if name == "format_type":
         return _format_type(args[0] if args else None, args[1] if len(args) > 1 else None)
@@ -337,12 +370,14 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
             return virtual.viewdef_for_oid(ctx.db, ctx.catalog, args[0])
         return None
+    if name in ("nextval", "currval", "setval", "lastval"):
+        return _sequence_func(name, args, ctx)
     if name in (
         "pg_get_expr",
         "pg_get_serial_sequence",
         "pg_get_indexdef",
     ):
-        # No stored defaults / sequences; index defs not rendered.
+        # No stored defaults; index defs not rendered.
         return None
     if name in ("json_build_object", "jsonb_build_object"):
         out: dict[str, Any] = {}

@@ -56,6 +56,15 @@ def execute_create_table(
         raise errors.duplicate_table(plan.table.name)
     catalog.put(db, plan.table)
     storage.create_collection(db, plan.table.collection)
+    # Auto-create the sequence behind each SERIAL column (owned by the table).
+    for seq in plan.sequences:
+        catalog.create_sequence(
+            db,
+            seq["name"],
+            start=seq.get("start", 1),
+            increment=seq.get("increment", 1),
+            owned_by=f"{plan.table.name}.{seq['column']}",
+        )
     return SQLResult(command_tag="CREATE TABLE")
 
 
@@ -69,6 +78,12 @@ def execute_drop_table(
         raise errors.undefined_table(plan.name)
     catalog.drop(db, plan.name)
     storage.drop_collection(db, table.collection)
+    # Drop any sequences the table owned (SERIAL columns).
+    for col in table.columns:
+        if col.sequence is not None:
+            seq = catalog.get_sequence(db, col.sequence)
+            if seq is not None and seq.get("owned_by") == f"{table.name}.{col.name}":
+                catalog.drop_sequence(db, col.sequence)
     return SQLResult(command_tag="DROP TABLE")
 
 
@@ -383,6 +398,7 @@ def execute_insert(
 ) -> SQLResult:
     if plan.on_conflict is not None:
         return _execute_insert_on_conflict(plan, storage, db, catalog, session)
+    _assign_sequences(plan.docs, plan.table, db, catalog, session)
     if plan.returning is not None:
         # Pin an ``_id`` on every doc up front so the in-hand list is the
         # authoritative inserted set to project from (storage may deep-copy on
@@ -477,6 +493,29 @@ def _has_not_null(table: Any) -> bool:
 
 # -- combined enforcement entry points (shared by INSERT / UPDATE / ON CONFLICT /
 #    MERGE) so every write path enforces the same NOT NULL / CHECK / UNIQUE / FK.
+
+
+def _assign_sequences(
+    docs: list[dict[str, Any]], table: Any, db: str, catalog: Any, session: Any
+) -> None:
+    """Fill sequence-backed columns (SERIAL / ``DEFAULT nextval``) omitted from an
+    INSERT: draw each doc's next value from the sequence and record it as the
+    session's ``currval`` / ``lastval``. A supplied value is left untouched."""
+    if catalog is None or getattr(table, "reflected", False):
+        return
+    seq_cols = [c for c in table.columns if c.sequence is not None]
+    if not seq_cols:
+        return
+    for doc in docs:
+        for col in seq_cols:
+            if col.field in doc and doc[col.field] is not None:
+                continue
+            if not catalog.sequence_exists(db, col.sequence):
+                continue  # dropped sequence — leave unset (NOT NULL will catch it)
+            value = catalog.sequence_nextval(db, col.sequence)
+            doc[col.field] = value
+            if session is not None:
+                session.record_sequence_value(col.sequence, value)
 
 
 def enforce_insert_rows(
@@ -597,6 +636,7 @@ def _execute_insert_on_conflict(
     affected = 0
     result_docs: list[dict[str, Any]] = []
     for doc in plan.docs:
+        _assign_sequences([doc], plan.table, db, catalog, session)
         if plan.returning is not None:
             doc.setdefault("_id", bson.ObjectId())
         existing = _find_conflict(storage, db, coll, oc, doc)

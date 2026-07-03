@@ -715,6 +715,8 @@ def _run_statement(
             if _is_materialized(stmt):
                 return _create_matview(stmt, storage, db, catalog, session)
             return executor.execute_create_view(stmt, catalog, storage, db)
+        if kind == "SEQUENCE":
+            return _create_sequence(stmt, db, catalog)
         raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
     if isinstance(stmt, exp.Drop):
@@ -727,6 +729,8 @@ def _run_statement(
             if stmt.args.get("materialized"):
                 return _drop_matview(stmt, storage, db, catalog)
             return executor.execute_drop_view(stmt, catalog, storage, db)
+        if kind == "SEQUENCE":
+            return _drop_sequence(stmt, db, catalog)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
     if isinstance(stmt, exp.Alter):
@@ -826,7 +830,9 @@ def _run_select(
 ) -> SQLResult:
     table_node = stmt.find(exp.Table)
     if table_node is None:
-        return executor.execute_constant_select(planner.plan_constant_select(stmt, session))
+        return executor.execute_constant_select(
+            planner.plan_constant_select(stmt, session, storage, catalog, db)
+        )
 
     # A WITH NO DATA materialized view is not scannable until its first REFRESH.
     if (
@@ -1095,6 +1101,61 @@ def _drop_matview(stmt: exp.Drop, storage: Any, db: str, catalog) -> SQLResult:
     catalog.drop(db, name)
     storage.drop_collection(db, name)
     return SQLResult(command_tag="DROP MATERIALIZED VIEW")
+
+
+def _seq_prop_int(props: Any, key: str) -> int | None:
+    """Read an int-valued ``SequenceProperties`` field (start / increment / …)."""
+    if props is None:
+        return None
+    for e in props.expressions:
+        if isinstance(e, exp.SequenceProperties):
+            val = e.args.get(key)
+            if val is not None:
+                return int(val.this if isinstance(val, exp.Literal) else val)
+    return None
+
+
+def _seq_has_cycle(props: Any) -> bool:
+    if props is None:
+        return False
+    for e in props.expressions:
+        if isinstance(e, exp.SequenceProperties):
+            for opt in e.args.get("options") or []:
+                if str(getattr(opt, "this", opt)).upper() == "CYCLE":
+                    return True
+    return False
+
+
+def _create_sequence(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
+    """``CREATE SEQUENCE [IF NOT EXISTS] name [START WITH n] [INCREMENT BY n]
+    [MINVALUE n] [MAXVALUE n] [CYCLE]``."""
+    name = stmt.this.name
+    if catalog.sequence_exists(db, name):
+        if stmt.args.get("exists"):
+            return SQLResult(command_tag="CREATE SEQUENCE")
+        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+    props = stmt.args.get("properties")
+    increment = _seq_prop_int(props, "increment") or 1
+    start = _seq_prop_int(props, "start")
+    if start is None:
+        start = 1 if increment > 0 else -1
+    catalog.create_sequence(
+        db,
+        name,
+        start=start,
+        increment=increment,
+        minvalue=_seq_prop_int(props, "minvalue"),
+        maxvalue=_seq_prop_int(props, "maxvalue"),
+        cycle=_seq_has_cycle(props),
+    )
+    return SQLResult(command_tag="CREATE SEQUENCE")
+
+
+def _drop_sequence(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
+    name = stmt.this.name
+    if not catalog.drop_sequence(db, name) and not stmt.args.get("exists"):
+        raise errors.SQLError("42P01", f'sequence "{name}" does not exist')
+    return SQLResult(command_tag="DROP SEQUENCE")
 
 
 _MAX_VIEW_DEPTH = 32
