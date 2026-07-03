@@ -1814,6 +1814,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (codec). **Limitations:** text + CSV only (no binary `COPY`); `STDIN` / `STDOUT` only (no server-side
   file paths — the client streams, like `\copy`); the embedded `run_sql` API can't do COPY (no stream) —
   it's wire-only; whole-table `COPY TO` (no query form `COPY (SELECT …) TO`).
+- [ ] **Partial indexes landed** (b110): `CREATE INDEX … WHERE <predicate>` lowers the predicate to a
+  Mongo filter (`planner.plan_create_index` calls `_expr_to_filter` on the index's `params.where`) and
+  passes it to storage as `partialFilterExpression` (`executor.execute_create_index`), so the query
+  planner accelerates matching queries and `explain` reports `IXSCAN` `isPartial: true` (the storage
+  layer already supported partial indexes; this wires the SQL surface to it). Works with `UNIQUE` and
+  `IF NOT EXISTS`, and compound `AND` predicates merge into one filter. **Expression indexes**
+  (`CREATE INDEX … ((a + b))`) are rejected `0A000` — the storage engine indexes stored fields, not
+  computed values (add a `GENERATED … STORED` column and index that). Tests:
+  `tests/test_sql_partial_index.py`. **Limitations:** `pg_index.indpred` still reflects as NULL (the
+  index works + accelerates, but SQLAlchemy's `get_indexes` won't report it as partial — rendering the
+  Mongo filter back to a SQL predicate for `pg_get_expr` isn't done); a partial predicate that doesn't
+  lower to a field filter (e.g. a function call) would raise at CREATE rather than degrade to a full
+  index.
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
