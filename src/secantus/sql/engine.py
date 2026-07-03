@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import sqlglot
@@ -691,6 +692,136 @@ def _require_table(catalog: Catalog, db: str, name: str, storage: Any = None) ->
     if table is None:
         raise errors.undefined_table(name)
     return table
+
+
+# --------------------------------------------------------------------------- #
+# COPY … FROM/TO STDIN/STDOUT — the wire server drives the streaming; these
+# helpers plan the target and convert between copy-stream cells and rows.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class CopyPlan:
+    table: Any
+    columns: list[str]  # target column SQL names
+    to_stdout: bool  # True = COPY TO STDOUT, False = COPY FROM STDIN
+    fmt: str  # "text" | "csv"
+    delimiter: str
+    null: str
+    header: bool
+
+
+def copy_plan(stmt: exp.Copy, storage: Any, db: str, catalog: Catalog) -> CopyPlan:
+    """Resolve a ``COPY`` statement to a :class:`CopyPlan`. Only ``STDIN`` /
+    ``STDOUT`` are supported (no server-side file access)."""
+    files = stmt.args.get("files") or []
+    target = files[0].name.upper() if files else ""
+    if target not in ("STDIN", "STDOUT"):
+        raise errors.feature_not_supported("COPY only supports STDIN / STDOUT")
+    to_stdout = not bool(stmt.args.get("kind"))  # kind True = FROM, False = TO
+    this = stmt.this
+    if isinstance(this, exp.Schema):
+        tname = this.this.name
+        columns: list[str] | None = [c.name for c in this.expressions]
+    else:
+        tname = this.name
+        columns = None
+    table = catalog.get(db, tname) or reflect.reflect(storage, db, tname)
+    if table is None:
+        raise errors.undefined_table(tname)
+    fmt, delimiter, null, header = _copy_options(stmt)
+    if columns is None:
+        cols = list(table.columns)
+        if not to_stdout:  # a generated column can't be copied in
+            cols = [c for c in cols if c.generated is None and c.identity != "always"]
+        columns = [c.name for c in cols]
+    if delimiter is None:
+        delimiter = "," if fmt == "csv" else "\t"
+    if null is None:
+        null = "" if fmt == "csv" else "\\N"
+    return CopyPlan(table, columns, to_stdout, fmt, delimiter, null, header)
+
+
+def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool]:
+    """Parse ``FORMAT`` / ``CSV`` / ``DELIMITER`` / ``NULL`` / ``HEADER`` from a
+    COPY statement's parameter list."""
+    fmt, delimiter, null, header = "text", None, None, False
+    for p in stmt.args.get("params") or []:
+        key = str(getattr(p.this, "name", p.this)).upper()
+        val = p.args.get("expression")
+        val_text = (
+            val.this if isinstance(val, exp.Literal) else (val.name if val is not None else "")
+        )
+        if key == "FORMAT":
+            fmt = str(val_text).lower()
+        elif key == "CSV":
+            fmt = "csv"
+            # The legacy ``WITH CSV HEADER`` bundles HEADER as the CSV param's
+            # expression rather than a separate parameter.
+            if str(val_text).upper() == "HEADER":
+                header = True
+        elif key == "DELIMITER":
+            delimiter = str(val_text)
+        elif key == "NULL":
+            null = str(val_text)
+        elif key == "HEADER":
+            header = str(val_text).lower() not in ("false", "off", "0")
+    return fmt, delimiter, null, header
+
+
+def _parse_bool_text(cell: str) -> bool:
+    return cell.strip().lower() in ("t", "true", "y", "yes", "1", "on")
+
+
+def copy_insert(
+    storage: Any, db: str, catalog: Catalog, session: Session, plan: CopyPlan, rows: list[list]
+) -> int:
+    """Insert copy-stream rows (lists of string / None cells) into the target,
+    coercing each cell to its column type; returns the number of rows inserted."""
+    docs = []
+    for cells in rows:
+        if len(cells) != len(plan.columns):
+            raise errors.SQLError(
+                "22P04", f"extra or missing columns for COPY (expected {len(plan.columns)})"
+            )
+        converted = []
+        for name, cell in zip(plan.columns, cells, strict=True):
+            if cell is None:
+                converted.append(None)
+                continue
+            col = plan.table.column(name)
+            if col is not None and col.type_tag == "bool":
+                converted.append(_parse_bool_text(cell))
+            else:
+                converted.append(cell)
+        docs.append(planner.copy_row_doc(plan.columns, converted, plan.table))
+    res = executor.execute_insert(
+        planner.InsertPlan(table=plan.table, docs=docs), storage, db, catalog, session
+    )
+    return res.rowcount
+
+
+def copy_extract(
+    storage: Any, db: str, catalog: Catalog, session: Session, plan: CopyPlan
+) -> list[list]:
+    """Read the target's rows as copy-stream cells (string / None) for COPY TO."""
+    from secantus.paths import get_path
+
+    out: list[list] = []
+    for doc in storage.find_matching(db, plan.table.collection, {}):
+        cells: list = []
+        for name in plan.columns:
+            col = plan.table.column(name)
+            field = col.field if col is not None else name
+            tag = col.type_tag if col is not None else "any"
+            value = get_path(doc, field)
+            if value is None:
+                cells.append(None)
+            else:
+                rendered = typemap.to_pg_text(value, tag)
+                cells.append(rendered.decode() if rendered is not None else None)
+        out.append(cells)
+    return out
 
 
 def _run_statement(

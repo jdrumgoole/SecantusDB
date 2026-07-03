@@ -333,6 +333,40 @@ def notice_response(message: str) -> bytes:
     return _msg("N", payload)
 
 
+def copy_in_response(column_count: int, *, binary: bool = False) -> bytes:
+    """``CopyInResponse`` ('G') — the server's go-ahead for ``COPY … FROM STDIN``.
+    All columns use the overall format (0=text / 1=binary)."""
+    fmt = 1 if binary else 0
+    payload = bytearray([fmt]) + _INT16.pack(column_count)
+    for _ in range(column_count):
+        payload += _INT16.pack(fmt)
+    return _msg("G", bytes(payload))
+
+
+def copy_out_response(column_count: int, *, binary: bool = False) -> bytes:
+    """``CopyOutResponse`` ('H') — the server starting ``COPY … TO STDOUT``."""
+    fmt = 1 if binary else 0
+    payload = bytearray([fmt]) + _INT16.pack(column_count)
+    for _ in range(column_count):
+        payload += _INT16.pack(fmt)
+    return _msg("H", bytes(payload))
+
+
+def copy_data(data: bytes) -> bytes:
+    """``CopyData`` ('d') — one chunk of copy stream bytes (either direction)."""
+    return _msg("d", data)
+
+
+def copy_done() -> bytes:
+    """``CopyDone`` ('c') — end of a copy stream."""
+    return _msg("c", b"")
+
+
+def copy_fail(message: str) -> bytes:
+    """``CopyFail`` ('f') — the client aborting a ``COPY … FROM STDIN``."""
+    return _msg("f", _cstr(message))
+
+
 def parse_complete() -> bytes:
     return _msg("1", b"")
 

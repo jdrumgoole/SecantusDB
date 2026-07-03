@@ -1115,6 +1115,36 @@ RETURNING i.sku, i.qty;
 `merge_action()` function and source-column references in `RETURNING` aren't
 supported.
 
+## Bulk load / dump (`COPY`)
+
+`COPY … FROM STDIN` bulk-loads rows and `COPY … TO STDOUT` streams them out — the
+sub-protocol `psql`'s `\copy` and `pg_dump` use. Both the default *text* format
+and *CSV* are supported:
+
+```sql
+COPY users (id, name, active) FROM STDIN;      -- then stream tab-separated rows
+COPY users FROM STDIN WITH CSV HEADER;         -- CSV, first line is column names
+COPY users TO STDOUT;                          -- stream every row back, text format
+COPY users (id, name) TO STDOUT WITH CSV;      -- selected columns, CSV format
+```
+
+From `psql`:
+
+```
+\copy users FROM 'users.csv' WITH CSV HEADER
+\copy users TO 'out.tsv'
+```
+
+Rows loaded via `COPY FROM` go through the same coercion and constraint
+enforcement as `INSERT` (NOT NULL / CHECK / UNIQUE / FK, sequence defaults,
+generated + enum columns). In *text* format a field of `\N` is NULL and `\t` /
+`\n` / `\\` are escaped; in CSV an unquoted empty field is NULL while a quoted
+empty field (`""`) is the empty string, and `HEADER` skips / emits a column-name
+line. `DELIMITER` and `NULL` options are honoured. Only `STDIN` / `STDOUT` are
+supported (no server-side file paths — the client streams the data, exactly as
+`\copy` does). A generated or `GENERATED ALWAYS AS IDENTITY` column is excluded
+from a no-column-list `COPY FROM`.
+
 ## Indexes
 
 `CREATE INDEX` (optionally `UNIQUE`) maps to a real Mongo secondary index on the
@@ -1390,7 +1420,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE` |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
-| Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format | `COPY`, `DECLARE CURSOR` |
+| Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |
 | Auth | trust, SCRAM-SHA-256, TLS, SQL `CREATE`/`ALTER`/`DROP ROLE`/`USER` (reflected via `pg_roles`), `GRANT`/`REVOKE` (accepted) | channel binding, mTLS, enforced privileges, SQL roles wired to SCRAM login |
 | Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`, `get_foreign_keys`, `get_table_comment` + column comments) | `get_check_constraints`, `get_unique_constraints` |
 

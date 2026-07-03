@@ -1204,6 +1204,13 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
     return doc
 
 
+def copy_row_doc(col_names: list[str], values: list[Any], table: TableDef) -> dict[str, Any]:
+    """Build one insert doc for a ``COPY … FROM`` row (values already converted
+    from copy-stream text). Reuses the INSERT coercion / default-fill / NOT NULL
+    machinery so COPY and INSERT enforce the same rules."""
+    return _insert_doc(col_names, values, table)
+
+
 def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
     col_names = insert_target_columns(stmt, table)
     values = stmt.expression

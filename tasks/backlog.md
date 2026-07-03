@@ -1800,6 +1800,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   same row (no subqueries / volatile functions guard); no `ALTER TABLE … ADD COLUMN … GENERATED` (the
   ALTER ADD path doesn't parse the constraint yet); a generated column isn't re-derived if the underlying
   data was written directly via the Mongo API (SQL writes only).
+- [ ] **COPY FROM/TO STDIN/STDOUT landed** (b109): the `COPY` bulk-load / dump sub-protocol over the
+  wire (`psql \copy`, `pg_dump`). `pgwire` gained `copy_in_response` ('G') / `copy_out_response` ('H') /
+  `copy_data` ('d') / `copy_done` ('c') / `copy_fail` ('f'); `pgserver._handle_copy` / `_copy_in` /
+  `_copy_out` drive the streaming (detected in `_handle_query` when the single parsed statement is
+  `exp.Copy`). `engine.copy_plan` resolves the target + options (`FORMAT` / `CSV` / `DELIMITER` /
+  `NULL` / `HEADER`, incl. the legacy `WITH CSV HEADER` bundling); `engine.copy_insert` coerces cells and
+  routes through `executor.execute_insert` (so COPY enforces the same NOT NULL / CHECK / UNIQUE / FK +
+  sequence / generated / enum rules as INSERT); `engine.copy_extract` renders rows for TO. The text/CSV
+  codec is `secantus.sql.copyfmt` (pure string↔rows; text `\N` NULL + backslash escapes; CSV NULL =
+  unquoted-empty vs `""` = empty string, `HEADER` skip/emit). A no-column-list `COPY FROM` excludes
+  generated / identity-always columns. Tests: `tests/test_pgserver_copy.py` (wire) + `tests/test_sql_copyfmt.py`
+  (codec). **Limitations:** text + CSV only (no binary `COPY`); `STDIN` / `STDOUT` only (no server-side
+  file paths — the client streams, like `\copy`); the embedded `run_sql` API can't do COPY (no stream) —
+  it's wire-only; whole-table `COPY TO` (no query form `COPY (SELECT …) TO`).
 - [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
