@@ -19,6 +19,32 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$geoNear` rides the geo index instead of scanning
+
+A bounded `$geoNear` — one with a `maxDistance` — no longer walks the whole
+collection computing a distance for every document. When it's the leading stage
+and the collection has a matching geo index on the queried field, SecantusDB now
+lifts the search into a conservative `$geoWithin` candidate query and serves it
+through the same geo-index path `$near` and `$geoWithin` already use, then
+computes exact distances and sorts over just the candidates.
+
+The candidate radius is inflated by a negligible epsilon so the fetched set is a
+strict superset of the exact within-`maxDistance` set; the `$geoNear` stage then
+re-applies the exact distance filter, so results — the documents, their order, and
+the attached `distanceField` — are byte-for-byte identical to the brute-force
+path. Only the number of documents fetched shrinks. An unbounded `$geoNear` (no
+`maxDistance`) must still return every document in distance order, so it keeps
+scanning; the optimization is scoped to the bounded case, and a mismatched index
+type falls back to the full scan. A randomized regression test asserts the
+optimized output equals the scan output across many queries.
+
+#### Changed
+
+- `$geoNear` with a `maxDistance` and a matching `2dsphere` / `2d` index now
+  fetches candidates through the geo index (`aggregate._geo_near_index_filter`,
+  lifted into the aggregate command's initial fetch) instead of a full collection
+  scan. Output is unchanged. (Rust-server mirror tracked in the backlog.)
+
 ### Rust server: bool-as-int range comparison in the query matcher
 
 The Rust server's query matcher now compares a boolean field against a numeric

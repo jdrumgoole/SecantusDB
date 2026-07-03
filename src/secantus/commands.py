@@ -17,6 +17,7 @@ from secantus.aggregate import (
     SEARCH_INDEX_ATLAS_MSG,
     AggregateError,
     PipelineContext,
+    _geo_near_index_filter,
     apply_pipeline,
     validate_stage_names,
 )
@@ -4049,6 +4050,17 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             ):
                 initial_filter = dict(first_stage["$match"])
                 pipeline = list(pipeline[1:])
+            elif isinstance(first_stage, Mapping) and "$geoNear" in first_stage:
+                # A leading $geoNear with a maxDistance and a matching geo index
+                # rides that index via a conservative $geoWithin candidate fetch
+                # instead of scanning the whole collection. The $geoNear stage is
+                # NOT skipped — it re-applies the exact distance filter, so the
+                # output is identical; only the fetched candidate set shrinks.
+                candidate = _geo_near_index_filter(
+                    first_stage["$geoNear"], ctx.storage, ctx.db_name, coll
+                )
+                if candidate is not None:
+                    initial_filter = candidate
             try:
                 docs = ctx.storage.find_matching(
                     ctx.db_name,
