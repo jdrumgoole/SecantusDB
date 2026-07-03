@@ -391,11 +391,24 @@ DROP MATERIALIZED VIEW active;
 DROP MATERIALIZED VIEW IF EXISTS active;
 ```
 
+`CREATE MATERIALIZED VIEW … WITH NO DATA` registers the view **unpopulated** — it
+is not scannable (querying it errors `55000`) until its first `REFRESH`. `WITH
+DATA` is the default. `REFRESH MATERIALIZED VIEW CONCURRENTLY` is accepted (our
+refresh is already a full recompute). `ALTER MATERIALIZED VIEW … RENAME TO` moves
+the view, its catalog shape, and its backing collection:
+
+```sql
+CREATE MATERIALIZED VIEW active AS SELECT id FROM users WHERE age >= 18 WITH NO DATA;
+SELECT * FROM active;                      -- 55000: has not been populated
+REFRESH MATERIALIZED VIEW active;          -- now scannable
+ALTER MATERIALIZED VIEW active RENAME TO adults;
+```
+
 Materialized views reflect through `pg_class` (`relkind = 'm'`) and
 `pg_get_viewdef()` — SQLAlchemy's `get_materialized_view_names()` sees them, and
 they are excluded from `get_table_names()` / `information_schema.tables` (matching
-Postgres). Refreshing is a full recompute (no incremental / `CONCURRENTLY`
-refresh, no indexes on the snapshot).
+Postgres). Refreshing is always a full recompute; `CONCURRENTLY` doesn't require a
+unique index here, and there are no indexes on the snapshot.
 
 ## Querying
 
