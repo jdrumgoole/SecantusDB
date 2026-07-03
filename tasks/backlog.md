@@ -1559,6 +1559,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `virtual._pk_constraints`) surface PRIMARY KEY (and now FOREIGN KEY) rows, so the standard PK
   reflection join (`table_constraints ⋈ key_column_usage`) that Alembic / SQLAlchemy's inspector emit
   resolves; `sequences` is present-but-empty (no sequences).
+- [ ] **Enforcement made uniform across all write paths** (b98): the NOT NULL / CHECK / UNIQUE / FK
+  validators now run on `MERGE` (its `INSERT` / `UPDATE` / `DELETE` actions in `engine._merge_apply_*`)
+  and on `INSERT … ON CONFLICT` for constraints *other than the arbiter target* (the DO-insert branch
+  and the DO-UPDATE post-image). Three shared entry points in `executor` — `enforce_insert_rows`,
+  `enforce_update_images` (UNIQUE excludes the rewritten rows), `enforce_parent_delete` (FK referential
+  actions) — are reused by `execute_insert`, `_execute_insert_on_conflict`, `_apply_conflict_update`,
+  and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
+  secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
+  aren't modeled (all checks are immediate — a future slice).
 - [ ] **FOREIGN KEY enforcement on write landed** (b96): referential integrity is now enforced both
   ways (`23503`, `errors.foreign_key_violation`). **Child side** (`executor._validate_fk_child_rows`,
   wired into `execute_insert` + the UPDATE post-image path): an INSERT/UPDATE row whose FK columns are

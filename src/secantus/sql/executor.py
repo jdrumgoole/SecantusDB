@@ -389,9 +389,7 @@ def execute_insert(
         # insert, so we can't rely on it back-filling ``_id`` into plan.docs).
         for doc in plan.docs:
             doc.setdefault("_id", bson.ObjectId())
-    _validate_rows(plan.docs, plan.table, storage, db, session, catalog)
-    _validate_unique_rows(plan.docs, plan.table, storage, db)
-    _validate_fk_child_rows(plan.docs, plan.table, storage, db, catalog)
+    enforce_insert_rows(plan.docs, plan.table, storage, db, catalog, session)
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
         _raise_write_error(write_errors[0], plan.table)
@@ -477,6 +475,51 @@ def _has_not_null(table: Any) -> bool:
     return any(not c.pk and not c.nullable for c in table.columns)
 
 
+# -- combined enforcement entry points (shared by INSERT / UPDATE / ON CONFLICT /
+#    MERGE) so every write path enforces the same NOT NULL / CHECK / UNIQUE / FK.
+
+
+def enforce_insert_rows(
+    docs: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any, session: Any
+) -> None:
+    """Enforce every declared constraint against rows about to be inserted."""
+    _validate_rows(docs, table, storage, db, session, catalog)
+    _validate_unique_rows(docs, table, storage, db)
+    _validate_fk_child_rows(docs, table, storage, db, catalog)
+
+
+def enforce_update_images(
+    post_images: list[dict[str, Any]],
+    matched_ids: Any,
+    table: Any,
+    storage: Any,
+    db: str,
+    catalog: Any,
+    session: Any,
+) -> None:
+    """Enforce constraints against an UPDATE's post-images (UNIQUE probes exclude
+    the rows being rewritten). Parent-side FK actions are the caller's job."""
+    from secantus.sql import scalar
+
+    if getattr(table, "reflected", False):
+        return
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    for post in post_images:
+        _validate_write_row(post, table, ctx)
+    _validate_unique_rows(post_images, table, storage, db, exclude_ids=frozenset(matched_ids))
+    _validate_fk_child_rows(post_images, table, storage, db, catalog)
+
+
+def enforce_parent_delete(
+    victims: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any
+) -> None:
+    """Apply referential actions before deleting parent rows (RESTRICT / CASCADE /
+    SET NULL). Safe to call for any table — a no-op when nothing references it."""
+    if catalog is None or getattr(table, "reflected", False):
+        return
+    _enforce_fk_on_parent_delete(victims, table, storage, db, catalog)
+
+
 def _uq_violation(uq: Any) -> errors.SQLError:
     return errors.unique_violation(f'duplicate key value violates unique constraint "{uq.name}"')
 
@@ -532,7 +575,9 @@ def _execute_insert_on_conflict(
             doc.setdefault("_id", bson.ObjectId())
         existing = _find_conflict(storage, db, coll, oc, doc)
         if existing is None:
-            _validate_write_row(doc, plan.table, sctx)
+            # Full enforcement — including any UNIQUE / CHECK / FK other than the
+            # arbiter target (which _find_conflict already cleared).
+            enforce_insert_rows([doc], plan.table, storage, db, catalog, session)
             inserted, write_errors = storage.insert(db, coll, [doc])
             if write_errors:
                 # A bare ``DO NOTHING`` (no conflict target) absorbs any unique
@@ -601,7 +646,11 @@ def _apply_conflict_update(
         set_doc[field] = typemap.coerce(scalar.evaluate(expr, scope, sctx), type_tag)
     updated = copy.deepcopy(existing)
     updated.update(set_doc)
-    _validate_write_row(updated, table, sctx)  # DO UPDATE post-image
+    # Enforce every constraint on the DO UPDATE post-image (UNIQUE excludes the
+    # row itself; NOT NULL / CHECK / FK-child all apply).
+    enforce_update_images(
+        [updated], [existing["_id"]], table, storage, db, sctx.catalog, sctx.session
+    )
     storage.update_matching(db, table.collection, {"_id": existing["_id"]}, {"$set": set_doc})
     return updated
 
