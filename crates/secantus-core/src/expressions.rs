@@ -1222,17 +1222,27 @@ fn bounded_datetime(millis: i128) -> R {
 /// instant, which equals the bson-normalised form of the pure oracle's (possibly
 /// tz-aware) datetime.
 ///
-/// Defers (`Fallback` → Python) on: a `format` (strptime) or a separate
-/// `timezone` field (named zones need a tz database), **fractional seconds**
-/// (BSON is millisecond-only but `fromisoformat` keeps microseconds), a space
-/// separator or other non-canonical/offset shape, an out-of-range/invalid field,
-/// or a non-string `dateString`. A null `dateString` returns `onNull` (or null).
+/// A fixed-offset `timezone` field (`±HHMM` / `±HH:MM` / `UTC` / `GMT`) interprets
+/// a *naive* dateString as being in that zone (`utc = wall - offset`); a string
+/// that already carries a `Z` / offset ignores it, mirroring the pure oracle.
+///
+/// Defers (`Fallback` → Python) on: a `format` (strptime) or a *named* IANA
+/// `timezone` (needs a tz database), **fractional seconds** (BSON is
+/// millisecond-only but `fromisoformat` keeps microseconds), a space separator or
+/// other non-canonical/offset shape, an out-of-range/invalid field, or a
+/// non-string `dateString`. A null `dateString` returns `onNull` (or null).
 fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback)?;
-    // format -> strptime; a separate timezone field -> named-zone db. Both defer.
-    if spec.contains_key("format") || spec.contains_key("timezone") {
-        return Err(Fallback);
+    if spec.contains_key("format") {
+        return Err(Fallback); // strptime -> Python
     }
+    // A fixed-offset `timezone` field interprets a *naive* dateString as being in
+    // that zone (`utc = wall - offset`); a named zone / malformed offset defers.
+    let tz_offset = match spec.get("timezone") {
+        None => None,
+        Some(Bson::String(s)) => Some(resolve_tz_offset(s).ok_or(Fallback)?),
+        Some(_) => return Err(Fallback), // Python raises "timezone must be a string"
+    };
     let raw = match spec.get("dateString") {
         Some(e) => eval(e, ctx)?,
         None => Bson::Null,
@@ -1246,8 +1256,18 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = raw else {
         return Err(Fallback); // Python raises "dateString must be a string"
     };
+    // The tz applies only when the string carries no offset of its own, mirroring
+    // the pure oracle's `parsed.tzinfo is None` guard.
+    let has_embedded_offset =
+        s.ends_with('Z') || (s.len() == 25 && matches!(s.as_bytes()[19], b'+' | b'-'));
     match parse_iso(&s) {
-        Some(millis) => bounded_datetime(millis),
+        Some(millis) => {
+            let millis = match tz_offset {
+                Some(off) if !has_embedded_offset => millis - off as i128 * 60_000,
+                _ => millis,
+            };
+            bounded_datetime(millis)
+        }
         None => Err(Fallback), // non-canonical / invalid -> Python (onError or raise)
     }
 }
@@ -1256,17 +1276,25 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 /// date (UTC) per a strftime-style `format`, defaulting to
 /// `"%Y-%m-%dT%H:%M:%S.%LZ"`. A non-datetime `date` (incl. null) → null.
 ///
+/// A fixed-offset `timezone` (`±HHMM` / `±HH:MM` / `UTC` / `GMT`) shifts the wall
+/// clock before rendering (naive input is treated as UTC); a named IANA zone
+/// defers to Python.
+///
 /// Renders the unambiguous directives — `%Y` (4-digit year), `%m`/`%d`/`%H`/`%M`/
 /// `%S` (2-digit), `%L` (3-digit millis), `%j` (3-digit day-of-year), `%w`
 /// (mongod Sunday=1..7), `%u` (ISO Monday=1..7), `%%` — and defers (`Fallback`)
-/// on a `timezone`, any other directive (`%z`/`%Z`/`%G`/`%V`/`%U`/locale names —
-/// Python `strftime` handles those), a non-4-digit year (glibc `%Y` padding
-/// differs), or a non-string `format`.
+/// on a named/malformed `timezone`, any other directive (`%z`/`%Z`/`%G`/`%V`/`%U`/
+/// locale names — Python `strftime` handles those), a non-4-digit year (glibc
+/// `%Y` padding differs), or a non-string `format`.
 fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback)?;
-    if spec.contains_key("timezone") {
-        return Err(Fallback); // tz conversion -> Python
-    }
+    // A fixed-offset `timezone` shifts the wall clock (naive input is UTC, matching
+    // BSON Date semantics); a named zone / malformed offset defers to Python.
+    let tz_offset = match spec.get("timezone") {
+        None => 0,
+        Some(Bson::String(s)) => resolve_tz_offset(s).ok_or(Fallback)? * 60_000,
+        Some(_) => return Err(Fallback), // Python raises "timezone must be a string"
+    };
     let millis = match eval(spec.get("date").ok_or(Fallback)?, ctx)? {
         Bson::DateTime(dt) => dt.timestamp_millis(),
         _ => return Ok(Bson::Null), // `_ensure_datetime(non-datetime)` -> None -> null
@@ -1276,7 +1304,7 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
         Some(Bson::String(s)) => s.as_str(),
         Some(_) => return Err(Fallback), // Python raises "format must be a string"
     };
-    Ok(Bson::String(render_date(millis, fmt)?))
+    Ok(Bson::String(render_date(millis + tz_offset, fmt)?))
 }
 
 fn render_date(millis: i64, fmt: &str) -> Result<String, Fallback> {
@@ -1337,6 +1365,34 @@ fn parse_iso(s: &str) -> Option<i128> {
         return parse_naive(base).map(|ms| ms - off_min as i128 * 60_000);
     }
     parse_naive(s)
+}
+
+/// Resolve a MongoDB `timezone` field to a fixed UTC offset in signed minutes,
+/// mirroring the offset branch of the pure `_resolve_timezone`. Handles the UTC
+/// aliases (`UTC` / `GMT` / `Etc/UTC` / `Etc/GMT` → 0) and a `±HHMM` / `±HH:MM`
+/// offset (four digits after the sign, colon optional). Returns `None` for a
+/// named IANA zone (needs a tz database) or a malformed offset — the caller
+/// defers those to Python, which resolves the zone or raises.
+fn resolve_tz_offset(name: &str) -> Option<i64> {
+    match name {
+        "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" => Some(0),
+        _ if name.starts_with(['+', '-']) => {
+            let sign = if name.starts_with('-') { -1 } else { 1 };
+            let digits: String = name[1..].chars().filter(|c| *c != ':').collect();
+            if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None; // malformed -> defer (Python raises)
+            }
+            let hh: i64 = digits[..2].parse().ok()?;
+            let mm: i64 = digits[2..].parse().ok()?;
+            // Python's datetime.timezone rejects a magnitude >= 24h; defer those
+            // (and any out-of-range minute) so the oracle decides.
+            if hh > 23 || mm > 59 {
+                return None;
+            }
+            Some(sign * (hh * 60 + mm))
+        }
+        _ => None, // named zone -> defer
+    }
 }
 
 /// A fixed `±HH:MM` UTC offset in signed minutes, or `None` if malformed.
@@ -2602,11 +2658,11 @@ mod tests {
 
     #[test]
     fn unsupported_falls_back() {
-        // A deferring shape ($dateToString with a timezone), non-ASCII $toUpper,
-        // and string $add all defer.
+        // A deferring shape ($dateToString with a named IANA timezone — offset
+        // zones now compute), non-ASCII $toUpper, and string $add all defer.
         assert!(evaluate(
             &doc! {},
-            &bson::bson!({"$dateToString": {"date": "$d", "timezone": "UTC"}}),
+            &bson::bson!({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}),
             &Document::new()
         )
         .is_err());
