@@ -3211,3 +3211,19 @@ def test_exhaust_midstream_getmore_fault_terminates_cleanly(coll, monkeypatch) -
 
     # The connection survives — a fresh command on the same client works.
     assert coll.count_documents({}) == 5
+
+
+def test_json_schema_unique_items_find(coll) -> None:
+    """`$jsonSchema` with `uniqueItems: true` over the wire: only docs whose
+    array field has all-distinct elements match."""
+    coll.insert_many(
+        [
+            {"_id": 1, "tags": ["a", "b", "c"]},  # unique -> matches
+            {"_id": 2, "tags": ["a", "b", "a"]},  # duplicate -> no match
+            {"_id": 3, "tags": [1, 1.0]},  # cross-type-equal numeric -> no match
+            {"_id": 4, "tags": []},  # empty -> matches
+        ]
+    )
+    schema = {"$jsonSchema": {"properties": {"tags": {"bsonType": "array", "uniqueItems": True}}}}
+    got = sorted(d["_id"] for d in coll.find(schema))
+    assert got == [1, 4]

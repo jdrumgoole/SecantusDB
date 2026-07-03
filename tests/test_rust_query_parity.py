@@ -401,6 +401,15 @@ CURATED = [
     ({"xs": [1]}, {"$jsonSchema": {"properties": {"xs": {"minItems": 2}}}}),  # too few
     ({"xs": [1, 2]}, {"$jsonSchema": {"properties": {"xs": {"items": {"bsonType": "int"}}}}}),
     ({"xs": [1, "x"]}, {"$jsonSchema": {"properties": {"xs": {"items": {"bsonType": "int"}}}}}),
+    # uniqueItems — distinct scalars pass; a duplicate (incl. cross-type-equal
+    # numeric 1 == 1.0 at top level) or duplicate documents fail; false is a no-op.
+    ({"xs": [1, 2, 3]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [1, 2, 2]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [1, 1.0]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": ["a", "b", "a"]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [{"a": 1}, {"a": 2}]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [{"a": 1}, {"a": 1}]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [1, 1]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": False}}}}),
     # enum.
     ({"c": "red"}, {"$jsonSchema": {"properties": {"c": {"enum": ["red", "green"]}}}}),
     ({"c": "blue"}, {"$jsonSchema": {"properties": {"c": {"enum": ["red", "green"]}}}}),

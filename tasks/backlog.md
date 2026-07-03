@@ -1266,10 +1266,14 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   / `%z`/`%Z`/ISO-week directives (Python `strftime` handles those). Fractional
   seconds stay deferred (BSON is millisecond-only).
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
-  (`uniqueItems` / `$ref`-style refs / `title`/`description` metadata / ...) —
-  would need porting on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/
-  `pattern`/counts/`items`/`required`/`properties`/`additionalProperties`/
-  `patternProperties`/`dependencies`/`allOf`/`anyOf`/`oneOf`/`not` all ship on both.)
+  (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
+  on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
+  `items`/`uniqueItems`/`required`/`properties`/`additionalProperties`/
+  `patternProperties`/`dependencies`/`allOf`/`anyOf`/`oneOf`/`not` all ship on
+  both. **`uniqueItems` known gap:** cross-type-equal numerics nested inside a
+  document/array element — e.g. `[{a: 1}, {a: 1.0}]` — are treated as distinct on
+  both servers, where mongod considers them equal. Top-level scalar arrays,
+  including cross-type `[1, 1.0]`, are faithful.)
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 
