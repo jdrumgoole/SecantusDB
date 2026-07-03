@@ -28,6 +28,74 @@ from rust_tasks import _rust_env  # noqa: E402  (underscore name: explicit impor
 
 
 @task(
+    name="pr-watch",
+    help={
+        "pr": "Pull-request number to watch.",
+        "repo": "GitHub repo (default: jdrumgoole/SecantusDB).",
+        "interval": "Seconds between polls (default: 25).",
+        "timeout": "Give up after this many seconds (default: 3600).",
+    },
+)
+def pr_watch(
+    c: Context,
+    pr: int,
+    repo: str = "jdrumgoole/SecantusDB",
+    interval: int = 25,
+    timeout: int = 3600,
+) -> None:
+    """Poll a PR's CI checks until they all finish, then print the result.
+
+    Replaces the ad-hoc ``gh pr checks`` shell poll loop used to gate
+    "merge when green". Prints one line per check (``name  bucket``) once
+    every check has left the pending/queued/in-progress state, and exits
+    non-zero if any check did not pass — so it composes in a shell, e.g.
+    ``invoke pr-watch 203 && gh pr merge 203 --rebase --delete-branch``.
+
+    A check counts as passing only when its bucket is ``pass`` or
+    ``skipping``; ``fail`` and ``cancel`` are reported and cause a
+    non-zero exit (a spurious ``cancel`` is worth a human's eyes, not a
+    silent merge). While GitHub reports no checks yet, it keeps waiting up
+    to ``timeout``.
+    """
+    from invoke.exceptions import Exit
+
+    pending = {"PENDING", "QUEUED", "IN_PROGRESS"}
+    ok_buckets = {"pass", "skipping"}
+    deadline = time.monotonic() + timeout
+    checks: list[dict] = []
+    while True:
+        proc = subprocess.run(
+            ["gh", "pr", "checks", str(pr), "--repo", repo, "--json", "name,state,bucket"],
+            capture_output=True,
+            text=True,
+        )
+        try:
+            checks = json.loads(proc.stdout) if proc.stdout.strip() else []
+        except json.JSONDecodeError:
+            checks = []
+        if checks and all(ch.get("state") not in pending for ch in checks):
+            break
+        if time.monotonic() >= deadline:
+            raise Exit(f"pr-watch: timed out after {timeout}s waiting on PR #{pr}", code=2)
+        time.sleep(interval)
+
+    checks.sort(key=lambda ch: ch["name"])
+    width = max((len(ch["name"]) for ch in checks), default=0)
+    failed = []
+    for ch in checks:
+        result = ch.get("bucket") or ch.get("state") or "?"
+        print(f"  {ch['name']:<{width}}  {result}")
+        if result not in ok_buckets:
+            failed.append(ch["name"])
+    if failed:
+        raise Exit(
+            f"PR #{pr}: {len(failed)} of {len(checks)} check(s) not green: {', '.join(failed)}",
+            code=1,
+        )
+    print(f"PR #{pr}: all {len(checks)} checks passed.")
+
+
+@task(
     help={
         "uri": "MongoDB URI of the target server (default: mongodb://127.0.0.1:27017/).",
         "db": "Target database (default: harness).",
