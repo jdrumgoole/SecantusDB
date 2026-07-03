@@ -703,43 +703,78 @@ def _require_table(catalog: Catalog, db: str, name: str, storage: Any = None) ->
 @dataclass
 class CopyPlan:
     table: Any
-    columns: list[str]  # target column SQL names
+    columns: list[str]  # target column SQL names (or query output names)
     to_stdout: bool  # True = COPY TO STDOUT, False = COPY FROM STDIN
     fmt: str  # "text" | "csv"
     delimiter: str
     null: str
     header: bool
+    # For ``COPY (SELECT …) TO STDOUT``: the pre-rendered copy-stream cells of the
+    # query result (query-form COPY is dump-only; ``table`` is None).
+    query_rows: list[list] | None = None
 
 
-def copy_plan(stmt: exp.Copy, storage: Any, db: str, catalog: Catalog) -> CopyPlan:
+def copy_plan(
+    stmt: exp.Copy, storage: Any, db: str, catalog: Catalog, session: Session | None = None
+) -> CopyPlan:
     """Resolve a ``COPY`` statement to a :class:`CopyPlan`. Only ``STDIN`` /
-    ``STDOUT`` are supported (no server-side file access)."""
+    ``STDOUT`` are supported (no server-side file access). ``COPY (query) TO
+    STDOUT`` runs the query and dumps its result (query-form COPY)."""
     files = stmt.args.get("files") or []
     target = files[0].name.upper() if files else ""
     if target not in ("STDIN", "STDOUT"):
         raise errors.feature_not_supported("COPY only supports STDIN / STDOUT")
     to_stdout = not bool(stmt.args.get("kind"))  # kind True = FROM, False = TO
+    fmt, delimiter, null, header = _copy_options(stmt)
+    if delimiter is None:
+        delimiter = "," if fmt == "csv" else "\t"
+    if null is None:
+        null = "" if fmt == "csv" else "\\N"
+
     this = stmt.this
+    if isinstance(this, (exp.Subquery, exp.Select)):
+        if not to_stdout:
+            raise errors.syntax_error("COPY (query) must be COPY … TO, not FROM")
+        select = this.this if isinstance(this, exp.Subquery) else this
+        columns, query_rows = _copy_query_rows(select, storage, db, catalog, session)
+        return CopyPlan(None, columns, True, fmt, delimiter, null, header, query_rows=query_rows)
+
     if isinstance(this, exp.Schema):
         tname = this.this.name
-        columns: list[str] | None = [c.name for c in this.expressions]
+        columns = [c.name for c in this.expressions]
     else:
         tname = this.name
         columns = None
     table = catalog.get(db, tname) or reflect.reflect(storage, db, tname)
     if table is None:
         raise errors.undefined_table(tname)
-    fmt, delimiter, null, header = _copy_options(stmt)
     if columns is None:
         cols = list(table.columns)
         if not to_stdout:  # a generated column can't be copied in
             cols = [c for c in cols if c.generated is None and c.identity != "always"]
         columns = [c.name for c in cols]
-    if delimiter is None:
-        delimiter = "," if fmt == "csv" else "\t"
-    if null is None:
-        null = "" if fmt == "csv" else "\\N"
     return CopyPlan(table, columns, to_stdout, fmt, delimiter, null, header)
+
+
+def _copy_query_rows(
+    select: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session | None
+) -> tuple[list[str], list[list]]:
+    """Run a ``COPY (SELECT …) TO`` query and render its result as copy-stream
+    cells (string / None), returning ``(column_names, rows)``."""
+    result = _run_query(select, storage, db, catalog, session or Session(database=db))
+    columns = [c.name for c in result.columns]
+    tags = [c.type_tag for c in result.columns]
+    rows: list[list] = []
+    for row in result.rows:
+        cells: list = []
+        for value, tag in zip(row, tags, strict=True):
+            if value is None:
+                cells.append(None)
+            else:
+                rendered = typemap.to_pg_text(value, tag)
+                cells.append(rendered.decode() if rendered is not None else None)
+        rows.append(cells)
+    return columns, rows
 
 
 def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool]:
@@ -806,6 +841,9 @@ def copy_extract(
 ) -> list[list]:
     """Read the target's rows as copy-stream cells (string / None) for COPY TO."""
     from secantus.paths import get_path
+
+    if plan.query_rows is not None:  # COPY (SELECT …) TO — already rendered
+        return plan.query_rows
 
     out: list[list] = []
     for doc in storage.find_matching(db, plan.table.collection, {}):

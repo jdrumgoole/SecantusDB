@@ -319,7 +319,7 @@ class SecantusPGServer:
         ``FROM STDIN``, or CopyOutResponse → CopyData* → CopyDone for ``TO STDOUT``."""
         catalog = Catalog(self.storage)
         try:
-            plan = sql_engine.copy_plan(stmt, self.storage, session.database, catalog)
+            plan = sql_engine.copy_plan(stmt, self.storage, session.database, catalog, session)
             if plan.to_stdout:
                 self._copy_out(conn, session, catalog, plan)
             else:
