@@ -1386,6 +1386,24 @@ def test_array_columns_via_driver(server):
     conn.close()
 
 
+def test_alter_type_add_value_via_driver(server):
+    # ALTER TYPE … ADD VALUE extends an enum; ORDER BY on the enum column follows
+    # the declared label order (not lexical) — through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    cur.execute("CREATE TABLE t (id bigint primary key, m mood)")
+    cur.execute("INSERT INTO t (id, m) VALUES (1, 'happy'), (2, 'sad'), (3, 'ok')")
+    # Declared order, not lexical (which would be happy, ok, sad).
+    cur.execute("SELECT id, m FROM t ORDER BY m")
+    assert cur.fetchall() == ([2, "sad"], [3, "ok"], [1, "happy"])
+    cur.execute("ALTER TYPE mood ADD VALUE 'meh' AFTER 'ok'")
+    cur.execute("INSERT INTO t (id, m) VALUES (4, 'meh')")
+    cur.execute("SELECT m FROM t ORDER BY m")
+    assert cur.fetchall() == (["sad"], ["ok"], ["meh"], ["happy"])
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

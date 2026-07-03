@@ -133,6 +133,9 @@ class SelectPlan:
     out_columns: list[tuple[str, Column]] = field(default_factory=list)
     count_star: bool = False
     count_alias: str = "count"
+    # For an ORDER BY field that is an enum column: field_path -> the enum's
+    # declared label list, so the executor sorts by declared order not lexically.
+    enum_orders: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -150,6 +153,7 @@ class CorrelatedSelectPlan:
     count_star: bool = False
     count_alias: str = "count"
     outer_alias: str | None = None
+    enum_orders: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1356,6 +1360,27 @@ def _order_terms(stmt: exp.Expression, table: TableDef) -> list[tuple[str, int, 
     return terms
 
 
+def _enum_order_map(
+    stmt: exp.Expression, table: TableDef, subctx: SubqueryCtx | None
+) -> dict[str, list[str]]:
+    """For each ORDER BY term that names an enum-typed column, map its field path
+    to the enum's declared label list (looked up via the catalog on ``subctx``).
+    Enum values are stored as their label text, so without this the executor would
+    sort them lexically instead of by declared order."""
+    order = stmt.args.get("order")
+    if order is None or subctx is None or subctx.catalog is None:
+        return {}
+    out: dict[str, list[str]] = {}
+    for o in order.expressions:
+        col = table.column(_column_name(o.this))
+        if col is None or col.enum_type is None:
+            continue
+        enum = subctx.catalog.get_enum(subctx.db, col.enum_type)
+        if enum is not None:
+            out[table.field_for(col.name)] = list(enum["labels"])
+    return out
+
+
 def _emit_pipeline_sort(pipeline: list[dict[str, Any]], terms: list[tuple[str, int, bool]]) -> None:
     """Append a NULL-aware ``$sort`` for ``terms`` (``(field, direction,
     nulls_first)``). Mongo's ``$sort`` orders NULL/missing as the lowest value, so
@@ -1496,6 +1521,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
         limit=limit,
         skip=skip,
         out_columns=_select_out_columns(stmt, table),
+        enum_orders=_enum_order_map(stmt, table, subctx),
     )
 
 

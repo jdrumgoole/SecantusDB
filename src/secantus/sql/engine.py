@@ -929,6 +929,8 @@ def _run_statement(
             return _alter_matview_command(stmt, storage, db, catalog, session)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("SEQUENCE"):
             return _alter_sequence_command(stmt, db, catalog)
+        if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("TYPE"):
+            return _alter_type_command(stmt, db, catalog)
         if verb == "SET" and _command_text(stmt).lstrip().upper().startswith("CONSTRAINTS"):
             return _set_constraints_command(stmt, storage, db, catalog, session)
         if verb in ("CREATE", "DROP", "ALTER") and _command_text(stmt).lstrip().upper().startswith(
@@ -1414,6 +1416,35 @@ def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     if not catalog.drop_enum(db, name) and not stmt.args.get("exists"):
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     return SQLResult(command_tag="DROP TYPE")
+
+
+# ``ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']``
+# falls back to a Command (sqlglot doesn't model the enum grammar).
+_ALTER_TYPE_ADD_RE = re.compile(
+    r"(?is)^\s*TYPE\s+(\"[^\"]+\"|\w+)\s+ADD\s+VALUE\s+(IF\s+NOT\s+EXISTS\s+)?"
+    r"'((?:[^']|'')*)'\s*(?:(BEFORE|AFTER)\s+'((?:[^']|'')*)')?\s*;?\s*$"
+)
+
+
+def _alter_type_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    """``ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']``
+    — extend an enum with a new label, optionally positioned relative to an
+    existing one. Other ALTER TYPE forms are unsupported."""
+    m = _ALTER_TYPE_ADD_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.feature_not_supported(
+            "only ALTER TYPE … ADD VALUE is supported (RENAME / composite alters are not)"
+        )
+    name = _unquote_ident(m.group(1))
+    if_not_exists = m.group(2) is not None
+    label = m.group(3).replace("''", "'")
+    keyword, neighbour = m.group(4), m.group(5)
+    before = neighbour.replace("''", "'") if keyword and keyword.upper() == "BEFORE" else None
+    after = neighbour.replace("''", "'") if keyword and keyword.upper() == "AFTER" else None
+    catalog.alter_enum_add_value(
+        db, name, label, before=before, after=after, if_not_exists=if_not_exists
+    )
+    return SQLResult(command_tag="ALTER TYPE")
 
 
 _ALTER_SEQUENCE_RE = re.compile(
