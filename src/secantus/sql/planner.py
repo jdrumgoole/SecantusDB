@@ -759,6 +759,18 @@ def _expr_to_filter(
             spec["$options"] = "i"
         return {field: spec}
 
+    if isinstance(node, (exp.RegexpLike, exp.RegexpILike)):
+        # POSIX regex-match operators: ``~`` / ``~*`` (and their negations ``!~`` /
+        # ``!~*``, which parse as ``Not(RegexpLike/RegexpILike)`` and route through
+        # the ``exp.Not`` branch above). The pattern is a raw regex — unlike LIKE,
+        # it is *not* translated — and matches unanchored (Mongo ``$regex`` uses
+        # ``re.search`` semantics, matching Postgres' ``~``).
+        field, _ = _field(node.this, resolve)
+        spec = {"$regex": str(_literal(node.expression))}
+        if isinstance(node, exp.RegexpILike):
+            spec["$options"] = "i"
+        return {field: spec}
+
     if isinstance(node, exp.ArrayContainsAll):  # jsonb @> (contains)
         field, _ = _field(node.this, resolve)
         return _jsonb_contains_filter(field, _json_value(node.expression))
@@ -3776,6 +3788,8 @@ _BOOL_EXPR_TYPES = (
     exp.LTE,
     exp.Like,
     exp.ILike,
+    exp.RegexpLike,
+    exp.RegexpILike,
 )
 
 

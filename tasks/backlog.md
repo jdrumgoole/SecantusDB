@@ -1647,6 +1647,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
   secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
   aren't modeled (all checks are immediate — a future slice).
+- [ ] **POSIX regex-match operators landed** (b124): `~` / `~*` / `!~` / `!~*` in WHERE lower to a Mongo
+  `$regex` filter (`planner._expr_to_filter`, next to the LIKE handler; the pattern is a raw regex,
+  *not* LIKE-translated, and matches unanchored — `re.search` semantics — like Postgres). `~*` adds
+  `$options: "i"`; `!~` / `!~*` parse as `Not(RegexpLike/RegexpILike)` and negate through the existing
+  `exp.Not` → `$nor` branch. In the scalar engine (SELECT-list booleans, CHECK constraints)
+  `scalar._eval_regexp` runs Python `re.search`; `_BOOL_EXPR_TYPES` gained the two nodes so
+  `(col ~ 'x')` types as `bool`. **This closes the regex gap in table + domain CHECK constraints.**
+  **Limitation:** `!~` / `!~*` inherit the layer's existing NULL-in-negation divergence (a NULL row
+  leaks into the negated result, shared with `!=` / `NOT LIKE`; the positive `~` correctly excludes
+  NULL) — a broader NULL-semantics fix, not regex-specific.
 - [ ] **`CREATE DOMAIN` landed** (b122): a named base type with its own `NOT NULL` / `CHECK` (and
   optional `DEFAULT`). `CREATE DOMAIN name AS base [DEFAULT expr] [ [CONSTRAINT c] { NOT NULL | CHECK
   (…) } … ]` and `DROP DOMAIN [IF EXISTS] name` arrive as `exp.Command` (sqlglot doesn't model the

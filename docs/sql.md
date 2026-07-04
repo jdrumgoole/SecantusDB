@@ -395,8 +395,8 @@ EXISTS] name` removes one; a missing domain raises `42704` (silenced by
 `IF EXISTS`). A domain name that clashes with an existing type raises `42710`, and
 a domain built on an unknown base type raises `42704`. The `CHECK` predicate is
 evaluated by the scalar engine, so it supports the same operators as a table
-`CHECK` (comparisons, `LIKE`, `length()`, arithmetic; the `~` regex-match operator
-is not yet supported → `0A000`).
+`CHECK` (comparisons, `LIKE`, the `~` / `~*` regex-match operators, `length()`,
+arithmetic).
 
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
@@ -714,6 +714,8 @@ SELECT * FROM users WHERE age < 18 OR age > 40;
 SELECT * FROM users WHERE id IN (1, 3);
 SELECT * FROM users WHERE age BETWEEN 18 AND 40;
 SELECT * FROM users WHERE name LIKE 'a%';      -- ILIKE too
+SELECT * FROM users WHERE name ~ '^a';         -- POSIX regex match (~* case-insensitive)
+SELECT * FROM users WHERE name !~* 'test$';    -- negated, case-insensitive
 SELECT * FROM users WHERE name IS NOT NULL;
 SELECT name FROM users ORDER BY age DESC LIMIT 2 OFFSET 1;
 -- NULL placement follows Postgres: ASC orders NULLs last, DESC orders them
@@ -1661,7 +1663,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | `MERGE`, `ON CONFLICT ON CONSTRAINT` |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` | `WITH RECURSIVE` on a write body |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
