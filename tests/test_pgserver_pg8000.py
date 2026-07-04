@@ -993,6 +993,25 @@ def test_regex_string_funcs_via_driver(server):
     conn.close()
 
 
+def test_math_funcs_via_driver(server):
+    # trunc / sqrt / sign / log10 / factorial / gcd typed correctly on the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE m (id int primary key, x double precision, n int)")
+    cur.execute("INSERT INTO m VALUES (1, 9.87, 5)")
+    cur.execute(
+        "SELECT trunc(x), sqrt(16.0), sign(x), log10(1000.0), factorial(n), gcd(n, 18) FROM m"
+    )
+    row = cur.fetchone()
+    assert row[0] == 9  # trunc(9.87) -> 9
+    assert row[1] == pytest.approx(4.0)  # sqrt(16)
+    assert row[2] == 1  # sign(9.87)
+    assert row[3] == pytest.approx(3.0)  # log10(1000)
+    assert row[4] == 120  # factorial(5)
+    assert row[5] == 1  # gcd(5, 18)
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

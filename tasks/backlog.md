@@ -1406,6 +1406,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (text / int4). **Limitation:** `regexp_matches` is genuinely set-returning in Postgres (one row per
   match); in our scalar context it returns only the **first** match's capture groups as a `text[]` (whole
   match if no groups), NULL when there is no match — sufficient for the common non-`g` use.
+- [ ] **Math / numeric scalar functions landed** (b130): `trunc(x [,n])` (truncate toward zero;
+  numeric), `sqrt` / `cbrt` (real cube root via `copysign` so negatives work), `sign` (−1/0/1,
+  operand kind preserved), `ln`, `log(x)` (base-10 in PG) / `log(b, x)` / `log10` (base-10/2 use the
+  exact `math.log10`/`log2` so `log10(1000) == 3.0`), `exp`, `pi()`, `degrees`, `radians`,
+  `factorial`, plus `gcd` / `lcm` — in `scalar.py` (`_SCALAR_FUNC_NODES` for the dedicated nodes,
+  registered via the version-tolerant getattr loop; `gcd`/`lcm`/`log10` fall through `_call_func`).
+  Output types wired in `planner._infer_scalar_tag` (float8 for the transcendental/root funcs,
+  numeric for trunc/sign/factorial, int8 for gcd/lcm). `mod` / `power` / `abs` / `ceil` / `floor` /
+  `round` were already present.
 - [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
   `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
   `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`
