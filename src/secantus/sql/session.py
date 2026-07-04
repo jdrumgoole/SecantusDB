@@ -77,6 +77,14 @@ class Session:
     user: str = "secantus"
     backend_pid: int = 0
     settings: dict[str, str] = field(default_factory=dict)
+    # RBAC (#193). ``authz_active`` gates per-statement authorization — the wire
+    # server sets it when started with ``require_auth`` *and* explicit per-user
+    # role bindings. When false (embedded ``run_sql``, or trust mode) the SQL
+    # surface is unrestricted, preserving prior behaviour. ``roles`` is the
+    # authenticated user's bindings (``[{"role": ..., "db": ...}]``), reused by
+    # ``secantus.rbac.check_privilege`` — the same model the Mongo server uses.
+    authz_active: bool = False
+    roles: list[Any] = field(default_factory=list)
     # Multi-statement transaction state. ``txn_handle`` is the open
     # ``Storage`` user-transaction (None outside a BEGIN block); ``txn_failed``
     # marks an aborted block (every command except COMMIT/ROLLBACK errors with

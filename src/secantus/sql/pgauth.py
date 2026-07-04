@@ -17,7 +17,7 @@ import base64
 import hashlib
 import hmac
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from secantus.auth import SCRAM_SHA_256, StoredCredentials, derive_credentials
 
@@ -32,16 +32,34 @@ class PGAuthError(Exception):
 
 @dataclass
 class UserStore:
-    """In-memory username -> SCRAM credentials, derived from plaintext at init."""
+    """In-memory username -> SCRAM credentials, derived from plaintext at init.
+
+    ``roles`` optionally binds each username to RBAC role bindings
+    (``[{"role": ..., "db": ...}]``) so the wire server can authorize statements
+    via :func:`secantus.rbac.check_privilege` — the same role model as the Mongo
+    server. A user with credentials but no role entry authenticates but is
+    granted nothing (real RBAC: LOGIN without grants). (#193)
+    """
 
     creds: dict[str, StoredCredentials]
+    roles: dict[str, list[dict[str, str]]] = field(default_factory=dict)
 
     @classmethod
-    def from_passwords(cls, users: dict[str, str]) -> UserStore:
-        return cls({u: derive_credentials(p, mechanism=SCRAM_SHA_256) for u, p in users.items()})
+    def from_passwords(
+        cls,
+        users: dict[str, str],
+        roles: dict[str, list[dict[str, str]]] | None = None,
+    ) -> UserStore:
+        return cls(
+            {u: derive_credentials(p, mechanism=SCRAM_SHA_256) for u, p in users.items()},
+            {u: list(r) for u, r in (roles or {}).items()},
+        )
 
     def get(self, username: str) -> StoredCredentials | None:
         return self.creds.get(username)
+
+    def roles_for(self, username: str) -> list[dict[str, str]]:
+        return self.roles.get(username, [])
 
 
 def mock_credentials() -> StoredCredentials:
@@ -62,9 +80,9 @@ def mock_credentials() -> StoredCredentials:
 
 def _attrs(message: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for field in message.split(","):
-        if "=" in field:
-            key, _, value = field.partition("=")
+    for part in message.split(","):
+        if "=" in part:
+            key, _, value = part.partition("=")
             out[key] = value
     return out
 

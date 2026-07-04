@@ -17,7 +17,7 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
-from secantus.sql import errors, executor, planner, reflect, scalar, typemap, virtual
+from secantus.sql import authz, errors, executor, planner, reflect, scalar, typemap, virtual
 from secantus.sql.catalog import Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import REPORTABLE_GUCS, Session, _Cursor, _Savepoint
@@ -72,6 +72,11 @@ def _dispatch(
         return (
             _savepoint(name, session) if word == "SAVEPOINT" else _release_savepoint(name, session)
         )
+
+    # Per-statement RBAC gate (#193). No-op unless the session marked
+    # authorization active (wire server with require_auth + per-user roles);
+    # transaction control and savepoints above are exempt and already returned.
+    authz.authorize(stmt, session, storage)
 
     if session.txn_handle is not None:
         try:

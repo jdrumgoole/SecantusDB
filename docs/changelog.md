@@ -58,6 +58,42 @@ writes. A regular collection write is unaffected.
   instead of being silently accepted. Regression: `tests/test_rust_server_smoke.py::
   test_synthetic_view_write_rejected_against_rust_server`.
 
+### PostgreSQL/SQL server: per-statement RBAC, reusing the Mongo role model
+
+The PostgreSQL/SQL server gained an authorization layer. Until now an
+authenticated SQL client — or, in the documented trust default, any client —
+could run any statement against any database it named at connect time, so a SQL
+client had broader effective access than an equivalently-authenticated Mongo
+client on the same data. The SQL surface now enforces the *same* RBAC engine the
+Mongo server uses (`secantus.rbac`): each statement maps to one action on the
+connection's database and is checked against the authenticated user's roles.
+
+Authorization is opt-in and backward-compatible. Start the server with
+`require_auth=True` and per-user role bindings via the new `user_roles` argument
+(`{"analyst": [{"role": "read", "db": "shop"}]}`) to turn it on; without
+`user_roles`, and for the embedded `run_sql` API, the surface stays unrestricted
+exactly as before. Built-in roles (`read` / `readWrite` / `dbAdmin` / `dbOwner` /
+`root`) resolve directly and custom roles resolve through the shared roles table,
+so a role defined once governs both protocols on a shared `Storage`. A denied
+statement returns SQLSTATE `42501` and the connection survives.
+
+Found by the nightly security review (issue #193).
+
+#### Added
+
+- `SecantusPGServer(user_roles=...)`: per-user RBAC role bindings, enforced
+  per-statement when `require_auth` is on. New pure `sql/authz.py` maps each
+  statement to an `rbac` action and calls `rbac.check_privilege`; transaction
+  control, `SET`/`SHOW`, and cursor navigation need no privilege. New
+  `errors.insufficient_privilege` (SQLSTATE 42501).
+
+#### Security
+
+- SQL clients on a `Storage` shared with a Mongo server are now gated by the same
+  roles as Mongo clients, closing the "authenticated SQL client has unrestricted
+  access" gap. Regressions in `tests/test_sql_authz.py` (engine-level, built-in +
+  custom roles) and `tests/test_pgserver_auth.py` (over the wire).
+
 ### Rust server: rejects a malformed `writeConcern`
 
 The Rust server now validates a write command's `writeConcern` before running it,
