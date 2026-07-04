@@ -1389,6 +1389,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   join (`_plan_join_group_select`) paths via the shared `_register_distinct_agg`; `_aggregate_of` /
   `_join_aggregate_of` now return `(func, col, distinct)`. **Still `0A000`:** a `DISTINCT` aggregate
   inside `HAVING` (the SELECT-list reduction stage isn't shared with the HAVING `$match`).
+  `string_agg` + the boolean aggregates landed in b121: `bool_and`/`bool_or` (registered in
+  `_AGG_CLASSES`) lower to `$min`/`$max` over booleans, `every(x)` is recognised as `bool_and` in
+  `_aggregate_of`; `string_agg(expr, sep)` (`exp.GroupConcat`) lowers to a `$push` accumulator plus a
+  `$reduce` in the group `$project` (`_string_agg_project`) that joins the pushed array skipping NULL
+  elements (NULL when all-NULL) — wired into the single-table, join, and grouping-set planners with the
+  routing predicates updated. Tests: `tests/test_sql_string_agg.py`. **Still `0A000`:** the ordered-set
+  aggregates `percentile_cont` / `mode` (`WITHIN GROUP (ORDER BY …)`) — they need within-group ordering
+  the `$group` accumulator model doesn't express; `string_agg`'s own `ORDER BY` inside the call is ignored
+  (sqlglot drops it).
 - [ ] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
   literal` keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is
   a constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`
