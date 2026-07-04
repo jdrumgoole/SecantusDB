@@ -25,7 +25,7 @@ import sqlglot
 from sqlglot import exp
 
 from secantus.paths import set_path
-from secantus.sql import errors, typemap
+from secantus.sql import errors, ranges, typemap
 from secantus.sql.catalog import (
     CheckConstraint,
     Column,
@@ -208,6 +208,17 @@ def _literal(node: exp.Expression) -> Any:
         # ``ROW(a, b, …)`` composite constructor -> a positional list; the INSERT
         # path maps it onto a composite column's named fields.
         return [_literal(e) for e in node.expressions]
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() in typemap._RANGE_TAGS:
+        # ``int4range(lo, hi [, bounds])`` -> a normalised range subdocument.
+        from secantus.sql import ranges as _ranges
+
+        tag = str(node.this).lower()
+        elem, _discrete = _ranges.RANGE_TYPES[tag]
+        args = [_literal(e) for e in node.expressions]
+        lo = typemap.coerce(args[0], elem) if len(args) > 0 and args[0] is not None else None
+        hi = typemap.coerce(args[1], elem) if len(args) > 1 and args[1] is not None else None
+        bounds = str(args[2]) if len(args) > 2 and args[2] is not None else "[)"
+        return _ranges.make_range(lo, hi, bounds, tag)
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
         # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
         # SQLAlchemy's psycopg dialect probes ``t.oid = to_regtype('hstore')`` at
@@ -1787,18 +1798,39 @@ def _returning_columns(
     return items
 
 
-def where_needs_per_row(stmt: exp.Select) -> bool:
+def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool:
     """Whether the WHERE clause must be evaluated per-row in Python rather than
-    pushed down as a Mongo filter: it contains an ``EXISTS`` predicate or a
-    correlated subquery (one that references the outer row). Non-correlated
-    ``IN`` / scalar ``= (SELECT …)`` subqueries stay on the fast pushdown path."""
+    pushed down as a Mongo filter: it contains an ``EXISTS`` predicate, a
+    correlated subquery (one that references the outer row), or a range operator
+    (``@>`` / ``<@`` / ``&&`` over a range column — the scalar evaluator handles
+    range semantics that don't lower to a Mongo filter). Non-correlated ``IN`` /
+    scalar ``= (SELECT …)`` subqueries stay on the fast pushdown path."""
     where = stmt.args.get("where")
     if where is None:
         return False
     node = where.this
     if node.find(exp.Exists) is not None:
         return True
+    if table is not None and _where_has_range_predicate(node, table):
+        return True
     return any(_subquery_has_outer_ref(sub) for sub in node.find_all(exp.Select))
+
+
+def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` contains an ``@>`` / ``<@`` / ``&&`` whose operand is a
+    range-typed column or a range constructor — those need per-row evaluation."""
+    for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
+        for operand in (op.this, op.expression):
+            if isinstance(operand, exp.Column):
+                col = table.column(_column_name(operand))
+                if col is not None and col.type_tag in typemap._RANGE_TAGS:
+                    return True
+            if (
+                isinstance(operand, exp.Anonymous)
+                and str(operand.this).lower() in typemap._RANGE_TAGS
+            ):
+                return True
+    return False
 
 
 def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelectPlan:
@@ -4176,12 +4208,45 @@ _BOOL_EXPR_TYPES = (
 )
 
 
+def _has_range_operand(node: exp.Expression, resolve: Resolve) -> bool:
+    """Does an operand of ``node`` (an @> / <@ / && operator) resolve to a range —
+    a range-typed column or a range constructor?"""
+    for operand in (node.this, node.expression):
+        if isinstance(operand, exp.Anonymous) and str(operand.this).lower() in typemap._RANGE_TAGS:
+            return True
+        if isinstance(operand, exp.Column):
+            try:
+                if resolve(operand)[1] in typemap._RANGE_TAGS:
+                    return True
+            except errors.SQLError:
+                pass
+    return False
+
+
 def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
     # Composite field access ``(col).field`` types as the field's declared type.
     composite_tag = _composite_field_tag(node, resolve)
     if composite_tag is not None:
         return composite_tag
+    # Range operators (@> / <@ / &&) over a range operand are boolean; a range
+    # constructor / cast is the range type. (Non-range @> / <@ fall through to the
+    # jsonb typing below.)
+    if isinstance(
+        node, (exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps)
+    ) and _has_range_operand(node, resolve):
+        return "bool"
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() in typemap._RANGE_TAGS:
+        return str(node.this).lower()
+    # ``lower(range)`` / ``upper(range)`` yield the range's element type.
+    if isinstance(node, (exp.Lower, exp.Upper)) and node.this is not None:
+        operand_tag = _infer_scalar_tag(node.this, resolve)
+        if operand_tag in typemap._RANGE_TAGS:
+            return ranges.RANGE_TYPES[operand_tag][0]
+    if isinstance(node, exp.Cast) and node.to is not None:
+        _to = node.to.sql(dialect="postgres").lower().strip()
+        if _to in typemap._RANGE_TAGS:
+            return _to
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
@@ -4357,6 +4422,8 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):
             return "int4"
         if fname in ("jsonb_path_exists", "jsonb_path_match"):
+            return "bool"
+        if fname == "isempty":
             return "bool"
         if fname in ("gcd", "lcm"):
             return "int8"

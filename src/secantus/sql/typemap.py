@@ -42,6 +42,12 @@ PG_OID: dict[str, int] = {
     # A composite (row) value renders as the ``(f1,f2,…)`` record text literal. We
     # report the generic RECORD pseudo-type OID rather than minting a per-type OID.
     "composite": 2249,
+    # Range types render as the ``[lower,upper)`` text form.
+    "int4range": 3904,
+    "numrange": 3906,
+    "tsrange": 3908,
+    "int8range": 3926,
+    "daterange": 3912,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -52,6 +58,9 @@ PG_OID: dict[str, int] = {
 # Type tags whose value is a list rendered as a Postgres ``int2vector`` /
 # ``oidvector`` (space-separated, not array braces / JSON).
 _VECTOR_TAGS = frozenset({"int2vector", "oidvector"})
+
+# Range type tags — stored as a subdocument, rendered as ``[lower,upper)``.
+_RANGE_TAGS = frozenset({"int4range", "int8range", "numrange", "tsrange", "daterange"})
 
 # Internal type tag -> SQL type name (for information_schema.columns.data_type
 # and any place a human-facing type spelling is needed).
@@ -66,6 +75,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "json": "jsonb",
     "bytea": "bytea",
     "composite": "record",
+    **{t: t for t in _RANGE_TAGS},
 }
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
@@ -80,6 +90,7 @@ PG_TYPENAME: dict[str, str] = {
     "json": "jsonb",
     "bytea": "bytea",
     "composite": "record",
+    **{t: t for t in _RANGE_TAGS},
 }
 
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
@@ -135,7 +146,13 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         inner = datatype.args.get("expressions") or []
         elem = type_tag_for_sql(inner[0]) if inner else None
         return f"{elem}[]" if elem is not None else None
-    return _DATATYPE_TAGS.get(datatype.this)
+    tag = _DATATYPE_TAGS.get(datatype.this)
+    if tag is not None:
+        return tag
+    # Range types — sqlglot's DataType.Type enum names vary across versions, so
+    # match on the rendered type name (``int4range`` etc.).
+    name = datatype.sql(dialect="postgres").lower().strip()
+    return name if name in _RANGE_TAGS else None
 
 
 def is_array_tag(tag: str | None) -> bool:
@@ -202,6 +219,15 @@ def coerce(value: Any, tag: str) -> Any:
         # Schema-on-read (reflected tables): keep the literal's natural Python
         # type so it compares against the stored BSON value as-is.
         return value
+    if tag in _RANGE_TAGS:
+        # Already-built subdocument (from a range constructor) passes through; a
+        # text literal (``'[1,10)'``) is parsed to the subdocument form.
+        if isinstance(value, dict):
+            return value
+        from secantus.sql import ranges as _ranges
+
+        elem, _discrete = _ranges.RANGE_TYPES[tag]
+        return _ranges.parse_literal(str(value), tag, lambda tok: coerce(tok, elem))
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -252,6 +278,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if isinstance(value, _dt.datetime):
         # Postgres renders timestamptz space-separated with a UTC offset.
         return value.isoformat(sep=" ").encode("utf-8")
+    if tag in _RANGE_TAGS and isinstance(value, dict):
+        from secantus.sql import ranges as _ranges
+
+        return _ranges.render(value).encode("utf-8")
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):

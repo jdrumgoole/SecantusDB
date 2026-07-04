@@ -83,6 +83,10 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_jsonb_nav(node, scope, ctx)
     if isinstance(node, exp.JSONBDeleteAtPath):
         return _eval_jsonb_delete_path(node, scope, ctx)
+    if isinstance(node, (exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps)):
+        result = _eval_range_op(node, scope, ctx)
+        if result is not _NOT_RANGE:
+            return result
     if isinstance(node, exp.JSONBPathExists):  # jsonb @? jsonpath
         return _eval_jsonb_path_op(node.this, node.expression, "exists", scope, ctx)
     if getattr(exp, "MatchAgainst", None) is not None and isinstance(node, exp.MatchAgainst):
@@ -792,8 +796,10 @@ def _utcnow(ctx: ScalarContext | None) -> _dt.datetime:
 # Typed scalar function nodes (sqlglot parses these to dedicated classes whose
 # operands live in ``this`` / named args, not ``expressions``).
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
-    exp.Upper: _unary(lambda v: _as_text(v).upper()),
-    exp.Lower: _unary(lambda v: _as_text(v).lower()),
+    # ``upper`` / ``lower`` are overloaded: a range operand yields its bound, any
+    # other operand is the string case-shift.
+    exp.Upper: _unary(lambda v: v.get("upper") if isinstance(v, dict) else _as_text(v).upper()),
+    exp.Lower: _unary(lambda v: v.get("lower") if isinstance(v, dict) else _as_text(v).lower()),
     exp.Length: _unary(lambda v: len(_as_text(v))),
     exp.Trim: _unary(lambda v: _as_text(v).strip()),
     exp.Abs: _unary(abs),
@@ -892,10 +898,15 @@ def _eval_case(node: exp.Case, scope: Scope, ctx: ScalarContext) -> Any:
 
 
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
-    # We don't model regclass/oid identity types; evaluating the inner value is
-    # enough for the catalog queries that use casts (the results are compared or
-    # discarded, never round-tripped through a real type).
-    return evaluate(node.this, scope, ctx)
+    value = evaluate(node.this, scope, ctx)
+    # ``'[1,10)'::int4range`` — parse a range text literal into its subdocument.
+    to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
+    if value is not None and to in typemap._RANGE_TAGS and not isinstance(value, dict):
+        return typemap.coerce(value, to)
+    # Otherwise we don't model regclass/oid identity types; evaluating the inner
+    # value is enough for the catalog queries that use casts (compared / discarded,
+    # never round-tripped through a real type).
+    return value
 
 
 def _func_name(node: exp.Anonymous) -> str:
@@ -1038,6 +1049,25 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
     if name == "log10":
         v = args[0] if args else None
         return None if v is None else math.log10(v)
+    if name in typemap._RANGE_TAGS:
+        # ``int4range(lo, hi [, bounds])`` etc. -> a range subdocument.
+        from secantus.sql import ranges as _ranges
+
+        lo = args[0] if args else None
+        hi = args[1] if len(args) > 1 else None
+        bounds = _as_text(args[2]) if len(args) > 2 else "[)"
+        return _ranges.make_range(lo, hi, bounds, name)
+    if name == "isempty":
+        from secantus.sql import ranges as _ranges
+
+        v = args[0] if args else None
+        return None if v is None else _ranges.is_empty(v)
+    if name in ("lower", "upper") and args and isinstance(args[0], dict):
+        # lower()/upper() on a range value (the string-function overloads are the
+        # exp.Lower/exp.Upper nodes; a dict operand here is a range subdocument).
+        from secantus.sql import ranges as _ranges
+
+        return _ranges.lower_bound(args[0]) if name == "lower" else _ranges.upper_bound(args[0])
     if name in (
         "jsonb_path_query",
         "jsonb_path_query_array",
@@ -1188,6 +1218,33 @@ def _jsonb_strip_nulls(value: Any) -> Any:
     if isinstance(value, list):
         return [_jsonb_strip_nulls(v) for v in value]
     return value
+
+
+_NOT_RANGE = object()
+
+
+def _eval_range_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``@>`` / ``<@`` / ``&&`` on range operands. Returns ``_NOT_RANGE`` when
+    neither operand is a range subdocument (so the caller falls back to the jsonb /
+    array handling of the same operator)."""
+    from secantus.sql import ranges as _ranges
+
+    left = evaluate(node.this, scope, ctx)
+    right = evaluate(node.expression, scope, ctx)
+    left_r = isinstance(left, dict) and ("lower" in left or "empty" in left)
+    right_r = isinstance(right, dict) and ("lower" in right or "empty" in right)
+    if not (left_r or right_r):
+        return _NOT_RANGE
+    if left is None or right is None:
+        return None
+    if isinstance(node, exp.ArrayOverlaps):  # &&
+        return _ranges.overlaps(left, right)
+    if isinstance(node, exp.ArrayContainedBy):  # <@ : left contained by right
+        return (
+            _ranges.contains_range(right, left) if left_r else _ranges.contains_value(right, left)
+        )
+    # ArrayContainsAll -> @> : left contains right (element or range)
+    return _ranges.contains_range(left, right) if right_r else _ranges.contains_value(left, right)
 
 
 def _eval_jsonb_path_op(

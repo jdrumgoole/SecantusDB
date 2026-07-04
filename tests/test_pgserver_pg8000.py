@@ -1116,6 +1116,37 @@ def test_stat_bit_agg_via_driver(server):
     conn.close()
 
 
+def test_range_types_via_driver(server):
+    # Range storage, constructors, text literals, accessors and the @> / <@ / &&
+    # operators over the real pg8000 wire (which parses the range text form).
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE r (id int primary key, span int4range)")
+    cur.execute("INSERT INTO r VALUES (1, int4range(1,10))")
+    cur.execute("INSERT INTO r VALUES (2, '[5,20)')")
+    cur.execute("INSERT INTO r VALUES (3, int4range(100,200))")
+
+    # pg8000 parses the range OID into a Range object rendering as [lo,hi).
+    cur.execute("SELECT span FROM r WHERE id = 1")
+    assert str(cur.fetchone()[0]) == "[1,10)"
+
+    # Accessors: lower/upper come back as ints, isempty as a real bool.
+    cur.execute("SELECT lower(span), upper(span), isempty(span) FROM r WHERE id = 2")
+    lo, hi, empty = cur.fetchone()
+    assert (lo, hi, empty) == (5, 20, False)
+
+    # Containment / overlap in WHERE.
+    cur.execute("SELECT id FROM r WHERE span @> 7 ORDER BY id")
+    assert [row[0] for row in cur.fetchall()] == [1, 2]
+    cur.execute("SELECT id FROM r WHERE span && int4range(15,150) ORDER BY id")
+    assert [row[0] for row in cur.fetchall()] == [2, 3]
+
+    # Containment as a boolean projection.
+    cur.execute("SELECT span @> 7 FROM r WHERE id = 3")
+    assert cur.fetchone()[0] is False
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

@@ -98,6 +98,15 @@ def is_scalar_function(node: exp.Expression) -> bool:
     """Whether ``plan_constant_select`` should evaluate ``node`` as a function."""
     if isinstance(node, exp.Dot):
         return is_scalar_function(node.expression)
+    if isinstance(node, exp.Anonymous):
+        # Range constructors (``int4range(1,5)`` …) and range predicates like
+        # ``isempty(...)`` are handled by the full scalar evaluator, not the
+        # session/info-function path — let them fall through.
+        from secantus.sql import typemap
+
+        name = str(node.this).lower()
+        if name in typemap._RANGE_TAGS or name == "isempty":
+            return False
     return isinstance(
         node,
         exp.CurrentVersion

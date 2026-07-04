@@ -463,6 +463,45 @@ column that references it (columns track the domain by name), rejecting a name
 that clashes with an existing type (`42710`). Not modeled: `VALIDATE CONSTRAINT`
 (accepted as a no-op, since we validate eagerly) and `RENAME CONSTRAINT`.
 
+### Range types (`int4range`, `numrange`, `daterange`, …)
+
+A range column stores an interval of element values. Five built-in range types
+are supported: `int4range` / `int8range` (discrete integers), `numrange`
+(numeric), `tsrange` (timestamp), and `daterange` (dates). A range value is
+stored as a subdocument `{"lower", "upper", "lower_inc", "upper_inc"}` (or
+`{"empty": true}`); discrete types canonicalise to the half-open `[)` form, so
+`int4range(1,10)`, `'[1,10)'`, `'(0,10]'` and `'[1,9]'` all normalise to the
+same interval.
+
+```sql
+CREATE TABLE reservations (id int PRIMARY KEY, during int4range);
+INSERT INTO reservations VALUES (1, int4range(1, 10));   -- constructor
+INSERT INTO reservations VALUES (2, '[5,20)');           -- text literal
+INSERT INTO reservations VALUES (3, '(0,10]');           -- -> canonical [1,11)
+
+-- Constructors and casts
+SELECT int4range(1, 5);              -- [1,5)
+SELECT '[1,10)'::int4range;          -- [1,10)
+SELECT numrange(1.5, 3.5);           -- continuous, keeps its bound flags
+
+-- Accessors
+SELECT lower(during), upper(during), isempty(during) FROM reservations;
+
+-- Operators: @> (contains value or range), <@ (contained by), && (overlaps)
+SELECT * FROM reservations WHERE during @> 7;                -- value in range
+SELECT * FROM reservations WHERE during @> int4range(6, 8);  -- range in range
+SELECT * FROM reservations WHERE during && int4range(15, 150);
+SELECT * FROM reservations WHERE int4range(6, 8) <@ during;
+```
+
+The `@>` / `<@` / `&&` operators work in both the `SELECT` list (yielding a
+`bool`) and in `WHERE`. `lower(r)` / `upper(r)` return the range's element type
+(`lower(int4range)` → `int4`); an unbounded side is `NULL`. Ranges reflect
+through `pg_type` with `typtype = 'r'`.
+
+Not yet supported: multirange types, range GiST indexes, and the additional
+range functions (`range_merge`, `-|-` adjacency, `*` intersection, …).
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every
