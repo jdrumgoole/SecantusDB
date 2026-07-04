@@ -1087,7 +1087,21 @@ SELECT jsonb_array_length(data #> '{tags}') FROM docs WHERE _id = 1;
 SELECT jsonb_typeof(data) FROM docs WHERE _id = 1;       -- 'object'
 SELECT jsonb_array_elements((data->'tags')) FROM docs;   -- one row per element
 SELECT jsonb_object_keys(data) FROM docs;                -- one row per key
+
+-- manipulation: set / insert / strip / delete (each returns a modified copy)
+SELECT jsonb_set(data, '{a}', '5') FROM docs;            -- set data.a = 5 (creates if absent)
+SELECT jsonb_set(data, '{b,c}', '{"k":1}') FROM docs;    -- set a nested path to any json
+SELECT jsonb_insert(data, '{d}', '9') FROM docs;         -- insert only if the key is absent
+SELECT jsonb_strip_nulls(data) FROM docs;                -- drop object members whose value is null
+SELECT data #- '{a}' FROM docs;                          -- delete data.a
+SELECT data #- '{b,c}' FROM docs;                        -- delete a nested path
+SELECT jsonb_pretty(data) FROM docs;                     -- indented text rendering
 ```
+
+The path argument to `jsonb_set` / `jsonb_insert` / `#-` is a Postgres `text[]`
+(`'{a,b}'`); the value argument is parsed as JSON (`'5'` → 5, `'{"k":1}'` → an
+object) the way an implicit `::jsonb` cast would. These functions return a
+modified copy — the stored row is untouched (use them in an `UPDATE … SET`).
 
 Two caveats. `<@` (contained-by) is supported only as `'<const>' <@ field`
 (equivalently `field @> '<const>'`) — the `field <@ '<const>'` direction ("this

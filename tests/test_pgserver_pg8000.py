@@ -1478,6 +1478,21 @@ def test_unnest_in_from_via_driver(server):
     conn.close()
 
 
+def test_jsonb_functions_via_driver(server):
+    # jsonb_set / jsonb_insert / #- through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, data jsonb)")
+    cur.execute("""INSERT INTO t (id, data) VALUES (1, '{"a": 1, "b": {"c": 2}}')""")
+    cur.execute("SELECT jsonb_set(data, '{a}', '5') FROM t")
+    assert cur.fetchall() == ([{"a": 5, "b": {"c": 2}}],)
+    cur.execute("SELECT jsonb_insert(data, '{d}', '9') FROM t")
+    assert cur.fetchall() == ([{"a": 1, "b": {"c": 2}, "d": 9}],)
+    cur.execute("SELECT data #- '{b,c}' FROM t")
+    assert cur.fetchall() == ([{"a": 1, "b": {}}],)
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

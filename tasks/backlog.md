@@ -1344,9 +1344,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   equality). `jsonb_build_object` / `jsonb_build_array` / `jsonb_array_length` / `jsonb_typeof`
   (scalar) and `jsonb_array_elements` / `jsonb_object_keys` (set-returning) are evaluated per row;
   `->`/`->>`/`#>`/`#>>` navigation now also works inside the per-row scalar evaluator (not just the
-  find projection / WHERE). **Gaps:** `<@` (contained-by) is `0A000` — "field is a subset of a
-  constant" isn't expressible as a pushed-down filter (rewrite as `<const> @> field`); `jsonb_each`
-  (key+value record SRF) and the `jsonb_*_text` family aren't modeled. **Parser quirk:** sqlglot reads
+  find projection / WHERE). The manipulation functions landed in b120 (`scalar`): `jsonb_set` /
+  `jsonb_set_lax` / `jsonb_insert` (path is a Postgres `text[]` via `_pg_text_path`; the value arg is
+  JSON-parsed via `_as_json_value`; `create_missing` / `insert_after` honoured; a copy is returned so the
+  stored row is untouched), `jsonb_strip_nulls` / `json_strip_nulls`, `jsonb_pretty`, and the `#-`
+  delete-at-path operator (`exp.JSONBDeleteAtPath`). Type inference: the modifiers → `json`, `jsonb_pretty`
+  → `text`. Tests: `tests/test_sql_jsonb_funcs.py`. **Gaps:** `<@` (contained-by) is `0A000` — "field is a
+  subset of a constant" isn't expressible as a pushed-down filter (rewrite as `<const> @> field`);
+  `jsonb_each` (key+value record SRF) and the `jsonb_*_text` family aren't modeled. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +

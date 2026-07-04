@@ -3782,6 +3782,8 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return _infer_scalar_tag(first, resolve) if first is not None else "text"
     if isinstance(node, exp.Nullif):
         return _infer_scalar_tag(node.this, resolve)
+    if isinstance(node, exp.JSONBDeleteAtPath):  # jsonb #- path -> jsonb
+        return "json"
     if isinstance(node, (exp.Column, *_JSONB_CLASSES)):
         try:
             return _field(node, resolve)[1]
@@ -3799,6 +3801,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "jsonb_build_object",
             "json_build_array",
             "jsonb_build_array",
+            "jsonb_set",
+            "jsonb_set_lax",
+            "jsonb_insert",
+            "jsonb_strip_nulls",
+            "json_strip_nulls",
         ):
             return "json"
         if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):
