@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Reads on a view resolve its pipeline
+
+`find`, `aggregate`, and `count_documents` on a view now run the view's stored
+pipeline against its base collection instead of returning nothing. Create a view
+with `db.createView("active", "users", [{$match: {status: "active"}}])` and a
+`find` / `aggregate` on `active` reads exactly the matching users — with the
+caller's filter, sort, skip, limit, and projection applied on top (a `find` is
+translated into the equivalent aggregate over the base collection). A view defined
+on another view resolves recursively.
+
+Previously only the `count` command resolved views; `find` and `aggregate` (and
+therefore `count_documents`, which pymongo implements via `aggregate`) treated the
+view as an empty collection.
+
+#### Fixed
+
+- `find` / `aggregate` on a view now resolve the view's `viewOn` + pipeline
+  (recursively for a view-on-a-view) via `commands._resolve_view`, applying the
+  request's own filter/sort/skip/limit/projection over the result. Fixes
+  `count_documents` on a view returning 0.
+
 ### Rust server: refuses direct writes to synthetic read-only views
 
 The Rust server now rejects a direct `insert` / `update` / `delete` on

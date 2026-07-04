@@ -3227,3 +3227,29 @@ def test_json_schema_unique_items_find(coll) -> None:
     schema = {"$jsonSchema": {"properties": {"tags": {"bsonType": "array", "uniqueItems": True}}}}
     got = sorted(d["_id"] for d in coll.find(schema))
     assert got == [1, 4]
+
+
+def test_view_reads_resolve_the_pipeline(client: MongoClient) -> None:
+    """find / aggregate / count on a view resolve the view's pipeline against its
+    base collection (previously they returned nothing). Covers filtering, sort,
+    skip, limit, projection, and a view defined on another view."""
+    db = client["view_reads"]
+    db.src.insert_many([{"_id": i, "a": i % 3, "v": i} for i in range(9)])
+    db.command("create", "vw", viewOn="src", pipeline=[{"$match": {"a": 1}}])
+
+    # find over the view (a == 1 → _ids 1, 4, 7)
+    assert sorted(d["_id"] for d in db.vw.find({})) == [1, 4, 7]
+    assert sorted(d["_id"] for d in db.vw.find({"v": {"$gt": 3}})) == [4, 7]
+    assert [d["_id"] for d in db.vw.find({}).sort("_id", -1).limit(2)] == [7, 4]
+    assert [d["_id"] for d in db.vw.find({}).sort("_id", 1).skip(1)] == [4, 7]
+    assert db.vw.find_one({"_id": 4}, {"v": 1, "_id": 0}) == {"v": 4}
+
+    # aggregate + count over the view
+    assert [d["_id"] for d in db.vw.aggregate([{"$sort": {"_id": 1}}])] == [1, 4, 7]
+    assert db.vw.count_documents({}) == 3
+    assert db.vw.count_documents({"v": {"$gt": 3}}) == 2
+
+    # a view defined on another view resolves recursively
+    db.command("create", "vw2", viewOn="vw", pipeline=[{"$match": {"v": {"$gt": 3}}}])
+    assert sorted(d["_id"] for d in db.vw2.find({})) == [4, 7]
+    assert db.vw2.count_documents({}) == 2
