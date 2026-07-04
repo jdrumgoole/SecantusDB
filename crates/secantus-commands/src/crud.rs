@@ -18,10 +18,11 @@
 //! and on `update` / replace (the validator is read here and threaded into the
 //! storage update to check the post-apply doc).
 //!
-//! **Deferred (documented so parity is honest):**
-//! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`); view-collection reads
-//!   (`find` / `aggregate` / `count` on a view return empty on *both* servers —
-//!   view pipelines aren't resolved for reads yet).
+//! Direct writes to the synthetic read-only views `local.oplog.rs` /
+//! `admin.system.users` are rejected in `dispatch` (`reject_synthetic_view_write`,
+//! code 13); reads on a user view (`find` / `aggregate` / `count`) resolve the
+//! view's `viewOn` + pipeline in the aggregate/find command layer
+//! (`aggregate::resolve_view`).
 
 use bson::{doc, Bson, Document};
 

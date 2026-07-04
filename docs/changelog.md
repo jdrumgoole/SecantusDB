@@ -40,6 +40,23 @@ view as an empty collection.
   request's own filter/sort/skip/limit/projection over the result. Fixes
   `count_documents` on a view returning 0.
 
+### Rust server: reads on a view resolve its pipeline
+
+The Rust server now mirrors the Python server: `find`, `aggregate`, and
+`count_documents` on a view resolve the view's `viewOn` + stored pipeline against
+its base collection (recursively for a view-on-a-view) instead of returning
+nothing. The aggregate command's initial fetch resolves the view chain (next to
+the leading-`$match` / `$geoNear` lifts, keeping the view name for the reply `ns`);
+`find` on a view is translated into the equivalent aggregate. Previously the Rust
+server treated a view as an empty collection.
+
+#### Fixed
+
+- **Rust server:** `find` / `aggregate` / `count` on a view resolve
+  `viewOn` + `viewPipeline` (`aggregate::resolve_view`), applying the request's own
+  filter/sort/skip/limit/projection on top. Regression:
+  `tests/test_rust_server_smoke.py::test_view_reads_resolve_against_rust_server`.
+
 ### Rust server: refuses direct writes to synthetic read-only views
 
 The Rust server now rejects a direct `insert` / `update` / `delete` on

@@ -657,18 +657,12 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   matches on the Python server but not the Rust server. Rare; documented in
   `query.rs` module docs. Fuzz subjects are newline-free to avoid spurious parity
   failures from this gap.
-- [ ] **View-collection reads — Rust-server mirror remaining.** The **Python
-  server ships it** (0.5.4b124): `find` / `aggregate` on a view resolve its
-  `viewOn` + stored `viewPipeline` (recursively for a view-on-a-view) via
-  `commands._resolve_view`, applying the request's own filter/sort/skip/limit/
-  projection on top; a `find` is translated into the equivalent aggregate over the
-  base collection (regression: `tests/test_crud.py::
-  test_view_reads_resolve_the_pipeline`). The `count` command already resolved
-  views. **Remaining:** mirror in the Rust aggregate/find command layer (the Rust
-  server still returns empty for view reads) — resolve `viewOn`/`viewPipeline`
-  into the initial fetch, next to the leading-`$match`/`$geoNear` lifts. **Rust
-  CRUD cross-cutting now done:** `writeConcern` value validation (codes 9/79/14 —
-  0.5.3-beta.124),
+- [x] **View-collection reads — DONE on both servers.** `find` / `aggregate` /
+  `count` on a view resolve the view's `viewOn` + pipeline against the base
+  collection (recursively for a view-on-a-view): Python `commands._resolve_view`
+  (0.5.4b124), Rust `aggregate::resolve_view` (0.5.3-beta.126); a `find` on a view
+  is translated into the equivalent aggregate on both. **Rust CRUD cross-cutting
+  all done:** `writeConcern` value validation (codes 9/79/14 — 0.5.3-beta.124),
   `validator` on update/replace (post-apply doc via `Storage::update_matching`),
   and `_reject_oplog_rs_write` — direct writes to `local.oplog.rs` /
   `admin.system.users` rejected with code 13 (0.5.3-beta.125), all matching the

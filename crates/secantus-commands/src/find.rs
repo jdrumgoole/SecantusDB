@@ -112,8 +112,71 @@ pub(crate) fn query_filter_error(filter: &Document) -> CommandError {
 }
 
 /// `find` — run a query and open a cursor over the results.
+/// Build the aggregate command equivalent to a `find` on a view: the find's
+/// filter / sort / skip / limit / projection become pipeline stages (in that
+/// order), over the view namespace, carrying the collation / let / batchSize.
+fn build_view_find_aggregate(doc: &Document, coll: &str) -> Document {
+    let mut pipeline: Vec<Bson> = Vec::new();
+    if let Some(Bson::Document(f)) = doc.get("filter") {
+        if !f.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$match": f.clone() }));
+        }
+    }
+    if let Some(Bson::Document(s)) = doc.get("sort") {
+        if !s.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$sort": s.clone() }));
+        }
+    }
+    if let Some(n) = doc.get("skip").and_then(as_i64) {
+        if n > 0 {
+            pipeline.push(Bson::Document(doc! { "$skip": n }));
+        }
+    }
+    if let Some(n) = doc.get("limit").and_then(as_i64) {
+        if n > 0 {
+            pipeline.push(Bson::Document(doc! { "$limit": n }));
+        }
+    }
+    if let Some(Bson::Document(p)) = doc.get("projection") {
+        if !p.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$project": p.clone() }));
+        }
+    }
+    let batch_size = doc
+        .get("batchSize")
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let mut agg = doc! {
+        "aggregate": coll,
+        "pipeline": pipeline,
+        "cursor": { "batchSize": batch_size },
+    };
+    if let Some(c) = doc.get("collation") {
+        agg.insert("collation", c.clone());
+    }
+    if let Some(l) = doc.get("let") {
+        agg.insert("let", l.clone());
+    }
+    agg
+}
+
 pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "find")?;
+    // A view: translate the find into the equivalent aggregate over the base
+    // collection (the find options become pipeline stages after the view's own
+    // pipeline) and delegate — the aggregate handler resolves the view. `find` and
+    // `aggregate` return the same cursor-reply shape. Mirrors commands._find.
+    let is_view = {
+        let storage = ctx.storage()?;
+        storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map(|o| o.contains_key("viewOn"))
+            .unwrap_or(false)
+    };
+    if is_view {
+        let agg = build_view_find_aggregate(doc, &coll);
+        return crate::aggregate::aggregate(&agg, ctx);
+    }
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
 
