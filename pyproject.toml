@@ -189,6 +189,15 @@ sdist.exclude = [
     # (tests/test_geo_cross_driver.py) ships, but the JS/Go sources
     # don't need to live in the wheel — they're dev-only scaffolding.
     "tests/cross_driver/**",
+    # Dev-only trees that aren't needed to build or install the package: the
+    # Sphinx docs, the invoke task defs, the benchmark harness, and the CI
+    # workflow config. Trimming them keeps the source tarball lean without
+    # touching what the build actually consumes (src/, CMakeLists, cmake/,
+    # vendor/wiredtiger, pyproject). (security review §I7)
+    "docs/**",
+    "tasks/**",
+    "bench/**",
+    ".github/**",
 ]
 
 [tool.cibuildwheel]

@@ -9,6 +9,13 @@ __pycache__/
 venv/
 .env
 
+# Never commit private keys / certs / keystores — a safety net so a stray
+# credential file can't be added by accident. (security review §I8)
+*.pem
+*.key
+*.p12
+*.pfx
+
 build/
 dist/
 wheelhouse/

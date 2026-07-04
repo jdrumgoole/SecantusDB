@@ -36,6 +36,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: these jobs only check out the repo, restore caches, and run
+# the test suite — none of which need write access to repo contents. Declaring
+# an explicit read-only scope drops the default token's broader grant. (§I6)
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}

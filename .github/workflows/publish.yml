@@ -185,3 +185,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
         with:
           packages-dir: dist/
+          # Generate + upload PEP 740 sigstore attestations for each artifact,
+          # signed with the workflow's OIDC identity (id-token: write above).
+          # (security review §I15)
+          attestations: true
