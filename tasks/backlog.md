@@ -657,10 +657,14 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   matches on the Python server but not the Rust server. Rare; documented in
   `query.rs` module docs. Fuzz subjects are newline-free to avoid spurious parity
   failures from this gap.
-- [ ] **CRUD cross-cutting still deferred in the Rust handlers:** `writeConcern`
-  *value validation* (malformed `w`/`wtimeout`); `validator` on update/replace;
-  `_reject_oplog_rs_write`; view-collection `count` (needs the aggregation
-  engine). All tracked in `crud.rs`'s module docs.
+- [ ] **CRUD cross-cutting still deferred in the Rust handlers:**
+  `_reject_oplog_rs_write` (writes to `local.oplog.rs`); view-collection reads
+  (`find` / `aggregate` / `count` on a view resolve nothing — this is a *shared*
+  limitation: both servers return empty for reads on a view, needs the view
+  pipeline resolved into the read path). **Done:** `writeConcern` *value
+  validation* (malformed `w`/`j`/`wtimeout` rejected in `dispatch` with mongod's
+  codes 9/79/14 — 0.5.3-beta.124, matches Python) and `validator` on
+  update/replace (post-apply doc checked via `Storage::update_matching`).
 
 - [x] **Engine selection** — `secantus.engine` is the single source of truth
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six

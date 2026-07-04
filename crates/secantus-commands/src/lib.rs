@@ -455,6 +455,104 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     }
 }
 
+/// Commands that accept a `writeConcern` and whose malformed value mongod
+/// rejects *before* running — the set `commands.py::_validate_write_concern` is
+/// prepended to (insert / update / delete / findAndModify / create / collMod /
+/// createIndexes / drop / dropIndexes / dropDatabase / renameCollection).
+fn is_write_concern_command(name: &str) -> bool {
+    matches!(
+        name,
+        "insert"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
+            | "create"
+            | "collMod"
+            | "collmod"
+            | "createIndexes"
+            | "drop"
+            | "dropIndexes"
+            | "dropDatabase"
+            | "renameCollection"
+    )
+}
+
+/// Reject a malformed `writeConcern` before a write command runs, mirroring
+/// `commands.py::_validate_write_concern`: a non-document `writeConcern` or a
+/// non-bool/int `j` / non-number `wtimeout` → `TypeMismatch` (14); a `w` that's a
+/// bool or non-number/string → `TypeMismatch` (14); a string `w` other than
+/// `"majority"` → `UnknownReplWriteConcern` (79); an integer `w` outside `[0, 50]`
+/// → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1` still
+/// succeeds with a `writeConcernError` attached — see `attach_write_concern_error`.)
+fn validate_write_concern(doc: &Document) -> Option<CommandError> {
+    let wc = match doc.get("writeConcern") {
+        None => return None,
+        Some(Bson::Document(d)) => d,
+        Some(_) => {
+            return Some(CommandError::new(
+                14,
+                "TypeMismatch",
+                "writeConcern must be a document",
+            ))
+        }
+    };
+    if let Some(w) = wc.get("w") {
+        match w {
+            Bson::Int32(_) | Bson::Int64(_) => {
+                let n = if let Bson::Int32(x) = w {
+                    *x as i64
+                } else if let Bson::Int64(x) = w {
+                    *x
+                } else {
+                    0
+                };
+                if !(0..=50).contains(&n) {
+                    return Some(CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "w has to be a non-negative number and not greater than 50",
+                    ));
+                }
+            }
+            Bson::String(s) if s == "majority" => {}
+            Bson::String(s) => {
+                return Some(CommandError::new(
+                    79,
+                    "UnknownReplWriteConcern",
+                    format!("No write concern mode named '{s}' found in replica set configuration"),
+                ))
+            }
+            _ => {
+                return Some(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    "writeConcern.w must be a number or string",
+                ))
+            }
+        }
+    }
+    if let Some(j) = wc.get("j") {
+        if !matches!(j, Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_)) {
+            return Some(CommandError::new(
+                14,
+                "TypeMismatch",
+                "writeConcern.j must be a boolean or integer",
+            ));
+        }
+    }
+    if let Some(wt) = wc.get("wtimeout") {
+        if !matches!(wt, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
+            return Some(CommandError::new(
+                14,
+                "TypeMismatch",
+                "writeConcern.wtimeout must be a number",
+            ));
+        }
+    }
+    None
+}
+
 /// Reject a namespace component (database / collection / index name) that
 /// carries an embedded NUL byte.
 ///
@@ -562,6 +660,14 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                         );
                     }
                     return reply;
+                }
+            }
+            // Malformed writeConcern is rejected before a write command runs
+            // (mirrors commands.py, which prepends _validate_write_concern to each
+            // write handler). Reads don't carry a writeConcern.
+            if is_write_concern_command(name) {
+                if let Some(e) = validate_write_concern(doc) {
+                    return e.into_reply();
                 }
             }
             // Time profile-eligible commands so dispatch can record a
