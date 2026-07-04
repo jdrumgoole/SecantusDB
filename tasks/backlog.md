@@ -1395,10 +1395,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `_aggregate_of`; `string_agg(expr, sep)` (`exp.GroupConcat`) lowers to a `$push` accumulator plus a
   `$reduce` in the group `$project` (`_string_agg_project`) that joins the pushed array skipping NULL
   elements (NULL when all-NULL) — wired into the single-table, join, and grouping-set planners with the
-  routing predicates updated. Tests: `tests/test_sql_string_agg.py`. **Still `0A000`:** the ordered-set
-  aggregates `percentile_cont` / `mode` (`WITHIN GROUP (ORDER BY …)`) — they need within-group ordering
-  the `$group` accumulator model doesn't express; `string_agg`'s own `ORDER BY` inside the call is ignored
-  (sqlglot drops it).
+  routing predicates updated. Tests: `tests/test_sql_string_agg.py`. `string_agg`'s own `ORDER BY` inside
+  the call is ignored (sqlglot drops it).
+- [ ] **Ordered-set aggregates landed** (b127): `percentile_cont(f)` / `percentile_disc(f)` / `mode()`
+  via `WITHIN GROUP (ORDER BY expr)` (sqlglot `exp.WithinGroup`). `planner._ordered_set_agg` detects them
+  (wired into `select_needs_pipeline` + the two `has_aggregate` routing predicates); `_plan_group_select`
+  collects the ORDER BY values into a `$push` accumulator and records a `PipelineSelectPlan.post_aggregates`
+  entry `(field, kind, fraction)`. The executor (`_ordered_set_value`, run in `execute_pipeline_select`
+  after `apply_pipeline`) drops NULLs, sorts, and computes: `percentile_cont` = linear interpolation
+  between the two nearest ranks (→ `float8`); `percentile_disc` = first value whose cumulative fraction ≥
+  `f` (keeps the element type); `mode` = most frequent (smallest on a tie). NULLs ignored; all-NULL / empty
+  group → NULL; `f` outside `[0,1]` → `2202E`. (Computed in Python because the aggregation-expression
+  engine has no `$sortArray`.) **Not supported:** ordered-set aggs over a JOIN (single-table + whole-table
+  only), and — like all pipeline aggregates — a whole-table aggregate over zero input rows returns no row
+  rather than one NULL row.
 - [ ] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
   literal` keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is
   a constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`

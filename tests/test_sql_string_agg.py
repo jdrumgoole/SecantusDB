@@ -122,14 +122,16 @@ def test_every_is_bool_and(t, session):
     ]
 
 
-# -- ordered-set aggregates are deferred -------------------------------------- #
+# -- ordered-set aggregates now supported (see test_sql_ordered_set_agg.py) ---- #
 
 
-def test_percentile_cont_unsupported(t, session):
-    assert sqlstate(
+def test_percentile_cont_supported(t, session):
+    # ids 1,2,3,4 -> median rank 1.5 -> 2.5.
+    assert run(
         t, session, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM t"
-    ) == ("0A000")
+    ).rows == [(2.5,)]
 
 
-def test_mode_unsupported(t, session):
-    assert sqlstate(t, session, "SELECT mode() WITHIN GROUP (ORDER BY id) FROM t") == "0A000"
+def test_mode_supported(t, session):
+    # ids are all distinct -> the smallest.
+    assert run(t, session, "SELECT mode() WITHIN GROUP (ORDER BY id) FROM t").rows == [(1,)]

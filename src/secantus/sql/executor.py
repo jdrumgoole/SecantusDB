@@ -1230,6 +1230,48 @@ def _pipeline_input_docs(
     return [d for d in docs if keep(d)], remaining
 
 
+def _ordered_set_value(kind: str, fraction: float | None, values: Any) -> Any:
+    """Compute an ordered-set aggregate from the pushed ORDER BY values (NULLs
+    dropped, then sorted ascending):
+
+    - ``percentile_cont(f)``: continuous percentile with linear interpolation
+      between the two nearest ranks (``f`` in [0, 1]).
+    - ``percentile_disc(f)``: the first value whose cumulative fraction ≥ ``f``.
+    - ``mode``: the most frequent value; on a tie, the smallest.
+
+    Returns NULL when the (non-NULL) set is empty."""
+    import math
+
+    vals = sorted(v for v in (values or []) if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    if kind == "mode":
+        best_val, best_count = vals[0], 0
+        i = 0
+        while i < n:
+            j = i
+            while j < n and vals[j] == vals[i]:
+                j += 1
+            if j - i > best_count:
+                best_val, best_count = vals[i], j - i
+            i = j
+        return best_val
+    assert fraction is not None
+    if kind == "percentile_disc":
+        # Smallest index whose 1-based position / n ≥ fraction.
+        idx = 0 if fraction == 0 else min(math.ceil(fraction * n) - 1, n - 1)
+        return vals[max(idx, 0)]
+    # percentile_cont: linear interpolation between the neighbouring ranks.
+    rank = fraction * (n - 1)
+    lo = math.floor(rank)
+    hi = math.ceil(rank)
+    if lo == hi:
+        return float(vals[lo])
+    frac = rank - lo
+    return float(vals[lo]) + (float(vals[hi]) - float(vals[lo])) * frac
+
+
 def execute_pipeline_select(
     plan: planner.PipelineSelectPlan, storage: Any, db: str, sctx: Any = None
 ) -> SQLResult:
@@ -1240,6 +1282,10 @@ def execute_pipeline_select(
     docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
     result = apply_pipeline(docs, remaining, ctx)
+    if plan.post_aggregates:
+        for doc in result:
+            for field_name, kind, fraction in plan.post_aggregates:
+                doc[field_name] = _ordered_set_value(kind, fraction, doc.get(field_name))
     columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
     rows = [
         tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result
