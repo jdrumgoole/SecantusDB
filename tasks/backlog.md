@@ -1556,9 +1556,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`scalar._eval_bracket`: `arr[i]` 1-based element, NULL out of range; `arr[lo:hi]` 1-based inclusive
   slice; `WHERE arr[i]` lowers to `$arrayElemAt` via `planner._to_agg_expr`; element/array type inference
   in `_infer_scalar_tag`). `unnest(array_col)` in the SELECT list works (via the b-set-returning-function
-  path). **Limitations:** one level deep only (no multi-dimensional arrays — `array_length(col, 2)` is
-  NULL); the FROM-clause table form `FROM unnest(col)` is unsupported; no `array_agg` into a declared
-  array column; no element-type coercion beyond the scalar tags.
+  path). The array manipulation functions landed in b118 (`scalar._eval_array_{append,prepend,cat,position,
+  remove,to_string}` + an `exp.Array` constructor handler; type inference in `_infer_scalar_tag`):
+  `array_append` / `array_prepend` / `array_cat` (NULL array treated as empty, per Postgres),
+  `array_position` (1-based, NULL if absent), `array_remove`, `array_to_string` (optional null-string
+  arg; NULL elements dropped otherwise). `array_agg` populates a declared array column via `INSERT …
+  SELECT`. **Limitations:** one level deep only (no multi-dimensional arrays — `array_length(col, 2)` is
+  NULL); the FROM-clause table form `FROM unnest(col)` is unsupported; array functions are evaluated in
+  Python (SELECT-list / INSERT-SELECT), not pushed into a Mongo `$match` when used in WHERE; no
+  element-type coercion beyond the scalar tags.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys landed** (b117): a `PRIMARY KEY (a, b)` maps to a subdocument `_id: {a, b}`
