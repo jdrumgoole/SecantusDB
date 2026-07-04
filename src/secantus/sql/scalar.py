@@ -79,6 +79,8 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return scope(node)
     if isinstance(node, _JSONB_NAV):
         return _eval_jsonb_nav(node, scope, ctx)
+    if isinstance(node, exp.JSONBDeleteAtPath):
+        return _eval_jsonb_delete_path(node, scope, ctx)
     if isinstance(node, exp.Case):
         return _eval_case(node, scope, ctx)
     if isinstance(node, exp.If):
@@ -523,6 +525,19 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         return len(v)
     if name in ("jsonb_typeof", "json_typeof"):
         return _json_typeof(args[0] if args else None)
+    if name in ("jsonb_set", "jsonb_set_lax"):
+        target, path, value = args[0], _pg_text_path(args[1]), _as_json_value(args[2])
+        create = args[3] if len(args) > 3 else True
+        return _jsonb_set(target, path, value, create=bool(create), insert=False)
+    if name == "jsonb_insert":
+        target, path, value = args[0], _pg_text_path(args[1]), _as_json_value(args[2])
+        after = bool(args[3]) if len(args) > 3 else False
+        return _jsonb_set(target, path, value, create=True, insert=True, insert_after=after)
+    if name in ("jsonb_strip_nulls", "json_strip_nulls"):
+        return _jsonb_strip_nulls(args[0] if args else None)
+    if name in ("jsonb_pretty",):
+        v = args[0] if args else None
+        return None if v is None else json.dumps(v, indent=4, default=str)
     if name == "coalesce":
         for a in args:
             if a is not None:
@@ -561,6 +576,132 @@ def _json_as_text(val: Any) -> str | None:
     if isinstance(val, (dict, list)):
         return json.dumps(val)
     return str(val)
+
+
+def _pg_text_path(value: Any) -> list[str]:
+    """Parse a jsonb function's ``path`` argument — a Postgres ``text[]`` given
+    either as a Python list or a ``'{a,b}'`` string literal — into a key list."""
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    from secantus.sql import typemap
+
+    return [str(v) for v in typemap._parse_pg_array_literal(str(value))]
+
+
+def _as_json_value(value: Any) -> Any:
+    """Coerce a ``jsonb`` value argument: a string is parsed as JSON (so ``'5'`` ->
+    5, ``'{"k":1}'`` -> dict) when it parses, else used verbatim."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
+def _jsonb_set(
+    target: Any,
+    keys: list[str],
+    value: Any,
+    *,
+    create: bool,
+    insert: bool = False,
+    insert_after: bool = False,
+) -> Any:
+    """``jsonb_set`` / ``jsonb_insert`` core: return a copy of ``target`` with
+    ``value`` set (or inserted) at the ``keys`` path. ``create`` adds missing
+    object keys; ``insert`` only adds a new element (object key must be absent, or
+    array position ``insert_after``-adjusted), leaving an existing value alone."""
+    import copy
+
+    if target is None or not keys:
+        return target
+    root = copy.deepcopy(target)
+    node = root
+    for key in keys[:-1]:  # walk to the parent of the leaf
+        if isinstance(node, dict):
+            if key not in node:
+                if not create:
+                    return root
+                node[key] = {}
+            node = node[key]
+        elif isinstance(node, list):
+            idx = _list_index(node, key)
+            if idx is None or not 0 <= idx < len(node):
+                return root
+            node = node[idx]
+        else:
+            return root
+    leaf = keys[-1]
+    if isinstance(node, dict):
+        if insert and leaf in node:
+            return root  # jsonb_insert leaves an existing key untouched
+        if leaf not in node and not create and not insert:
+            return root
+        node[leaf] = value
+    elif isinstance(node, list):
+        idx = _list_index(node, leaf)
+        if idx is None:
+            return root
+        if insert:
+            pos = idx + 1 if insert_after else idx
+            node.insert(max(0, min(pos, len(node))), value)
+        elif 0 <= idx < len(node):
+            node[idx] = value
+    return root
+
+
+def _list_index(arr: list, key: str) -> int | None:
+    """A jsonb array subscript: a signed int (negative counts from the end)."""
+    try:
+        idx = int(key)
+    except (ValueError, TypeError):
+        return None
+    return idx + len(arr) if idx < 0 else idx
+
+
+def _jsonb_strip_nulls(value: Any) -> Any:
+    """Recursively drop object members whose value is JSON null (arrays keep their
+    null elements, matching Postgres ``jsonb_strip_nulls``)."""
+    if isinstance(value, dict):
+        return {k: _jsonb_strip_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_jsonb_strip_nulls(v) for v in value]
+    return value
+
+
+def _eval_jsonb_delete_path(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``jsonb #- text[]`` — return a copy of the jsonb with the element at the path
+    removed."""
+    import copy
+
+    target = evaluate(node.this, scope, ctx)
+    if target is None:
+        return None
+    keys = _pg_text_path(evaluate(node.expression, scope, ctx))
+    if not keys:
+        return target
+    root = copy.deepcopy(target)
+    node_ref = root
+    for key in keys[:-1]:
+        if isinstance(node_ref, dict) and key in node_ref:
+            node_ref = node_ref[key]
+        elif (
+            isinstance(node_ref, list)
+            and (i := _list_index(node_ref, key)) is not None
+            and 0 <= i < len(node_ref)
+        ):
+            node_ref = node_ref[i]
+        else:
+            return root
+    leaf = keys[-1]
+    if isinstance(node_ref, dict):
+        node_ref.pop(leaf, None)
+    elif isinstance(node_ref, list):
+        i = _list_index(node_ref, leaf)
+        if i is not None and 0 <= i < len(node_ref):
+            del node_ref[i]
+    return root
 
 
 def _json_typeof(value: Any) -> str | None:
