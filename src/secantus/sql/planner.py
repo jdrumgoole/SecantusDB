@@ -2043,6 +2043,39 @@ def _string_agg_arg(node: exp.Expression) -> tuple[exp.Expression, str] | None:
     return inner.this, sep
 
 
+def _agg_order_spec(
+    value_node: exp.Expression,
+) -> tuple[exp.Expression, list[tuple[exp.Expression, int, bool]] | None]:
+    """Unwrap an in-call ``ORDER BY`` from an aggregate argument. ``array_agg(x
+    ORDER BY y DESC)`` / ``string_agg(x, sep ORDER BY y)`` parse the argument as an
+    ``exp.Order`` whose ``this`` is the value and ``expressions`` are the sort
+    keys. Returns ``(value_expr, [(key_expr, direction, nulls_first), …])`` — or
+    ``(value_node, None)`` when there is no in-call ORDER BY."""
+    if not isinstance(value_node, exp.Order):
+        return value_node, None
+    terms: list[tuple[exp.Expression, int, bool]] = []
+    for o in value_node.expressions:  # exp.Ordered
+        direction = -1 if o.args.get("desc") else 1
+        nulls_first = bool(o.args.get("nulls_first"))
+        terms.append((o.this, direction, nulls_first))
+    return value_node.this, terms
+
+
+def _sorted_agg_push(
+    value_node: exp.Expression,
+    terms: list[tuple[exp.Expression, int, bool]],
+    table: TableDef,
+) -> dict[str, Any]:
+    """The ``$push`` expression for an ordered aggregate: a ``{v, k}`` pair per row
+    (``v`` the value, ``k`` the list of sort-key values) that the executor sorts."""
+    return {
+        "$push": {
+            "v": _agg_arg_to_expr(value_node, table),
+            "k": [_agg_arg_to_expr(key, table) for key, _dir, _nf in terms],
+        }
+    }
+
+
 def _string_agg_project(fname: str, sep: str) -> dict[str, Any]:
     """The ``$project`` expression that turns a ``string_agg`` field's pushed
     array (``[v1, v2, …]``) into the delimited string, skipping NULL elements and
@@ -2703,13 +2736,26 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             out_columns.append((fname, tag))
         elif arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:  # array_agg(x ORDER BY …): push {v, k}, executor sorts
+                accumulators[fname] = _sorted_agg_push(value_node, terms, table)
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             project[fname] = f"${fname}"
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(sagg[0], table)}
-            project[fname] = _string_agg_project(fname, sagg[1])
+            value_node, terms = _agg_order_spec(sagg[0])
+            if terms:  # string_agg(x, sep ORDER BY …): push {v, k}, executor sorts+joins
+                accumulators[fname] = _sorted_agg_push(value_node, terms, table)
+                project[fname] = f"${fname}"
+                post_aggregates.append(
+                    (fname, "sorted_string", ([(d, nf) for _k, d, nf in terms], sagg[1]))
+                )
+            else:
+                accumulators[fname] = {"$push": _agg_arg_to_expr(sagg[0], table)}
+                project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None:
             func, col, distinct = agg

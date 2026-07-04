@@ -817,6 +817,18 @@ SELECT region, bool_and(active), bool_or(active) FROM sales GROUP BY region;
 separator (returning NULL when every value was NULL). `bool_and` / `every` are
 true only when every input is true; `bool_or` is true when any is.
 
+`array_agg` and `string_agg` accept an **in-call `ORDER BY`** that orders the
+aggregated values (multiple keys, `ASC`/`DESC`, and Postgres NULL placement):
+
+```sql
+SELECT dept, array_agg(name ORDER BY hired) FROM emp GROUP BY dept;
+SELECT string_agg(name, ', ' ORDER BY name DESC) FROM emp;
+```
+
+The value + sort-key pair is collected per row and sorted in Python before the
+array is built / the string joined. Supported grouped and whole-table (not yet
+over a JOIN — there the in-call `ORDER BY` raises `0A000`).
+
 The **ordered-set aggregates** `percentile_cont(f)` / `percentile_disc(f)` /
 `mode()` are supported via `WITHIN GROUP (ORDER BY expr)`:
 
