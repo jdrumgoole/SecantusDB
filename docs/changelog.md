@@ -19,6 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: correct error codes for unrecognized / Atlas aggregation stages
+
+The Rust server now validates aggregation stage names up-front, matching the
+Python server (and mongod): an unrecognized stage (`{$badStage: …}`) is rejected
+with `Location40324` ("Unrecognized pipeline stage name"), and an Atlas-only stage
+(`$search` / `$vectorSearch` / `$searchMeta` / `$listSearchIndexes`) with
+`CommandNotSupported` (115) and the Atlas configuration message. Previously both
+surfaced as a generic `BadValue` (2), so drivers couldn't tell an unknown stage
+from any other unsupported construct.
+
+#### Fixed
+
+- **Rust server:** an unrecognized aggregation stage now returns code 40324 (was
+  2), and an Atlas-only stage returns 115 with the Atlas message
+  (`aggregate::validate_stage_names`, recognized-stage set kept in sync with the
+  Python `aggregate._STAGES` registry). Regression:
+  `tests/test_rust_server_smoke.py::test_aggregate_stage_name_validation_against_rust_server`.
+
 ### Reads on a view resolve its pipeline
 
 `find`, `aggregate`, and `count_documents` on a view now run the view's stored

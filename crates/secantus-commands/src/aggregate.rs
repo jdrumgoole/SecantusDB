@@ -72,6 +72,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         _ => Vec::new(),
     };
 
+    // Validate stage names up-front (mongod parses before running): an
+    // unrecognised stage is Location40324, an Atlas-only stage is
+    // CommandNotSupported (115) — not the generic "unsupported" BadValue.
+    if let Err(e) = validate_stage_names(&pipeline) {
+        return Ok(e.into_reply());
+    }
+
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct
     // from the top-level `explain` wrapper): return the plan instead of running
     // the pipeline, and crucially do NOT execute `$out` / `$merge`. Delegate to
@@ -295,6 +302,96 @@ fn apply_source_stage(
         "ns": ns,
         "op": "command",
     }]
+}
+
+/// Atlas-only aggregation stages SecantusDB can't provide — rejected with the
+/// Atlas message (`CommandNotSupported`, 115) rather than the generic
+/// unrecognized-stage error. Mirrors `aggregate._ATLAS_ONLY_STAGES`.
+const ATLAS_STAGES: &[&str] = &[
+    "$listSearchIndexes",
+    "$search",
+    "$searchMeta",
+    "$vectorSearch",
+];
+
+const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
+$listSearchIndexes aggregation stage requires additional configuration. Please connect to Atlas \
+or an Atlas-compatible deployment to use this feature.";
+
+/// Whether `name` is a recognised aggregation stage (the set the Python
+/// `aggregate._STAGES` registry recognises). Keep in sync with that set.
+fn recognized_stage(name: &str) -> bool {
+    matches!(
+        name,
+        "$addFields"
+            | "$bucket"
+            | "$bucketAuto"
+            | "$changeStream"
+            | "$changeStreamSplitLargeEvent"
+            | "$collStats"
+            | "$count"
+            | "$currentOp"
+            | "$densify"
+            | "$documents"
+            | "$facet"
+            | "$fill"
+            | "$geoNear"
+            | "$graphLookup"
+            | "$group"
+            | "$indexStats"
+            | "$limit"
+            | "$listLocalSessions"
+            | "$listSessions"
+            | "$lookup"
+            | "$match"
+            | "$merge"
+            | "$out"
+            | "$project"
+            | "$redact"
+            | "$replaceRoot"
+            | "$replaceWith"
+            | "$sample"
+            | "$set"
+            | "$setWindowFields"
+            | "$skip"
+            | "$sort"
+            | "$sortByCount"
+            | "$unionWith"
+            | "$unset"
+            | "$unwind"
+    )
+}
+
+/// Up-front pipeline stage-name validation (mongod validates at parse time,
+/// before any document flows). An Atlas-only stage → `CommandNotSupported` (115);
+/// an unrecognised single-key stage → `Location40324`. Malformed stage shapes
+/// (non-document / empty / multi-key) are left to the engine path. Mirrors
+/// `aggregate.validate_stage_names`.
+fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
+    for stage in pipeline {
+        let Some(d) = stage.as_document() else {
+            continue;
+        };
+        if d.len() != 1 {
+            continue;
+        }
+        let name = stage_name(stage);
+        if ATLAS_STAGES.contains(&name) {
+            return Err(CommandError::new(
+                115,
+                "CommandNotSupported",
+                SEARCH_INDEX_ATLAS_MSG,
+            ));
+        }
+        if !recognized_stage(name) {
+            return Err(CommandError::new(
+                40324,
+                "Location40324",
+                format!("Unrecognized pipeline stage name: '{name}'"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The stage operator name (the single key of a stage document), or `""`.
