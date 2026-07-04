@@ -1147,6 +1147,28 @@ def test_range_types_via_driver(server):
     conn.close()
 
 
+def test_jsonb_agg_and_builders_via_driver(server):
+    # jsonb_agg / jsonb_object_agg aggregates and to_jsonb over the real wire; the
+    # driver decodes the json column back into Python containers.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE j (id int primary key, g int, k text, v int)")
+    cur.execute("INSERT INTO j VALUES (1,1,'a',10),(2,1,'b',20),(3,2,'c',30)")
+
+    cur.execute("SELECT jsonb_agg(v ORDER BY v) AS a FROM j")
+    assert cur.fetchone()[0] == [10, 20, 30]
+
+    cur.execute("SELECT jsonb_object_agg(k, v) AS o FROM j")
+    assert cur.fetchone()[0] == {"a": 10, "b": 20, "c": 30}
+
+    cur.execute("SELECT g, jsonb_object_agg(k, v) AS o FROM j GROUP BY g ORDER BY g")
+    assert [tuple(r) for r in cur.fetchall()] == [(1, {"a": 10, "b": 20}), (2, {"c": 30})]
+
+    cur.execute("SELECT to_jsonb(v) AS j FROM j WHERE id = 1")
+    assert cur.fetchone()[0] == 10
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

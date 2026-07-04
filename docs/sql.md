@@ -1369,7 +1369,24 @@ SELECT jsonb_strip_nulls(data) FROM docs;                -- drop object members 
 SELECT data #- '{a}' FROM docs;                          -- delete data.a
 SELECT data #- '{b,c}' FROM docs;                        -- delete a nested path
 SELECT jsonb_pretty(data) FROM docs;                     -- indented text rendering
+
+-- aggregates: collect rows into a json array / object
+SELECT jsonb_agg(v) FROM t;                              -- [v1, v2, …]
+SELECT jsonb_agg(v ORDER BY v DESC) FROM t;              -- in-call ORDER BY honoured
+SELECT g, jsonb_object_agg(k, v) FROM t GROUP BY g;      -- {k1: v1, k2: v2, …} per group
+SELECT json_agg(v), json_object_agg(k, v) FROM t;        -- the json_* spellings too
+
+-- builders: value / row -> json
+SELECT to_jsonb(5), to_json('hi');                       -- scalar -> json
+SELECT to_jsonb(p), row_to_json(p) FROM composites;      -- a composite -> a json object
 ```
+
+`jsonb_agg` / `json_agg` build a json array from the group's values (an in-call
+`ORDER BY` sorts them, like `array_agg`); `jsonb_object_agg` / `json_object_agg`
+build a json object, with each key coerced to text (Postgres object keys are
+text). `to_jsonb` / `to_json` / `row_to_json` convert a value or a composite /
+`ROW(...)` into json (a composite becomes an object keyed by its field names).
+All are typed `json` on the wire.
 
 The path argument to `jsonb_set` / `jsonb_insert` / `#-` is a Postgres `text[]`
 (`'{a,b}'`); the value argument is parsed as JSON (`'5'` → 5, `'{"k":1}'` → an
