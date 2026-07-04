@@ -4180,6 +4180,24 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         ),
     ) or (getattr(exp, "Translate", None) is not None and isinstance(node, exp.Translate)):
         return "text"
+    # String round-out functions -> text (lpad/rpad/left/right/repeat/reverse/
+    # initcap/chr/overlay); ascii/strpos/position -> int4. Attribute lookup for
+    # version tolerance.
+    _text_str = tuple(
+        c
+        for c in (
+            getattr(exp, n, None)
+            for n in ("Pad", "Left", "Right", "Repeat", "Reverse", "Initcap", "Chr", "Overlay")
+        )
+        if c is not None
+    )
+    if _text_str and isinstance(node, _text_str):
+        return "text"
+    _int_str = tuple(
+        c for c in (getattr(exp, n, None) for n in ("Ascii", "StrPosition")) if c is not None
+    )
+    if _int_str and isinstance(node, _int_str):
+        return "int4"
     if isinstance(node, (exp.Length, exp.ArraySize, exp.ArrayPosition)) or (
         getattr(exp, "RegexpCount", None) is not None and isinstance(node, exp.RegexpCount)
     ):

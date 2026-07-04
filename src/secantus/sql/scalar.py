@@ -441,6 +441,88 @@ def _eval_regexp_count(node: exp.Expression, scope: Scope, ctx: ScalarContext) -
     return len(_re_compile(_as_text(pattern), "").findall(_as_text(src)))
 
 
+def _eval_pad(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``lpad(str, len [, fill])`` / ``rpad(...)`` — pad (or truncate) ``str`` to
+    ``len`` characters using ``fill`` (default a space); ``is_left`` selects lpad."""
+    src = evaluate(node.this, scope, ctx)
+    length = evaluate(node.expression, scope, ctx)
+    if src is None or length is None:
+        return None
+    text, n = _as_text(src), int(length)
+    if n <= 0:
+        return ""
+    fill_node = node.args.get("fill_pattern")
+    fill = _as_text(evaluate(fill_node, scope, ctx)) if fill_node is not None else " "
+    if len(text) >= n:
+        return text[:n]
+    if not fill:
+        return text
+    pad = (fill * (n // len(fill) + 1))[: n - len(text)]
+    return (pad + text) if node.args.get("is_left") else (text + pad)
+
+
+def _eval_left(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    n = evaluate(node.expression, scope, ctx)
+    if src is None or n is None:
+        return None
+    return _as_text(src)[: int(n)]  # negative n drops the last |n| chars (Postgres)
+
+
+def _eval_right(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    n = evaluate(node.expression, scope, ctx)
+    if src is None or n is None:
+        return None
+    text, i = _as_text(src), int(n)
+    return "" if i == 0 else text[-i:]  # negative i drops the first |i| chars
+
+
+def _eval_repeat(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    times = evaluate(node.args.get("times"), scope, ctx)
+    if src is None or times is None:
+        return None
+    return _as_text(src) * max(int(times), 0)
+
+
+def _eval_ascii(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    if src is None:
+        return None
+    text = _as_text(src)
+    return ord(text[0]) if text else 0
+
+
+def _eval_chr(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    args = node.expressions or ([node.this] if node.this is not None else [])
+    code = evaluate(args[0], scope, ctx) if args else None
+    return None if code is None else chr(int(code))
+
+
+def _eval_str_position(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``position(sub IN str)`` / ``strpos(str, sub)`` -> 1-based index, 0 if absent."""
+    src = evaluate(node.this, scope, ctx)
+    sub = evaluate(node.args.get("substr"), scope, ctx)
+    if src is None or sub is None:
+        return None
+    return _as_text(src).find(_as_text(sub)) + 1
+
+
+def _eval_overlay(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``overlay(str placing rep from start [for len])`` — replace ``len`` chars
+    (default ``len(rep)``) starting at 1-based ``start`` with ``rep``."""
+    src = evaluate(node.this, scope, ctx)
+    rep = evaluate(node.expression, scope, ctx)
+    start = evaluate(node.args.get("from_"), scope, ctx)
+    if src is None or rep is None or start is None:
+        return None
+    text, rep_text, i = _as_text(src), _as_text(rep), int(start)
+    for_node = node.args.get("for_")
+    span = int(evaluate(for_node, scope, ctx)) if for_node is not None else len(rep_text)
+    return text[: i - 1] + rep_text + text[i - 1 + span :]
+
+
 def _eval_trunc(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """``trunc(x [, n])`` — truncate toward zero to ``n`` decimal places (0 default)."""
     v = evaluate(node.this, scope, ctx)
@@ -753,6 +835,16 @@ for _cls_name, _handler in (
     ("TimeToStr", _eval_to_char),
     ("CurrentTimestamp", lambda n, s, c: _utcnow(c)),
     ("CurrentDate", lambda n, s, c: _utcnow(c).date()),
+    ("Pad", _eval_pad),
+    ("Left", _eval_left),
+    ("Right", _eval_right),
+    ("Repeat", _eval_repeat),
+    ("Reverse", _unary(lambda v: _as_text(v)[::-1])),
+    ("Initcap", _unary(lambda v: _as_text(v).title())),
+    ("Ascii", _eval_ascii),
+    ("Chr", _eval_chr),
+    ("StrPosition", _eval_str_position),
+    ("Overlay", _eval_overlay),
 ):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:
