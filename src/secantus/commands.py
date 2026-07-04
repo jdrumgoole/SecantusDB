@@ -2038,6 +2038,32 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         DEFAULT_BATCH_SIZE if raw_batch_size is None else _coerce_command_int(raw_batch_size)
     )
     single_batch = bool(doc.get("singleBatch", False))
+    # View: translate the find into an equivalent aggregate over the base
+    # collection (the find options become pipeline stages after the view's own
+    # pipeline) and run it through the aggregate path, which resolves the view.
+    # find and aggregate return the same cursor-reply shape.
+    if isinstance(ctx.storage.get_collection_options(ctx.db_name, coll).get("viewOn"), str):
+        agg_pipeline: list[Any] = []
+        if filter_:
+            agg_pipeline.append({"$match": filter_})
+        if sort:
+            agg_pipeline.append({"$sort": sort})
+        if skip:
+            agg_pipeline.append({"$skip": skip})
+        if limit:
+            agg_pipeline.append({"$limit": limit})
+        if projection:
+            agg_pipeline.append({"$project": projection})
+        agg_doc: dict[str, Any] = {
+            "aggregate": coll,
+            "pipeline": agg_pipeline,
+            "cursor": {"batchSize": batch_size},
+        }
+        if collation is not None:
+            agg_doc["collation"] = collation
+        if doc.get("let") is not None:
+            agg_doc["let"] = doc["let"]
+        return _aggregate(agg_doc, ctx)
     # Validate filter syntax up-front. matches() raises QueryError for
     # unknown top-level operators; running it against an empty doc is
     # cheap and triggers the same validation paths the real query would
@@ -3945,6 +3971,28 @@ def _map_reduce(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"results": [], "ok": 1.0}
 
 
+def _resolve_view(ctx: CommandContext, coll: str, pipeline: list[Any]) -> tuple[str, list[Any]]:
+    """Resolve a view namespace to its base collection + combined pipeline.
+
+    Follows a ``viewOn`` chain (a view may be defined on another view),
+    prepending each view's stored ``viewPipeline`` ahead of the caller's
+    pipeline, until a base (non-view) collection is reached. A cycle in the chain
+    is broken defensively. Returns ``(base_coll, combined_pipeline)`` — the inputs
+    unchanged when ``coll`` isn't a view.
+    """
+    combined = list(pipeline)
+    seen: set[str] = set()
+    while coll not in seen:
+        seen.add(coll)
+        opts = ctx.storage.get_collection_options(ctx.db_name, coll)
+        view_on = opts.get("viewOn")
+        if not isinstance(view_on, str):
+            break
+        combined = list(opts.get("viewPipeline") or []) + combined
+        coll = view_on
+    return coll, combined
+
+
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus import changestreams
     from secantus.storage import BadHint, IndexConflict
@@ -4032,6 +4080,11 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
     if isinstance(coll, str):
         coll_name = coll
+        # Resolve a view to its base collection + prepended view pipeline (a view
+        # may be defined on another view). The reply ns and pipeline context keep
+        # the queried (view) name; only the fetch reads the base collection.
+        base_coll, pipeline = _resolve_view(ctx, coll, pipeline)
+        first_stage = pipeline[0] if pipeline else {}
         if isinstance(first_stage, Mapping) and (
             "$collStats" in first_stage
             or "$indexStats" in first_stage
@@ -4057,14 +4110,14 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 # NOT skipped — it re-applies the exact distance filter, so the
                 # output is identical; only the fetched candidate set shrinks.
                 candidate = _geo_near_index_filter(
-                    first_stage["$geoNear"], ctx.storage, ctx.db_name, coll
+                    first_stage["$geoNear"], ctx.storage, ctx.db_name, base_coll
                 )
                 if candidate is not None:
                     initial_filter = candidate
             try:
                 docs = ctx.storage.find_matching(
                     ctx.db_name,
-                    coll,
+                    base_coll,
                     initial_filter,
                     hint=hint,
                     let=let,
