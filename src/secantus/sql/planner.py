@@ -1939,6 +1939,8 @@ def _aggregate_of(node: exp.Expression) -> tuple[str, str | None, bool] | None:
     ``(func, column, distinct)``. ``column`` is None for ``COUNT(*)``; the
     argument of a ``COUNT(DISTINCT x)`` is unwrapped from its ``exp.Distinct``."""
     inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):  # agg(...) FILTER (WHERE ...)
+        inner = inner.this
     for cls, name in _AGG_CLASSES.items():
         if isinstance(inner, cls):
             arg = inner.this
@@ -1958,10 +1960,77 @@ def _aggregate_of(node: exp.Expression) -> tuple[str, str | None, bool] | None:
     return None
 
 
+# ``agg(...) FILTER (WHERE cond)`` parses as ``exp.Filter(this=<agg>,
+# expression=Where(cond))`` (possibly under an Alias). These helpers peel the
+# Filter so the aggregate detectors still see the underlying func, and lower the
+# FILTER condition to a Mongo aggregation expression for use inside a ``$cond``.
+
+
+def _agg_filter_where(node: exp.Expression) -> exp.Where | None:
+    """The ``WHERE`` node of an ``agg(...) FILTER (WHERE cond)``, else None."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):
+        where = inner.args.get("expression")
+        return where if isinstance(where, exp.Where) else None
+    return None
+
+
+def _filter_cond_to_agg(cond: exp.Expression, resolve: Resolve) -> Any:
+    """Lower a FILTER predicate (a boolean WHERE condition) to a Mongo aggregation
+    expression suitable for ``$cond``. Supports comparisons, AND/OR/NOT, IS [NOT]
+    NULL, and a bare boolean column; anything else raises (unsupported)."""
+    if isinstance(cond, exp.Where):
+        cond = cond.this
+    if isinstance(cond, exp.Paren):
+        return _filter_cond_to_agg(cond.this, resolve)
+    if isinstance(cond, exp.And):
+        return {
+            "$and": [
+                _filter_cond_to_agg(cond.this, resolve),
+                _filter_cond_to_agg(cond.expression, resolve),
+            ]
+        }
+    if isinstance(cond, exp.Or):
+        return {
+            "$or": [
+                _filter_cond_to_agg(cond.this, resolve),
+                _filter_cond_to_agg(cond.expression, resolve),
+            ]
+        }
+    if isinstance(cond, exp.Not):
+        return {"$not": [_filter_cond_to_agg(cond.this, resolve)]}
+    if isinstance(cond, exp.Is):
+        left = _to_agg_expr(cond.this, resolve)
+        if isinstance(cond.expression, exp.Null):
+            return {"$eq": [left, None]}
+        return {"$eq": [left, _to_agg_expr(cond.expression, resolve)]}
+    if type(cond) in _EXPR_CMP:
+        return {
+            _EXPR_CMP[type(cond)]: [
+                _to_agg_expr(cond.this, resolve),
+                _to_agg_expr(cond.expression, resolve),
+            ]
+        }
+    # A bare boolean column / expression is truthy.
+    return {"$eq": [_to_agg_expr(cond, resolve), True]}
+
+
+def _table_resolve(table: TableDef) -> Resolve:
+    """A single-table ``Resolve``: a column node -> (field path, type tag)."""
+
+    def resolve(node: exp.Expression) -> tuple[str, str]:
+        name = node.name
+        return table.field_for(name), table.type_for(name)
+
+    return resolve
+
+
 def _string_agg_arg(node: exp.Expression) -> tuple[exp.Expression, str] | None:
     """If ``node`` is ``string_agg(expr, sep)`` (sqlglot ``GroupConcat``), return
     ``(value_expr, separator)``. The separator is a string literal."""
     inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
     if not isinstance(inner, exp.GroupConcat):
         return None
     sep_node = inner.args.get("separator")
@@ -1997,6 +2066,8 @@ def _string_agg_project(fname: str, sep: str) -> dict[str, Any]:
 def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
     """If ``node`` is ``array_agg(<arg>)``, return its argument expression."""
     inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
     return inner.this if isinstance(inner, exp.ArrayAgg) else None
 
 
@@ -2086,10 +2157,14 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     ]
     if not aggs:
         return False
-    # A lone COUNT(*) (no GROUP BY) is served by the simpler find path.
+    # A lone COUNT(*) (no GROUP BY, no FILTER) is served by the simpler find path.
     if len(stmt.expressions) == 1:
         only = _aggregate_of(stmt.expressions[0])
-        if only is not None and only == ("count", None, False):
+        if (
+            only is not None
+            and only == ("count", None, False)
+            and _agg_filter_where(stmt.expressions[0]) is None
+        ):
             return False
     return True
 
@@ -2301,39 +2376,49 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
-def _accumulator_for(func: str, field: str | None, tag: str | None) -> tuple[dict[str, Any], str]:
+def _accumulator_for(
+    func: str, field: str | None, tag: str | None, filter_cond: Any = None
+) -> tuple[dict[str, Any], str]:
     """Build a ``$group`` accumulator from an already-resolved field path + tag.
 
     ``field`` is the pipeline field path (e.g. ``amt`` or ``b.amt`` after a join)
     and is None only for ``COUNT(*)``. This is the field-resolved core shared by
-    the single-table (`_accumulator`) and join (`_join_accumulator`) paths."""
+    the single-table (`_accumulator`) and join (`_join_accumulator`) paths.
+
+    ``filter_cond`` (a Mongo aggregation boolean expression) implements
+    ``agg(...) FILTER (WHERE cond)``: only rows satisfying it contribute. A
+    non-matching row donates the accumulator's neutral element (0 for sum/count,
+    NULL for avg/min/max — the aggregate engine skips NULL there)."""
+    val = f"${field}" if field is not None else None
     if func == "count":
         if field is None:
-            return {"$sum": 1}, "int8"
+            body = {"$cond": [filter_cond, 1, 0]} if filter_cond is not None else 1
+            return {"$sum": body}, "int8"
         # COUNT(col) counts non-null values.
-        return {"$sum": {"$cond": [{"$ne": [f"${field}", None]}, 1, 0]}}, "int8"
+        matched = {"$ne": [val, None]}
+        cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
+        return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
     if func == "sum":
-        return {"$sum": f"${field}"}, (
-            tag if tag in ("int4", "int8", "numeric", "float8") else "float8"
-        )
+        body = {"$cond": [filter_cond, val, 0]} if filter_cond is not None else val
+        return {"$sum": body}, (tag if tag in ("int4", "int8", "numeric", "float8") else "float8")
     if func == "avg":
-        return {"$avg": f"${field}"}, "float8"
-    if func == "min":
-        return {"$min": f"${field}"}, (tag or "text")
-    if func == "max":
-        return {"$max": f"${field}"}, (tag or "text")
-    # bool_and = all-true = the minimum boolean (false < true); bool_or = max.
-    if func == "bool_and":
-        return {"$min": f"${field}"}, "bool"
-    if func == "bool_or":
-        return {"$max": f"${field}"}, "bool"
+        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        return {"$avg": body}, "float8"
+    if func in ("min", "bool_and"):
+        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        return {"$min": body}, ("bool" if func == "bool_and" else (tag or "text"))
+    if func in ("max", "bool_or"):
+        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        return {"$max": body}, ("bool" if func == "bool_or" else (tag or "text"))
     raise errors.feature_not_supported(f"aggregate {func} is not supported")
 
 
-def _accumulator(func: str, col: str | None, table: TableDef) -> tuple[dict[str, Any], str]:
+def _accumulator(
+    func: str, col: str | None, table: TableDef, filter_cond: Any = None
+) -> tuple[dict[str, Any], str]:
     if col is None:
-        return _accumulator_for(func, None, None)
-    return _accumulator_for(func, table.field_for(col), table.type_for(col))
+        return _accumulator_for(func, None, None, filter_cond)
+    return _accumulator_for(func, table.field_for(col), table.type_for(col), filter_cond)
 
 
 # DISTINCT changes the result only for these — MIN/MAX of a set equal MIN/MAX of
@@ -2469,6 +2554,12 @@ def _grouping_set_branch(
         arr_arg = _array_agg_arg(e)
         sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
+        where = _agg_filter_where(e)
+        if (arr_arg is not None or sagg is not None) and where is not None:
+            raise errors.feature_not_supported(
+                "FILTER (WHERE ...) is not supported on array_agg / string_agg"
+            )
+        fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
@@ -2481,7 +2572,7 @@ def _grouping_set_branch(
             out_columns.append((fname, "text"))
         elif agg is not None:
             func, col, _distinct = agg
-            acc, tag = _accumulator(func, col, table)
+            acc, tag = _accumulator(func, col, table, fcond)
             fname = names.fresh(alias or func)
             accumulators[fname] = acc
             project[fname] = f"${fname}"
@@ -2547,6 +2638,12 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         arr_arg = _array_agg_arg(e)
         sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
+        where = _agg_filter_where(e)
+        if (arr_arg is not None or sagg is not None) and where is not None:
+            raise errors.feature_not_supported(
+                "FILTER (WHERE ...) is not supported on array_agg / string_agg"
+            )
+        fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
@@ -2562,6 +2659,10 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             if distinct and func in _DISTINCT_FUNCS:
                 if col is None:
                     raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with DISTINCT is not supported"
+                    )
                 fname, tag = _register_distinct_agg(
                     func,
                     table.field_for(col),
@@ -2572,7 +2673,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                     reductions,
                 )
             else:
-                acc, tag = _accumulator(func, col, table)
+                acc, tag = _accumulator(func, col, table, fcond)
                 fname = names.fresh(alias or func)
                 accumulators[fname] = acc
             agg_fields[(func, col, distinct)] = fname
@@ -2731,7 +2832,9 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 reductions,
             )
         else:
-            acc, tag = _accumulator(func, col, table)
+            where = _agg_filter_where(node)
+            fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
+            acc, tag = _accumulator(func, col, table, fcond)
             fname = names.fresh(func)
             accumulators[fname] = acc
         agg_fields[agg] = fname
@@ -2861,7 +2964,9 @@ def _having_to_match(
             raise errors.feature_not_supported(
                 f"DISTINCT inside {func}() is not supported in HAVING"
             )
-        acc, tag = _accumulator(func, col, table)
+        where = _agg_filter_where(term)
+        fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
+        acc, tag = _accumulator(func, col, table, fcond)
         if agg not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc
@@ -2871,7 +2976,7 @@ def _having_to_match(
     if isinstance(node, (exp.EQ, exp.NEQ)) or type(node) in _HAVING_CMP:
         left, right = node.this, node.expression
         term, lit, on_left = (left, right, True)
-        if not isinstance(left, (exp.Column, *(_AGG_CLASSES.keys()))):
+        if not isinstance(left, (exp.Column, exp.Filter, *(_AGG_CLASSES.keys()))):
             term, lit, on_left = right, left, False
         field, tag = field_tag(term)
         value = typemap.coerce(_literal(lit), tag)
@@ -3445,6 +3550,8 @@ def _join_aggregate_of(
     map a qualified column (``b.amt``). Returns ``(func, arg_node, distinct)``; a
     None argument means ``COUNT(*)`` and a ``DISTINCT`` argument is unwrapped."""
     inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):  # agg(...) FILTER (WHERE ...)
+        inner = inner.this
     for cls, name in _AGG_CLASSES.items():
         if isinstance(inner, cls):
             arg = inner.this
@@ -3457,12 +3564,12 @@ def _join_aggregate_of(
 
 
 def _join_accumulator(
-    func: str, arg: exp.Expression | None, resolve: Resolve
+    func: str, arg: exp.Expression | None, resolve: Resolve, filter_cond: Any = None
 ) -> tuple[dict[str, Any], str]:
     if arg is None:
-        return _accumulator_for(func, None, None)
+        return _accumulator_for(func, None, None, filter_cond)
     path, tag = resolve(arg)
-    return _accumulator_for(func, path, tag)
+    return _accumulator_for(func, path, tag, filter_cond)
 
 
 def _agg_key(
@@ -3511,6 +3618,12 @@ def _plan_join_group_select(
         arr_arg = _array_agg_arg(e)
         sagg = _string_agg_arg(e)
         agg = _join_aggregate_of(e)
+        where = _agg_filter_where(e)
+        if (arr_arg is not None or sagg is not None) and where is not None:
+            raise errors.feature_not_supported(
+                "FILTER (WHERE ...) is not supported on array_agg / string_agg"
+            )
+        fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             path, _ = resolve(arr_arg)
@@ -3528,12 +3641,16 @@ def _plan_join_group_select(
             if distinct and func in _DISTINCT_FUNCS:
                 if arg is None:
                     raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with DISTINCT is not supported"
+                    )
                 path, tag = resolve(arg)
                 fname, tag = _register_distinct_agg(
                     func, path, tag, alias, names, accumulators, reductions
                 )
             else:
-                acc, tag = _join_accumulator(func, arg, resolve)
+                acc, tag = _join_accumulator(func, arg, resolve, fcond)
                 fname = names.fresh(alias or func)
                 accumulators[fname] = acc
             agg_fields[_agg_key(func, arg, resolve, distinct)] = fname
@@ -3646,7 +3763,9 @@ def _plan_join_group_window_select(
                 func, path, tag, None, names, accumulators, reductions
             )
         else:
-            acc, tag = _join_accumulator(func, arg, resolve)
+            where = _agg_filter_where(node)
+            fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
+            acc, tag = _join_accumulator(func, arg, resolve, fcond)
             fname = names.fresh(func)
             accumulators[fname] = acc
         agg_fields[key] = fname
@@ -3723,7 +3842,9 @@ def _join_having_to_match(
             raise errors.feature_not_supported(
                 f"DISTINCT inside {func}() is not supported in HAVING"
             )
-        acc, tag = _join_accumulator(func, arg, resolve)
+        where = _agg_filter_where(term)
+        fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
+        acc, tag = _join_accumulator(func, arg, resolve, fcond)
         key = _agg_key(func, arg, resolve, distinct)
         if key not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
@@ -3734,7 +3855,7 @@ def _join_having_to_match(
     if isinstance(node, (exp.EQ, exp.NEQ)) or type(node) in _HAVING_CMP:
         left, right = node.this, node.expression
         term, lit, on_left = left, right, True
-        if not isinstance(left, (exp.Column, *_AGG_CLASSES.keys())):
+        if not isinstance(left, (exp.Column, exp.Filter, *_AGG_CLASSES.keys())):
             term, lit, on_left = right, left, False
         field, tag = field_tag(term)
         value = typemap.coerce(_literal(lit), tag)

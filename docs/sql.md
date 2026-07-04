@@ -819,6 +819,28 @@ true only when every input is true; `bool_or` is true when any is. The ordered-s
 aggregates `percentile_cont` / `mode` (`WITHIN GROUP (ORDER BY …)`) are not yet
 supported (`0A000`).
 
+An aggregate can carry a `FILTER (WHERE cond)` clause — only rows satisfying
+`cond` contribute to that aggregate:
+
+```sql
+SELECT region,
+       count(*) FILTER (WHERE active)          AS active_n,
+       sum(amount) FILTER (WHERE amount > 100) AS big_total,
+       avg(amount) FILTER (WHERE active)       AS active_mean
+FROM sales GROUP BY region;
+
+SELECT count(*) FILTER (WHERE status = 'paid') FROM orders;   -- whole-table
+SELECT region FROM sales GROUP BY region
+HAVING count(*) FILTER (WHERE active) >= 1;                    -- in HAVING
+```
+
+`FILTER` works on `count` / `sum` / `avg` / `min` / `max` / `bool_and` / `bool_or`
+in the SELECT list (grouped, whole-table, and over a JOIN) and in `HAVING`. It
+lowers to a `$cond` inside the accumulator (a non-matching row donates the neutral
+element — `0` for sum/count, NULL for avg/min/max). The condition supports
+comparisons, `AND` / `OR` / `NOT`, and `IS [NOT] NULL`. Not supported: `FILTER` on
+`array_agg` / `string_agg`, or combined with `DISTINCT` (both `0A000`).
+
 `DISTINCT` inside an aggregate is supported for `COUNT` / `SUM` / `AVG` (and is a
 no-op for `MIN` / `MAX`, which are unaffected by duplicates). It deduplicates the
 non-NULL values within each group before applying the function:
