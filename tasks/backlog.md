@@ -1641,6 +1641,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
   secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
   aren't modeled (all checks are immediate — a future slice).
+- [ ] **Aggregate `FILTER (WHERE cond)` landed** (b126): `agg(...) FILTER (WHERE cond)` scopes an
+  aggregate to matching rows. sqlglot parses it as `exp.Filter(this=<agg>, expression=Where(cond))`;
+  the aggregate detectors (`_aggregate_of` / `_array_agg_arg` / `_string_agg_arg` / `_join_aggregate_of`)
+  peel the Filter, and `_agg_filter_where` + `_filter_cond_to_agg` lower the predicate to a Mongo
+  aggregation expression (comparisons, AND/OR/NOT, IS [NOT] NULL, bare boolean column). `_accumulator_for`
+  gained a `filter_cond` param that wraps each accumulator in a `$cond` (neutral element 0 for sum/count,
+  NULL for avg/min/max — the aggregate engine skips NULL there). Threaded through every accumulator site:
+  single-table `$group`, GROUPING SETS, JOIN+GROUP, and the HAVING / ORDER BY resolvers (the HAVING
+  comparison matcher recognises `exp.Filter` as the aggregate side). A lone `count(*) FILTER (...)` is
+  kept off the simple-find fast path so the filter isn't dropped. **Not supported (→ `0A000`):** `FILTER`
+  on `array_agg` / `string_agg` (a `$push` can't drop non-matching rows cleanly), and with `DISTINCT`.
 - [ ] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
   [IF EXISTS] c`, `SET DEFAULT expr` / `DROP DEFAULT`, `SET NOT NULL` / `DROP NOT NULL`, and `RENAME TO
   new`. Handled in `engine._alter_domain_command` (Command-parsed; catalog `update_domain`). `ADD …

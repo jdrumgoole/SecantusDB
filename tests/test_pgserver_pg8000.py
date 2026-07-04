@@ -937,6 +937,20 @@ def test_alter_domain_via_driver(server):
     conn.close()
 
 
+def test_aggregate_filter_via_driver(server):
+    # agg(...) FILTER (WHERE ...) grouped, on the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE s (id int primary key, dept text, amt int, ok bool)")
+    cur.execute("INSERT INTO s VALUES (1,'a',10,true),(2,'a',20,false),(3,'b',30,true)")
+    cur.execute(
+        "SELECT dept, count(*) FILTER (WHERE ok), sum(amt) FILTER (WHERE ok) "
+        "FROM s GROUP BY dept ORDER BY dept"
+    )
+    assert cur.fetchall() == (["a", 1, 10], ["b", 1, 30])
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
