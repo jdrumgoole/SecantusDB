@@ -1296,6 +1296,10 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
                 doc[field_name] = _sorted_agg_value(kind, payload, doc.get(field_name))
             elif kind in ("variance", "bit_and", "bit_or", "bit_xor"):
                 doc[field_name] = _stat_bit_value(kind, doc.get(field_name))
+            elif kind == "range_agg":
+                from secantus.sql import ranges as _ranges
+
+                doc[field_name] = _ranges.make_multirange(doc.get(field_name) or [])
             else:
                 doc[field_name] = _ordered_set_value(kind, payload, doc.get(field_name))
     return result

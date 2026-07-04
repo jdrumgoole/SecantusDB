@@ -219,6 +219,12 @@ def _literal(node: exp.Expression) -> Any:
         hi = typemap.coerce(args[1], elem) if len(args) > 1 and args[1] is not None else None
         bounds = str(args[2]) if len(args) > 2 and args[2] is not None else "[)"
         return _ranges.make_range(lo, hi, bounds, tag)
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() in typemap._MULTIRANGE_TAGS:
+        # ``int4multirange(r1, r2, …)`` -> a coalesced multirange subdocument.
+        from secantus.sql import ranges as _ranges
+
+        members = [_literal(e) for e in node.expressions]
+        return _ranges.make_multirange([m for m in members if m is not None])
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
         # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
         # SQLAlchemy's psycopg dialect probes ``t.oid = to_regtype('hstore')`` at
@@ -2344,6 +2350,33 @@ def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
     return None
 
 
+def _range_agg_arg(node: exp.Expression) -> exp.Expression | None:
+    """If ``node`` is ``range_agg(<range>)``, return its argument expression. The
+    aggregate coalesces the group's ranges into a multirange."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
+    if (
+        isinstance(inner, exp.Anonymous)
+        and str(inner.this).lower() == "range_agg"
+        and inner.expressions
+    ):
+        return inner.expressions[0]
+    return None
+
+
+def _multirange_tag_for_arg(arg: exp.Expression, table: TableDef) -> str:
+    """The multirange output tag for ``range_agg(arg)`` — mapped from the argument's
+    range type (defaults to int4multirange when the range type can't be resolved)."""
+    if isinstance(arg, exp.Column):
+        rtag = table.type_for(arg.name)
+    elif isinstance(arg, exp.Anonymous) and str(arg.this).lower() in typemap._RANGE_TAGS:
+        rtag = str(arg.this).lower()
+    else:
+        rtag = None
+    return ranges.RANGE_TO_MULTIRANGE.get(rtag or "", "int4multirange")
+
+
 def _jsonb_object_agg_args(
     node: exp.Expression,
 ) -> tuple[exp.Expression, exp.Expression] | None:
@@ -2499,6 +2532,7 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
         if _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
         or _jsonb_object_agg_args(e) is not None
+        or _range_agg_arg(e) is not None
         or _string_agg_arg(e) is not None
         or _ordered_set_agg(e) is not None
     ]
@@ -2566,6 +2600,7 @@ def _plan_pipeline_select(
             _aggregate_of(e) is not None
             or _array_agg_arg(e) is not None
             or _jsonb_object_agg_args(e) is not None
+            or _range_agg_arg(e) is not None
             or _string_agg_arg(e) is not None
             for e in stmt.expressions
         )
@@ -2588,6 +2623,7 @@ def _plan_pipeline_select(
         _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
         or _jsonb_object_agg_args(e) is not None
+        or _range_agg_arg(e) is not None
         or _string_agg_arg(e) is not None
         or _ordered_set_agg(e) is not None
         for e in stmt.expressions
@@ -3000,6 +3036,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         alias = e.alias if isinstance(e, exp.Alias) else None
         arr_arg = _array_agg_arg(e)
         oagg = _jsonb_object_agg_args(e)
+        ragg = _range_agg_arg(e)
         sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
         osa = _ordered_set_agg(e)
@@ -3014,6 +3051,12 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table)
             project[fname] = {"$arrayToObject": f"${fname}"}
             out_columns.append((fname, "json"))
+        elif ragg is not None:
+            fname = names.fresh(alias or "range_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(ragg, table)}
+            project[fname] = f"${fname}"
+            post_aggregates.append((fname, "range_agg", None))
+            out_columns.append((fname, _multirange_tag_for_arg(ragg, table)))
         elif osa is not None:
             kind, fraction, order_val = osa
             fname = names.fresh(alias or kind)
@@ -3614,6 +3657,7 @@ def _lateral_stage(
         _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
         or _jsonb_object_agg_args(e) is not None
+        or _range_agg_arg(e) is not None
         or _string_agg_arg(e) is not None
         for e in sub.expressions
     )
@@ -4315,6 +4359,7 @@ def _stmt_needs_evaluation(stmt: exp.Select) -> bool:
             or _aggregate_of(e) is not None
             or _array_agg_arg(e) is not None
             or _jsonb_object_agg_args(e) is not None
+            or _range_agg_arg(e) is not None
         ):
             continue
         return True
@@ -4359,6 +4404,24 @@ def _has_range_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _range_tag_of(operands: Any, resolve: Resolve) -> str | None:
+    """The range type tag among ``operands`` — a range constructor / range-typed
+    column — or None if none is a range."""
+    for operand in operands:
+        if operand is None:
+            continue
+        if isinstance(operand, exp.Anonymous) and str(operand.this).lower() in typemap._RANGE_TAGS:
+            return str(operand.this).lower()
+        if isinstance(operand, exp.Column):
+            try:
+                tag = resolve(operand)[1]
+            except errors.SQLError:
+                continue
+            if tag in typemap._RANGE_TAGS:
+                return tag
+    return None
+
+
 def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
     # Composite field access ``(col).field`` types as the field's declared type.
@@ -4374,6 +4437,23 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "bool"
     if isinstance(node, exp.Anonymous) and str(node.this).lower() in typemap._RANGE_TAGS:
         return str(node.this).lower()
+    # Multirange constructor (``int4multirange(...)``) -> the multirange type.
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() in typemap._MULTIRANGE_TAGS:
+        return str(node.this).lower()
+    # ``range_merge(a, b)`` -> the operands' range type.
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() == "range_merge":
+        rtag = _range_tag_of(node.expressions, resolve)
+        if rtag is not None:
+            return rtag
+    # ``-|-`` adjacency -> bool.
+    if getattr(exp, "Adjacent", None) is not None and isinstance(node, exp.Adjacent):
+        return "bool"
+    # ``*`` / ``+`` / ``-`` over range operands -> the range type (intersection /
+    # union / difference).
+    if isinstance(node, (exp.Mul, exp.Add, exp.Sub)):
+        rtag = _range_tag_of((node.this, node.expression), resolve)
+        if rtag is not None:
+            return rtag
     # ``lower(range)`` / ``upper(range)`` yield the range's element type.
     if isinstance(node, (exp.Lower, exp.Upper)) and node.this is not None:
         operand_tag = _infer_scalar_tag(node.this, resolve)
@@ -4381,7 +4461,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return ranges.RANGE_TYPES[operand_tag][0]
     if isinstance(node, exp.Cast) and node.to is not None:
         _to = node.to.sql(dialect="postgres").lower().strip()
-        if _to in typemap._RANGE_TAGS:
+        if _to in typemap._RANGE_TAGS or _to in typemap._MULTIRANGE_TAGS:
             return _to
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)

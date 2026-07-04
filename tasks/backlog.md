@@ -1519,7 +1519,26 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   Tests: `tests/test_sql_ranges.py` (28: pure-module canonicalisation/contains/overlaps/parse/render +
   SQL surface) and a pg8000 wire test. **Limitations:** the `@>`/`<@`/`&&` operators run a COLLSCAN
   per-row (no lowered Mongo filter / index); multirange types, range GiST indexes, and the extra range
-  functions (`range_merge`, `-|-` adjacency, `*` intersection, `range_agg`) are unimplemented.
+  functions are unimplemented (**range algebra + multirange landed b140, below**).
+- [ ] **Range algebra + multirange landed** (b140): the range set operators and the `range_agg` aggregate
+  + multirange types (`int4multirange`/`int8multirange`/`nummultirange`/`tsmultirange`/`datemultirange`).
+  `ranges.py` gained `merge` (range_merge, spans gaps), `intersect` (`*`), `union` (`+`, raises if
+  non-contiguous), `difference` (`-`, raises if it splits), `adjacent` (`-|-`), and a multirange layer
+  (`make_multirange` coalesces sorted/overlapping/adjacent members into `{"multirange": [range, …]}`,
+  `render_multirange` → `{[a,b), …}`, `parse_multirange`, `RANGE_TO_MULTIRANGE`). `scalar._eval_arith`
+  dispatches `Mul`/`Add`/`Sub` to intersect/union/difference when both operands are ranges (`_is_range_value`);
+  `exp.Adjacent` (`-|-`) → `ranges.adjacent`; `_call_func` gains multirange constructors + `range_merge`;
+  `_eval_cast` parses multirange literals. `typemap` adds `_MULTIRANGE_TAGS` (OIDs 4451/4532/4533/4535/4536),
+  `to_pg_text` → `render_multirange`, `coerce` → `parse_multirange`, and multirange names to
+  `type_tag_for_sql` / `SQL_TYPE_NAME` / `PG_TYPENAME`. `planner._infer_scalar_tag` types the operators →
+  range tag, adjacency → bool, `range_merge` → range tag (`_range_tag_of`), multirange constructor/cast →
+  multirange tag; `_literal` builds a multirange constructor subdoc. `range_agg` (`_range_agg_arg`) pushes
+  the group's ranges then a `range_agg` post-aggregate (`executor._apply_post_aggregates`) coalesces them
+  into a multirange (typed via `_multirange_tag_for_arg`); wired into the detection sites + the primary
+  single-table group path. `functions.is_scalar_function` excludes multirange constructors + `range_merge`.
+  Tests: `tests/test_sql_range_agg.py` (27: pure algebra + SQL surface) and a pg8000 wire test. **Not yet:**
+  multirange containment/overlap operators (`@>`/`&&` on multiranges), `range_intersect_agg`, multirange
+  extraction functions, range_agg over a JOIN or GROUPING SETS, and range GiST indexes.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

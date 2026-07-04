@@ -157,6 +157,173 @@ def render(rng: Any) -> str:
     return f"{lb}{_fmt(rng.get('lower'))},{_fmt(rng.get('upper'))}{ub}"
 
 
+def _pick_lower(a: dict, b: dict, *, smallest: bool) -> dict[str, Any]:
+    """Return ``{lower, lower_inc}`` — the smaller (or larger) of the two lower
+    bounds. An unbounded lower is the smallest possible."""
+    a_le = _lower_le(a, b)
+    src = a if (a_le == smallest) else b
+    return {"lower": src.get("lower"), "lower_inc": bool(src.get("lower_inc"))}
+
+
+def _pick_upper(a: dict, b: dict, *, largest: bool) -> dict[str, Any]:
+    """Return ``{upper, upper_inc}`` — the larger (or smaller) of the two upper
+    bounds. An unbounded upper is the largest possible."""
+    a_ge = _upper_ge(a, b)
+    src = a if (a_ge == largest) else b
+    return {"upper": src.get("upper"), "upper_inc": bool(src.get("upper_inc"))}
+
+
+def merge(a: Any, b: Any) -> dict[str, Any]:
+    """The smallest range covering both ``a`` and ``b`` (``range_merge``). Unlike
+    ``union`` this never errors — it spans any gap between disjoint ranges."""
+    if is_empty(a):
+        return dict(b) if isinstance(b, dict) else {"empty": True}
+    if is_empty(b):
+        return dict(a) if isinstance(a, dict) else {"empty": True}
+    return {**_pick_lower(a, b, smallest=True), **_pick_upper(a, b, largest=True)}
+
+
+def intersect(a: Any, b: Any) -> dict[str, Any]:
+    """The overlap of ``a`` and ``b`` (the ``*`` operator); empty when disjoint."""
+    if is_empty(a) or is_empty(b) or not overlaps(a, b):
+        return {"empty": True}
+    return {**_pick_lower(a, b, smallest=False), **_pick_upper(a, b, largest=False)}
+
+
+def adjacent(a: Any, b: Any) -> bool:
+    """Are ``a`` and ``b`` adjacent (touching with no gap and no overlap)? The
+    ``-|-`` operator."""
+    if is_empty(a) or is_empty(b) or not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if overlaps(a, b):
+        return False
+    return _touches(a, b) or _touches(b, a)
+
+
+def _touches(left: dict, right: dict) -> bool:
+    """Does ``left``'s upper bound meet ``right``'s lower bound with exactly one
+    side inclusive (so they abut without overlapping or leaving a gap)?"""
+    up, lo = left.get("upper"), right.get("lower")
+    if up is None or lo is None or up != lo:
+        return False
+    return bool(left.get("upper_inc")) != bool(right.get("lower_inc"))
+
+
+def union(a: Any, b: Any) -> dict[str, Any]:
+    """The union of ``a`` and ``b`` as a single range (the ``+`` operator). Raises
+    when the result would not be contiguous (disjoint and non-adjacent)."""
+    if is_empty(a):
+        return dict(b) if isinstance(b, dict) else {"empty": True}
+    if is_empty(b):
+        return dict(a) if isinstance(a, dict) else {"empty": True}
+    if not overlaps(a, b) and not adjacent(a, b):
+        raise RangeError("result of range union would not be contiguous")
+    return {**_pick_lower(a, b, smallest=True), **_pick_upper(a, b, largest=True)}
+
+
+def difference(a: Any, b: Any) -> dict[str, Any]:
+    """``a`` minus ``b`` (the ``-`` operator). Raises when the result would not be a
+    single range (``b`` strictly interior to ``a``)."""
+    if is_empty(a) or is_empty(b) or not overlaps(a, b):
+        return dict(a) if isinstance(a, dict) else {"empty": True}
+    left_open = not _lower_le(b, a)  # b starts strictly after a's lower -> left piece
+    right_open = not _upper_ge(b, a)  # b ends strictly before a's upper -> right piece
+    if left_open and right_open:
+        raise RangeError("result of range difference would not be contiguous")
+    if left_open:  # keep a's lower up to b's lower
+        return {
+            "lower": a.get("lower"),
+            "lower_inc": bool(a.get("lower_inc")),
+            "upper": b.get("lower"),
+            "upper_inc": not b.get("lower_inc"),
+        }
+    if right_open:  # keep b's upper up to a's upper
+        return {
+            "lower": b.get("upper"),
+            "lower_inc": not b.get("upper_inc"),
+            "upper": a.get("upper"),
+            "upper_inc": bool(a.get("upper_inc")),
+        }
+    return {"empty": True}  # b covers a
+
+
+# --------------------------------------------------------------------------- #
+# Multiranges: a normalised (sorted, non-overlapping, coalesced) list of ranges,
+# stored as ``{"multirange": [range, …]}``.
+# --------------------------------------------------------------------------- #
+
+MULTIRANGE_TYPES: dict[str, str] = {
+    "int4multirange": "int4range",
+    "int8multirange": "int8range",
+    "nummultirange": "numrange",
+    "tsmultirange": "tsrange",
+    "datemultirange": "daterange",
+}
+
+
+# Range type -> the multirange type that aggregates it (``range_agg``).
+RANGE_TO_MULTIRANGE: dict[str, str] = {rng: mr for mr, rng in MULTIRANGE_TYPES.items()}
+
+
+def is_multirange_tag(tag: str | None) -> bool:
+    return tag in MULTIRANGE_TYPES
+
+
+def make_multirange(rngs: list) -> dict[str, Any]:
+    """Coalesce a list of ranges into a normalised multirange: drop empties, sort
+    by lower bound, and merge overlapping / adjacent members."""
+    members = [r for r in rngs if isinstance(r, dict) and not is_empty(r)]
+    members.sort(key=_lower_sort_key)
+    out: list[dict] = []
+    for r in members:
+        if out and (overlaps(out[-1], r) or adjacent(out[-1], r)):
+            out[-1] = union(out[-1], r)
+        else:
+            out.append(dict(r))
+    return {"multirange": out}
+
+
+def _lower_sort_key(rng: dict):
+    lo = rng.get("lower")
+    return (0,) if lo is None else (1, lo, 0 if rng.get("lower_inc") else 1)
+
+
+def multirange_members(mr: Any) -> list:
+    return mr.get("multirange", []) if isinstance(mr, dict) else []
+
+
+def render_multirange(mr: Any) -> str:
+    """Render a multirange as the Postgres text form ``{[1,5), [10,20)}``."""
+    return "{" + ", ".join(render(r) for r in multirange_members(mr)) + "}"
+
+
+def parse_multirange(text: str, tag: str, coerce: Any) -> dict[str, Any]:
+    """Parse a multirange text literal ``{[1,5), [10,20)}`` into a normalised
+    subdocument. ``tag`` is the multirange type; each member parses as its range."""
+    s = text.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        raise RangeError(f"malformed multirange literal: {text!r}")
+    body = s[1:-1].strip()
+    range_tag = MULTIRANGE_TYPES[tag]
+    if not body:
+        return {"multirange": []}
+    # Split on commas that sit between a closing bound and the next opening bound.
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(body):
+        if ch in "[(":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(body[start:i])
+            start = i + 1
+    parts.append(body[start:])
+    rngs = [parse_literal(p.strip(), range_tag, coerce) for p in parts if p.strip()]
+    return make_multirange(rngs)
+
+
 def parse_literal(text: str, tag: str, coerce: Any) -> dict[str, Any]:
     """Parse a range text literal (``[1,10)`` / ``(1,10]`` / ``empty``) into a
     normalised subdocument. ``coerce`` converts a bound token to the element type."""
