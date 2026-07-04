@@ -132,6 +132,16 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     # Schema-qualified function: pg_catalog.format_type(...) -> the call.
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
         return _eval_func(node.expression, scope, ctx)
+    # Composite field access: ``(col).field`` -> Dot(Paren(col), Identifier). The
+    # inner expression resolves to a subdocument; return the named field (NULL for
+    # a missing field or a NULL composite).
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
+        base = evaluate(node.this, scope, ctx)
+        if base is None:
+            return None
+        if isinstance(base, dict):
+            return base.get(node.expression.name)
+        raise errors.feature_not_supported(f"field access on a non-composite value: {node.sql()}")
     if isinstance(node, exp.Anonymous):
         return _eval_func(node, scope, ctx)
     if isinstance(node, exp.Func):

@@ -835,6 +835,15 @@ def _domain_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return {name: _DOMAIN_OID_BASE + i for i, name in enumerate(names)}
 
 
+_COMPOSITE_OID_BASE = 67000
+
+
+def _composite_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    lister = getattr(catalog, "list_composites", None)
+    names = lister(db) if lister is not None else []
+    return {name: _COMPOSITE_OID_BASE + i for i, name in enumerate(names)}
+
+
 def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     rows = [
         {
@@ -883,6 +892,22 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typnotnull": bool(domain.get("not_null")) if domain else False,
                 "typdefault": None if default is None else str(default),
                 "typtype": "d",
+            }
+        )
+    # User-declared composite types (typtype 'c') live in the public namespace;
+    # their fields are reflected as pg_attribute rows keyed on this oid.
+    for name, oid in _composite_oids(db, catalog).items():
+        rows.append(
+            {
+                "oid": oid,
+                "typname": name,
+                "typcollation": 0,
+                "typnamespace": _NS_OIDS["public"],
+                "typbasetype": 0,
+                "typtypmod": -1,
+                "typnotnull": False,
+                "typdefault": None,
+                "typtype": "c",
             }
         )
     return rows

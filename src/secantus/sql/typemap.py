@@ -39,6 +39,9 @@ PG_OID: dict[str, int] = {
     "timestamptz": 1184,
     "numeric": 1700,
     "json": 3802,
+    # A composite (row) value renders as the ``(f1,f2,…)`` record text literal. We
+    # report the generic RECORD pseudo-type OID rather than minting a per-type OID.
+    "composite": 2249,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -62,6 +65,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "timestamptz": "timestamp with time zone",
     "json": "jsonb",
     "bytea": "bytea",
+    "composite": "record",
 }
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
@@ -75,6 +79,7 @@ PG_TYPENAME: dict[str, str] = {
     "timestamptz": "timestamptz",
     "json": "jsonb",
     "bytea": "bytea",
+    "composite": "record",
 }
 
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
@@ -247,9 +252,29 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if isinstance(value, _dt.datetime):
         # Postgres renders timestamptz space-separated with a UTC offset.
         return value.isoformat(sep=" ").encode("utf-8")
+    if tag == "composite" and isinstance(value, dict):
+        return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):
         return _json.dumps(value, default=str).encode("utf-8")
     return str(value).encode("utf-8")
+
+
+def _render_pg_composite(value: dict) -> str:
+    """Render a composite value (a subdocument, already in field order) as the
+    Postgres record text literal ``(f1,f2,…)``. A NULL field is empty; a field is
+    double-quoted when empty or containing a comma / paren / quote / backslash /
+    whitespace, with internal ``"`` and ``\\`` doubled."""
+    parts: list[str] = []
+    for field_val in value.values():
+        if field_val is None:
+            parts.append("")
+            continue
+        rendered = to_pg_text(field_val)
+        text = rendered.decode("utf-8") if rendered is not None else ""
+        if text == "" or any(ch in text for ch in ',()"\\') or any(ch.isspace() for ch in text):
+            text = '"' + text.replace("\\", "\\\\").replace('"', '""') + '"'
+        parts.append(text)
+    return "(" + ",".join(parts) + ")"
 
 
 def to_py(value: Any, tag: str) -> Any:

@@ -86,6 +86,18 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
     name = col.enum_type
     if catalog.enum_exists(db, name):
         return col
+    composite = catalog.get_composite(db, name)
+    if composite is not None:
+        # A composite-typed column stores a subdocument; carry the type's ordered
+        # fields on the column so INSERT (ROW → named subdoc) and (col).field can
+        # use them without a catalog round-trip.
+        return dataclasses.replace(
+            col,
+            enum_type=None,
+            composite_type=name,
+            composite_fields=tuple(composite),
+            type_tag="composite",
+        )
     domain = catalog.get_domain(db, name)
     if domain is None:
         raise errors.SQLError("42704", f'type "{name}" does not exist')

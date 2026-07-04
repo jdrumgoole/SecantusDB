@@ -26,6 +26,7 @@ SEQUENCE_COLLECTION = "__sql_sequences__"
 ROLE_COLLECTION = "__sql_roles__"
 ENUM_COLLECTION = "__sql_enums__"
 DOMAIN_COLLECTION = "__sql_domains__"
+COMPOSITE_COLLECTION = "__sql_composites__"
 
 
 class _StorageLike(Protocol):
@@ -75,6 +76,13 @@ class Column:
     # column. Computed from the row's other columns on every write; a user value
     # can't be supplied. Reflected as ``attgenerated = 's'``.
     generated: str | None = None
+    # The composite type name for a column declared with a ``CREATE TYPE … AS
+    # (…)`` type. The value is stored as a subdocument keyed by the type's field
+    # names; ``composite_fields`` carries ``[[name, type_tag], …]`` (copied from
+    # the type at CREATE TABLE) so the INSERT path can map a positional ``ROW(…)``
+    # onto the named fields and ``(col).field`` access can type its result.
+    composite_type: str | None = None
+    composite_fields: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +197,12 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "enum_type": c.enum_type,
                 "domain_type": c.domain_type,
                 "generated": c.generated,
+                "composite_type": c.composite_type,
+                "composite_fields": (
+                    [list(f) for f in c.composite_fields]
+                    if c.composite_fields is not None
+                    else None
+                ),
             }
             for c in table.columns
         ],
@@ -240,6 +254,12 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 enum_type=c.get("enum_type"),
                 domain_type=c.get("domain_type"),
                 generated=c.get("generated"),
+                composite_type=c.get("composite_type"),
+                composite_fields=(
+                    tuple(tuple(f) for f in c["composite_fields"])
+                    if c.get("composite_fields") is not None
+                    else None
+                ),
             )
             for c in doc["columns"]
         ],
@@ -551,6 +571,36 @@ class Catalog:
     def list_enums(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ENUM_COLLECTION, {})
         return sorted(d["enum"] for d in docs)
+
+    # -- composite types ---------------------------------------------------- #
+    # ``CREATE TYPE name AS (field type, …)`` — the ordered ``(field, type_tag)``
+    # list is stored here. A composite-typed column stores its value as a
+    # subdocument keyed by the field names and reflects via pg_type
+    # (``typtype = 'c'``) + pg_attribute.
+
+    def create_composite(self, db: str, name: str, fields: list[tuple[str, str]]) -> None:
+        self._storage.delete_matching(db, COMPOSITE_COLLECTION, {"_id": name})
+        self._storage.insert(
+            db,
+            COMPOSITE_COLLECTION,
+            [{"_id": name, "composite": name, "fields": [list(f) for f in fields]}],
+        )
+
+    def get_composite(self, db: str, name: str) -> list[tuple[str, str]] | None:
+        docs = self._storage.find_matching(db, COMPOSITE_COLLECTION, {"_id": name}, limit=1)
+        if not docs:
+            return None
+        return [tuple(f) for f in docs[0]["fields"]]
+
+    def composite_exists(self, db: str, name: str) -> bool:
+        return self.get_composite(db, name) is not None
+
+    def drop_composite(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, COMPOSITE_COLLECTION, {"_id": name}) > 0
+
+    def list_composites(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, COMPOSITE_COLLECTION, {})
+        return sorted(d["composite"] for d in docs)
 
     # -- domain types ------------------------------------------------------- #
     # ``CREATE DOMAIN name AS base [DEFAULT expr] [NOT NULL] [CHECK (...)]`` — a

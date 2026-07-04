@@ -398,6 +398,36 @@ evaluated by the scalar engine, so it supports the same operators as a table
 `CHECK` (comparisons, `LIKE`, the `~` / `~*` regex-match operators, `length()`,
 arithmetic).
 
+### Composite types (`CREATE TYPE … AS (…)`)
+
+A composite type is an ordered list of named, typed fields. A column declared with
+a composite type stores its value as a subdocument keyed by the field names; you
+write it with the `ROW(…)` constructor (positional, mapped onto the type's fields)
+and read a field with the `(col).field` accessor, which returns the field's
+declared type:
+
+```sql
+CREATE TYPE addr AS (street text, zip int);
+CREATE TABLE people (id int PRIMARY KEY, home addr);
+
+INSERT INTO people VALUES (1, ROW('Main St', 90210));
+
+SELECT (home).street, (home).zip FROM people;   -- 'Main St', 90210 (int, not text)
+SELECT home FROM people;                          -- ("Main St",90210)  (record literal)
+```
+
+Selecting the whole column renders the Postgres record text literal
+`(field1,field2)` (a field is double-quoted when empty or containing a comma /
+paren / quote / backslash / whitespace; a `NULL` field is empty) and reports the
+generic `RECORD` type oid, so a driver decodes it as a tuple of text fields.
+Composite types reflect through `pg_catalog.pg_type` (`typtype = 'c'`). `DROP TYPE
+[IF EXISTS] name` removes one; a missing type raises `42704` (silenced by
+`IF EXISTS`) and a name clash raises `42710`.
+
+Not yet supported: composite field access in a `WHERE` / `UPDATE … SET` target
+(only the `SELECT` list and `RETURNING`), nested composite fields, and
+`pg_attribute`-level reflection of a composite type's individual fields.
+
 `ALTER DOMAIN` evolves a domain in place:
 
 ```sql
