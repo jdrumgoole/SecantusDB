@@ -48,6 +48,12 @@ PG_OID: dict[str, int] = {
     "tsrange": 3908,
     "int8range": 3926,
     "daterange": 3912,
+    # Multirange types render as the ``{[a,b), [c,d)}`` text form.
+    "int4multirange": 4451,
+    "nummultirange": 4532,
+    "tsmultirange": 4533,
+    "datemultirange": 4535,
+    "int8multirange": 4536,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -61,6 +67,12 @@ _VECTOR_TAGS = frozenset({"int2vector", "oidvector"})
 
 # Range type tags — stored as a subdocument, rendered as ``[lower,upper)``.
 _RANGE_TAGS = frozenset({"int4range", "int8range", "numrange", "tsrange", "daterange"})
+
+# Multirange type tags — stored as ``{"multirange": [range, …]}``, rendered as
+# ``{[a,b), [c,d)}``.
+_MULTIRANGE_TAGS = frozenset(
+    {"int4multirange", "int8multirange", "nummultirange", "tsmultirange", "datemultirange"}
+)
 
 # Internal type tag -> SQL type name (for information_schema.columns.data_type
 # and any place a human-facing type spelling is needed).
@@ -76,6 +88,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "bytea": "bytea",
     "composite": "record",
     **{t: t for t in _RANGE_TAGS},
+    **{t: t for t in _MULTIRANGE_TAGS},
 }
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
@@ -91,6 +104,7 @@ PG_TYPENAME: dict[str, str] = {
     "bytea": "bytea",
     "composite": "record",
     **{t: t for t in _RANGE_TAGS},
+    **{t: t for t in _MULTIRANGE_TAGS},
 }
 
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
@@ -152,7 +166,7 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     # Range types — sqlglot's DataType.Type enum names vary across versions, so
     # match on the rendered type name (``int4range`` etc.).
     name = datatype.sql(dialect="postgres").lower().strip()
-    return name if name in _RANGE_TAGS else None
+    return name if name in _RANGE_TAGS or name in _MULTIRANGE_TAGS else None
 
 
 def is_array_tag(tag: str | None) -> bool:
@@ -228,6 +242,14 @@ def coerce(value: Any, tag: str) -> Any:
 
         elem, _discrete = _ranges.RANGE_TYPES[tag]
         return _ranges.parse_literal(str(value), tag, lambda tok: coerce(tok, elem))
+    if tag in _MULTIRANGE_TAGS:
+        if isinstance(value, dict):
+            return value
+        from secantus.sql import ranges as _ranges
+
+        range_tag = _ranges.MULTIRANGE_TYPES[tag]
+        elem, _discrete = _ranges.RANGE_TYPES[range_tag]
+        return _ranges.parse_multirange(str(value), tag, lambda tok: coerce(tok, elem))
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -282,6 +304,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         from secantus.sql import ranges as _ranges
 
         return _ranges.render(value).encode("utf-8")
+    if tag in _MULTIRANGE_TAGS and isinstance(value, dict):
+        from secantus.sql import ranges as _ranges
+
+        return _ranges.render_multirange(value).encode("utf-8")
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):

@@ -96,7 +96,7 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
 
 # Anonymous calls that the full scalar evaluator (``scalar._call_func``) handles,
 # so a FROM-less ``SELECT <fn>(...)`` must defer to it rather than the session path.
-_SCALAR_EVAL_ANON = frozenset({"isempty", "to_jsonb", "to_json", "row_to_json"})
+_SCALAR_EVAL_ANON = frozenset({"isempty", "to_jsonb", "to_json", "row_to_json", "range_merge"})
 
 
 def is_scalar_function(node: exp.Expression) -> bool:
@@ -112,7 +112,11 @@ def is_scalar_function(node: exp.Expression) -> bool:
         name = str(node.this).lower()
         # Range constructors / isempty and the jsonb builders (to_jsonb / to_json /
         # row_to_json) are implemented by the full scalar evaluator, not here.
-        if name in typemap._RANGE_TAGS or name in _SCALAR_EVAL_ANON:
+        if (
+            name in typemap._RANGE_TAGS
+            or name in typemap._MULTIRANGE_TAGS
+            or name in _SCALAR_EVAL_ANON
+        ):
             return False
     return isinstance(
         node,

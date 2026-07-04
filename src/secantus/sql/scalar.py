@@ -87,6 +87,14 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         result = _eval_range_op(node, scope, ctx)
         if result is not _NOT_RANGE:
             return result
+    if getattr(exp, "Adjacent", None) is not None and isinstance(node, exp.Adjacent):
+        from secantus.sql import ranges as _ranges
+
+        left = evaluate(node.this, scope, ctx)
+        right = evaluate(node.expression, scope, ctx)
+        if left is None or right is None:
+            return None
+        return _ranges.adjacent(left, right)
     if isinstance(node, exp.JSONBPathExists):  # jsonb @? jsonpath
         return _eval_jsonb_path_op(node.this, node.expression, "exists", scope, ctx)
     if getattr(exp, "MatchAgainst", None) is not None and isinstance(node, exp.MatchAgainst):
@@ -239,7 +247,22 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     left, right = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
     if left is None or right is None:  # NULL propagates through arithmetic
         return None
+    # ``*`` / ``+`` / ``-`` are overloaded for ranges (intersection / union /
+    # difference) when both operands are range subdocuments.
+    if _is_range_value(left) and _is_range_value(right):
+        from secantus.sql import ranges as _ranges
+
+        if isinstance(node, exp.Mul):
+            return _ranges.intersect(left, right)
+        if isinstance(node, exp.Add):
+            return _ranges.union(left, right)
+        if isinstance(node, exp.Sub):
+            return _ranges.difference(left, right)
     return _ARITH[type(node)](left, right)
+
+
+def _is_range_value(v: Any) -> bool:
+    return isinstance(v, dict) and ("lower" in v or "empty" in v)
 
 
 def _variadic(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> list[Any]:
@@ -901,7 +924,11 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'[1,10)'::int4range`` — parse a range text literal into its subdocument.
     to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
-    if value is not None and to in typemap._RANGE_TAGS and not isinstance(value, dict):
+    if (
+        value is not None
+        and (to in typemap._RANGE_TAGS or to in typemap._MULTIRANGE_TAGS)
+        and not isinstance(value, dict)
+    ):
         return typemap.coerce(value, to)
     # Otherwise we don't model regclass/oid identity types; evaluating the inner
     # value is enough for the catalog queries that use casts (compared / discarded,
@@ -1062,6 +1089,19 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         hi = args[1] if len(args) > 1 else None
         bounds = _as_text(args[2]) if len(args) > 2 else "[)"
         return _ranges.make_range(lo, hi, bounds, name)
+    if name in typemap._MULTIRANGE_TAGS:
+        # ``int4multirange(r1, r2, …)`` -> a coalesced multirange subdocument.
+        from secantus.sql import ranges as _ranges
+
+        return _ranges.make_multirange([a for a in args if a is not None])
+    if name == "range_merge":
+        from secantus.sql import ranges as _ranges
+
+        a = args[0] if args else None
+        b = args[1] if len(args) > 1 else None
+        if a is None or b is None:
+            return None
+        return _ranges.merge(a, b)
     if name == "isempty":
         from secantus.sql import ranges as _ranges
 

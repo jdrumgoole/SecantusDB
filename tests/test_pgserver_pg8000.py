@@ -1195,6 +1195,35 @@ def test_nested_composite_via_driver(server):
     conn.close()
 
 
+def test_range_algebra_and_range_agg_via_driver(server):
+    # Range operators, range_merge, and the range_agg -> multirange aggregate over
+    # the real wire (pg8000 parses range / multirange text into its own objects).
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id int primary key, g int, r int4range)")
+    cur.execute(
+        "INSERT INTO t VALUES (1,1,int4range(1,5)),(2,1,int4range(3,8)),"
+        "(3,1,int4range(20,25)),(4,2,int4range(1,2))"
+    )
+
+    cur.execute("SELECT int4range(1,10) * int4range(5,20)")
+    assert str(cur.fetchone()[0]) == "[5,10)"
+    cur.execute("SELECT int4range(1,10) + int4range(5,20)")
+    assert str(cur.fetchone()[0]) == "[1,20)"
+    cur.execute("SELECT range_merge(int4range(1,5), int4range(10,15))")
+    assert str(cur.fetchone()[0]) == "[1,15)"
+    cur.execute("SELECT int4range(1,5) -|- int4range(5,9)")
+    assert cur.fetchone()[0] is True
+
+    # range_agg coalesces each group's ranges into a multirange (pg8000 decodes it
+    # into a list of Range objects).
+    cur.execute("SELECT g, range_agg(r) AS m FROM t GROUP BY g ORDER BY g")
+    rows = cur.fetchall()
+    assert [r[0] for r in rows] == [1, 2]
+    assert [[str(m) for m in r[1]] for r in rows] == [["[1,8)", "[20,25)"], ["[1,2)"]]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

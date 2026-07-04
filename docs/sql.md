@@ -520,8 +520,27 @@ The `@>` / `<@` / `&&` operators work in both the `SELECT` list (yielding a
 (`lower(int4range)` → `int4`); an unbounded side is `NULL`. Ranges reflect
 through `pg_type` with `typtype = 'r'`.
 
-Not yet supported: multirange types, range GiST indexes, and the additional
-range functions (`range_merge`, `-|-` adjacency, `*` intersection, …).
+**Range algebra + multiranges.** Ranges support the set operators and the
+`range_merge` function, and `range_agg` coalesces a group's ranges into a
+**multirange** (`int4multirange` / `nummultirange` / …), stored as an ordered,
+non-overlapping list of ranges:
+
+```sql
+SELECT int4range(1,10) * int4range(5,20);   -- [5,10)   (intersection)
+SELECT int4range(1,10) + int4range(5,20);   -- [1,20)   (union; errors if disjoint)
+SELECT int4range(5,20) - int4range(1,10);   -- [10,20)  (difference; errors if it splits)
+SELECT int4range(1,5) -|- int4range(5,9);   -- true     (adjacency)
+SELECT range_merge(int4range(1,5), int4range(10,15));  -- [1,15) (smallest covering range)
+
+SELECT int4multirange(int4range(1,5), int4range(10,15));  -- {[1,5), [10,15)}
+SELECT '{[1,5), [10,20)}'::int4multirange;
+
+SELECT g, range_agg(r) FROM t GROUP BY g;   -- coalesced multirange per group
+```
+
+Not yet supported: multirange operators (`@>` / `&&` on multiranges),
+`range_intersect_agg`, `multirange()` extraction functions, and range GiST
+indexes.
 
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
