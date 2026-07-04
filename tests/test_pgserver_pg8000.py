@@ -1169,6 +1169,32 @@ def test_jsonb_agg_and_builders_via_driver(server):
     conn.close()
 
 
+def test_nested_composite_via_driver(server):
+    # A composite type whose field is itself a composite: nested ROW insert, single-
+    # and deep-level field access, and nested UPDATE over the real wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TYPE addr AS (street text, zip int)")
+    cur.execute("CREATE TYPE person AS (name text, home addr)")
+    cur.execute("CREATE TABLE t (id int primary key, p person)")
+    cur.execute("INSERT INTO t VALUES (1, ROW('Bob', ROW('Main St', 90210)))")
+
+    cur.execute("SELECT (p).name FROM t WHERE id = 1")
+    assert cur.fetchone()[0] == "Bob"
+
+    # A single-level composite field decodes into a record tuple.
+    cur.execute("SELECT (p).home FROM t WHERE id = 1")
+    assert tuple(cur.fetchone()[0]) == ("Main St", "90210")
+
+    cur.execute("SELECT ((p).home).street, ((p).home).zip FROM t WHERE id = 1")
+    assert tuple(cur.fetchone()) == ("Main St", 90210)
+
+    cur.execute("UPDATE t SET p.home = ROW('Elm St', 11111) WHERE id = 1")
+    cur.execute("SELECT ((p).home).zip FROM t WHERE id = 1")
+    assert cur.fetchone()[0] == 11111
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

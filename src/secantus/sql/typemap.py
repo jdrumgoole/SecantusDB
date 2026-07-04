@@ -299,8 +299,13 @@ def _render_pg_composite(value: dict) -> str:
         if field_val is None:
             parts.append("")
             continue
-        rendered = to_pg_text(field_val)
-        text = rendered.decode("utf-8") if rendered is not None else ""
+        # A dict-valued field is itself a composite (nested composite type) — render
+        # it recursively as a ``(…)`` record rather than as JSON.
+        if isinstance(field_val, dict):
+            text = _render_pg_composite(field_val)
+        else:
+            rendered = to_pg_text(field_val)
+            text = rendered.decode("utf-8") if rendered is not None else ""
         if text == "" or any(ch in text for ch in ',()"\\') or any(ch.isspace() for ch in text):
             text = '"' + text.replace("\\", "\\\\").replace('"', '""') + '"'
         parts.append(text)

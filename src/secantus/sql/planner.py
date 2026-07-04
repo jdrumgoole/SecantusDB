@@ -429,26 +429,60 @@ def table_resolver(table: TableDef) -> Resolve:
     return resolve
 
 
-def _composite_field_tag(node: exp.Expression, resolve: Resolve) -> str | None:
-    """Type of a composite field-access ``(col).field`` node, or None when the
-    node isn't that shape / the column isn't a resolvable composite. ``node`` is a
-    ``Dot(Paren(Column), Identifier)``."""
-    if not (isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier)):
+def _field_parts(entry: Any) -> tuple[str, str, Any]:
+    """Unpack a composite-field entry into ``(name, tag, subfields)``. ``subfields``
+    is None for a scalar field, or the nested field list for a composite field.
+    Tolerates legacy two-element ``(name, tag)`` entries."""
+    name, tag = entry[0], entry[1]
+    sub = entry[2] if len(entry) > 2 else None
+    return name, tag, sub
+
+
+def _composite_walk(node: exp.Expression, resolve: Resolve) -> tuple[str, str, Any] | None:
+    """Resolve a (possibly nested) composite access ``((col).a).b`` to
+    ``(dotted_path, field_tag, subfields)``. ``field_tag`` is the accessed field's
+    declared type (a composite field's tag is its type name); ``subfields`` is that
+    field's nested field list when it is itself composite, else None. Returns None
+    when ``node`` isn't a composite access or the base isn't a resolvable
+    composite."""
+    if not (
+        isinstance(node, exp.Dot)
+        and isinstance(node.this, exp.Paren)
+        and isinstance(node.expression, exp.Identifier)
+    ):
         return None
-    inner = node.this.this if isinstance(node.this, exp.Paren) else node.this
-    if not isinstance(inner, exp.Column):
-        return None
-    table = getattr(resolve, "table", None)
-    if table is None:
-        return None
-    col = table.column(_column_name(inner))
-    if col is None or col.composite_fields is None:
-        return None
-    fname = node.expression.name
-    for field_name, tag in col.composite_fields:
-        if field_name == fname:
-            return tag
+    field = node.expression.name
+    inner = node.this.this
+    if isinstance(inner, exp.Column):
+        table = getattr(resolve, "table", None)
+        if table is None:
+            return None
+        col = table.column(_column_name(inner))
+        if col is None or col.composite_fields is None:
+            return None
+        base_path, _ = resolve(inner)
+        fields = col.composite_fields
+    else:
+        parent = _composite_walk(inner, resolve)
+        if parent is None or parent[2] is None:
+            return None
+        base_path, _ptag, fields = parent
+    for entry in fields:
+        fname, tag, sub = _field_parts(entry)
+        if fname == field:
+            return f"{base_path}.{field}", tag, sub
     return None
+
+
+def _composite_field_tag(node: exp.Expression, resolve: Resolve) -> str | None:
+    """Output type of a composite field-access ``(col).field`` (or nested
+    ``((col).a).b``). A field that is itself composite types as ``composite`` so it
+    renders as a record on the wire; a scalar field keeps its declared tag."""
+    walked = _composite_walk(node, resolve)
+    if walked is None:
+        return None
+    _path, tag, sub = walked
+    return "composite" if sub is not None else tag
 
 
 # jsonb navigation: ->, ->>, #>, #>> parse to these nodes. ``Scalar`` variants
@@ -458,9 +492,11 @@ _JSONB_SCALAR = (exp.JSONExtractScalar, exp.JSONBExtractScalar)
 
 
 def _composite_access_parts(node: exp.Expression) -> tuple[exp.Column, str] | None:
-    """A composite field-access ``(col).field`` -> ``(inner_column, subfield)``, or
-    None. Requires the parenthesised form (``Dot(Paren(Column), Identifier)``) so a
-    schema-qualified ``pg_catalog.x`` Dot is never mistaken for field access."""
+    """A single-level composite field-access ``(col).field`` ->
+    ``(inner_column, subfield)``, or None. Requires the parenthesised form
+    (``Dot(Paren(Column), Identifier)``) so a schema-qualified ``pg_catalog.x`` Dot
+    is never mistaken for field access. Nested accesses (``((col).a).b``) are
+    handled by ``_composite_walk``, not here."""
     if not (
         isinstance(node, exp.Dot)
         and isinstance(node.this, exp.Paren)
@@ -471,10 +507,20 @@ def _composite_access_parts(node: exp.Expression) -> tuple[exp.Column, str] | No
     return (inner, node.expression.name) if isinstance(inner, exp.Column) else None
 
 
+def _is_composite_access_shape(node: exp.Expression) -> bool:
+    """Shape-only test for a (possibly nested) composite access ``((col).a).b``."""
+    if not (
+        isinstance(node, exp.Dot)
+        and isinstance(node.this, exp.Paren)
+        and isinstance(node.expression, exp.Identifier)
+    ):
+        return False
+    inner = node.this.this
+    return isinstance(inner, exp.Column) or _is_composite_access_shape(inner)
+
+
 def _is_field_node(node: exp.Expression) -> bool:
-    return isinstance(node, (exp.Column, *_JSONB_CLASSES)) or (
-        _composite_access_parts(node) is not None
-    )
+    return isinstance(node, (exp.Column, *_JSONB_CLASSES)) or _is_composite_access_shape(node)
 
 
 def _json_keys(expr: exp.Expression) -> list[str]:
@@ -496,13 +542,13 @@ def _field(node: exp.Expression, resolve: Resolve) -> tuple[str, str]:
         keys = _json_keys(node.expression)
         path = base_path + ("." + ".".join(keys) if keys else "")
         return path, ("text" if isinstance(node, _JSONB_SCALAR) else "json")
-    parts = _composite_access_parts(node)
-    if parts is not None:
-        # ``(col).field`` -> the column's storage path plus the subfield name; the
-        # value lives in a subdocument, so a dotted Mongo path reaches it directly.
-        inner, subfield = parts
-        base_path, _ = resolve(inner)
-        return f"{base_path}.{subfield}", (_composite_field_tag(node, resolve) or "text")
+    walked = _composite_walk(node, resolve)
+    if walked is not None:
+        # ``(col).field`` / ``((col).a).b`` -> the storage path into the (possibly
+        # nested) subdocument; a composite field types as ``composite`` so it
+        # renders as a record on the wire.
+        path, tag, sub = walked
+        return path, ("composite" if sub is not None else (tag or "text"))
     raise errors.feature_not_supported(f"expected a column or jsonb path: {node.sql()}")
 
 
@@ -1330,24 +1376,34 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
 
 def _composite_value(raw: Any, col: Column) -> dict[str, Any]:
     """Map a ``ROW(…)`` positional value (or an already-named subdocument) onto a
-    composite column's named fields, coercing each field to its declared type."""
-    fields = col.composite_fields or ()
+    composite column's named fields, coercing each field to its declared type. A
+    field that is itself composite recurses (nested ``ROW(...)`` → nested subdoc)."""
+    return _build_composite(raw, col.composite_fields or (), col.composite_type or "record")
+
+
+def _build_composite(raw: Any, fields: Any, type_name: str) -> dict[str, Any]:
+    """Build a composite subdocument from a positional ``ROW`` / list, or an
+    already-named dict, against ``fields`` (``(name, tag, subfields)`` entries)."""
     if isinstance(raw, dict):
-        pairs = [(fname, raw.get(fname)) for fname, _ in fields]
+        pairs = [(_field_parts(f)[0], raw.get(_field_parts(f)[0])) for f in fields]
     elif isinstance(raw, (list, tuple)):
         if len(raw) != len(fields):
             raise errors.SQLError(
                 "22P02",
-                f'malformed record literal for type "{col.composite_type}": '
+                f'malformed record literal for type "{type_name}": '
                 f"expected {len(fields)} fields, got {len(raw)}",
             )
-        pairs = list(zip((f[0] for f in fields), raw, strict=True))
+        pairs = list(zip((_field_parts(f)[0] for f in fields), raw, strict=True))
     else:
-        raise errors.SQLError("22P02", f'malformed record literal for type "{col.composite_type}"')
-    return {
-        fname: typemap.coerce(val, tag)
-        for (fname, val), (_, tag) in zip(pairs, fields, strict=True)
-    }
+        raise errors.SQLError("22P02", f'malformed record literal for type "{type_name}"')
+    out: dict[str, Any] = {}
+    for (fname, val), entry in zip(pairs, fields, strict=True):
+        _name, tag, sub = _field_parts(entry)
+        if sub is not None and val is not None:
+            out[fname] = _build_composite(val, sub, tag)
+        else:
+            out[fname] = typemap.coerce(val, tag)
+    return out
 
 
 def _set_doc_field(doc: dict[str, Any], field: str, value: Any) -> None:
@@ -1863,20 +1919,24 @@ def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelec
 
 def _composite_subfield_target(target: exp.Expression, table: TableDef):
     """A composite subfield SET target ``col.field`` parses as ``Column(this=field,
-    table=col)``; return ``(composite_column, subfield, field_tag)`` when ``col`` is
-    a composite column, else None."""
+    table=col)``; return ``(composite_column, subfield, field_tag, subfields)`` when
+    ``col`` is a composite column, else None. ``subfields`` is the field's nested
+    field list when it is itself composite, else None."""
     if not (isinstance(target, exp.Column) and target.table):
         return None
     comp_col = table.column(target.table)
     if comp_col is None or comp_col.composite_fields is None:
         return None
     subfield = target.name
-    tag = next((t for f, t in comp_col.composite_fields if f == subfield), None)
-    if tag is None:
+    match = next(
+        (_field_parts(f) for f in comp_col.composite_fields if _field_parts(f)[0] == subfield),
+        None,
+    )
+    if match is None:
         raise errors.SQLError(
             "42703", f'column "{subfield}" not found in composite type "{comp_col.composite_type}"'
         )
-    return comp_col, subfield, tag
+    return comp_col, subfield, match[1], match[2]
 
 
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
@@ -1887,11 +1947,15 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         # ``SET col.field = v`` writes into the composite subdocument at ``col.field``.
         subfield_target = _composite_subfield_target(assign.this, table)
         if subfield_target is not None:
-            comp_col, subfield, tag = subfield_target
+            comp_col, subfield, tag, subfields = subfield_target
             if comp_col.pk:
                 raise errors.feature_not_supported("updating the primary key is not supported")
             raw = _literal(assign.expression)
-            set_doc[f"{comp_col.field}.{subfield}"] = typemap.coerce(raw, tag)
+            if subfields is not None and raw is not None:
+                value = _build_composite(raw, subfields, tag)
+            else:
+                value = typemap.coerce(raw, tag)
+            set_doc[f"{comp_col.field}.{subfield}"] = value
             continue
         col_name = _column_name(assign.this)
         col = table.column(col_name)

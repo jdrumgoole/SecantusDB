@@ -1479,7 +1479,7 @@ def _create_type(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
     # ColumnDefs.
     if isinstance(expr, exp.Schema):
         _check_type_name_free(catalog, db, name)
-        fields = _composite_fields_from_schema(expr, name)
+        fields = _composite_fields_from_schema(expr, name, catalog, db)
         catalog.create_composite(db, name, fields)
         return SQLResult(command_tag="CREATE TYPE")
     if not (isinstance(expr, exp.DataType) and expr.this and expr.this.name == "ENUM"):
@@ -1502,20 +1502,38 @@ def _check_type_name_free(catalog: Catalog, db: str, name: str) -> None:
         raise errors.SQLError("42710", f'type "{name}" already exists')
 
 
-def _composite_fields_from_schema(schema: exp.Schema, type_name: str) -> list[tuple[str, str]]:
-    fields: list[tuple[str, str]] = []
+def _composite_fields_from_schema(
+    schema: exp.Schema, type_name: str, catalog: Catalog, db: str
+) -> list[tuple]:
+    """Build a composite type's ordered fields from ``CREATE TYPE t AS (…)``. A
+    field whose type is a builtin gets ``(name, tag, None)``; a field whose type is
+    another (already-declared) composite gets ``(name, subtype_name, subfields)``
+    with the referenced type's fields embedded (resolved once, since composite
+    types don't support ALTER)."""
+    fields: list[tuple] = []
     for coldef in schema.expressions:
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(
                 f"unsupported composite type element: {coldef.sql()}"
             )
-        tag = typemap.type_tag_for_sql(coldef.args["kind"])
-        if tag is None:
+        kind = coldef.args["kind"]
+        tag = typemap.type_tag_for_sql(kind)
+        if tag is not None:
+            fields.append((coldef.name, tag, None))
+            continue
+        # A non-builtin field type may be another composite (nested composite).
+        subtype = kind.sql(dialect="postgres").lower().strip().strip('"')
+        if subtype == type_name.lower():
             raise errors.feature_not_supported(
-                f'unsupported field type in composite type "{type_name}": '
-                f"{coldef.args['kind'].sql()}"
+                f'composite type "{type_name}" cannot contain itself'
             )
-        fields.append((coldef.name, tag))
+        sub = catalog.get_composite(db, subtype)
+        if sub is not None:
+            fields.append((coldef.name, subtype, tuple(sub)))
+            continue
+        raise errors.feature_not_supported(
+            f'unsupported field type in composite type "{type_name}": {kind.sql()}'
+        )
     return fields
 
 

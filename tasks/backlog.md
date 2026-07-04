@@ -1469,8 +1469,25 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`virtual._composite_rel_oids`, oid base 68000) with `reltype` pointing back, plus one pg_attribute
   row per field, so `pg_type.typrelid → pg_class.oid → pg_attribute.attrelid` resolves field names /
   oids (`psql \dT+`, SQLAlchemy). Added the `typrelid` column to the pg_type schema and `reltype` to
-  pg_class. **Still not supported:** nested composite types (a field whose own type is a composite —
-  `engine._composite_fields_from_schema` rejects a non-builtin field type).
+  pg_class.
+- [ ] **Nested composite types landed** (b139): a composite type whose own field is another composite,
+  closing the b134 gap. Composite field entries became recursive 3-tuples `(name, tag, subfields)` —
+  `subfields` is None for a scalar field or the referenced type's fields for a composite field (embedded
+  at `CREATE TYPE` time by `engine._composite_fields_from_schema`, which now takes `catalog`/`db` and
+  resolves a non-builtin field type as a composite; a direct self-reference raises `0A000`). Catalog
+  ser/deser recurse (`catalog._ser_composite_fields` / `_deser_composite_fields`, backward-compatible
+  with legacy 2-tuples). `planner._composite_walk` resolves arbitrary-depth access `((p).home).street`
+  to a dotted path + tag (a composite field types as `composite` so it renders as a record; deeper walks
+  key off `subfields`), driving `_composite_field_tag` / `_field` / `_is_field_node` (a new
+  `_is_composite_access_shape` accepts the nested shape). `planner._build_composite` recurses to build
+  nested subdocs from nested `ROW(...)` on INSERT and `SET col.field = ROW(...)` on UPDATE. The scalar
+  evaluator already walked nested access recursively (it reads the data). `typemap._render_pg_composite`
+  renders a dict-valued field as a nested `(…)` record (quoted/escaped when embedded).
+  `virtual._pg_attribute` points a composite field at its subtype's composite oid. Tests:
+  `tests/test_sql_nested_composite.py` (16, incl. three-level nesting, nested WHERE/UPDATE, reflection)
+  plus a pg8000 wire test. **Limitation:** pg8000's own record parser mis-splits a *doubly*-nested
+  anonymous record on the wire (a client-side limitation — the emitted text is byte-exact Postgres);
+  single-level composite fields decode cleanly.
 - [ ] **Statistical + bitwise aggregates landed** (b136): `stddev`/`stddev_samp`/`stddev_pop`,
   `variance`/`var_samp`(=variance)/`var_pop`, and `bit_and`/`bit_or`/`bit_xor` (`every` already aliased
   `bool_and`). Added the dedicated sqlglot nodes to `planner._AGG_CLASSES` (via a version-tolerant

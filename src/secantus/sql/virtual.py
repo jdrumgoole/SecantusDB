@@ -729,15 +729,24 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
     # Composite-type fields are pg_attribute rows keyed on the type's relkind='c'
     # relation oid, so pg_type.typrelid -> pg_class.oid -> pg_attribute resolves.
     rel_oids = _composite_rel_oids(db, catalog)
+    comp_oids = _composite_oids(db, catalog)
     getter = getattr(catalog, "get_composite", None)
     for name, rel_oid in rel_oids.items():
         fields = getter(db, name) if getter is not None else None
-        for i, (fname, tag) in enumerate(fields or [], start=1):
+        for i, entry in enumerate(fields or [], start=1):
+            fname, tag = entry[0], entry[1]
+            sub = entry[2] if len(entry) > 2 else None
+            # A field whose type is another composite reflects that type's oid.
+            atttypid = (
+                comp_oids.get(tag, typemap.PG_OID.get(tag, 25))
+                if sub
+                else (typemap.PG_OID.get(tag, 25))
+            )
             rows.append(
                 {
                     "attrelid": rel_oid,
                     "attname": fname,
-                    "atttypid": typemap.PG_OID.get(tag, 25),
+                    "atttypid": atttypid,
                     "atttypmod": -1,
                     "attnum": i,
                     "attnotnull": False,
