@@ -1823,10 +1823,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   missing type / neighbour → `42704`. A single-table `ORDER BY` on an enum column now sorts by the
   **declared** label order: `planner._enum_order_map` records the label list on `SelectPlan.enum_orders`
   (via the catalog on the pushdown `SubqueryCtx`), and `executor._order_key_fn` maps each value to its
-  ordinal. Tests: `tests/test_sql_alter_type.py` + a pg8000 wire round-trip. **Limitations:** `ALTER TYPE
-  RENAME VALUE` / composite-type alters → `0A000`; enum-aware ordering covers the single-table pushdown
-  path only — an enum sorted inside a JOIN / GROUP BY / evaluated pipeline (or a correlated SELECT) still
-  sorts lexically (the pipeline `$sort` and `plan_correlated_select` don't thread `enum_orders`).
+  ordinal. Tests: `tests/test_sql_alter_type.py` + a pg8000 wire round-trip. Enum-aware ordering was
+  extended to the pipeline / evaluated paths in b116 (`planner._emit_pipeline_sort` gains an
+  `$indexOfArray` ordinal companion; `_append_sort_limit` / `_append_join_tail` thread the enum labels via
+  `_enum_labels_for_column` + `_column_for_order_node`; the evaluated planners carry
+  `EvaluatedSelectPlan.enum_orders`, applied in `executor._evaluated_value_rows`) — so GROUP BY, DISTINCT,
+  JOIN, JOIN+GROUP BY, and computed-column ORDER BY all sort an enum by declared order. Tests:
+  `tests/test_sql_enum_order.py`. **Limitations:** `ALTER TYPE RENAME VALUE` / composite-type alters →
+  `0A000`; a correlated single-table SELECT (`plan_correlated_select`) still sorts an enum lexically.
 - [ ] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
   (`planner._generated_expr` stores the rendered SQL on `Column.generated`). Computed from the row's
   other columns on every write by `executor._apply_generated_columns` (evaluates the expr via

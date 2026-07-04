@@ -1003,10 +1003,21 @@ def _evaluated_value_rows(
 
         return scope
 
+    # An enum ORDER BY term sorts by the label's declared ordinal, not lexically.
+    enum_ordinals = {
+        i: {lbl: k for k, lbl in enumerate(labels)}
+        for i, labels in getattr(plan, "enum_orders", {}).items()
+    }
+
+    def _order_key(oe: Any, i: int, scope: Any) -> Any:
+        v = scalar.evaluate(oe, scope, sctx)
+        omap = enum_ordinals.get(i)
+        return omap.get(v, len(omap)) if omap is not None and v is not None else v
+
     scored: list[tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]] = []
     for doc in docs:
         scope = make_scope(doc)
-        keys = tuple(scalar.evaluate(oe, scope, sctx) for oe, _, _ in plan.order)
+        keys = tuple(_order_key(oe, i, scope) for i, (oe, _, _) in enumerate(plan.order))
         # DISTINCT ON key (row-level, evaluated before any SRF expansion).
         don_key = (
             tuple(repr(scalar.evaluate(e, scope, sctx)) for e in plan.distinct_on)
