@@ -94,6 +94,11 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
     raise errors.feature_not_supported(f"function {name}() is not supported")
 
 
+# Anonymous calls that the full scalar evaluator (``scalar._call_func``) handles,
+# so a FROM-less ``SELECT <fn>(...)`` must defer to it rather than the session path.
+_SCALAR_EVAL_ANON = frozenset({"isempty", "to_jsonb", "to_json", "row_to_json"})
+
+
 def is_scalar_function(node: exp.Expression) -> bool:
     """Whether ``plan_constant_select`` should evaluate ``node`` as a function."""
     if isinstance(node, exp.Dot):
@@ -105,7 +110,9 @@ def is_scalar_function(node: exp.Expression) -> bool:
         from secantus.sql import typemap
 
         name = str(node.this).lower()
-        if name in typemap._RANGE_TAGS or name == "isempty":
+        # Range constructors / isempty and the jsonb builders (to_jsonb / to_json /
+        # row_to_json) are implemented by the full scalar evaluator, not here.
+        if name in typemap._RANGE_TAGS or name in _SCALAR_EVAL_ANON:
             return False
     return isinstance(
         node,

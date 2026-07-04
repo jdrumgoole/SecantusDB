@@ -1503,6 +1503,24 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   SQL surface) and a pg8000 wire test. **Limitations:** the `@>`/`<@`/`&&` operators run a COLLSCAN
   per-row (no lowered Mongo filter / index); multirange types, range GiST indexes, and the extra range
   functions (`range_merge`, `-|-` adjacency, `*` intersection, `range_agg`) are unimplemented.
+- [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
+  `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
+  `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same
+  `$push` array and are already typed `json` here) so every group-plan + detection site lights up
+  automatically, including the in-call `ORDER BY` (`json_agg` is the dedicated `exp.JSONArrayAgg`
+  node; `jsonb_agg` an `Anonymous`). `jsonb_object_agg` (`_jsonb_object_agg_args` + `_jsonb_object_agg_push`)
+  pushes `{k: {$toString: key}, v: val}` pairs then projects `{$arrayToObject: "$field"}` → a json
+  object (key coerced to text); wired into the single-table, grouping-set and JOIN group paths plus
+  the five aggregate-detection sites. `json_object_agg` parses as `exp.JSONObjectAgg` (args in an
+  `expressions` list), `jsonb_object_agg` as `exp.JSONBObjectAgg` (`this`/`expression`). The builders
+  are the identity in `scalar._call_func` (values already store as native Python that renders as json;
+  a composite / `ROW(...)` arrives as a subdocument); `functions.is_scalar_function` excludes them
+  (via `_SCALAR_EVAL_ANON`) so a FROM-less `SELECT to_jsonb(...)` defers to the scalar evaluator. All
+  typed `json` in `planner._infer_scalar_tag`. Tests: `tests/test_sql_jsonb_agg.py` (18) + a pg8000
+  wire test. **Not yet implemented:** `jsonb_each` / `jsonb_each_text` (a two-column `(key, value)`
+  record SRF — the current SRF executor emits a single value per row, so a multi-column record SRF
+  needs an executor change); `FILTER (WHERE …)` on the jsonb aggregates; the default output label for
+  an un-aliased `jsonb_agg` is `array_agg` (cosmetic).
 - [ ] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
   (tokenizer + recursive-descent parser + evaluator) powering `jsonb_path_query` / `jsonb_path_query_array`
   / `jsonb_path_exists` / `jsonb_path_match` (via `scalar._call_func`) and the `@?` (`exp.JSONBPathExists`)

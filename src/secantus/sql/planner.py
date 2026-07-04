@@ -2264,11 +2264,58 @@ def _string_agg_project(fname: str, sep: str) -> dict[str, Any]:
 
 
 def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
-    """If ``node`` is ``array_agg(<arg>)``, return its argument expression."""
+    """If ``node`` is ``array_agg(<arg>)`` — or ``jsonb_agg`` / ``json_agg``, which
+    build the same ``$push`` array and are likewise typed ``json`` here — return its
+    argument expression (an in-call ``ORDER BY`` stays wrapped as ``exp.Order``)."""
     inner = node.this if isinstance(node, exp.Alias) else node
     if isinstance(inner, exp.Filter):
         inner = inner.this
-    return inner.this if isinstance(inner, exp.ArrayAgg) else None
+    if isinstance(inner, exp.ArrayAgg):
+        return inner.this
+    # json_agg has a dedicated sqlglot node; jsonb_agg parses as an Anonymous call.
+    if isinstance(inner, exp.JSONArrayAgg):
+        return inner.this
+    if isinstance(inner, exp.Anonymous) and str(inner.this).lower() in ("jsonb_agg", "json_agg"):
+        return inner.expressions[0] if inner.expressions else None
+    return None
+
+
+def _jsonb_object_agg_args(
+    node: exp.Expression,
+) -> tuple[exp.Expression, exp.Expression] | None:
+    """If ``node`` is ``jsonb_object_agg(k, v)`` / ``json_object_agg(k, v)``, return
+    the ``(key_expr, value_expr)`` pair. Both a dedicated sqlglot node and an
+    Anonymous two-argument call are accepted."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
+    # jsonb_object_agg → JSONBObjectAgg (this / expression); json_object_agg →
+    # JSONObjectAgg (a two-element expressions list). Attribute lookup for version
+    # tolerance across sqlglot releases.
+    jsonb_cls = getattr(exp, "JSONBObjectAgg", None)
+    if jsonb_cls is not None and isinstance(inner, jsonb_cls):
+        return inner.this, inner.expression
+    json_cls = getattr(exp, "JSONObjectAgg", None)
+    if json_cls is not None and isinstance(inner, json_cls) and len(inner.expressions) == 2:
+        return inner.expressions[0], inner.expressions[1]
+    if (
+        isinstance(inner, exp.Anonymous)
+        and str(inner.this).lower() in ("jsonb_object_agg", "json_object_agg")
+        and len(inner.expressions) == 2
+    ):
+        return inner.expressions[0], inner.expressions[1]
+    return None
+
+
+def _jsonb_object_agg_push(key: exp.Expression, val: exp.Expression, table: TableDef) -> dict:
+    """The ``$push`` accumulator for ``jsonb_object_agg`` — a ``{k, v}`` pair per row
+    (key coerced to a string, per Postgres' text object keys)."""
+    return {
+        "$push": {
+            "k": {"$toString": _agg_arg_to_expr(key, table)},
+            "v": _agg_arg_to_expr(val, table),
+        }
+    }
 
 
 # Ordered-set aggregates: ``<func>(...) WITHIN GROUP (ORDER BY expr)``.
@@ -2387,6 +2434,7 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
         for e in stmt.expressions
         if _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
+        or _jsonb_object_agg_args(e) is not None
         or _string_agg_arg(e) is not None
         or _ordered_set_agg(e) is not None
     ]
@@ -2453,6 +2501,7 @@ def _plan_pipeline_select(
         has_agg = any(
             _aggregate_of(e) is not None
             or _array_agg_arg(e) is not None
+            or _jsonb_object_agg_args(e) is not None
             or _string_agg_arg(e) is not None
             for e in stmt.expressions
         )
@@ -2474,6 +2523,7 @@ def _plan_pipeline_select(
     has_aggregate = any(
         _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
+        or _jsonb_object_agg_args(e) is not None
         or _string_agg_arg(e) is not None
         or _ordered_set_agg(e) is not None
         for e in stmt.expressions
@@ -2794,18 +2844,24 @@ def _grouping_set_branch(
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         arr_arg = _array_agg_arg(e)
+        oagg = _jsonb_object_agg_args(e)
         sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
         where = _agg_filter_where(e)
-        if (arr_arg is not None or sagg is not None) and where is not None:
+        if (arr_arg is not None or sagg is not None or oagg is not None) and where is not None:
             raise errors.feature_not_supported(
-                "FILTER (WHERE ...) is not supported on array_agg / string_agg"
+                "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
             )
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             project[fname] = f"${fname}"
+            out_columns.append((fname, "json"))
+        elif oagg is not None:
+            fname = names.fresh(alias or "jsonb_object_agg")
+            accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table)
+            project[fname] = {"$arrayToObject": f"${fname}"}
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
@@ -2879,16 +2935,22 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         arr_arg = _array_agg_arg(e)
+        oagg = _jsonb_object_agg_args(e)
         sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
         osa = _ordered_set_agg(e)
         where = _agg_filter_where(e)
-        if (arr_arg is not None or sagg is not None) and where is not None:
+        if (arr_arg is not None or sagg is not None or oagg is not None) and where is not None:
             raise errors.feature_not_supported(
-                "FILTER (WHERE ...) is not supported on array_agg / string_agg"
+                "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
             )
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
-        if osa is not None:
+        if oagg is not None:
+            fname = names.fresh(alias or "jsonb_object_agg")
+            accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table)
+            project[fname] = {"$arrayToObject": f"${fname}"}
+            out_columns.append((fname, "json"))
+        elif osa is not None:
             kind, fraction, order_val = osa
             fname = names.fresh(alias or kind)
             # Collect the ORDER BY values; the executor sorts + computes in Python.
@@ -3487,6 +3549,7 @@ def _lateral_stage(
     has_agg = any(
         _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
+        or _jsonb_object_agg_args(e) is not None
         or _string_agg_arg(e) is not None
         for e in sub.expressions
     )
@@ -3910,12 +3973,13 @@ def _plan_join_group_select(
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         arr_arg = _array_agg_arg(e)
+        oagg = _jsonb_object_agg_args(e)
         sagg = _string_agg_arg(e)
         agg = _join_aggregate_of(e)
         where = _agg_filter_where(e)
-        if (arr_arg is not None or sagg is not None) and where is not None:
+        if (arr_arg is not None or sagg is not None or oagg is not None) and where is not None:
             raise errors.feature_not_supported(
-                "FILTER (WHERE ...) is not supported on array_agg / string_agg"
+                "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
             )
         fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         if arr_arg is not None:
@@ -3923,6 +3987,13 @@ def _plan_join_group_select(
             path, _ = resolve(arr_arg)
             accumulators[fname] = {"$push": f"${path}"}
             project[fname] = f"${fname}"
+            out_columns.append((fname, "json"))
+        elif oagg is not None:
+            fname = names.fresh(alias or "jsonb_object_agg")
+            kpath, _ = resolve(oagg[0])
+            vpath, _ = resolve(oagg[1])
+            accumulators[fname] = {"$push": {"k": {"$toString": f"${kpath}"}, "v": f"${vpath}"}}
+            project[fname] = {"$arrayToObject": f"${fname}"}
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
@@ -4179,6 +4250,7 @@ def _stmt_needs_evaluation(stmt: exp.Select) -> bool:
             _is_simple_projection(e)
             or _aggregate_of(e) is not None
             or _array_agg_arg(e) is not None
+            or _jsonb_object_agg_args(e) is not None
         ):
             continue
         return True
@@ -4417,6 +4489,13 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "json_strip_nulls",
             "jsonb_path_query",
             "jsonb_path_query_array",
+            "to_jsonb",
+            "to_json",
+            "row_to_json",
+            "jsonb_agg",
+            "json_agg",
+            "jsonb_object_agg",
+            "json_object_agg",
         ):
             return "json"
         if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):

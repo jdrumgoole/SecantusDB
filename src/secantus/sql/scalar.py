@@ -1008,6 +1008,11 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         return out
     if name in ("json_build_array", "jsonb_build_array"):
         return list(args)
+    if name in ("to_jsonb", "to_json", "row_to_json"):
+        # Values are already stored as native Python (dict / list / scalar) that
+        # renders as json on the wire, so the conversion is the identity — a
+        # composite / ROW(...) argument arrives as a subdocument, a scalar as itself.
+        return _as_json_value(args[0]) if args else None
     if name in ("jsonb_array_length", "json_array_length"):
         v = args[0] if args else None
         if not isinstance(v, list):
