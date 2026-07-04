@@ -437,8 +437,29 @@ type's fields reflect via the `pg_type.typrelid` → `pg_class` (`relkind = 'c'`
 `DROP TYPE [IF EXISTS] name` removes one; a missing type raises `42704` (silenced
 by `IF EXISTS`) and a name clash raises `42710`.
 
-Not yet supported: nested composite types (a composite field whose own type is a
-composite).
+A composite field may itself be a composite type (**nested composites**). The
+referenced type's fields are embedded at `CREATE TYPE` time; you build the value
+with nested `ROW(...)`, walk in with chained accessors, and the whole value
+renders as a nested Postgres record:
+
+```sql
+CREATE TYPE addr AS (street text, zip int);
+CREATE TYPE person AS (name text, home addr);          -- home is itself a composite
+CREATE TABLE t (id int PRIMARY KEY, p person);
+
+INSERT INTO t VALUES (1, ROW('Bob', ROW('Main St', 90210)));
+
+SELECT (p).home FROM t;              -- ("Main St",90210)  (the addr record)
+SELECT ((p).home).street FROM t;     -- 'Main St'  (deep access, typed text)
+SELECT ((p).home).zip FROM t;        -- 90210      (typed int)
+SELECT p FROM t;                     -- (Bob,"(""Main St"",90210)")  (nested record)
+UPDATE t SET p.home = ROW('Elm St', 11111) WHERE id = 1;
+```
+
+Nesting is arbitrary-depth (`(((p).home).at).lat`), works in `WHERE`
+(`WHERE ((p).home).zip = 90210` lowers to a dotted Mongo path), and a composite
+field reflects at its own type's oid in `pg_attribute`. A composite type cannot
+contain itself (a direct cycle raises `0A000`).
 
 `ALTER DOMAIN` evolves a domain in place:
 

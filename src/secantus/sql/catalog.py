@@ -29,6 +29,32 @@ DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
 
 
+def _ser_composite_fields(fields: Any) -> list | None:
+    """Serialize composite fields ``(name, tag, subfields)`` to plain lists (bson-
+    safe), recursing into a nested composite field's own subfields. Tolerates
+    legacy two-element ``(name, tag)`` entries."""
+    if fields is None:
+        return None
+    out = []
+    for f in fields:
+        name, tag = f[0], f[1]
+        sub = f[2] if len(f) > 2 else None
+        out.append([name, tag, _ser_composite_fields(sub)])
+    return out
+
+
+def _deser_composite_fields(raw: Any) -> tuple | None:
+    """Inverse of ``_ser_composite_fields`` — plain lists back to nested tuples."""
+    if raw is None:
+        return None
+    out = []
+    for f in raw:
+        name, tag = f[0], f[1]
+        sub = f[2] if len(f) > 2 else None
+        out.append((name, tag, _deser_composite_fields(sub)))
+    return tuple(out)
+
+
 class _StorageLike(Protocol):
     """The slice of ``Storage`` the catalog uses (duck-typed for testability)."""
 
@@ -198,11 +224,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "domain_type": c.domain_type,
                 "generated": c.generated,
                 "composite_type": c.composite_type,
-                "composite_fields": (
-                    [list(f) for f in c.composite_fields]
-                    if c.composite_fields is not None
-                    else None
-                ),
+                "composite_fields": _ser_composite_fields(c.composite_fields),
             }
             for c in table.columns
         ],
@@ -255,11 +277,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 domain_type=c.get("domain_type"),
                 generated=c.get("generated"),
                 composite_type=c.get("composite_type"),
-                composite_fields=(
-                    tuple(tuple(f) for f in c["composite_fields"])
-                    if c.get("composite_fields") is not None
-                    else None
-                ),
+                composite_fields=_deser_composite_fields(c.get("composite_fields")),
             )
             for c in doc["columns"]
         ],
@@ -578,19 +596,19 @@ class Catalog:
     # subdocument keyed by the field names and reflects via pg_type
     # (``typtype = 'c'``) + pg_attribute.
 
-    def create_composite(self, db: str, name: str, fields: list[tuple[str, str]]) -> None:
+    def create_composite(self, db: str, name: str, fields: list[tuple]) -> None:
         self._storage.delete_matching(db, COMPOSITE_COLLECTION, {"_id": name})
         self._storage.insert(
             db,
             COMPOSITE_COLLECTION,
-            [{"_id": name, "composite": name, "fields": [list(f) for f in fields]}],
+            [{"_id": name, "composite": name, "fields": _ser_composite_fields(fields)}],
         )
 
-    def get_composite(self, db: str, name: str) -> list[tuple[str, str]] | None:
+    def get_composite(self, db: str, name: str) -> list[tuple] | None:
         docs = self._storage.find_matching(db, COMPOSITE_COLLECTION, {"_id": name}, limit=1)
         if not docs:
             return None
-        return [tuple(f) for f in docs[0]["fields"]]
+        return list(_deser_composite_fields(docs[0]["fields"]) or ())
 
     def composite_exists(self, db: str, name: str) -> bool:
         return self.get_composite(db, name) is not None
