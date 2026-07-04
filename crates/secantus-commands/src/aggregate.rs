@@ -13,10 +13,15 @@
 //! 3. Split the result into `firstBatch` + a cursor (`cursor.batchSize`).
 //!
 //! **Storage-backed stages handled at this layer** (the core engine is
-//! storage-free): `$lookup` (simple + `let`/`pipeline` forms), `$sample`,
-//! `$collStats`, `$indexStats`, `$out`, `$merge`. A `run_segmented` flushes the
-//! buffered run of storage-free stages through `apply_pipeline`, then applies the
-//! storage-backed stage, repeating.
+//! storage-free): `$lookup` (simple + `let`/`pipeline` forms), `$graphLookup`
+//! (recursive BFS over a foreign collection — `maxDepth` / `depthField` /
+//! `restrictSearchWithMatch`), `$sample`, `$collStats`, `$indexStats`,
+//! `$unionWith`, `$out`, `$merge` (including the pipeline-form `whenMatched` with
+//! `$$new` bound, and non-`_id` `on`-field unique-index validation). A
+//! `run_segmented` flushes the buffered run of storage-free stages through
+//! `apply_pipeline`, then applies the storage-backed stage, repeating — and
+//! `$facet` sub-pipelines run through `run_segmented` too, so a storage-backed
+//! stage (`$lookup` / `$graphLookup`) nested inside a `$facet` works.
 //!
 //! **Source stages** (`$currentOp` / `$listLocalSessions` / `$listSessions`)
 //! also run here: they ignore their input and emit a single synthetic "op" row
@@ -33,15 +38,13 @@
 //! COLLSCAN — the stage is kept and re-applies the exact distance filter, so the
 //! output is identical; only the fetched set shrinks. Mirrors the Python lift.
 //!
-//! **Deferred (documented so parity is honest):**
-//! * **`$graphLookup`** — recursive BFS traversal of a foreign collection
-//!   (`maxDepth` / `depthField` / `restrictSearchWithMatch`).
-//! * **`$lookup` inside `$facet`** — `$facet` sub-pipelines run inside the
-//!   storage-free core, so a storage-backed stage nested in a facet still
-//!   Fallbacks. **`$merge` pipeline-form `whenMatched`** and **`on`-field
-//!   unique-index validation** are also deferred.
-//! * **`$changeStream`** — handled separately (`changestream::open_change_stream`);
-//!   the standalone-rejection (40573) is honoured here.
+//! `$changeStream` is handled separately (`changestream::open_change_stream`);
+//! the standalone-rejection (40573) is honoured here.
+//!
+//! **Perf follow-up (correctness is already there):** `$lookup` materialises the
+//! whole foreign collection and hash-joins in Rust rather than driving a
+//! per-outer-doc index probe the way the Python `Storage.find_matching` path does
+//! — same results, an index-acceleration opportunity (see `tasks/backlog.md`).
 //!
 //! **`collation`** is threaded through `$match` / `$sort` (the storage-free core)
 //! and the lifted-`$match` fetch (COLLSCAN-forced); a collation the engine can't

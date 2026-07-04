@@ -487,6 +487,17 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   bound to the incoming doc) plus **`on`-field unique-index validation** (a
   non-`_id` `on` requires a matching unique index on the target, else code
   51183). The command-layer storage-backed aggregate surface is now complete.
+- [ ] **Rust `$lookup` index acceleration (perf, output-identical).** The Rust
+  `apply_lookup` (`secantus-commands`) materialises the *whole* foreign collection
+  once and hash-joins in Rust — correctness-identical to the Python server, but it
+  ignores any index on `foreignField`. The Python `_stage_lookup` instead drives a
+  per-outer-doc `Storage.find_matching` whenever the foreign collection has an
+  index whose leading field is `foreignField` (single-field / compound-prefix /
+  multikey all light up at IXSCAN), falling back to the O(N+M) hash-join
+  otherwise. Mirror that in Rust: when such an index exists, probe it per outer
+  doc via the storage query path instead of scanning; output (the `as` array
+  contents + order) must stay identical to the hash-join. Same shape as the
+  `$geoNear` index optimization just shipped.
 - [x] **`distinct` + DDL/introspection** — `distinct`, `create`, `drop`,
   `listCollections`, `listIndexes`, `createIndexes`, `dropIndexes` (the `Storage`
   trait gained the list/DDL methods; the R4b adapter forwards them).
