@@ -13,7 +13,7 @@ from typing import Any
 
 import bson
 
-from secantus.paths import get_path
+from secantus.paths import get_path, has_path
 from secantus.sql import errors, planner, typemap
 from secantus.sql.catalog import Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
@@ -635,7 +635,12 @@ def enforce_update_images(
         _validate_write_row(post, table, ctx)
     _validate_enum_columns(post_images, table, catalog, db)
     _validate_unique_rows(
-        post_images, table, storage, db, exclude_ids=frozenset(matched_ids), session=session
+        post_images,
+        table,
+        storage,
+        db,
+        exclude_ids=frozenset(_hashable_id(i) for i in matched_ids),
+        session=session,
     )
     _validate_fk_child_rows(post_images, table, storage, db, catalog, session)
 
@@ -648,6 +653,17 @@ def enforce_parent_delete(
     if catalog is None or getattr(table, "reflected", False):
         return
     _enforce_fk_on_parent_delete(victims, table, storage, db, catalog)
+
+
+def _hashable_id(value: Any) -> Any:
+    """A hashable key for an ``_id`` value. A composite PK's ``_id`` is a
+    subdocument (dict) — unhashable — so canonicalize it to a sorted tuple of
+    items; a scalar ``_id`` passes through."""
+    if isinstance(value, dict):
+        return tuple(sorted((k, _hashable_id(v)) for k, v in value.items()))
+    if isinstance(value, list):
+        return tuple(_hashable_id(v) for v in value)
+    return value
 
 
 def _uq_violation(uq: Any) -> errors.SQLError:
@@ -699,7 +715,7 @@ def _validate_unique_rows(
             if not violated:
                 probe = dict(zip(fields, key, strict=True))
                 for existing in storage.find_matching(db, table.collection, probe):
-                    if existing.get("_id") not in exclude_ids:
+                    if _hashable_id(existing.get("_id")) not in exclude_ids:
                         violated = True
                         break
             if violated:
@@ -765,9 +781,13 @@ def _find_conflict(
     """The existing row that ``doc`` would conflict with on the conflict target,
     or None. A row with any target field unset can't collide (a fresh PK is
     unique), so it short-circuits to an insert."""
-    if not oc.conflict_fields or any(f not in doc for f in oc.conflict_fields):
+    # A composite-PK conflict field is a dotted path (``_id.a``) into the ``_id``
+    # subdocument, so probe with has_path / get_path, not flat dict access.
+    if not oc.conflict_fields or any(not has_path(doc, f) for f in oc.conflict_fields):
         return None
-    found = storage.find_matching(db, coll, {f: doc[f] for f in oc.conflict_fields}, limit=1)
+    found = storage.find_matching(
+        db, coll, {f: get_path(doc, f) for f in oc.conflict_fields}, limit=1
+    )
     return found[0] if found else None
 
 
@@ -792,7 +812,7 @@ def _apply_conflict_update(
         field = table.field_for(node.name)
         tbl = (node.table or "").lower()
         source = excluded if tbl == "excluded" else existing
-        return source.get(field)
+        return get_path(source, field)  # field may be a dotted composite-PK path
 
     if oc.where is not None and not scalar._truthy(scalar.evaluate(oc.where, scope, sctx)):
         return None
@@ -1257,7 +1277,7 @@ def _fk_ref_columns(fk: Any, parent: Any) -> list[str]:
     reference had no column list (``REFERENCES t``), the parent's PRIMARY KEY."""
     if fk.ref_columns:
         return list(fk.ref_columns)
-    return [parent.pk_column.name] if parent is not None and parent.pk_column else []
+    return [c.name for c in parent.pk_columns] if parent is not None else []
 
 
 def _parent_probe(fk: Any, parent: Any, values: list[Any]) -> dict[str, Any]:

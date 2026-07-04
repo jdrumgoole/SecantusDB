@@ -598,10 +598,16 @@ def _merge_apply_not_matched(
     values = then.expression.expressions if then.expression is not None else []
     if len(values) != len(cols):
         raise errors.SQLError("42601", "MERGE INSERT has mismatched column and value counts")
+    from secantus.paths import set_path
+
     doc: dict[str, Any] = {}
     for col, vexpr in zip(cols, values, strict=True):
-        doc[target.field_for(col)] = typemap.coerce(
-            scalar.evaluate(vexpr, scope, sctx), target.type_for(col)
+        # A composite-PK column's field is a dotted ``_id.<name>`` path — set_path
+        # builds the ``_id`` subdocument instead of a flat ``_id.a`` key.
+        set_path(
+            doc,
+            target.field_for(col),
+            typemap.coerce(scalar.evaluate(vexpr, scope, sctx), target.type_for(col)),
         )
     doc.setdefault("_id", bson.ObjectId())
     executor.enforce_insert_rows([doc], target, storage, db, sctx.catalog, sctx.session)

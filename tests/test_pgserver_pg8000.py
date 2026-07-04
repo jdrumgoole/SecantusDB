@@ -1419,6 +1419,37 @@ def test_array_subscript_via_driver(server):
     conn.close()
 
 
+def test_composite_primary_key_via_driver(server):
+    # A composite PK round-trips through the real driver, enforces uniqueness on
+    # the (a, b) pair, and reflects both columns via SQLAlchemy's inspector.
+    sa = pytest.importorskip("sqlalchemy")
+    conn = connect(server)
+    conn.autocommit = True  # commit DDL so a separate SQLAlchemy connection sees it
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (a bigint, b text, n int, PRIMARY KEY (a, b))")
+    cur.execute("INSERT INTO t (a, b, n) VALUES (1, 'x', 10), (1, 'y', 20), (2, 'z', 30)")
+    cur.execute("SELECT a, b, n FROM t ORDER BY a, b")
+    assert cur.fetchall() == ([1, "x", 10], [1, "y", 20], [2, "z", 30])
+    cur.execute("SELECT n FROM t WHERE a = 1 AND b = 'y'")
+    assert cur.fetchall() == ([20],)
+
+    # Duplicate composite key is rejected.
+    try:
+        cur.execute("INSERT INTO t (a, b, n) VALUES (1, 'x', 99)")
+        raise AssertionError("expected a unique-violation error")
+    except Exception as exc:  # pg8000 surfaces the SQLSTATE in the message
+        assert "23505" in str(exc) or "duplicate" in str(exc).lower()
+    conn.close()
+
+    # SQLAlchemy reflects both PK columns, in order.
+    host, port = server.address
+    engine = sa.create_engine(f"postgresql+pg8000://joe@{host}:{port}/db")
+    insp = sa.inspect(engine)
+    pk = insp.get_pk_constraint("t")
+    assert pk["constrained_columns"] == ["a", "b"]
+    engine.dispose()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address
