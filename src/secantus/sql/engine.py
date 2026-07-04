@@ -994,6 +994,10 @@ def _run_statement(
             return _alter_sequence_command(stmt, db, catalog)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("TYPE"):
             return _alter_type_command(stmt, db, catalog)
+        if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
+            return _create_domain_command(stmt, db, catalog)
+        if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
+            return _drop_domain_command(stmt, db, catalog)
         if verb == "SET" and _command_text(stmt).lstrip().upper().startswith("CONSTRAINTS"):
             return _set_constraints_command(stmt, storage, db, catalog, session)
         if verb in ("CREATE", "DROP", "ALTER") and _command_text(stmt).lstrip().upper().startswith(
@@ -1479,6 +1483,95 @@ def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     if not catalog.drop_enum(db, name) and not stmt.args.get("exists"):
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     return SQLResult(command_tag="DROP TYPE")
+
+
+# ``CREATE DOMAIN name [AS] base_type [DEFAULT expr] [ [CONSTRAINT c] { NOT NULL |
+# NULL | CHECK (expr) } … ]`` — sqlglot doesn't model the grammar, so it arrives
+# as a Command. The base type + constraints are re-parsed as a column definition
+# (``CREATE TABLE _ (value <body>)``) which reuses sqlglot's column-constraint
+# grammar for CHECK / NOT NULL / DEFAULT.
+_CREATE_DOMAIN_RE = re.compile(
+    r'(?is)^\s*DOMAIN\s+(?:IF\s+NOT\s+EXISTS\s+)?("[^"]+"|[\w.]+)\s+(?:AS\s+)?(.*?)\s*;?\s*$'
+)
+_DROP_DOMAIN_RE = re.compile(
+    r'(?is)^\s*DOMAIN\s+(IF\s+EXISTS\s+)?("[^"]+"|[\w.]+)'
+    r"(?:\s*,\s*(?:\"[^\"]+\"|[\w.]+))*\s*(?:CASCADE|RESTRICT)?\s*;?\s*$"
+)
+
+
+def _create_domain_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    m = _CREATE_DOMAIN_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported CREATE DOMAIN: {stmt.sql()}")
+    name = _unquote_ident(m.group(1))
+    if catalog.domain_exists(db, name) or catalog.enum_exists(db, name):
+        raise errors.SQLError("42710", f'type "{name}" already exists')
+    coldef = _parse_domain_body(name, m.group(2))
+    kind = coldef.args["kind"]
+    base_tag = typemap.type_tag_for_sql(kind)
+    if base_tag is None:
+        # An unrecognised bare identifier reads as an undefined type (42704);
+        # a known-but-unmapped type (e.g. a range) is unsupported (0A000).
+        if isinstance(kind, exp.DataType) and kind.this and kind.this.name == "USERDEFINED":
+            raise errors.SQLError("42704", f'type "{kind.sql(dialect="postgres")}" does not exist')
+        raise errors.feature_not_supported(
+            f'unsupported base type for domain "{name}": {kind.sql()}'
+        )
+    not_null = False
+    checks: list[dict[str, str]] = []
+    has_default, default = False, None
+    for con in coldef.args.get("constraints") or []:
+        kind = con.kind
+        if isinstance(kind, exp.NotNullColumnConstraint) and not kind.args.get("allow_null"):
+            not_null = True
+        elif isinstance(kind, exp.CheckColumnConstraint):
+            cname = con.args.get("this")
+            checks.append(
+                {
+                    "name": (cname.name if cname is not None else f"{name}_check"),
+                    "expression": kind.this.sql(dialect="postgres"),
+                }
+            )
+        elif isinstance(kind, exp.DefaultColumnConstraint):
+            has_default, default = planner._literal_default(kind.this, base_tag)
+    catalog.create_domain(
+        db,
+        name,
+        base_tag,
+        not_null=not_null,
+        checks=checks,
+        has_default=has_default,
+        default=default,
+    )
+    return SQLResult(command_tag="CREATE DOMAIN")
+
+
+def _parse_domain_body(name: str, body: str) -> exp.ColumnDef:
+    """Re-parse a domain's ``base_type [constraints…]`` tail as a column
+    definition, reusing sqlglot's column-constraint grammar (CHECK / NOT NULL /
+    DEFAULT). The ``VALUE`` keyword in a domain CHECK becomes a column reference."""
+    try:
+        tbl = sqlglot.parse_one(f"CREATE TABLE _d (value {body})", read="postgres")
+        coldef = tbl.this.expressions[0]
+    except Exception as exc:  # noqa: BLE001 — surface a clean SQL error
+        raise errors.feature_not_supported(
+            f'could not parse domain "{name}" definition: {body}'
+        ) from exc
+    if not isinstance(coldef, exp.ColumnDef):
+        raise errors.feature_not_supported(f'could not parse domain "{name}" definition: {body}')
+    return coldef
+
+
+def _drop_domain_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    text = _command_text(stmt)
+    m = _DROP_DOMAIN_RE.match(text)
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported DROP DOMAIN: {stmt.sql()}")
+    if_exists = m.group(1) is not None
+    name = _unquote_ident(m.group(2))
+    if not catalog.drop_domain(db, name) and not if_exists:
+        raise errors.SQLError("42704", f'type "{name}" does not exist')
+    return SQLResult(command_tag="DROP DOMAIN")
 
 
 # ``ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']``

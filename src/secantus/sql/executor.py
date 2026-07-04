@@ -73,6 +73,33 @@ def _order_key_fn(
     return key_of
 
 
+def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
+    """Resolve a column whose declared type is a user-defined name. The planner
+    tags any unknown type as ``enum_type`` (it can't reach storage); here we
+    disambiguate: a declared enum keeps that tag, a declared domain is rewritten
+    to ``domain_type`` with the domain's base type tag (inheriting the domain's
+    DEFAULT when the column has none), and anything else is 42704."""
+    import dataclasses
+
+    if col.enum_type is None:
+        return col
+    name = col.enum_type
+    if catalog.enum_exists(db, name):
+        return col
+    domain = catalog.get_domain(db, name)
+    if domain is None:
+        raise errors.SQLError("42704", f'type "{name}" does not exist')
+    inherit_default = not col.has_default and bool(domain.get("has_default"))
+    return dataclasses.replace(
+        col,
+        enum_type=None,
+        domain_type=name,
+        type_tag=domain["base_tag"],
+        has_default=col.has_default or inherit_default,
+        default=domain.get("default") if inherit_default else col.default,
+    )
+
+
 def execute_create_table(
     plan: planner.CreateTablePlan, catalog: Catalog, storage: Any, db: str
 ) -> SQLResult:
@@ -80,10 +107,11 @@ def execute_create_table(
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE TABLE")
         raise errors.duplicate_table(plan.table.name)
-    # An enum-typed column must reference a declared enum type (else 42704).
-    for col in plan.table.columns:
-        if col.enum_type is not None and not catalog.enum_exists(db, col.enum_type):
-            raise errors.SQLError("42704", f'type "{col.enum_type}" does not exist')
+    # A user-defined column type (the planner records it as ``enum_type``, since
+    # it can't reach storage to tell enum from domain) must resolve to a declared
+    # enum *or* domain — else 42704. A domain column adopts the domain's base tag
+    # and inherits its DEFAULT when the column declares none.
+    plan.table.columns = [_resolve_user_type_column(col, catalog, db) for col in plan.table.columns]
     catalog.put(db, plan.table)
     storage.create_collection(db, plan.table.collection)
     # Auto-create the sequence behind each SERIAL column (owned by the table).
@@ -577,6 +605,52 @@ def _validate_enum_columns(docs: list[dict[str, Any]], table: Any, catalog: Any,
                 )
 
 
+def _validate_domain_columns(
+    docs: list[dict[str, Any]], table: Any, storage: Any, db: str, session: Any, catalog: Any
+) -> None:
+    """Every domain-typed column value must satisfy the domain's NOT NULL and
+    CHECK constraints. NOT NULL → ``23502`` (``domain <name> does not allow null
+    values``, matching Postgres' not_null_violation); a CHECK evaluating to FALSE
+    → ``23514`` (NULL passes, matching Postgres' three-valued CHECK semantics). The
+    CHECK expression references the value via the ``VALUE`` keyword."""
+    from secantus.sql import scalar
+
+    if catalog is None or getattr(table, "reflected", False):
+        return
+    domain_cols = [c for c in table.columns if c.domain_type is not None]
+    if not domain_cols:
+        return
+    cache: dict[str, dict[str, Any] | None] = {}
+    for col in domain_cols:
+        if col.domain_type not in cache:
+            cache[col.domain_type] = catalog.get_domain(db, col.domain_type)
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    for doc in docs:
+        for col in domain_cols:
+            domain = cache[col.domain_type]
+            if domain is None:
+                continue
+            value = get_path(doc, col.field)
+            if value is None:
+                if domain.get("not_null"):
+                    raise errors.SQLError(
+                        "23502", f"domain {col.domain_type} does not allow null values"
+                    )
+                continue
+            for check in domain.get("checks") or []:
+
+                def scope(node: Any, _v: Any = value) -> Any:
+                    return _v if node.name.lower() == "value" else None
+
+                result = scalar.evaluate(_parse_check_expr(check["expression"]), scope, ctx)
+                if result is not None and not scalar._truthy(result):
+                    raise errors.SQLError(
+                        "23514",
+                        f"value for domain {col.domain_type} violates check "
+                        f'constraint "{check["name"]}"',
+                    )
+
+
 def _apply_generated_columns(docs: list[dict[str, Any]], table: Any, ctx: Any) -> None:
     """Compute each ``GENERATED ALWAYS AS (expr) STORED`` column from the row's
     other columns and store the result (runs before validation so NOT NULL / CHECK
@@ -610,6 +684,7 @@ def enforce_insert_rows(
     )
     _validate_rows(docs, table, storage, db, session, catalog)
     _validate_enum_columns(docs, table, catalog, db)
+    _validate_domain_columns(docs, table, storage, db, session, catalog)
     _validate_unique_rows(docs, table, storage, db, session=session)
     _validate_fk_child_rows(docs, table, storage, db, catalog, session)
 
@@ -634,6 +709,7 @@ def enforce_update_images(
     for post in post_images:
         _validate_write_row(post, table, ctx)
     _validate_enum_columns(post_images, table, catalog, db)
+    _validate_domain_columns(post_images, table, storage, db, session, catalog)
     _validate_unique_rows(
         post_images,
         table,
@@ -1243,6 +1319,7 @@ def _validate_update_post_images(
         or table.foreign_keys
         or _has_not_null(table)
         or any(c.enum_type for c in table.columns)
+        or any(c.domain_type for c in table.columns)
         or any(c.generated for c in table.columns)
         or (catalog is not None and _referencing_fks(catalog, db, table.name))
     )
@@ -1255,6 +1332,7 @@ def _validate_update_post_images(
     for post in post_images:
         _validate_write_row(post, table, ctx)
     _validate_enum_columns(post_images, table, catalog, db)
+    _validate_domain_columns(post_images, table, storage, db, session, catalog)
     _validate_unique_rows(
         post_images,
         table,

@@ -355,6 +355,49 @@ forms (e.g. `RENAME VALUE`) raise `0A000`. Enum-aware ordering applies everywher
 an enum column is an `ORDER BY` key — single-table, `GROUP BY`, `DISTINCT`, JOIN,
 JOIN + GROUP BY, and the evaluated (computed-column) path.
 
+### Domain types (`CREATE DOMAIN`)
+
+A domain is a named base type carrying its own constraints. A column declared with
+a domain type stores as the domain's **base type** and enforces the domain's
+`NOT NULL` and `CHECK` constraints on every write (`INSERT` / `UPDATE` / upsert /
+`MERGE`). The `CHECK` predicate refers to the value under test as `VALUE`:
+
+```sql
+CREATE DOMAIN posint   AS integer CHECK (VALUE > 0);
+CREATE DOMAIN nonblank AS text NOT NULL CHECK (length(VALUE) > 0);
+CREATE DOMAIN email    AS varchar(255) CONSTRAINT email_chk CHECK (VALUE LIKE '%@%');
+
+CREATE TABLE parts (id int PRIMARY KEY, qty posint, label nonblank, contact email);
+
+INSERT INTO parts VALUES (1, 5, 'bolt', 'a@b.com');   -- OK
+INSERT INTO parts VALUES (2, -1, 'nut',  'a@b.com');  -- error 23514 (CHECK)
+INSERT INTO parts VALUES (3, 5,  NULL,   'a@b.com');  -- error 23502 (domain NOT NULL)
+```
+
+A `CHECK` that fails raises `23514`; a `NULL` into a `NOT NULL` domain raises
+`23502` (`domain <name> does not allow null values`). A domain `CHECK` is *not*
+evaluated for a `NULL` value (Postgres' three-valued logic), so a domain without
+`NOT NULL` accepts `NULL`. A domain may carry a `DEFAULT`, which a column of that
+type inherits when it declares no default of its own:
+
+```sql
+CREATE DOMAIN score AS int DEFAULT 100 CHECK (VALUE >= 0);
+CREATE TABLE game (id int PRIMARY KEY, s score);
+INSERT INTO game (id) VALUES (1);          -- s defaults to 100
+```
+
+Domains reflect through `pg_catalog.pg_type` (`typtype = 'd'`, `typbasetype`
+pointing at the base type's oid, `typnotnull` set for a `NOT NULL` domain); a
+domain column's `pg_attribute.atttypid` points at the domain's oid, and each
+domain `CHECK` is a `pg_constraint` row (`contype = 'c'` with `contypid` = the
+domain oid) — so SQLAlchemy and `psql`'s `\dD` reflect them. `DROP DOMAIN [IF
+EXISTS] name` removes one; a missing domain raises `42704` (silenced by
+`IF EXISTS`). A domain name that clashes with an existing type raises `42710`, and
+a domain built on an unknown base type raises `42704`. The `CHECK` predicate is
+evaluated by the scalar engine, so it supports the same operators as a table
+`CHECK` (comparisons, `LIKE`, `length()`, arithmetic; the `~` regex-match operator
+is not yet supported → `0A000`).
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

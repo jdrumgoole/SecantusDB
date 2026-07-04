@@ -682,14 +682,16 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
     tools (and ``\\d``-style queries) read. attrelid lines up with pg_class.oid."""
     oids = _table_oids(db, catalog)
     enum_oids = _enum_oids(db, catalog)
+    domain_oids = _domain_oids(db, catalog)
     rows: list[dict] = []
     for t in _user_tables(db, catalog):
         for i, col in enumerate(t.columns, start=1):
-            typoid = (
-                enum_oids.get(col.enum_type, 25)
-                if col.enum_type is not None
-                else typemap.PG_OID.get(col.type_tag, 25)
-            )
+            if col.domain_type is not None:
+                typoid = domain_oids.get(col.domain_type, 25)
+            elif col.enum_type is not None:
+                typoid = enum_oids.get(col.enum_type, 25)
+            else:
+                typoid = typemap.PG_OID.get(col.type_tag, 25)
             rows.append(
                 {
                     "attrelid": oids[t.name],
@@ -824,6 +826,15 @@ def _enum_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return {name: _ENUM_OID_BASE + i for i, name in enumerate(names)}
 
 
+_DOMAIN_OID_BASE = 66000
+
+
+def _domain_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    lister = getattr(catalog, "list_domains", None)
+    names = lister(db) if lister is not None else []
+    return {name: _DOMAIN_OID_BASE + i for i, name in enumerate(names)}
+
+
 def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     rows = [
         {
@@ -852,6 +863,26 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typnotnull": False,
                 "typdefault": None,
                 "typtype": "e",
+            }
+        )
+    # User-declared domain types (typtype 'd') carry their base type's oid in
+    # typbasetype and the domain's NOT NULL in typnotnull.
+    getter = getattr(catalog, "get_domain", None)
+    for name, oid in _domain_oids(db, catalog).items():
+        domain = getter(db, name) if getter is not None else None
+        base_tag = domain.get("base_tag") if domain else None
+        default = domain.get("default") if domain else None
+        rows.append(
+            {
+                "oid": oid,
+                "typname": name,
+                "typcollation": 0,
+                "typnamespace": _NS_OIDS["public"],
+                "typbasetype": typemap.PG_OID.get(base_tag or "", 25),
+                "typtypmod": -1,
+                "typnotnull": bool(domain.get("not_null")) if domain else False,
+                "typdefault": None if default is None else str(default),
+                "typtype": "d",
             }
         )
     return rows
@@ -931,6 +962,28 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "confkey": None,
             }
         )
+    # Domain CHECK constraints (contype 'c', keyed to the domain via contypid).
+    getter = getattr(catalog, "get_domain", None)
+    doid = 33000
+    for name, type_oid in _domain_oids(db, catalog).items():
+        domain = getter(db, name) if getter is not None else None
+        for check in (domain or {}).get("checks") or []:
+            rows.append(
+                {
+                    "oid": doid,
+                    "conname": check["name"],
+                    "conrelid": 0,
+                    "confrelid": 0,
+                    "conindid": 0,
+                    "contype": "c",
+                    "contypid": type_oid,
+                    "condeferrable": False,
+                    "condeferred": False,
+                    "conkey": None,
+                    "confkey": None,
+                }
+            )
+            doid += 1
     return rows
 
 

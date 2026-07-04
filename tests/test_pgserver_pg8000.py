@@ -886,6 +886,38 @@ def test_session_functions(server):
     conn.close()
 
 
+def test_create_domain_via_driver(server):
+    # CREATE DOMAIN + a domain-typed column enforced + reflected, on the wire.
+    conn = connect(server)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("CREATE DOMAIN posint AS integer CHECK (VALUE > 0)")
+    cur.execute("CREATE DOMAIN nonblank AS text NOT NULL CHECK (length(VALUE) > 0)")
+    cur.execute("CREATE TABLE parts (id int primary key, qty posint, label nonblank)")
+    cur.execute("INSERT INTO parts VALUES (1, 5, 'bolt')")
+    cur.execute("SELECT id, qty, label FROM parts")
+    assert cur.fetchall() == ([1, 5, "bolt"],)
+
+    # CHECK violation surfaces as an error over the wire.
+    with pytest.raises(pg8000.DatabaseError):
+        cur.execute("INSERT INTO parts VALUES (2, -1, 'nut')")
+    # NOT NULL domain violation likewise.
+    with pytest.raises(pg8000.DatabaseError):
+        cur.execute("INSERT INTO parts VALUES (3, 5, NULL)")
+
+    # Reflection: the domain is a pg_type row with typtype 'd', and the column's
+    # atttypid points at it.
+    cur.execute(
+        "SELECT a.attname, ty.typname, ty.typtype "
+        "FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+        "JOIN pg_catalog.pg_type ty ON a.atttypid = ty.oid "
+        "WHERE c.relname = 'parts' AND ty.typtype = 'd' ORDER BY a.attname"
+    )
+    assert cur.fetchall() == (["label", "nonblank", "d"], ["qty", "posint", "d"])
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

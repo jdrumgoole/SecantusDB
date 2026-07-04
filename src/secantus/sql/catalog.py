@@ -25,6 +25,7 @@ MATVIEW_COLLECTION = "__sql_matviews__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
 ROLE_COLLECTION = "__sql_roles__"
 ENUM_COLLECTION = "__sql_enums__"
+DOMAIN_COLLECTION = "__sql_domains__"
 
 
 class _StorageLike(Protocol):
@@ -65,6 +66,11 @@ class Column:
     # type. Stored as ``text`` (``type_tag``) but validated against the enum's
     # labels on write and reflected with the enum's type oid.
     enum_type: str | None = None
+    # The domain type name for a column declared with a ``CREATE DOMAIN`` type.
+    # ``type_tag`` holds the domain's base type; the domain's NOT NULL / CHECK
+    # constraints are enforced on write and it reflects with the domain's type oid
+    # (pg_type ``typtype = 'd'``).
+    domain_type: str | None = None
     # The rendered SQL expression of a ``GENERATED ALWAYS AS (expr) STORED``
     # column. Computed from the row's other columns on every write; a user value
     # can't be supplied. Reflected as ``attgenerated = 's'``.
@@ -181,6 +187,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "sequence": c.sequence,
                 "identity": c.identity,
                 "enum_type": c.enum_type,
+                "domain_type": c.domain_type,
                 "generated": c.generated,
             }
             for c in table.columns
@@ -231,6 +238,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 sequence=c.get("sequence"),
                 identity=c.get("identity"),
                 enum_type=c.get("enum_type"),
+                domain_type=c.get("domain_type"),
                 generated=c.get("generated"),
             )
             for c in doc["columns"]
@@ -543,6 +551,54 @@ class Catalog:
     def list_enums(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ENUM_COLLECTION, {})
         return sorted(d["enum"] for d in docs)
+
+    # -- domain types ------------------------------------------------------- #
+    # ``CREATE DOMAIN name AS base [DEFAULT expr] [NOT NULL] [CHECK (...)]`` — a
+    # named base type carrying its own constraints. A domain-typed column stores
+    # as the base tag, enforces the domain's NOT NULL / CHECK on write, and
+    # reflects via pg_type (``typtype = 'd'``).
+
+    def create_domain(
+        self,
+        db: str,
+        name: str,
+        base_tag: str,
+        *,
+        not_null: bool = False,
+        checks: list[dict[str, Any]] | None = None,
+        has_default: bool = False,
+        default: Any = None,
+    ) -> None:
+        self._storage.delete_matching(db, DOMAIN_COLLECTION, {"_id": name})
+        self._storage.insert(
+            db,
+            DOMAIN_COLLECTION,
+            [
+                {
+                    "_id": name,
+                    "domain": name,
+                    "base_tag": base_tag,
+                    "not_null": bool(not_null),
+                    "checks": list(checks or []),
+                    "has_default": bool(has_default),
+                    "default": default,
+                }
+            ],
+        )
+
+    def get_domain(self, db: str, name: str) -> dict[str, Any] | None:
+        docs = self._storage.find_matching(db, DOMAIN_COLLECTION, {"_id": name}, limit=1)
+        return docs[0] if docs else None
+
+    def domain_exists(self, db: str, name: str) -> bool:
+        return self.get_domain(db, name) is not None
+
+    def drop_domain(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, DOMAIN_COLLECTION, {"_id": name}) > 0
+
+    def list_domains(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, DOMAIN_COLLECTION, {})
+        return sorted(d["domain"] for d in docs)
 
     def alter_sequence(self, db: str, name: str, changes: dict[str, Any]) -> None:
         """Apply ``ALTER SEQUENCE`` changes. ``changes`` may set ``increment`` /
