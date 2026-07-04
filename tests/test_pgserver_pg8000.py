@@ -1029,6 +1029,24 @@ def test_composite_type_via_driver(server):
     conn.close()
 
 
+def test_datetime_funcs_via_driver(server):
+    # extract / date_trunc / to_char / interval arithmetic typed over the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE ev (id int primary key, at timestamptz)")
+    cur.execute("INSERT INTO ev VALUES (1, '2021-03-15T14:30:45+00:00')")
+    cur.execute(
+        "SELECT extract(year FROM at), date_trunc('month', at), "
+        "to_char(at, 'YYYY-MM-DD'), at + interval '1 day' FROM ev"
+    )
+    row = cur.fetchone()
+    assert row[0] == 2021  # extract -> numeric, decoded as a number
+    assert row[1] == _dt.datetime(2021, 3, 1, tzinfo=_dt.timezone.utc)  # date_trunc
+    assert row[2] == "2021-03-15"  # to_char -> text
+    assert row[3] == _dt.datetime(2021, 3, 16, 14, 30, 45, tzinfo=_dt.timezone.utc)
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

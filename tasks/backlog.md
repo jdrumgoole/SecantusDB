@@ -1462,6 +1462,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   SET` target (the Mongo-filter translation doesn't lower `(col).field`); no nested composites; and
   `pg_attribute`-level reflection of a composite type's fields (needs a `pg_class` `relkind='c'` row +
   `typrelid`) is not implemented, so `psql \dT+` won't list the fields.
+- [ ] **Date/time scalar functions landed** (b132): `extract(field FROM ts)` / `date_part('field', ts)`
+  (year/month/day/hour/minute/second/quarter/dow[Sun=0]/isodow[Mon=1]/doy/week/epoch → numeric),
+  `date_trunc('unit', ts)` (year/quarter/month/week[→Monday]/day/hour/minute/second → timestamptz),
+  `to_char(ts, fmt)` (text), interval arithmetic `ts ± interval '…'`, and `now()` / `current_timestamp`
+  / `current_date` — all in `scalar.py`. Intervals lower to an `_Interval` (calendar `months` +
+  fixed `timedelta`) whose `__radd__`/`__rsub__` apply calendar-aware month/year math with day
+  clamping (Jan 31 + 1 month → Feb 28); `_eval_interval` handles both `(value, unit)` and compound
+  string forms (`'1 year 2 months 3 days'`). `to_char` relies on sqlglot pre-normalising the standard
+  tokens to strftime directives, then maps the leftover word tokens (`Mon`/`Month`/`Dy`/`Day`/`AM`/`PM`)
+  and strftimes once. Typed in `planner._infer_scalar_tag` (Extract → numeric, TimestampTrunc /
+  Current* → timestamptz, TimeToStr → text, `ts ± interval` inherits the timestamp's tag). **Limitations:**
+  `age()` (returns an interval *value* — we don't model an interval type) is not implemented;
+  `to_char` full weekday names (`Day`/`Dy`) mis-render because sqlglot greedily eats the leading `D`
+  during normalisation; date/time functions in a `WHERE` predicate go through COLLSCAN + the scalar
+  path (not lowered to a Mongo filter), same as other computed predicates.
 - [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
   `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
   `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`
