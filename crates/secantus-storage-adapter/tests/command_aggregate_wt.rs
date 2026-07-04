@@ -103,15 +103,17 @@ fn aggregate_sort_then_limit() {
 }
 
 #[test]
-fn aggregate_unsupported_stage_is_bad_value() {
+fn aggregate_unrecognized_stage_is_location_40324() {
     with_wt(|c| {
         seed(c, "c", vec![doc! {"_id": 1}]);
         let reply = dispatch(
             &doc! {"aggregate": "c", "pipeline": [{"$notARealStage": {}}], "cursor": {}},
             c,
         );
-        assert_eq!(reply.get_i32("code").unwrap(), 2);
-        assert_eq!(reply.get_str("codeName").unwrap(), "BadValue");
+        // An unrecognized stage name is validated up-front as Location40324
+        // ("Unrecognized pipeline stage name"), matching mongod / the Python server.
+        assert_eq!(reply.get_i32("code").unwrap(), 40324);
+        assert_eq!(reply.get_str("codeName").unwrap(), "Location40324");
     });
 }
 

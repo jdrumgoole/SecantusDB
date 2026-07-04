@@ -37,6 +37,71 @@ _KNOWN_UPDATE_OPS = frozenset(
 )
 
 
+def _is_each_modifier(value: Any) -> bool:
+    """Whether a `$push` / `$addToSet` value is the `{$each: [...], ...}` modifier
+    form (vs a plain value to append)."""
+    return isinstance(value, Mapping) and "$each" in value
+
+
+def _apply_push(arr: list[Any], value: Any) -> list[Any]:
+    """Apply one `$push` to `arr` (a fresh copy). A plain value is appended; the
+    `{$each: [...]}` modifier form appends each element, honouring `$position`
+    (insert index, negative counts from the end), then `$sort` (whole-element
+    `1`/`-1` or a `{field: dir}` doc, in BSON order), then `$slice` (keep the
+    first N for N≥0, the last |N| for N<0, empty for 0) — mongod's modifier order.
+    """
+    if not _is_each_modifier(value):
+        arr.append(value)
+        return arr
+    allowed = {"$each", "$position", "$slice", "$sort"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise UpdateError(f"Unrecognized $push modifier: {next(iter(unknown))!r}")
+    each = value["$each"]
+    if not isinstance(each, list):
+        raise UpdateError("$each must be an array")
+    position = value.get("$position")
+    if position is not None:
+        if not isinstance(position, int) or isinstance(position, bool):
+            raise UpdateError("$position must be an integer")
+        idx = position if position >= 0 else max(len(arr) + position, 0)
+        arr[idx:idx] = each
+    else:
+        arr.extend(each)
+    if "$sort" in value:
+        arr = _push_sort(arr, value["$sort"])
+    if "$slice" in value:
+        arr = _push_slice(arr, value["$slice"])
+    return arr
+
+
+def _push_sort(arr: list[Any], spec: Any) -> list[Any]:
+    """`$push` `$sort`: `1`/`-1` sorts whole elements (BSON order); a `{field: dir}`
+    document sorts (stably, field-by-field) by those paths."""
+    from secantus.storage import _SortKey
+
+    if isinstance(spec, int) and not isinstance(spec, bool):
+        return sorted(arr, key=_SortKey, reverse=(spec == -1))
+    if isinstance(spec, Mapping):
+        result = list(arr)
+        for field, direction in reversed(list(spec.items())):
+            result.sort(
+                key=lambda e, f=field: _SortKey(get_path(e, f) if isinstance(e, Mapping) else e),
+                reverse=(int(direction) == -1),
+            )
+        return result
+    raise UpdateError("$sort requires 1, -1, or a document")
+
+
+def _push_slice(arr: list[Any], n: Any) -> list[Any]:
+    """`$push` `$slice`: keep the first `n` (n≥0), the last `|n|` (n<0), or none."""
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise UpdateError("$slice must be an integer")
+    if n == 0:
+        return []
+    return arr[:n] if n > 0 else arr[n:]
+
+
 def validate_update_doc(update: Any) -> None:
     """Parse-time validation of an update document's top-level operators.
 
@@ -359,22 +424,30 @@ def _apply_op(
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if arr is None:
-                    set_path(doc, concrete, [value])
+                    arr = []
                 elif isinstance(arr, list):
-                    arr.append(value)
+                    arr = list(arr)
                 else:
                     raise UpdateError(f"$push on non-array at {concrete!r}")
+                set_path(doc, concrete, _apply_push(arr, value))
     elif op == "$addToSet":
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if arr is None:
-                    set_path(doc, concrete, [value])
+                    arr = []
                 elif isinstance(arr, list):
-                    if value not in arr:
-                        arr.append(value)
+                    arr = list(arr)
                 else:
                     raise UpdateError(f"$addToSet on non-array at {concrete!r}")
+                # `$each` adds each element (deduped); otherwise the value itself.
+                to_add = value["$each"] if _is_each_modifier(value) else [value]
+                if _is_each_modifier(value) and not isinstance(value["$each"], list):
+                    raise UpdateError("$each must be an array")
+                for elem in to_add:
+                    if elem not in arr:
+                        arr.append(elem)
+                set_path(doc, concrete, arr)
     elif op == "$pull":
         for path, criterion in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):

@@ -5,15 +5,17 @@
 //! pure-Python `apply_update` instead (which also raises the right errors).
 //!
 //! Handled: replacement-style updates, `$set`, `$setOnInsert`, `$unset`,
-//! `$inc`, `$mul`, `$push`, `$pop`, `$rename`, `$bit`, `$min`/`$max` (Python `<`
-//! for numeric / string / date pairs — cross-type defers), `$addToSet` /
+//! `$inc`, `$mul`, `$push` (incl. the `$each` modifier form with `$position` /
+//! `$slice`), `$pop`, `$rename`, `$bit`, `$min`/`$max` (Python `<` for numeric /
+//! string / date pairs — cross-type defers), `$addToSet` (incl. `$each`) /
 //! `$pull` (Python `==` element semantics, incl. bool-as-int and structural
 //! equality via `expressions::py_eq`), plus `_id` immutability.
 //! Deferred to Python: pipeline (array) updates, positional operators
 //! (`$`/`$[]`/`$[id]`) and array filters, `$currentDate` (non-deterministic),
-//! a `$min`/`$max` comparison Python's `<` would raise (cross-type / Decimal128 /
-//! ObjectId / arrays), Decimal128 / non-numeric arithmetic, and every error
-//! condition (so Python raises the exact `UpdateError`).
+//! `$push` `$sort` (BSON-order array sort), a `$min`/`$max` comparison Python's
+//! `<` would raise (cross-type / Decimal128 / ObjectId / arrays), Decimal128 /
+//! non-numeric arithmetic, and every error condition (so Python raises the exact
+//! `UpdateError`).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -290,6 +292,59 @@ fn py_cmp(a: &Bson, b: &Bson) -> Option<Ordering> {
     }
 }
 
+/// Apply one `$push` value to `arr`: a plain value is appended; the `{$each: […]}`
+/// modifier form appends each element, honouring `$position` and `$slice`. Mirrors
+/// the pure `_apply_push`. **`$sort` defers** (Python's BSON-order array sort), as
+/// does a non-integer `$position`/`$slice`, a non-array `$each`, or an unknown
+/// modifier — the pure engine either sorts or raises there.
+fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
+    let m = match value {
+        Bson::Document(d) if d.contains_key("$each") => d,
+        _ => {
+            arr.push(value.clone());
+            return Ok(());
+        }
+    };
+    for k in m.keys() {
+        match k.as_str() {
+            "$each" | "$position" | "$slice" => {}
+            _ => return Err(Fallback), // $sort / unknown modifier -> Python
+        }
+    }
+    let each = match m.get("$each") {
+        Some(Bson::Array(a)) => a,
+        _ => return Err(Fallback),
+    };
+    match m.get("$position") {
+        None => arr.extend(each.iter().cloned()),
+        Some(p) => {
+            let n = as_int_like(p).ok_or(Fallback)?;
+            let idx = if n >= 0 {
+                (n as usize).min(arr.len())
+            } else {
+                (arr.len() as i128 + n).max(0) as usize
+            };
+            for (off, e) in each.iter().enumerate() {
+                arr.insert(idx + off, e.clone());
+            }
+        }
+    }
+    if let Some(s) = m.get("$slice") {
+        let n = as_int_like(s).ok_or(Fallback)?;
+        if n == 0 {
+            arr.clear();
+        } else if n > 0 {
+            arr.truncate(n as usize);
+        } else {
+            let keep = (-n) as usize;
+            if arr.len() > keep {
+                arr.drain(0..arr.len() - keep);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_op(
     result: &mut Document,
     op: &str,
@@ -334,16 +389,13 @@ fn apply_op(
         "$push" => {
             for (path, value) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
-                    match get_path(result, &cpath).cloned() {
-                        None | Some(Bson::Null) => {
-                            set_path(result, &cpath, Bson::Array(vec![value.clone()]))?;
-                        }
-                        Some(Bson::Array(mut a)) => {
-                            a.push(value.clone());
-                            set_path(result, &cpath, Bson::Array(a))?;
-                        }
+                    let mut a = match get_path(result, &cpath).cloned() {
+                        None | Some(Bson::Null) => Vec::new(),
+                        Some(Bson::Array(a)) => a,
                         Some(_) => return Err(Fallback), // $push on non-array -> Python raises
-                    }
+                    };
+                    push_apply(&mut a, value)?;
+                    set_path(result, &cpath, Bson::Array(a))?;
                 }
             }
         }
@@ -451,28 +503,33 @@ fn apply_op(
         }
         "$addToSet" => {
             for (path, value) in payload {
+                // `$each` adds each element (deduped); otherwise the value itself.
+                let items: Vec<Bson> = match value {
+                    Bson::Document(d) if d.contains_key("$each") => match d.get("$each") {
+                        Some(Bson::Array(a)) => a.clone(),
+                        _ => return Err(Fallback), // $each not an array -> Python raises
+                    },
+                    _ => vec![value.clone()],
+                };
                 for cpath in expand_path(result, path, filters, pos)? {
-                    // No `$each` unwrapping — the pure oracle appends the value
-                    // (including a `$each` doc) as a single element; match it.
-                    match get_path(result, &cpath).cloned() {
-                        None | Some(Bson::Null) => {
-                            set_path(result, &cpath, Bson::Array(vec![value.clone()]))?;
-                        }
-                        Some(Bson::Array(mut a)) => {
-                            let mut present = false;
-                            for e in &a {
-                                if expressions::py_eq(e, value).map_err(|_| Fallback)? {
-                                    present = true;
-                                    break;
-                                }
-                            }
-                            if !present {
-                                a.push(value.clone());
-                            }
-                            set_path(result, &cpath, Bson::Array(a))?;
-                        }
+                    let mut a = match get_path(result, &cpath).cloned() {
+                        None | Some(Bson::Null) => Vec::new(),
+                        Some(Bson::Array(a)) => a,
                         Some(_) => return Err(Fallback), // non-array -> Python raises
+                    };
+                    for item in &items {
+                        let mut present = false;
+                        for e in &a {
+                            if expressions::py_eq(e, item).map_err(|_| Fallback)? {
+                                present = true;
+                                break;
+                            }
+                        }
+                        if !present {
+                            a.push(item.clone());
+                        }
                     }
+                    set_path(result, &cpath, Bson::Array(a))?;
                 }
             }
         }

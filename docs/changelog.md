@@ -34,6 +34,30 @@ right exception type. Found by the nightly security review (2026-07-04 §I21).
   raises `PGAuthError` on a truncated header instead of an unpack `ValueError`.
   New unit tests in `tests/test_pgauth.py`.
 
+### `$push` / `$addToSet` honour the `$each` modifier
+
+`$push` and `$addToSet` now unwrap the `$each` modifier and append every element,
+instead of storing the `{$each: […]}` document as a single array element. So
+`{$push: {scores: {$each: [90, 85, 82]}}}` appends three scores, and
+`{$addToSet: {tags: {$each: ["a", "b", "a"]}}}` adds each not-already-present tag —
+matching MongoDB. `$push` also honours the companion modifiers `$position` (insert
+at an index, negative from the end), `$slice` (keep the first N / last |N| / none),
+and `$sort` (order the array — whole elements by `1`/`-1`, or documents by a
+`{field: dir}` spec, in BSON order).
+
+Previously both operators appended the modifier document verbatim — a silent
+data-shape bug for one of the most common update forms. It ships on both the
+Python and Rust servers, pinned by the update parity suite; the Rust engine
+computes `$each` / `$position` / `$slice` natively and defers `$sort` (BSON-order
+array sort) to the Python oracle.
+
+#### Fixed
+
+- `$push` / `$addToSet` `$each` is now unwrapped (multi-element append / add),
+  with `$push` `$position` / `$slice` / `$sort` modifiers, instead of the `$each`
+  document being stored as a single element. Ships on both servers
+  (`update.apply_update` + `secantus-core::update`).
+
 ### Rust server: correct error codes for unrecognized / Atlas aggregation stages
 
 The Rust server now validates aggregation stage names up-front, matching the

@@ -77,6 +77,17 @@ CURATED = [
     ({}, {"$bit": {"b": {"or": 7}}}, False),
     ({}, {"$push": {"tags": "x"}}, False),
     ({"tags": ["x"]}, {"$push": {"tags": "y"}}, False),
+    # $push / $addToSet $each modifiers: multi-append, $position, $slice (compute);
+    # $sort defers to Python.
+    ({"a": [3, 1, 2]}, {"$push": {"a": {"$each": [5, 4]}}}, False),
+    ({}, {"$push": {"a": {"$each": [1, 2, 3]}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$slice": -2}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$slice": 2}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9, 8], "$position": 1}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$position": -1}}}, False),
+    ({"a": [1, 2]}, {"$addToSet": {"a": {"$each": [2, 3, 3, 4]}}}, False),
+    ({}, {"$addToSet": {"a": {"$each": [1, 1, 2]}}}, False),
+    ({"a": [1, 2]}, {"$push": {"a": {"$each": [4, 3], "$sort": 1}}}, False),  # $sort -> defer
     ({"a": [1, 2, 3]}, {"$pop": {"a": 1}}, False),
     ({"a": [1, 2, 3]}, {"$pop": {"a": -1}}, False),
     ({"a": []}, {"$pop": {"a": 1}}, False),
@@ -246,6 +257,17 @@ def _rand_update(rng):
         return {op: {field: ""}}
     if op in ("$inc", "$mul"):
         return {op: {field: rng.choice([rng.randint(-5, 5), round(rng.uniform(-3, 3), 2)])}}
+    if op in ("$push", "$addToSet") and rng.random() < 0.4:
+        # $each modifier form (with occasional $position / $slice / $sort).
+        val = {"$each": [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]}
+        if op == "$push":
+            if rng.random() < 0.4:
+                val["$position"] = rng.randint(-3, 4)
+            if rng.random() < 0.4:
+                val["$slice"] = rng.randint(-3, 4)
+            if rng.random() < 0.2:
+                val["$sort"] = rng.choice([1, -1])
+        return {op: {field: val}}
     if op in ("$push", "$min", "$max", "$addToSet", "$pull"):
         return {op: {field: _rand_scalar(rng)}}
     if op == "$pop":
