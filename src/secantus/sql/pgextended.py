@@ -233,10 +233,12 @@ class ExtendedSession:
         except errors.SQLError as exc:
             self.skip_until_sync = True
             return pgwire.error_response(exc.sqlstate, exc.message)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception:  # pragma: no cover - defensive
             logger.exception("error in extended protocol")
             self.skip_until_sync = True
-            return pgwire.error_response("XX000", f"internal error: {exc}")
+            # Generic wire message; full detail stays in the server log — don't
+            # leak the raw Python exception text to the client. (§I17)
+            return pgwire.error_response("XX000", "internal error")
 
     # -- handlers ----------------------------------------------------------- #
 

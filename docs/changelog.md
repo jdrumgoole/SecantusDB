@@ -37,6 +37,25 @@ from any other unsupported construct.
   Python `aggregate._STAGES` registry). Regression:
   `tests/test_rust_server_smoke.py::test_aggregate_stage_name_validation_against_rust_server`.
 
+### PostgreSQL/SQL server: an unexpected internal error no longer leaks its Python text to the client
+
+When a statement hit an *unexpected* exception (not a curated `SQLError`), the
+PostgreSQL/SQL server sent the raw `str(exc)` back to the client as
+`internal error: <text>`. That text could disclose internal file paths, type
+names, or document values. The server now logs the full exception server-side
+(as it already did) but answers the client with a generic `XX000 internal error`,
+matching the Mongo dispatch's discipline of never leaking a Python traceback to
+the wire. Curated `SQLError`s are unaffected — they still surface their real
+SQLSTATE and user-facing message.
+
+Found by the nightly security review (2026-07-04 §I17).
+
+#### Security
+
+- `sql/pgserver.py` (simple-query + COPY paths) and `sql/pgextended.py` (extended
+  protocol) no longer interpolate the raw exception into the `ErrorResponse` for
+  an unexpected internal error. Regression: `tests/test_pgserver_error_hygiene.py`.
+
 ### Reads on a view resolve its pipeline
 
 `find`, `aggregate`, and `count_documents` on a view now run the view's stored
