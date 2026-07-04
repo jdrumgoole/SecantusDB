@@ -767,7 +767,21 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
     for k, v in list(bucket.items()):
         if isinstance(v, dict) and "_avg_total" in v and "_avg_n" in v:
             bucket[k] = v["_avg_total"] / v["_avg_n"] if v["_avg_n"] else None
+        elif isinstance(v, dict) and "_std_vals" in v:
+            bucket[k] = _std_dev(v["_std_vals"], pop=v["_std_pop"])
     return bucket
+
+
+def _std_dev(values: list[Any], *, pop: bool) -> float | None:
+    """Population / sample standard deviation, matching Mongo's ``$stdDevPop`` /
+    ``$stdDevSamp``: pop is null for an empty set (0 for a single value); samp is
+    null for fewer than two values."""
+    n = len(values)
+    if n == 0 or (not pop and n < 2):
+        return None
+    mean = sum(values) / n
+    denom = n if pop else n - 1
+    return (sum((x - mean) ** 2 for x in values) / denom) ** 0.5
 
 
 _AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
@@ -851,6 +865,37 @@ def _acc_add_to_set(
         bucket[field].append(v)
 
 
+def _acc_std(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    pop: bool,
+) -> None:
+    v = evaluate(arg, doc, vars)
+    if v is None:
+        return
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_std_vals" not in state:
+        state = {"_std_vals": [], "_std_pop": pop}
+        bucket[field] = state
+    state["_std_vals"].append(v)
+
+
+def _acc_std_pop(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_std(bucket, field, arg, doc, vars, pop=True)
+
+
+def _acc_std_samp(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_std(bucket, field, arg, doc, vars, pop=False)
+
+
 _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$sum": _acc_sum,
     "$count": _acc_count,
@@ -861,6 +906,8 @@ _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$last": _acc_last,
     "$push": _acc_push,
     "$addToSet": _acc_add_to_set,
+    "$stdDevPop": _acc_std_pop,
+    "$stdDevSamp": _acc_std_samp,
 }
 
 

@@ -9,6 +9,7 @@ the planner stays pure translation.
 from __future__ import annotations
 
 import functools
+import operator
 from typing import Any
 
 import bson
@@ -1293,9 +1294,30 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
         for doc in result:
             if kind in ("sorted_array", "sorted_string"):
                 doc[field_name] = _sorted_agg_value(kind, payload, doc.get(field_name))
+            elif kind in ("variance", "bit_and", "bit_or", "bit_xor"):
+                doc[field_name] = _stat_bit_value(kind, doc.get(field_name))
             else:
                 doc[field_name] = _ordered_set_value(kind, payload, doc.get(field_name))
     return result
+
+
+def _stat_bit_value(kind: str, value: Any) -> Any:
+    """Finish a statistical / bitwise aggregate. ``variance`` squares the pushed
+    stdDev (NULL stays NULL — matching Postgres' single-row sample variance);
+    the ``bit_*`` kinds fold the pushed integers (NULLs skipped, NULL when empty)."""
+    if kind == "variance":
+        if value is None:
+            return None
+        v = float(value)
+        return v * v
+    ints = [int(x) for x in (value or []) if x is not None]
+    if not ints:
+        return None
+    if kind == "bit_and":
+        return functools.reduce(operator.and_, ints)
+    if kind == "bit_or":
+        return functools.reduce(operator.or_, ints)
+    return functools.reduce(operator.xor, ints)  # bit_xor
 
 
 def _sorted_agg_value(kind: str, payload: Any, pairs: Any) -> Any:

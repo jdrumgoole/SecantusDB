@@ -1471,6 +1471,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   oids (`psql \dT+`, SQLAlchemy). Added the `typrelid` column to the pg_type schema and `reltype` to
   pg_class. **Still not supported:** nested composite types (a field whose own type is a composite —
   `engine._composite_fields_from_schema` rejects a non-builtin field type).
+- [ ] **Statistical + bitwise aggregates landed** (b136): `stddev`/`stddev_samp`/`stddev_pop`,
+  `variance`/`var_samp`(=variance)/`var_pop`, and `bit_and`/`bit_or`/`bit_xor` (`every` already aliased
+  `bool_and`). Added the dedicated sqlglot nodes to `planner._AGG_CLASSES` (via a version-tolerant
+  getattr loop). stddev lowers to Mongo's native `$stdDevSamp`/`$stdDevPop` accumulators (newly
+  implemented in the pure-Python engine: `aggregate._acc_std_pop`/`_acc_std_samp` + `_std_dev` in
+  `_finalize` — pop is null for empty / 0 for one value, samp is null for <2). variance and the bit
+  folds run through the `post_aggregates` path: variance accumulates the matching stdDev then squares it
+  (`executor._stat_bit_value`, kind `variance`); `bit_*` `$push` the values and fold with
+  `operator.and_`/`or_`/`xor_` (NULLs skipped, NULL for an empty group). Typed float8 (stddev) / numeric
+  (variance) / int (bit). Routed through `_plan_group_select` for both grouped and whole-table single-table
+  aggregates. **Limitations:** not wired into the JOIN group path (`_join_accumulator` → the stddev
+  natives work, but variance/bit raise `feature_not_supported` over a JOIN); `every()`/`bool_and` still
+  require a boolean **column** argument, not a boolean expression; a whole-table aggregate over an
+  **empty** table returns no row (pre-existing, except `count`).
 - [ ] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
   (tokenizer + recursive-descent parser + evaluator) powering `jsonb_path_query` / `jsonb_path_query_array`
   / `jsonb_path_exists` / `jsonb_path_match` (via `scalar._call_func`) and the `@?` (`exp.JSONBPathExists`)

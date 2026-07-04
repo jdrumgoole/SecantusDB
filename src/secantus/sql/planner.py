@@ -2037,6 +2037,28 @@ _AGG_CLASSES: dict[type, str] = {
     exp.LogicalAnd: "bool_and",
     exp.LogicalOr: "bool_or",
 }
+# Statistical / bitwise aggregates parse to dedicated nodes whose availability
+# varies across sqlglot versions; look them up by attribute. sqlglot maps both
+# ``variance`` and ``var_samp`` onto ``Variance`` (sample variance).
+for _agg_cls_name, _agg_func in (
+    ("Stddev", "stddev"),
+    ("StddevSamp", "stddev_samp"),
+    ("StddevPop", "stddev_pop"),
+    ("Variance", "variance"),
+    ("VariancePop", "var_pop"),
+    ("BitwiseAndAgg", "bit_and"),
+    ("BitwiseOrAgg", "bit_or"),
+    ("BitwiseXorAgg", "bit_xor"),
+):
+    _agg_cls = getattr(exp, _agg_cls_name, None)
+    if _agg_cls is not None:
+        _AGG_CLASSES[_agg_cls] = _agg_func
+
+# Aggregates that need a Python finish after the $group: sample/pop variance
+# (square of the corresponding stdDev) and the bitwise reductions (a $push then
+# a fold). ``variance`` -> $stdDevSamp, ``var_pop`` -> $stdDevPop.
+_POST_STAT_FUNCS = {"variance": "$stdDevSamp", "var_pop": "$stdDevPop"}
+_BIT_AGG_FUNCS = {"bit_and", "bit_or", "bit_xor"}
 
 _HAVING_CMP: dict[type, tuple[str, str]] = {
     exp.GT: ("$gt", "$lt"),
@@ -2592,6 +2614,12 @@ def _accumulator_for(
     if func in ("max", "bool_or"):
         body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
         return {"$max": body}, ("bool" if func == "bool_or" else (tag or "text"))
+    if func in ("stddev", "stddev_samp"):
+        # Native Mongo accumulators; a lone value yields NULL (Mongo returns null
+        # for a single sample), matching Postgres' sample stddev.
+        return {"$stdDevSamp": val}, "float8"
+    if func == "stddev_pop":
+        return {"$stdDevPop": val}, "float8"
     raise errors.feature_not_supported(f"aggregate {func} is not supported")
 
 
@@ -2865,6 +2893,28 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                 accumulators[fname] = {"$push": _agg_arg_to_expr(sagg[0], table)}
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
+        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+            # variance / var_pop (square of stdDev) and bit_and/or/xor (push +
+            # Python fold) — a $group accumulator plus a post-aggregate finish.
+            func, col, _distinct = agg
+            if col is None:
+                raise errors.feature_not_supported(f"{func}(*) is not supported")
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}() is not supported"
+                )
+            fname = names.fresh(alias or func)
+            val = f"${table.field_for(col)}"
+            if func in _BIT_AGG_FUNCS:
+                accumulators[fname] = {"$push": val}
+                tag = table.type_for(col) if table.type_for(col) in ("int4", "int8") else "int8"
+                post_aggregates.append((fname, func, None))
+            else:
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "numeric"
+                post_aggregates.append((fname, "variance", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, tag))
         elif agg is not None:
             func, col, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
