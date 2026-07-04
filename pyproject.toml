@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.4b115"
+version = "0.5.4b116"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,7 +42,11 @@ dev = [
     "psycopg[binary]>=3.1",  # libpq-based driver: strictest wire gauge (binary params, prepared stmts)
     "sqlalchemy>=2.0",  # ORM smoke for the SQL server (drives pg8000 + psycopg)
     "invoke>=2.2",
-    "ruff>=0.6",
+    # Pinned exactly: ruff's formatter output changes between releases, so an
+    # unpinned floor let CI silently pull a newer ruff that reformatted an
+    # untouched file and failed the `ruff format --check` gate on every PR. Bump
+    # this deliberately (and re-run `ruff format`) when adopting a new ruff.
+    "ruff==0.15.20",
     "sphinx>=7.2",
     "myst-parser>=2.0",
     "furo>=2024.1",

@@ -1390,19 +1390,59 @@ def _enum_order_map(
     return out
 
 
-def _emit_pipeline_sort(pipeline: list[dict[str, Any]], terms: list[tuple[str, int, bool]]) -> None:
+def _enum_labels_for_column(col: Column | None) -> list[str] | None:
+    """The declared label list of an enum-typed column (via the planning-scoped
+    catalog on ``_pipeline_subctx``), or None if the column isn't enum-typed / no
+    catalog is available. Lets a pipeline ``$sort`` order an enum column by its
+    declared order instead of lexically."""
+    if col is None or col.enum_type is None:
+        return None
+    ctx = _pipeline_subctx.get()
+    if ctx is None or ctx.catalog is None:
+        return None
+    enum = ctx.catalog.get_enum(ctx.db, col.enum_type)
+    return list(enum["labels"]) if enum else None
+
+
+def _column_for_order_node(
+    node: exp.Expression, amap: dict[str, tuple[str, TableDef]]
+) -> Column | None:
+    """Resolve an ORDER BY expression to its source ``Column`` across a join's
+    alias map (qualified ``a.col`` or an unqualified name found in any table), or
+    None if the term isn't a bare column (e.g. a function / arithmetic expr)."""
+    if not isinstance(node, exp.Column):
+        return None
+    name = node.name
+    if node.table and node.table in amap:
+        return amap[node.table][1].column(name)
+    for _alias, (_role, tdef) in amap.items():
+        col = tdef.column(name)
+        if col is not None:
+            return col
+    return None
+
+
+def _emit_pipeline_sort(
+    pipeline: list[dict[str, Any]],
+    terms: list[tuple[str, int, bool]],
+    enum_labels: dict[str, list[str]] | None = None,
+) -> None:
     """Append a NULL-aware ``$sort`` for ``terms`` (``(field, direction,
     nulls_first)``). Mongo's ``$sort`` orders NULL/missing as the lowest value, so
     each term gets a companion ``$cond`` null-rank field sorted ahead of it — that
     places NULLs first or last per ``nulls_first``, independent of direction, the
-    way Postgres does. The rank fields are dropped again after the sort."""
+    way Postgres does. A term whose field is an enum column (``enum_labels[field]``
+    gives its declared labels) gets a second companion — its ordinal via
+    ``$indexOfArray`` — sorted in place of the raw label text, so the order follows
+    the declared enum order. All companions are dropped again after the sort."""
     if not terms:
         return
-    nullranks: dict[str, Any] = {}
+    enum_labels = enum_labels or {}
+    companions: dict[str, Any] = {}
     sort: dict[str, int] = {}
     for k, (name, direction, nulls_first) in enumerate(terms):
         nr = f"__nr_{k}"
-        nullranks[nr] = {
+        companions[nr] = {
             "$cond": [
                 {"$eq": [{"$ifNull": [f"${name}", None]}, None]},
                 0 if nulls_first else 1,
@@ -1410,10 +1450,16 @@ def _emit_pipeline_sort(pipeline: list[dict[str, Any]], terms: list[tuple[str, i
             ]
         }
         sort[nr] = 1
-        sort[name] = direction
-    pipeline.append({"$addFields": nullranks})
+        labels = enum_labels.get(name)
+        if labels is not None:
+            eo = f"__eo_{k}"
+            companions[eo] = {"$indexOfArray": [labels, f"${name}"]}
+            sort[eo] = direction
+        else:
+            sort[name] = direction
+    pipeline.append({"$addFields": companions})
     pipeline.append({"$sort": sort})
-    pipeline.append({"$unset": list(nullranks)})
+    pipeline.append({"$unset": list(companions)})
 
 
 def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
@@ -1812,6 +1858,23 @@ class EvaluatedSelectPlan:
     # ``DISTINCT ON (exprs)`` — keep the first row (in ORDER BY order) per distinct
     # value of these expressions. Mutually exclusive with plain ``distinct``.
     distinct_on: list[exp.Expression] = field(default_factory=list)
+    # ORDER BY index -> the enum's declared labels, when that ORDER BY term is an
+    # enum column, so the executor sorts by declared order not lexically.
+    enum_orders: dict[int, list[str]] = field(default_factory=dict)
+
+
+def _evaluated_enum_orders(
+    order: list[tuple[exp.Expression, int, bool]],
+    column_of: Any,
+) -> dict[int, list[str]]:
+    """Map each ORDER BY term index to its enum labels (if the term is an enum
+    column, resolved via ``column_of(node) -> Column | None``)."""
+    out: dict[int, list[str]] = {}
+    for i, (expr, _d, _n) in enumerate(order):
+        labels = _enum_labels_for_column(column_of(expr))
+        if labels is not None:
+            out[i] = labels
+    return out
 
 
 _AGG_CLASSES: dict[type, str] = {
@@ -2057,7 +2120,7 @@ def _plan_plain_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         project[nm] = f"${path}"
         out_columns.append((nm, tag))
     pipeline: list[dict[str, Any]] = [{"$project": project}]
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
@@ -2089,6 +2152,10 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
             order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
     don = _distinct_on(stmt)
+    enum_orders = _evaluated_enum_orders(
+        order,
+        lambda node: table.column(_column_name(node)) if isinstance(node, exp.Column) else None,
+    )
     return EvaluatedSelectPlan(
         base_collection=table.collection,
         base_filter=base_filter,
@@ -2101,6 +2168,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         limit=limit,
         skip=skip,
         distinct_on=don,
+        enum_orders=enum_orders,
     )
 
 
@@ -2137,7 +2205,7 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
         out_columns.append((nm, tag))
     pipeline: list[dict[str, Any]] = [{"$project": project}]
     _append_distinct(pipeline, out_columns)
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
@@ -2354,7 +2422,7 @@ def _plan_grouping_sets_select(stmt: exp.Select, table: TableDef) -> PipelineSel
     prefix = [{"$match": base_filter}] if base_filter else []
     for sub, _cols in branches[1:]:
         pipeline.append({"$unionWith": {"coll": table.collection, "pipeline": prefix + sub}})
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
@@ -2436,7 +2504,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
     return PipelineSelectPlan(
         table.collection,
         base_filter,
@@ -3202,7 +3270,7 @@ def _plan_join_select(
         name = names.fresh(alias or _column_name(inner))
         project[name] = f"${path}"
         out_columns.append((name, tag))
-    _append_join_tail(pipeline, stmt, resolve, project, out_columns)
+    _append_join_tail(pipeline, stmt, resolve, project, out_columns, amap)
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
 
 
@@ -3246,7 +3314,7 @@ def _plan_join_group_select(
     """JOIN combined with GROUP BY / aggregates: build the $lookup/$unwind/$match
     prefix, then a $group whose keys and accumulators resolve through the join
     resolver (so ``a.region`` / ``SUM(b.amt)`` map to the post-unwind paths)."""
-    base, _amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
+    base, amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
     # A correlated / EXISTS WHERE wasn't pushed into a ``$match`` (see
     # ``_build_join_pipeline``); it's filtered per joined row after the join prefix
     # and before the ``$group`` below. ``residual_split`` marks that boundary.
@@ -3331,7 +3399,7 @@ def _plan_join_group_select(
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns})
+    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, amap=amap)
     return PipelineSelectPlan(
         base.collection,
         {},
@@ -3687,6 +3755,7 @@ def _build_evaluated_join(
     where_node = stmt.args.get("where")
     residual = where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
     don = _distinct_on(stmt)
+    enum_orders = _evaluated_enum_orders(order, lambda node: _column_for_order_node(node, amap))
     return EvaluatedSelectPlan(
         base_collection=base.collection,
         base_filter={},
@@ -3701,6 +3770,7 @@ def _build_evaluated_join(
         derived=derived,
         where=residual,
         distinct_on=don,
+        enum_orders=enum_orders,
     )
 
 
@@ -3710,6 +3780,7 @@ def _append_join_tail(
     resolve: Resolve,
     project: dict[str, Any],
     out_columns: list[tuple[str, str]],
+    amap: dict[str, tuple[str, TableDef]] | None = None,
 ) -> None:
     """Project, optionally dedup (DISTINCT), then sort/skip/limit for a join.
 
@@ -3722,6 +3793,7 @@ def _append_join_tail(
     distinct = bool(stmt.args.get("distinct"))
     order = stmt.args.get("order")
     terms: list[tuple[str, int, bool]] = []
+    enum_labels: dict[str, list[str]] = {}
     hidden: list[str] = []
     if order is not None:
         for o in order.expressions:
@@ -3737,10 +3809,14 @@ def _append_join_tail(
                 project[key] = f"${path}"
                 hidden.append(key)
             terms.append((key, direction, _nulls_first(o)))
+            if amap is not None:
+                labels = _enum_labels_for_column(_column_for_order_node(o.this, amap))
+                if labels is not None:
+                    enum_labels[key] = labels
     pipeline.append({"$project": project})
     if distinct:
         _append_distinct(pipeline, out_columns)
-    _emit_pipeline_sort(pipeline, terms)
+    _emit_pipeline_sort(pipeline, terms, enum_labels)
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})
@@ -3766,17 +3842,30 @@ def _append_distinct(pipeline: list[dict[str, Any]], out_columns: list[tuple[str
 
 
 def _append_sort_limit(
-    pipeline: list[dict[str, Any]], stmt: exp.Expression, valid_names: set[str]
+    pipeline: list[dict[str, Any]],
+    stmt: exp.Expression,
+    valid_names: set[str],
+    table: TableDef | None = None,
+    amap: dict[str, tuple[str, TableDef]] | None = None,
 ) -> None:
     order = stmt.args.get("order")
     if order is not None:
         terms: list[tuple[str, int, bool]] = []
+        enum_labels: dict[str, list[str]] = {}
         for o in order.expressions:
             col = _column_name(o.this)
             if col not in valid_names:
                 raise errors.undefined_column(col)
             terms.append((col, -1 if o.args.get("desc") else 1, _nulls_first(o)))
-        _emit_pipeline_sort(pipeline, terms)
+            # Resolve the source column (single-table via `table`, or across a
+            # join's alias map) so an enum column sorts by its declared order.
+            src = _column_for_order_node(o.this, amap) if amap is not None else None
+            if src is None and table is not None:
+                src = table.column(col)
+            labels = _enum_labels_for_column(src)
+            if labels is not None:
+                enum_labels[col] = labels
+        _emit_pipeline_sort(pipeline, terms, enum_labels)
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})

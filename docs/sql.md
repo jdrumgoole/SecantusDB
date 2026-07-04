@@ -332,9 +332,9 @@ SELECT feeling FROM survey ORDER BY feeling;
 
 Adding a label that already exists raises `42710` (unless `IF NOT EXISTS`); a
 missing type or `BEFORE`/`AFTER` neighbour raises `42704`. Other `ALTER TYPE`
-forms (e.g. `RENAME VALUE`) raise `0A000`. Enum-aware ordering applies to a
-single-table `ORDER BY`; an enum ordered inside a JOIN / GROUP BY pipeline still
-sorts lexically (see `tasks/backlog.md`).
+forms (e.g. `RENAME VALUE`) raise `0A000`. Enum-aware ordering applies everywhere
+an enum column is an `ORDER BY` key — single-table, `GROUP BY`, `DISTINCT`, JOIN,
+JOIN + GROUP BY, and the evaluated (computed-column) path.
 
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 

@@ -1908,14 +1908,10 @@ def test_verify_websocket_token_is_constant_time_and_robust() -> None:
     non-ASCII presented value without raising (issue #195)."""
     from secantus.admin.middleware import QUERY_NAME, verify_websocket_token
 
-    ok = verify_websocket_token(
-        expected="s3cret", query_params={QUERY_NAME: "s3cret"}, cookies={}
-    )
+    ok = verify_websocket_token(expected="s3cret", query_params={QUERY_NAME: "s3cret"}, cookies={})
     assert ok is True
 
-    wrong = verify_websocket_token(
-        expected="s3cret", query_params={QUERY_NAME: "nope"}, cookies={}
-    )
+    wrong = verify_websocket_token(expected="s3cret", query_params={QUERY_NAME: "nope"}, cookies={})
     assert wrong is False
 
     # Absent token → rejected, not an exception.
@@ -1924,8 +1920,6 @@ def test_verify_websocket_token_is_constant_time_and_robust() -> None:
     # A non-ASCII presented value must be rejected, not raise (the bytes-encode
     # guard around compare_digest).
     assert (
-        verify_websocket_token(
-            expected="s3cret", query_params={QUERY_NAME: "s3crét"}, cookies={}
-        )
+        verify_websocket_token(expected="s3cret", query_params={QUERY_NAME: "s3crét"}, cookies={})
         is False
     )
