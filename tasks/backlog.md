@@ -1395,8 +1395,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `_aggregate_of`; `string_agg(expr, sep)` (`exp.GroupConcat`) lowers to a `$push` accumulator plus a
   `$reduce` in the group `$project` (`_string_agg_project`) that joins the pushed array skipping NULL
   elements (NULL when all-NULL) — wired into the single-table, join, and grouping-set planners with the
-  routing predicates updated. Tests: `tests/test_sql_string_agg.py`. `string_agg`'s own `ORDER BY` inside
-  the call is ignored (sqlglot drops it).
+  routing predicates updated. Tests: `tests/test_sql_string_agg.py`.
+- [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
+  `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
+  `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`
+  unwraps it into `(value, [(key, direction, nulls_first), …])`; `_sorted_agg_push` emits a `$push` of
+  `{v, k}` pairs, and the executor (`_sorted_agg_value`) sorts the pairs by the key list via the existing
+  `_pg_sort` (per-key direction + Postgres NULL placement) before building the array / joining the string
+  (NULL values skipped, NULL when all-NULL). Recorded as a `PipelineSelectPlan.post_aggregates` entry
+  (`sorted_array` / `sorted_string`). Single-table + whole-table; **not** over a JOIN (the join array_agg /
+  string_agg branch gets the `exp.Order` node and raises `0A000`) or in GROUPING SETS. The finalization
+  (`executor._apply_post_aggregates`) runs in **both** the top-level pipeline executor and derived-table
+  materialization (`_run_subplan_to_docs`) so the `{v, k}` push pairs never leak — this also closed a
+  latent b127 gap where an ordered-set agg inside a derived table (e.g. SQLAlchemy's index reflection,
+  which does `array_agg(attname ORDER BY …)` over a derived table) leaked its raw pushed array.
 - [ ] **Ordered-set aggregates landed** (b127): `percentile_cont(f)` / `percentile_disc(f)` / `mode()`
   via `WITHIN GROUP (ORDER BY expr)` (sqlglot `exp.WithinGroup`). `planner._ordered_set_agg` detects them
   (wired into `select_needs_pipeline` + the two `has_aggregate` routing predicates); `_plan_group_select`

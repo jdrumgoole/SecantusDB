@@ -1050,7 +1050,7 @@ def _run_subplan_to_docs(
     if isinstance(plan, planner.PipelineSelectPlan):
         docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)
         ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
-        return apply_pipeline(docs, remaining, ctx)
+        return _apply_post_aggregates(plan, apply_pipeline(docs, remaining, ctx))
     if isinstance(plan, planner.EvaluatedSelectPlan):
         rows = _evaluated_value_rows(plan, storage, db, _scalar_ctx(storage, db, sctx))
         names = [n for n, _ in plan.out_columns]
@@ -1272,6 +1272,36 @@ def _ordered_set_value(kind: str, fraction: float | None, values: Any) -> Any:
     return float(vals[lo]) + (float(vals[hi]) - float(vals[lo])) * frac
 
 
+def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Finish any ordered / ordered-set aggregates in a pipeline plan's result
+    (Python-side, since the aggregation engine can't sort). Shared by the top-level
+    pipeline executor and derived-table materialization so the ``{v, k}`` push
+    pairs never leak past either path."""
+    for field_name, kind, payload in getattr(plan, "post_aggregates", ()) or ():
+        for doc in result:
+            if kind in ("sorted_array", "sorted_string"):
+                doc[field_name] = _sorted_agg_value(kind, payload, doc.get(field_name))
+            else:
+                doc[field_name] = _ordered_set_value(kind, payload, doc.get(field_name))
+    return result
+
+
+def _sorted_agg_value(kind: str, payload: Any, pairs: Any) -> Any:
+    """Compute an ordered ``array_agg`` / ``string_agg`` from the pushed ``{v, k}``
+    pairs: sort by the key list ``k`` (Postgres ORDER BY semantics per key), then
+    return the ``v`` values as a list (``sorted_array``) or joined with the
+    separator, skipping NULLs (``sorted_string`` — NULL when all values are NULL)."""
+    items = list(pairs or [])
+    if kind == "sorted_array":
+        specs = payload
+        _pg_sort(items, lambda p: tuple(p.get("k") or []), specs)
+        return [p.get("v") for p in items]
+    specs, sep = payload  # sorted_string
+    _pg_sort(items, lambda p: tuple(p.get("k") or []), specs)
+    parts = [str(p.get("v")) for p in items if p.get("v") is not None]
+    return sep.join(parts) if parts else None
+
+
 def execute_pipeline_select(
     plan: planner.PipelineSelectPlan, storage: Any, db: str, sctx: Any = None
 ) -> SQLResult:
@@ -1281,11 +1311,7 @@ def execute_pipeline_select(
     _materialize_derived(plan, storage, db, sctx)
     docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
-    result = apply_pipeline(docs, remaining, ctx)
-    if plan.post_aggregates:
-        for doc in result:
-            for field_name, kind, fraction in plan.post_aggregates:
-                doc[field_name] = _ordered_set_value(kind, fraction, doc.get(field_name))
+    result = _apply_post_aggregates(plan, apply_pipeline(docs, remaining, ctx))
     columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
     rows = [
         tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result

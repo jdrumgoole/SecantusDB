@@ -965,6 +965,20 @@ def test_ordered_set_aggregate_via_driver(server):
     conn.close()
 
 
+def test_agg_order_by_via_driver(server):
+    # array_agg / string_agg with an in-call ORDER BY, on the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE e (id int primary key, g text, name text, ord int)")
+    cur.execute("INSERT INTO e VALUES (1,'a','c',3),(2,'a','a',1),(3,'a','b',2)")
+    cur.execute(
+        "SELECT g, array_agg(name ORDER BY ord), string_agg(name, ',' ORDER BY name DESC) "
+        "FROM e GROUP BY g"
+    )
+    assert cur.fetchall() == (["a", ["a", "b", "c"], "c,b,a"],)
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
