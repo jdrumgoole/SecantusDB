@@ -999,6 +999,8 @@ def _run_statement(
             return _alter_sequence_command(stmt, db, catalog)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("TYPE"):
             return _alter_type_command(stmt, db, catalog)
+        if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
+            return _alter_domain_command(stmt, storage, db, catalog)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
             return _create_domain_command(stmt, db, catalog)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
@@ -1577,6 +1579,193 @@ def _drop_domain_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLRes
     if not catalog.drop_domain(db, name) and not if_exists:
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     return SQLResult(command_tag="DROP DOMAIN")
+
+
+# ``ALTER DOMAIN name <action>`` — sqlglot doesn't model the grammar, so it
+# arrives as a Command. Peel ``DOMAIN <name>`` then dispatch on the action tail.
+_ALTER_DOMAIN_RE = re.compile(r'(?is)^\s*DOMAIN\s+("[^"]+"|[\w.]+)\s+(.*?)\s*;?\s*$')
+
+
+def _alter_domain_command(stmt: exp.Command, storage: Any, db: str, catalog: Catalog) -> SQLResult:
+    m = _ALTER_DOMAIN_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported ALTER DOMAIN: {stmt.sql()}")
+    name = _unquote_ident(m.group(1))
+    action = m.group(2).strip()
+    domain = catalog.get_domain(db, name)
+    if domain is None:
+        raise errors.SQLError("42704", f'type "{name}" does not exist')
+    doc = {
+        "base_tag": domain["base_tag"],
+        "not_null": bool(domain.get("not_null")),
+        "checks": list(domain.get("checks") or []),
+        "has_default": bool(domain.get("has_default")),
+        "default": domain.get("default"),
+    }
+    upper = action.upper()
+
+    if upper.startswith("ADD"):
+        _alter_domain_add_constraint(storage, db, catalog, name, doc, action)
+    elif upper.startswith("DROP CONSTRAINT"):
+        _alter_domain_drop_constraint(name, doc, action)
+    elif upper.startswith("SET DEFAULT"):
+        expr = action[len("SET DEFAULT") :].strip()
+        node = sqlglot.parse_one(expr, read="postgres")
+        doc["has_default"], doc["default"] = planner._literal_default(node, doc["base_tag"])
+    elif upper == "DROP DEFAULT":
+        doc["has_default"], doc["default"] = False, None
+    elif upper == "SET NOT NULL":
+        _revalidate_domain_not_null(storage, db, catalog, name)
+        doc["not_null"] = True
+    elif upper == "DROP NOT NULL":
+        doc["not_null"] = False
+    elif upper.startswith("RENAME TO"):
+        new = _unquote_ident(action[len("RENAME TO") :].strip())
+        return _alter_domain_rename(db, catalog, name, new, doc)
+    elif upper.startswith("VALIDATE CONSTRAINT"):
+        # We validate eagerly on ADD, so VALIDATE is a no-op acceptance.
+        return SQLResult(command_tag="ALTER DOMAIN")
+    else:
+        raise errors.feature_not_supported(f"unsupported ALTER DOMAIN action: {action}")
+
+    catalog.update_domain(db, name, doc)
+    return SQLResult(command_tag="ALTER DOMAIN")
+
+
+_ADD_NOT_VALID_RE = re.compile(r"(?is)\s+NOT\s+VALID\s*$")
+
+
+def _alter_domain_add_constraint(
+    storage: Any, db: str, catalog: Catalog, name: str, doc: dict[str, Any], action: str
+) -> None:
+    """``ADD [CONSTRAINT c] CHECK (expr) [NOT VALID]`` — append a CHECK to the
+    domain. Existing rows are re-validated unless ``NOT VALID`` is given."""
+    body = action[len("ADD") :].strip()
+    not_valid = bool(_ADD_NOT_VALID_RE.search(body))
+    body = _ADD_NOT_VALID_RE.sub("", body).strip()
+    coldef = _parse_domain_body(name, f"int {body}")
+    check = None
+    for con in coldef.args.get("constraints") or []:
+        if isinstance(con.kind, exp.CheckColumnConstraint):
+            cname = con.args.get("this")
+            check = {
+                "name": cname.name if cname is not None else None,  # None → auto-name below
+                "expression": con.kind.this.sql(dialect="postgres"),
+            }
+    if check is None:
+        raise errors.feature_not_supported(
+            "only ALTER DOMAIN ADD [CONSTRAINT c] CHECK (...) is supported"
+        )
+    existing = {c["name"] for c in doc["checks"]}
+    if check["name"] is None:
+        # Unnamed CHECK: Postgres auto-generates <domain>_check, _check1, _check2…
+        base = f"{name}_check"
+        candidate = base
+        i = 0
+        while candidate in existing:
+            i += 1
+            candidate = f"{base}{i}"
+        check["name"] = candidate
+    elif check["name"] in existing:
+        raise errors.SQLError(
+            "42710", f'constraint "{check["name"]}" for domain "{name}" already exists'
+        )
+    if not not_valid:
+        _revalidate_domain_check(storage, db, catalog, name, check)
+    doc["checks"].append(check)
+
+
+def _alter_domain_drop_constraint(name: str, doc: dict[str, Any], action: str) -> None:
+    """``DROP CONSTRAINT [IF EXISTS] c [RESTRICT|CASCADE]``."""
+    m = re.match(
+        r'(?is)^DROP\s+CONSTRAINT\s+(IF\s+EXISTS\s+)?("[^"]+"|[\w]+)'
+        r"(?:\s+(?:RESTRICT|CASCADE))?\s*$",
+        action,
+    )
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported ALTER DOMAIN action: {action}")
+    if_exists = m.group(1) is not None
+    cname = _unquote_ident(m.group(2))
+    before = len(doc["checks"])
+    doc["checks"] = [c for c in doc["checks"] if c["name"] != cname]
+    if len(doc["checks"]) == before and not if_exists:
+        raise errors.SQLError("42704", f'constraint "{cname}" of domain "{name}" does not exist')
+
+
+def _alter_domain_rename(
+    db: str, catalog: Catalog, name: str, new: str, doc: dict[str, Any]
+) -> SQLResult:
+    """``RENAME TO new`` — re-key the domain and repoint every column that
+    references it (columns store ``domain_type`` by name)."""
+    if catalog.domain_exists(db, new) or catalog.enum_exists(db, new):
+        raise errors.SQLError("42710", f'type "{new}" already exists')
+    catalog.drop_domain(db, name)
+    catalog.update_domain(db, new, doc)
+    for tname in catalog.list_tables(db):
+        table = catalog.get(db, tname)
+        if table is None or not any(c.domain_type == name for c in table.columns):
+            continue
+        from dataclasses import replace as _replace
+
+        table.columns = [
+            _replace(c, domain_type=new) if c.domain_type == name else c for c in table.columns
+        ]
+        catalog.replace(db, table)
+    return SQLResult(command_tag="ALTER DOMAIN")
+
+
+def _domain_columns(catalog: Catalog, db: str, name: str) -> list[tuple[Any, Any]]:
+    """Every (table, column) pair whose column is typed with domain ``name``."""
+    out = []
+    for tname in catalog.list_tables(db):
+        table = catalog.get(db, tname)
+        if table is None:
+            continue
+        for col in table.columns:
+            if col.domain_type == name:
+                out.append((table, col))
+    return out
+
+
+def _revalidate_domain_check(
+    storage: Any, db: str, catalog: Catalog, name: str, check: dict[str, str]
+) -> None:
+    """Re-check every stored row of every column typed with domain ``name`` against
+    a new CHECK; raise ``23514`` if any row violates it (NULL passes)."""
+    predicate = sqlglot.parse_one(check["expression"], read="postgres")
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=None)
+    for table, col in _domain_columns(catalog, db, name):
+        for doc in storage.find_matching(db, table.collection, {}):
+            from secantus.paths import get_path
+
+            value = get_path(doc, col.field)
+            if value is None:
+                continue
+
+            def scope(node: Any, _v: Any = value) -> Any:
+                return _v if node.name.lower() == "value" else None
+
+            result = scalar.evaluate(predicate, scope, ctx)
+            if result is not None and not scalar._truthy(result):
+                raise errors.SQLError(
+                    "23514",
+                    f'column "{col.name}" of table "{table.name}" contains values that '
+                    f"violate the new constraint",
+                )
+
+
+def _revalidate_domain_not_null(storage: Any, db: str, catalog: Catalog, name: str) -> None:
+    """Raise ``23502`` if any stored row of a column typed with domain ``name``
+    holds a NULL (blocks ``SET NOT NULL`` when existing data would violate it)."""
+    from secantus.paths import get_path
+
+    for table, col in _domain_columns(catalog, db, name):
+        for doc in storage.find_matching(db, table.collection, {}):
+            if get_path(doc, col.field) is None:
+                raise errors.SQLError(
+                    "23502",
+                    f'column "{col.name}" of table "{table.name}" contains null values',
+                )
 
 
 # ``ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']``

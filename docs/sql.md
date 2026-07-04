@@ -398,6 +398,29 @@ evaluated by the scalar engine, so it supports the same operators as a table
 `CHECK` (comparisons, `LIKE`, the `~` / `~*` regex-match operators, `length()`,
 arithmetic).
 
+`ALTER DOMAIN` evolves a domain in place:
+
+```sql
+ALTER DOMAIN posint ADD CONSTRAINT lt100 CHECK (VALUE < 100);  -- re-validates rows
+ALTER DOMAIN posint ADD CHECK (VALUE <> 42) NOT VALID;         -- skip re-validation
+ALTER DOMAIN posint DROP CONSTRAINT lt100;                     -- IF EXISTS supported
+ALTER DOMAIN posint SET DEFAULT 1;
+ALTER DOMAIN posint DROP DEFAULT;
+ALTER DOMAIN posint SET NOT NULL;                              -- re-validates rows
+ALTER DOMAIN posint DROP NOT NULL;
+ALTER DOMAIN posint RENAME TO posnum;                          -- repoints columns
+```
+
+`ADD CONSTRAINT … CHECK` and `SET NOT NULL` **re-validate every existing row** of
+every column typed with the domain: a row that would violate the new constraint
+rejects the `ALTER` (`23514` / `23502`) and leaves the domain unchanged — add
+`NOT VALID` to skip the re-check (it still applies to new writes). An unnamed
+`ADD … CHECK` gets an auto-generated `<domain>_check[N]` name; a duplicate
+explicit name raises `42710`. `RENAME TO` re-keys the domain and repoints every
+column that references it (columns track the domain by name), rejecting a name
+that clashes with an existing type (`42710`). Not modeled: `VALIDATE CONSTRAINT`
+(accepted as a no-op, since we validate eagerly) and `RENAME CONSTRAINT`.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every
