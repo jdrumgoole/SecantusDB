@@ -907,7 +907,8 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             "typtypmod": -1,
             "typnotnull": False,
             "typdefault": None,
-            "typtype": "b",  # base type (never a domain 'd')
+            # Range types report typtype 'r'; everything else is a base type 'b'.
+            "typtype": "r" if tag in typemap._RANGE_TAGS else "b",
         }
         for tag, typname in typemap.PG_TYPENAME.items()
     ]

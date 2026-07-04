@@ -1485,6 +1485,24 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   natives work, but variance/bit raise `feature_not_supported` over a JOIN); `every()`/`bool_and` still
   require a boolean **column** argument, not a boolean expression; a whole-table aggregate over an
   **empty** table returns no row (pre-existing, except `count`).
+- [ ] **Range types landed** (b137): `int4range`/`int8range`/`numrange`/`tsrange`/`daterange`. A new
+  self-contained `secantus/sql/ranges.py` (build/parse/render/compare) stores a range as a subdocument
+  `{"lower","upper","lower_inc","upper_inc"}` (or `{"empty": true}`); discrete types canonicalise to the
+  half-open `[)` form (`(1,10]` → `[2,11)`). Wired through every layer: `typemap` (PG OIDs 3904/3906/3908/
+  3912/3926, `_RANGE_TAGS`, `to_pg_text` → range text, `coerce` → parse literal); `scalar._call_func`
+  (constructors, `isempty`, range-aware `lower`/`upper`) + `scalar._eval_range_op` (the `@>`/`<@`/`&&`
+  operators, which sqlglot parses as `exp.ArrayContainsAll`/`ArrayContainedBy`/`ArrayOverlaps` — a
+  `_NOT_RANGE` sentinel defers non-range operands to the existing jsonb/array containment path);
+  `planner` (`_literal` builds the constructor subdoc; `_infer_scalar_tag` types constructor/cast → range
+  tag, `@>`/`<@`/`&&` over a range operand → bool via `_has_range_operand`, `lower`/`upper` over a range →
+  element tag, `isempty` → bool; `where_needs_per_row(stmt, table)` + `_where_has_range_predicate` route a
+  range-operator WHERE to the per-row scalar path since the operators don't lower to a Mongo filter);
+  `functions.is_scalar_function` excludes range constructors + `isempty` so a FROM-less `SELECT int4range(…)`
+  / `isempty(…)` falls through to the full scalar evaluator; reflected via `pg_type` with `typtype = 'r'`.
+  Tests: `tests/test_sql_ranges.py` (28: pure-module canonicalisation/contains/overlaps/parse/render +
+  SQL surface) and a pg8000 wire test. **Limitations:** the `@>`/`<@`/`&&` operators run a COLLSCAN
+  per-row (no lowered Mongo filter / index); multirange types, range GiST indexes, and the extra range
+  functions (`range_merge`, `-|-` adjacency, `*` intersection, `range_agg`) are unimplemented.
 - [ ] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
   (tokenizer + recursive-descent parser + evaluator) powering `jsonb_path_query` / `jsonb_path_query_array`
   / `jsonb_path_exists` / `jsonb_path_match` (via `scalar._call_func`) and the `@?` (`exp.JSONBPathExists`)
