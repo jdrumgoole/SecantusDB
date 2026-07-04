@@ -1502,7 +1502,53 @@ login role, like Postgres' bootstrap superuser.
 
 These SQL roles are a schema-shape / reflection record, **distinct from the wire
 server's SCRAM auth users** (the `users={...}` constructor argument above): creating
-a SQL role does not by itself add a login credential, and vice versa.
+a SQL role does not by itself add a login credential, and vice versa. SQL-level
+`GRANT` / `REVOKE` of *table privileges* is still not enforced — per-statement
+authorization is driven by the role bindings below, not by SQL `GRANT`.
+
+### Authorization (RBAC)
+
+By default the SQL surface is **unrestricted**: in trust mode (no `require_auth`)
+and for the embedded `run_sql` API, any statement runs against any database. To
+gate statements, start the server with `require_auth=True` **and** per-user role
+bindings via `user_roles`. Authorization then reuses the **same role model as the
+Mongo server** (`secantus.rbac`), so a SQL client and a Mongo client on the same
+`Storage` are held to the same roles:
+
+```python
+server = SecantusPGServer(
+    port=5432,
+    require_auth=True,
+    users={"analyst": "s3cret", "editor": "hunter2"},
+    user_roles={
+        "analyst": [{"role": "read", "db": "shop"}],       # SELECT only
+        "editor":  [{"role": "readWrite", "db": "shop"}],  # + INSERT/UPDATE/DELETE/DDL
+    },
+)
+```
+
+Each statement maps to one RBAC action on the connection's database and is
+checked with `rbac.check_privilege`: reads (`SELECT`, `DECLARE … CURSOR`, and a
+plain `WITH`) need `find`; `INSERT` / `UPDATE` / `DELETE` / `MERGE` (and any
+data-modifying CTE) need the matching write action; DDL needs
+`createCollection` / `dropCollection` / `createIndex`; `CREATE/DROP/ALTER ROLE`
+and `GRANT` / `REVOKE` need user-admin actions. Transaction control
+(`BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT`), `SET` / `SHOW`, cursor
+navigation (`FETCH` / `MOVE` / `CLOSE`), and session-info queries need no
+privilege. A denied statement returns SQLSTATE **`42501`**
+(`insufficient_privilege`) and the connection survives.
+
+Built-in roles (`read`, `readWrite`, `dbAdmin`, `dbOwner`, `root`, the
+`*AnyDatabase` variants) resolve directly; custom roles resolve through the
+shared roles table (`Storage.get_role` / the Mongo `createRole` command), so a
+role defined once governs both protocols. An authenticated user with no role
+binding can connect and run session-only statements but touches no data.
+
+Without `user_roles`, authorization stays off — pass it only when you want the
+per-database gate. `GRANT` / `REVOKE` **statements** are gated (they need a
+user-admin action when authorization is active), but they still do not *change*
+stored privileges; adjust access by changing `user_roles` (or the shared
+users/roles tables), not by SQL grants.
 
 ## Session and catalog introspection
 

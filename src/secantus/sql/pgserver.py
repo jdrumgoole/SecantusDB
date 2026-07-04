@@ -65,6 +65,7 @@ class SecantusPGServer:
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         require_auth: bool = False,
         users: dict[str, str] | None = None,
+        user_roles: dict[str, list[dict[str, str]]] | None = None,
         tls_cert_file: str | None = None,
         tls_key_file: str | None = None,
     ) -> None:
@@ -82,7 +83,14 @@ class SecantusPGServer:
         # against a user from ``users`` (username -> plaintext, hashed into a
         # SCRAM verifier at startup; the plaintext is not retained).
         self.require_auth = require_auth
-        self._users = UserStore.from_passwords(users or {})
+        self._users = UserStore.from_passwords(users or {}, user_roles)
+        # Per-statement RBAC is enforced only when explicit per-user role bindings
+        # are supplied *and* auth is on (an identity is required to authorize).
+        # Without ``user_roles`` the SQL surface stays unrestricted — the
+        # documented trust default, unchanged from prior behaviour. When active,
+        # statements are gated by ``secantus.rbac.check_privilege`` against the
+        # authenticated user's roles, the same model the Mongo server uses. (#193)
+        self._authz_active = bool(require_auth and user_roles)
         # Optional TLS: when a cert/key pair is given, an SSLRequest is answered
         # 'S' and the socket is wrapped before the startup flow. Without it, the
         # server declines TLS ('N') and stays plaintext.
@@ -244,6 +252,9 @@ class SecantusPGServer:
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
+        if self._authz_active:
+            session.authz_active = True
+            session.roles = self._users.roles_for(user)
         if application_name:
             session.settings["application_name"] = application_name
 

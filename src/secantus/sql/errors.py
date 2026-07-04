@@ -40,6 +40,13 @@ def program_limit_exceeded(message: str) -> SQLError:
     return SQLError("54000", message)
 
 
+def insufficient_privilege(database: str, action: str) -> SQLError:
+    """SQLSTATE 42501 — the connection's roles don't grant the RBAC ``action``
+    the statement needs on ``database``. Raised by the per-statement gate in
+    ``sql/authz.py`` when authorization is active. (#193)"""
+    return SQLError("42501", f'permission denied for database "{database}" (requires {action})')
+
+
 def undefined_table(name: str) -> SQLError:
     return SQLError("42P01", f'relation "{name}" does not exist')
 

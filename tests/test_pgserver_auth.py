@@ -196,3 +196,78 @@ def test_tls_declined_when_not_configured():
         s.close()
     finally:
         srv.stop()
+
+
+# --------------------------------------------------------------------------- #
+# RBAC authorization over the wire (#193). The server is started with
+# ``require_auth`` + per-user role bindings, so each statement is gated by
+# ``secantus.rbac.check_privilege`` against the authenticated user's roles.
+# --------------------------------------------------------------------------- #
+
+
+def _authenticated_socket(server, user, password, database="db"):
+    """Connect, run SCRAM to completion, and drain to ReadyForQuery."""
+    host, port = server.address
+    s = socket.create_connection((host, port), timeout=5)
+    _startup(s, user=user, database=database)
+    pgwire.read_message(s)  # AuthenticationSASL
+    final = scram_authenticate(s, user, password)
+    assert pgwire.parse_authentication(final.payload)[0] == 12  # verified
+    _read_until_ready(s)
+    return s
+
+
+@pytest.fixture
+def authz_server(tmp_path):
+    # Shared storage seeded with a table + row via the embedded (unrestricted)
+    # API before the server starts; the wire clients are then gated by roles.
+    from secantus.sql import run_sql
+    from secantus.sql.session import Session
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    seed = Session(database="db")
+    run_sql(storage, "db", "CREATE TABLE t (id bigint primary key, n int)", session=seed)
+    run_sql(storage, "db", "INSERT INTO t (id, n) VALUES (1, 10)", session=seed)
+
+    srv = SecantusPGServer(
+        port=0,
+        storage=storage,
+        require_auth=True,
+        users={"reader": "r-pw", "writer": "w-pw"},
+        user_roles={
+            "reader": [{"role": "read", "db": "db"}],
+            "writer": [{"role": "readWrite", "db": "db"}],
+        },
+    )
+    srv.start()
+    try:
+        yield srv
+    finally:
+        srv.stop()
+        storage.close()
+
+
+def test_authz_read_role_selects_but_cannot_write(authz_server):
+    s = _authenticated_socket(authz_server, "reader", "r-pw")
+    try:
+        s.sendall(pgwire.build_query("SELECT n FROM t"))
+        assert [m.type for m in _read_until_ready(s)] == ["T", "D", "C", "Z"]
+        # An INSERT is denied with SQLSTATE 42501, and the connection survives.
+        s.sendall(pgwire.build_query("INSERT INTO t (id, n) VALUES (2, 20)"))
+        msgs = _read_until_ready(s)
+        err = next(m for m in msgs if m.type == "E")
+        assert pgwire.parse_error_response(err.payload)["C"] == "42501"
+        s.sendall(pgwire.build_query("SELECT n FROM t"))
+        assert any(m.type == "D" for m in _read_until_ready(s))
+    finally:
+        s.close()
+
+
+def test_authz_readwrite_role_can_insert(authz_server):
+    s = _authenticated_socket(authz_server, "writer", "w-pw")
+    try:
+        s.sendall(pgwire.build_query("INSERT INTO t (id, n) VALUES (3, 30)"))
+        assert [m.type for m in _read_until_ready(s)] == ["C", "Z"]
+    finally:
+        s.close()
