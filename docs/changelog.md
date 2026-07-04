@@ -19,6 +19,26 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: rejects a malformed `writeConcern`
+
+The Rust server now validates a write command's `writeConcern` before running it,
+matching the Python server (and mongod). A negative or too-large integer `w` is a
+`FailedToParse` (9), a string `w` other than `"majority"` is an
+`UnknownReplWriteConcern` (79), and a bool / non-number-or-string `w` — or a
+non-bool/int `j` or non-number `wtimeout` — is a `TypeMismatch` (14). A
+well-formed writeConcern is accepted as before, and a satisfiable-but-too-wide
+`w > 1` still succeeds with the single-node `writeConcernError` attached. The check
+runs in `dispatch` for every write command (insert / update / delete /
+findAndModify / create / collMod / createIndexes / drop / dropIndexes /
+dropDatabase / renameCollection).
+
+#### Fixed
+
+- **Rust server:** malformed `writeConcern` values are now rejected with mongod's
+  codes (9 / 79 / 14) before the write runs, instead of being silently accepted.
+  Regression: `tests/test_rust_server_smoke.py::
+  test_write_concern_validation_against_rust_server`.
+
 ### Rust server: `$lookup` drives the foreign index (and fixes its result order)
 
 The Rust server's simple-form `$lookup` now drives a per-outer-doc index probe

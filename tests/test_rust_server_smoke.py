@@ -656,3 +656,36 @@ def test_lookup_index_order_against_rust_server(tmp_path) -> None:
         assert [m["_id"] for m in res2[0]["m"]] == [20]
     finally:
         srv.stop()
+
+
+def test_write_concern_validation_against_rust_server(tmp_path) -> None:
+    """The Rust server rejects a malformed `writeConcern` before running a write
+    command, with mongod's codes (matching the Python server): negative/too-large
+    integer `w` → FailedToParse (9), unknown string `w` → UnknownReplWriteConcern
+    (79), a bool / non-number-or-string `w` → TypeMismatch (14). A well-formed
+    (or absent) writeConcern is accepted; `w > 1` still succeeds (the single-node
+    writeConcernError is attached, not an error)."""
+    import pymongo.errors
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        rejects = [
+            ({"w": -5}, 9),
+            ({"w": 99}, 9),
+            ({"w": "nope"}, 79),
+            ({"w": 1.5}, 14),
+            ({"w": True}, 14),
+            ({"j": "x"}, 14),
+        ]
+        for wc, code in rejects:
+            with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                db.command("insert", "c", documents=[{"x": 1}], writeConcern=wc)
+            assert exc.value.code == code, f"wc={wc} expected {code} got {exc.value.code}"
+
+        # Well-formed / satisfiable writeConcerns are accepted.
+        for wc in [{"w": 1}, {"w": "majority"}, {"j": True}, {"wtimeout": 100}, {"w": 2}]:
+            r = db.command("insert", "c", documents=[{"x": 1}], writeConcern=wc)
+            assert r["ok"] == 1.0, f"wc={wc} should succeed"
+    finally:
+        srv.stop()

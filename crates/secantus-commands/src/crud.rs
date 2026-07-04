@@ -11,13 +11,17 @@
 //! `let` + `collation` thread through update / delete / count (collation forces a
 //! COLLSCAN; non-ASCII / numericOrdering collation → `BadValue`).
 //!
+//! `writeConcern` validation (malformed `w` / `j` / `wtimeout`) runs in `dispatch`
+//! before the handler (`validate_write_concern`), and `writeConcernError`
+//! attachment for a satisfiable-but-too-wide `w > 1` is added after
+//! (`attach_write_concern_error`). `validator` enforcement runs on `insert` (here)
+//! and on `update` / replace (the validator is read here and threaded into the
+//! storage update to check the post-apply doc).
+//!
 //! **Deferred (documented so parity is honest):**
-//! * `writeConcern` validation and `writeConcernError` attachment (cross-cutting,
-//!   lands with the write-concern slice).
-//! * `validator` enforcement on `update` / replace (needs the post-apply doc in
-//!   storage; `insert` is enforced here at the command layer).
-//! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`); view-collection
-//!   `count`.
+//! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`); view-collection reads
+//!   (`find` / `aggregate` / `count` on a view return empty on *both* servers —
+//!   view pipelines aren't resolved for reads yet).
 
 use bson::{doc, Bson, Document};
 
@@ -434,8 +438,10 @@ fn unsupported_update_modifier(u: &Document) -> Option<String> {
 /// filter, `$[ident]` from the per-statement `arrayFilters`); `let` + `collation`
 /// thread through (collation forces a COLLSCAN match).
 ///
-/// **Deferred (tracked in backlog §7):** `validator`, `writeConcern`,
-/// `_reject_oplog_rs_write` (none are in the Rust `update_matching` seam yet).
+/// The collection `validator` is enforced on the post-apply document (read once
+/// here, threaded into `Storage::update_matching`); malformed `writeConcern` is
+/// rejected in `dispatch` before this handler. **Deferred:**
+/// `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
 ///
 /// Whether a timeseries update's `u` touches only the metaField (mongod 7.0's
 /// rule): an operator-form update whose every modifier targets a path rooted at
