@@ -1639,6 +1639,25 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
   secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
   aren't modeled (all checks are immediate — a future slice).
+- [ ] **`CREATE DOMAIN` landed** (b122): a named base type with its own `NOT NULL` / `CHECK` (and
+  optional `DEFAULT`). `CREATE DOMAIN name AS base [DEFAULT expr] [ [CONSTRAINT c] { NOT NULL | CHECK
+  (…) } … ]` and `DROP DOMAIN [IF EXISTS] name` arrive as `exp.Command` (sqlglot doesn't model the
+  grammar) and are handled in `engine._create_domain_command` / `_drop_domain_command`; the base type +
+  constraints are re-parsed as a column def (`CREATE TABLE _ (value <body>)`) to reuse sqlglot's
+  column-constraint grammar. Stored in the `__sql_domains__` catalog collection (`catalog.create_domain`
+  / `get_domain` / `drop_domain` / `list_domains`). A domain-typed column stores as the domain's **base
+  tag** (`Column.domain_type`; the planner tags any user type as `enum_type`, and
+  `executor._resolve_user_type_column` disambiguates enum vs domain at `CREATE TABLE`, inheriting the
+  domain `DEFAULT` when the column declares none). Enforcement (`executor._validate_domain_columns`,
+  wired into `enforce_insert_rows` / `enforce_update_images` + the filter-update path): domain `NOT NULL`
+  → `23502` (`domain <name> does not allow null values`), domain `CHECK` (references the value as
+  `VALUE`) → `23514`; a `NULL` skips the `CHECK` (three-valued logic). Reflection: `pg_type` row
+  `typtype='d'` with `typbasetype`/`typnotnull`, the column's `pg_attribute.atttypid` → domain oid, and
+  each domain `CHECK` a `pg_constraint` row (`contype='c'`, `contypid`=domain oid). **Limitations:** the
+  domain `CHECK` is evaluated by the scalar engine, so the `~` / `~*` regex-match operators aren't
+  supported (→ `0A000`, same gap as table CHECKs); `ALTER DOMAIN` (add/drop constraint, set default) and
+  domain-on-domain aren't modeled; `DROP DOMAIN` doesn't check for dependent columns (no RESTRICT/CASCADE
+  dependency tracking).
 - [ ] **FOREIGN KEY enforcement on write landed** (b96): referential integrity is now enforced both
   ways (`23503`, `errors.foreign_key_violation`). **Child side** (`executor._validate_fk_child_rows`,
   wired into `execute_insert` + the UPDATE post-image path): an INSERT/UPDATE row whose FK columns are
