@@ -160,6 +160,38 @@ def compare_servers(
 
 
 @task(
+    name="startup-times",
+    help={
+        "reps": "Cold-start measurements per server (default: 5).",
+        "no-mongod": "Skip the mongod comparison (SecantusDB servers only).",
+        "json": "Emit machine-readable JSON instead of the formatted table.",
+    },
+)
+def startup_times(
+    c: Context,
+    reps: int = 5,
+    no_mongod: bool = False,
+    json: bool = False,
+) -> None:
+    """Compare cold-start startup latency of the three standalone servers.
+
+    Spawns mongod, the Python server (``python -m secantus``), and the Rust
+    server (the ``secantusdb`` binary) as standalone daemons over a fresh
+    on-disk WiredTiger dir, and reports how long each takes from process
+    spawn to serving its first ``ping`` (median / min / max / mean over
+    ``--reps`` cold starts). mongod is skipped when not on PATH; the Rust
+    server uses the standalone binary, so it does NOT need the embedded
+    ``_secantus_server`` extension built.
+    """
+    cmd = f"uv run --no-sync python -m bench.startup_times --reps {int(reps)}"
+    if no_mongod:
+        cmd += " --no-mongod"
+    if json:
+        cmd += " --json"
+    c.run(cmd, pty=True)
+
+
+@task(
     help={
         "duration": "Wall-clock seconds per writer count (default: 30).",
         "batch-size": "Documents per insert call (default: 100).",
