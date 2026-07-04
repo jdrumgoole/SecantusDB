@@ -45,6 +45,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
+#: Cap on concurrently-served connections — an over-cap accept is closed
+#: immediately rather than spawning a thread (mirrors the Mongo server's
+#: ``DEFAULT_MAX_CONNECTIONS``). Bounds the fan-out of the per-connection cursor
+#: caps so total memory is bounded even under an unauthenticated flood. (#194)
+DEFAULT_MAX_CONNECTIONS = 1000
 
 
 class SecantusPGServer:
@@ -57,6 +62,7 @@ class SecantusPGServer:
         storage: Any = None,
         default_database: str = "postgres",
         client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
         require_auth: bool = False,
         users: dict[str, str] | None = None,
         tls_cert_file: str | None = None,
@@ -66,6 +72,7 @@ class SecantusPGServer:
         self.port = port
         self.default_database = default_database
         self.client_idle_timeout_s = client_idle_timeout_s
+        self.max_connections = max_connections
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -155,6 +162,25 @@ class SecantusPGServer:
                 conn, addr = self._socket.accept()
             except OSError:
                 return
+            # Enforce the connection cap before spawning a handler, and register
+            # the socket under the lock so the count is accurate (the handler
+            # removes it on exit). An over-cap accept is closed immediately — the
+            # client sees a reset, not a hang. (#194)
+            with self._conns_lock:
+                if len(self._conns) >= self.max_connections:
+                    over_cap = True
+                else:
+                    self._conns.add(conn)
+                    over_cap = False
+            if over_cap:
+                logger.warning(
+                    "rejecting PG connection from %s: at %d-connection cap",
+                    addr,
+                    self.max_connections,
+                )
+                with contextlib.suppress(OSError):
+                    conn.close()
+                continue
             with contextlib.suppress(OSError):
                 conn.settimeout(self.client_idle_timeout_s)
             threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
@@ -162,8 +188,8 @@ class SecantusPGServer:
     # -- per-connection ----------------------------------------------------- #
 
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
-        with self._conns_lock:
-            self._conns.add(conn)
+        # NB: the socket is already registered in ``self._conns`` by
+        # ``_serve_forever`` (under the cap check); we only remove it on exit.
         session: Session | None = None
         try:
             with conn:

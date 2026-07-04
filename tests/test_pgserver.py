@@ -223,3 +223,31 @@ def test_information_schema_over_wire(client):
         )
     )["results"][0]
     assert res["rows"] == [[b"widgets"]]
+
+
+def test_connection_cap_rejects_over_limit():
+    """Over the max_connections cap, an accepted socket is closed immediately
+    rather than served (issue #194)."""
+    srv = SecantusPGServer(port=0, storage=FakeStorage(), max_connections=1)
+    srv.start()
+    try:
+        host, port = srv.address
+        c1 = PGClient(host, port)
+        c1.startup()  # occupies the single connection slot
+        # A second connection is accepted, then closed immediately by the server.
+        s2 = socket.create_connection((host, port), timeout=5)
+        try:
+            s2.sendall(pgwire.build_startup_message({"user": "x", "database": "d"}))
+            s2.settimeout(5)
+            try:
+                data = s2.recv(1)
+                assert data == b""  # clean EOF: the server closed the socket
+            except (ConnectionResetError, ConnectionAbortedError):
+                pass  # RST also acceptable — the server dropped the connection
+        finally:
+            s2.close()
+        # The first connection is unaffected.
+        assert parse_results(c1.query("SELECT 1"))["results"][0]["rows"] == [[b"1"]]
+        c1.close()
+    finally:
+        srv.stop()

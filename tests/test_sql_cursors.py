@@ -136,3 +136,49 @@ def test_fetch_unknown_cursor_errors(storage, session):
     with pytest.raises(SQLError) as ei:
         q(storage, session, "FETCH 1 FROM nope")
     assert ei.value.sqlstate == "34000"
+
+
+# --------------------------------------------------------------------------- #
+# Resource caps (issue #194)
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_rejects_overlong_statement():
+    from secantus.sql import planner
+
+    with pytest.raises(SQLError) as ei:
+        planner.parse("SELECT 1" + " " * (planner.MAX_SQL_LENGTH + 1))
+    assert ei.value.sqlstate == "54000"
+
+
+def test_parse_rejects_deeply_nested_statement():
+    from secantus.sql import planner
+
+    # Hundreds of nested parens blow Python's recursion limit inside sqlglot;
+    # we convert that to a clean 54000 instead of an uncaught RecursionError.
+    with pytest.raises(SQLError) as ei:
+        planner.parse("SELECT " + "(" * 500 + "1" + ")" * 500)
+    assert ei.value.sqlstate == "54000"
+
+
+def test_cursor_count_is_capped(storage, session, monkeypatch):
+    from secantus.sql import engine
+
+    monkeypatch.setattr(engine, "MAX_CURSORS_PER_SESSION", 2)
+    q(storage, session, "DECLARE c1 CURSOR FOR SELECT id FROM t")
+    q(storage, session, "DECLARE c2 CURSOR FOR SELECT id FROM t")
+    with pytest.raises(SQLError) as ei:
+        q(storage, session, "DECLARE c3 CURSOR FOR SELECT id FROM t")
+    assert ei.value.sqlstate == "54000"
+    # Re-declaring an existing name replaces it (no net growth) — still allowed.
+    q(storage, session, "DECLARE c1 CURSOR FOR SELECT id FROM t")
+
+
+def test_cursor_row_count_is_capped(storage, session, monkeypatch):
+    from secantus.sql import engine
+
+    monkeypatch.setattr(engine, "MAX_CURSOR_ROWS", 3)
+    # ``t`` has 5 rows; retaining all of them exceeds the cap.
+    with pytest.raises(SQLError) as ei:
+        q(storage, session, "DECLARE big CURSOR FOR SELECT id FROM t")
+    assert ei.value.sqlstate == "54000"

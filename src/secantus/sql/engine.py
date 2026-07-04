@@ -258,6 +258,12 @@ def _write_target_collection(
 
 _CURSOR_TAIL = re.compile(r"^(?P<opts>.*?)\bFOR\b\s+(?P<query>.*)$", re.IGNORECASE | re.DOTALL)
 
+#: Per-session caps on server-side cursors (each holds its whole result set in
+#: memory). Combined with the connection cap in ``pgserver``, these bound total
+#: memory under an unauthenticated flood. Generous enough for real use. (#194)
+MAX_CURSORS_PER_SESSION = 100
+MAX_CURSOR_ROWS = 1_000_000
+
 
 def _command_tail(stmt: exp.Command) -> str:
     arg = stmt.expression
@@ -282,14 +288,27 @@ def _declare_cursor(
     if not parts:
         raise errors.syntax_error("DECLARE CURSOR requires a cursor name")
     name = _unquote_ident(parts[0])
+    # Cap the number of open server-side cursors per session — each holds its
+    # whole result set in memory, so an unbounded count is a memory-DoS. A
+    # re-DECLARE of an existing name replaces it (no net growth). (#194)
+    if name not in session.cursors and len(session.cursors) >= MAX_CURSORS_PER_SESSION:
+        raise errors.program_limit_exceeded(
+            f"too many open cursors (limit {MAX_CURSORS_PER_SESSION}); CLOSE some first"
+        )
     hold = re.search(r"\bWITH\s+HOLD\b", opts, re.IGNORECASE) is not None
     stmts = planner.parse(m.group("query"))
     if len(stmts) != 1:
         raise errors.syntax_error("DECLARE CURSOR expects a single query")
     result = _run_query(stmts[0], storage, db, catalog, session)
-    session.cursors[name] = _Cursor(
-        name=name, columns=result.columns, rows=list(result.rows), pos=-1, hold=hold
-    )
+    rows = list(result.rows)
+    # Cap the materialized row set a single cursor retains (SecantusDB cursors
+    # are eager, unlike mongod's lazy ones). Bounds the memory one connection can
+    # pin; the number is generous so real queries aren't affected. (#194)
+    if len(rows) > MAX_CURSOR_ROWS:
+        raise errors.program_limit_exceeded(
+            f"cursor result too large: {len(rows)} rows exceeds the {MAX_CURSOR_ROWS} limit"
+        )
+    session.cursors[name] = _Cursor(name=name, columns=result.columns, rows=rows, pos=-1, hold=hold)
     return SQLResult(command_tag="DECLARE CURSOR")
 
 
