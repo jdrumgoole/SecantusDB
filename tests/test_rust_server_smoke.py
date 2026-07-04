@@ -565,3 +565,53 @@ def test_get_log_returns_connection_lines(tmp_path) -> None:
         assert any("connection accepted" in line for line in res["log"])
     finally:
         srv.stop()
+
+
+def test_geo_near_index_optimization_against_rust_server(tmp_path) -> None:
+    """A leading bounded ``$geoNear`` rides the geo index (conservative
+    ``$geoWithin`` candidate fetch) on the Rust server; output must be identical
+    to the brute-force scan. Compare an indexed collection against an unindexed
+    one over many random queries."""
+    import random
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        rng = random.Random(2024)
+        docs = [
+            {
+                "_id": i,
+                "loc": {
+                    "type": "Point",
+                    "coordinates": [rng.uniform(-15, 15), rng.uniform(-15, 15)],
+                },
+                "v": rng.randint(0, 5),
+            }
+            for i in range(400)
+        ]
+        db.idx.insert_many(docs)
+        db.noidx.insert_many(docs)
+        db.idx.create_index([("loc", "2dsphere")])  # only this one gets optimized
+
+        for _ in range(40):
+            cx, cy = rng.uniform(-15, 15), rng.uniform(-15, 15)
+            max_d = rng.uniform(50_000, 1_500_000)
+            stage = {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [cx, cy]},
+                    "distanceField": "d",
+                    "maxDistance": max_d,
+                    "key": "loc",
+                    "spherical": True,
+                }
+            }
+            pipeline: list[dict] = [stage]
+            if rng.random() < 0.4:
+                pipeline.append({"$match": {"v": {"$gte": 2}}})
+            if rng.random() < 0.3:
+                stage["$geoNear"]["query"] = {"v": {"$lte": 4}}
+            opt = [(d["_id"], round(d["d"], 6)) for d in db.idx.aggregate(pipeline)]
+            brute = [(d["_id"], round(d["d"], 6)) for d in db.noidx.aggregate(pipeline)]
+            assert opt == brute, f"center={(cx, cy)} maxDistance={max_d}"
+    finally:
+        srv.stop()
