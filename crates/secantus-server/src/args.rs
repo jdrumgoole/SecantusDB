@@ -2,24 +2,42 @@
 //!
 //! Lives here — not in the bin crate — so it is WT-free and unit-testable in
 //! the clean workspace (`cargo test -p secantus-server`). The WT-linked
-//! `crates/secantusdb` bin consumes [`parse_args`] and maps the result onto
+//! `crates/secantusdb` bin consumes [`parse_args`], resolves the TOML config
+//! (see [`crate::config`]), and maps the [`ResolvedConfig`] onto
 //! `secantus_storage::Storage` + `secantus_server::bind`.
 //!
-//! Mirrors the subset of `src/secantus/cli.py`'s flags the Rust server
-//! supports today: `--host`, `--port`, `--storage-path`, `--auth`,
-//! `--standalone`, and the four `--tls-*` options. Hand-rolled (no `clap`)
-//! to keep the dependency tree flat; both `--flag value` and `--flag=value`
-//! spellings are accepted.
+//! Mirrors `src/secantus/cli.py`'s flag surface. Every value-bearing flag is
+//! optional at the CLI layer: a flag the user did **not** pass stays `None` in
+//! the emitted [`ConfigOverrides`], so it can defer to the TOML file / built-in
+//! defaults (the precedence rule enforced in [`crate::config::resolve`]).
+//! Boolean flags (`--auth`, `--standalone`, `--sync-on-commit`,
+//! `--tls-require-client-cert`) are `store_true`: the CLI can only flip them to
+//! `true` (TOML can set either value). Hand-rolled (no `clap`) to keep the
+//! dependency tree flat; both `--flag value` and `--flag=value` spellings work.
 
+use std::path::PathBuf;
+
+use crate::config::{validate_log_level, ConfigOverrides, ResolvedConfig};
 use crate::{ServerConfig, TlsOptions};
 
-/// Defaults matching `src/secantus/config.py`'s `SecantusConfig`.
-const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 27017;
-const DEFAULT_STORAGE_PATH: &str = "./secantus-data";
+/// The raw result of parsing the command line: the config-file path (if
+/// `--config` was passed) and the set of overrides the user actually typed.
+/// The bin crate hands this to [`crate::config::resolve`] to layer the TOML
+/// file underneath and produce a [`ResolvedConfig`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ParsedRun {
+    /// The `--config PATH` value, if passed (disables auto-discovery).
+    pub config_path: Option<PathBuf>,
+    /// The CLI flags the user actually passed (highest precedence).
+    pub overrides: ConfigOverrides,
+}
 
-/// Parsed CLI: where to bind, where the WiredTiger home lives, and the
-/// [`ServerConfig`] handed to `bind`.
+/// A fully-resolved run configuration: where to bind, the WiredTiger home, and
+/// the storage/oplog/logging knobs. Built from a [`ResolvedConfig`] by
+/// [`CliArgs::from_resolved`] after TOML + CLI precedence has been applied. The
+/// `--standalone` → `replica_set_name` derivation happens here (post-precedence)
+/// so a TOML `[server] standalone = true/false` is honoured and a CLI
+/// `--standalone` forces STANDALONE.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
     pub host: String,
@@ -30,6 +48,14 @@ pub struct CliArgs {
     pub tls: Option<CliTls>,
     /// PITR v2: archive pruned oplog rows to this directory (off by default).
     pub oplog_archive_dir: Option<String>,
+    pub log_level: String,
+    pub cache_size: String,
+    pub session_max: u32,
+    pub sync_on_commit: bool,
+    pub noop_heartbeat_seconds: f64,
+    pub oplog_retention_seconds: f64,
+    pub oplog_max_entries: usize,
+    pub ttl_sweep_seconds: f64,
 }
 
 /// TLS options in plain-data form (the lib's [`TlsOptions`] is not `PartialEq`,
@@ -43,6 +69,40 @@ pub struct CliTls {
 }
 
 impl CliArgs {
+    /// Build resolved run args from a [`ResolvedConfig`] (TOML + CLI already
+    /// layered). Applies the TLS pairing rules and derives `replica_set_name`
+    /// from `standalone`. Returns an error string if the TLS options are
+    /// inconsistent (mirrors `server.py`'s constructor checks).
+    pub fn from_resolved(cfg: &ResolvedConfig) -> Result<Self, String> {
+        let tls = build_tls(
+            cfg.tls_cert_file.clone(),
+            cfg.tls_key_file.clone(),
+            cfg.tls_ca_file.clone(),
+            cfg.tls_require_client_cert,
+        )?;
+        Ok(CliArgs {
+            host: cfg.host.clone(),
+            port: cfg.port,
+            storage_path: cfg.storage_path.clone(),
+            replica_set_name: if cfg.standalone {
+                None
+            } else {
+                Some("secantus".to_string())
+            },
+            require_auth: cfg.auth,
+            tls,
+            oplog_archive_dir: cfg.oplog_archive_dir.clone(),
+            log_level: cfg.log_level.clone(),
+            cache_size: cfg.cache_size.clone(),
+            session_max: cfg.session_max,
+            sync_on_commit: cfg.sync_on_commit,
+            noop_heartbeat_seconds: cfg.noop_heartbeat_seconds,
+            oplog_retention_seconds: cfg.oplog_retention_seconds,
+            oplog_max_entries: cfg.oplog_max_entries,
+            ttl_sweep_seconds: cfg.ttl_sweep_seconds,
+        })
+    }
+
     /// The `ServerConfig` for `bind`.
     pub fn server_config(&self) -> ServerConfig {
         ServerConfig {
@@ -64,10 +124,49 @@ impl CliArgs {
     }
 }
 
-/// Outcome of parsing: run the server, or print a text and exit cleanly.
+/// Apply the TLS pairing rules (cert+key both-or-neither; CA / mandatory-mTLS
+/// need cert+key; mandatory-mTLS needs a CA). Shared between CLI-only parsing
+/// and the full resolved-config path.
+fn build_tls(
+    cert_file: Option<String>,
+    key_file: Option<String>,
+    ca_file: Option<String>,
+    require_client_cert: bool,
+) -> Result<Option<CliTls>, String> {
+    let tls = match (cert_file, key_file) {
+        (Some(cert_file), Some(key_file)) => Some(CliTls {
+            cert_file,
+            key_file,
+            ca_file,
+            require_client_cert,
+        }),
+        (None, None) => {
+            if ca_file.is_some() {
+                return Err("--tls-ca-file requires --tls-cert-file and --tls-key-file".to_string());
+            }
+            if require_client_cert {
+                return Err(
+                    "--tls-require-client-cert requires --tls-cert-file and --tls-key-file"
+                        .to_string(),
+                );
+            }
+            None
+        }
+        _ => return Err("--tls-cert-file and --tls-key-file must be passed together".to_string()),
+    };
+    if let Some(t) = &tls {
+        if t.require_client_cert && t.ca_file.is_none() {
+            return Err("--tls-require-client-cert requires --tls-ca-file".to_string());
+        }
+    }
+    Ok(tls)
+}
+
+/// Outcome of parsing: run the server (with the raw CLI overrides + config
+/// path), or print a text and exit cleanly.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parsed {
-    Run(CliArgs),
+    Run(Box<ParsedRun>),
     /// `--help`: the usage text to print to stdout.
     Help(String),
     /// `--version`: the version line to print to stdout.
@@ -76,19 +175,21 @@ pub enum Parsed {
 
 /// Parse `args` (NOT including the binary name, i.e. `env::args().skip(1)`).
 ///
+/// Emits a [`ParsedRun`] carrying only the flags the user passed — the TOML
+/// file is layered underneath by [`crate::config::resolve`] afterwards.
+///
 /// Errors are user-facing strings; the bin prints them to stderr with the
 /// usage hint and exits 2 (argparse's exit code for bad args).
 pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
-    let mut host = DEFAULT_HOST.to_string();
-    let mut port = DEFAULT_PORT;
-    let mut storage_path = DEFAULT_STORAGE_PATH.to_string();
-    let mut auth = false;
-    let mut standalone = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut o = ConfigOverrides::default();
+    // TLS bits are parsed piecemeal, then validated by the resolved-config path;
+    // but a CLI-only inconsistency (e.g. `--tls-cert-file` alone) must still be
+    // caught here so a bad command line fails before TOML is even read.
     let mut tls_cert_file: Option<String> = None;
     let mut tls_key_file: Option<String> = None;
     let mut tls_ca_file: Option<String> = None;
     let mut tls_require_client_cert = false;
-    let mut oplog_archive_dir: Option<String> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -116,110 +217,152 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     env!("CARGO_PKG_VERSION")
                 )))
             }
-            "--host" => host = take_value("--host")?,
+            "--config" => config_path = Some(PathBuf::from(take_value("--config")?)),
+            "--host" => o.host = Some(take_value("--host")?),
             "--port" => {
                 let raw = take_value("--port")?;
-                port = raw
-                    .parse::<u16>()
-                    .map_err(|_| format!("--port expects an integer in 0..=65535, got {raw:?}"))?;
+                o.port =
+                    Some(raw.parse::<u16>().map_err(|_| {
+                        format!("--port expects an integer in 0..=65535, got {raw:?}")
+                    })?);
             }
-            "--storage-path" => storage_path = take_value("--storage-path")?,
-            "--auth" => auth = true,
-            "--standalone" => standalone = true,
+            "--storage-path" => o.storage_path = Some(take_value("--storage-path")?),
+            "--log-level" => {
+                let lvl = take_value("--log-level")?;
+                validate_log_level(&lvl, "secantusdb").map_err(|_| {
+                    format!("--log-level must be one of DEBUG/INFO/WARNING/ERROR, got {lvl:?}")
+                })?;
+                o.log_level = Some(lvl);
+            }
+            "--cache-size" => o.cache_size = Some(take_value("--cache-size")?),
+            "--session-max" => {
+                let raw = take_value("--session-max")?;
+                o.session_max = Some(raw.parse::<u32>().map_err(|_| {
+                    format!("--session-max expects a non-negative integer, got {raw:?}")
+                })?);
+            }
+            "--sync-on-commit" => o.sync_on_commit = Some(true),
+            "--noop-heartbeat-seconds" => {
+                let raw = take_value("--noop-heartbeat-seconds")?;
+                o.noop_heartbeat_seconds = Some(raw.parse::<f64>().map_err(|_| {
+                    format!("--noop-heartbeat-seconds expects a number, got {raw:?}")
+                })?);
+            }
+            "--oplog-retention-seconds" => {
+                let raw = take_value("--oplog-retention-seconds")?;
+                o.oplog_retention_seconds = Some(raw.parse::<f64>().map_err(|_| {
+                    format!("--oplog-retention-seconds expects a number, got {raw:?}")
+                })?);
+            }
+            "--oplog-max-entries" => {
+                let raw = take_value("--oplog-max-entries")?;
+                o.oplog_max_entries = Some(raw.parse::<usize>().map_err(|_| {
+                    format!("--oplog-max-entries expects a non-negative integer, got {raw:?}")
+                })?);
+            }
+            "--auth" => o.auth = Some(true),
+            "--standalone" => o.standalone = Some(true),
             "--tls-cert-file" => tls_cert_file = Some(take_value("--tls-cert-file")?),
             "--tls-key-file" => tls_key_file = Some(take_value("--tls-key-file")?),
             "--tls-ca-file" => tls_ca_file = Some(take_value("--tls-ca-file")?),
             "--tls-require-client-cert" => tls_require_client_cert = true,
-            "--oplog-archive-dir" => oplog_archive_dir = Some(take_value("--oplog-archive-dir")?),
+            "--oplog-archive-dir" => o.oplog_archive_dir = Some(take_value("--oplog-archive-dir")?),
             other => return Err(format!("unknown argument: {other}")),
         }
-        // Reject `--auth=yes`-style inline values on boolean flags.
+        // Reject `--auth=yes`-style inline values on boolean / no-value flags.
         if inline.is_some()
             && matches!(
                 flag,
-                "--auth" | "--standalone" | "--tls-require-client-cert" | "--help" | "--version"
+                "--auth"
+                    | "--standalone"
+                    | "--sync-on-commit"
+                    | "--tls-require-client-cert"
+                    | "--help"
+                    | "--version"
             )
         {
             return Err(format!("{flag} does not take a value"));
         }
     }
 
-    // TLS pairing rules (matching server.py / the embedded handle): cert+key
-    // both-or-neither; the CA file and mandatory-mTLS flag need cert+key; the
-    // mandatory-mTLS flag needs a CA to verify against.
-    let tls = match (tls_cert_file, tls_key_file) {
-        (Some(cert_file), Some(key_file)) => Some(CliTls {
-            cert_file,
-            key_file,
-            ca_file: tls_ca_file,
-            require_client_cert: tls_require_client_cert,
-        }),
-        (None, None) => {
-            if tls_ca_file.is_some() {
-                return Err("--tls-ca-file requires --tls-cert-file and --tls-key-file".to_string());
-            }
-            if tls_require_client_cert {
-                return Err(
-                    "--tls-require-client-cert requires --tls-cert-file and --tls-key-file"
-                        .to_string(),
-                );
-            }
-            None
-        }
-        _ => return Err("--tls-cert-file and --tls-key-file must be passed together".to_string()),
-    };
-    if let Some(t) = &tls {
-        if t.require_client_cert && t.ca_file.is_none() {
-            return Err("--tls-require-client-cert requires --tls-ca-file".to_string());
+    // Validate the CLI-only TLS combination up front (a bad command line fails
+    // before TOML is read). The resolved-config path re-validates the merged
+    // result (a TOML-supplied cert/key still gets checked).
+    let cli_tls = build_tls(
+        tls_cert_file.clone(),
+        tls_key_file.clone(),
+        tls_ca_file.clone(),
+        tls_require_client_cert,
+    )?;
+    if let Some(t) = cli_tls {
+        o.tls_cert_file = Some(t.cert_file);
+        o.tls_key_file = Some(t.key_file);
+        o.tls_ca_file = t.ca_file;
+        if t.require_client_cert {
+            o.tls_require_client_cert = Some(true);
         }
     }
 
-    Ok(Parsed::Run(CliArgs {
-        host,
-        port,
-        storage_path,
-        replica_set_name: if standalone {
-            None
-        } else {
-            Some("secantus".to_string())
-        },
-        require_auth: auth,
-        tls,
-        oplog_archive_dir,
-    }))
+    Ok(Parsed::Run(Box::new(ParsedRun {
+        config_path,
+        overrides: o,
+    })))
 }
 
-/// The `--help` text. Mirrors the wording of `src/secantus/cli.py` for the
-/// flags the Rust server supports.
+/// The `--help` text. Mirrors the wording of `src/secantus/cli.py`.
 pub fn usage() -> String {
     format!(
         "\
 secantusdb {} — standalone single-node MongoDB-compatible server (Rust)
 
+Flags override values in secantusdb.toml; secantusdb.toml overrides built-in
+defaults.
+
 USAGE:
     secantusdb [OPTIONS]
 
 OPTIONS:
-    --host HOST                  Bind address (default: {DEFAULT_HOST})
+    --config PATH                Path to a secantusdb.toml config file. When
+                                 omitted, auto-discovers ./secantusdb.toml,
+                                 ~/.secantus/secantusdb.toml,
+                                 /etc/secantus/secantusdb.toml (first hit wins).
+                                 Passing this flag disables auto-discovery.
+    --host HOST                  Bind address (default: 127.0.0.1)
     --port PORT                  Bind port; 0 picks an ephemeral port and
-                                 prints it on startup (default: {DEFAULT_PORT})
+                                 prints it on startup (default: 27017)
     --storage-path PATH          WiredTiger home directory; created if missing,
                                  reopened intact across restarts
-                                 (default: {DEFAULT_STORAGE_PATH})
+                                 (default: ./secantus-data)
+    --log-level LEVEL            One of DEBUG/INFO/WARNING/ERROR (default: INFO)
     --auth                       Require SCRAM-SHA-256 authentication for
                                  non-handshake commands
     --standalone                 Drop the single-node replica-set advertisement
                                  from the hello reply (drivers see a STANDALONE
                                  topology; change streams need the default)
+    --cache-size SIZE            WiredTiger cache size, unit-suffixed string like
+                                 '256M', '1G', '8G' (default: 1G)
+    --session-max N              WiredTiger session_max — concurrent WT session
+                                 cap (default: 1000)
+    --sync-on-commit             Fsync the WT log on every transaction commit
+                                 (closes the writeConcern j:true durability gap
+                                 at a throughput cost; off by default)
+    --noop-heartbeat-seconds S   Emit a periodic {{op:'n'}} oplog heartbeat every
+                                 S seconds so quiet change-stream cursors keep
+                                 their resume token inside the retention window.
+                                 0 = disabled (default)
+    --oplog-retention-seconds S  Oplog wall-clock retention; entries older than
+                                 this are pruned opportunistically (default: 3600)
+    --oplog-max-entries N        Oplog count cap; whichever bound hits first
+                                 prunes the oldest entries (default: 100000)
+    --oplog-archive-dir DIR      PITR v2: archive pruned oplog rows here before
+                                 they are dropped, so recovery can reach a time
+                                 before the live oplog floor (off by default)
     --tls-cert-file PATH         PEM server certificate chain (with
                                  --tls-key-file, enables TLS)
     --tls-key-file PATH          PEM private key matching --tls-cert-file
     --tls-ca-file PATH           PEM CA bundle to verify client certs (mTLS)
     --tls-require-client-cert    Reject clients without a valid X.509 cert;
                                  requires --tls-ca-file
-    --oplog-archive-dir DIR      PITR v2: archive pruned oplog rows here before
-                                 they are dropped, so recovery can reach a time
-                                 before the live oplog floor (off by default)
     --version                    Print the version and exit
     -h, --help                   Print this help and exit
 ",
@@ -236,22 +379,46 @@ mod tests {
         parse_args(&owned)
     }
 
+    /// Parse into a [`ParsedRun`], then resolve with no TOML file so the result
+    /// reflects CLI-over-defaults (the common test path).
     fn run(words: &[&str]) -> CliArgs {
-        match parse(words).expect("parse should succeed") {
-            Parsed::Run(a) => a,
+        let pr = match parse(words).expect("parse should succeed") {
+            Parsed::Run(pr) => pr,
             other => panic!("expected Run, got {other:?}"),
+        };
+        let mut cfg = ResolvedConfig::default();
+        pr.overrides.apply_to_for_test(&mut cfg);
+        CliArgs::from_resolved(&cfg).expect("resolved config should be valid")
+    }
+
+    // A tiny test shim so we don't need to expose `ConfigOverrides::apply_to`.
+    impl ConfigOverrides {
+        fn apply_to_for_test(&self, base: &mut ResolvedConfig) {
+            // Re-use the real precedence application via config::resolve would
+            // need a file; instead round-trip through resolve with no file by
+            // constructing directly. Simplest: mirror the public resolve path.
+            let (cfg, _src) = crate::config::resolve(None, self).expect("resolve without file");
+            *base = cfg;
         }
     }
 
     #[test]
     fn defaults() {
         let a = run(&[]);
-        assert_eq!(a.host, DEFAULT_HOST);
-        assert_eq!(a.port, DEFAULT_PORT);
-        assert_eq!(a.storage_path, DEFAULT_STORAGE_PATH);
+        assert_eq!(a.host, "127.0.0.1");
+        assert_eq!(a.port, 27017);
+        assert_eq!(a.storage_path, "./secantus-data");
         assert_eq!(a.replica_set_name.as_deref(), Some("secantus"));
         assert!(!a.require_auth);
         assert!(a.tls.is_none());
+        assert_eq!(a.log_level, "INFO");
+        assert_eq!(a.cache_size, "1G");
+        assert_eq!(a.session_max, 1000);
+        assert!(!a.sync_on_commit);
+        assert_eq!(a.noop_heartbeat_seconds, 0.0);
+        assert_eq!(a.oplog_retention_seconds, 3600.0);
+        assert_eq!(a.oplog_max_entries, 100_000);
+        assert_eq!(a.ttl_sweep_seconds, 60.0);
     }
 
     #[test]
@@ -285,6 +452,7 @@ mod tests {
     fn boolean_flag_rejects_inline_value() {
         assert!(parse(&["--auth=yes"]).is_err());
         assert!(parse(&["--standalone=1"]).is_err());
+        assert!(parse(&["--sync-on-commit=1"]).is_err());
     }
 
     #[test]
@@ -294,12 +462,61 @@ mod tests {
     }
 
     #[test]
+    fn new_scalar_flags_resolve() {
+        let a = run(&[
+            "--log-level",
+            "DEBUG",
+            "--cache-size",
+            "512M",
+            "--session-max",
+            "200",
+            "--sync-on-commit",
+            "--noop-heartbeat-seconds",
+            "1.5",
+            "--oplog-retention-seconds",
+            "60",
+            "--oplog-max-entries",
+            "500",
+        ]);
+        assert_eq!(a.log_level, "DEBUG");
+        assert_eq!(a.cache_size, "512M");
+        assert_eq!(a.session_max, 200);
+        assert!(a.sync_on_commit);
+        assert_eq!(a.noop_heartbeat_seconds, 1.5);
+        assert_eq!(a.oplog_retention_seconds, 60.0);
+        assert_eq!(a.oplog_max_entries, 500);
+    }
+
+    #[test]
+    fn bad_log_level_rejected() {
+        assert!(parse(&["--log-level", "TRACE"]).is_err());
+    }
+
+    #[test]
+    fn bad_numeric_flags_rejected() {
+        assert!(parse(&["--session-max", "-1"]).is_err());
+        assert!(parse(&["--oplog-max-entries", "x"]).is_err());
+        assert!(parse(&["--noop-heartbeat-seconds", "abc"]).is_err());
+    }
+
+    #[test]
+    fn config_flag_captured() {
+        let pr = match parse(&["--config", "/tmp/foo.toml"]).unwrap() {
+            Parsed::Run(pr) => pr,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        assert_eq!(
+            pr.config_path.as_deref(),
+            Some(PathBuf::from("/tmp/foo.toml").as_path())
+        );
+    }
+
+    #[test]
     fn tls_pairing_enforced() {
         assert!(parse(&["--tls-cert-file", "c.pem"]).is_err());
         assert!(parse(&["--tls-key-file", "k.pem"]).is_err());
         assert!(parse(&["--tls-ca-file", "ca.pem"]).is_err());
         assert!(parse(&["--tls-require-client-cert"]).is_err());
-        // require-client-cert without a CA is also an error even with cert+key.
         assert!(parse(&[
             "--tls-cert-file",
             "c.pem",

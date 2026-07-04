@@ -1,6 +1,6 @@
 [package]
 name = "secantus-server"
-version = "0.5.3-beta.127"
+version = "0.5.3-beta.128"
 edition = "2021"
 description = "The standalone SecantusDB Rust server: TCP accept loop + connection handling over secantus-wire + secantus-commands."
 license = "GPL-2.0-only"
@@ -28,6 +28,8 @@ secantus-commands = { path = "../secantus-commands" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 x509-parser = "0.16"
+# TOML config-file loader for the standalone `secantusdb` daemon (`--config`).
+toml = "0.8"
 
 [dev-dependencies]
 # Self-signed cert generation for the TLS integration tests (ring backend).
