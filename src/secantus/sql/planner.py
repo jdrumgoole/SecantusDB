@@ -3120,6 +3120,55 @@ def _resolve_source(
     return (node.alias or node.name), tdef
 
 
+def _unnest_join_stage(
+    unnest: exp.Unnest, side: str, amap: dict[str, tuple[str, TableDef]]
+) -> tuple[list[dict[str, Any]], str, TableDef]:
+    """A ``FROM … , unnest(<array>) AS alias`` table-function source. Returns the
+    ``$addFields`` + ``$unwind`` stages, the alias, and a synthetic one-column
+    ``TableDef`` (the unwound element, exposed at the top level).
+
+    The array source may be a column of an already-joined table (``t.tags``) or an
+    ``ARRAY[…]`` literal. ``WITH ORDINALITY`` and multi-array unnest aren't
+    supported."""
+    alias_node = unnest.args.get("alias")
+    if alias_node is None or not alias_node.name:
+        raise errors.feature_not_supported("unnest() in FROM requires an alias")
+    alias = alias_node.name
+    if unnest.args.get("offset"):
+        raise errors.feature_not_supported("unnest … WITH ORDINALITY is not supported")
+    exprs = unnest.expressions
+    if len(exprs) != 1:
+        raise errors.feature_not_supported("unnest() of multiple arrays is not supported")
+    # An ``AS x(v)`` column-alias names the element column; else it's the alias.
+    col_idents = alias_node.args.get("columns") or []
+    col_name = col_idents[0].name if col_idents else alias
+
+    arr = exprs[0]
+    while isinstance(arr, (exp.Paren, exp.Cast)):  # unwrap ``ARRAY[…]::text[]`` etc.
+        arr = arr.this
+    if _is_field_node(arr):
+        path, tag = _field(arr, _join_resolver(amap))
+        elem_tag = typemap.array_element_tag(tag) if typemap.is_array_tag(tag) else "any"
+        arr_value: Any = f"${path}"
+    elif isinstance(arr, exp.Array):
+        items = [_literal(e) for e in arr.expressions]
+        elem_tag = _infer_value_tag(items[0]) if items else "any"
+        arr_value = items
+    else:
+        raise errors.feature_not_supported(f"unsupported unnest() source: {arr.sql()}")
+
+    stages = [
+        {"$addFields": {col_name: arr_value}},
+        {"$unwind": {"path": f"${col_name}", "preserveNullAndEmptyArrays": side == "LEFT"}},
+    ]
+    tdef = TableDef(
+        name=alias,
+        collection=alias,
+        columns=[Column(col_name, elem_tag, col_name, pk=False, nullable=True)],
+    )
+    return stages, alias, tdef
+
+
 def _build_join_pipeline(
     stmt: exp.Select, db: str, catalog: Any, storage: Any
 ) -> tuple[
@@ -3168,6 +3217,14 @@ def _build_join_pipeline(
             )
             pipeline.extend(stages)
             amap[lat_alias] = ("join", lat_table)
+            continue
+        if isinstance(jt, exp.Unnest):
+            # ``FROM t, unnest(t.tags) AS tag`` — a table-function source. Expose
+            # the array under the alias column, then $unwind it (one row per
+            # element, paired with the outer row). LEFT/comma keeps empty arrays.
+            stages, un_alias, un_tdef = _unnest_join_stage(jt, side, amap)
+            pipeline.extend(stages)
+            amap[un_alias] = ("base", un_tdef)  # element field lives at top level
             continue
         join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
         if on is None:

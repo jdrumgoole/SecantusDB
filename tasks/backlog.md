@@ -1562,9 +1562,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `array_position` (1-based, NULL if absent), `array_remove`, `array_to_string` (optional null-string
   arg; NULL elements dropped otherwise). `array_agg` populates a declared array column via `INSERT …
   SELECT`. **Limitations:** one level deep only (no multi-dimensional arrays — `array_length(col, 2)` is
-  NULL); the FROM-clause table form `FROM unnest(col)` is unsupported; array functions are evaluated in
-  Python (SELECT-list / INSERT-SELECT), not pushed into a Mongo `$match` when used in WHERE; no
-  element-type coercion beyond the scalar tags.
+  NULL); array functions are evaluated in Python (SELECT-list / INSERT-SELECT), not pushed into a Mongo
+  `$match` when used in WHERE; no element-type coercion beyond the scalar tags. The FROM-clause table form
+  `SELECT … FROM t, unnest(t.tags) AS tag` landed in b119 (`planner._unnest_join_stage`: an `$addFields`
+  exposing the array under the alias column + `$unwind`; a synthetic one-column `TableDef` registered at
+  top level in the join `amap`; inner/comma/CROSS drops empty arrays, `LEFT JOIN … ON true` keeps them with
+  a NULL element; the `AS x(v)` column-alias form works). Tests: `tests/test_sql_unnest_from.py`.
+  **Remaining unnest limitations:** the base-less form (`FROM unnest(ARRAY[…])` with no other table) →
+  `42703` (use the SELECT-list `SELECT unnest(…)` form); `WITH ORDINALITY` and multi-array `unnest(a, b)`
+  unsupported.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys landed** (b117): a `PRIMARY KEY (a, b)` maps to a subdocument `_id: {a, b}`

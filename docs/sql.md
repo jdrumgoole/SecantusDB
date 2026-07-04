@@ -438,6 +438,20 @@ And `array_agg` can populate a declared array column via `INSERT … SELECT`:
 INSERT INTO groups (grp, members) SELECT grp, array_agg(user_id) FROM m GROUP BY grp;
 ```
 
+`unnest(array_col)` also works as a FROM-clause table function — each outer row is
+paired with one row per array element, exposed under the alias:
+
+```sql
+SELECT id, tag FROM post, unnest(tags) AS tag;     -- one row per (post, tag)
+SELECT id, count(*) FROM post, unnest(tags) AS t GROUP BY id;
+```
+
+An inner (comma / `CROSS JOIN`) form drops a row whose array is empty; a
+`LEFT JOIN unnest(tags) AS t ON true` keeps it with a NULL element. The
+column-alias form (`unnest(tags) AS x(v)`) names the element column. The base-less
+form (`FROM unnest(ARRAY[…])` with no other table) and `WITH ORDINALITY` are not
+yet supported — use the SELECT-list form (`SELECT unnest(ARRAY[…])`) for the former.
+
 ### Foreign keys
 
 Column-level `REFERENCES` and table-level `FOREIGN KEY` — named or unnamed — are
