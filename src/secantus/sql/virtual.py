@@ -115,14 +115,14 @@ def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, 
     for t in _user_tables(db, catalog):
         relid = table_oids[t.name]
         field_to_attnum = {col.field: i for i, col in enumerate(t.columns, start=1)}
-        pk = t.pk_column
-        if pk is not None:
+        pk_cols = t.pk_columns
+        if pk_cols:
             out.append(
                 {
                     "indexrelid": oid,
                     "indrelid": relid,
                     "relname": f"{t.name}_pkey",
-                    "indkey": [field_to_attnum.get(pk.field, 1)],
+                    "indkey": [field_to_attnum.get(c.field, 1) for c in pk_cols],
                     "unique": True,
                     "primary": True,
                     "conname": f"{t.name}_pkey",
@@ -231,9 +231,9 @@ def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list
     an index, not a constraint), so these builders surface PK rows only."""
     out: list[tuple[TableDef, str, list[str]]] = []
     for t in _user_tables(db, catalog):
-        pk = t.pk_column
-        if pk is not None:
-            out.append((t, f"{t.name}_pkey", [pk.name]))
+        pk_cols = t.pk_columns
+        if pk_cols:
+            out.append((t, f"{t.name}_pkey", [c.name for c in pk_cols]))
     return out
 
 
@@ -267,8 +267,8 @@ def _foreign_keys(db: str, catalog: Catalog) -> list[dict[str, Any]]:
         for fk in t.foreign_keys:
             ref = tables.get(fk.ref_table)
             ref_cols = list(fk.ref_columns)
-            if not ref_cols and ref is not None and ref.pk_column is not None:
-                ref_cols = [ref.pk_column.name]  # REFERENCES t → its PRIMARY KEY
+            if not ref_cols and ref is not None and ref.pk_columns:
+                ref_cols = [c.name for c in ref.pk_columns]  # REFERENCES t → its PRIMARY KEY
             ref_attnum = {c.name: i for i, c in enumerate(ref.columns, start=1)} if ref else {}
             out.append(
                 {

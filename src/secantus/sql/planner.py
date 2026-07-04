@@ -18,12 +18,13 @@ import json
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import sqlglot
 from sqlglot import exp
 
+from secantus.paths import set_path
 from secantus.sql import errors, typemap
 from secantus.sql.catalog import (
     CheckConstraint,
@@ -874,11 +875,11 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
     pk_seen = False
     for coldef in schema.expressions:
         if isinstance(coldef, exp.PrimaryKey):
-            # Table-level PRIMARY KEY (col) — mark the named column.
+            # Table-level PRIMARY KEY (col, ...) — mark the named column(s). A
+            # composite PK maps to a subdocument ``_id`` (field ``_id.<name>`` per
+            # column); a single PK maps directly to ``_id``.
             names = [_column_name(c) for c in coldef.expressions]
-            if len(names) != 1:
-                raise errors.feature_not_supported("composite primary keys are not supported")
-            columns = [_with_pk(c, names[0]) for c in columns]
+            columns = [_with_pk(c, names) for c in columns]
             pk_seen = True
             continue
         if isinstance(coldef, exp.ForeignKey):
@@ -1116,10 +1117,14 @@ def _extract_constraints(
     return checks, uniques
 
 
-def _with_pk(col: Column, pk_name: str) -> Column:
-    if col.name != pk_name:
+def _with_pk(col: Column, pk_names: list[str]) -> Column:
+    """Mark ``col`` as a PK column if it's named in ``pk_names``. A composite PK
+    (>1 name) maps each column to the subdocument field ``_id.<name>``; a single
+    PK maps to ``_id``. Preserves the column's other attributes."""
+    if col.name not in pk_names:
         return col
-    return Column(name=col.name, type_tag=col.type_tag, field="_id", pk=True, nullable=False)
+    field = f"_id.{col.name}" if len(pk_names) > 1 else "_id"
+    return replace(col, field=field, pk=True, nullable=False)
 
 
 def plan_drop_table(stmt: exp.Drop) -> DropTablePlan:
@@ -1227,7 +1232,7 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             )
         if raw is None and not col.nullable:
             raise errors.not_null_violation(name)
-        doc[col.field] = typemap.coerce(raw, col.type_tag)
+        _set_doc_field(doc, col.field, typemap.coerce(raw, col.type_tag))
         provided.add(name)
     # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
     # omission is a violation. A sequence-backed column (SERIAL / DEFAULT
@@ -1238,10 +1243,32 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
         if col.sequence is not None or col.generated is not None:
             continue  # filled by the executor (sequence draw / computed expr)
         if col.has_default:
-            doc[col.field] = typemap.coerce(col.default, col.type_tag)
+            _set_doc_field(doc, col.field, typemap.coerce(col.default, col.type_tag))
         elif not col.nullable:
             raise errors.not_null_violation(col.name)
+    _canonicalize_composite_id(doc, table)
     return doc
+
+
+def _set_doc_field(doc: dict[str, Any], field: str, value: Any) -> None:
+    """Assign a column's value to its storage field. A composite-PK column has a
+    dotted field (``_id.<name>``) that builds a subdocument ``_id``; a plain field
+    is a direct key."""
+    if "." in field:
+        set_path(doc, field, value)
+    else:
+        doc[field] = value
+
+
+def _canonicalize_composite_id(doc: dict[str, Any], table: TableDef) -> None:
+    """Rebuild a composite-PK ``_id`` subdocument with its keys in PK-declaration
+    order. Mongo treats ``{a:1,b:2}`` and ``{b:2,a:1}`` as distinct ``_id`` values,
+    so a stable key order keeps equality / uniqueness deterministic regardless of
+    the INSERT's column order."""
+    if not table.composite_pk or not isinstance(doc.get("_id"), dict):
+        return
+    ordered = {c.name: doc["_id"][c.name] for c in table.pk_columns if c.name in doc["_id"]}
+    doc["_id"] = ordered
 
 
 def copy_row_doc(col_names: list[str], values: list[Any], table: TableDef) -> dict[str, Any]:

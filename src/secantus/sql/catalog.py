@@ -151,6 +151,17 @@ class TableDef:
                 return c
         return None
 
+    @property
+    def pk_columns(self) -> list[Column]:
+        """All PRIMARY KEY columns in declaration order. A composite PK maps to a
+        subdocument ``_id`` (each column's field is ``_id.<name>``); a single PK
+        maps directly to ``_id``."""
+        return [c for c in self.columns if c.pk]
+
+    @property
+    def composite_pk(self) -> bool:
+        return len(self.pk_columns) > 1
+
 
 def _to_doc(table: TableDef) -> dict[str, Any]:
     return {

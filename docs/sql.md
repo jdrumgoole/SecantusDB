@@ -122,9 +122,28 @@ aren't run in CI.
 
 ## Declared tables
 
-`CREATE TABLE` records a typed schema in a per-database catalog. The single
+`CREATE TABLE` records a typed schema in a per-database catalog. A single
 `PRIMARY KEY` column maps to the document `_id`, so PK uniqueness rides the
-storage layer's `_id` index.
+storage layer's `_id` index. A **composite** `PRIMARY KEY (a, b)` maps to a
+subdocument `_id: {a, b}` — uniqueness still rides the `_id` index, and the
+subdocument's key order is fixed to the PK declaration order so equality is
+independent of the column order you insert with:
+
+```sql
+CREATE TABLE membership (
+    org_id  bigint,
+    user_id bigint,
+    role    text,
+    PRIMARY KEY (org_id, user_id)
+);
+INSERT INTO membership VALUES (1, 100, 'admin');
+INSERT INTO membership VALUES (1, 100, 'member');  -- error 23505 (duplicate key)
+SELECT role FROM membership WHERE org_id = 1 AND user_id = 100;
+```
+
+Both PK columns reflect through `pg_index` / `pg_constraint` / SQLAlchemy's
+`get_pk_constraint`. Updating any PK column is rejected (`0A000`) — the `_id` a
+row maps to is immutable, as in a real MongoDB deployment.
 
 ```sql
 CREATE TABLE users (
