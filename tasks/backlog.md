@@ -1539,6 +1539,25 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   Tests: `tests/test_sql_range_agg.py` (27: pure algebra + SQL surface) and a pg8000 wire test. **Not yet:**
   multirange containment/overlap operators (`@>`/`&&` on multiranges), `range_intersect_agg`, multirange
   extraction functions, range_agg over a JOIN or GROUPING SETS, and range GiST indexes.
+- [ ] **Full-text search landed** (b141): `tsvector` / `tsquery` types + `to_tsvector` / `to_tsquery` /
+  `plainto_tsquery`, the `@@` match operator, and `ts_rank`. New self-contained `secantus/sql/fts.py`:
+  `to_tsvector` → `{"tsvector": {lexeme: [pos, …]}}` (lower-cased tokens, English stop-words dropped, 1-based
+  positions); `to_tsquery` (a recursive-descent parser over `& | !` + parens) / `plainto_tsquery` →
+  `{"tsquery": <node>}` boolean tree; `matches` evaluates the tree against the vector's lexeme set;
+  `ts_rank` is a log-dampened match-count (monotonic so `ORDER BY ts_rank(...) DESC` works). Wired through
+  `typemap` (OIDs tsvector 3614 / tsquery 3615, `_FTS_TAGS`, `to_pg_text` → `render_tsvector` /
+  `render_tsquery`, `coerce` → parse, names in `type_tag_for_sql` / `SQL_TYPE_NAME` / `PG_TYPENAME`);
+  `scalar._call_func` (the builders + `ts_rank` / `ts_rank_cd`) and `scalar._eval_fts_match` (the `@@`
+  operator — `exp.MatchAgainst`, shared with jsonb `@@`; a `_NOT_FTS` sentinel defers non-FTS operands to the
+  jsonb-path predicate); `scalar._eval_cast` parses FTS literals; `planner._literal` builds the constructor
+  subdoc, `_infer_scalar_tag` types the builders (tsvector/tsquery) + `ts_rank` (float8) — `@@` already types
+  bool. `where_needs_per_row` routes a `@@` WHERE to the per-row scalar path, and `_build_evaluated_single`
+  carries a non-lowerable WHERE (FTS `@@` / range op) as a per-row residual (`EvaluatedSelectPlan.where`) so
+  `WHERE @@ … ORDER BY ts_rank(…)` works. `functions.is_scalar_function` excludes the FTS builders (FROM-less).
+  Tests: `tests/test_sql_fts.py` (19: pure fts + SQL surface) plus a pg8000 wire test. **Simplifications:**
+  fixed english config, **no stemming** (`cats` ≠ `cat`), `ts_rank` is a match-count not cover-density;
+  weights (`:A` / `setweight`), prefix (`cat:*`), phrase (`<->`), `ts_headline`, and GIN/GiST FTS indexes
+  are out of scope.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

@@ -96,7 +96,20 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
 
 # Anonymous calls that the full scalar evaluator (``scalar._call_func``) handles,
 # so a FROM-less ``SELECT <fn>(...)`` must defer to it rather than the session path.
-_SCALAR_EVAL_ANON = frozenset({"isempty", "to_jsonb", "to_json", "row_to_json", "range_merge"})
+_SCALAR_EVAL_ANON = frozenset(
+    {
+        "isempty",
+        "to_jsonb",
+        "to_json",
+        "row_to_json",
+        "range_merge",
+        "to_tsvector",
+        "to_tsquery",
+        "plainto_tsquery",
+        "ts_rank",
+        "ts_rank_cd",
+    }
+)
 
 
 def is_scalar_function(node: exp.Expression) -> bool:

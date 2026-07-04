@@ -225,6 +225,24 @@ def _literal(node: exp.Expression) -> Any:
 
         members = [_literal(e) for e in node.expressions]
         return _ranges.make_multirange([m for m in members if m is not None])
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() in (
+        "to_tsvector",
+        "to_tsquery",
+        "plainto_tsquery",
+    ):
+        # Full-text constructors -> a tsvector / tsquery subdocument (a two-arg form
+        # passes the fixed text-search config first, which we ignore).
+        from secantus.sql import fts as _fts
+
+        fname = str(node.this).lower()
+        text = _literal(node.expressions[-1]) if node.expressions else None
+        if text is None:
+            return None
+        if fname == "to_tsvector":
+            return _fts.to_tsvector(str(text))
+        if fname == "plainto_tsquery":
+            return _fts.plainto_tsquery(str(text))
+        return _fts.to_tsquery(str(text))
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
         # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
         # SQLAlchemy's psycopg dialect probes ``t.oid = to_regtype('hstore')`` at
@@ -1875,6 +1893,9 @@ def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool
         return True
     if table is not None and _where_has_range_predicate(node, table):
         return True
+    # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
+    if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
+        return True
     return any(_subquery_has_outer_ref(sub) for sub in node.find_all(exp.Select))
 
 
@@ -2683,7 +2704,15 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
     The base collection is read with the WHERE filter; the executor evaluates
     each output expression per row (expanding set-returning functions)."""
     resolve = table_resolver(table)
-    base_filter = _where_filter(stmt, table)
+    # A WHERE that can't lower to a ``$match`` (a full-text ``@@`` / range operator)
+    # is carried as a per-row residual and evaluated by the executor's scalar pass.
+    residual_where = None
+    if where_needs_per_row(stmt, table):
+        where_node = stmt.args.get("where")
+        residual_where = where_node.this if where_node is not None else None
+        base_filter: dict[str, Any] = {}
+    else:
+        base_filter = _where_filter(stmt, table)
     out_columns: list[tuple[str, str]] = []
     out_exprs: list[exp.Expression] = []
     names = _NameAllocator()
@@ -2716,6 +2745,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         out_columns=out_columns,
         out_exprs=out_exprs,
         resolve=resolve,
+        where=residual_where,
         order=order,
         distinct=bool(stmt.args.get("distinct")) and not don,
         limit=limit,
@@ -4461,7 +4491,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return ranges.RANGE_TYPES[operand_tag][0]
     if isinstance(node, exp.Cast) and node.to is not None:
         _to = node.to.sql(dialect="postgres").lower().strip()
-        if _to in typemap._RANGE_TAGS or _to in typemap._MULTIRANGE_TAGS:
+        if (
+            _to in typemap._RANGE_TAGS
+            or _to in typemap._MULTIRANGE_TAGS
+            or _to in typemap._FTS_TAGS
+        ):
             return _to
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)
@@ -4648,6 +4682,12 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "bool"
         if fname == "isempty":
             return "bool"
+        if fname == "to_tsvector":
+            return "tsvector"
+        if fname in ("to_tsquery", "plainto_tsquery"):
+            return "tsquery"
+        if fname in ("ts_rank", "ts_rank_cd"):
+            return "float8"
         if fname in ("gcd", "lcm"):
             return "int8"
         if fname == "log10":
