@@ -516,6 +516,15 @@ def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
                 _to_agg_expr(node.expression, resolve),
             ]
         }
+    if isinstance(node, exp.Bracket) and node.expressions:
+        idx_node = node.expressions[0]
+        if not isinstance(idx_node, exp.Slice):
+            # ``arr[i]`` -> ``$arrayElemAt``. sqlglot folds a constant index to
+            # 0-based; a runtime (column-bearing) index stays 1-based, so subtract.
+            idx_expr = _to_agg_expr(idx_node, resolve)
+            if any(True for _ in idx_node.find_all(exp.Column)):
+                idx_expr = {"$subtract": [idx_expr, 1]}
+            return {"$arrayElemAt": [_to_agg_expr(node.this, resolve), idx_expr]}
     val = _literal(node)
     return {"$literal": val} if isinstance(val, str) else val
 
@@ -3551,6 +3560,12 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         # A bare literal in the SELECT list (``SELECT 0 AS lvl``) must type from its
         # value, else an int rides the wire as text.
         return _infer_value_tag(_literal(node))
+    if isinstance(node, exp.Bracket) and node.expressions:
+        # ``arr[i]`` yields the element type; ``arr[lo:hi]`` stays the array type.
+        base_tag = _infer_scalar_tag(node.this, resolve)
+        if isinstance(node.expressions[0], exp.Slice):
+            return base_tag
+        return typemap.array_element_tag(base_tag) if typemap.is_array_tag(base_tag) else base_tag
     if isinstance(node, exp.Window):
         func = node.this
         if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count, exp.Ntile)):
