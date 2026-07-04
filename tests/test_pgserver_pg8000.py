@@ -1404,6 +1404,21 @@ def test_alter_type_add_value_via_driver(server):
     conn.close()
 
 
+def test_array_subscript_via_driver(server):
+    # arr[i] element access and arr[lo:hi] slicing through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, tags text[], nums int[])")
+    cur.execute("INSERT INTO t (id, tags, nums) VALUES (1, ARRAY['a','b','c'], ARRAY[10,20,30])")
+    cur.execute("SELECT tags[1], tags[3], nums[2] FROM t WHERE id = 1")
+    assert cur.fetchall() == (["a", "c", 20],)
+    cur.execute("SELECT tags[2:3] FROM t WHERE id = 1")
+    assert cur.fetchall() == ([["b", "c"]],)
+    cur.execute("SELECT id FROM t WHERE tags[1] = 'a'")
+    assert cur.fetchall() == ([1],)
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

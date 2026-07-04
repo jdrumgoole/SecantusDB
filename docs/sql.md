@@ -386,6 +386,21 @@ dimension 1 exists — arrays are one level deep, so any other dimension is NULL
 Array columns reflect as `information_schema.columns.data_type = 'ARRAY'` with the
 Postgres array type OID in `pg_attribute`.
 
+Subscripting is 1-based, and `unnest(col)` expands an array to one row per element:
+
+```sql
+SELECT tags[1] FROM post;              -- first element ('py')
+SELECT tags[2:3] FROM post;            -- 1-based inclusive slice -> {db}
+SELECT tags[99] FROM post;            -- out of range -> NULL (no wraparound)
+SELECT id, unnest(tags) FROM post;    -- one row per element
+```
+
+`arr[i]` returns the *i*-th element (NULL for an out-of-range or zero/negative
+index — Postgres arrays don't wrap), and `arr[lo:hi]` returns the 1-based
+inclusive slice (clamped to the array bounds). Both work in the SELECT list and in
+`WHERE` (`WHERE tags[1] = 'py'`). `unnest(array_col)` in the SELECT list expands
+the array; the FROM-clause table form (`FROM unnest(col)`) is not yet supported.
+
 ### Foreign keys
 
 Column-level `REFERENCES` and table-level `FOREIGN KEY` — named or unnamed — are

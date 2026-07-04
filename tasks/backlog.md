@@ -1556,10 +1556,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   array text (`_render_pg_array`) with the array type OID in `PG_OID` so a driver decodes back to a list.
   `<value> = ANY(col)` → array membership, `col @> ARRAY[…]` → containment (reuses the jsonb `$all` path),
   `array_length(col, 1)` / `cardinality(col)` → element count. Reflection: `information_schema.columns.
-  data_type = 'ARRAY'` + `pg_attribute.atttypid` = array OID. **Limitations:** one level deep only (no
-  multi-dimensional arrays — `array_length(col, 2)` is NULL), no array subscripting (`col[1]`), no slicing,
-  no `unnest(col)` / `array_agg` into a declared array column, and no element-type coercion beyond the
-  scalar tags.
+  data_type = 'ARRAY'` + `pg_attribute.atttypid` = array OID. Array subscripting / slicing landed in b114
+  (`scalar._eval_bracket`: `arr[i]` 1-based element, NULL out of range; `arr[lo:hi]` 1-based inclusive
+  slice; `WHERE arr[i]` lowers to `$arrayElemAt` via `planner._to_agg_expr`; element/array type inference
+  in `_infer_scalar_tag`). `unnest(array_col)` in the SELECT list works (via the b-set-returning-function
+  path). **Limitations:** one level deep only (no multi-dimensional arrays — `array_length(col, 2)` is
+  NULL); the FROM-clause table form `FROM unnest(col)` is unsupported; no `array_agg` into a declared
+  array column; no element-type coercion beyond the scalar tags.
 - [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
   `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
 - [ ] **Composite primary keys rejected** (single-column PK ↔ `_id` only). Updating the

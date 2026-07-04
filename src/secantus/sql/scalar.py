@@ -118,6 +118,8 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(node, exp.DPipe):  # || string concatenation
         left, right = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
         return None if left is None or right is None else _as_text(left) + _as_text(right)
+    if isinstance(node, exp.Bracket):
+        return _eval_bracket(node, scope, ctx)
     typed = _SCALAR_FUNC_NODES.get(type(node))
     if typed is not None:
         return typed(node, scope, ctx)
@@ -131,6 +133,40 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(node, (exp.Select, exp.Subquery)):
         return _eval_subquery(node, scope, ctx)
     raise errors.feature_not_supported(f"unsupported scalar expression: {node.sql()}")
+
+
+def _eval_bracket(node: exp.Bracket, scope: Scope, ctx: ScalarContext) -> Any:
+    """Postgres array subscript / slice: ``arr[i]`` (1-based element, NULL when out
+    of range) and ``arr[lo:hi]`` (1-based inclusive slice, clamped).
+
+    sqlglot's Postgres dialect folds a compile-time-constant single index to
+    0-based (``arr[1]`` → literal ``0``) but leaves a runtime (column-bearing)
+    index as the raw 1-based value; slice bounds always stay 1-based. We mirror
+    that: a column-bearing single index is decremented, a constant one is used
+    as-is, and a negative resulting index is out of range (no Python wraparound)."""
+    base = evaluate(node.this, scope, ctx)
+    if base is None or not node.expressions:
+        return None
+    idx_node = node.expressions[0]
+    if isinstance(idx_node, exp.Slice):
+        if not isinstance(base, (list, tuple)):
+            return None
+        lo = idx_node.this
+        hi = idx_node.args.get("expression")
+        lo_i = max(int(evaluate(lo, scope, ctx)), 1) if lo is not None else 1
+        hi_i = int(evaluate(hi, scope, ctx)) if hi is not None else len(base)
+        return list(base[lo_i - 1 : hi_i])
+    if not isinstance(base, (list, tuple)):
+        return None
+    val = evaluate(idx_node, scope, ctx)
+    if val is None:
+        return None
+    i = int(val)
+    if any(True for _ in idx_node.find_all(exp.Column)):
+        i -= 1  # runtime 1-based index -> 0-based
+    if i < 0 or i >= len(base):
+        return None  # out of range -> NULL (no negative wraparound)
+    return base[i]
 
 
 def _truthy(value: Any) -> bool:
