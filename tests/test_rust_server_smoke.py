@@ -689,3 +689,31 @@ def test_write_concern_validation_against_rust_server(tmp_path) -> None:
             assert r["ok"] == 1.0, f"wc={wc} should succeed"
     finally:
         srv.stop()
+
+
+def test_synthetic_view_write_rejected_against_rust_server(tmp_path) -> None:
+    """A direct insert / update / delete on a synthetic read-only view
+    (`local.oplog.rs` / `admin.system.users`) is rejected with code 13 on the Rust
+    server (matching the Python server / mongod), while a regular collection write
+    still succeeds."""
+    import pymongo.errors
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        client = _client(srv)
+        for db_name, coll in [("local", "oplog.rs"), ("admin", "system.users")]:
+            db = client[db_name]
+            for op, args in [
+                ("insert", {"documents": [{"x": 1}]}),
+                ("update", {"updates": [{"q": {}, "u": {"$set": {"x": 1}}}]}),
+                ("delete", {"deletes": [{"q": {}, "limit": 0}]}),
+            ]:
+                with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                    db.command(op, coll, **args)
+                assert exc.value.code == 13, f"{db_name}.{coll} {op}: got {exc.value.code}"
+
+        # A regular collection write is unaffected.
+        r = client["t"].command("insert", "c", documents=[{"x": 1}])
+        assert r["ok"] == 1.0
+    finally:
+        srv.stop()
