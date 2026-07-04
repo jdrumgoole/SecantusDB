@@ -83,6 +83,13 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_jsonb_nav(node, scope, ctx)
     if isinstance(node, exp.JSONBDeleteAtPath):
         return _eval_jsonb_delete_path(node, scope, ctx)
+    if isinstance(node, exp.JSONBPathExists):  # jsonb @? jsonpath
+        return _eval_jsonb_path_op(node.this, node.expression, "exists", scope, ctx)
+    if getattr(exp, "MatchAgainst", None) is not None and isinstance(node, exp.MatchAgainst):
+        # jsonb @@ jsonpath — sqlglot parses ``data @@ path`` with the path in
+        # ``this`` and the document in ``expressions[0]``.
+        data_node = node.expressions[0] if node.expressions else None
+        return _eval_jsonb_path_op(data_node, node.this, "match", scope, ctx)
     if isinstance(node, exp.Case):
         return _eval_case(node, scope, ctx)
     if isinstance(node, exp.If):
@@ -1031,6 +1038,31 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
     if name == "log10":
         v = args[0] if args else None
         return None if v is None else math.log10(v)
+    if name in (
+        "jsonb_path_query",
+        "jsonb_path_query_array",
+        "jsonb_path_exists",
+        "jsonb_path_match",
+    ):
+        from secantus.sql import jsonpath as _jsonpath
+
+        doc = args[0] if args else None
+        path = args[1] if len(args) > 1 else None
+        if doc is None or path is None:
+            return None
+        try:
+            if name == "jsonb_path_exists":
+                return _jsonpath.exists(doc, _as_text(path))
+            if name == "jsonb_path_match":
+                return _jsonpath.match(doc, _as_text(path))
+            matches = _jsonpath.query(doc, _as_text(path))
+        except _jsonpath.JsonPathError as e:
+            raise errors.feature_not_supported(f"unsupported jsonpath: {e}") from e
+        if name == "jsonb_path_query_array":
+            return matches
+        # jsonb_path_query is set-returning; in a scalar context return the first
+        # match (NULL when the path matches nothing).
+        return matches[0] if matches else None
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
 
 
@@ -1156,6 +1188,28 @@ def _jsonb_strip_nulls(value: Any) -> Any:
     if isinstance(value, list):
         return [_jsonb_strip_nulls(v) for v in value]
     return value
+
+
+def _eval_jsonb_path_op(
+    data_node: exp.Expression | None,
+    path_node: exp.Expression | None,
+    kind: str,
+    scope: Scope,
+    ctx: ScalarContext,
+) -> Any:
+    """Shared ``@?`` (exists) / ``@@`` (match) jsonpath operator evaluation."""
+    from secantus.sql import jsonpath as _jsonpath
+
+    doc = evaluate(data_node, scope, ctx) if data_node is not None else None
+    path = evaluate(path_node, scope, ctx) if path_node is not None else None
+    if doc is None or path is None:
+        return None
+    try:
+        if kind == "exists":
+            return _jsonpath.exists(doc, _as_text(path))
+        return _jsonpath.match(doc, _as_text(path))
+    except _jsonpath.JsonPathError as e:
+        raise errors.feature_not_supported(f"unsupported jsonpath: {e}") from e
 
 
 def _eval_jsonb_delete_path(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:

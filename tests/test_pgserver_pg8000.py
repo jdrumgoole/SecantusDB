@@ -1084,6 +1084,22 @@ def test_composite_where_update_via_driver(server):
     conn.close()
 
 
+def test_jsonpath_via_driver(server):
+    # jsonb_path_query / _exists and the @? / @@ operators typed over the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id int primary key, data jsonb)")
+    cur.execute('INSERT INTO t VALUES (1, \'{"a": {"b": 5}, "items": [{"x": 1}, {"x": 2}]}\')')
+    cur.execute("SELECT jsonb_path_query(data, '$.a.b') FROM t")
+    assert cur.fetchone() == [5]
+    cur.execute(
+        "SELECT jsonb_path_exists(data, '$.a.b'), data @? '$.items[*] ? (@.x == 2)', "
+        "data @@ '$.a.b == 5' FROM t"
+    )
+    assert cur.fetchone() == [True, True, True]  # all real booleans
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
