@@ -103,7 +103,14 @@ class ScramExchange:
         text = client_first.decode("utf-8", "replace")
         # Strip the gs2 header ("n,," / "y,," / "n,a=..,") to get client-first-bare.
         if text.startswith("n,") or text.startswith("y,"):
-            _, _, bare = text.split(",", 2)
+            parts = text.split(",", 2)
+            # A well-formed header has the gs2 flag, an (optional) authzid, then
+            # the bare message — three comma-separated parts. A truncated
+            # header like "n," yields fewer; surface it as the typed
+            # PGAuthError rather than an unpack ValueError. (§I21)
+            if len(parts) < 3:
+                raise PGAuthError("malformed SCRAM client-first message")
+            bare = parts[2]
         else:
             bare = text
         self._client_first_bare = bare

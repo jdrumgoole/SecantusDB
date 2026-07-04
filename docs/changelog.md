@@ -19,6 +19,21 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### PostgreSQL/SQL server: a malformed SCRAM client-first is a typed auth error
+
+A truncated SCRAM gs2 header (e.g. a client-first message of just `"n,"`, with no
+bare message after the header) made `ScramExchange.server_first` raise a bare
+`ValueError` from an unpack, caught only by the connection's outer generic
+handler. It now raises the typed `PGAuthError`, consistent with the rest of the
+PG-auth path — the connection still fails cleanly with no leak, just via the
+right exception type. Found by the nightly security review (2026-07-04 §I21).
+
+#### Fixed
+
+- `sql/pgauth.py`: `ScramExchange.server_first` guards the gs2-header split and
+  raises `PGAuthError` on a truncated header instead of an unpack `ValueError`.
+  New unit tests in `tests/test_pgauth.py`.
+
 ### Rust server: correct error codes for unrecognized / Atlas aggregation stages
 
 The Rust server now validates aggregation stage names up-front, matching the
