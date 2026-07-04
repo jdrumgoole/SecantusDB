@@ -1224,6 +1224,34 @@ def test_range_algebra_and_range_agg_via_driver(server):
     conn.close()
 
 
+def test_full_text_search_via_driver(server):
+    # to_tsvector / to_tsquery / @@ match / ts_rank ordering over the real wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE docs (id int primary key, body tsvector)")
+    cur.execute("INSERT INTO docs VALUES (1, to_tsvector('the quick brown fox'))")
+    cur.execute("INSERT INTO docs VALUES (2, to_tsvector('a lazy dog sleeps'))")
+    cur.execute("INSERT INTO docs VALUES (3, to_tsvector('the quick dog runs quick'))")
+
+    cur.execute("SELECT to_tsvector('a cat sat') @@ to_tsquery('cat')")
+    assert cur.fetchone()[0] is True
+
+    cur.execute("SELECT id FROM docs WHERE body @@ to_tsquery('quick & dog') ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [3]
+
+    # ts_rank orders the higher-frequency match first.
+    cur.execute(
+        "SELECT id FROM docs WHERE body @@ to_tsquery('quick') "
+        "ORDER BY ts_rank(body, to_tsquery('quick')) DESC"
+    )
+    assert [r[0] for r in cur.fetchall()] == [3, 1]
+
+    # The tsvector column renders as the Postgres text form 'lexeme':pos.
+    cur.execute("SELECT body FROM docs WHERE id = 1")
+    assert cur.fetchone()[0] == "'brown':3 'fox':4 'quick':2"
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

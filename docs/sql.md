@@ -542,6 +542,40 @@ Not yet supported: multirange operators (`@>` / `&&` on multiranges),
 `range_intersect_agg`, `multirange()` extraction functions, and range GiST
 indexes.
 
+### Full-text search (`tsvector` / `tsquery`)
+
+`tsvector` and `tsquery` columns support the standard full-text search surface:
+`to_tsvector` builds a document vector (lower-cased lexemes with positions,
+English stop-words dropped), `to_tsquery` / `plainto_tsquery` build queries, the
+`@@` operator matches, and `ts_rank` scores relevance:
+
+```sql
+CREATE TABLE docs (id int PRIMARY KEY, body tsvector);
+INSERT INTO docs VALUES (1, to_tsvector('the quick brown fox'));
+INSERT INTO docs VALUES (2, to_tsvector('the quick dog runs quick'));
+
+SELECT to_tsvector('a cat sat') @@ to_tsquery('cat');    -- true
+
+-- match: & (and), | (or), ! (not), and parentheses
+SELECT id FROM docs WHERE body @@ to_tsquery('quick & dog');
+SELECT id FROM docs WHERE body @@ plainto_tsquery('quick fox');  -- ANDs the words
+
+-- rank the matches (higher term frequency ranks higher)
+SELECT id FROM docs
+WHERE body @@ to_tsquery('quick')
+ORDER BY ts_rank(body, to_tsquery('quick')) DESC;
+```
+
+A `tsvector` renders as the Postgres text form `'brown':3 'fox':4 'quick':2`; a
+`tsquery` as `'quick' & 'dog'`. Both accept text-literal casts
+(`'a cat'::tsvector`, `'cat & dog'::tsquery`).
+
+Simplifications vs real Postgres: the text-search configuration is fixed
+(English stop-words, **no stemming** — `cats` and `cat` stay distinct), `ts_rank`
+is a monotonic match-count score rather than the cover-density algorithm, and
+weights (`:A`), prefix (`cat:*`) and phrase (`<->`) queries and GIN/GiST indexes
+are out of scope.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

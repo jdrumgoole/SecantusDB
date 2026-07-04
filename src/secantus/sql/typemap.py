@@ -54,12 +54,18 @@ PG_OID: dict[str, int] = {
     "tsmultirange": 4533,
     "datemultirange": 4535,
     "int8multirange": 4536,
+    # Full-text search types.
+    "tsvector": 3614,
+    "tsquery": 3615,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
     "int2vector": 22,
     "oidvector": 30,
 }
+
+# Full-text search type tags — stored as subdocuments, rendered as their PG text.
+_FTS_TAGS = frozenset({"tsvector", "tsquery"})
 
 # Type tags whose value is a list rendered as a Postgres ``int2vector`` /
 # ``oidvector`` (space-separated, not array braces / JSON).
@@ -89,6 +95,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "composite": "record",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
+    **{t: t for t in _FTS_TAGS},
 }
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
@@ -105,6 +112,7 @@ PG_TYPENAME: dict[str, str] = {
     "composite": "record",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
+    **{t: t for t in _FTS_TAGS},
 }
 
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
@@ -166,7 +174,9 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     # Range types — sqlglot's DataType.Type enum names vary across versions, so
     # match on the rendered type name (``int4range`` etc.).
     name = datatype.sql(dialect="postgres").lower().strip()
-    return name if name in _RANGE_TAGS or name in _MULTIRANGE_TAGS else None
+    if name in _RANGE_TAGS or name in _MULTIRANGE_TAGS or name in _FTS_TAGS:
+        return name
+    return None
 
 
 def is_array_tag(tag: str | None) -> bool:
@@ -250,6 +260,12 @@ def coerce(value: Any, tag: str) -> Any:
         range_tag = _ranges.MULTIRANGE_TYPES[tag]
         elem, _discrete = _ranges.RANGE_TYPES[range_tag]
         return _ranges.parse_multirange(str(value), tag, lambda tok: coerce(tok, elem))
+    if tag in _FTS_TAGS:
+        if isinstance(value, dict):
+            return value
+        from secantus.sql import fts as _fts
+
+        return _fts.parse_tsvector(str(value)) if tag == "tsvector" else _fts.to_tsquery(str(value))
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -308,6 +324,14 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         from secantus.sql import ranges as _ranges
 
         return _ranges.render_multirange(value).encode("utf-8")
+    if tag == "tsvector" and isinstance(value, dict):
+        from secantus.sql import fts as _fts
+
+        return _fts.render_tsvector(value).encode("utf-8")
+    if tag == "tsquery" and isinstance(value, dict):
+        from secantus.sql import fts as _fts
+
+        return _fts.render_tsquery(value).encode("utf-8")
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):

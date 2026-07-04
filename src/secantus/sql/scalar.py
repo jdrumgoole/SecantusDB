@@ -98,10 +98,17 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(node, exp.JSONBPathExists):  # jsonb @? jsonpath
         return _eval_jsonb_path_op(node.this, node.expression, "exists", scope, ctx)
     if getattr(exp, "MatchAgainst", None) is not None and isinstance(node, exp.MatchAgainst):
-        # jsonb @@ jsonpath — sqlglot parses ``data @@ path`` with the path in
-        # ``this`` and the document in ``expressions[0]``.
-        data_node = node.expressions[0] if node.expressions else None
-        return _eval_jsonb_path_op(data_node, node.this, "match", scope, ctx)
+        # ``@@`` is overloaded: full-text ``tsvector @@ tsquery`` and jsonb
+        # ``data @@ jsonpath``. sqlglot parses ``left @@ right`` with the right
+        # operand in ``this`` and the left in ``expressions[0]``.
+        left_node = node.expressions[0] if node.expressions else None
+        right_val = evaluate(node.this, scope, ctx)
+        left_val = evaluate(left_node, scope, ctx) if left_node is not None else None
+        fts_result = _eval_fts_match(left_val, right_val)
+        if fts_result is not _NOT_FTS:
+            return fts_result
+        # Otherwise it's a jsonb @@ jsonpath predicate.
+        return _eval_jsonb_path_op(left_node, node.this, "match", scope, ctx)
     if isinstance(node, exp.Case):
         return _eval_case(node, scope, ctx)
     if isinstance(node, exp.If):
@@ -926,7 +933,7 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
     if (
         value is not None
-        and (to in typemap._RANGE_TAGS or to in typemap._MULTIRANGE_TAGS)
+        and (to in typemap._RANGE_TAGS or to in typemap._MULTIRANGE_TAGS or to in typemap._FTS_TAGS)
         and not isinstance(value, dict)
     ):
         return typemap.coerce(value, to)
@@ -1102,6 +1109,27 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if a is None or b is None:
             return None
         return _ranges.merge(a, b)
+    if name in ("to_tsvector", "to_tsquery", "plainto_tsquery"):
+        from secantus.sql import fts as _fts
+
+        # A two-argument form passes the text-search config first; we ignore it
+        # (the config is fixed) and read the last argument as the document / query.
+        text = args[-1] if args else None
+        if text is None:
+            return None
+        if name == "to_tsvector":
+            return _fts.to_tsvector(_as_text(text))
+        if name == "plainto_tsquery":
+            return _fts.plainto_tsquery(_as_text(text))
+        return _fts.to_tsquery(_as_text(text))
+    if name in ("ts_rank", "ts_rank_cd"):
+        from secantus.sql import fts as _fts
+
+        vec = args[0] if args else None
+        query = args[1] if len(args) > 1 else None
+        if vec is None or query is None:
+            return None
+        return _fts.ts_rank(vec, query)
     if name == "isempty":
         from secantus.sql import ranges as _ranges
 
@@ -1266,6 +1294,26 @@ def _jsonb_strip_nulls(value: Any) -> Any:
 
 
 _NOT_RANGE = object()
+_NOT_FTS = object()
+
+
+def _eval_fts_match(left: Any, right: Any) -> Any:
+    """``@@`` on full-text operands: ``tsvector @@ tsquery`` (either order). Returns
+    ``_NOT_FTS`` when neither operand is a tsvector / tsquery so the caller can fall
+    back to the jsonb ``@@`` path predicate. NULL on either side yields None."""
+    from secantus.sql import fts as _fts
+
+    left_v, left_q = _fts.is_tsvector(left), _fts.is_tsquery(left)
+    right_v, right_q = _fts.is_tsvector(right), _fts.is_tsquery(right)
+    if not (left_v or left_q or right_v or right_q):
+        return _NOT_FTS
+    if left is None or right is None:
+        return None
+    if left_v and right_q:
+        return _fts.matches(left, right)
+    if left_q and right_v:
+        return _fts.matches(right, left)
+    return None
 
 
 def _eval_range_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
