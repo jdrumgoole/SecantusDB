@@ -42,6 +42,35 @@ asserts the index-ordered output.
   foreign collection. Regression: `tests/test_rust_server_smoke.py::
   test_lookup_index_order_against_rust_server`.
 
+### PostgreSQL/SQL server: connection cap, cursor caps, and a parser guard
+
+The PostgreSQL wire server gained the resource limits its MongoDB counterpart
+already had, closing a compounding denial-of-service surface (all reachable
+pre-auth, since `require_auth` defaults off):
+
+- **Connection cap.** `SecantusPGServer` now enforces `max_connections` (default
+  1000, matching the Mongo server's `DEFAULT_MAX_CONNECTIONS`). An over-cap
+  accept is closed immediately instead of spawning a handler thread.
+- **Per-session cursor caps.** `DECLARE CURSOR` (which eagerly materializes its
+  whole result set) now rejects a session's 101st open cursor, and a cursor
+  whose result exceeds 1,000,000 rows, with `program_limit_exceeded` (SQLSTATE
+  54000). Combined with the connection cap, total cursor memory is bounded.
+- **Parser guard.** `planner.parse` rejects a statement longer than 1 MB before
+  handing it to sqlglot, and converts the `RecursionError` from a deeply-nested
+  statement (e.g. hundreds of parentheses — a ~600-byte trigger) into a clean
+  54000 error instead of relying on the connection loop's broad `except`.
+
+Found by the nightly security review (issue #194).
+
+#### Security
+
+- `sql/pgserver.py`: `max_connections` cap (default `DEFAULT_MAX_CONNECTIONS`).
+- `sql/engine.py`: `MAX_CURSORS_PER_SESSION` (100) + `MAX_CURSOR_ROWS` (1e6) caps
+  on `DECLARE CURSOR`.
+- `sql/planner.py`: `MAX_SQL_LENGTH` (1 MB) cap + `RecursionError` guard in
+  `parse`. New `errors.program_limit_exceeded` (SQLSTATE 54000). Regressions in
+  `tests/test_sql_cursors.py` + `tests/test_pgserver.py`.
+
 ### `$geoNear` rides the geo index instead of scanning
 
 A bounded `$geoNear` — one with a `maxDistance` — no longer walks the whole

@@ -4099,8 +4099,21 @@ UNCOMMENT_SENTINEL = "\x00__secantus_uncomment__"
 _COMMENT_NULL_RE = re.compile(r"(?is)^(\s*COMMENT\s+ON\b.*\bIS\s+)NULL(\s*;?\s*)$")
 
 
+#: Reject a statement string longer than this before handing it to sqlglot. 1 MB
+#: is far larger than any real query yet small enough that a flood of oversized
+#: statements can't pin the parser.
+MAX_SQL_LENGTH = 1_000_000
+
+
 def parse(sql: str) -> list[exp.Expression]:
     """Parse a (possibly multi-statement) SQL string into AST statements."""
+    # Cap the statement length before parsing — a cheap upper bound on parse cost
+    # so a flood of oversized statements can't pin CPU (the Mongo wire has
+    # analogous 16/48 MB size ceilings). 1 MB is far above any real query. (#194)
+    if len(sql) > MAX_SQL_LENGTH:
+        raise errors.program_limit_exceeded(
+            f"statement too long: {len(sql)} bytes exceeds the {MAX_SQL_LENGTH}-byte limit"
+        )
     move = _MOVE_RE.match(sql)
     if move is not None:
         return [exp.Command(this="MOVE", expression=exp.Literal.string(move.group("tail")))]
@@ -4116,3 +4129,8 @@ def parse(sql: str) -> list[exp.Expression]:
         return [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
     except sqlglot.errors.ParseError as exc:
         raise errors.syntax_error(str(exc).splitlines()[0]) from exc
+    except RecursionError as exc:
+        # A deeply-nested statement (e.g. hundreds of parentheses) blows Python's
+        # recursion limit inside sqlglot. Convert it to a clean error rather than
+        # relying on the connection loop's broad catch. (#194)
+        raise errors.program_limit_exceeded("statement too deeply nested to parse") from exc

@@ -34,6 +34,12 @@ def feature_not_supported(message: str) -> SQLError:
     return SQLError("0A000", message)
 
 
+def program_limit_exceeded(message: str) -> SQLError:
+    """SQLSTATE 54000 — a configured resource cap was hit (too many cursors, a
+    cursor result too large, a statement too long / deeply nested). (#194)"""
+    return SQLError("54000", message)
+
+
 def undefined_table(name: str) -> SQLError:
     return SQLError("42P01", f'relation "{name}" does not exist')
 
