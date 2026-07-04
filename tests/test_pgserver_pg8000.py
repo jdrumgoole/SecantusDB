@@ -1493,6 +1493,22 @@ def test_jsonb_functions_via_driver(server):
     conn.close()
 
 
+def test_string_agg_and_bool_aggregates_via_driver(server):
+    # string_agg + bool_and / bool_or through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, grp text, name text, active boolean)")
+    cur.execute(
+        "INSERT INTO t (id, grp, name, active) VALUES "
+        "(1,'a','x',true),(2,'a','y',false),(3,'b','z',true)"
+    )
+    cur.execute("SELECT grp, string_agg(name, ',') FROM t GROUP BY grp ORDER BY grp")
+    assert cur.fetchall() == (["a", "x,y"], ["b", "z"])
+    cur.execute("SELECT grp, bool_and(active), bool_or(active) FROM t GROUP BY grp ORDER BY grp")
+    assert cur.fetchall() == (["a", False, True], ["b", True, True])
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

@@ -1936,7 +1936,50 @@ def _aggregate_of(node: exp.Expression) -> tuple[str, str | None, bool] | None:
                 arg = exprs[0] if exprs else None
             col = _column_name(arg) if isinstance(arg, exp.Column) else None
             return name, col, distinct
+    # ``every(x)`` is the standard-SQL spelling of ``bool_and(x)`` (parses as an
+    # Anonymous call rather than a dedicated node).
+    if isinstance(inner, exp.Anonymous):
+        fname = (inner.this if isinstance(inner.this, str) else inner.name).lower()
+        if fname == "every" and inner.expressions:
+            arg = inner.expressions[0]
+            return "bool_and", (_column_name(arg) if isinstance(arg, exp.Column) else None), False
     return None
+
+
+def _string_agg_arg(node: exp.Expression) -> tuple[exp.Expression, str] | None:
+    """If ``node`` is ``string_agg(expr, sep)`` (sqlglot ``GroupConcat``), return
+    ``(value_expr, separator)``. The separator is a string literal."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if not isinstance(inner, exp.GroupConcat):
+        return None
+    sep_node = inner.args.get("separator")
+    sep = sep_node.name if isinstance(sep_node, exp.Literal) else ""
+    return inner.this, sep
+
+
+def _string_agg_project(fname: str, sep: str) -> dict[str, Any]:
+    """The ``$project`` expression that turns a ``string_agg`` field's pushed
+    array (``[v1, v2, …]``) into the delimited string, skipping NULL elements and
+    yielding NULL when every element was NULL (Postgres ``string_agg`` semantics)."""
+    return {
+        "$reduce": {
+            "input": f"${fname}",
+            "initialValue": None,
+            "in": {
+                "$cond": [
+                    {"$eq": ["$$this", None]},
+                    "$$value",  # skip NULL elements
+                    {
+                        "$cond": [
+                            {"$eq": ["$$value", None]},
+                            {"$toString": "$$this"},
+                            {"$concat": ["$$value", {"$literal": sep}, {"$toString": "$$this"}]},
+                        ]
+                    },
+                ]
+            },
+        }
+    }
 
 
 def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
@@ -2023,7 +2066,11 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     if _stmt_needs_evaluation(stmt):
         return True
     aggs = [
-        e for e in stmt.expressions if _aggregate_of(e) is not None or _array_agg_arg(e) is not None
+        e
+        for e in stmt.expressions
+        if _aggregate_of(e) is not None
+        or _array_agg_arg(e) is not None
+        or _string_agg_arg(e) is not None
     ]
     if not aggs:
         return False
@@ -2082,7 +2129,10 @@ def _plan_pipeline_select(
         if _has_grouping_sets(stmt):
             raise errors.feature_not_supported("GROUPING SETS over a JOIN is not supported")
         has_agg = any(
-            _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
+            _aggregate_of(e) is not None
+            or _array_agg_arg(e) is not None
+            or _string_agg_arg(e) is not None
+            for e in stmt.expressions
         )
         grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_agg)
         if _select_has_window(stmt) and (grouped or _group_agg_nodes(stmt)):
@@ -2100,7 +2150,10 @@ def _plan_pipeline_select(
     _alias, table = _resolve_source(from_node.this, db, catalog, storage, derived)
 
     has_aggregate = any(
-        _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in stmt.expressions
+        _aggregate_of(e) is not None
+        or _array_agg_arg(e) is not None
+        or _string_agg_arg(e) is not None
+        for e in stmt.expressions
     )
     grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_aggregate)
     if _has_grouping_sets(stmt):
@@ -2402,12 +2455,18 @@ def _grouping_set_branch(
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         arr_arg = _array_agg_arg(e)
+        sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             project[fname] = f"${fname}"
             out_columns.append((fname, "json"))
+        elif sagg is not None:
+            fname = names.fresh(alias or "string_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(sagg[0], table)}
+            project[fname] = _string_agg_project(fname, sagg[1])
+            out_columns.append((fname, "text"))
         elif agg is not None:
             func, col, _distinct = agg
             acc, tag = _accumulator(func, col, table)
@@ -2474,12 +2533,18 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         arr_arg = _array_agg_arg(e)
+        sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             project[fname] = f"${fname}"
             out_columns.append((fname, "json"))
+        elif sagg is not None:
+            fname = names.fresh(alias or "string_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(sagg[0], table)}
+            project[fname] = _string_agg_project(fname, sagg[1])
+            out_columns.append((fname, "text"))
         elif agg is not None:
             func, col, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
@@ -3009,7 +3074,10 @@ def _lateral_stage(
     if not isinstance(sub, exp.Select):
         raise errors.feature_not_supported(f"unsupported LATERAL source: {lateral.sql()}")
     has_agg = any(
-        _aggregate_of(e) is not None or _array_agg_arg(e) is not None for e in sub.expressions
+        _aggregate_of(e) is not None
+        or _array_agg_arg(e) is not None
+        or _string_agg_arg(e) is not None
+        for e in sub.expressions
     )
     if (
         sub.args.get("joins")
@@ -3429,6 +3497,7 @@ def _plan_join_group_select(
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         arr_arg = _array_agg_arg(e)
+        sagg = _string_agg_arg(e)
         agg = _join_aggregate_of(e)
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
@@ -3436,6 +3505,12 @@ def _plan_join_group_select(
             accumulators[fname] = {"$push": f"${path}"}
             project[fname] = f"${fname}"
             out_columns.append((fname, "json"))
+        elif sagg is not None:
+            fname = names.fresh(alias or "string_agg")
+            path, _ = resolve(sagg[0])
+            accumulators[fname] = {"$push": f"${path}"}
+            project[fname] = _string_agg_project(fname, sagg[1])
+            out_columns.append((fname, "text"))
         elif agg is not None:
             func, arg, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:

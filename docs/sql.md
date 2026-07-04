@@ -728,7 +728,8 @@ GROUP BY, **and** a window function all in one SELECT is not yet supported.
 ## Aggregates, GROUP BY, HAVING
 
 `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` compile to an aggregation pipeline
-(`$group`).
+(`$group`), along with `array_agg`, `string_agg`, and the boolean aggregates
+`bool_and` / `bool_or` (and their `every` spelling).
 
 ```sql
 SELECT region, COUNT(*) AS n, SUM(amount) AS total, AVG(amount) AS mean
@@ -739,7 +740,16 @@ ORDER BY total DESC;
 
 SELECT COUNT(*), SUM(amount) FROM sales;          -- whole-table aggregate
 SELECT COUNT(id) FROM sales;                      -- COUNT(col) excludes NULLs
+
+SELECT region, string_agg(name, ', ') FROM sales GROUP BY region;  -- NULLs skipped
+SELECT region, bool_and(active), bool_or(active) FROM sales GROUP BY region;
 ```
+
+`string_agg(expr, sep)` joins the non-NULL values in each group with the
+separator (returning NULL when every value was NULL). `bool_and` / `every` are
+true only when every input is true; `bool_or` is true when any is. The ordered-set
+aggregates `percentile_cont` / `mode` (`WITHIN GROUP (ORDER BY …)`) are not yet
+supported (`0A000`).
 
 `DISTINCT` inside an aggregate is supported for `COUNT` / `SUM` / `AVG` (and is a
 no-op for `MIN` / `MAX`, which are unaffected by duplicates). It deduplicates the
