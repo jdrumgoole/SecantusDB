@@ -1320,6 +1320,30 @@ The path argument to `jsonb_set` / `jsonb_insert` / `#-` is a Postgres `text[]`
 object) the way an implicit `::jsonb` cast would. These functions return a
 modified copy — the stored row is untouched (use them in an `UPDATE … SET`).
 
+SQL/JSON **path** queries navigate a jsonb value with a `jsonpath` expression:
+
+```sql
+-- jsonb_path_query returns the matched value (first match in this scalar
+-- context); jsonb_path_query_array collects all matches into a jsonb array.
+SELECT jsonb_path_query(data, '$.a.b') FROM docs;            -- a nested member
+SELECT jsonb_path_query_array(data, '$.items[*].x') FROM docs;
+
+-- jsonb_path_exists / @? test whether a path matches anything; jsonb_path_match
+-- / @@ evaluate a boolean predicate path. Both return a real boolean.
+SELECT jsonb_path_exists(data, '$.a.b') FROM docs;
+SELECT data @? '$.items[*] ? (@.x == 2)' FROM docs;          -- filter expression
+SELECT data @@ '$.a.b == 5' FROM docs;                       -- predicate
+```
+
+The supported `jsonpath` subset is `$` (root), `.key` / `."key"` member access,
+`[n]` array index (negative counts from the end), `[*]` all array elements, `.*`
+all members, and a `? (<predicate>)` filter whose predicate compares `@` / `@.path`
+(`== != < <= > >=`) to a literal, combined with `&&` / `||`. Arithmetic, functions
+(`.size()`), recursive `**`, and `like_regex` are out of scope (they raise a
+faithful "not supported" error). `jsonb_path_query` is set-returning in Postgres;
+here it yields the **first** match in a scalar `SELECT` (use `jsonb_path_query_array`
+for the full set).
+
 Two caveats. `<@` (contained-by) is supported only as `'<const>' <@ field`
 (equivalently `field @> '<const>'`) — the `field <@ '<const>'` direction ("this
 field is a subset of a constant") is a constraint on the stored shape and can't

@@ -1471,6 +1471,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   oids (`psql \dT+`, SQLAlchemy). Added the `typrelid` column to the pg_type schema and `reltype` to
   pg_class. **Still not supported:** nested composite types (a field whose own type is a composite —
   `engine._composite_fields_from_schema` rejects a non-builtin field type).
+- [ ] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
+  (tokenizer + recursive-descent parser + evaluator) powering `jsonb_path_query` / `jsonb_path_query_array`
+  / `jsonb_path_exists` / `jsonb_path_match` (via `scalar._call_func`) and the `@?` (`exp.JSONBPathExists`)
+  / `@@` (`exp.MatchAgainst` — sqlglot puts the path in `this`, the doc in `expressions[0]`) operators
+  (via `scalar.evaluate` → `_eval_jsonb_path_op`). Supported grammar: `$` root, `.key` / `."key"`, `[n]`
+  (negative from end), `[*]`, `.*`, and `? (<pred>)` filters where a predicate compares `@`/`@.path`
+  (`== != < <= > >=`) to a literal, combined with `&&`/`||`; `@@`/`jsonb_path_match` parse a top-level
+  predicate (`$.a == 5`). Typed in `planner._infer_scalar_tag` (JSONBPathExists/MatchAgainst → bool;
+  `jsonb_path_query`/`_array` → json; `jsonb_path_exists`/`_match` → bool). **Limitations:** unsupported
+  jsonpath constructs (arithmetic, `.size()` and other methods, recursive `**`, `like_regex`, `exists()`
+  inside a predicate, `$var` bindings) raise a faithful `feature_not_supported`; `jsonb_path_query` is
+  genuinely set-returning in PG but returns only the **first** match in a scalar SELECT (use
+  `jsonb_path_query_array` for the set); `@?`/`@@` in a WHERE predicate go through the scalar path
+  (COLLSCAN), not a lowered Mongo filter.
 - [ ] **Date/time scalar functions landed** (b132): `extract(field FROM ts)` / `date_part('field', ts)`
   (year/month/day/hour/minute/second/quarter/dow[Sun=0]/isodow[Mon=1]/doy/week/epoch → numeric),
   `date_trunc('unit', ts)` (year/quarter/month/week[→Monday]/day/hour/minute/second → timestamptz),

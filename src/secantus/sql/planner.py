@@ -4173,6 +4173,12 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
     if isinstance(node, _BOOL_EXPR_TYPES):
         return "bool"
+    # jsonpath predicate operators: ``@?`` (JSONBPathExists) and ``@@``
+    # (MatchAgainst) -> bool.
+    _jp_names = ("JSONBPathExists", "MatchAgainst")
+    _jsonpath_bool = tuple(c for c in (getattr(exp, n, None) for n in _jp_names) if c is not None)
+    if _jsonpath_bool and isinstance(node, _jsonpath_bool):
+        return "bool"
     # Date/time: extract/date_part -> numeric field; date_trunc / now() /
     # current_timestamp / current_date -> timestamptz; to_char -> text. Classes are
     # looked up by attribute because their availability varies across sqlglot.
@@ -4294,10 +4300,14 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "jsonb_insert",
             "jsonb_strip_nulls",
             "json_strip_nulls",
+            "jsonb_path_query",
+            "jsonb_path_query_array",
         ):
             return "json"
         if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):
             return "int4"
+        if fname in ("jsonb_path_exists", "jsonb_path_match"):
+            return "bool"
         if fname in ("gcd", "lcm"):
             return "int8"
         if fname == "log10":
