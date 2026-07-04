@@ -115,6 +115,8 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_between(node, scope, ctx)
     if isinstance(node, (exp.Like, exp.ILike)):
         return _eval_like(node, scope, ctx)
+    if isinstance(node, (exp.RegexpLike, exp.RegexpILike)):
+        return _eval_regexp(node, scope, ctx)
     if type(node) in _ARITH:
         return _eval_arith(node, scope, ctx)
     if isinstance(node, exp.DPipe):  # || string concatenation
@@ -848,6 +850,20 @@ def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
         return None
     flags = re.IGNORECASE if isinstance(node, exp.ILike) else 0
     return re.match(_like_to_regex(_as_text(pattern)), _as_text(val), flags) is not None
+
+
+def _eval_regexp(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
+    """POSIX regex-match operators ``~`` (``RegexpLike``) / ``~*`` (``RegexpILike``).
+    The pattern is a raw regex matched *unanchored* (``re.search``), unlike LIKE.
+    ``!~`` / ``!~*`` arrive as ``Not(...)`` and are negated by the caller."""
+    import re
+
+    val = evaluate(node.this, outer, ctx)
+    pattern = evaluate(node.expression, outer, ctx)
+    if val is None or pattern is None:
+        return None
+    flags = re.IGNORECASE if isinstance(node, exp.RegexpILike) else 0
+    return re.search(_as_text(pattern), _as_text(val), flags) is not None
 
 
 def _sub_scope(inner_alias: str, tdef: Any, row: dict[str, Any], outer: Scope) -> Scope:
