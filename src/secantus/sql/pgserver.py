@@ -51,6 +51,12 @@ DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
 #: caps so total memory is bounded even under an unauthenticated flood. (#194)
 DEFAULT_MAX_CONNECTIONS = 1000
 
+#: Wire message for an unexpected internal error. The raw Python exception text
+#: is written to the server log (``logger.exception``) but never sent to the
+#: client — leaking it could disclose internal paths, types, or data values.
+#: Mirrors the Mongo dispatch's generic-error discipline. (security review §I17)
+_INTERNAL_ERROR_MSG = "internal error"
+
 
 class SecantusPGServer:
     def __init__(
@@ -344,9 +350,12 @@ class SecantusPGServer:
                     out += _render_result(res)
         except errors.SQLError as exc:
             out += pgwire.error_response(exc.sqlstate, exc.message)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception:  # pragma: no cover - defensive
             logger.exception("error executing SQL")
-            out += pgwire.error_response("XX000", f"internal error: {exc}")
+            # Don't leak the raw Python exception text to the wire client — the
+            # full detail is in the server log. Mirrors the Mongo dispatch's
+            # generic-error discipline. (security review 2026-07-04 §I17)
+            out += pgwire.error_response("XX000", _INTERNAL_ERROR_MSG)
         # The ReadyForQuery status reflects the transaction block (I/T/E).
         out += pgwire.ready_for_query(session.txn_status())
         conn.sendall(bytes(out))
@@ -364,9 +373,10 @@ class SecantusPGServer:
         except errors.SQLError as exc:
             conn.sendall(pgwire.error_response(exc.sqlstate, exc.message))
             conn.sendall(pgwire.ready_for_query(session.txn_status()))
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception:  # pragma: no cover - defensive
             logger.exception("error executing COPY")
-            conn.sendall(pgwire.error_response("XX000", f"internal error: {exc}"))
+            # Generic wire message; full detail stays in the server log. (§I17)
+            conn.sendall(pgwire.error_response("XX000", _INTERNAL_ERROR_MSG))
             conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
     def _copy_in(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
