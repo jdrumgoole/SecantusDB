@@ -1301,6 +1301,38 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   both servers, where mongod considers them equal. Top-level scalar arrays,
   including cross-type `[1, 1.0]`, are faithful.)
 
+### 7.6 Standalone `secantusdb` binary: CLI-flag conformance shipped (beta.96)
+
+The Rust `secantusdb` binary now mirrors the Python daemon's full flag surface
+(`--config`, `--log-level`, `--cache-size`, `--session-max`, `--sync-on-commit`,
+`--noop-heartbeat-seconds`, `--oplog-retention-seconds`, `--oplog-max-entries`),
+including the `secantusdb.toml` loader (`crates/secantus-server/src/config.rs`,
+a faithful port of `src/secantus/config.py`: strict unknown-table / unknown-key
+rejection, the vestigial `[oplog] archive_dir` rejection, defaults < TOML < CLI
+precedence, and the `./`, `~/.secantus/`, `/etc/secantus/` auto-discovery path).
+Storage knobs flow through `secantus_storage::wt_config(cache_size, session_max,
+sync_on_commit)` into `Storage::open_with_config`; oplog knobs via the existing
+setters; `--noop-heartbeat-seconds` and `[storage] ttl_sweep_seconds` drive
+background maintenance threads that observe a shutdown flag and are joined before
+teardown. Remaining, worth tracking:
+
+- [ ] **Embedded `RustServer` handle still hard-codes the WiredTiger cache at
+  256M**, while the standalone binary (and the Python daemon) default to 1G. The
+  embedded PyO3 lifecycle handle (`crates/secantus-server-py`) opens storage
+  without threading `cache_size` / `session_max` / `sync_on_commit` through, so a
+  test that wants a bigger cache via the embedded handle can't set it. Thread the
+  same `wt_config(...)` call into the embedded constructor when the handle grows a
+  config surface.
+- [ ] **Rust write-path oplog pruning only happens via the noop-heartbeat
+  thread** (which also calls `prune_oplog`). When `--noop-heartbeat-seconds` is 0
+  (the default), nothing prunes the oplog on the standalone binary except an
+  explicit `restore`/PITR path — a long-lived busy server can grow the oplog past
+  its retention window / entry cap until a heartbeat is enabled. The Python server
+  prunes opportunistically every ~1000 emits from inside the write path; the Rust
+  `Storage` does not yet self-prune on emit. Either add an emit-counter prune hook
+  in `secantus_storage::emit_oplog` (mirrors Python) or always run a low-frequency
+  prune thread regardless of the heartbeat interval.
+
 ## SQL / PostgreSQL interface — P0 spike limitations
 
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of

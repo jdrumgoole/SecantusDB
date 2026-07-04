@@ -1,6 +1,6 @@
 [package]
 name = "secantusdb"
-version = "0.5.3-beta.127"
+version = "0.5.3-beta.128"
 edition = "2021"
 description = "Standalone SecantusDB server binary (Rust): WiredTiger-backed, MongoDB wire protocol."
 license = "GPL-2.0-only"
@@ -28,3 +28,6 @@ secantus-storage = { path = "../secantus-storage" }
 secantus-storage-adapter = { path = "../secantus-storage-adapter" }
 secantus-commands = { path = "../secantus-commands" }
 secantus-server = { path = "../secantus-server" }
+# --log-level: init a logger to the resolved level before storage opens.
+log = "0.4"
+env_logger = "0.11"

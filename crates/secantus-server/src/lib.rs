@@ -20,6 +20,9 @@
 //! yet — `hello`'s replica-set `lastWrite` uses a zero timestamp until then).
 
 pub mod args;
+pub mod config;
+
+pub use config::{ConfigOverrides, ResolvedConfig};
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
