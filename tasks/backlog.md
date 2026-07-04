@@ -1447,6 +1447,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   Output types wired in `planner._infer_scalar_tag` (float8 for the transcendental/root funcs,
   numeric for trunc/sign/factorial, int8 for gcd/lcm). `mod` / `power` / `abs` / `ceil` / `floor` /
   `round` were already present.
+- [ ] **Composite types landed** (b131): `CREATE TYPE name AS (field type, …)` stores an ordered
+  `(field, type_tag)` list in the `__sql_composites__` catalog collection (`Catalog.create_composite`
+  / `get_composite` / `composite_exists` / `drop_composite` / `list_composites`). A composite-typed
+  column carries `composite_type` + `composite_fields` on its `Column` (resolved from the type at
+  CREATE TABLE via `executor._resolve_user_type_column`, `type_tag = "composite"`) and stores a
+  subdocument. Write: `ROW(a, b)` → `planner._literal` returns a positional list, `_composite_value`
+  maps it onto the named fields (coercing each). Read: `(col).field` (a `Dot(Paren(Column),
+  Identifier)`) evaluates in `scalar.py` to the subdoc field, typed via `planner._composite_field_tag`
+  (the resolver stashes its `TableDef` on `resolve.table`). Whole-composite selects render the PG
+  record text literal `(f1,f2)` (`typemap._render_pg_composite`, RECORD oid 2249). Reflected via
+  `pg_type` (`typtype = 'c'`, oid base 67000 in `virtual._composite_oids`). **Limitations:** composite
+  field access is only in the SELECT list / RETURNING — **not** in a `WHERE` predicate or `UPDATE …
+  SET` target (the Mongo-filter translation doesn't lower `(col).field`); no nested composites; and
+  `pg_attribute`-level reflection of a composite type's fields (needs a `pg_class` `relkind='c'` row +
+  `typrelid`) is not implemented, so `psql \dT+` won't list the fields.
 - [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
   `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
   `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`

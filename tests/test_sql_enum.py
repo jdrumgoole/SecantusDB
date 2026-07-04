@@ -63,9 +63,10 @@ def test_drop_type_if_exists(storage, session):
     assert run(storage, session, "DROP TYPE IF EXISTS nope").command_tag == "DROP TYPE"
 
 
-def test_non_enum_create_type_unsupported(storage, session):
-    # Composite types aren't supported — faithful not-supported (0A000).
-    assert sqlstate(storage, session, "CREATE TYPE pt AS (x int, y int)") == "0A000"
+def test_range_create_type_unsupported(storage, session):
+    # Composite types are supported (see test_sql_composite_type); range / base
+    # types remain a faithful not-supported (0A000).
+    assert sqlstate(storage, session, "CREATE TYPE fr AS RANGE (subtype = float8)") == "0A000"
 
 
 # -- enum-typed columns -------------------------------------------------------- #

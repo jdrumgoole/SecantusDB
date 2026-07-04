@@ -1012,6 +1012,23 @@ def test_math_funcs_via_driver(server):
     conn.close()
 
 
+def test_composite_type_via_driver(server):
+    # CREATE TYPE composite: ROW insert, (col).field read (typed), and the whole
+    # composite rendered as a Postgres record literal over the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TYPE addr AS (street text, zip int)")
+    cur.execute("CREATE TABLE people (id int primary key, home addr)")
+    cur.execute("INSERT INTO people VALUES (1, ROW('Main St', 90210))")
+    cur.execute("SELECT (home).street, (home).zip FROM people")
+    assert cur.fetchone() == ["Main St", 90210]  # zip is a real int, not '90210'
+    cur.execute("SELECT home FROM people")
+    # We send the RECORD OID (2249) with the ``("Main St",90210)`` text literal;
+    # pg8000 decodes an anonymous record into a tuple of (untyped) text fields.
+    assert cur.fetchone() == [("Main St", "90210")]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

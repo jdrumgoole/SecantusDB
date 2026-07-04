@@ -1470,24 +1470,59 @@ def _drop_sequence(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
 
 
 def _create_type(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
-    """``CREATE TYPE name AS ENUM ('a', 'b', …)`` — record the enum's label list.
-    Only the ENUM form is supported (composite / range / base types are not)."""
+    """``CREATE TYPE name AS ENUM ('a', 'b', …)`` records the enum's label list;
+    ``CREATE TYPE name AS (field type, …)`` records a composite type's ordered
+    fields. Range / base types are not supported."""
     name = stmt.this.name
-    dt = stmt.args.get("expression")
-    if not (isinstance(dt, exp.DataType) and dt.this and dt.this.name == "ENUM"):
+    expr = stmt.args.get("expression")
+    # Composite form: sqlglot parses the ``(field type, …)`` body as a Schema of
+    # ColumnDefs.
+    if isinstance(expr, exp.Schema):
+        _check_type_name_free(catalog, db, name)
+        fields = _composite_fields_from_schema(expr, name)
+        catalog.create_composite(db, name, fields)
+        return SQLResult(command_tag="CREATE TYPE")
+    if not (isinstance(expr, exp.DataType) and expr.this and expr.this.name == "ENUM"):
         raise errors.feature_not_supported(
-            "only CREATE TYPE … AS ENUM is supported (composite/range types are not)"
+            "only CREATE TYPE … AS ENUM and CREATE TYPE … AS (…) are supported "
+            "(range / base types are not)"
         )
-    if catalog.enum_exists(db, name):
-        raise errors.SQLError("42710", f'type "{name}" already exists')
-    labels = [e.this if isinstance(e, exp.Literal) else str(e) for e in dt.expressions]
+    _check_type_name_free(catalog, db, name)
+    labels = [e.this if isinstance(e, exp.Literal) else str(e) for e in expr.expressions]
     catalog.create_enum(db, name, labels)
     return SQLResult(command_tag="CREATE TYPE")
 
 
+def _check_type_name_free(catalog: Catalog, db: str, name: str) -> None:
+    if (
+        catalog.enum_exists(db, name)
+        or catalog.composite_exists(db, name)
+        or catalog.domain_exists(db, name)
+    ):
+        raise errors.SQLError("42710", f'type "{name}" already exists')
+
+
+def _composite_fields_from_schema(schema: exp.Schema, type_name: str) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    for coldef in schema.expressions:
+        if not isinstance(coldef, exp.ColumnDef):
+            raise errors.feature_not_supported(
+                f"unsupported composite type element: {coldef.sql()}"
+            )
+        tag = typemap.type_tag_for_sql(coldef.args["kind"])
+        if tag is None:
+            raise errors.feature_not_supported(
+                f'unsupported field type in composite type "{type_name}": '
+                f"{coldef.args['kind'].sql()}"
+            )
+        fields.append((coldef.name, tag))
+    return fields
+
+
 def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     name = stmt.this.name
-    if not catalog.drop_enum(db, name) and not stmt.args.get("exists"):
+    dropped = catalog.drop_enum(db, name) or catalog.drop_composite(db, name)
+    if not dropped and not stmt.args.get("exists"):
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     return SQLResult(command_tag="DROP TYPE")
 

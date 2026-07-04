@@ -204,6 +204,10 @@ def _literal(node: exp.Expression) -> Any:
             return node.this
         text = node.this
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() == "row":
+        # ``ROW(a, b, …)`` composite constructor -> a positional list; the INSERT
+        # path maps it onto a composite column's named fields.
+        return [_literal(e) for e in node.expressions]
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
         # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
         # SQLAlchemy's psycopg dialect probes ``t.oid = to_regtype('hstore')`` at
@@ -409,7 +413,31 @@ def table_resolver(table: TableDef) -> Resolve:
         col = _column_name(node)
         return table.field_for(col), table.type_for(col)
 
+    # Stashed so composite ``(col).field`` typing can look up the type's fields.
+    resolve.table = table  # type: ignore[attr-defined]
     return resolve
+
+
+def _composite_field_tag(node: exp.Expression, resolve: Resolve) -> str | None:
+    """Type of a composite field-access ``(col).field`` node, or None when the
+    node isn't that shape / the column isn't a resolvable composite. ``node`` is a
+    ``Dot(Paren(Column), Identifier)``."""
+    if not (isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier)):
+        return None
+    inner = node.this.this if isinstance(node.this, exp.Paren) else node.this
+    if not isinstance(inner, exp.Column):
+        return None
+    table = getattr(resolve, "table", None)
+    if table is None:
+        return None
+    col = table.column(_column_name(inner))
+    if col is None or col.composite_fields is None:
+        return None
+    fname = node.expression.name
+    for field_name, tag in col.composite_fields:
+        if field_name == fname:
+            return tag
+    return None
 
 
 # jsonb navigation: ->, ->>, #>, #>> parse to these nodes. ``Scalar`` variants
@@ -1244,7 +1272,11 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             )
         if raw is None and not col.nullable:
             raise errors.not_null_violation(name)
-        _set_doc_field(doc, col.field, typemap.coerce(raw, col.type_tag))
+        if col.composite_type is not None and raw is not None:
+            value = _composite_value(raw, col)
+        else:
+            value = typemap.coerce(raw, col.type_tag)
+        _set_doc_field(doc, col.field, value)
         provided.add(name)
     # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
     # omission is a violation. A sequence-backed column (SERIAL / DEFAULT
@@ -1260,6 +1292,28 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             raise errors.not_null_violation(col.name)
     _canonicalize_composite_id(doc, table)
     return doc
+
+
+def _composite_value(raw: Any, col: Column) -> dict[str, Any]:
+    """Map a ``ROW(…)`` positional value (or an already-named subdocument) onto a
+    composite column's named fields, coercing each field to its declared type."""
+    fields = col.composite_fields or ()
+    if isinstance(raw, dict):
+        pairs = [(fname, raw.get(fname)) for fname, _ in fields]
+    elif isinstance(raw, (list, tuple)):
+        if len(raw) != len(fields):
+            raise errors.SQLError(
+                "22P02",
+                f'malformed record literal for type "{col.composite_type}": '
+                f"expected {len(fields)} fields, got {len(raw)}",
+            )
+        pairs = list(zip((f[0] for f in fields), raw, strict=True))
+    else:
+        raise errors.SQLError("22P02", f'malformed record literal for type "{col.composite_type}"')
+    return {
+        fname: typemap.coerce(val, tag)
+        for (fname, val), (_, tag) in zip(pairs, fields, strict=True)
+    }
 
 
 def _set_doc_field(doc: dict[str, Any], field: str, value: Any) -> None:
@@ -2027,6 +2081,7 @@ def _table_resolve(table: TableDef) -> Resolve:
         name = node.name
         return table.field_for(name), table.type_for(name)
 
+    resolve.table = table  # type: ignore[attr-defined]
     return resolve
 
 
@@ -4020,6 +4075,10 @@ _BOOL_EXPR_TYPES = (
 
 def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
+    # Composite field access ``(col).field`` types as the field's declared type.
+    composite_tag = _composite_field_tag(node, resolve)
+    if composite_tag is not None:
+        return composite_tag
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
