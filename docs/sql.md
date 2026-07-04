@@ -815,9 +815,26 @@ SELECT region, bool_and(active), bool_or(active) FROM sales GROUP BY region;
 
 `string_agg(expr, sep)` joins the non-NULL values in each group with the
 separator (returning NULL when every value was NULL). `bool_and` / `every` are
-true only when every input is true; `bool_or` is true when any is. The ordered-set
-aggregates `percentile_cont` / `mode` (`WITHIN GROUP (ORDER BY …)`) are not yet
-supported (`0A000`).
+true only when every input is true; `bool_or` is true when any is.
+
+The **ordered-set aggregates** `percentile_cont(f)` / `percentile_disc(f)` /
+`mode()` are supported via `WITHIN GROUP (ORDER BY expr)`:
+
+```sql
+SELECT dept,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY salary) AS median,   -- interpolated
+       percentile_disc(0.9) WITHIN GROUP (ORDER BY salary) AS p90,      -- an actual value
+       mode()               WITHIN GROUP (ORDER BY salary) AS commonest
+FROM emp GROUP BY dept;
+```
+
+`percentile_cont(f)` interpolates linearly between the two nearest ranks
+(returning `float8`); `percentile_disc(f)` returns the first value whose
+cumulative fraction ≥ `f` (keeping the value's type); `mode()` returns the most
+frequent value (the smallest on a tie). NULLs are ignored; an all-NULL / empty
+group yields NULL. `f` must be in `[0, 1]` (else `2202E`). They collect the
+ordered values and compute in Python, so they work grouped and whole-table (not
+yet over a JOIN).
 
 An aggregate can carry a `FILTER (WHERE cond)` clause — only rows satisfying
 `cond` contribute to that aggregate:

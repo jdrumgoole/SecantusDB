@@ -951,6 +951,20 @@ def test_aggregate_filter_via_driver(server):
     conn.close()
 
 
+def test_ordered_set_aggregate_via_driver(server):
+    # percentile_cont / mode WITHIN GROUP, grouped, on the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE m (id int primary key, g text, v int)")
+    cur.execute("INSERT INTO m VALUES (1,'a',1),(2,'a',2),(3,'a',3),(4,'b',9),(5,'b',9)")
+    cur.execute(
+        "SELECT g, percentile_cont(0.5) WITHIN GROUP (ORDER BY v), "
+        "mode() WITHIN GROUP (ORDER BY v) FROM m GROUP BY g ORDER BY g"
+    )
+    assert cur.fetchall() == (["a", 2.0, 1], ["b", 9.0, 9])
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

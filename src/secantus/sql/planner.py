@@ -1868,6 +1868,11 @@ class PipelineSelectPlan:
     residual_where: exp.Expression | None = None
     residual_resolve: Resolve | None = None
     residual_split: int = 0
+    # Ordered-set aggregates (percentile_cont / percentile_disc / mode) collect
+    # their ORDER BY values via a ``$push`` accumulator, then the executor computes
+    # the scalar in Python (the aggregation engine has no ``$sortArray``). Each
+    # entry is ``(output_field, kind, fraction)`` — ``fraction`` None for mode.
+    post_aggregates: list[tuple[str, str, float | None]] = field(default_factory=list)
 
 
 @dataclass
@@ -2071,6 +2076,40 @@ def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
     return inner.this if isinstance(inner, exp.ArrayAgg) else None
 
 
+# Ordered-set aggregates: ``<func>(...) WITHIN GROUP (ORDER BY expr)``.
+_ORDERED_SET_KINDS: dict[type, str] = {
+    exp.PercentileCont: "percentile_cont",
+    exp.PercentileDisc: "percentile_disc",
+    exp.Mode: "mode",
+}
+
+
+def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expression] | None:
+    """If ``node`` is an ordered-set aggregate — ``percentile_cont(f)`` /
+    ``percentile_disc(f)`` / ``mode() WITHIN GROUP (ORDER BY expr)`` — return
+    ``(kind, fraction, order_value_expr)``. ``fraction`` is None for ``mode``.
+    Raises for a fraction outside [0, 1] (``2202E``) or a non-single ORDER BY."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if not isinstance(inner, exp.WithinGroup):
+        return None
+    kind = _ORDERED_SET_KINDS.get(type(inner.this))
+    if kind is None:
+        raise errors.feature_not_supported(
+            f"unsupported WITHIN GROUP aggregate: {inner.this.sql()}"
+        )
+    order = inner.expression
+    ordered = order.expressions if isinstance(order, exp.Order) else []
+    if len(ordered) != 1:
+        raise errors.feature_not_supported("WITHIN GROUP requires exactly one ORDER BY expression")
+    order_val = ordered[0].this
+    fraction: float | None = None
+    if kind != "mode":
+        fraction = float(_literal(inner.this.this))
+        if not 0.0 <= fraction <= 1.0:
+            raise errors.SQLError("2202E", f"percentile value {fraction} is not between 0 and 1")
+    return kind, fraction, order_val
+
+
 def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
     """If ``node`` is a set-returning function, return (kind, array_expr).
 
@@ -2154,6 +2193,7 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
         if _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
         or _string_agg_arg(e) is not None
+        or _ordered_set_agg(e) is not None
     ]
     if not aggs:
         return False
@@ -2240,6 +2280,7 @@ def _plan_pipeline_select(
         _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
         or _string_agg_arg(e) is not None
+        or _ordered_set_agg(e) is not None
         for e in stmt.expressions
     )
     grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_aggregate)
@@ -2630,6 +2671,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    post_aggregates: list[tuple[str, str, float | None]] = []
     names = _NameAllocator()
     agg_fields: dict[tuple[str, str | None, bool], str] = {}
 
@@ -2638,13 +2680,28 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         arr_arg = _array_agg_arg(e)
         sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
+        osa = _ordered_set_agg(e)
         where = _agg_filter_where(e)
         if (arr_arg is not None or sagg is not None) and where is not None:
             raise errors.feature_not_supported(
                 "FILTER (WHERE ...) is not supported on array_agg / string_agg"
             )
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
-        if arr_arg is not None:
+        if osa is not None:
+            kind, fraction, order_val = osa
+            fname = names.fresh(alias or kind)
+            # Collect the ORDER BY values; the executor sorts + computes in Python.
+            accumulators[fname] = {"$push": _agg_arg_to_expr(order_val, table)}
+            project[fname] = f"${fname}"
+            if kind == "percentile_cont":
+                tag = "float8"
+            elif isinstance(order_val, exp.Column):
+                tag = table.type_for(order_val.name)
+            else:
+                tag = "float8"
+            post_aggregates.append((fname, kind, fraction))
+            out_columns.append((fname, tag))
+        elif arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             project[fname] = f"${fname}"
@@ -2717,6 +2774,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         out_columns,
         residual_where=residual,
         residual_resolve=table_resolver(table) if residual is not None else None,
+        post_aggregates=post_aggregates,
     )
 
 
