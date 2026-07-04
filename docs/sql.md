@@ -757,6 +757,14 @@ FROM items
 ORDER BY price * qty DESC;
 SELECT coalesce(nickname, name) || ' (' || length(name) || ')' AS label FROM users;
 
+-- Regex / string functions evaluate per row:
+SELECT regexp_replace(path, '/+', '/', 'g'),   -- collapse runs of slashes (g = global)
+       split_part(email, '@', 2) AS domain,    -- 2nd field (1-based; -1 counts from the end)
+       translate(code, 'O-', '0'),             -- map 'O'->'0', delete '-'
+       regexp_count(text, '[0-9]') AS digits,  -- number of matches
+       regexp_matches(text, '(\w+)@(\w+)')     -- first match's capture groups -> text[]
+FROM t;
+
 -- Non-correlated subqueries in WHERE: IN / NOT IN over a single column, and a
 -- scalar `OP (SELECT ...)`. The inner query runs first (it may aggregate/filter).
 -- These work in every query shape — a plain SELECT, or one that also JOINs /

@@ -979,6 +979,20 @@ def test_agg_order_by_via_driver(server):
     conn.close()
 
 
+def test_regex_string_funcs_via_driver(server):
+    # regexp_replace / split_part / regexp_count on the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id int primary key, s text)")
+    cur.execute("INSERT INTO t VALUES (1, 'a1b2c3')")
+    cur.execute(
+        "SELECT regexp_replace(s, '[0-9]', '#', 'g'), split_part(s, 'b', 1), "
+        "regexp_count(s, '[0-9]') FROM t"
+    )
+    assert cur.fetchall() == (["a#b#c#", "a1", 3],)
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

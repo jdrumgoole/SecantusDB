@@ -1396,6 +1396,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `$reduce` in the group `$project` (`_string_agg_project`) that joins the pushed array skipping NULL
   elements (NULL when all-NULL) — wired into the single-table, join, and grouping-set planners with the
   routing predicates updated. Tests: `tests/test_sql_string_agg.py`.
+- [ ] **Regex / string scalar functions landed** (b129): `regexp_replace(src, pat, repl [,flags])`
+  (Python `re.sub`; `g` flag → global, `i`/`m`/`s`/`x` supported; PG `\&` whole-match → Python `\g<0>`,
+  `\1`–`\9` pass through), `split_part(str, delim, n)` (1-based; negative counts from the end (PG14+);
+  out-of-range → `''`), `translate(str, from, to)` (per-char map; extra `from` chars deleted),
+  `regexp_count(str, pat)`, and `regexp_matches(str, pat [,flags])` — all in `scalar.py`
+  (`_SCALAR_FUNC_NODES` for the dedicated nodes `RegexpReplace`/`SplitPart`/`Translate`/`RegexpCount`;
+  `regexp_matches` is `Anonymous` → `_call_func`). Output types wired in `planner._infer_scalar_tag`
+  (text / int4). **Limitation:** `regexp_matches` is genuinely set-returning in Postgres (one row per
+  match); in our scalar context it returns only the **first** match's capture groups as a `text[]` (whole
+  match if no groups), NULL when there is no match — sufficient for the common non-`g` use.
 - [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
   `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
   `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`

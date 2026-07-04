@@ -4077,9 +4077,23 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         ),
     ):
         return "numeric"
-    if isinstance(node, (exp.DPipe, exp.Upper, exp.Lower, exp.Trim, exp.Substring, exp.Concat)):
+    if isinstance(
+        node,
+        (
+            exp.DPipe,
+            exp.Upper,
+            exp.Lower,
+            exp.Trim,
+            exp.Substring,
+            exp.Concat,
+            exp.RegexpReplace,
+            exp.SplitPart,
+        ),
+    ) or (getattr(exp, "Translate", None) is not None and isinstance(node, exp.Translate)):
         return "text"
-    if isinstance(node, (exp.Length, exp.ArraySize, exp.ArrayPosition)):
+    if isinstance(node, (exp.Length, exp.ArraySize, exp.ArrayPosition)) or (
+        getattr(exp, "RegexpCount", None) is not None and isinstance(node, exp.RegexpCount)
+    ):
         return "int4"
     if isinstance(node, exp.ArrayToString):
         return "text"
