@@ -16,6 +16,8 @@ current row (with outer-row fallthrough for correlation).
 
 from __future__ import annotations
 
+import calendar
+import datetime as _dt
 import json
 import math
 from collections.abc import Callable
@@ -126,6 +128,8 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_bracket(node, scope, ctx)
     if isinstance(node, exp.Array):  # ARRAY[...] constructor -> a Python list
         return [evaluate(e, scope, ctx) for e in node.expressions]
+    if isinstance(node, exp.Interval):  # interval '1 day' (added to / subtracted
+        return _eval_interval(node, scope, ctx)  # from a date via _Interval.__radd__)
     typed = _SCALAR_FUNC_NODES.get(type(node))
     if typed is not None:
         return typed(node, scope, ctx)
@@ -485,6 +489,217 @@ def _cbrt(v: Any) -> float:
     return math.copysign(abs(v) ** (1.0 / 3.0), v)
 
 
+# -- date / time ------------------------------------------------------------- #
+
+
+class _Interval:
+    """A Postgres ``interval`` value split into a calendar part (``months``) and a
+    fixed-duration part (``delta``). ``months`` needs calendar-aware arithmetic
+    (a month is not a fixed number of days) applied via ``__radd__`` / ``__rsub__``
+    onto a ``date`` / ``datetime`` so ``ts + interval '1 month'`` lands correctly."""
+
+    __slots__ = ("months", "delta")
+
+    def __init__(self, months: int = 0, delta: _dt.timedelta | None = None) -> None:
+        self.months = months
+        self.delta = delta or _dt.timedelta(0)
+
+    def __neg__(self) -> _Interval:
+        return _Interval(-self.months, -self.delta)
+
+    def _apply(self, base: Any, sign: int) -> Any:
+        months = sign * self.months
+        result = _add_months(base, months) if months else base
+        return result + (sign * self.delta)
+
+    def __radd__(self, base: Any) -> Any:  # base + interval
+        return self._apply(base, 1)
+
+    def __rsub__(self, base: Any) -> Any:  # base - interval
+        return self._apply(base, -1)
+
+
+def _add_months(base: Any, months: int) -> Any:
+    """Add ``months`` (may be negative) to a date/datetime, clamping the day to the
+    target month's length (Jan 31 + 1 month -> Feb 28)."""
+    total = base.year * 12 + (base.month - 1) + months
+    year, month = divmod(total, 12)
+    month += 1
+    day = min(base.day, calendar.monthrange(year, month)[1])
+    return base.replace(year=year, month=month, day=day)
+
+
+# interval unit -> either a ``timedelta`` factory (fixed) or a month count.
+_INTERVAL_FIXED = {
+    "week": lambda n: _dt.timedelta(weeks=n),
+    "day": lambda n: _dt.timedelta(days=n),
+    "hour": lambda n: _dt.timedelta(hours=n),
+    "minute": lambda n: _dt.timedelta(minutes=n),
+    "second": lambda n: _dt.timedelta(seconds=n),
+    "millisecond": lambda n: _dt.timedelta(milliseconds=n),
+    "microsecond": lambda n: _dt.timedelta(microseconds=n),
+}
+_INTERVAL_MONTHS = {"year": 12, "quarter": 3, "month": 1, "decade": 120, "century": 1200}
+
+
+def _interval_singular(unit: str) -> str:
+    return unit.lower().rstrip("s") if unit.lower() not in ("s",) else unit.lower()
+
+
+def _accumulate_interval(iv: _Interval, value: float, unit: str) -> None:
+    u = _interval_singular(unit)
+    if u in _INTERVAL_MONTHS:
+        iv.months += int(value * _INTERVAL_MONTHS[u])
+    elif u in _INTERVAL_FIXED:
+        iv.delta += _INTERVAL_FIXED[u](value)
+    else:
+        raise errors.feature_not_supported(f"unsupported interval unit: {unit}")
+
+
+def _eval_interval(node: exp.Interval, scope: Scope, ctx: ScalarContext) -> _Interval:
+    """``interval '<n> <unit>'`` / ``interval '<n>' <unit>`` / a compound literal
+    (``'1 year 2 months'``) -> an ``_Interval``."""
+    iv = _Interval()
+    raw = evaluate(node.this, scope, ctx) if node.this is not None else None
+    text = _as_text(raw).strip() if raw is not None else ""
+    unit = node.args.get("unit")
+    unit_name = unit.name if unit is not None else None
+    if unit_name:
+        _accumulate_interval(iv, float(text), unit_name)
+    else:
+        # Compound string: "1 year 2 months 3 days".
+        tokens = text.split()
+        for i in range(0, len(tokens) - 1, 2):
+            _accumulate_interval(iv, float(tokens[i]), tokens[i + 1])
+    return iv
+
+
+def _as_datetime(v: Any) -> _dt.datetime | _dt.date:
+    if isinstance(v, (_dt.datetime, _dt.date)):
+        return v
+    text = _as_text(v)
+    return _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def _eval_extract(node: exp.Extract, scope: Scope, ctx: ScalarContext) -> Any:
+    """``extract(field FROM ts)`` / ``date_part('field', ts)`` -> a numeric field."""
+    src = evaluate(node.expression, scope, ctx)
+    if src is None:
+        return None
+    ts = _as_datetime(src)
+    field = node.this.name.lower()
+    if field in ("year", "years"):
+        return ts.year
+    if field in ("month", "months"):
+        return ts.month
+    if field in ("day", "days"):
+        return ts.day
+    if field == "quarter":
+        return (ts.month - 1) // 3 + 1
+    if field in ("dow",):  # Postgres: Sunday = 0 .. Saturday = 6
+        return (ts.weekday() + 1) % 7
+    if field in ("isodow",):  # Monday = 1 .. Sunday = 7
+        return ts.isoweekday()
+    if field in ("doy",):
+        return ts.timetuple().tm_yday
+    if field in ("week",):
+        return ts.isocalendar()[1]
+    if field in ("hour", "hours"):
+        return getattr(ts, "hour", 0)
+    if field in ("minute", "minutes"):
+        return getattr(ts, "minute", 0)
+    if field in ("second", "seconds"):
+        return getattr(ts, "second", 0)
+    if field == "epoch":
+        base = ts if isinstance(ts, _dt.datetime) else _dt.datetime(ts.year, ts.month, ts.day)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=_dt.timezone.utc)
+        return base.timestamp()
+    raise errors.feature_not_supported(f"unsupported extract field: {field}")
+
+
+_DATE_TRUNC_UNITS = ("year", "quarter", "month", "week", "day", "hour", "minute", "second")
+
+
+def _eval_date_trunc(node: exp.TimestampTrunc, scope: Scope, ctx: ScalarContext) -> Any:
+    """``date_trunc('unit', ts)`` -> ts zeroed below ``unit`` (week -> Monday)."""
+    src = evaluate(node.this, scope, ctx)
+    if src is None:
+        return None
+    ts = _as_datetime(src)
+    if not isinstance(ts, _dt.datetime):
+        ts = _dt.datetime(ts.year, ts.month, ts.day, tzinfo=_dt.timezone.utc)
+    unit = node.args["unit"].name.lower().rstrip("s")
+    y, mo, d, h, mi, s = ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second
+    tz = ts.tzinfo
+    if unit == "year":
+        return _dt.datetime(y, 1, 1, tzinfo=tz)
+    if unit == "quarter":
+        return _dt.datetime(y, ((mo - 1) // 3) * 3 + 1, 1, tzinfo=tz)
+    if unit == "month":
+        return _dt.datetime(y, mo, 1, tzinfo=tz)
+    if unit == "week":
+        monday = ts - _dt.timedelta(days=ts.weekday())
+        return _dt.datetime(monday.year, monday.month, monday.day, tzinfo=tz)
+    if unit == "day":
+        return _dt.datetime(y, mo, d, tzinfo=tz)
+    if unit == "hour":
+        return _dt.datetime(y, mo, d, h, tzinfo=tz)
+    if unit == "minute":
+        return _dt.datetime(y, mo, d, h, mi, tzinfo=tz)
+    if unit == "second":
+        return _dt.datetime(y, mo, d, h, mi, s, tzinfo=tz)
+    raise errors.feature_not_supported(f"unsupported date_trunc unit: {unit}")
+
+
+# sqlglot's Postgres dialect already normalises the standard ``to_char`` tokens
+# (YYYY / MM / DD / HH24 / MI / SS …) to strftime directives; only the word-form
+# tokens are left as literals, so we map just those (longest-first) and then
+# strftime once. Existing ``%X`` directives are copied through untouched.
+_PG_WORD_TOKENS = [
+    ("MONTH", "%B"),
+    ("MON", "%b"),
+    ("DAY", "%A"),
+    ("DY", "%a"),
+    ("AM", "%p"),
+    ("PM", "%p"),
+]
+
+
+def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
+    """``to_char(ts, 'YYYY-MM-DD HH24:MI:SS')`` -> a formatted string."""
+    src = evaluate(node.this, scope, ctx)
+    fmt_node = node.args.get("format")
+    if src is None or fmt_node is None:
+        return None
+    ts = _as_datetime(src)
+    if not isinstance(ts, _dt.datetime):
+        ts = _dt.datetime(ts.year, ts.month, ts.day)
+    fmt = _as_text(
+        evaluate(fmt_node, scope, ctx) if isinstance(fmt_node, exp.Expression) else fmt_node
+    )
+    out, i = [], 0
+    up = fmt.upper()
+    while i < len(fmt):
+        if fmt[i] == "%" and i + 1 < len(fmt):
+            out.append(fmt[i : i + 2])  # already a strftime directive
+            i += 2
+            continue
+        for pat, directive in _PG_WORD_TOKENS:
+            if up.startswith(pat, i):
+                out.append(directive)
+                i += len(pat)
+                break
+        else:
+            out.append(fmt[i])
+            i += 1
+    return ts.strftime("".join(out))
+
+
+def _utcnow(ctx: ScalarContext | None) -> _dt.datetime:
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
 # Typed scalar function nodes (sqlglot parses these to dedicated classes whose
 # operands live in ``this`` / named args, not ``expressions``).
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
@@ -533,6 +748,11 @@ for _cls_name, _handler in (
     ("Degrees", _unary(math.degrees)),
     ("Radians", _unary(math.radians)),
     ("Factorial", _unary(lambda v: math.factorial(int(v)))),
+    ("Extract", _eval_extract),
+    ("TimestampTrunc", _eval_date_trunc),
+    ("TimeToStr", _eval_to_char),
+    ("CurrentTimestamp", lambda n, s, c: _utcnow(c)),
+    ("CurrentDate", lambda n, s, c: _utcnow(c).date()),
 ):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:

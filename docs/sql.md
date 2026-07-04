@@ -808,6 +808,19 @@ SELECT trunc(x),          -- truncate toward zero (trunc(x, n) keeps n decimals)
        mod(a, b), power(a, b), abs(x), ceil(x), floor(x), round(x, 2)
 FROM t;
 
+-- Date / time functions evaluate per row. extract / date_part return a numeric
+-- field; date_trunc returns a timestamp; to_char returns text; ts ± interval
+-- returns a timestamp (calendar-aware for month / year, with day clamping).
+SELECT extract(year FROM at),        -- also month/day/hour/minute/second/quarter/
+       extract(dow FROM at),         --   dow (Sun=0)/isodow (Mon=1)/doy/week/epoch
+       date_part('hour', at),        -- date_part is the function-call spelling
+       date_trunc('month', at),      -- zero everything below the unit (week -> Monday)
+       to_char(at, 'YYYY-MM-DD HH24:MI:SS'),   -- Mon/Day month/weekday names too
+       at + interval '1 day',        -- interval arithmetic (fixed + month/year units)
+       at - interval '2 months 3 days',
+       now(), current_timestamp, current_date
+FROM events;
+
 -- Non-correlated subqueries in WHERE: IN / NOT IN over a single column, and a
 -- scalar `OP (SELECT ...)`. The inner query runs first (it may aggregate/filter).
 -- These work in every query shape — a plain SELECT, or one that also JOINs /

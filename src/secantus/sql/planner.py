@@ -4120,6 +4120,24 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
     if isinstance(node, _BOOL_EXPR_TYPES):
         return "bool"
+    # Date/time: extract/date_part -> numeric field; date_trunc / now() /
+    # current_timestamp / current_date -> timestamptz; to_char -> text. Classes are
+    # looked up by attribute because their availability varies across sqlglot.
+    _ts_names = ("TimestampTrunc", "CurrentTimestamp", "CurrentDate", "CurrentTime")
+    _ts_types = tuple(c for c in (getattr(exp, n, None) for n in _ts_names) if c is not None)
+    if _ts_types and isinstance(node, _ts_types):
+        return "timestamptz"
+    if getattr(exp, "Extract", None) is not None and isinstance(node, exp.Extract):
+        return "numeric"
+    if getattr(exp, "TimeToStr", None) is not None and isinstance(node, exp.TimeToStr):
+        return "text"
+    # ``ts ± interval`` keeps the timestamp's type (the non-interval operand's).
+    if isinstance(node, (exp.Add, exp.Sub)):
+        left, right = node.this, node.expression
+        if isinstance(right, exp.Interval):
+            return _infer_scalar_tag(left, resolve)
+        if isinstance(left, exp.Interval):
+            return _infer_scalar_tag(right, resolve)
     if isinstance(
         node,
         (
