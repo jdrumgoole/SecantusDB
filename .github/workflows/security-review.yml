@@ -22,8 +22,10 @@ permissions:
   contents: write # commit + push the security-review/* branch
   pull-requests: write # open and squash-merge the report PR
   issues: write # file `security` issues for CRITICAL/WARNING findings
-  id-token: write
   actions: read
+  # No id-token: write — the review authenticates via CLAUDE_CODE_OAUTH_TOKEN
+  # and gh (contents/PR/issues), never OIDC. Dropping it keeps the token
+  # least-privileged. (security review 2026-06-30 §I6)
 
 concurrency:
   group: security-review
