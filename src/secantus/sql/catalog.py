@@ -600,6 +600,12 @@ class Catalog:
         docs = self._storage.find_matching(db, DOMAIN_COLLECTION, {})
         return sorted(d["domain"] for d in docs)
 
+    def update_domain(self, db: str, name: str, doc: dict[str, Any]) -> None:
+        """Overwrite a domain's stored definition (for ALTER DOMAIN). ``doc`` is a
+        full replacement, keyed under the given ``name``."""
+        self._storage.delete_matching(db, DOMAIN_COLLECTION, {"_id": name})
+        self._storage.insert(db, DOMAIN_COLLECTION, [{**doc, "_id": name, "domain": name}])
+
     def alter_sequence(self, db: str, name: str, changes: dict[str, Any]) -> None:
         """Apply ``ALTER SEQUENCE`` changes. ``changes`` may set ``increment`` /
         ``min_value`` / ``max_value`` / ``cycle`` / ``start``, and a ``restart``

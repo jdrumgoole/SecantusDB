@@ -918,6 +918,25 @@ def test_create_domain_via_driver(server):
     conn.close()
 
 
+def test_alter_domain_via_driver(server):
+    # ALTER DOMAIN ADD CONSTRAINT (re-validating existing data) + SET NOT NULL,
+    # enforced on the wire.
+    conn = connect(server)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("CREATE DOMAIN pct AS integer CHECK (VALUE >= 0)")
+    cur.execute("CREATE TABLE m (id int primary key, v pct)")
+    cur.execute("INSERT INTO m VALUES (1, 50)")
+    cur.execute("ALTER DOMAIN pct ADD CONSTRAINT le100 CHECK (VALUE <= 100)")
+    # New constraint is enforced.
+    with pytest.raises(pg8000.DatabaseError):
+        cur.execute("INSERT INTO m VALUES (2, 200)")
+    cur.execute("INSERT INTO m VALUES (3, 75)")
+    cur.execute("SELECT v FROM m ORDER BY id")
+    assert cur.fetchall() == ([50], [75])
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

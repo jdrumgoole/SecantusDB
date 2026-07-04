@@ -1641,6 +1641,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
   secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
   aren't modeled (all checks are immediate — a future slice).
+- [ ] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
+  [IF EXISTS] c`, `SET DEFAULT expr` / `DROP DEFAULT`, `SET NOT NULL` / `DROP NOT NULL`, and `RENAME TO
+  new`. Handled in `engine._alter_domain_command` (Command-parsed; catalog `update_domain`). `ADD …
+  CHECK` and `SET NOT NULL` **re-validate every existing row** of every column typed with the domain
+  (`_domain_columns` scans `catalog.list_tables`; `_revalidate_domain_check` → `23514`,
+  `_revalidate_domain_not_null` → `23502`) and reject the ALTER without applying it if data would
+  violate — `NOT VALID` skips the re-check (still enforced on new writes). Unnamed `ADD … CHECK`
+  auto-names `<domain>_check[N]`; a duplicate explicit name → `42710`. `RENAME TO` re-keys the domain
+  and repoints every referencing column's `domain_type` (columns track domains by name). **Not modeled:**
+  `VALIDATE CONSTRAINT` (no-op accept — we validate eagerly), `RENAME CONSTRAINT`, dependency tracking.
 - [ ] **POSIX regex-match operators landed** (b124): `~` / `~*` / `!~` / `!~*` in WHERE lower to a Mongo
   `$regex` filter (`planner._expr_to_filter`, next to the LIKE handler; the pattern is a raw regex,
   *not* LIKE-translated, and matches unanchored — `re.search` semantics — like Postgres). `~*` adds
