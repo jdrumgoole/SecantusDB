@@ -884,8 +884,10 @@ GROUP BY, **and** a window function all in one SELECT is not yet supported.
 ## Aggregates, GROUP BY, HAVING
 
 `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` compile to an aggregation pipeline
-(`$group`), along with `array_agg`, `string_agg`, and the boolean aggregates
-`bool_and` / `bool_or` (and their `every` spelling).
+(`$group`), along with `array_agg`, `string_agg`, the boolean aggregates
+`bool_and` / `bool_or` (and their `every` spelling), and the statistical /
+bitwise aggregates (`stddev*` / `variance` / `var_pop` / `bit_and` / `bit_or` /
+`bit_xor`).
 
 ```sql
 SELECT region, COUNT(*) AS n, SUM(amount) AS total, AVG(amount) AS mean
@@ -904,6 +906,21 @@ SELECT region, bool_and(active), bool_or(active) FROM sales GROUP BY region;
 `string_agg(expr, sep)` joins the non-NULL values in each group with the
 separator (returning NULL when every value was NULL). `bool_and` / `every` are
 true only when every input is true; `bool_or` is true when any is.
+
+Statistical and bitwise aggregates round out the set:
+
+```sql
+SELECT stddev(x), stddev_pop(x), stddev_samp(x),      -- sample / population stddev
+       variance(x), var_pop(x),                        -- and their variances
+       bit_and(n), bit_or(n), bit_xor(n)               -- bitwise fold over an int column
+FROM t GROUP BY g;
+```
+
+`stddev` / `stddev_samp` and `variance` / `var_samp` are the **sample** forms
+(NULL for a single row); `stddev_pop` / `var_pop` are the **population** forms.
+They lower to Mongo's native `$stdDevPop` / `$stdDevSamp` accumulators (variance
+is the square). `bit_and` / `bit_or` / `bit_xor` fold the non-NULL integer values
+of a group (NULL for an all-NULL / empty group). All ignore NULL inputs.
 
 `array_agg` and `string_agg` accept an **in-call `ORDER BY`** that orders the
 aggregated values (multiple keys, `ASC`/`DESC`, and Postgres NULL placement):

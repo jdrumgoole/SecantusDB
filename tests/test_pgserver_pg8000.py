@@ -1100,6 +1100,22 @@ def test_jsonpath_via_driver(server):
     conn.close()
 
 
+def test_stat_bit_agg_via_driver(server):
+    # stddev / variance / bit_and|or|xor typed correctly on the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id int primary key, x float8, n int)")
+    cur.execute("INSERT INTO t VALUES (1, 2.0, 6), (2, 4.0, 3), (3, 6.0, 5)")
+    cur.execute("SELECT stddev_pop(x), var_pop(x), bit_and(n), bit_or(n), bit_xor(n) FROM t")
+    row = cur.fetchone()
+    assert row[0] == pytest.approx(1.632993, abs=1e-5)  # stddev_pop
+    assert float(row[1]) == pytest.approx(2.666667, abs=1e-5)  # var_pop -> numeric
+    assert row[2] == (6 & 3 & 5)  # bit_and -> real int
+    assert row[3] == (6 | 3 | 5)
+    assert row[4] == (6 ^ 3 ^ 5)
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
