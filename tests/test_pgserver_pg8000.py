@@ -1066,6 +1066,24 @@ def test_string_funcs2_via_driver(server):
     conn.close()
 
 
+def test_composite_where_update_via_driver(server):
+    # (col).field in WHERE and UPDATE SET col.field / col = ROW(...) over the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TYPE addr AS (street text, zip int)")
+    cur.execute("CREATE TABLE people (id int primary key, home addr)")
+    cur.execute("INSERT INTO people VALUES (1, ROW('Main St', 90210))")
+    cur.execute("SELECT id FROM people WHERE (home).zip = 90210")
+    assert cur.fetchone() == [1]
+    cur.execute("UPDATE people SET home.zip = 55555 WHERE id = 1")
+    cur.execute("SELECT (home).zip FROM people WHERE id = 1")
+    assert cur.fetchone() == [55555]
+    cur.execute("UPDATE people SET home = ROW('New Rd', 12345) WHERE id = 1")
+    cur.execute("SELECT (home).street FROM people WHERE id = 1")
+    assert cur.fetchone() == ["New Rd"]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

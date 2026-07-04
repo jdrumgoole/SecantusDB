@@ -658,6 +658,24 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "reloptions": None,
             }
         )
+    # Composite types have a backing relation (relkind 'c') whose reltype points
+    # back at the pg_type row; its pg_attribute rows are the type's fields.
+    type_oids = _composite_oids(db, catalog)
+    for name, oid in _composite_rel_oids(db, catalog).items():
+        rows.append(
+            {
+                "oid": oid,
+                "relname": name,
+                "relnamespace": _NS_OIDS["public"],
+                "relkind": "c",
+                "relpersistence": "p",
+                "relam": 0,
+                "reloptions": None,
+                "reltype": type_oids.get(name, 0),
+            }
+        )
+    for row in rows:
+        row.setdefault("reltype", 0)
     return rows
 
 
@@ -704,6 +722,29 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                     "attisdropped": False,
                     "attidentity": {"always": "a", "by_default": "d"}.get(col.identity or "", ""),
                     "attgenerated": "s" if col.generated is not None else "",
+                    "attcollation": 0,
+                    "attlen": -1,
+                }
+            )
+    # Composite-type fields are pg_attribute rows keyed on the type's relkind='c'
+    # relation oid, so pg_type.typrelid -> pg_class.oid -> pg_attribute resolves.
+    rel_oids = _composite_rel_oids(db, catalog)
+    getter = getattr(catalog, "get_composite", None)
+    for name, rel_oid in rel_oids.items():
+        fields = getter(db, name) if getter is not None else None
+        for i, (fname, tag) in enumerate(fields or [], start=1):
+            rows.append(
+                {
+                    "attrelid": rel_oid,
+                    "attname": fname,
+                    "atttypid": typemap.PG_OID.get(tag, 25),
+                    "atttypmod": -1,
+                    "attnum": i,
+                    "attnotnull": False,
+                    "atthasdef": False,
+                    "attisdropped": False,
+                    "attidentity": "",
+                    "attgenerated": "",
                     "attcollation": 0,
                     "attlen": -1,
                 }
@@ -844,6 +885,17 @@ def _composite_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return {name: _COMPOSITE_OID_BASE + i for i, name in enumerate(names)}
 
 
+_COMPOSITE_REL_OID_BASE = 68000
+
+
+def _composite_rel_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    """pg_class relation OIDs for composite types (relkind 'c'); the type's
+    ``pg_type.typrelid`` points here and its fields are pg_attribute rows."""
+    lister = getattr(catalog, "list_composites", None)
+    names = lister(db) if lister is not None else []
+    return {name: _COMPOSITE_REL_OID_BASE + i for i, name in enumerate(names)}
+
+
 def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     rows = [
         {
@@ -895,7 +947,9 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             }
         )
     # User-declared composite types (typtype 'c') live in the public namespace;
-    # their fields are reflected as pg_attribute rows keyed on this oid.
+    # typrelid points at the relkind='c' pg_class row whose pg_attribute rows are
+    # the type's fields.
+    rel_oids = _composite_rel_oids(db, catalog)
     for name, oid in _composite_oids(db, catalog).items():
         rows.append(
             {
@@ -908,8 +962,12 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typnotnull": False,
                 "typdefault": None,
                 "typtype": "c",
+                "typrelid": rel_oids.get(name, 0),
             }
         )
+    # Non-composite types have no backing relation.
+    for row in rows:
+        row.setdefault("typrelid", 0)
     return rows
 
 
@@ -1233,6 +1291,7 @@ _register(
         ("relpersistence", "text"),
         ("relam", "int4"),
         ("reloptions", "text"),
+        ("reltype", "int4"),
     ],
     _pg_class,
 )
@@ -1317,6 +1376,7 @@ _register(
         ("typnotnull", "bool"),
         ("typdefault", "text"),
         ("typtype", "text"),
+        ("typrelid", "int4"),
     ],
     _pg_type,
 )
