@@ -446,8 +446,24 @@ _JSONB_CLASSES = (exp.JSONExtract, exp.JSONExtractScalar, exp.JSONBExtract, exp.
 _JSONB_SCALAR = (exp.JSONExtractScalar, exp.JSONBExtractScalar)
 
 
+def _composite_access_parts(node: exp.Expression) -> tuple[exp.Column, str] | None:
+    """A composite field-access ``(col).field`` -> ``(inner_column, subfield)``, or
+    None. Requires the parenthesised form (``Dot(Paren(Column), Identifier)``) so a
+    schema-qualified ``pg_catalog.x`` Dot is never mistaken for field access."""
+    if not (
+        isinstance(node, exp.Dot)
+        and isinstance(node.this, exp.Paren)
+        and isinstance(node.expression, exp.Identifier)
+    ):
+        return None
+    inner = node.this.this
+    return (inner, node.expression.name) if isinstance(inner, exp.Column) else None
+
+
 def _is_field_node(node: exp.Expression) -> bool:
-    return isinstance(node, (exp.Column, *_JSONB_CLASSES))
+    return isinstance(node, (exp.Column, *_JSONB_CLASSES)) or (
+        _composite_access_parts(node) is not None
+    )
 
 
 def _json_keys(expr: exp.Expression) -> list[str]:
@@ -469,6 +485,13 @@ def _field(node: exp.Expression, resolve: Resolve) -> tuple[str, str]:
         keys = _json_keys(node.expression)
         path = base_path + ("." + ".".join(keys) if keys else "")
         return path, ("text" if isinstance(node, _JSONB_SCALAR) else "json")
+    parts = _composite_access_parts(node)
+    if parts is not None:
+        # ``(col).field`` -> the column's storage path plus the subfield name; the
+        # value lives in a subdocument, so a dotted Mongo path reaches it directly.
+        inner, subfield = parts
+        base_path, _ = resolve(inner)
+        return f"{base_path}.{subfield}", (_composite_field_tag(node, resolve) or "text")
     raise errors.feature_not_supported(f"expected a column or jsonb path: {node.sql()}")
 
 
@@ -1806,11 +1829,38 @@ def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelec
     )
 
 
+def _composite_subfield_target(target: exp.Expression, table: TableDef):
+    """A composite subfield SET target ``col.field`` parses as ``Column(this=field,
+    table=col)``; return ``(composite_column, subfield, field_tag)`` when ``col`` is
+    a composite column, else None."""
+    if not (isinstance(target, exp.Column) and target.table):
+        return None
+    comp_col = table.column(target.table)
+    if comp_col is None or comp_col.composite_fields is None:
+        return None
+    subfield = target.name
+    tag = next((t for f, t in comp_col.composite_fields if f == subfield), None)
+    if tag is None:
+        raise errors.SQLError(
+            "42703", f'column "{subfield}" not found in composite type "{comp_col.composite_type}"'
+        )
+    return comp_col, subfield, tag
+
+
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
     for assign in stmt.expressions:
         if not isinstance(assign, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {assign.sql()}")
+        # ``SET col.field = v`` writes into the composite subdocument at ``col.field``.
+        subfield_target = _composite_subfield_target(assign.this, table)
+        if subfield_target is not None:
+            comp_col, subfield, tag = subfield_target
+            if comp_col.pk:
+                raise errors.feature_not_supported("updating the primary key is not supported")
+            raw = _literal(assign.expression)
+            set_doc[f"{comp_col.field}.{subfield}"] = typemap.coerce(raw, tag)
+            continue
         col_name = _column_name(assign.this)
         col = table.column(col_name)
         if col is None:
@@ -1833,7 +1883,10 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         raw = _literal(assign.expression)
         if raw is None and not col.nullable:
             raise errors.not_null_violation(col_name)
-        set_doc[col.field] = typemap.coerce(raw, col.type_tag)
+        if col.composite_type is not None and raw is not None:
+            set_doc[col.field] = _composite_value(raw, col)
+        else:
+            set_doc[col.field] = typemap.coerce(raw, col.type_tag)
     return UpdatePlan(
         table=table,
         filter=_where_filter(stmt, table),

@@ -1457,11 +1457,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   Identifier)`) evaluates in `scalar.py` to the subdoc field, typed via `planner._composite_field_tag`
   (the resolver stashes its `TableDef` on `resolve.table`). Whole-composite selects render the PG
   record text literal `(f1,f2)` (`typemap._render_pg_composite`, RECORD oid 2249). Reflected via
-  `pg_type` (`typtype = 'c'`, oid base 67000 in `virtual._composite_oids`). **Limitations:** composite
-  field access is only in the SELECT list / RETURNING — **not** in a `WHERE` predicate or `UPDATE …
-  SET` target (the Mongo-filter translation doesn't lower `(col).field`); no nested composites; and
-  `pg_attribute`-level reflection of a composite type's fields (needs a `pg_class` `relkind='c'` row +
-  `typrelid`) is not implemented, so `psql \dT+` won't list the fields.
+  `pg_type` (`typtype = 'c'`, oid base 67000 in `virtual._composite_oids`). WHERE/UPDATE access and
+  `pg_attribute` reflection landed in b134 (below). **Remaining limitation:** no nested composites.
+- [ ] **Composite type follow-ups landed** (b134): closed the b131 gaps. (1) `(col).field` in a WHERE
+  predicate — `planner._composite_access_parts` (Paren-gated `Dot(Paren(Column), Identifier)` so a
+  schema-qualified `pg_catalog.x` Dot is never misread) feeds `_field`/`_is_field_node`, lowering to a
+  dotted Mongo path `col.field`. (2) UPDATE targets — `SET col.field = v` (`_composite_subfield_target`
+  detects `Column(this=field, table=col)`, writes `$set: {"col.field": v}` coerced to the field's tag)
+  and `SET col = ROW(...)` (whole value via `_composite_value`); an unknown subfield → 42703. (3)
+  `pg_attribute` field reflection — added `typrelid` to pg_type + a `relkind='c'` pg_class row per type
+  (`virtual._composite_rel_oids`, oid base 68000) with `reltype` pointing back, plus one pg_attribute
+  row per field, so `pg_type.typrelid → pg_class.oid → pg_attribute.attrelid` resolves field names /
+  oids (`psql \dT+`, SQLAlchemy). Added the `typrelid` column to the pg_type schema and `reltype` to
+  pg_class. **Still not supported:** nested composite types (a field whose own type is a composite —
+  `engine._composite_fields_from_schema` rejects a non-builtin field type).
 - [ ] **Date/time scalar functions landed** (b132): `extract(field FROM ts)` / `date_part('field', ts)`
   (year/month/day/hour/minute/second/quarter/dow[Sun=0]/isodow[Mon=1]/doy/week/epoch → numeric),
   `date_trunc('unit', ts)` (year/quarter/month/week[→Monday]/day/hour/minute/second → timestamptz),

@@ -416,17 +416,29 @@ SELECT (home).street, (home).zip FROM people;   -- 'Main St', 90210 (int, not te
 SELECT home FROM people;                          -- ("Main St",90210)  (record literal)
 ```
 
+The `(col).field` accessor also works in a `WHERE` predicate (it lowers to a
+dotted Mongo path, so it can drive an equality / range filter) and as an `UPDATE`
+target — `UPDATE t SET col.field = v` rewrites a single subfield, while
+`UPDATE t SET col = ROW(...)` replaces the whole value:
+
+```sql
+SELECT id FROM people WHERE (home).zip = 90210;
+UPDATE people SET home.zip = 55555 WHERE id = 1;             -- one subfield
+UPDATE people SET home = ROW('New Rd', 12345) WHERE id = 1;  -- whole value
+```
+
 Selecting the whole column renders the Postgres record text literal
 `(field1,field2)` (a field is double-quoted when empty or containing a comma /
 paren / quote / backslash / whitespace; a `NULL` field is empty) and reports the
 generic `RECORD` type oid, so a driver decodes it as a tuple of text fields.
-Composite types reflect through `pg_catalog.pg_type` (`typtype = 'c'`). `DROP TYPE
-[IF EXISTS] name` removes one; a missing type raises `42704` (silenced by
-`IF EXISTS`) and a name clash raises `42710`.
+Composite types reflect through `pg_catalog.pg_type` (`typtype = 'c'`), and each
+type's fields reflect via the `pg_type.typrelid` → `pg_class` (`relkind = 'c'`) →
+`pg_attribute` chain, so `psql \dT+` and SQLAlchemy see the field names and types.
+`DROP TYPE [IF EXISTS] name` removes one; a missing type raises `42704` (silenced
+by `IF EXISTS`) and a name clash raises `42710`.
 
-Not yet supported: composite field access in a `WHERE` / `UPDATE … SET` target
-(only the `SELECT` list and `RETURNING`), nested composite fields, and
-`pg_attribute`-level reflection of a composite type's individual fields.
+Not yet supported: nested composite types (a composite field whose own type is a
+composite).
 
 `ALTER DOMAIN` evolves a domain in place:
 
