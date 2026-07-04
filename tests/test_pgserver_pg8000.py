@@ -1465,6 +1465,19 @@ def test_array_functions_via_driver(server):
     conn.close()
 
 
+def test_unnest_in_from_via_driver(server):
+    # unnest(array_col) as a FROM table-function source, through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, tags text[])")
+    cur.execute("INSERT INTO t (id, tags) VALUES (1, ARRAY['a','b']), (2, ARRAY['c'])")
+    cur.execute("SELECT id, tag FROM t, unnest(t.tags) AS tag ORDER BY id, tag")
+    assert cur.fetchall() == ([1, "a"], [1, "b"], [2, "c"])
+    cur.execute("SELECT id, count(*) FROM t, unnest(t.tags) AS tag GROUP BY id ORDER BY id")
+    assert cur.fetchall() == ([1, 2], [2, 1])
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address
